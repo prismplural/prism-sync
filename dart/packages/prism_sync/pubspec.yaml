@@ -1,0 +1,25 @@
+name: prism_sync
+description: Dart bindings for prism-sync encrypted CRDT sync library
+version: 0.1.0
+
+environment:
+  sdk: ^3.11.1
+
+flutter:
+  plugin:
+    platforms:
+      ios:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      android:
+        ffiPlugin: true
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_rust_bridge: 2.11.1
+  meta: ^1.11.0
+dev_dependencies:
+  integration_test:
+    sdk: flutter

@@ -1,0 +1,7 @@
+name: prism_sync_workspace
+packages:
+  - packages/**
+
+command:
+  bootstrap:
+    usePubspecOverrides: true

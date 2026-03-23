@@ -1,0 +1,7 @@
+dbs:
+  - path: /data/relay.db
+    replicas:
+      - type: s3
+        bucket: prism-relay-backup
+        path: relay.db
+        endpoint: https://s3.us-west-004.backblazeb2.com

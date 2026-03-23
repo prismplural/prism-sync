@@ -1,0 +1,10 @@
+/target
+*.swp
+*.swo
+.DS_Store
+
+# Never commit SQLite databases or backup artifacts
+backups/
+*.db
+*.sqlite
+*.sqlite3

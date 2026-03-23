@@ -1,0 +1,11 @@
+name: prism_sync_flutter
+description: Flutter integrations for prism-sync (secure storage, Riverpod providers)
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.11.1
+
+dependencies:
+  prism_sync:
+    path: ../prism_sync
