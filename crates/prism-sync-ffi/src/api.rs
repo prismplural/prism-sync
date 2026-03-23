@@ -855,6 +855,27 @@ pub fn is_websocket_connected(handle: &PrismSyncHandle) -> bool {
         .unwrap_or(false)
 }
 
+/// Reconnect the WebSocket if it is currently disconnected.
+///
+/// Tears down any existing (stale) WebSocket connection and starts a fresh one,
+/// resetting the exponential backoff. No-op if no relay is configured.
+/// Non-fatal: errors are logged but not propagated.
+pub async fn reconnect_websocket(handle: &PrismSyncHandle) -> Result<(), String> {
+    let relay = handle.relay.lock().ok().and_then(|g| g.clone());
+    if let Some(relay) = relay {
+        if !relay.is_websocket_connected() {
+            // disconnect drops the old client (and its stale backoff loop),
+            // then connect starts fresh with attempt=0.
+            let _ = relay.disconnect_websocket().await;
+            relay
+                .connect_websocket()
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// App lifecycle hook — catch up sync if stale (>5 s since last sync).
 ///
 /// Triggers a full sync cycle only when the last successful sync was more

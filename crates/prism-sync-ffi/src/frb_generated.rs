@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -120935150;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1748570295;
 
 // Section: executor
 
@@ -1897,6 +1897,63 @@ fn wire__crate__api__random_bytes_impl(
         },
     )
 }
+fn wire__crate__api__reconnect_websocket_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "reconnect_websocket",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_handle = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, String>(
+                    (move || async move {
+                        let mut api_handle_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_handle,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_handle_guard =
+                                        Some(api_handle.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_handle_guard = api_handle_guard.unwrap();
+                        let output_ok = crate::api::reconnect_websocket(&*api_handle_guard).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__record_create_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -2953,19 +3010,20 @@ fn pde_ffi_dispatcher_primary_impl(
         34 => wire__crate__api__perform_ecdh_impl(port, ptr, rust_vec_len, data_len),
         35 => wire__crate__api__poll_event_impl(port, ptr, rust_vec_len, data_len),
         36 => wire__crate__api__random_bytes_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__record_create_impl(port, ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__record_delete_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__record_update_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__restore_runtime_keys_impl(port, ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__revoke_and_rekey_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__revoke_device_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__seed_secure_store_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__set_auto_sync_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__status_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__sync_event_stream_impl(port, ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__sync_now_impl(port, ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__unlock_impl(port, ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__upload_pairing_snapshot_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__reconnect_websocket_impl(port, ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__record_create_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__record_delete_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__record_update_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__restore_runtime_keys_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__revoke_and_rekey_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__revoke_device_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__seed_secure_store_impl(port, ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__set_auto_sync_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__status_impl(port, ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__sync_event_stream_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__sync_now_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__unlock_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__upload_pairing_snapshot_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

@@ -206,6 +206,14 @@ Future<String> syncNow({required PrismSyncHandle handle}) =>
 Future<bool> isWebsocketConnected({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiIsWebsocketConnected(handle: handle);
 
+/// Reconnect the WebSocket if it is currently disconnected.
+///
+/// Tears down any existing (stale) WebSocket connection and starts a fresh one,
+/// resetting the exponential backoff. No-op if no relay is configured.
+/// Non-fatal: errors are logged but not propagated.
+Future<void> reconnectWebsocket({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiReconnectWebsocket(handle: handle);
+
 /// App lifecycle hook — catch up sync if stale (>5 s since last sync).
 ///
 /// Triggers a full sync cycle only when the last successful sync was more
