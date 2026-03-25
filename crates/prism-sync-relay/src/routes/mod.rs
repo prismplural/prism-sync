@@ -113,9 +113,9 @@ pub fn router(state: AppState) -> Router {
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<axum::body::Body>| {
                     let path = request.uri().path();
-                    tracing::info_span!("http", method = %request.method(), path)
+                    tracing::debug_span!("http", method = %request.method(), path)
                 })
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                .on_response(DefaultOnResponse::new().level(Level::DEBUG)),
         )
         .with_state(state)
 }

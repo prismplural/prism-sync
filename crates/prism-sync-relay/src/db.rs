@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -137,7 +138,26 @@ fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
          PRAGMA mmap_size = 268435456;
          PRAGMA cache_size = -65536;
          PRAGMA auto_vacuum = INCREMENTAL;",
-    )
+    )?;
+
+    // auto_vacuum mode can only change on a newly created database. If the DB
+    // was created with auto_vacuum=NONE (the default), the pragma above is
+    // silently ignored and incremental_vacuum becomes a no-op. A one-time full
+    // VACUUM converts the file to INCREMENTAL mode so future cleanup cycles
+    // can reclaim freelist pages incrementally.
+    let current_mode: i64 = conn
+        .query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))
+        .unwrap_or(0);
+    if current_mode != 2 {
+        // 0 = NONE, 1 = FULL, 2 = INCREMENTAL
+        tracing::warn!(
+            current_mode,
+            "auto_vacuum not INCREMENTAL — running one-time VACUUM to convert"
+        );
+        conn.execute_batch("VACUUM;")?;
+    }
+
+    Ok(())
 }
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -259,6 +279,14 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
         ",
+    )?;
+
+    // -- Counters (persistent metrics that survive restarts) --
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS counters (
+            name    TEXT PRIMARY KEY,
+            value   INTEGER NOT NULL DEFAULT 0
+        );",
     )?;
 
     // -- Incremental migrations for existing databases --
@@ -1099,6 +1127,39 @@ pub fn prune_stale_sync_groups(
     }
 
     Ok(stale_ids.len())
+}
+
+// ---------------------------------------------------------------------------
+// Persistent counters
+// ---------------------------------------------------------------------------
+
+/// Load persisted counter values from SQLite. Returns a map of name → value.
+pub fn load_counters(conn: &Connection) -> Result<HashMap<String, u64>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT name, value FROM counters")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (name, value) = row?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+/// Flush current counter values to SQLite (upsert).
+pub fn flush_counters(
+    conn: &Connection,
+    values: &[(&str, u64)],
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO counters (name, value) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET value = ?2",
+    )?;
+    for (name, value) in values {
+        stmt.execute(params![name, value])?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

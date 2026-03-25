@@ -28,7 +28,7 @@ pub async fn ws_upgrade(
     Path(sync_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         "WebSocket upgrade requested"
     );
@@ -78,7 +78,7 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         device_id = %trunc(&device_id),
         "WebSocket authenticated"
@@ -165,7 +165,7 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
     state.unregister_ws(&sync_id, &device_id).await;
     send_task.abort();
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         device_id = %trunc(&device_id),
         "WebSocket disconnected"

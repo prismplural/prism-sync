@@ -107,7 +107,10 @@ async fn prometheus_metrics(
          prism_freelist_pages {freelist_pages}\n\
          # HELP prism_vacuum_pages_freed_total Pages reclaimed by incremental vacuum\n\
          # TYPE prism_vacuum_pages_freed_total counter\n\
-         prism_vacuum_pages_freed_total {}\n",
+         prism_vacuum_pages_freed_total {}\n\
+         # HELP prism_last_cleanup_timestamp_seconds Unix timestamp of last successful cleanup cycle\n\
+         # TYPE prism_last_cleanup_timestamp_seconds gauge\n\
+         prism_last_cleanup_timestamp_seconds {}\n",
         m.changesets_pushed.load(Ordering::Relaxed),
         m.changesets_pulled.load(Ordering::Relaxed),
         m.changesets_pruned.load(Ordering::Relaxed),
@@ -116,6 +119,7 @@ async fn prometheus_metrics(
         m.snapshots_exchanged.load(Ordering::Relaxed),
         m.registrations.load(Ordering::Relaxed),
         m.vacuum_pages_freed.load(Ordering::Relaxed),
+        m.last_cleanup_epoch_secs.load(Ordering::Relaxed),
     );
 
     Ok((

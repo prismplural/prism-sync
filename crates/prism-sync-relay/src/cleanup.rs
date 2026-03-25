@@ -60,6 +60,10 @@ async fn run_cleanup(state: &AppState) {
 
     match result {
         Ok(Ok((nonces, stale, revoked_groups, pruned, expired_snapshots, pages_freed))) => {
+            state.metrics.last_cleanup_epoch_secs.store(
+                crate::db::now_secs() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if pages_freed > 0 {
                 state.metrics.inc_by(&state.metrics.vacuum_pages_freed, pages_freed);
             }
@@ -101,4 +105,17 @@ async fn run_cleanup(state: &AppState) {
     state
         .nonce_rate_limiter
         .prune_stale(state.config.nonce_rate_window_secs);
+
+    // Flush counter values to SQLite so they survive restarts.
+    let db = state.db.clone();
+    let counters = state.metrics.snapshot_counters();
+    let flush_result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::flush_counters(conn, &counters))
+    })
+    .await;
+    match flush_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("counter flush db error: {e}"),
+        Err(e) => tracing::error!("counter flush task panic: {e}"),
+    }
 }

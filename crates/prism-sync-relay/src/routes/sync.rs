@@ -50,7 +50,7 @@ pub async fn push_changes(
     let data = body.to_vec();
     let max_unpruned = state.config.max_unpruned_batches;
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         device_id = %trunc(&device_id),
         batch_id = %trunc(&batch_id),
@@ -86,7 +86,7 @@ pub async fn push_changes(
 
     state.metrics.inc(&state.metrics.changesets_pushed);
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         device_id = %trunc(&device_id),
         server_seq,
@@ -183,7 +183,7 @@ pub async fn pull_changes(
     let device_id = auth.device_id.clone();
     let stale_threshold = state.config.stale_device_secs as i64;
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         device_id = %trunc(&device_id),
         since,
@@ -212,7 +212,7 @@ pub async fn pull_changes(
 
     let max_server_seq = batches.iter().map(|b| b.server_seq).max().unwrap_or(since);
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         batch_count = batches.len(),
         max_server_seq,
@@ -262,7 +262,7 @@ pub async fn get_snapshot(
             .map_err(|e| AppError::Internal(e.to_string()))?
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&auth.sync_id),
         found = snapshot.is_some(),
         "Get snapshot"
@@ -297,7 +297,7 @@ pub async fn get_snapshot(
                     db.with_conn(|conn| db::delete_snapshot(conn, &sid))
                 })
                 .await;
-                tracing::info!(
+                tracing::debug!(
                     sync_id = %trunc(&auth.sync_id),
                     device_id = %trunc(&auth.device_id),
                     "Snapshot auto-deleted after cross-device download"
@@ -363,7 +363,7 @@ pub async fn put_snapshot(
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %trunc(&sync_id),
         epoch,
         server_seq_at,
@@ -398,7 +398,7 @@ pub async fn put_snapshot(
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
     state.metrics.inc(&state.metrics.snapshots_exchanged);
-    tracing::info!(sync_id = %trunc(&sync_id), "Put snapshot stored");
+    tracing::debug!(sync_id = %trunc(&sync_id), "Put snapshot stored");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -460,7 +460,7 @@ pub async fn delete_account(
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
     if deleted {
-        tracing::info!(sync_id = %trunc(&sync_id), "Sync group deleted");
+        tracing::debug!(sync_id = %trunc(&sync_id), "Sync group deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::Forbidden(

@@ -51,7 +51,7 @@ async fn get_register_nonce(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %&sync_id[..16],
         "Registration nonce issued"
     );
@@ -121,7 +121,7 @@ async fn register_device(
     let challenge_sig = hex::decode(&body.registration_challenge)
         .map_err(|_| AppError::BadRequest("Invalid registration_challenge hex"))?;
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %&sync_id[..16],
         device_id = %&body.device_id[..8.min(body.device_id.len())],
         has_invitation = body.signed_invitation.is_some(),
@@ -175,7 +175,7 @@ async fn register_device(
 
     state.metrics.inc(&state.metrics.registrations);
 
-    tracing::info!(
+    tracing::debug!(
         sync_id = %&sync_id[..16],
         device_id = %&body.device_id[..8.min(body.device_id.len())],
         "Register completed successfully"
@@ -218,7 +218,7 @@ fn do_register(
 
     if is_first_device {
         // First device: create the sync group, no invitation needed
-        tracing::info!(
+        tracing::debug!(
             sync_id = %&sync_id[..16],
             "Creating new sync group (first device)"
         );
@@ -243,7 +243,7 @@ fn do_register(
         if existing.status != "active" {
             return Err(AppError::Forbidden("Device has been revoked"));
         }
-        tracing::info!(
+        tracing::debug!(
             sync_id = %&sync_id[..16],
             device_id = %&device_id[..8.min(device_id.len())],
             "Existing device re-registered"
@@ -254,7 +254,7 @@ fn do_register(
             .map_err(|e| AppError::Internal(e.to_string()))?
             .unwrap_or(0);
         let permission = "admin";
-        tracing::info!(
+        tracing::debug!(
             sync_id = %&sync_id[..16],
             device_id = %&device_id[..8.min(device_id.len())],
             epoch,
