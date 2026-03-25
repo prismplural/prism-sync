@@ -140,36 +140,46 @@ async fn auth_middleware(
 
     let token_owned = token.to_string();
     let session_expiry = state.config.session_expiry_secs as i64;
-    let db = state.db.clone();
 
-    // Validate session: hash token, look up in device_sessions, check not expired,
-    // touch session (sliding expiry), verify device is active.
+    // Phase 1 — Read (blocking, must complete): validate session + device status
+    let db_read = state.db.clone();
     let identity =
         tokio::task::spawn_blocking(move || -> Result<Option<AuthIdentity>, AppError> {
-            db.with_conn(|conn| {
-                // Validate session token
-                let Some((sync_id, device_id)) = db::validate_session(conn, &token_owned)? else {
-                    return Ok(None);
-                };
-
-                // Verify device is still active
-                let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
-                    return Ok(None);
-                };
-                if device.status != "active" {
-                    return Ok(None);
-                }
-
-                // Touch session (sliding window expiry) and device last_seen_at
-                db::touch_session(conn, &sync_id, &device_id, session_expiry)?;
-                db::touch_device(conn, &sync_id, &device_id)?;
-
-                Ok(Some(AuthIdentity { sync_id, device_id }))
-            })
-            .map_err(|e| AppError::Internal(e.to_string()))
+            db_read
+                .with_read_conn(|conn| {
+                    let Some((sync_id, device_id)) =
+                        db::validate_session(conn, &token_owned)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
+                        return Ok(None);
+                    };
+                    if device.status != "active" {
+                        return Ok(None);
+                    }
+                    Ok(Some(AuthIdentity { sync_id, device_id }))
+                })
+                .map_err(|e| AppError::Internal(e.to_string()))
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
+
+    // Phase 2 — Write (fire-and-forget): touch session + device timestamps
+    if let Some(ref auth) = identity {
+        let db_write = state.db.clone();
+        let sid = auth.sync_id.clone();
+        let did = auth.device_id.clone();
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                db_write.with_conn(|conn| {
+                    db::touch_session(conn, &sid, &did, session_expiry)?;
+                    db::touch_device(conn, &sid, &did)
+                })
+            })
+            .await;
+        });
+    }
 
     match identity {
         Some(identity) => {

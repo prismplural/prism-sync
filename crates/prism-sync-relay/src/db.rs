@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -81,45 +82,62 @@ fn hash_token(token: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
+    writer: Mutex<Connection>,
+    readers: Vec<Mutex<Connection>>,
+    next_reader: AtomicUsize,
 }
 
 impl Database {
     /// Open a persistent database at the given path.
-    pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
+    pub fn open(path: &str, reader_count: usize) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
         apply_pragmas(&conn)?;
         migrate(&conn)?;
+
+        let readers = (0..reader_count)
+            .map(|_| {
+                let c = Connection::open(path)?;
+                apply_read_pragmas(&c)?;
+                Ok(Mutex::new(c))
+            })
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            writer: Mutex::new(conn),
+            readers,
+            next_reader: AtomicUsize::new(0),
         })
     }
 
-    /// Open an in-memory database for testing.
+    /// Open a database for testing, backed by a temp file so multiple
+    /// connections can share the same WAL.
     pub fn in_memory() -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open_in_memory()?;
-        // In-memory: skip mmap/cache pragmas, but enable FK and WAL-like settings
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA temp_store = memory;",
-        )?;
-        migrate(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        let path = std::env::temp_dir()
+            .join(format!("prism_relay_test_{}.db", uuid::Uuid::new_v4()));
+        Self::open(path.to_str().unwrap(), 2)
     }
 
-    /// Run a blocking DB operation on the current thread.
+    /// Run a blocking DB operation on the writer connection.
     /// For async contexts, wrap calls in `tokio::task::spawn_blocking`.
     pub fn with_conn<F, T>(&self, f: F) -> Result<T, rusqlite::Error>
     where
         F: FnOnce(&Connection) -> Result<T, rusqlite::Error>,
     {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.writer.lock().expect("writer mutex poisoned");
+        f(&conn)
+    }
+
+    /// Run a read-only DB operation using a connection from the reader pool.
+    /// For async contexts, wrap calls in `tokio::task::spawn_blocking`.
+    pub fn with_read_conn<F, T>(&self, f: F) -> Result<T, rusqlite::Error>
+    where
+        F: FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    {
+        let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        let conn = self.readers[idx].lock().expect("reader mutex poisoned");
         f(&conn)
     }
 }
@@ -157,6 +175,20 @@ fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch("VACUUM;")?;
     }
 
+    Ok(())
+}
+
+fn apply_read_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;
+         PRAGMA temp_store = memory;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA cache_size = -65536;
+         PRAGMA query_only = ON;",
+    )?;
     Ok(())
 }
 

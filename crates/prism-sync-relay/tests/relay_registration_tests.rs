@@ -148,6 +148,8 @@ async fn test_registration_rejects_expired_nonce() {
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
         snapshot_default_ttl_secs: 86400,
+        reader_pool_size: 2,
+        node_exporter_url: None,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -223,6 +225,8 @@ async fn test_nonce_rate_limiting() {
         nonce_rate_limit: 3, // Only 3 nonces per window
         nonce_rate_window_secs: 60,
         snapshot_default_ttl_secs: 86400,
+        reader_pool_size: 2,
+        node_exporter_url: None,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -502,6 +506,8 @@ async fn test_nonce_rate_limiting_window_expiry() {
         nonce_rate_limit: 2,       // Only 2 nonces per window
         nonce_rate_window_secs: 1, // 1-second window
         snapshot_default_ttl_secs: 86400,
+        reader_pool_size: 2,
+        node_exporter_url: None,
     };
 
     let db = Database::in_memory().expect("in-memory db");

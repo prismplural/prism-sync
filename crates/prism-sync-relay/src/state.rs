@@ -127,7 +127,7 @@ impl AppState {
         let metrics = Arc::new(Metrics::default());
 
         // Restore persisted counters so lifetime totals survive restarts.
-        match db.with_conn(|conn| crate::db::load_counters(conn)) {
+        match db.with_read_conn(crate::db::load_counters) {
             Ok(counters) => metrics.restore_from(&counters),
             Err(e) => tracing::warn!("failed to load persisted counters: {e}"),
         }

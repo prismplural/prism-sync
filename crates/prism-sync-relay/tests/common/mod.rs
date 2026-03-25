@@ -37,6 +37,8 @@ pub async fn start_test_relay() -> (
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
         snapshot_default_ttl_secs: 86400,
+        reader_pool_size: 2,
+        node_exporter_url: None,
     };
 
     let db = Database::in_memory().expect("in-memory db");

@@ -35,7 +35,7 @@ pub async fn list_devices(
     let sid = auth.sync_id;
 
     let devices =
-        tokio::task::spawn_blocking(move || db.with_conn(|conn| db::list_devices(conn, &sid)))
+        tokio::task::spawn_blocking(move || db.with_read_conn(|conn| db::list_devices(conn, &sid)))
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -384,7 +384,7 @@ pub async fn get_rekey_artifact(
     let sid = auth.sync_id;
 
     let artifact = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| db::get_rekey_artifact(conn, &sid, epoch, &target_device_id))
+        db.with_read_conn(|conn| db::get_rekey_artifact(conn, &sid, epoch, &target_device_id))
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
@@ -461,7 +461,7 @@ pub async fn get_wipe_status(
     let db = state.db.clone();
 
     let status = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| db::get_device_wipe_status(conn, &path_sync_id, &device_id))
+        db.with_read_conn(|conn| db::get_device_wipe_status(conn, &path_sync_id, &device_id))
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?

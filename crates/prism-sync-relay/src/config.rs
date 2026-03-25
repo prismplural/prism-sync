@@ -17,6 +17,11 @@ pub struct Config {
     pub nonce_rate_window_secs: u64,
     /// Default TTL in seconds for ephemeral snapshots (24 hours).
     pub snapshot_default_ttl_secs: u64,
+    /// Number of read-only SQLite connections in the reader pool.
+    pub reader_pool_size: usize,
+    /// URL of node-exporter for /metrics/node proxy (e.g. http://node-exporter:9100).
+    /// If unset, the endpoint returns 404.
+    pub node_exporter_url: Option<String>,
 }
 
 impl Config {
@@ -37,6 +42,10 @@ impl Config {
             nonce_rate_limit: parse_env("NONCE_RATE_LIMIT", 10),
             nonce_rate_window_secs: parse_env("NONCE_RATE_WINDOW_SECS", 60),
             snapshot_default_ttl_secs: parse_env("SNAPSHOT_DEFAULT_TTL_SECS", 86400),
+            reader_pool_size: parse_env("READER_POOL_SIZE", 4),
+            node_exporter_url: std::env::var("NODE_EXPORTER_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }

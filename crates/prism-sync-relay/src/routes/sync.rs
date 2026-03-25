@@ -193,12 +193,9 @@ pub async fn pull_changes(
 
     let db = state.db.clone();
     let sid = sync_id.clone();
-    let did = device_id;
 
     let (batches, min_acked_seq) = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            // Touch device last_seen_at
-            db::touch_device(conn, &sid, &did)?;
+        db.with_read_conn(|conn| {
             let batches = db::get_batches_since(conn, &sid, since, limit)?;
             let min_acked = db::get_min_acked_seq(conn, &sid, stale_threshold)?;
             Ok((batches, min_acked))
@@ -257,7 +254,7 @@ pub async fn get_snapshot(
     let sid = auth.sync_id.clone();
 
     let snapshot =
-        tokio::task::spawn_blocking(move || db.with_conn(|conn| db::get_snapshot(conn, &sid)))
+        tokio::task::spawn_blocking(move || db.with_read_conn(|conn| db::get_snapshot(conn, &sid)))
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?
             .map_err(|e| AppError::Internal(e.to_string()))?;

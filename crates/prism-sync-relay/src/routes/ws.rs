@@ -186,19 +186,18 @@ async fn parse_and_validate_auth(state: &AppState, sync_id: &str, text: &str) ->
     let device_id = json["device_id"].as_str()?.to_string();
     let token = json["token"].as_str()?.to_string();
 
-    let db = state.db.clone();
     let expected_sync_id = sync_id.to_string();
     let session_expiry = state.config.session_expiry_secs as i64;
 
+    // Phase 1 — Read (blocking): validate session
+    let db_read = state.db.clone();
+    let expected_sid = expected_sync_id.clone();
+    let expected_did = device_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
+        db_read.with_read_conn(|conn| {
             let session = db::validate_session(conn, &token)?;
             match session {
-                Some((sid, did)) if sid == expected_sync_id && did == device_id => {
-                    db::touch_session(conn, &sid, &did, session_expiry)?;
-                    db::touch_device(conn, &sid, &did)?;
-                    Ok(Some(did))
-                }
+                Some((sid, did)) if sid == expected_sid && did == expected_did => Ok(Some(did)),
                 _ => Ok(None),
             }
         })
@@ -206,6 +205,22 @@ async fn parse_and_validate_auth(state: &AppState, sync_id: &str, text: &str) ->
     .await
     .ok()?
     .ok()?;
+
+    // Phase 2 — Write (fire-and-forget): touch session + device
+    if let Some(ref did) = result {
+        let db_write = state.db.clone();
+        let sid = expected_sync_id;
+        let did = did.clone();
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                db_write.with_conn(|conn| {
+                    db::touch_session(conn, &sid, &did, session_expiry)?;
+                    db::touch_device(conn, &sid, &did)
+                })
+            })
+            .await;
+        });
+    }
 
     result
 }

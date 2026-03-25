@@ -4,7 +4,9 @@ use std::sync::atomic::Ordering;
 use crate::{auth, errors::AppError, state::AppState};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/metrics", get(prometheus_metrics))
+    Router::new()
+        .route("/metrics", get(prometheus_metrics))
+        .route("/metrics/node", get(node_metrics))
 }
 
 /// Expose Prometheus-format metrics.
@@ -34,7 +36,7 @@ async fn prometheus_metrics(
     let db = state.db.clone();
     let (registered_syncs, stored_batches, db_size_bytes, freelist_pages) =
         tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
+            db.with_read_conn(|conn| {
                 let registered_syncs: u64 = conn
                     .query_row("SELECT COUNT(*) FROM sync_groups", [], |r| r.get(0))
                     .unwrap_or(0);
@@ -125,5 +127,43 @@ async fn prometheus_metrics(
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
+    ))
+}
+
+/// Reverse-proxy to node-exporter, gated by the same METRICS_TOKEN.
+/// Returns 404 if NODE_EXPORTER_URL is not configured.
+async fn node_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    // Same bearer-token gate as /metrics.
+    if let Some(expected_token) = state.config.metrics_token.as_deref() {
+        let provided = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !auth::timing_safe_eq(provided, expected_token) {
+            return Err(AppError::Unauthorized);
+        }
+    }
+
+    let base_url = state
+        .config
+        .node_exporter_url
+        .as_deref()
+        .ok_or(AppError::NotFound)?;
+
+    let url = format!("{base_url}/metrics");
+    let body = reqwest::get(&url)
+        .await
+        .map_err(|e| AppError::Internal(format!("node-exporter fetch failed: {e}")))?
+        .text()
+        .await
+        .map_err(|e| AppError::Internal(format!("node-exporter read failed: {e}")))?;
+
+    Ok((
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
     ))
 }
