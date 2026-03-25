@@ -5,6 +5,7 @@ members = [
     "crates/prism-sync-core",
     "crates/prism-sync-ffi",
     "crates/prism-sync-relay",
+    "crates/prism-sync-bench",
 ]
 
 [workspace.package]
