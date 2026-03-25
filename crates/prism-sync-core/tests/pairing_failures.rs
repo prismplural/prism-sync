@@ -5,50 +5,17 @@
 //! - Wrong password rejected
 //! - Rollback marker cleanup
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+mod common;
+
+use std::sync::Arc;
 
 use prism_sync_core::pairing::models::PairingResponse;
 use prism_sync_core::pairing::service::{cleanup_failed_setup, PairingService};
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::secure_store::SecureStore;
-use prism_sync_core::Result;
 use prism_sync_crypto::DeviceSecret;
 
-// ── MemorySecureStore ──
-
-struct MemorySecureStore {
-    data: Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl MemorySecureStore {
-    fn new() -> Self {
-        Self {
-            data: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl SecureStore for MemorySecureStore {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.data.lock().unwrap().get(key).cloned())
-    }
-    fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_vec());
-        Ok(())
-    }
-    fn delete(&self, key: &str) -> Result<()> {
-        self.data.lock().unwrap().remove(key);
-        Ok(())
-    }
-    fn clear(&self) -> Result<()> {
-        self.data.lock().unwrap().clear();
-        Ok(())
-    }
-}
+use common::MemorySecureStore;
 
 // ── Helpers ──
 

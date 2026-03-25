@@ -4,8 +4,9 @@
 //! `PairingService` create/join flow using in-memory storage and a minimal
 //! in-memory `SecureStore`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+mod common;
+
+use std::sync::Arc;
 
 use prism_sync_core::pairing::service::PairingService;
 use prism_sync_core::relay::MockRelay;
@@ -14,45 +15,7 @@ use prism_sync_core::secure_store::SecureStore;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::PrismSync;
 
-// ══════════════════════════════════════════════════════════════════════════
-// MemorySecureStore — simple in-memory SecureStore for testing
-// ══════════════════════════════════════════════════════════════════════════
-
-struct MemorySecureStore {
-    data: Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl MemorySecureStore {
-    fn new() -> Self {
-        Self {
-            data: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl SecureStore for MemorySecureStore {
-    fn get(&self, key: &str) -> prism_sync_core::Result<Option<Vec<u8>>> {
-        Ok(self.data.lock().unwrap().get(key).cloned())
-    }
-
-    fn set(&self, key: &str, value: &[u8]) -> prism_sync_core::Result<()> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_vec());
-        Ok(())
-    }
-
-    fn delete(&self, key: &str) -> prism_sync_core::Result<()> {
-        self.data.lock().unwrap().remove(key);
-        Ok(())
-    }
-
-    fn clear(&self) -> prism_sync_core::Result<()> {
-        self.data.lock().unwrap().clear();
-        Ok(())
-    }
-}
+use common::MemorySecureStore;
 
 // ══════════════════════════════════════════════════════════════════════════
 // Helpers

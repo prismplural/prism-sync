@@ -366,4 +366,27 @@ mod tests {
         assert_ne!(epoch0, *invite);
         assert_ne!(*db_key, *invite);
     }
+
+    #[test]
+    fn device_identity_independent_of_dek() {
+        use crate::{mnemonic, DeviceSecret, DeviceSigningKey};
+
+        let device_secret = DeviceSecret::generate();
+        let signing_key = device_secret.ed25519_keypair("device_123").unwrap();
+        let _exchange_key = device_secret.x25519_keypair("device_123").unwrap();
+
+        // Sign and verify
+        let message = b"registration challenge data";
+        let signature = signing_key.sign(message);
+        DeviceSigningKey::verify(&signing_key.public_key_bytes(), message, &signature).unwrap();
+
+        // Device keys differ from DEK-derived keys
+        let mut kh = KeyHierarchy::new();
+        let secret_key = mnemonic::to_bytes(&mnemonic::generate()).unwrap();
+        kh.initialize("password", &secret_key).unwrap();
+        assert_ne!(
+            signing_key.public_key_bytes().to_vec(),
+            kh.epoch_key(0).unwrap()
+        );
+    }
 }

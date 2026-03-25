@@ -137,14 +137,4 @@ mod tests {
         assert_eq!(key.len(), 32);
     }
 
-    #[test]
-    fn all_derived_keys_differ() {
-        let dek = vec![42u8; 32];
-        let epoch = derive_epoch_zero_key(&dek).unwrap();
-        let invite = derive_group_invite_secret(&dek).unwrap();
-        let db = derive_database_key(&dek).unwrap();
-        assert_ne!(*epoch, *invite);
-        assert_ne!(*epoch, *db);
-        assert_ne!(*invite, *db);
-    }
 }
