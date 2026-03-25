@@ -85,7 +85,22 @@ impl ServerRelay {
     /// Classify an HTTP status code into a RelayError.
     fn classify_error(status: u16, body: &str) -> RelayError {
         match status {
-            401 | 403 => RelayError::Auth {
+            401 => {
+                // Check if this is a device_revoked response with wipe status
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                    if json.get("error").and_then(|v| v.as_str()) == Some("device_revoked") {
+                        let remote_wipe = json
+                            .get("remote_wipe")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        return RelayError::DeviceRevoked { remote_wipe };
+                    }
+                }
+                RelayError::Auth {
+                    message: format!("HTTP {status}: {body}"),
+                }
+            }
+            403 => RelayError::Auth {
                 message: format!("HTTP {status}: {body}"),
             },
             408 | 504 => RelayError::Timeout {
@@ -128,7 +143,7 @@ impl ServerRelay {
         // Use try_lock to avoid blocking — if the lock is held, assume disconnected.
         self.ws_client
             .try_lock()
-            .map(|guard| guard.as_ref().map_or(false, |ws| ws.is_connected()))
+            .map(|guard| guard.as_ref().is_some_and(|ws| ws.is_connected()))
             .unwrap_or(false)
     }
 
@@ -285,7 +300,6 @@ impl SyncRelay for ServerRelay {
         let resp = self
             .apply_auth(self.client.put(&url))
             .header("X-Batch-Id", &batch.batch_id)
-            .header("X-Epoch", batch.envelope.epoch.to_string())
             .header("Content-Type", "application/json")
             .json(&batch.envelope)
             .timeout(self.request_timeout)
@@ -326,45 +340,37 @@ impl SyncRelay for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let epoch: i32 = resp
-            .headers()
-            .get("X-Epoch")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let server_seq_at: i64 = resp
-            .headers()
-            .get("X-Server-Seq-At")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let data = resp.bytes().await.map_err(|e| RelayError::Network {
-            message: format!("Failed to read snapshot body: {e}"),
+        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse snapshot response: {e}"),
         })?;
+
+        let epoch = json["epoch"].as_i64().unwrap_or(0) as i32;
+        let server_seq_at = json["server_seq_at"].as_i64().unwrap_or(0);
+        let data = json["data"]
+            .as_str()
+            .and_then(|s| BASE64.decode(s).ok())
+            .unwrap_or_default();
 
         Ok(Some(SnapshotResponse {
             epoch,
             server_seq_at,
-            data: data.to_vec(),
+            data,
         }))
     }
 
     async fn put_snapshot(
         &self,
-        epoch: i32,
+        _epoch: i32,
         server_seq_at: i64,
         data: Vec<u8>,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
     ) -> Result<(), RelayError> {
         let url = format!("{}/snapshot", self.base_path());
-        debug!("put_snapshot epoch={epoch} server_seq_at={server_seq_at}");
+        debug!("put_snapshot server_seq_at={server_seq_at}");
 
         let mut req = self
             .apply_auth(self.client.put(&url))
-            .header("X-Epoch", epoch.to_string())
             .header("X-Server-Seq-At", server_seq_at.to_string());
 
         if let Some(ttl) = ttl_secs {
@@ -437,30 +443,6 @@ impl SyncRelay for ServerRelay {
         Ok(())
     }
 
-    async fn check_wipe_status(&self, device_id: &str) -> Result<Option<bool>, RelayError> {
-        let url = format!("{}/devices/{}/wipe-status", self.base_path(), device_id);
-        // NOTE: This is unauthenticated — do NOT use apply_auth
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-        match resp.status().as_u16() {
-            200 => {
-                let json: serde_json::Value =
-                    resp.json().await.map_err(|e| RelayError::Protocol {
-                        message: format!("Failed to parse wipe-status response: {e}"),
-                    })?;
-                Ok(json["remote_wipe"].as_bool())
-            }
-            404 => Ok(None),
-            status => Err(RelayError::Protocol {
-                message: format!("Unexpected HTTP {status}"),
-            }),
-        }
-    }
-
     async fn post_rekey_artifacts(
         &self,
         epoch: i32,
@@ -508,7 +490,7 @@ impl SyncRelay for ServerRelay {
         epoch: i32,
         device_id: &str,
     ) -> Result<Option<Vec<u8>>, RelayError> {
-        let url = format!("{}/rekey/{epoch}/{device_id}", self.base_path());
+        let url = format!("{}/rekey/{device_id}?epoch={epoch}", self.base_path());
         debug!("get_rekey_artifact epoch={epoch} device={device_id}");
 
         let resp = self

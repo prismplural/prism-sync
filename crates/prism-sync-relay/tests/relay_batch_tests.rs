@@ -162,7 +162,6 @@ async fn test_ack_triggers_pruning() {
         .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
         .header("Authorization", format!("Bearer {token}"))
         .header("X-Device-Id", &device_id)
-        .header("X-Epoch", "0")
         .header("X-Server-Seq-At", last_seq.to_string())
         .body(b"snapshot-data".to_vec())
         .send()

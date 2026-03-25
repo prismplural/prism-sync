@@ -17,7 +17,6 @@ pub struct DeviceRecord {
     pub x25519_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
-    pub permission: String,
     pub last_seen_at: i64,
 }
 
@@ -28,7 +27,6 @@ pub struct DeviceListEntry {
     pub x25519_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
-    pub permission: String,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +210,6 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             x25519_public_key   BLOB NOT NULL,
             epoch               INTEGER NOT NULL DEFAULT 0,
             status              TEXT NOT NULL DEFAULT 'active',
-            permission          TEXT NOT NULL DEFAULT 'admin',
             registered_at       INTEGER NOT NULL,
             last_seen_at        INTEGER NOT NULL,
             revoked_at          INTEGER,
@@ -244,20 +241,6 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS idx_nonces_expires
             ON registration_nonces(expires_at);
-
-        -- Enrollment invitations
-        CREATE TABLE IF NOT EXISTS enrollment_invitations (
-            id                      TEXT PRIMARY KEY,
-            sync_id                 TEXT NOT NULL,
-            inviter_device_id       TEXT NOT NULL,
-            signature               BLOB NOT NULL,
-            valid_until             INTEGER NOT NULL,
-            consumed_at             INTEGER,
-            consumed_by_device_id   TEXT,
-            created_at              INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_enrollment_valid_until
-            ON enrollment_invitations(valid_until);
 
         -- Device receipts (tracks each device's last acknowledged server_seq)
         CREATE TABLE IF NOT EXISTS device_receipts (
@@ -460,15 +443,14 @@ pub fn register_device(
     signing_pk: &[u8],
     x25519_pk: &[u8],
     epoch: i64,
-    permission: &str,
 ) -> Result<(), rusqlite::Error> {
     let now = now_secs();
     conn.execute(
         "INSERT INTO devices (
             sync_id, device_id, signing_public_key, x25519_public_key,
-            epoch, status, permission, registered_at, last_seen_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7)",
-        params![sync_id, device_id, signing_pk, x25519_pk, epoch, permission, now],
+            epoch, status, registered_at, last_seen_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+        params![sync_id, device_id, signing_pk, x25519_pk, epoch, now],
     )?;
     Ok(())
 }
@@ -479,7 +461,7 @@ pub fn get_device(
     device_id: &str,
 ) -> Result<Option<DeviceRecord>, rusqlite::Error> {
     conn.query_row(
-        "SELECT device_id, signing_public_key, x25519_public_key, epoch, status, permission, last_seen_at
+        "SELECT device_id, signing_public_key, x25519_public_key, epoch, status, last_seen_at
          FROM devices
          WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
@@ -490,8 +472,7 @@ pub fn get_device(
                 x25519_public_key: row.get(2)?,
                 epoch: row.get(3)?,
                 status: row.get(4)?,
-                permission: row.get(5)?,
-                last_seen_at: row.get(6)?,
+                last_seen_at: row.get(5)?,
             })
         },
     )
@@ -503,7 +484,7 @@ pub fn list_devices(
     sync_id: &str,
 ) -> Result<Vec<DeviceListEntry>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT device_id, signing_public_key, x25519_public_key, epoch, status, permission
+        "SELECT device_id, signing_public_key, x25519_public_key, epoch, status
          FROM devices
          WHERE sync_id = ?1
          ORDER BY registered_at ASC",
@@ -515,7 +496,6 @@ pub fn list_devices(
             x25519_public_key: row.get(2)?,
             epoch: row.get(3)?,
             status: row.get(4)?,
-            permission: row.get(5)?,
         })
     })?;
     rows.collect()
@@ -600,19 +580,6 @@ pub fn count_active_devices(conn: &Connection, sync_id: &str) -> Result<u64, rus
         params![sync_id],
         |row| row.get(0),
     )
-}
-
-pub fn get_device_permission(
-    conn: &Connection,
-    sync_id: &str,
-    device_id: &str,
-) -> Result<Option<String>, rusqlite::Error> {
-    conn.query_row(
-        "SELECT permission FROM devices WHERE sync_id = ?1 AND device_id = ?2",
-        params![sync_id, device_id],
-        |row| row.get(0),
-    )
-    .optional()
 }
 
 // ---------------------------------------------------------------------------
@@ -743,40 +710,6 @@ pub fn cleanup_expired_nonces(conn: &Connection) -> Result<usize, rusqlite::Erro
 }
 
 // ---------------------------------------------------------------------------
-// Enrollment invitation queries
-// ---------------------------------------------------------------------------
-
-pub fn consume_invitation(
-    conn: &Connection,
-    invitation_id: &str,
-    sync_id: &str,
-    inviter_device_id: &str,
-    target_device_id: &str,
-) -> Result<(), rusqlite::Error> {
-    let now = now_secs();
-    // For consumed invitations, we store them with signature as empty and valid_until as 0
-    // since those fields were verified at consumption time by the caller.
-    conn.execute(
-        "INSERT INTO enrollment_invitations (id, sync_id, inviter_device_id, signature, valid_until, consumed_at, consumed_by_device_id, created_at)
-         VALUES (?1, ?2, ?3, X'', 0, ?4, ?5, ?4)",
-        params![invitation_id, sync_id, inviter_device_id, now, target_device_id],
-    )?;
-    Ok(())
-}
-
-pub fn is_invitation_consumed(
-    conn: &Connection,
-    invitation_id: &str,
-) -> Result<bool, rusqlite::Error> {
-    let count: u64 = conn.query_row(
-        "SELECT COUNT(*) FROM enrollment_invitations WHERE id = ?1 AND consumed_at IS NOT NULL",
-        params![invitation_id],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
-}
-
-// ---------------------------------------------------------------------------
 // Batch queries
 // ---------------------------------------------------------------------------
 
@@ -850,6 +783,7 @@ pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite:
 // Snapshot queries
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_snapshot(
     conn: &Connection,
     sync_id: &str,
@@ -1057,10 +991,6 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlit
         params![sync_id],
     )?;
     tx.execute(
-        "DELETE FROM enrollment_invitations WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
         "DELETE FROM device_sessions WHERE sync_id = ?1",
         params![sync_id],
     )?;
@@ -1235,7 +1165,7 @@ mod tests {
 
             let signing_pk = vec![1u8; 32];
             let x25519_pk = vec![2u8; 32];
-            register_device(conn, "sg1", "dev1", &signing_pk, &x25519_pk, 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &signing_pk, &x25519_pk, 0)?;
 
             let device = get_device(conn, "sg1", "dev1")?;
             assert!(device.is_some());
@@ -1245,7 +1175,7 @@ mod tests {
             assert_eq!(device.x25519_public_key, x25519_pk);
             assert_eq!(device.epoch, 0);
             assert_eq!(device.status, "active");
-            assert_eq!(device.permission, "admin");
+
 
             // Non-existent device
             let device = get_device(conn, "sg1", "nonexistent")?;
@@ -1261,7 +1191,7 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
 
             // Create session with 3600s expiry
             let token = create_session(conn, "sg1", "dev1", 3600)?;
@@ -1436,8 +1366,8 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
-            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
 
             // Touch devices so they're not considered stale
             touch_device(conn, "sg1", "dev1")?;
@@ -1527,13 +1457,12 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
             create_session(conn, "sg1", "dev1", 3600)?;
             upsert_device_receipt(conn, "sg1", "dev1", 5)?;
             insert_batch(conn, "sg1", 0, "dev1", "b1", b"data")?;
             upsert_snapshot(conn, "sg1", 0, 0, b"snap", None, None, None)?;
             store_rekey_artifact(conn, "sg1", 1, "dev1", &[42; 32])?;
-            consume_invitation(conn, "inv1", "sg1", "dev1", "dev2")?;
             create_nonce(conn, "sg1", 3600)?;
 
             // Delete everything
@@ -1551,28 +1480,6 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn test_permission_stored_correctly() {
-        let db = test_db();
-        db.with_conn(|conn| {
-            create_sync_group(conn, "sg1", 0)?;
-
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
-            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0, "member")?;
-
-            let perm1 = get_device_permission(conn, "sg1", "dev1")?;
-            assert_eq!(perm1, Some("admin".to_string()));
-
-            let perm2 = get_device_permission(conn, "sg1", "dev2")?;
-            assert_eq!(perm2, Some("member".to_string()));
-
-            let perm3 = get_device_permission(conn, "sg1", "nonexistent")?;
-            assert!(perm3.is_none());
-
-            Ok(())
-        })
-        .unwrap();
-    }
 
     #[test]
     fn test_list_devices_includes_public_keys() {
@@ -1582,14 +1489,14 @@ mod tests {
 
             let signing_pk = vec![10u8; 32];
             let x25519_pk = vec![20u8; 32];
-            register_device(conn, "sg1", "dev1", &signing_pk, &x25519_pk, 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &signing_pk, &x25519_pk, 0)?;
 
             let devices = list_devices(conn, "sg1")?;
             assert_eq!(devices.len(), 1);
             assert_eq!(devices[0].device_id, "dev1");
             assert_eq!(devices[0].signing_public_key, signing_pk);
             assert_eq!(devices[0].x25519_public_key, x25519_pk);
-            assert_eq!(devices[0].permission, "admin");
+
 
             Ok(())
         })
@@ -1601,8 +1508,8 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
-            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
 
             assert_eq!(count_active_devices(conn, "sg1")?, 2);
 
@@ -1625,7 +1532,7 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
             create_session(conn, "sg1", "dev1", 3600)?;
             upsert_device_receipt(conn, "sg1", "dev1", 5)?;
             store_rekey_artifact(conn, "sg1", 1, "dev1", &[42; 32])?;
@@ -1638,23 +1545,6 @@ mod tests {
             // Deleting again returns false
             let deleted = delete_device(conn, "sg1", "dev1")?;
             assert!(!deleted);
-
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn test_enrollment_invitation() {
-        let db = test_db();
-        db.with_conn(|conn| {
-            create_sync_group(conn, "sg1", 0)?;
-
-            assert!(!is_invitation_consumed(conn, "inv1")?);
-
-            consume_invitation(conn, "inv1", "sg1", "dev1", "dev2")?;
-
-            assert!(is_invitation_consumed(conn, "inv1")?);
 
             Ok(())
         })
@@ -1701,8 +1591,8 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
-            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
             touch_device(conn, "sg1", "dev1")?;
             touch_device(conn, "sg1", "dev2")?;
 
@@ -1742,7 +1632,7 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
             touch_device(conn, "sg1", "dev1")?;
             upsert_device_receipt(conn, "sg1", "dev1", 20)?;
 
@@ -1938,8 +1828,8 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev_a", &[1; 32], &[2; 32], 0, "admin")?;
-            register_device(conn, "sg1", "dev_b", &[3; 32], &[4; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev_a", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev_b", &[3; 32], &[4; 32], 0)?;
 
             let future = now_secs() + 300; // 5 minute TTL
 
@@ -1982,8 +1872,8 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
-            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
             touch_device(conn, "sg1", "dev1")?;
             touch_device(conn, "sg1", "dev2")?;
 
@@ -2141,7 +2031,7 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
             touch_device(conn, "sg1", "dev1")?;
 
             // Snapshot at seq=50
@@ -2182,8 +2072,8 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev_a", &[1; 32], &[2; 32], 0, "admin")?;
-            register_device(conn, "sg1", "dev_b", &[3; 32], &[4; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev_a", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev_b", &[3; 32], &[4; 32], 0)?;
 
             let future = now_secs() + 300;
 
@@ -2235,7 +2125,7 @@ mod tests {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
-            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0, "admin")?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
             touch_device(conn, "sg1", "dev1")?;
 
             // Push many batches without any snapshot

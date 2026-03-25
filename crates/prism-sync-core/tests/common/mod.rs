@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -14,7 +14,7 @@ use prism_sync_core::schema::{SyncFieldDef, SyncSchema, SyncType, SyncValue};
 use prism_sync_core::secure_store::SecureStore;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
-use prism_sync_core::{CrdtChange, Hlc, SyncMetadata};
+use prism_sync_core::{CrdtChange, SyncMetadata};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MemorySecureStore — simple in-memory SecureStore for testing

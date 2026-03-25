@@ -33,6 +33,9 @@ pub enum RelayError {
 
     #[error("key changed: {message}")]
     KeyChanged { message: String },
+
+    #[error("device revoked (remote_wipe={remote_wipe})")]
+    DeviceRevoked { remote_wipe: bool },
 }
 
 impl RelayError {
@@ -47,6 +50,7 @@ impl RelayError {
             RelayError::EpochRotation { .. } => RelayErrorKind::EpochRotation,
             RelayError::ClockSkew { .. } => RelayErrorKind::ClockSkew,
             RelayError::KeyChanged { .. } => RelayErrorKind::KeyChanged,
+            RelayError::DeviceRevoked { .. } => RelayErrorKind::DeviceRevoked,
         }
     }
 
@@ -70,6 +74,7 @@ pub enum RelayErrorKind {
     EpochRotation,
     ClockSkew,
     KeyChanged,
+    DeviceRevoked,
 }
 
 // ── Request/Response types ──
@@ -305,16 +310,6 @@ pub trait SyncRelay: Send + Sync {
         device_id: &str,
         remote_wipe: bool,
     ) -> std::result::Result<(), RelayError>;
-
-    /// Check whether a device has been flagged for remote wipe.
-    ///
-    /// Returns `Some(true)` if remote wipe was requested, `Some(false)` if
-    /// the device was revoked without wipe, or `None` if the device is not
-    /// found (e.g. already cleaned up).
-    async fn check_wipe_status(
-        &self,
-        device_id: &str,
-    ) -> std::result::Result<Option<bool>, RelayError>;
 
     /// Post rekey artifacts: per-device wrapped epoch keys for the new epoch.
     async fn post_rekey_artifacts(

@@ -304,8 +304,6 @@ async fn test_list_devices_returns_public_keys() {
     assert_eq!(dev["device_id"].as_str().unwrap(), device_id);
     assert_eq!(dev["status"].as_str().unwrap(), "active");
     assert_eq!(dev["epoch"].as_i64().unwrap(), 0);
-    assert_eq!(dev["permission"].as_str().unwrap(), "admin");
-
     // Verify public keys are present (base64-encoded by the relay)
     let b64 = base64::engine::general_purpose::STANDARD;
     let signing_pk_b64 = dev["signing_public_key"].as_str().unwrap();
@@ -450,7 +448,7 @@ async fn test_rekey_artifacts_store_and_retrieve() {
 
     // Retrieve the artifact
     let artifact_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/rekey/1/{device_id}"))
+        .get(format!("{url}/v1/sync/{sync_id}/rekey/{device_id}"))
         .header("Authorization", format!("Bearer {token}"))
         .header("X-Device-Id", &device_id)
         .send()
@@ -463,9 +461,11 @@ async fn test_rekey_artifacts_store_and_retrieve() {
         .unwrap();
     assert_eq!(retrieved, wrapped_key_data);
 
-    // Non-existent artifact returns 404
+    // Non-existent device returns 404
     let missing_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/rekey/99/{device_id}"))
+        .get(format!(
+            "{url}/v1/sync/{sync_id}/rekey/nonexistent-device"
+        ))
         .header("Authorization", format!("Bearer {token}"))
         .header("X-Device-Id", &device_id)
         .send()
@@ -749,7 +749,7 @@ async fn test_revoke_then_rekey_atomic_flow() {
 
     // Verify the rekey artifact exists for the admin device
     let artifact_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/rekey/1/{admin_id}"))
+        .get(format!("{url}/v1/sync/{sync_id}/rekey/{admin_id}"))
         .header("Authorization", format!("Bearer {admin_token}"))
         .header("X-Device-Id", &admin_id)
         .send()

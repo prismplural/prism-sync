@@ -83,6 +83,7 @@ fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
 /// Uses a deterministic binary format with domain separation prefix
 /// `PRISM_SYNC_INVITE_V1\x00` to prevent signature reuse across protocols.
 /// Mirrors `prism-sync-core::pairing::models::build_invitation_signing_data`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_invitation_signing_data(
     sync_id: &str,
     relay_url: &str,

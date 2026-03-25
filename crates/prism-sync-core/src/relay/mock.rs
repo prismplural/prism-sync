@@ -227,10 +227,6 @@ impl SyncRelay for MockRelay {
         Ok(())
     }
 
-    async fn check_wipe_status(&self, _device_id: &str) -> Result<Option<bool>, RelayError> {
-        Ok(None)
-    }
-
     async fn post_rekey_artifacts(
         &self,
         epoch: i32,

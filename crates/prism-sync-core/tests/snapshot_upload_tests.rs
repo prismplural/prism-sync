@@ -19,8 +19,7 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
-use prism_sync_core::relay::{DeviceInfo, MockRelay};
-use prism_sync_core::schema::SyncValue;
+use prism_sync_core::relay::MockRelay;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{CrdtChange, Hlc};

@@ -411,7 +411,7 @@ impl SasVerification {
             &self.responder_ed25519_pk
         };
         DeviceSigningKey::verify(pk, &self.transcript_hash, signature)
-            .map_err(|e| CoreError::Crypto(e))
+            .map_err(CoreError::Crypto)
     }
 }
 

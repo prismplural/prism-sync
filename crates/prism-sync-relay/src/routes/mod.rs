@@ -8,45 +8,15 @@ use axum::{
     extract::State,
     http::Request,
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Router,
+    Json, Router,
 };
 use tower_http::cors::CorsLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::{db, errors::AppError, state::AppState};
-
-/// Permission levels, ordered from least to most privileged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Permission {
-    ReadOnly,
-    ReadWrite,
-    Admin,
-}
-
-impl Permission {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "read_only" => Some(Permission::ReadOnly),
-            "read_write" => Some(Permission::ReadWrite),
-            "admin" => Some(Permission::Admin),
-            _ => None,
-        }
-    }
-}
-
-/// Check that a device has at least the required permission level.
-pub fn require_permission(device_permission: &str, min_level: Permission) -> Result<(), AppError> {
-    let actual = Permission::parse(device_permission)
-        .ok_or(AppError::Forbidden("Unknown permission level"))?;
-    if actual >= min_level {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden("Insufficient permissions"))
-    }
-}
 
 /// Authenticated identity injected into request extensions by auth middleware.
 #[derive(Debug, Clone)]
@@ -77,7 +47,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/sync/{sync_id}/rekey", post(devices::post_rekey))
         .route(
-            "/v1/sync/{sync_id}/rekey/{epoch}/{device_id}",
+            "/v1/sync/{sync_id}/rekey/{device_id}",
             get(devices::get_rekey_artifact),
         )
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
@@ -90,11 +60,7 @@ pub fn router(state: AppState) -> Router {
     // (WebSocket does message-based auth after upgrade)
     let public_routes = Router::new()
         .merge(register::routes())
-        .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade))
-        .route(
-            "/v1/sync/{sync_id}/devices/{device_id}/wipe-status",
-            get(devices::get_wipe_status),
-        );
+        .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade));
 
     // Relay is accessed only by native clients — no browser origin is expected.
     // Default CorsLayer rejects all cross-origin requests.
@@ -120,22 +86,38 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Result of auth validation — distinguishes "no session" from "device revoked".
+enum AuthResult {
+    Ok(AuthIdentity),
+    /// Valid session but device is revoked; includes remote_wipe flag.
+    DeviceRevoked { remote_wipe: bool },
+    /// Session not found, expired, or device missing.
+    Invalid,
+}
+
 /// Auth middleware: extracts Bearer token, validates session, injects AuthIdentity.
+///
+/// When a revoked device authenticates, the 401 response includes a JSON body
+/// with `{"error": "device_revoked", "remote_wipe": true/false}` so the client
+/// can act on it without needing a separate unauthenticated endpoint.
 async fn auth_middleware(
     State(state): State<AppState>,
     mut req: Request<axum::body::Body>,
     next: Next,
-) -> Result<Response, AppError> {
+) -> Result<Response, Response> {
     let token = req
         .headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(AppError::Unauthorized)?;
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let Some(token) = token else {
+        return Err(AppError::Unauthorized.into_response());
+    };
 
     if token.len() < 32 {
         state.metrics.inc(&state.metrics.auth_failures);
-        return Err(AppError::Unauthorized);
+        return Err(AppError::Unauthorized.into_response());
     }
 
     let token_owned = token.to_string();
@@ -143,46 +125,47 @@ async fn auth_middleware(
 
     // Phase 1 — Read (blocking, must complete): validate session + device status
     let db_read = state.db.clone();
-    let identity =
-        tokio::task::spawn_blocking(move || -> Result<Option<AuthIdentity>, AppError> {
+    let auth_result =
+        tokio::task::spawn_blocking(move || -> Result<AuthResult, AppError> {
             db_read
                 .with_read_conn(|conn| {
                     let Some((sync_id, device_id)) =
                         db::validate_session(conn, &token_owned)?
                     else {
-                        return Ok(None);
+                        return Ok(AuthResult::Invalid);
                     };
                     let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
-                        return Ok(None);
+                        return Ok(AuthResult::Invalid);
                     };
                     if device.status != "active" {
-                        return Ok(None);
+                        let wipe = db::get_device_wipe_status(conn, &sync_id, &device_id)?
+                            .unwrap_or(false);
+                        return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
                     }
-                    Ok(Some(AuthIdentity { sync_id, device_id }))
+                    Ok(AuthResult::Ok(AuthIdentity { sync_id, device_id }))
                 })
                 .map_err(|e| AppError::Internal(e.to_string()))
         })
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))??;
+        .map_err(|e| AppError::Internal(e.to_string()).into_response())?
+        .map_err(|e| e.into_response())?;
 
-    // Phase 2 — Write (fire-and-forget): touch session + device timestamps
-    if let Some(ref auth) = identity {
-        let db_write = state.db.clone();
-        let sid = auth.sync_id.clone();
-        let did = auth.device_id.clone();
-        tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                db_write.with_conn(|conn| {
-                    db::touch_session(conn, &sid, &did, session_expiry)?;
-                    db::touch_device(conn, &sid, &did)
+    match auth_result {
+        AuthResult::Ok(identity) => {
+            // Phase 2 — Write (fire-and-forget): touch session + device timestamps
+            let db_write = state.db.clone();
+            let sid = identity.sync_id.clone();
+            let did = identity.device_id.clone();
+            tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    db_write.with_conn(|conn| {
+                        db::touch_session(conn, &sid, &did, session_expiry)?;
+                        db::touch_device(conn, &sid, &did)
+                    })
                 })
-            })
-            .await;
-        });
-    }
+                .await;
+            });
 
-    match identity {
-        Some(identity) => {
             tracing::debug!(
                 sync_id = %&identity.sync_id[..16.min(identity.sync_id.len())],
                 device_id = %&identity.device_id[..8.min(identity.device_id.len())],
@@ -193,14 +176,31 @@ async fn auth_middleware(
             req.extensions_mut().insert(identity);
             Ok(next.run(req).await)
         }
-        None => {
+        AuthResult::DeviceRevoked { remote_wipe } => {
+            tracing::warn!(
+                method = %req.method(),
+                path = %req.uri().path(),
+                remote_wipe,
+                "Auth REJECTED: device revoked"
+            );
+            state.metrics.inc(&state.metrics.auth_failures);
+            Err((
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "device_revoked",
+                    "remote_wipe": remote_wipe,
+                })),
+            )
+                .into_response())
+        }
+        AuthResult::Invalid => {
             tracing::warn!(
                 method = %req.method(),
                 path = %req.uri().path(),
                 "Auth REJECTED: invalid session or inactive device"
             );
             state.metrics.inc(&state.metrics.auth_failures);
-            Err(AppError::Unauthorized)
+            Err(AppError::Unauthorized.into_response())
         }
     }
 }

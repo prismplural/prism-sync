@@ -189,7 +189,7 @@ async fn parse_and_validate_auth(state: &AppState, sync_id: &str, text: &str) ->
     let expected_sync_id = sync_id.to_string();
     let session_expiry = state.config.session_expiry_secs as i64;
 
-    // Phase 1 — Read (blocking): validate session
+    // Phase 1 — Read (blocking): validate session + check device is active
     let db_read = state.db.clone();
     let expected_sid = expected_sync_id.clone();
     let expected_did = device_id.clone();
@@ -197,7 +197,14 @@ async fn parse_and_validate_auth(state: &AppState, sync_id: &str, text: &str) ->
         db_read.with_read_conn(|conn| {
             let session = db::validate_session(conn, &token)?;
             match session {
-                Some((sid, did)) if sid == expected_sid && did == expected_did => Ok(Some(did)),
+                Some((sid, did)) if sid == expected_sid && did == expected_did => {
+                    // Also verify the device is still active (not revoked)
+                    let device = db::get_device(conn, &sid, &did)?;
+                    match device {
+                        Some(d) if d.status == "active" => Ok(Some(did)),
+                        _ => Ok(None),
+                    }
+                }
                 _ => Ok(None),
             }
         })

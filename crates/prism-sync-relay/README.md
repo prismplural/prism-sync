@@ -41,7 +41,7 @@ All configuration via environment variables:
 - `GET /v2/sync/{sync_id}/devices` — List devices with public keys
 - `DELETE /v2/sync/{sync_id}/devices/{device_id}` — Revoke or deregister
 - `POST /v2/sync/{sync_id}/rekey` — Post epoch rotation artifacts
-- `GET /v2/sync/{sync_id}/rekey/{epoch}/{device_id}` — Get wrapped epoch key
+- `GET /v2/sync/{sync_id}/rekey/{device_id}` — Get wrapped epoch key
 - `POST /v2/sync/{sync_id}/ack` — Acknowledge receipt
 
 ### WebSocket

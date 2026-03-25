@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::Engine;
 use serde::Deserialize;
 
 use crate::{db, errors::AppError, state::AppState};
@@ -106,6 +107,7 @@ pub async fn push_changes(
     Ok(Json(serde_json::json!({ "server_seq": server_seq })))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_push(
     conn: &rusqlite::Connection,
     sync_id: &str,
@@ -116,16 +118,6 @@ fn do_push(
     max_unpruned: u64,
     stale_threshold: i64,
 ) -> Result<i64, AppError> {
-    // Permission check
-    let perm = db::get_device_permission(conn, sync_id, device_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if perm.as_deref() == Some("read_only") {
-        return Err(AppError::Forbidden("Read-only device cannot push changes"));
-    }
-    if perm.is_none() {
-        return Err(AppError::NotFound);
-    }
-
     // Epoch validation
     let current_epoch = db::get_sync_group_epoch(conn, sync_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -285,7 +277,7 @@ pub async fn get_snapshot(
                 .unwrap_or_else(|| {
                     snap.uploaded_by_device_id
                         .as_deref()
-                        .map_or(false, |uploader| uploader != auth.device_id)
+                        .is_some_and(|uploader| uploader != auth.device_id)
                 });
             if should_delete {
                 let db = state.db.clone();
@@ -301,14 +293,13 @@ pub async fn get_snapshot(
                 );
             }
 
-            let mut headers = HeaderMap::new();
-            headers.insert("content-type", "application/octet-stream".parse().unwrap());
-            headers.insert("X-Epoch", snap.epoch.to_string().parse().unwrap());
-            headers.insert(
-                "X-Server-Seq-At",
-                snap.server_seq_at.to_string().parse().unwrap(),
-            );
-            Ok((StatusCode::OK, headers, snap.data).into_response())
+            let b64 = base64::engine::general_purpose::STANDARD;
+            Ok(Json(serde_json::json!({
+                "epoch": snap.epoch,
+                "server_seq_at": snap.server_seq_at,
+                "data": b64.encode(&snap.data),
+            }))
+            .into_response())
         }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
@@ -333,11 +324,6 @@ pub async fn put_snapshot(
         return Err(AppError::PayloadTooLarge("Snapshot exceeds 25 MB limit"));
     }
 
-    let epoch = headers
-        .get("X-Epoch")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<i64>().ok())
-        .ok_or(AppError::BadRequest("Missing or invalid X-Epoch header"))?;
     let server_seq_at = headers
         .get("X-Server-Seq-At")
         .and_then(|v| v.to_str().ok())
@@ -362,7 +348,6 @@ pub async fn put_snapshot(
 
     tracing::debug!(
         sync_id = %trunc(&sync_id),
-        epoch,
         server_seq_at,
         body_bytes = body.len(),
         ?ttl_secs,
@@ -382,7 +367,6 @@ pub async fn put_snapshot(
                 conn,
                 &sid,
                 &did,
-                epoch,
                 server_seq_at,
                 &data,
                 expires_at,
@@ -403,19 +387,17 @@ fn do_put_snapshot(
     conn: &rusqlite::Connection,
     sync_id: &str,
     device_id: &str,
-    epoch: i64,
     server_seq_at: i64,
     data: &[u8],
     expires_at: Option<i64>,
     target_device_id: Option<&str>,
 ) -> Result<(), AppError> {
-    let perm = db::get_device_permission(conn, sync_id, device_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if perm.as_deref() == Some("read_only") {
-        return Err(AppError::Forbidden(
-            "Read-only device cannot upload snapshot",
-        ));
-    }
+    // Look up the device's current epoch from the devices table
+    let device = db::get_device(conn, sync_id, device_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or(AppError::NotFound)?;
+    let epoch = device.epoch;
+
     db::upsert_snapshot(
         conn,
         sync_id,
@@ -471,12 +453,6 @@ fn do_delete_account(
     sync_id: &str,
     device_id: &str,
 ) -> Result<bool, AppError> {
-    let perm = db::get_device_permission(conn, sync_id, device_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if perm.as_deref() != Some("admin") {
-        return Ok(false);
-    }
-
     let devices = db::list_devices(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;
     let active: Vec<_> = devices
         .into_iter()

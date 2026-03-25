@@ -253,7 +253,6 @@ fn do_register(
         let epoch = db::get_sync_group_epoch(&tx, sync_id)
             .map_err(|e| AppError::Internal(e.to_string()))?
             .unwrap_or(0);
-        let permission = "admin";
         tracing::debug!(
             sync_id = %&sync_id[..16],
             device_id = %&device_id[..8.min(device_id.len())],
@@ -261,7 +260,7 @@ fn do_register(
             "New device registered"
         );
         db::register_device(
-            &tx, sync_id, device_id, signing_pk, x25519_pk, epoch, permission,
+            &tx, sync_id, device_id, signing_pk, x25519_pk, epoch,
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
 

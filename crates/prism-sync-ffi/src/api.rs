@@ -1118,7 +1118,7 @@ pub async fn create_sync_group(
 /// Returns JSON with `qr_payload`, `words`, `url`, `sync_id`, `relay_url`.
 ///
 /// Requires sync to be set up (sync_id, mnemonic, wrapped_dek, salt in SecureStore).
-pub async fn create_invite(handle: &PrismSyncHandle, password: String) -> Result<String, String> {
+pub async fn create_invite(handle: &PrismSyncHandle, _password: String) -> Result<String, String> {
     let inner = handle.inner.lock().await;
     let store = inner.secure_store();
 
@@ -1324,7 +1324,7 @@ async fn join_with_response(
         .map_err(|e| e.to_string())?
         .ok_or("device_secret not found after join")?;
     inner
-        .restore_runtime_keys(&dek, &device_secret_bytes)
+        .restore_runtime_keys(dek, &device_secret_bytes)
         .map_err(|e| e.to_string())?;
 
     // Restore epoch keys that were stored during join into the live handle's
@@ -1470,33 +1470,14 @@ pub async fn revoke_and_rekey(
         .map_err(|e| format!("revoke_and_rekey failed: {e}"))
 }
 
-/// Check whether a device has been flagged for remote wipe.
-///
-/// This is a standalone HTTP call that does NOT require authentication —
-/// useful when the device has already been revoked and may not hold valid
-/// credentials.  Returns `Some(true)` if the relay confirms a remote-wipe
-/// flag, `Some(false)` if the device exists but is not flagged, or `None`
-/// if the device/sync-group is not found (HTTP 404).
+/// Deprecated: wipe status is now embedded in the 401 response from the relay.
+/// This stub is kept only for FFI binding compatibility until bindings are regenerated.
 pub async fn check_wipe_status(
-    relay_url: String,
-    sync_id: String,
-    device_id: String,
+    _relay_url: String,
+    _sync_id: String,
+    _device_id: String,
 ) -> Result<Option<bool>, String> {
-    // Build a minimal reqwest client — no auth needed
-    let client = reqwest::Client::new();
-    let url = format!(
-        "{}/v1/sync/{}/devices/{}/wipe-status",
-        relay_url, sync_id, device_id
-    );
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-    match resp.status().as_u16() {
-        200 => {
-            let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(json["remote_wipe"].as_bool())
-        }
-        404 => Ok(None),
-        status => Err(format!("Unexpected HTTP {status}")),
-    }
+    Err("check_wipe_status is deprecated: wipe status is now embedded in 401 auth responses".into())
 }
 
 // ── Mnemonic utilities ──

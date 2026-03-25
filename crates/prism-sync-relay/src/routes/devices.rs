@@ -50,7 +50,6 @@ pub async fn list_devices(
                 "x25519_public_key": b64.encode(&d.x25519_public_key),
                 "epoch": d.epoch,
                 "status": d.status,
-                "permission": d.permission,
             })
         })
         .collect();
@@ -101,7 +100,7 @@ pub async fn delete_device(
             )
             .await;
     } else {
-        // Revoke another device: only admin can revoke others
+        // Revoke another device
         let db = state.db.clone();
         let sid = sync_id.clone();
         let did = requester.clone();
@@ -155,28 +154,21 @@ fn do_self_deregister(
 fn do_revoke_device(
     conn: &rusqlite::Connection,
     sync_id: &str,
-    requester_device_id: &str,
+    _requester_device_id: &str,
     target_device_id: &str,
     remote_wipe: bool,
 ) -> Result<(), AppError> {
-    // Permission check: only admin can revoke others
-    let perm = db::get_device_permission(conn, sync_id, requester_device_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if perm.as_deref() != Some("admin") {
-        return Err(AppError::Forbidden(
-            "Only admin devices can revoke other devices",
-        ));
-    }
-
     let changed = db::revoke_device(conn, sync_id, target_device_id, remote_wipe)
         .map_err(|e| AppError::Internal(e.to_string()))?;
     if !changed {
         return Err(AppError::NotFound);
     }
 
-    // Invalidate revoked device's session
-    db::delete_session(conn, sync_id, target_device_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    // Keep the revoked device's session with an extended TTL (30 days) so the
+    // auth middleware can look up the device and embed wipe status in the 401
+    // response even if the device has been offline for a while.
+    let thirty_days: i64 = 30 * 24 * 3600;
+    let _ = db::touch_session(conn, sync_id, target_device_id, thirty_days);
 
     // Mark needs_rekey (epoch bump happens during rekey)
     db::set_needs_rekey(conn, sync_id, true).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -252,24 +244,11 @@ pub async fn post_rekey(
 fn do_rekey(
     conn: &rusqlite::Connection,
     sync_id: &str,
-    device_id: &str,
+    _device_id: &str,
     epoch: i64,
     revoked_device_id: Option<&str>,
     wrapped_keys: &[(String, Vec<u8>)],
 ) -> Result<i64, AppError> {
-    // Permission check: read_only cannot rekey
-    let perm = db::get_device_permission(conn, sync_id, device_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    match perm.as_deref() {
-        Some("read_only") => {
-            return Err(AppError::Forbidden(
-                "Read-only device cannot initiate rekey",
-            ));
-        }
-        None => return Err(AppError::NotFound),
-        _ => {}
-    }
-
     let current_epoch = db::get_sync_group_epoch(conn, sync_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::NotFound)?;
@@ -284,8 +263,10 @@ fn do_rekey(
         let changed = db::revoke_device(conn, sync_id, target, false)
             .map_err(|e| AppError::Internal(e.to_string()))?;
         if changed {
-            db::delete_session(conn, sync_id, target)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            // Extend session TTL (30 days) so auth middleware can embed wipe
+            // status when the revoked device next connects.
+            let thirty_days: i64 = 30 * 24 * 3600;
+            let _ = db::touch_session(conn, sync_id, target, thirty_days);
         }
         // If already revoked, continue silently — idempotent
     }
@@ -368,13 +349,20 @@ fn parse_wrapped_keys(body: &serde_json::Value) -> Result<Vec<(String, Vec<u8>)>
 }
 
 // ---------------------------------------------------------------------------
-// get_rekey_artifact — GET /v1/sync/{sync_id}/rekey/{epoch}/{device_id}
+// get_rekey_artifact — GET /v1/sync/{sync_id}/rekey/{device_id}
 // ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RekeyArtifactQuery {
+    /// Optional epoch to fetch. If omitted, uses the device's current epoch.
+    pub epoch: Option<i64>,
+}
 
 pub async fn get_rekey_artifact(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
-    Path((path_sync_id, epoch, target_device_id)): Path<(String, i64, String)>,
+    Path((path_sync_id, target_device_id)): Path<(String, String)>,
+    Query(query): Query<RekeyArtifactQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
@@ -384,7 +372,20 @@ pub async fn get_rekey_artifact(
     let sid = auth.sync_id;
 
     let artifact = tokio::task::spawn_blocking(move || {
-        db.with_read_conn(|conn| db::get_rekey_artifact(conn, &sid, epoch, &target_device_id))
+        db.with_read_conn(|conn| {
+            // Use client-specified epoch if provided, otherwise look up from device record
+            let epoch = match query.epoch {
+                Some(e) => e,
+                None => {
+                    let device = db::get_device(conn, &sid, &target_device_id)?;
+                    match device {
+                        Some(d) => d.epoch,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            db::get_rekey_artifact(conn, &sid, epoch, &target_device_id)
+        })
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
@@ -450,28 +451,3 @@ pub async fn post_ack(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---------------------------------------------------------------------------
-// get_wipe_status — GET /v1/sync/{sync_id}/devices/{device_id}/wipe-status
-// ---------------------------------------------------------------------------
-
-pub async fn get_wipe_status(
-    State(state): State<AppState>,
-    Path((path_sync_id, device_id)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let db = state.db.clone();
-
-    let status = tokio::task::spawn_blocking(move || {
-        db.with_read_conn(|conn| db::get_device_wipe_status(conn, &path_sync_id, &device_id))
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    match status {
-        Some(remote_wipe) => Ok(Json(serde_json::json!({
-            "remote_wipe": remote_wipe,
-        }))
-        .into_response()),
-        None => Ok(StatusCode::NOT_FOUND.into_response()),
-    }
-}

@@ -173,7 +173,7 @@ pub async fn prepare_device(db: &std::sync::Arc<Database>, sync_id: &str, device
     let sync_id = sync_id.to_string();
     db.with_conn(|conn| {
         db::register_device(
-            conn, &sync_id, &device_id, &[7u8; 32], &[8u8; 32], 0, "admin",
+            conn, &sync_id, &device_id, &[7u8; 32], &[8u8; 32], 0,
         )?;
         let token = db::create_session(conn, &sync_id, &device_id, 3600)?;
         Ok(token)

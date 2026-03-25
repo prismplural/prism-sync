@@ -9,9 +9,9 @@
 
 mod common;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::SigningKey;
 use reqwest::Client;
-use serde_json::Value;
 
 use prism_sync_relay::db;
 
@@ -39,13 +39,12 @@ async fn test_snapshot_put_get_roundtrip() {
         .unwrap();
     assert_eq!(get_resp.status(), 404, "no snapshot initially");
 
-    // Upload snapshot
+    // Upload snapshot (epoch is looked up from device record, no X-Epoch header)
     let snapshot_data = b"encrypted-snapshot-payload-here";
     let put_resp = client
         .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
         .header("Authorization", format!("Bearer {token}"))
         .header("X-Device-Id", &device_id)
-        .header("X-Epoch", "0")
         .header("X-Server-Seq-At", "42")
         .body(snapshot_data.to_vec())
         .send()
@@ -53,7 +52,7 @@ async fn test_snapshot_put_get_roundtrip() {
         .unwrap();
     assert_eq!(put_resp.status(), 204, "snapshot put should return 204");
 
-    // Download snapshot
+    // Download snapshot (response is now JSON with base64-encoded data)
     let get_resp2 = client
         .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
         .header("Authorization", format!("Bearer {token}"))
@@ -62,26 +61,11 @@ async fn test_snapshot_put_get_roundtrip() {
         .await
         .unwrap();
     assert_eq!(get_resp2.status(), 200);
-    assert_eq!(
-        get_resp2
-            .headers()
-            .get("X-Epoch")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "0"
-    );
-    assert_eq!(
-        get_resp2
-            .headers()
-            .get("X-Server-Seq-At")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "42"
-    );
-    let body = get_resp2.bytes().await.unwrap();
-    assert_eq!(body.as_ref(), snapshot_data);
+    let json: serde_json::Value = get_resp2.json().await.unwrap();
+    assert_eq!(json["epoch"].as_i64().unwrap(), 0);
+    assert_eq!(json["server_seq_at"].as_i64().unwrap(), 42);
+    let decoded_data = BASE64.decode(json["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded_data.as_slice(), snapshot_data);
 }
 
 #[tokio::test]
@@ -101,7 +85,6 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
         .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
         .header("Authorization", format!("Bearer {token_a}"))
         .header("X-Device-Id", &device_a_id)
-        .header("X-Epoch", "0")
         .header("X-Server-Seq-At", "42")
         .header("X-Snapshot-TTL", "300")
         .header("X-For-Device-Id", &device_b_id)
@@ -132,10 +115,9 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
         200,
         "target device should be allowed"
     );
-    assert_eq!(
-        download_resp.bytes().await.unwrap().as_ref(),
-        b"targeted-snapshot"
-    );
+    let json: serde_json::Value = download_resp.json().await.unwrap();
+    let decoded_data = BASE64.decode(json["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded_data.as_slice(), b"targeted-snapshot");
 
     let post_delete_resp = client
         .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
@@ -168,7 +150,6 @@ async fn test_targeted_snapshot_expires() {
         .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
         .header("Authorization", format!("Bearer {token_a}"))
         .header("X-Device-Id", &device_a_id)
-        .header("X-Epoch", "0")
         .header("X-Server-Seq-At", "99")
         .header("X-Snapshot-TTL", "1")
         .header("X-For-Device-Id", &device_b_id)

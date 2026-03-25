@@ -255,7 +255,7 @@ impl PairingService {
         let device_id = response
             .joiner_device_id
             .clone()
-            .unwrap_or_else(|| crate::node_id::generate_node_id());
+            .unwrap_or_else(crate::node_id::generate_node_id);
         let signing_key = device_secret
             .ed25519_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
@@ -484,12 +484,6 @@ mod tests {
             _device_id: &str,
             _remote_wipe: bool,
         ) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn check_wipe_status(
-            &self,
-            _device_id: &str,
-        ) -> std::result::Result<Option<bool>, RelayError> {
             unimplemented!()
         }
         async fn post_rekey_artifacts(
@@ -817,12 +811,6 @@ mod tests {
                 unimplemented!()
             }
             async fn revoke_device(&self, _: &str, _: bool) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn check_wipe_status(
-                &self,
-                _: &str,
-            ) -> std::result::Result<Option<bool>, RelayError> {
                 unimplemented!()
             }
             async fn post_rekey_artifacts(

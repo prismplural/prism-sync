@@ -226,12 +226,6 @@ mod tests {
         ) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
-        async fn check_wipe_status(
-            &self,
-            _device_id: &str,
-        ) -> std::result::Result<Option<bool>, RelayError> {
-            unimplemented!()
-        }
         async fn post_rekey_artifacts(
             &self,
             epoch: i32,
