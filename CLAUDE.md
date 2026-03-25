@@ -85,7 +85,7 @@ just test-crate prism-sync-core                 # Via justfile
 - Relay deploys via Docker to DigitalOcean
 - SQLite on LUKS-encrypted volume
 - Cloudflare Tunnel for ingress (no exposed ports)
-- `rsync` + `docker compose up -d --build relay`
+- `cd deploy && ./deploy.sh` — cross-compiles for linux/amd64 locally, pushes image tarball to server
 
 ## FFI Codegen
 After changing `crates/prism-sync-ffi/src/api.rs`:
