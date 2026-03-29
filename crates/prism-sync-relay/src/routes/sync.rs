@@ -190,11 +190,7 @@ pub async fn pull_changes(
         db.with_read_conn(|conn| {
             let batches = db::get_batches_since(conn, &sid, since, limit)?;
             let min_acked = db::get_min_acked_seq(conn, &sid, stale_threshold)?;
-            let pw_version: i64 = conn.query_row(
-                "SELECT password_version FROM sync_groups WHERE sync_id = ?1",
-                [&sid],
-                |row| row.get(0),
-            ).unwrap_or(0);
+            let pw_version = db::get_password_version(conn, &sid)?.unwrap_or(0);
             Ok((batches, min_acked, pw_version))
         })
     })
