@@ -186,11 +186,16 @@ pub async fn pull_changes(
     let db = state.db.clone();
     let sid = sync_id.clone();
 
-    let (batches, min_acked_seq) = tokio::task::spawn_blocking(move || {
+    let (batches, min_acked_seq, password_version) = tokio::task::spawn_blocking(move || {
         db.with_read_conn(|conn| {
             let batches = db::get_batches_since(conn, &sid, since, limit)?;
             let min_acked = db::get_min_acked_seq(conn, &sid, stale_threshold)?;
-            Ok((batches, min_acked))
+            let pw_version: i64 = conn.query_row(
+                "SELECT password_version FROM sync_groups WHERE sync_id = ?1",
+                [&sid],
+                |row| row.get(0),
+            ).unwrap_or(0);
+            Ok((batches, min_acked, pw_version))
         })
     })
     .await
@@ -226,6 +231,7 @@ pub async fn pull_changes(
         "batches": encoded,
         "max_server_seq": max_server_seq,
         "min_acked_seq": min_acked_seq,
+        "password_version": password_version,
     })))
 }
 

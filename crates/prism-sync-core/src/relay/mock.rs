@@ -180,6 +180,7 @@ impl SyncRelay for MockRelay {
             batches,
             max_server_seq,
             min_acked_seq: state.min_acked_seq,
+            password_version: None,
         })
     }
 
