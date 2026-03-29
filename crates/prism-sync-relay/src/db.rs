@@ -294,6 +294,15 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRIMARY KEY (sync_id, epoch, target_device_id),
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
+
+        -- Password-change artifacts (per-device wrapped blobs, versioned)
+        CREATE TABLE IF NOT EXISTS password_change_artifacts (
+            sync_id          TEXT NOT NULL,
+            version          INTEGER NOT NULL,
+            target_device_id TEXT NOT NULL,
+            wrapped_blob     BLOB NOT NULL,
+            PRIMARY KEY (sync_id, version, target_device_id)
+        );
         ",
     )?;
 
