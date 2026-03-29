@@ -586,6 +586,10 @@ pub fn delete_device(
         "DELETE FROM rekey_artifacts WHERE sync_id = ?1 AND target_device_id = ?2",
         params![sync_id, device_id],
     )?;
+    tx.execute(
+        "DELETE FROM password_change_artifacts WHERE sync_id = ?1 AND target_device_id = ?2",
+        params![sync_id, device_id],
+    )?;
     let deleted = tx.execute(
         "DELETE FROM devices WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
@@ -1013,6 +1017,79 @@ pub fn get_rekey_artifact(
 }
 
 // ---------------------------------------------------------------------------
+// Password change artifact queries
+// ---------------------------------------------------------------------------
+
+pub fn get_password_version(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT password_version FROM sync_groups WHERE sync_id = ?1",
+        params![sync_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub fn bump_password_version(
+    conn: &Connection,
+    sync_id: &str,
+    new_version: i64,
+) -> Result<(), rusqlite::Error> {
+    let now = now_secs();
+    conn.execute(
+        "UPDATE sync_groups SET password_version = ?1, updated_at = ?2 WHERE sync_id = ?3",
+        params![new_version, now, sync_id],
+    )?;
+    Ok(())
+}
+
+pub fn store_password_change_artifact(
+    conn: &Connection,
+    sync_id: &str,
+    version: i64,
+    target_device_id: &str,
+    wrapped_blob: &[u8],
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO password_change_artifacts (sync_id, version, target_device_id, wrapped_blob)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(sync_id, version, target_device_id) DO UPDATE SET
+            wrapped_blob = excluded.wrapped_blob",
+        params![sync_id, version, target_device_id, wrapped_blob],
+    )?;
+    Ok(())
+}
+
+pub fn get_password_change_artifact(
+    conn: &Connection,
+    sync_id: &str,
+    version: i64,
+    target_device_id: &str,
+) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT wrapped_blob
+         FROM password_change_artifacts
+         WHERE sync_id = ?1 AND version = ?2 AND target_device_id = ?3",
+        params![sync_id, version, target_device_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub fn delete_password_change_artifacts_before(
+    conn: &Connection,
+    sync_id: &str,
+    version: i64,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM password_change_artifacts WHERE sync_id = ?1 AND version < ?2",
+        params![sync_id, version],
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup queries
 // ---------------------------------------------------------------------------
 
@@ -1020,6 +1097,10 @@ pub fn get_rekey_artifact(
 pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlite::Error> {
     let tx = conn.unchecked_transaction()?;
 
+    tx.execute(
+        "DELETE FROM password_change_artifacts WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
     tx.execute(
         "DELETE FROM rekey_artifacts WHERE sync_id = ?1",
         params![sync_id],
