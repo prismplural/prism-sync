@@ -195,11 +195,12 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         "
         -- Sync groups
         CREATE TABLE IF NOT EXISTS sync_groups (
-            sync_id         TEXT PRIMARY KEY,
-            current_epoch   INTEGER NOT NULL DEFAULT 0,
-            needs_rekey     INTEGER NOT NULL DEFAULT 0,
-            created_at      INTEGER NOT NULL,
-            updated_at      INTEGER NOT NULL
+            sync_id           TEXT PRIMARY KEY,
+            current_epoch     INTEGER NOT NULL DEFAULT 0,
+            needs_rekey       INTEGER NOT NULL DEFAULT 0,
+            password_version  INTEGER NOT NULL DEFAULT 0,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL
         );
 
         -- Devices
@@ -309,6 +310,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     // with the columns already present. For pre-existing tables we need to add them.
     migrate_snapshots_ephemeral(conn)?;
     migrate_devices_remote_wipe(conn)?;
+    migrate_sync_groups_password_version(conn)?;
 
     Ok(())
 }
@@ -374,6 +376,29 @@ fn snapshot_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite
         }
     }
     Ok(false)
+}
+
+fn sync_group_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(sync_groups)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Add password_version column to an existing `sync_groups` table.
+/// Safe to call repeatedly — checks for column existence first.
+fn migrate_sync_groups_password_version(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_password_version = sync_group_has_column(conn, "password_version")?;
+    if !has_password_version {
+        conn.execute_batch(
+            "ALTER TABLE sync_groups ADD COLUMN password_version INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
