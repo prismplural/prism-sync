@@ -121,6 +121,9 @@ pub struct PullResponse {
     pub batches: Vec<ReceivedBatch>,
     pub max_server_seq: i64,
     pub min_acked_seq: Option<i64>,
+    /// The current password version for this sync group.
+    /// `None` if the relay is older and doesn't include this field.
+    pub password_version: Option<i32>,
 }
 
 /// A batch received from the relay, including the full signed envelope.

@@ -286,10 +286,13 @@ impl SyncRelay for ServerRelay {
             });
         }
 
+        let password_version = json.get("password_version").and_then(|v| v.as_i64()).map(|v| v as i32);
+
         Ok(PullResponse {
             batches,
             max_server_seq,
             min_acked_seq,
+            password_version,
         })
     }
 
