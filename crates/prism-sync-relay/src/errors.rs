@@ -10,6 +10,8 @@ pub enum AppError {
     Unauthorized,
     DeviceIdentityMismatch,
     DeviceRevoked { remote_wipe: bool },
+    FirstDeviceAdmissionRequired,
+    FirstDeviceAdmissionInvalid,
     Forbidden(&'static str),
     NotFound,
     Conflict(&'static str),
@@ -26,6 +28,8 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::DeviceIdentityMismatch => StatusCode::UNAUTHORIZED,
             AppError::DeviceRevoked { .. } => StatusCode::UNAUTHORIZED,
+            AppError::FirstDeviceAdmissionRequired => StatusCode::FORBIDDEN,
+            AppError::FirstDeviceAdmissionInvalid => StatusCode::FORBIDDEN,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Conflict(_) => StatusCode::CONFLICT,
@@ -52,6 +56,24 @@ impl IntoResponse for AppError {
                     error: "device_revoked",
                     message: Some("Device has been revoked"),
                     remote_wipe: Some(*remote_wipe),
+                }),
+            )
+                .into_response(),
+            AppError::FirstDeviceAdmissionRequired => (
+                status,
+                Json(ErrorBody {
+                    error: "first_device_admission_required",
+                    message: Some("First-device admission proof is required"),
+                    remote_wipe: None,
+                }),
+            )
+                .into_response(),
+            AppError::FirstDeviceAdmissionInvalid => (
+                status,
+                Json(ErrorBody {
+                    error: "first_device_admission_invalid",
+                    message: Some("First-device admission proof is invalid"),
+                    remote_wipe: None,
                 }),
             )
                 .into_response(),
@@ -89,6 +111,10 @@ impl Display for AppError {
             AppError::DeviceRevoked { remote_wipe } => {
                 write!(f, "DeviceRevoked(remote_wipe={remote_wipe})")
             }
+            AppError::FirstDeviceAdmissionRequired => {
+                write!(f, "FirstDeviceAdmissionRequired")
+            }
+            AppError::FirstDeviceAdmissionInvalid => write!(f, "FirstDeviceAdmissionInvalid"),
             AppError::Forbidden(msg) => write!(f, "Forbidden({msg})"),
             AppError::NotFound => write!(f, "NotFound"),
             AppError::Conflict(msg) => write!(f, "Conflict({msg})"),

@@ -112,6 +112,28 @@ pub struct RegisterRequest {
     pub registration_challenge: Vec<u8>,
     pub nonce: String,
     pub signed_invitation: Option<SignedInvitationPayload>,
+    pub pow_solution: Option<ProofOfWorkSolution>,
+}
+
+/// Optional anti-abuse challenge returned with a registration nonce.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofOfWorkChallenge {
+    pub algorithm: String,
+    pub difficulty_bits: u8,
+}
+
+/// PoW response sent back during registration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofOfWorkSolution {
+    pub counter: u64,
+}
+
+/// Registration nonce plus any optional first-device admission challenge.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RegistrationNonceResponse {
+    pub nonce: String,
+    #[serde(default)]
+    pub pow_challenge: Option<ProofOfWorkChallenge>,
 }
 
 /// Registration response with device session token.
@@ -277,7 +299,9 @@ pub trait SyncRelay: Send + Sync {
     /// The nonce is cryptographically random, short-lived (60s), and consumed
     /// after a single use. The client signs `sync_id || device_id || nonce`
     /// with its Ed25519 key as a challenge-response for registration.
-    async fn get_registration_nonce(&self) -> std::result::Result<String, RelayError>;
+    async fn get_registration_nonce(
+        &self,
+    ) -> std::result::Result<RegistrationNonceResponse, RelayError>;
 
     /// Register device with relay via challenge-response.
     /// Returns device-scoped session token.

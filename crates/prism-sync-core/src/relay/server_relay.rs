@@ -273,7 +273,7 @@ mod tests {
 
 #[async_trait]
 impl SyncRelay for ServerRelay {
-    async fn get_registration_nonce(&self) -> Result<String, RelayError> {
+    async fn get_registration_nonce(&self) -> Result<RegistrationNonceResponse, RelayError> {
         let url = format!("{}/register-nonce", self.base_path());
         debug!("get_registration_nonce");
 
@@ -291,15 +291,10 @@ impl SyncRelay for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse nonce response: {e}"),
-        })?;
-
-        json["nonce"]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| RelayError::Protocol {
-                message: "nonce field missing from response".to_string(),
+        resp.json::<RegistrationNonceResponse>()
+            .await
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse nonce response: {e}"),
             })
     }
 
@@ -324,6 +319,11 @@ impl SyncRelay for ServerRelay {
                     "joiner_device_id": inv.joiner_device_id,
                     "current_epoch": inv.current_epoch,
                     "epoch_key_hex": inv.epoch_key_hex,
+                })
+            }),
+            "pow_solution": req.pow_solution.as_ref().map(|solution| {
+                serde_json::json!({
+                    "counter": solution.counter,
                 })
             }),
         });

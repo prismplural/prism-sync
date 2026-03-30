@@ -33,8 +33,13 @@ impl RekeyMockRelay {
 
 #[async_trait]
 impl SyncRelay for RekeyMockRelay {
-    async fn get_registration_nonce(&self) -> Result<String, RelayError> {
-        Ok(uuid::Uuid::new_v4().to_string())
+    async fn get_registration_nonce(
+        &self,
+    ) -> Result<prism_sync_core::relay::traits::RegistrationNonceResponse, RelayError> {
+        Ok(prism_sync_core::relay::traits::RegistrationNonceResponse {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            pow_challenge: None,
+        })
     }
     async fn register_device(&self, _req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
         Ok(RegisterResponse {

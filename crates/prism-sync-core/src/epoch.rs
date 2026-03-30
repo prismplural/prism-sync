@@ -187,8 +187,14 @@ mod tests {
 
     #[async_trait]
     impl SyncRelay for MockRelay {
-        async fn get_registration_nonce(&self) -> std::result::Result<String, RelayError> {
-            Ok(uuid::Uuid::new_v4().to_string())
+        async fn get_registration_nonce(
+            &self,
+        ) -> std::result::Result<crate::relay::traits::RegistrationNonceResponse, RelayError>
+        {
+            Ok(crate::relay::traits::RegistrationNonceResponse {
+                nonce: uuid::Uuid::new_v4().to_string(),
+                pow_challenge: None,
+            })
         }
         async fn register_device(
             &self,

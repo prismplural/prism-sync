@@ -187,6 +187,7 @@ async fn test_registration_rejects_expired_nonce() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 0, // Expire immediately
         session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
         stale_device_secs: 2_592_000,
@@ -268,6 +269,7 @@ async fn test_nonce_rate_limiting() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
         stale_device_secs: 2_592_000,
@@ -328,6 +330,308 @@ async fn test_nonce_rate_limiting() {
         resp.status(),
         200,
         "different sync_id should not be rate-limited"
+    );
+}
+
+#[tokio::test]
+async fn test_first_device_registration_requires_valid_pow_when_enabled() {
+    let config = Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 8,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 10_000,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        snapshot_default_ttl_secs: 86400,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+    };
+
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    assert_eq!(
+        nonce_json["pow_challenge"]["difficulty_bits"].as_u64(),
+        Some(8)
+    );
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, nonce);
+    let mut x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut x25519_pk);
+
+    let missing_pow_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_pow_resp.status(), 403);
+    let missing_body: Value = missing_pow_resp.json().await.unwrap();
+    assert_eq!(
+        missing_body["error"].as_str(),
+        Some("first_device_admission_required")
+    );
+
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, nonce);
+    let invalid_pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &nonce_json)
+        .map(|solution| {
+            serde_json::json!({
+                "counter": solution["counter"].as_u64().unwrap() + 1,
+            })
+        })
+        .unwrap();
+
+    let invalid_pow_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "pow_solution": invalid_pow_solution,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_pow_resp.status(), 403);
+    let invalid_body: Value = invalid_pow_resp.json().await.unwrap();
+    assert_eq!(
+        invalid_body["error"].as_str(),
+        Some("first_device_admission_invalid")
+    );
+
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, nonce);
+    let pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &nonce_json).unwrap();
+
+    let valid_pow_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "pow_solution": pow_solution,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid_pow_resp.status(), 201);
+}
+
+#[tokio::test]
+async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
+    let config = Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 8,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 10_000,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        snapshot_default_ttl_secs: 86400,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+    };
+
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let inviter_device_id = generate_device_id();
+    let inviter_key = SigningKey::generate(&mut rand::thread_rng());
+    let _token = register_device(&client, &url, &sync_id, &inviter_device_id, &inviter_key).await;
+
+    let joiner_device_id = generate_device_id();
+    let joiner_key = SigningKey::generate(&mut rand::thread_rng());
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    assert!(
+        nonce_json.get("pow_challenge").is_some(),
+        "nonce shape should not reveal whether the sync group exists"
+    );
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+
+    let challenge_sig = sign_challenge(&joiner_key, &sync_id, &joiner_device_id, nonce);
+    let mut x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut x25519_pk);
+    let signed_invitation = build_signed_invitation(
+        &sync_id,
+        &url,
+        &inviter_device_id,
+        &inviter_key,
+        &joiner_device_id,
+    );
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": joiner_device_id,
+            "signing_public_key": hex::encode(joiner_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "signed_invitation": signed_invitation,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), 201);
+}
+
+#[tokio::test]
+async fn test_first_device_pow_is_bound_to_device_and_nonce() {
+    let config = Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 8,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 10_000,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        snapshot_default_ttl_secs: 86400,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+    };
+
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let other_device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut x25519_pk);
+
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+    let pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &nonce_json).unwrap();
+    let other_device_sig = sign_challenge(&signing_key, &sync_id, &other_device_id, nonce);
+
+    let wrong_device_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": other_device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&other_device_sig),
+            "nonce": nonce,
+            "pow_solution": pow_solution,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_device_resp.status(), 403);
+    let wrong_device_body: Value = wrong_device_resp.json().await.unwrap();
+    assert_eq!(
+        wrong_device_body["error"].as_str(),
+        Some("first_device_admission_invalid")
+    );
+
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let first_nonce_json: Value = nonce_resp.json().await.unwrap();
+    let first_nonce = first_nonce_json["nonce"].as_str().unwrap().to_string();
+    let replay_pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &first_nonce_json)
+        .expect("PoW solution should be present");
+
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let second_nonce_json: Value = nonce_resp.json().await.unwrap();
+    let second_nonce = second_nonce_json["nonce"].as_str().unwrap();
+    assert_ne!(first_nonce, second_nonce);
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, second_nonce);
+
+    let replay_nonce_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": second_nonce,
+            "pow_solution": replay_pow_solution,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay_nonce_resp.status(), 403);
+    let replay_nonce_body: Value = replay_nonce_resp.json().await.unwrap();
+    assert_eq!(
+        replay_nonce_body["error"].as_str(),
+        Some("first_device_admission_invalid")
     );
 }
 
@@ -568,6 +872,7 @@ async fn test_nonce_rate_limiting_window_expiry() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
         stale_device_secs: 2_592_000,

@@ -5,8 +5,11 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{auth, db, errors::AppError, state::AppState};
+
+const POW_ALGORITHM: &str = "sha256_leading_zero_bits";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -21,6 +24,19 @@ pub fn routes() -> Router<AppState> {
 #[derive(Serialize)]
 struct NonceResponse {
     nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pow_challenge: Option<PowChallenge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PowChallenge {
+    algorithm: String,
+    difficulty_bits: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PowSolution {
+    counter: u64,
 }
 
 async fn get_register_nonce(
@@ -41,11 +57,23 @@ async fn get_register_nonce(
     }
 
     let nonce_expiry = state.config.nonce_expiry_secs as i64;
+    let first_device_pow_difficulty_bits = state.config.first_device_pow_difficulty_bits;
     let db = state.db.clone();
     let sid = sync_id.clone();
 
-    let nonce = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| db::create_nonce(conn, &sid, nonce_expiry))
+    let (nonce, pow_challenge) = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let nonce = db::create_nonce(conn, &sid, nonce_expiry)?;
+            let pow_challenge = if first_device_pow_difficulty_bits > 0 {
+                Some(PowChallenge {
+                    algorithm: POW_ALGORITHM.to_string(),
+                    difficulty_bits: first_device_pow_difficulty_bits,
+                })
+            } else {
+                None
+            };
+            Ok((nonce, pow_challenge))
+        })
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
@@ -53,10 +81,14 @@ async fn get_register_nonce(
 
     tracing::debug!(
         sync_id = %&sync_id[..16],
+        has_pow_challenge = pow_challenge.is_some(),
         "Registration nonce issued"
     );
 
-    Ok(axum::Json(NonceResponse { nonce }))
+    Ok(axum::Json(NonceResponse {
+        nonce,
+        pow_challenge,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +104,8 @@ struct RegisterRequest {
     nonce: String,
     #[serde(default)]
     signed_invitation: Option<SignedInvitation>,
+    #[serde(default)]
+    pow_solution: Option<PowSolution>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -154,6 +188,8 @@ async fn register_device(
     let device_id = body.device_id.clone();
     let nonce = body.nonce.clone();
     let invitation = body.signed_invitation.clone();
+    let pow_solution = body.pow_solution.clone();
+    let first_device_pow_difficulty_bits = state.config.first_device_pow_difficulty_bits;
 
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
@@ -165,6 +201,8 @@ async fn register_device(
                 &signing_pk,
                 &x25519_pk,
                 invitation,
+                pow_solution,
+                first_device_pow_difficulty_bits,
                 session_expiry,
             );
             // We tunnel the outcome through rusqlite::Error to satisfy with_conn's signature
@@ -203,6 +241,8 @@ fn do_register(
     signing_pk: &[u8],
     x25519_pk: &[u8],
     invitation: Option<SignedInvitation>,
+    pow_solution: Option<PowSolution>,
+    first_device_pow_difficulty_bits: u8,
     session_expiry: i64,
 ) -> Result<String, AppError> {
     let tx = conn
@@ -221,6 +261,24 @@ fn do_register(
         .is_none();
 
     if is_first_device {
+        if first_device_pow_difficulty_bits > 0 {
+            let pow_solution = pow_solution.ok_or(AppError::FirstDeviceAdmissionRequired)?;
+            if !verify_first_device_pow(
+                sync_id,
+                device_id,
+                nonce,
+                &pow_solution,
+                first_device_pow_difficulty_bits,
+            ) {
+                tracing::warn!(
+                    sync_id = %&sync_id[..16],
+                    device_id = %&device_id[..8.min(device_id.len())],
+                    "Registration rejected: invalid first-device PoW solution"
+                );
+                return Err(AppError::FirstDeviceAdmissionInvalid);
+            }
+        }
+
         // First device: create the sync group, no invitation needed
         tracing::debug!(
             sync_id = %&sync_id[..16],
@@ -291,6 +349,48 @@ fn do_register(
     tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(token)
+}
+
+fn verify_first_device_pow(
+    sync_id: &str,
+    device_id: &str,
+    nonce: &str,
+    solution: &PowSolution,
+    difficulty_bits: u8,
+) -> bool {
+    let mut hasher = Sha256::new();
+    hasher.update(b"PRISM_SYNC_FIRST_DEVICE_POW_V1\x00");
+    hasher.update(sync_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(device_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(nonce.as_bytes());
+    hasher.update([0]);
+    hasher.update(solution.counter.to_be_bytes());
+
+    has_leading_zero_bits(&hasher.finalize(), difficulty_bits)
+}
+
+fn has_leading_zero_bits(hash: &[u8], difficulty_bits: u8) -> bool {
+    let full_zero_bytes = (difficulty_bits / 8) as usize;
+    let remaining_bits = difficulty_bits % 8;
+
+    if hash.len() < full_zero_bytes {
+        return false;
+    }
+
+    if hash[..full_zero_bytes].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+
+    if remaining_bits == 0 {
+        return true;
+    }
+
+    let mask = 0xFFu8 << (8 - remaining_bits);
+    hash.get(full_zero_bytes)
+        .map(|byte| byte & mask == 0)
+        .unwrap_or(false)
 }
 
 /// Verify a signed invitation for an existing sync group.

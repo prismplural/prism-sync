@@ -11,6 +11,9 @@ pub struct Config {
     pub metrics_token: Option<String>,
     pub session_expiry_secs: u64,
     pub nonce_expiry_secs: u64,
+    /// Leading zero bits required for first-device PoW admission.
+    /// Set to 0 to disable PoW gating.
+    pub first_device_pow_difficulty_bits: u8,
     /// Max nonces per sync_id within the rate limit window.
     pub nonce_rate_limit: u32,
     /// Sliding window duration in seconds for nonce rate limiting.
@@ -47,6 +50,7 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             session_expiry_secs: parse_env("SESSION_EXPIRY_SECS", 2_592_000),
             nonce_expiry_secs: parse_env("NONCE_EXPIRY_SECS", 60),
+            first_device_pow_difficulty_bits: parse_env("FIRST_DEVICE_POW_DIFFICULTY_BITS", 18),
             nonce_rate_limit: parse_env("NONCE_RATE_LIMIT", 10),
             nonce_rate_window_secs: parse_env("NONCE_RATE_WINDOW_SECS", 60),
             revoke_rate_limit: parse_env("REVOKE_RATE_LIMIT", 2),

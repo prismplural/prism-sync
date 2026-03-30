@@ -745,8 +745,14 @@ mod tests {
 
     #[async_trait]
     impl SyncRelay for NoopRelay {
-        async fn get_registration_nonce(&self) -> std::result::Result<String, RelayError> {
-            Ok("nonce".to_string())
+        async fn get_registration_nonce(
+            &self,
+        ) -> std::result::Result<crate::relay::traits::RegistrationNonceResponse, RelayError>
+        {
+            Ok(crate::relay::traits::RegistrationNonceResponse {
+                nonce: "nonce".to_string(),
+                pow_challenge: None,
+            })
         }
         async fn register_device(
             &self,

@@ -10,9 +10,11 @@ use std::sync::Arc;
 use crate::epoch::EpochManager;
 use crate::error::{CoreError, Result};
 use crate::pairing::models::*;
+use crate::relay::traits::{ProofOfWorkChallenge, ProofOfWorkSolution, RegistrationNonceResponse};
 use crate::relay::SyncRelay;
 use crate::secure_store::SecureStore;
 use prism_sync_crypto::{mnemonic, DeviceSecret, DeviceSigningKey, KeyHierarchy};
+use sha2::{Digest, Sha256};
 
 /// Orchestrates sync group creation and joining.
 ///
@@ -136,11 +138,13 @@ impl PairingService {
         };
 
         // 9. Fetch registration nonce and build challenge-response (CRITICAL-2)
-        let nonce = self
+        let nonce_response = self
             .relay
             .get_registration_nonce()
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
+        let pow_solution = solve_registration_pow(&sync_id, &device_id, &nonce_response)?;
+        let nonce = nonce_response.nonce;
 
         // Build canonical challenge data matching the relay's verification format:
         // "PRISM_SYNC_CHALLENGE_V1" || 0x00 || len_prefixed(sync_id) || len_prefixed(device_id) || len_prefixed(nonce)
@@ -163,6 +167,7 @@ impl PairingService {
             registration_challenge: challenge_signature,
             nonce,
             signed_invitation: Some(signed_invitation_payload),
+            pow_solution,
         };
 
         let register_response = self
@@ -256,11 +261,13 @@ impl PairingService {
             .map_err(CoreError::Crypto)?;
 
         // 4. Fetch registration nonce and build challenge-response (CRITICAL-2)
-        let nonce = self
+        let nonce_response = self
             .relay
             .get_registration_nonce()
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
+        let pow_solution = solve_registration_pow(&response.sync_id, &device_id, &nonce_response)?;
+        let nonce = nonce_response.nonce;
 
         // Build canonical challenge data matching the relay's verification format
         let mut challenge_data = Vec::new();
@@ -296,6 +303,7 @@ impl PairingService {
                 registration_challenge: challenge_signature,
                 nonce,
                 signed_invitation: Some(join_invitation),
+                pow_solution,
             })
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
@@ -352,6 +360,83 @@ impl PairingService {
     pub fn secure_store(&self) -> &Arc<dyn SecureStore> {
         &self.secure_store
     }
+}
+
+fn solve_registration_pow(
+    sync_id: &str,
+    device_id: &str,
+    nonce_response: &RegistrationNonceResponse,
+) -> Result<Option<ProofOfWorkSolution>> {
+    let challenge = match &nonce_response.pow_challenge {
+        Some(challenge) => challenge,
+        None => return Ok(None),
+    };
+
+    if challenge.algorithm != "sha256_leading_zero_bits" {
+        return Err(CoreError::Engine(format!(
+            "unsupported first-device admission challenge: {}",
+            challenge.algorithm
+        )));
+    }
+
+    let counter = find_pow_counter(sync_id, device_id, &nonce_response.nonce, challenge)?;
+    Ok(Some(ProofOfWorkSolution { counter }))
+}
+
+fn find_pow_counter(
+    sync_id: &str,
+    device_id: &str,
+    nonce: &str,
+    challenge: &ProofOfWorkChallenge,
+) -> Result<u64> {
+    for counter in 0..=u64::MAX {
+        if pow_hash_meets_difficulty(
+            &compute_registration_pow_hash(sync_id, device_id, nonce, counter),
+            challenge.difficulty_bits,
+        ) {
+            return Ok(counter);
+        }
+    }
+
+    Err(CoreError::Engine(
+        "failed to solve first-device admission challenge".into(),
+    ))
+}
+
+fn compute_registration_pow_hash(
+    sync_id: &str,
+    device_id: &str,
+    nonce: &str,
+    counter: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"PRISM_SYNC_FIRST_DEVICE_POW_V1\x00");
+    hasher.update(sync_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(device_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(nonce.as_bytes());
+    hasher.update([0]);
+    hasher.update(counter.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn pow_hash_meets_difficulty(hash: &[u8; 32], difficulty_bits: u8) -> bool {
+    let full_zero_bytes = (difficulty_bits / 8) as usize;
+    let remaining_bits = difficulty_bits % 8;
+
+    if hash[..full_zero_bytes].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+
+    if remaining_bits == 0 {
+        return true;
+    }
+
+    let mask = 0xFFu8 << (8 - remaining_bits);
+    hash.get(full_zero_bytes)
+        .map(|byte| byte & mask == 0)
+        .unwrap_or(false)
 }
 
 /// Call on app startup to clean up a partially-completed setup.
@@ -427,8 +512,13 @@ mod tests {
 
     #[async_trait]
     impl SyncRelay for MockRelay {
-        async fn get_registration_nonce(&self) -> std::result::Result<String, RelayError> {
-            Ok(uuid::Uuid::new_v4().to_string())
+        async fn get_registration_nonce(
+            &self,
+        ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+            Ok(RegistrationNonceResponse {
+                nonce: uuid::Uuid::new_v4().to_string(),
+                pow_challenge: None,
+            })
         }
         async fn register_device(
             &self,
@@ -748,6 +838,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn solve_registration_pow_returns_counter_for_supported_challenge() {
+        let nonce_response = RegistrationNonceResponse {
+            nonce: "test-nonce-12345".to_string(),
+            pow_challenge: Some(ProofOfWorkChallenge {
+                algorithm: "sha256_leading_zero_bits".to_string(),
+                difficulty_bits: 8,
+            }),
+        };
+
+        let solution = solve_registration_pow("sync-id", "device-id", &nonce_response)
+            .unwrap()
+            .expect("PoW solution should be present");
+        let hash = compute_registration_pow_hash(
+            "sync-id",
+            "device-id",
+            &nonce_response.nonce,
+            solution.counter,
+        );
+
+        assert!(pow_hash_meets_difficulty(&hash, 8));
+    }
+
+    #[test]
+    fn solve_registration_pow_rejects_unsupported_challenge_algorithm() {
+        let nonce_response = RegistrationNonceResponse {
+            nonce: "test-nonce-12345".to_string(),
+            pow_challenge: Some(ProofOfWorkChallenge {
+                algorithm: "argon2id".to_string(),
+                difficulty_bits: 8,
+            }),
+        };
+
+        let err = solve_registration_pow("sync-id", "device-id", &nonce_response).unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported first-device admission challenge"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn challenge_signature_present_in_registration() {
         // Use a relay that captures the registration request
@@ -759,8 +889,13 @@ mod tests {
 
         #[async_trait]
         impl SyncRelay for CapturingRelay {
-            async fn get_registration_nonce(&self) -> std::result::Result<String, RelayError> {
-                Ok("test-nonce-12345".to_string())
+            async fn get_registration_nonce(
+                &self,
+            ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+                Ok(RegistrationNonceResponse {
+                    nonce: "test-nonce-12345".to_string(),
+                    pow_challenge: None,
+                })
             }
             async fn register_device(
                 &self,
@@ -861,5 +996,6 @@ mod tests {
         assert_eq!(req.nonce, "test-nonce-12345");
         // signed_invitation should be present
         assert!(req.signed_invitation.is_some());
+        assert!(req.pow_solution.is_none());
     }
 }

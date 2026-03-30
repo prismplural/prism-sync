@@ -8,6 +8,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use prism_sync_relay::{
     config::Config,
@@ -28,6 +29,7 @@ pub async fn start_test_relay() -> (
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
         stale_device_secs: 2_592_000,
@@ -45,6 +47,16 @@ pub async fn start_test_relay() -> (
         node_exporter_url: None,
     };
 
+    start_test_relay_with_config(config).await
+}
+
+pub async fn start_test_relay_with_config(
+    config: Config,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<Database>,
+) {
     let db = Database::in_memory().expect("in-memory db");
     let state = AppState::new(db, config);
     let db = state.db.clone();
@@ -124,6 +136,51 @@ pub fn apply_signed_headers(
         )
 }
 
+fn solve_first_device_pow(sync_id: &str, device_id: &str, nonce: &str, difficulty_bits: u8) -> u64 {
+    for counter in 0..=u64::MAX {
+        let mut hasher = Sha256::new();
+        hasher.update(b"PRISM_SYNC_FIRST_DEVICE_POW_V1\x00");
+        hasher.update(sync_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(device_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(nonce.as_bytes());
+        hasher.update([0]);
+        hasher.update(counter.to_be_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        let full_zero_bytes = (difficulty_bits / 8) as usize;
+        let remaining_bits = difficulty_bits % 8;
+        if hash[..full_zero_bytes].iter().any(|byte| *byte != 0) {
+            continue;
+        }
+        if remaining_bits == 0 {
+            return counter;
+        }
+        let mask = 0xFFu8 << (8 - remaining_bits);
+        if hash
+            .get(full_zero_bytes)
+            .is_some_and(|byte| byte & mask == 0)
+        {
+            return counter;
+        }
+    }
+
+    panic!("failed to solve test PoW challenge");
+}
+
+pub fn pow_solution_from_nonce_json(
+    sync_id: &str,
+    device_id: &str,
+    nonce_json: &Value,
+) -> Option<Value> {
+    let challenge = nonce_json.get("pow_challenge")?;
+    let difficulty_bits = challenge.get("difficulty_bits")?.as_u64()? as u8;
+    let nonce = nonce_json.get("nonce")?.as_str()?;
+    let counter = solve_first_device_pow(sync_id, device_id, nonce, difficulty_bits);
+    Some(serde_json::json!({ "counter": counter }))
+}
+
 /// Full registration helper: fetches nonce, signs challenge, registers device.
 /// Returns the session token.
 pub async fn register_device(
@@ -142,6 +199,7 @@ pub async fn register_device(
     assert_eq!(nonce_resp.status(), 200, "nonce request failed");
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
+    let pow_solution = pow_solution_from_nonce_json(sync_id, device_id, &nonce_json);
 
     // 2. Sign challenge
     let challenge_sig = sign_challenge(signing_key, sync_id, device_id, &nonce);
@@ -159,6 +217,7 @@ pub async fn register_device(
             "x25519_public_key": hex::encode(x25519_pk),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
+            "pow_solution": pow_solution,
         }))
         .send()
         .await

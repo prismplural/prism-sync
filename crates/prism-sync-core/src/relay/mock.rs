@@ -9,7 +9,8 @@ use tokio::sync::broadcast;
 
 use super::traits::{
     DeviceInfo, OutgoingBatch, PullResponse, ReceivedBatch, RegisterRequest, RegisterResponse,
-    RelayError, SignedBatchEnvelope, SnapshotResponse, SyncNotification, SyncRelay,
+    RegistrationNonceResponse, RelayError, SignedBatchEnvelope, SnapshotResponse, SyncNotification,
+    SyncRelay,
 };
 
 /// In-memory mock implementation of [`SyncRelay`] for testing.
@@ -152,8 +153,11 @@ impl Default for MockRelay {
 
 #[async_trait]
 impl SyncRelay for MockRelay {
-    async fn get_registration_nonce(&self) -> Result<String, RelayError> {
-        Ok(uuid::Uuid::new_v4().to_string())
+    async fn get_registration_nonce(&self) -> Result<RegistrationNonceResponse, RelayError> {
+        Ok(RegistrationNonceResponse {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            pow_challenge: None,
+        })
     }
 
     async fn register_device(&self, _req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
@@ -321,6 +325,7 @@ mod tests {
                 registration_challenge: vec![],
                 nonce: "nonce".to_string(),
                 signed_invitation: None,
+                pow_solution: None,
             })
             .await
             .unwrap();
