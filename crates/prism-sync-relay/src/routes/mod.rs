@@ -11,7 +11,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
+    Router,
 };
 use base64::Engine;
 use tower_http::cors::CorsLayer;
@@ -172,9 +172,9 @@ enum AuthResult {
 
 /// Auth middleware: extracts Bearer token, validates session, injects AuthIdentity.
 ///
-/// When a revoked device authenticates, the 401 response includes a JSON body
-/// with `{"error": "device_revoked", "remote_wipe": true/false}` so the client
-/// can act on it without needing a separate unauthenticated endpoint.
+/// When a revoked device authenticates, the 401 response includes a structured
+/// JSON body so the client can act on it without needing a separate
+/// unauthenticated endpoint.
 async fn auth_middleware(
     State(state): State<AppState>,
     mut req: Request<axum::body::Body>,
@@ -203,22 +203,31 @@ async fn auth_middleware(
     let auth_result = tokio::task::spawn_blocking(move || -> Result<AuthResult, AppError> {
         db_read
             .with_read_conn(|conn| {
-                let Some((sync_id, device_id)) = db::validate_session(conn, &token_owned)? else {
-                    return Ok(AuthResult::Invalid);
-                };
-                let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
-                    return Ok(AuthResult::Invalid);
-                };
-                if device.status != "active" {
+                if let Some((sync_id, device_id)) = db::validate_session(conn, &token_owned)? {
+                    let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
+                        return Ok(AuthResult::Invalid);
+                    };
+                    if device.status != "active" {
+                        let wipe = db::get_device_wipe_status(conn, &sync_id, &device_id)?
+                            .unwrap_or(false);
+                        return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
+                    }
+                    return Ok(AuthResult::Ok(AuthIdentity {
+                        sync_id,
+                        device_id,
+                        signing_public_key: device.signing_public_key,
+                    }));
+                }
+
+                if let Some((sync_id, device_id)) =
+                    db::validate_revoked_session(conn, &token_owned)?
+                {
                     let wipe =
                         db::get_device_wipe_status(conn, &sync_id, &device_id)?.unwrap_or(false);
                     return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
                 }
-                Ok(AuthResult::Ok(AuthIdentity {
-                    sync_id,
-                    device_id,
-                    signing_public_key: device.signing_public_key,
-                }))
+
+                Ok(AuthResult::Invalid)
             })
             .map_err(|e| AppError::Internal(e.to_string()))
     })
@@ -260,14 +269,7 @@ async fn auth_middleware(
                 "Auth REJECTED: device revoked"
             );
             state.metrics.inc(&state.metrics.auth_failures);
-            Err((
-                axum::http::StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "device_revoked",
-                    "remote_wipe": remote_wipe,
-                })),
-            )
-                .into_response())
+            Err(AppError::DeviceRevoked { remote_wipe }.into_response())
         }
         AuthResult::Invalid => {
             tracing::warn!(

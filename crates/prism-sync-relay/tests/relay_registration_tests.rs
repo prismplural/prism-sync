@@ -24,6 +24,54 @@ use prism_sync_relay::{
 
 use common::*;
 
+async fn fetch_nonce(client: &Client, url: &str, sync_id: &str) -> String {
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    nonce_json["nonce"].as_str().unwrap().to_string()
+}
+
+fn build_signed_invitation(
+    sync_id: &str,
+    relay_url: &str,
+    inviter_device_id: &str,
+    inviter_key: &SigningKey,
+    joiner_device_id: &str,
+) -> Value {
+    let wrapped_dek = b"test-wrapped-dek";
+    let salt = b"test-salt-value-16";
+    let inviter_pk_bytes: [u8; 32] = *inviter_key.verifying_key().as_bytes();
+    let signing_data = prism_sync_relay::auth::build_invitation_signing_data(
+        sync_id,
+        relay_url,
+        wrapped_dek,
+        salt,
+        inviter_device_id,
+        &inviter_pk_bytes,
+        Some(joiner_device_id),
+        0,
+        &[],
+    );
+    let signature = inviter_key.sign(&signing_data);
+
+    serde_json::json!({
+        "sync_id": sync_id,
+        "relay_url": relay_url,
+        "wrapped_dek": hex::encode(wrapped_dek),
+        "salt": hex::encode(salt),
+        "inviter_device_id": inviter_device_id,
+        "inviter_ed25519_pk": hex::encode(inviter_pk_bytes),
+        "signature": hex::encode(signature.to_bytes()),
+        "joiner_device_id": joiner_device_id,
+        "current_epoch": 0,
+        "epoch_key_hex": "",
+    })
+}
+
 // ───────────────────────────── Test 1: Registration E2E ─────────────────
 
 #[tokio::test]
@@ -670,6 +718,203 @@ async fn test_registration_rollback_no_invitation() {
         "push should still work after failed registration: {}",
         push_resp.status()
     );
+}
+
+#[tokio::test]
+async fn test_reregister_existing_device_with_same_keys_succeeds() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let x25519_pk = [7u8; 32];
+
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, &nonce);
+
+    let first_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id.clone(),
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_resp.status(), 201);
+
+    let invitation = build_signed_invitation(&sync_id, &url, &device_id, &signing_key, &device_id);
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, &nonce);
+
+    let reregister_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id.clone(),
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "signed_invitation": invitation,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = reregister_resp.status();
+    let body: Value = reregister_resp.json().await.unwrap();
+    assert!(
+        status.is_success(),
+        "re-register should succeed: {status} - {body}"
+    );
+    assert!(body["device_session_token"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_reregister_existing_device_with_changed_signing_key_is_rejected() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let original_key = SigningKey::generate(&mut rand::thread_rng());
+    let replacement_key = SigningKey::generate(&mut rand::thread_rng());
+    let x25519_pk = [9u8; 32];
+
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&original_key, &sync_id, &device_id, &nonce);
+
+    let first_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id.clone(),
+            "signing_public_key": hex::encode(original_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_resp.status(), 201);
+
+    let invitation = build_signed_invitation(&sync_id, &url, &device_id, &original_key, &device_id);
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&replacement_key, &sync_id, &device_id, &nonce);
+
+    let reregister_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id.clone(),
+            "signing_public_key": hex::encode(replacement_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "signed_invitation": invitation,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reregister_resp.status(), 401);
+    let body: Value = reregister_resp.json().await.unwrap();
+    assert_eq!(body["error"], "device_identity_mismatch");
+}
+
+#[tokio::test]
+async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let original_x25519_pk = [11u8; 32];
+    let replacement_x25519_pk = [12u8; 32];
+
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, &nonce);
+
+    let first_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id.clone(),
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(original_x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_resp.status(), 201);
+
+    let invitation = build_signed_invitation(&sync_id, &url, &device_id, &signing_key, &device_id);
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, &nonce);
+
+    let reregister_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id.clone(),
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(replacement_x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "signed_invitation": invitation,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reregister_resp.status(), 401);
+    let body: Value = reregister_resp.json().await.unwrap();
+    assert_eq!(body["error"], "device_identity_mismatch");
+}
+
+#[tokio::test]
+async fn test_revoked_device_token_is_invalidated_but_still_identifies_revocation() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let admin_id = generate_device_id();
+    let admin_key = SigningKey::generate(&mut rand::thread_rng());
+    let admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_key).await;
+
+    let target_id = generate_device_id();
+    let target_token = prepare_device(&db, &sync_id, &target_id).await;
+
+    let revoke_resp = client
+        .delete(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}?remote_wipe=true"
+        ))
+        .header("Authorization", format!("Bearer {admin_token}"))
+        .header("X-Device-Id", &admin_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke_resp.status(), 204);
+
+    db.with_read_conn(|conn| {
+        assert!(db::validate_session(conn, &target_token)?.is_none());
+        assert_eq!(
+            db::validate_revoked_session(conn, &target_token)?,
+            Some((sync_id.clone(), target_id.clone()))
+        );
+        Ok::<_, rusqlite::Error>(())
+    })
+    .unwrap();
+
+    let devices_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/devices"))
+        .header("Authorization", format!("Bearer {target_token}"))
+        .header("X-Device-Id", &target_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(devices_resp.status(), 401);
+    let body: Value = devices_resp.json().await.unwrap();
+    assert_eq!(body["error"], "device_revoked");
+    assert_eq!(body["remote_wipe"], true);
 }
 
 // ────────────── Test: Revoke does not bump epoch ──────────────

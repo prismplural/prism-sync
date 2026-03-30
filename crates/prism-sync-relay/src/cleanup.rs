@@ -24,13 +24,19 @@ async fn run_cleanup(state: &AppState) {
         db.with_conn(|conn| {
             // 1. Expire registration nonces (> nonce_expiry_secs old)
             let nonces = crate::db::cleanup_expired_nonces(conn)?;
+            let revoked_sessions = crate::db::cleanup_expired_revoked_sessions(conn)?;
 
             // 2. Mark stale devices (> stale_device_secs no activity).
             //    Stale devices are excluded from min_acked_seq so they don't
             //    block batch pruning for the rest of the sync group.
             let stale = crate::db::mark_stale_devices(conn, config.stale_device_secs as i64)?;
 
-            // 3. Prune sync groups where no device has been seen within the
+            // 3. Auto-revoke abandoned devices (> sync_inactive_ttl_secs).
+            //    Returns sync_ids that had devices revoked and now need a rekey.
+            let revoked_groups =
+                crate::db::auto_revoke_devices(conn, config.sync_inactive_ttl_secs as i64)?;
+
+            // 4. Prune sync groups where no device has been seen within the
             //    sync_inactive_ttl_secs window.
             let pruned =
                 crate::db::prune_stale_sync_groups(conn, config.sync_inactive_ttl_secs as i64)?;
@@ -47,13 +53,29 @@ async fn run_cleanup(state: &AppState) {
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
             let pages_freed = (freelist_before - freelist_after).max(0) as u64;
-            Ok::<_, rusqlite::Error>((nonces, stale, pruned, expired_snapshots, pages_freed))
+            Ok::<_, rusqlite::Error>((
+                nonces,
+                revoked_sessions,
+                stale,
+                revoked_groups,
+                pruned,
+                expired_snapshots,
+                pages_freed,
+            ))
         })
     })
     .await;
 
     match result {
-        Ok(Ok((nonces, stale, pruned, expired_snapshots, pages_freed))) => {
+        Ok(Ok((
+            nonces,
+            revoked_sessions,
+            stale,
+            revoked_groups,
+            pruned,
+            expired_snapshots,
+            pages_freed,
+        ))) => {
             state.metrics.last_cleanup_epoch_secs.store(
                 crate::db::now_secs() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -63,9 +85,17 @@ async fn run_cleanup(state: &AppState) {
                     .metrics
                     .inc_by(&state.metrics.vacuum_pages_freed, pages_freed);
             }
-            if nonces > 0 || stale > 0 || pruned > 0 || expired_snapshots > 0 || pages_freed > 0 {
+            if nonces > 0
+                || revoked_sessions > 0
+                || stale > 0
+                || !revoked_groups.is_empty()
+                || pruned > 0
+                || expired_snapshots > 0
+                || pages_freed > 0
+            {
                 tracing::info!(
                     nonces,
+                    revoked_sessions,
                     stale,
                     pruned,
                     expired_snapshots,

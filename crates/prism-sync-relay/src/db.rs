@@ -232,6 +232,17 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRIMARY KEY (sync_id, device_id),
             FOREIGN KEY (sync_id, device_id) REFERENCES devices(sync_id, device_id)
         );
+        CREATE TABLE IF NOT EXISTS revoked_device_sessions (
+            sync_id             TEXT NOT NULL,
+            device_id           TEXT NOT NULL,
+            session_token_hash  TEXT NOT NULL UNIQUE,
+            revoked_at          INTEGER NOT NULL,
+            expires_at          INTEGER NOT NULL,
+            PRIMARY KEY (sync_id, device_id, session_token_hash),
+            FOREIGN KEY (sync_id, device_id) REFERENCES devices(sync_id, device_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_revoked_device_sessions_expires
+            ON revoked_device_sessions(expires_at);
 
         -- Registration nonces
         CREATE TABLE IF NOT EXISTS registration_nonces (
@@ -616,6 +627,10 @@ pub fn delete_device(
         params![sync_id, device_id],
     )?;
     tx.execute(
+        "DELETE FROM revoked_device_sessions WHERE sync_id = ?1 AND device_id = ?2",
+        params![sync_id, device_id],
+    )?;
+    tx.execute(
         "DELETE FROM device_receipts WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
     )?;
@@ -688,6 +703,37 @@ pub fn create_session(
     Ok(token)
 }
 
+/// Move the current session for a device into the revoked-session table and
+/// remove its active session.
+pub fn revoke_session(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    retention_secs: i64,
+) -> Result<(), rusqlite::Error> {
+    let now = now_secs();
+    let expires_at = now + retention_secs;
+
+    conn.execute(
+        "INSERT INTO revoked_device_sessions (
+            sync_id, device_id, session_token_hash, revoked_at, expires_at
+         )
+         SELECT sync_id, device_id, session_token_hash, ?3, ?4
+         FROM device_sessions
+         WHERE sync_id = ?1 AND device_id = ?2
+         ON CONFLICT(session_token_hash) DO UPDATE SET
+            revoked_at = excluded.revoked_at,
+            expires_at = excluded.expires_at",
+        params![sync_id, device_id, now, expires_at],
+    )?;
+    conn.execute(
+        "DELETE FROM device_sessions WHERE sync_id = ?1 AND device_id = ?2",
+        params![sync_id, device_id],
+    )?;
+
+    Ok(())
+}
+
 /// Validate a session token. Returns `(sync_id, device_id)` if valid and not expired.
 pub fn validate_session(
     conn: &Connection,
@@ -698,6 +744,24 @@ pub fn validate_session(
     conn.query_row(
         "SELECT sync_id, device_id
          FROM device_sessions
+         WHERE session_token_hash = ?1 AND expires_at > ?2",
+        params![token_hash, now],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Validate a revoked session token. Returns `(sync_id, device_id)` if the
+/// token belongs to a recently revoked device and has not expired.
+pub fn validate_revoked_session(
+    conn: &Connection,
+    token: &str,
+) -> Result<Option<(String, String)>, rusqlite::Error> {
+    let token_hash = hash_token(token);
+    let now = now_secs();
+    conn.query_row(
+        "SELECT sync_id, device_id
+         FROM revoked_device_sessions
          WHERE session_token_hash = ?1 AND expires_at > ?2",
         params![token_hash, now],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -780,6 +844,15 @@ pub fn cleanup_expired_nonces(conn: &Connection) -> Result<usize, rusqlite::Erro
     let now = now_secs();
     conn.execute(
         "DELETE FROM registration_nonces WHERE expires_at <= ?1",
+        params![now],
+    )
+}
+
+/// Remove expired revoked-session markers.
+pub fn cleanup_expired_revoked_sessions(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    conn.execute(
+        "DELETE FROM revoked_device_sessions WHERE expires_at <= ?1",
         params![now],
     )
 }
@@ -1193,6 +1266,10 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlit
         params![sync_id],
     )?;
     tx.execute(
+        "DELETE FROM revoked_device_sessions WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
+    tx.execute(
         "DELETE FROM device_receipts WHERE sync_id = ?1",
         params![sync_id],
     )?;
@@ -1410,6 +1487,27 @@ mod tests {
             delete_session(conn, "sg1", "dev1")?;
             let result = validate_session(conn, &token)?;
             assert!(result.is_none());
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_revoke_session_preserves_revoked_lookup() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+
+            let token = create_session(conn, "sg1", "dev1", 3600)?;
+            revoke_session(conn, "sg1", "dev1", 3600)?;
+
+            assert!(validate_session(conn, &token)?.is_none());
+            assert_eq!(
+                validate_revoked_session(conn, &token)?,
+                Some(("sg1".to_string(), "dev1".to_string()))
+            );
 
             Ok(())
         })
@@ -1652,7 +1750,9 @@ mod tests {
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
             register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
-            create_session(conn, "sg1", "dev1", 3600)?;
+            let token = create_session(conn, "sg1", "dev1", 3600)?;
+            revoke_session(conn, "sg1", "dev1", 3600)?;
+            assert!(validate_revoked_session(conn, &token)?.is_some());
             upsert_device_receipt(conn, "sg1", "dev1", 5)?;
             insert_batch(conn, "sg1", 0, "dev1", "b1", b"data")?;
             upsert_snapshot(conn, "sg1", 0, 0, b"snap", None, None, None)?;
@@ -1682,6 +1782,7 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert_eq!(rekey_count, 0);
+            assert!(validate_revoked_session(conn, &token)?.is_none());
 
             Ok(())
         })

@@ -17,6 +17,8 @@ use super::{verify_signed_request, AuthIdentity};
 const MAX_WRAPPED_KEY_SIZE: usize = 1024;
 const THIRTY_DAYS_SECS: i64 = 30 * 24 * 3600;
 
+const REVOKED_SESSION_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
 #[derive(Deserialize)]
 pub struct RevokeQuery {
     #[serde(default)]

@@ -206,6 +206,12 @@ impl AppState {
         }
     }
 
+    /// Drop the current WebSocket sender for a device so it stops receiving
+    /// future notifications immediately.
+    pub async fn disconnect_ws(&self, sync_id: &str, device_id: &str) {
+        self.unregister_ws(sync_id, device_id).await;
+    }
+
     /// Count total connected WebSocket devices.
     pub async fn connected_device_count(&self) -> usize {
         let conns = self.ws_connections.read().await;

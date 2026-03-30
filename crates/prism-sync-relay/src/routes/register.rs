@@ -247,6 +247,16 @@ fn do_register(
         if existing.status != "active" {
             return Err(AppError::Forbidden("Device has been revoked"));
         }
+        if existing.signing_public_key != signing_pk || existing.x25519_public_key != x25519_pk {
+            tracing::warn!(
+                sync_id = %&sync_id[..16],
+                device_id = %&device_id[..8.min(device_id.len())],
+                signing_key_mismatch = existing.signing_public_key != signing_pk,
+                x25519_key_mismatch = existing.x25519_public_key != x25519_pk,
+                "Registration rejected: existing device keys do not match stored identity"
+            );
+            return Err(AppError::DeviceIdentityMismatch);
+        }
         tracing::debug!(
             sync_id = %&sync_id[..16],
             device_id = %&device_id[..8.min(device_id.len())],
