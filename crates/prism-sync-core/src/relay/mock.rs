@@ -222,20 +222,25 @@ impl SyncRelay for MockRelay {
         Ok(self.state.lock().unwrap().devices.clone())
     }
 
-    async fn revoke_device(&self, device_id: &str, _remote_wipe: bool) -> Result<(), RelayError> {
+    async fn revoke_device(
+        &self,
+        device_id: &str,
+        _remote_wipe: bool,
+        epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> Result<i32, RelayError> {
         let mut state = self.state.lock().unwrap();
         state.devices.retain(|d| d.device_id != device_id);
-        Ok(())
+        let _ = wrapped_keys;
+        Ok(epoch)
     }
 
     async fn post_rekey_artifacts(
         &self,
         epoch: i32,
-        _revoked_device_id: &str,
         _wrapped_keys: HashMap<String, Vec<u8>>,
     ) -> Result<i32, RelayError> {
-        // Return next epoch (current epoch + 1) as a stub.
-        Ok(epoch + 1)
+        Ok(epoch)
     }
 
     async fn get_rekey_artifact(
@@ -456,7 +461,10 @@ mod tests {
         let devices = relay.list_devices().await.unwrap();
         assert_eq!(devices.len(), 2);
 
-        relay.revoke_device("d1", false).await.unwrap();
+        relay
+            .revoke_device("d1", false, 2, HashMap::new())
+            .await
+            .unwrap();
         let devices = relay.list_devices().await.unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_id, "d2");

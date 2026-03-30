@@ -72,6 +72,72 @@ pub fn is_valid_sync_id(sync_id: &str) -> bool {
     sync_id.len() == 64 && sync_id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Validate a device ID.
+///
+/// Requirements:
+/// - non-empty
+/// - <= 128 bytes
+/// - printable ASCII only (no control chars, no DEL)
+pub fn is_valid_device_id(device_id: &str) -> bool {
+    !device_id.is_empty()
+        && device_id.len() <= 128
+        && device_id.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Build canonical bytes that get signed for destructive HTTP requests.
+///
+/// Domain-separated binary format:
+/// ```text
+/// "PRISM_SYNC_HTTP_V1" || 0x00
+/// || len_prefixed_utf8(method)
+/// || len_prefixed_utf8(path)
+/// || len_prefixed_utf8(sync_id)
+/// || len_prefixed_utf8(device_id)
+/// || sha256(body) (32 bytes)
+/// || len_prefixed_utf8(timestamp)
+/// || len_prefixed_utf8(nonce)
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_signing_data(
+    method: &str,
+    path: &str,
+    sync_id: &str,
+    device_id: &str,
+    body: &[u8],
+    timestamp: &str,
+    nonce: &str,
+) -> Vec<u8> {
+    let body_hash = Sha256::digest(body);
+    let mut data = Vec::new();
+    data.extend_from_slice(b"PRISM_SYNC_HTTP_V1\x00");
+    write_len_prefixed(&mut data, method.as_bytes());
+    write_len_prefixed(&mut data, path.as_bytes());
+    write_len_prefixed(&mut data, sync_id.as_bytes());
+    write_len_prefixed(&mut data, device_id.as_bytes());
+    data.extend_from_slice(&body_hash);
+    write_len_prefixed(&mut data, timestamp.as_bytes());
+    write_len_prefixed(&mut data, nonce.as_bytes());
+    data
+}
+
+/// Verify an Ed25519 signature over canonical request signing data.
+pub fn verify_request_signature(
+    signing_public_key: &[u8],
+    signing_data: &[u8],
+    signature: &[u8],
+) -> bool {
+    let Ok(pk_bytes): Result<[u8; 32], _> = signing_public_key.try_into() else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_bytes) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_slice(signature) else {
+        return false;
+    };
+    verifying_key.verify(signing_data, &sig).is_ok()
+}
+
 /// Write a length-prefixed field: `(data.len() as u32).to_be_bytes() || data`.
 fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -210,6 +276,53 @@ mod tests {
             device_id,
             "wrong-nonce",
             &signature.to_bytes(),
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_device_id() {
+        assert!(is_valid_device_id("device-1"));
+        assert!(is_valid_device_id("abc_123"));
+        assert!(!is_valid_device_id(""));
+        assert!(!is_valid_device_id(&"a".repeat(129)));
+        assert!(!is_valid_device_id("line\nbreak"));
+        assert!(!is_valid_device_id("tab\tchar"));
+    }
+
+    #[test]
+    fn test_verify_request_signature() {
+        use ed25519_dalek::Signer;
+
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let method = "POST";
+        let path = "/v1/sync/sync123/devices/dev2/revoke";
+        let sync_id = "a".repeat(64);
+        let device_id = "device-1";
+        let body = br#"{"k":"v"}"#;
+        let timestamp = "1700000000";
+        let nonce = "nonce-1";
+        let data =
+            build_request_signing_data(method, path, &sync_id, device_id, body, timestamp, nonce);
+        let sig = signing_key.sign(&data);
+        assert!(verify_request_signature(
+            signing_key.verifying_key().as_bytes(),
+            &data,
+            &sig.to_bytes(),
+        ));
+
+        let wrong_data = build_request_signing_data(
+            method,
+            path,
+            &sync_id,
+            device_id,
+            br#"{"k":"tampered"}"#,
+            timestamp,
+            nonce,
+        );
+        assert!(!verify_request_signature(
+            signing_key.verifying_key().as_bytes(),
+            &wrong_data,
+            &sig.to_bytes(),
         ));
     }
 }

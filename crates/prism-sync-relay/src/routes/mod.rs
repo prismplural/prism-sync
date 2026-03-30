@@ -5,28 +5,100 @@ pub mod sync;
 pub mod ws;
 
 use axum::{
+    extract::DefaultBodyLimit,
     extract::State,
-    http::Request,
+    http::{HeaderMap, Request},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
+use base64::Engine;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
-use crate::{db, errors::AppError, state::AppState};
+use crate::{auth, db, errors::AppError, state::AppState};
 
 /// Authenticated identity injected into request extensions by auth middleware.
 #[derive(Debug, Clone)]
 pub struct AuthIdentity {
     pub sync_id: String,
     pub device_id: String,
+    pub signing_public_key: Vec<u8>,
+}
+
+pub(crate) fn verify_signed_request(
+    state: &AppState,
+    auth_identity: &AuthIdentity,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<(), AppError> {
+    let timestamp = headers
+        .get("X-Prism-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::BadRequest("Missing X-Prism-Timestamp"))?;
+    let nonce = headers
+        .get("X-Prism-Nonce")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::BadRequest("Missing X-Prism-Nonce"))?;
+    let signature_b64 = headers
+        .get("X-Prism-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::BadRequest("Missing X-Prism-Signature"))?;
+
+    if !auth::is_valid_device_id(&auth_identity.device_id) {
+        return Err(AppError::Unauthorized);
+    }
+
+    let timestamp_i64 = timestamp
+        .parse::<i64>()
+        .map_err(|_| AppError::BadRequest("Invalid X-Prism-Timestamp"))?;
+    let now = db::now_secs();
+    if (now - timestamp_i64).abs() > state.config.signed_request_max_skew_secs {
+        return Err(AppError::Unauthorized);
+    }
+
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .map_err(|_| AppError::BadRequest("Invalid X-Prism-Signature"))?;
+    let signing_data = auth::build_request_signing_data(
+        method,
+        path,
+        &auth_identity.sync_id,
+        &auth_identity.device_id,
+        body,
+        timestamp,
+        nonce,
+    );
+    if !auth::verify_request_signature(&auth_identity.signing_public_key, &signing_data, &signature)
+    {
+        return Err(AppError::Unauthorized);
+    }
+
+    let replay_key = format!("sig:{}\x00{}", auth_identity.device_id, nonce);
+    if !state.signed_request_replay_cache.check(
+        &replay_key,
+        1,
+        state.config.signed_request_nonce_window_secs,
+    ) {
+        return Err(AppError::Unauthorized);
+    }
+
+    Ok(())
 }
 
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
+    let snapshot_routes = Router::new()
+        .route(
+            "/v1/sync/{sync_id}/snapshot",
+            put(sync::put_snapshot).get(sync::get_snapshot),
+        )
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
+
     // Routes that require authentication
     let authenticated_routes = Router::new()
         // Sync routes (push/pull/snapshot/delete)
@@ -34,16 +106,17 @@ pub fn router(state: AppState) -> Router {
             "/v1/sync/{sync_id}/changes",
             put(sync::push_changes).get(sync::pull_changes),
         )
-        .route(
-            "/v1/sync/{sync_id}/snapshot",
-            put(sync::put_snapshot).get(sync::get_snapshot),
-        )
+        .merge(snapshot_routes)
         .route("/v1/sync/{sync_id}", delete(sync::delete_account))
         // Device routes (list/revoke/rekey/ack)
         .route("/v1/sync/{sync_id}/devices", get(devices::list_devices))
         .route(
             "/v1/sync/{sync_id}/devices/{device_id}",
             delete(devices::delete_device),
+        )
+        .route(
+            "/v1/sync/{sync_id}/devices/{device_id}/revoke",
+            post(devices::post_atomic_revoke),
         )
         .route("/v1/sync/{sync_id}/rekey", post(devices::post_rekey))
         .route(
@@ -90,7 +163,9 @@ pub fn router(state: AppState) -> Router {
 enum AuthResult {
     Ok(AuthIdentity),
     /// Valid session but device is revoked; includes remote_wipe flag.
-    DeviceRevoked { remote_wipe: bool },
+    DeviceRevoked {
+        remote_wipe: bool,
+    },
     /// Session not found, expired, or device missing.
     Invalid,
 }
@@ -125,30 +200,31 @@ async fn auth_middleware(
 
     // Phase 1 — Read (blocking, must complete): validate session + device status
     let db_read = state.db.clone();
-    let auth_result =
-        tokio::task::spawn_blocking(move || -> Result<AuthResult, AppError> {
-            db_read
-                .with_read_conn(|conn| {
-                    let Some((sync_id, device_id)) =
-                        db::validate_session(conn, &token_owned)?
-                    else {
-                        return Ok(AuthResult::Invalid);
-                    };
-                    let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
-                        return Ok(AuthResult::Invalid);
-                    };
-                    if device.status != "active" {
-                        let wipe = db::get_device_wipe_status(conn, &sync_id, &device_id)?
-                            .unwrap_or(false);
-                        return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
-                    }
-                    Ok(AuthResult::Ok(AuthIdentity { sync_id, device_id }))
-                })
-                .map_err(|e| AppError::Internal(e.to_string()))
-        })
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()).into_response())?
-        .map_err(|e| e.into_response())?;
+    let auth_result = tokio::task::spawn_blocking(move || -> Result<AuthResult, AppError> {
+        db_read
+            .with_read_conn(|conn| {
+                let Some((sync_id, device_id)) = db::validate_session(conn, &token_owned)? else {
+                    return Ok(AuthResult::Invalid);
+                };
+                let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
+                    return Ok(AuthResult::Invalid);
+                };
+                if device.status != "active" {
+                    let wipe =
+                        db::get_device_wipe_status(conn, &sync_id, &device_id)?.unwrap_or(false);
+                    return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
+                }
+                Ok(AuthResult::Ok(AuthIdentity {
+                    sync_id,
+                    device_id,
+                    signing_public_key: device.signing_public_key,
+                }))
+            })
+            .map_err(|e| AppError::Internal(e.to_string()))
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()).into_response())?
+    .map_err(|e| e.into_response())?;
 
     match auth_result {
         AuthResult::Ok(identity) => {

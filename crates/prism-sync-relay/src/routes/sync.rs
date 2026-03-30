@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::{db, errors::AppError, state::AppState};
 
-use super::AuthIdentity;
+use super::{verify_signed_request, AuthIdentity};
 
 const MAX_CHANGESET_SIZE: usize = 1_024 * 1_024; // 1 MB
 const MAX_SNAPSHOT_SIZE: usize = 25 * 1_024 * 1_024; // 25 MB
@@ -344,6 +344,11 @@ pub async fn put_snapshot(
         .and_then(|v| v.to_str().ok())
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
+    if let Some(target_device_id) = target_device_id.as_deref() {
+        if !crate::auth::is_valid_device_id(target_device_id) {
+            return Err(AppError::BadRequest("Invalid X-For-Device-Id"));
+        }
+    }
 
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();
@@ -419,12 +424,21 @@ fn do_put_snapshot(
 
 pub async fn delete_account(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(auth): Extension<AuthIdentity>,
     Path(path_sync_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
+    verify_signed_request(
+        &state,
+        &auth,
+        &headers,
+        "DELETE",
+        &format!("/v1/sync/{}", auth.sync_id),
+        &[],
+    )?;
 
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();

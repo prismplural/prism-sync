@@ -103,10 +103,7 @@ impl Stats {
         if parts.is_empty() {
             println!("[{elapsed}s] running...  errors: {total_errors}");
         } else {
-            println!(
-                "[{elapsed}s] {}  errors: {total_errors}",
-                parts.join("  ")
-            );
+            println!("[{elapsed}s] {}  errors: {total_errors}", parts.join("  "));
         }
     }
 

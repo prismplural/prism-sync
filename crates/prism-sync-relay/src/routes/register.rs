@@ -105,6 +105,10 @@ async fn register_device(
         return Err(AppError::BadRequest("Invalid sync ID"));
     }
 
+    if !auth::is_valid_device_id(&body.device_id) {
+        return Err(AppError::BadRequest("Invalid device_id"));
+    }
+
     // Decode public keys from hex
     let signing_pk = hex::decode(&body.signing_public_key)
         .map_err(|_| AppError::BadRequest("Invalid signing_public_key hex"))?;
@@ -228,12 +232,12 @@ fn do_register(
             // Another request created the group between our check and insert;
             // treat this as an existing group — invitation is required.
             let inv = invitation.as_ref().ok_or(AppError::Unauthorized)?;
-            verify_signed_invitation(&tx, sync_id, inv)?;
+            verify_signed_invitation(&tx, sync_id, device_id, inv)?;
         }
     } else {
         // Existing group: invitation is required
         let inv = invitation.ok_or(AppError::Unauthorized)?;
-        verify_signed_invitation(&tx, sync_id, &inv)?;
+        verify_signed_invitation(&tx, sync_id, device_id, &inv)?;
     }
 
     // Check if device already exists
@@ -259,10 +263,8 @@ fn do_register(
             epoch,
             "New device registered"
         );
-        db::register_device(
-            &tx, sync_id, device_id, signing_pk, x25519_pk, epoch,
-        )
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        db::register_device(&tx, sync_id, device_id, signing_pk, x25519_pk, epoch)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
         // Initialize device receipt
         db::upsert_device_receipt(&tx, sync_id, device_id, 0)
@@ -285,11 +287,21 @@ fn do_register(
 fn verify_signed_invitation(
     conn: &rusqlite::Connection,
     sync_id: &str,
+    registering_device_id: &str,
     inv: &SignedInvitation,
 ) -> Result<(), AppError> {
     // 1. Verify the invitation's sync_id matches
     if inv.sync_id != sync_id {
         return Err(AppError::BadRequest("Invitation sync_id mismatch"));
+    }
+
+    if let Some(joiner_device_id) = inv.joiner_device_id.as_deref() {
+        if !auth::is_valid_device_id(joiner_device_id) {
+            return Err(AppError::BadRequest("Invalid invitation joiner_device_id"));
+        }
+        if joiner_device_id != registering_device_id {
+            return Err(AppError::BadRequest("Invitation joiner_device_id mismatch"));
+        }
     }
 
     // 2. Look up the inviter device

@@ -113,8 +113,8 @@ impl Database {
     /// Open a database for testing, backed by a temp file so multiple
     /// connections can share the same WAL.
     pub fn in_memory() -> Result<Self, rusqlite::Error> {
-        let path = std::env::temp_dir()
-            .join(format!("prism_relay_test_{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("prism_relay_test_{}.db", uuid::Uuid::new_v4()));
         Self::open(path.to_str().unwrap(), 2)
     }
 
@@ -295,6 +295,32 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
 
+        -- Audit: revocation events
+        CREATE TABLE IF NOT EXISTS revocation_events (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            sync_id             TEXT NOT NULL,
+            revoker_device_id   TEXT NOT NULL,
+            target_device_id    TEXT NOT NULL,
+            new_epoch           INTEGER NOT NULL,
+            remote_wipe         INTEGER NOT NULL DEFAULT 0,
+            created_at          INTEGER NOT NULL,
+            FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_revocation_events_sync
+            ON revocation_events(sync_id, created_at);
+
+        -- Audit: standalone epoch rotations
+        CREATE TABLE IF NOT EXISTS rekey_events (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            sync_id             TEXT NOT NULL,
+            rekeyer_device_id   TEXT NOT NULL,
+            new_epoch           INTEGER NOT NULL,
+            created_at          INTEGER NOT NULL,
+            FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rekey_events_sync
+            ON rekey_events(sync_id, created_at);
+
         -- Password-change artifacts (per-device wrapped blobs, versioned)
         CREATE TABLE IF NOT EXISTS password_change_artifacts (
             sync_id          TEXT NOT NULL,
@@ -464,6 +490,17 @@ pub fn set_needs_rekey(
         params![needs as i64, now, sync_id],
     )?;
     Ok(())
+}
+
+pub fn get_needs_rekey(conn: &Connection, sync_id: &str) -> Result<Option<bool>, rusqlite::Error> {
+    let raw: Option<i64> = conn
+        .query_row(
+            "SELECT needs_rekey FROM sync_groups WHERE sync_id = ?1",
+            params![sync_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw.map(|v| v != 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1053,44 @@ pub fn get_rekey_artifact(
     .optional()
 }
 
+pub fn insert_revocation_event(
+    conn: &Connection,
+    sync_id: &str,
+    revoker_device_id: &str,
+    target_device_id: &str,
+    new_epoch: i64,
+    remote_wipe: bool,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO revocation_events (
+            sync_id, revoker_device_id, target_device_id, new_epoch, remote_wipe, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            sync_id,
+            revoker_device_id,
+            target_device_id,
+            new_epoch,
+            remote_wipe as i64,
+            now_secs(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn insert_rekey_event(
+    conn: &Connection,
+    sync_id: &str,
+    rekeyer_device_id: &str,
+    new_epoch: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO rekey_events (sync_id, rekeyer_device_id, new_epoch, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![sync_id, rekeyer_device_id, new_epoch, now_secs()],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Password change artifact queries
 // ---------------------------------------------------------------------------
@@ -1103,6 +1178,14 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlit
     )?;
     tx.execute(
         "DELETE FROM rekey_artifacts WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
+    tx.execute(
+        "DELETE FROM revocation_events WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
+    tx.execute(
+        "DELETE FROM rekey_events WHERE sync_id = ?1",
         params![sync_id],
     )?;
     tx.execute(
@@ -1225,10 +1308,7 @@ pub fn load_counters(conn: &Connection) -> Result<HashMap<String, u64>, rusqlite
 }
 
 /// Flush current counter values to SQLite (upsert).
-pub fn flush_counters(
-    conn: &Connection,
-    values: &[(&str, u64)],
-) -> Result<(), rusqlite::Error> {
+pub fn flush_counters(conn: &Connection, values: &[(&str, u64)]) -> Result<(), rusqlite::Error> {
     let mut stmt = conn.prepare(
         "INSERT INTO counters (name, value) VALUES (?1, ?2)
          ON CONFLICT(name) DO UPDATE SET value = ?2",
@@ -1290,7 +1370,6 @@ mod tests {
             assert_eq!(device.x25519_public_key, x25519_pk);
             assert_eq!(device.epoch, 0);
             assert_eq!(device.status, "active");
-
 
             // Non-existent device
             let device = get_device(conn, "sg1", "nonexistent")?;
@@ -1578,6 +1657,8 @@ mod tests {
             insert_batch(conn, "sg1", 0, "dev1", "b1", b"data")?;
             upsert_snapshot(conn, "sg1", 0, 0, b"snap", None, None, None)?;
             store_rekey_artifact(conn, "sg1", 1, "dev1", &[42; 32])?;
+            insert_revocation_event(conn, "sg1", "dev1", "dev2", 1, false)?;
+            insert_rekey_event(conn, "sg1", "dev1", 1)?;
             create_nonce(conn, "sg1", 3600)?;
 
             // Delete everything
@@ -1589,12 +1670,23 @@ mod tests {
             assert!(get_snapshot(conn, "sg1")?.is_none());
             assert_eq!(get_latest_seq(conn, "sg1")?, 0);
             assert!(get_rekey_artifact(conn, "sg1", 1, "dev1")?.is_none());
+            let rev_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM revocation_events WHERE sync_id = ?1",
+                params!["sg1"],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rev_count, 0);
+            let rekey_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM rekey_events WHERE sync_id = ?1",
+                params!["sg1"],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rekey_count, 0);
 
             Ok(())
         })
         .unwrap();
     }
-
 
     #[test]
     fn test_list_devices_includes_public_keys() {
@@ -1611,7 +1703,6 @@ mod tests {
             assert_eq!(devices[0].device_id, "dev1");
             assert_eq!(devices[0].signing_public_key, signing_pk);
             assert_eq!(devices[0].x25519_public_key, x25519_pk);
-
 
             Ok(())
         })

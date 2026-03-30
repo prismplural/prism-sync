@@ -55,22 +55,13 @@ impl EpochManager {
         Ok(())
     }
 
-    /// Generate a new epoch key and post per-device wrapped keys to the relay.
-    ///
-    /// Called by the device that initiates a revocation. For each active device
-    /// (excluding `revoked_device_id`), the epoch key is wrapped using an
-    /// X25519 DH shared secret derived with that device's public key.
-    ///
-    /// The new epoch key is stored in `key_hierarchy` **before** posting to the
-    /// relay, so the local device can immediately encrypt at the new epoch.
-    /// Returns the new epoch key wrapped in `Zeroizing`.
-    pub async fn post_rekey(
+    /// Generate a fresh epoch key and wrap it for all active devices, optionally
+    /// excluding one target device (for atomic revocation).
+    pub async fn prepare_wrapped_keys(
         relay: &dyn SyncRelay,
-        key_hierarchy: &mut KeyHierarchy,
-        new_epoch: u32,
         device_exchange_key: &DeviceExchangeKey,
-        revoked_device_id: &str,
-    ) -> Result<Zeroizing<Vec<u8>>> {
+        excluded_device_id: Option<&str>,
+    ) -> Result<(Zeroizing<Vec<u8>>, HashMap<String, Vec<u8>>)> {
         // 1. Generate a random 32-byte epoch key
         let mut epoch_key_bytes = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut epoch_key_bytes);
@@ -81,10 +72,13 @@ impl EpochManager {
             .await
             .map_err(|e| CoreError::Storage(format!("failed to list devices: {e}")))?;
 
-        // 3. For each active device (except revoked), wrap the epoch key
+        // 3. For each active surviving device, wrap the epoch key
         let mut wrapped_keys: HashMap<String, Vec<u8>> = HashMap::new();
         for device in &devices {
-            if device.device_id == revoked_device_id || device.status == "revoked" {
+            if device.status != "active" {
+                continue;
+            }
+            if excluded_device_id.is_some_and(|excluded| excluded == device.device_id) {
                 continue;
             }
             if device.x25519_public_key.len() != 32 {
@@ -107,17 +101,27 @@ impl EpochManager {
             wrapped_keys.insert(device.device_id.clone(), wrapped);
         }
 
-        // 4. Store the epoch key locally BEFORE posting to relay so the local
-        //    device can encrypt at the new epoch immediately.
-        key_hierarchy.store_epoch_key(new_epoch, Zeroizing::new(epoch_key_bytes.to_vec()));
+        Ok((Zeroizing::new(epoch_key_bytes.to_vec()), wrapped_keys))
+    }
 
-        // 5. Post wrapped keys to relay
+    /// Standalone non-revoking epoch rotation: upload wrapped artifacts for all
+    /// active devices and store the new epoch key locally.
+    pub async fn post_rekey(
+        relay: &dyn SyncRelay,
+        key_hierarchy: &mut KeyHierarchy,
+        new_epoch: u32,
+        device_exchange_key: &DeviceExchangeKey,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let (epoch_key, wrapped_keys) =
+            Self::prepare_wrapped_keys(relay, device_exchange_key, None).await?;
+
+        key_hierarchy.store_epoch_key(new_epoch, Zeroizing::new(epoch_key.to_vec()));
         relay
-            .post_rekey_artifacts(new_epoch as i32, revoked_device_id, wrapped_keys)
+            .post_rekey_artifacts(new_epoch as i32, wrapped_keys)
             .await
             .map_err(|e| CoreError::Storage(format!("failed to post rekey artifacts: {e}")))?;
 
-        Ok(Zeroizing::new(epoch_key_bytes.to_vec()))
+        Ok(epoch_key)
     }
 
     /// Generate a new sync_id: 32 random bytes, hex-encoded (64 chars).
@@ -160,7 +164,7 @@ mod tests {
         artifact: Option<Vec<u8>>,
         devices: Vec<DeviceInfo>,
         #[allow(clippy::type_complexity)]
-        posted_artifacts: Mutex<Option<(i32, String, HashMap<String, Vec<u8>>)>>,
+        posted_artifacts: Mutex<Option<(i32, HashMap<String, Vec<u8>>)>>,
     }
 
     impl MockRelay {
@@ -223,16 +227,17 @@ mod tests {
             &self,
             _device_id: &str,
             _remote_wipe: bool,
-        ) -> std::result::Result<(), RelayError> {
+            _new_epoch: i32,
+            _wrapped_keys: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
         async fn post_rekey_artifacts(
             &self,
             epoch: i32,
-            revoked: &str,
             keys: HashMap<String, Vec<u8>>,
         ) -> std::result::Result<i32, RelayError> {
-            *self.posted_artifacts.lock().unwrap() = Some((epoch, revoked.to_string(), keys));
+            *self.posted_artifacts.lock().unwrap() = Some((epoch, keys));
             Ok(epoch)
         }
         async fn get_rekey_artifact(
@@ -362,14 +367,13 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        EpochManager::post_rekey(&relay, &mut kh, 2, &sender_xk, "revoked-dev")
+        EpochManager::post_rekey(&relay, &mut kh, 2, &sender_xk)
             .await
             .unwrap();
 
         let posted = relay.posted_artifacts.lock().unwrap();
-        let (epoch, revoked, keys) = posted.as_ref().unwrap();
+        let (epoch, keys) = posted.as_ref().unwrap();
         assert_eq!(*epoch, 2);
-        assert_eq!(revoked, "revoked-dev");
         // Should have wrapped keys for sender and receiver, not revoked-dev
         assert_eq!(keys.len(), 2);
         assert!(keys.contains_key("sender"));
@@ -403,7 +407,7 @@ mod tests {
         // Epoch 2 key should not exist yet
         assert!(!kh.has_epoch_key(2));
 
-        let returned_key = EpochManager::post_rekey(&relay, &mut kh, 2, &sender_xk, "revoked-dev")
+        let returned_key = EpochManager::post_rekey(&relay, &mut kh, 2, &sender_xk)
             .await
             .unwrap();
 

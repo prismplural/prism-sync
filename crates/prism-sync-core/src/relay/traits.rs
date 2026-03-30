@@ -307,18 +307,24 @@ pub trait SyncRelay: Send + Sync {
     /// List all devices in this sync group.
     async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError>;
 
-    /// Revoke a device, triggering epoch rotation.
+    /// Atomically revoke a device and rotate to `new_epoch`.
+    ///
+    /// `wrapped_keys` must contain wrapped epoch-key artifacts for all
+    /// surviving devices.
     async fn revoke_device(
         &self,
         device_id: &str,
         remote_wipe: bool,
-    ) -> std::result::Result<(), RelayError>;
+        new_epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> std::result::Result<i32, RelayError>;
 
-    /// Post rekey artifacts: per-device wrapped epoch keys for the new epoch.
+    /// Standalone non-revoking epoch rotation.
+    ///
+    /// Posts per-device wrapped epoch-key artifacts for `epoch`.
     async fn post_rekey_artifacts(
         &self,
         epoch: i32,
-        revoked_device_id: &str,
         wrapped_keys: HashMap<String, Vec<u8>>,
     ) -> std::result::Result<i32, RelayError>;
 

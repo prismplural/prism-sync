@@ -25,9 +25,7 @@ pub async fn run(
 
     // Each client gets its own sync group (joining existing groups requires
     // signed invitations). This tests server capacity accurately.
-    println!(
-        "Registering {total_clients} devices ({ws_clients} WS + {active_clients} active)..."
-    );
+    println!("Registering {total_clients} devices ({ws_clients} WS + {active_clients} active)...");
     let mut all_clients = Vec::with_capacity(total_clients);
 
     for _ in 0..ws_clients {
@@ -58,10 +56,7 @@ pub async fn run(
     for handle in reg_handles {
         registered.push(handle.await?);
     }
-    let reg_count = registered
-        .iter()
-        .filter(|(c, _)| c.token.is_some())
-        .count();
+    let reg_count = registered.iter().filter(|(c, _)| c.token.is_some()).count();
     println!(
         "Registered {reg_count}/{total_clients} devices. Starting mixed workload for {}s...",
         duration.as_secs()
@@ -85,9 +80,8 @@ pub async fn run(
             let stats = stats.clone();
             let mut client = client;
             handles.push(tokio::spawn(async move {
-                let jitter = Duration::from_millis(
-                    rand::random::<u64>() % sync_interval.as_millis() as u64,
-                );
+                let jitter =
+                    Duration::from_millis(rand::random::<u64>() % sync_interval.as_millis() as u64);
                 tokio::time::sleep(jitter).await;
                 while Instant::now() < deadline {
                     let _ = client.push(&http, &base_url, &stats).await;

@@ -85,9 +85,9 @@ pub async fn run(
                     let (_write, mut read) = ws.split();
                     loop {
                         match tokio::time::timeout(Duration::from_secs(60), read.next()).await {
-                            Ok(Some(Ok(_))) => {}              // message received, continue
+                            Ok(Some(Ok(_))) => {}                 // message received, continue
                             Ok(Some(Err(_))) | Ok(None) => break, // connection closed
-                            Err(_) => {}                        // timeout, continue waiting
+                            Err(_) => {}                          // timeout, continue waiting
                         }
                     }
                     connected.fetch_sub(1, Ordering::Relaxed);

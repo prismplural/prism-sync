@@ -30,20 +30,15 @@ async fn run_cleanup(state: &AppState) {
             //    block batch pruning for the rest of the sync group.
             let stale = crate::db::mark_stale_devices(conn, config.stale_device_secs as i64)?;
 
-            // 3. Auto-revoke abandoned devices (> sync_inactive_ttl_secs).
-            //    Returns sync_ids that had devices revoked and now need a rekey.
-            let revoked_groups =
-                crate::db::auto_revoke_devices(conn, config.sync_inactive_ttl_secs as i64)?;
-
-            // 4. Prune sync groups where no device has been seen within the
+            // 3. Prune sync groups where no device has been seen within the
             //    sync_inactive_ttl_secs window.
             let pruned =
                 crate::db::prune_stale_sync_groups(conn, config.sync_inactive_ttl_secs as i64)?;
 
-            // 5. Delete expired ephemeral snapshots
+            // 4. Delete expired ephemeral snapshots
             let expired_snapshots = crate::db::cleanup_expired_snapshots(conn)?;
 
-            // 6. Reclaim freed pages (incremental auto_vacuum)
+            // 5. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 = conn
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -52,49 +47,31 @@ async fn run_cleanup(state: &AppState) {
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
             let pages_freed = (freelist_before - freelist_after).max(0) as u64;
-
-            Ok::<_, rusqlite::Error>((nonces, stale, revoked_groups, pruned, expired_snapshots, pages_freed))
+            Ok::<_, rusqlite::Error>((nonces, stale, pruned, expired_snapshots, pages_freed))
         })
     })
     .await;
 
     match result {
-        Ok(Ok((nonces, stale, revoked_groups, pruned, expired_snapshots, pages_freed))) => {
+        Ok(Ok((nonces, stale, pruned, expired_snapshots, pages_freed))) => {
             state.metrics.last_cleanup_epoch_secs.store(
                 crate::db::now_secs() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
             if pages_freed > 0 {
-                state.metrics.inc_by(&state.metrics.vacuum_pages_freed, pages_freed);
+                state
+                    .metrics
+                    .inc_by(&state.metrics.vacuum_pages_freed, pages_freed);
             }
-            if nonces > 0
-                || stale > 0
-                || !revoked_groups.is_empty()
-                || pruned > 0
-                || expired_snapshots > 0
-                || pages_freed > 0
-            {
+            if nonces > 0 || stale > 0 || pruned > 0 || expired_snapshots > 0 || pages_freed > 0 {
                 tracing::info!(
                     nonces,
                     stale,
-                    revoked_groups = revoked_groups.len(),
                     pruned,
                     expired_snapshots,
                     pages_freed,
                     "cleanup cycle complete"
                 );
-            }
-
-            // Notify active devices in each revoked group that a rekey is needed.
-            // Active devices are responsible for generating and posting rekey artifacts
-            // (the relay is zero-knowledge and cannot generate epoch keys).
-            for sync_id in &revoked_groups {
-                let msg = serde_json::json!({
-                    "type": "rekey_required",
-                    "sync_id": sync_id
-                })
-                .to_string();
-                state.notify_devices(sync_id, None, &msg).await;
             }
         }
         Ok(Err(e)) => tracing::error!("cleanup db error: {e}"),
@@ -105,6 +82,12 @@ async fn run_cleanup(state: &AppState) {
     state
         .nonce_rate_limiter
         .prune_stale(state.config.nonce_rate_window_secs);
+    state
+        .revoke_rate_limiter
+        .prune_stale(state.config.revoke_rate_window_secs);
+    state
+        .signed_request_replay_cache
+        .prune_stale(state.config.signed_request_nonce_window_secs);
 
     // Flush counter values to SQLite so they survive restarts.
     let db = state.db.clone();

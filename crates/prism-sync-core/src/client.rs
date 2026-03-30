@@ -559,39 +559,48 @@ impl PrismSync {
         let current_epoch = meta.map(|m| m.current_epoch).unwrap_or(0);
         let new_epoch = (current_epoch + 1) as u32;
 
-        // 2. Revoke device on relay (bumps epoch server-side)
-        relay
-            .revoke_device(target_device_id, remote_wipe)
-            .await
-            .map_err(|e| CoreError::Relay {
-                message: e.to_string(),
-                kind: crate::error::RelayErrorCategory::Network,
-                status: None,
-            })?;
-
-        // 3. Generate new epoch key and post wrapped keys for remaining devices
-        crate::epoch::EpochManager::post_rekey(
+        // 2. Generate wrapped keys for surviving devices, then perform the
+        //    atomic revoke+epoch-rotation request against the relay.
+        let (epoch_key, wrapped_keys) = crate::epoch::EpochManager::prepare_wrapped_keys(
             relay.as_ref(),
-            self.key_hierarchy_mut(),
-            new_epoch,
             &exchange_key,
-            target_device_id,
+            Some(target_device_id),
         )
         .await?;
 
-        // 4. Persist new epoch key to secure store
-        if let Ok(epoch_key) = self.key_hierarchy().epoch_key(new_epoch) {
+        let committed_epoch = relay
+            .revoke_device(
+                target_device_id,
+                remote_wipe,
+                new_epoch as i32,
+                wrapped_keys,
+            )
+            .await
+            .map_err(|e| CoreError::Relay {
+                message: e.to_string(),
+                kind: crate::error::RelayErrorCategory::Other,
+                status: None,
+            })? as u32;
+
+        self.key_hierarchy_mut()
+            .store_epoch_key(committed_epoch, zeroize::Zeroizing::new(epoch_key.to_vec()));
+
+        // 3. Persist new epoch key to secure store
+        if let Ok(epoch_key) = self.key_hierarchy().epoch_key(committed_epoch) {
             use base64::{engine::general_purpose::STANDARD, Engine};
             let encoded = STANDARD.encode(epoch_key);
             self.secure_store()
-                .set(&format!("epoch_key_{new_epoch}"), encoded.as_bytes())
+                .set(&format!("epoch_key_{committed_epoch}"), encoded.as_bytes())
                 .map_err(|e| CoreError::Storage(format!("failed to persist epoch key: {e}")))?;
         }
+        self.secure_store()
+            .set("epoch", committed_epoch.to_string().as_bytes())
+            .map_err(|e| CoreError::Storage(format!("failed to persist epoch: {e}")))?;
 
-        // 5. Update local epoch in sync metadata
+        // 4. Update local epoch in sync metadata
         let storage = self.storage().clone();
         let sid = sync_id.clone();
-        let ne = new_epoch as i32;
+        let ne = committed_epoch as i32;
         tokio::task::spawn_blocking(move || {
             let mut tx = storage.begin_tx()?;
             tx.update_current_epoch(&sid, ne)?;
@@ -600,10 +609,10 @@ impl PrismSync {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))??;
 
-        // 6. Advance runtime epoch so new mutations use the rotated epoch
-        self.advance_epoch(new_epoch as i32);
+        // 5. Advance runtime epoch so new mutations use the rotated epoch
+        self.advance_epoch(committed_epoch as i32);
 
-        Ok(new_epoch)
+        Ok(committed_epoch)
     }
 
     /// Advance the runtime epoch after a successful rotation or recovery.
@@ -771,13 +780,18 @@ mod tests {
         async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
             unimplemented!()
         }
-        async fn revoke_device(&self, _: &str, _: bool) -> std::result::Result<(), RelayError> {
+        async fn revoke_device(
+            &self,
+            _: &str,
+            _: bool,
+            _: i32,
+            _: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
         async fn post_rekey_artifacts(
             &self,
             _: i32,
-            _: &str,
             _: HashMap<String, Vec<u8>>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()

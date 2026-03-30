@@ -11,8 +11,8 @@ async fn main() {
     let config = Config::from_env();
     let port = config.port;
 
-    let db = Database::open(&config.db_path, config.reader_pool_size)
-        .expect("failed to open database");
+    let db =
+        Database::open(&config.db_path, config.reader_pool_size).expect("failed to open database");
     tracing::info!(db_path = %config.db_path, "Database opened");
 
     let state = AppState::new(db, config);

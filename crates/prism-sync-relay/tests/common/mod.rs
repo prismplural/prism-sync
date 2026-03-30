@@ -6,7 +6,7 @@
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 
 use prism_sync_relay::{
@@ -36,6 +36,10 @@ pub async fn start_test_relay() -> (
         metrics_token: None,
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
         reader_pool_size: 2,
         node_exporter_url: None,
@@ -93,6 +97,31 @@ pub fn sign_challenge(
 pub fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
     buf.extend_from_slice(data);
+}
+
+pub fn apply_signed_headers(
+    builder: RequestBuilder,
+    signing_key: &SigningKey,
+    method: &str,
+    path: &str,
+    sync_id: &str,
+    device_id: &str,
+    body: &[u8],
+) -> RequestBuilder {
+    let timestamp = db::now_secs().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let signing_data = prism_sync_relay::auth::build_request_signing_data(
+        method, path, sync_id, device_id, body, &timestamp, &nonce,
+    );
+    let signature = signing_key.sign(&signing_data);
+
+    builder
+        .header("X-Prism-Timestamp", timestamp)
+        .header("X-Prism-Nonce", nonce)
+        .header(
+            "X-Prism-Signature",
+            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+        )
 }
 
 /// Full registration helper: fetches nonce, signs challenge, registers device.
@@ -168,13 +197,15 @@ pub fn make_test_envelope(sync_id: &str, device_id: &str, batch_id: &str, epoch:
     })
 }
 
-pub async fn prepare_device(db: &std::sync::Arc<Database>, sync_id: &str, device_id: &str) -> String {
+pub async fn prepare_device(
+    db: &std::sync::Arc<Database>,
+    sync_id: &str,
+    device_id: &str,
+) -> String {
     let device_id = device_id.to_string();
     let sync_id = sync_id.to_string();
     db.with_conn(|conn| {
-        db::register_device(
-            conn, &sync_id, &device_id, &[7u8; 32], &[8u8; 32], 0,
-        )?;
+        db::register_device(conn, &sync_id, &device_id, &[7u8; 32], &[8u8; 32], 0)?;
         let token = db::create_session(conn, &sync_id, &device_id, 3600)?;
         Ok(token)
     })

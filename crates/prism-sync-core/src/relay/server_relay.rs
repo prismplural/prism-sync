@@ -5,8 +5,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signer, SigningKey};
 use futures_util::Stream;
+use rand::RngCore;
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tracing::debug;
 
@@ -22,6 +25,7 @@ pub struct ServerRelay {
     sync_id: String,
     device_id: String,
     device_session_token: String,
+    request_signing_key: SigningKey,
     client: Client,
     request_timeout: Duration,
     snapshot_timeout: Duration,
@@ -40,6 +44,7 @@ impl ServerRelay {
         sync_id: String,
         device_id: String,
         device_session_token: String,
+        request_signing_key: SigningKey,
     ) -> Result<Self, String> {
         if !base_url.starts_with("https://") && !base_url.starts_with("http://localhost") {
             return Err(format!(
@@ -61,6 +66,7 @@ impl ServerRelay {
             sync_id,
             device_id,
             device_session_token,
+            request_signing_key,
             client,
             request_timeout: Duration::from_secs(15),
             snapshot_timeout: Duration::from_secs(120),
@@ -73,6 +79,10 @@ impl ServerRelay {
         format!("{}/v1/sync/{}", self.base_url, self.sync_id)
     }
 
+    fn canonical_path(&self, suffix: &str) -> String {
+        format!("/v1/sync/{}{}", self.sync_id, suffix)
+    }
+
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder
             .header(
@@ -80,6 +90,49 @@ impl ServerRelay {
                 format!("Bearer {}", self.device_session_token),
             )
             .header("X-Device-Id", &self.device_id)
+    }
+
+    fn apply_signed_auth(
+        &self,
+        builder: reqwest::RequestBuilder,
+        method: &str,
+        canonical_path: &str,
+        body: &[u8],
+    ) -> reqwest::RequestBuilder {
+        let timestamp = Utc::now().timestamp().to_string();
+        let mut nonce_bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = hex::encode(nonce_bytes);
+        let signing_data =
+            self.build_request_signing_data(method, canonical_path, body, &timestamp, &nonce);
+        let signature = self.request_signing_key.sign(&signing_data);
+        let signature_b64 = BASE64.encode(signature.to_bytes());
+
+        self.apply_auth(builder)
+            .header("X-Prism-Timestamp", timestamp)
+            .header("X-Prism-Nonce", nonce)
+            .header("X-Prism-Signature", signature_b64)
+    }
+
+    fn build_request_signing_data(
+        &self,
+        method: &str,
+        canonical_path: &str,
+        body: &[u8],
+        timestamp: &str,
+        nonce: &str,
+    ) -> Vec<u8> {
+        let body_hash = Sha256::digest(body);
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PRISM_SYNC_HTTP_V1\x00");
+        write_len_prefixed(&mut data, method.as_bytes());
+        write_len_prefixed(&mut data, canonical_path.as_bytes());
+        write_len_prefixed(&mut data, self.sync_id.as_bytes());
+        write_len_prefixed(&mut data, self.device_id.as_bytes());
+        data.extend_from_slice(&body_hash);
+        write_len_prefixed(&mut data, timestamp.as_bytes());
+        write_len_prefixed(&mut data, nonce.as_bytes());
+        data
     }
 
     /// Classify an HTTP status code into a RelayError.
@@ -162,6 +215,11 @@ impl ServerRelay {
             .unwrap_or(&self.base_url);
         format!("{scheme}://{rest}/v1/sync/{}/ws", self.sync_id)
     }
+}
+
+fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
 }
 
 #[async_trait]
@@ -286,7 +344,10 @@ impl SyncRelay for ServerRelay {
             });
         }
 
-        let password_version = json.get("password_version").and_then(|v| v.as_i64()).map(|v| v as i32);
+        let password_version = json
+            .get("password_version")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
 
         Ok(PullResponse {
             batches,
@@ -423,15 +484,34 @@ impl SyncRelay for ServerRelay {
             })
     }
 
-    async fn revoke_device(&self, device_id: &str, remote_wipe: bool) -> Result<(), RelayError> {
-        let mut url = format!("{}/devices/{device_id}", self.base_path());
-        if remote_wipe {
-            url.push_str("?remote_wipe=true");
-        }
-        debug!("revoke_device {device_id} remote_wipe={remote_wipe}");
+    async fn revoke_device(
+        &self,
+        device_id: &str,
+        remote_wipe: bool,
+        new_epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> Result<i32, RelayError> {
+        let path = self.canonical_path(&format!("/devices/{device_id}/revoke"));
+        let url = format!("{}{}", self.base_url, path);
+        debug!("revoke_device_atomic {device_id} remote_wipe={remote_wipe} epoch={new_epoch}");
+
+        let encoded_keys: HashMap<String, String> = wrapped_keys
+            .into_iter()
+            .map(|(k, v)| (k, BASE64.encode(v)))
+            .collect();
+        let body = serde_json::json!({
+            "new_epoch": new_epoch,
+            "remote_wipe": remote_wipe,
+            "wrapped_keys": encoded_keys,
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode revoke request: {e}"),
+        })?;
 
         let resp = self
-            .apply_auth(self.client.delete(&url))
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
             .timeout(self.request_timeout)
             .send()
             .await
@@ -442,18 +522,24 @@ impl SyncRelay for ServerRelay {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(Self::classify_error(status, &body_text));
         }
+        if status == 204 {
+            return Ok(new_epoch);
+        }
 
-        Ok(())
+        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse atomic revoke response: {e}"),
+        })?;
+        Ok(json["new_epoch"].as_i64().unwrap_or(new_epoch as i64) as i32)
     }
 
     async fn post_rekey_artifacts(
         &self,
         epoch: i32,
-        revoked_device_id: &str,
         wrapped_keys: HashMap<String, Vec<u8>>,
     ) -> Result<i32, RelayError> {
-        let url = format!("{}/rekey", self.base_path());
-        debug!("post_rekey_artifacts epoch={epoch} revoked={revoked_device_id}");
+        let path = self.canonical_path("/rekey");
+        let url = format!("{}{}", self.base_url, path);
+        debug!("post_rekey_artifacts epoch={epoch}");
 
         // Encode wrapped keys as base64.
         let encoded_keys: HashMap<String, String> = wrapped_keys
@@ -463,13 +549,16 @@ impl SyncRelay for ServerRelay {
 
         let body = serde_json::json!({
             "epoch": epoch,
-            "revoked_device_id": revoked_device_id,
             "wrapped_keys": encoded_keys,
         });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode rekey request: {e}"),
+        })?;
 
         let resp = self
-            .apply_auth(self.client.post(&url))
-            .json(&body)
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
             .timeout(self.request_timeout)
             .send()
             .await
@@ -524,11 +613,12 @@ impl SyncRelay for ServerRelay {
     }
 
     async fn deregister(&self) -> Result<(), RelayError> {
-        let url = format!("{}/devices/{}", self.base_path(), self.device_id);
+        let path = self.canonical_path(&format!("/devices/{}", self.device_id));
+        let url = format!("{}{}", self.base_url, path);
         debug!("deregister device_id={}", self.device_id);
 
         let resp = self
-            .apply_auth(self.client.delete(&url))
+            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
             .timeout(self.request_timeout)
             .send()
             .await
@@ -544,11 +634,12 @@ impl SyncRelay for ServerRelay {
     }
 
     async fn delete_sync_group(&self) -> Result<(), RelayError> {
-        let url = self.base_path();
+        let path = self.canonical_path("");
+        let url = format!("{}{}", self.base_url, path);
         debug!("delete_sync_group");
 
         let resp = self
-            .apply_auth(self.client.delete(&url))
+            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
             .timeout(self.request_timeout)
             .send()
             .await

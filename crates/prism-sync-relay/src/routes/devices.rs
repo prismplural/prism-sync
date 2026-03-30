@@ -1,21 +1,32 @@
+use std::collections::HashSet;
+
 use axum::{
     body::Bytes,
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
 use base64::Engine;
 use serde::Deserialize;
 
-use crate::{db, errors::AppError, state::AppState};
+use crate::{auth, db, errors::AppError, state::AppState};
 
-use super::AuthIdentity;
+use super::{verify_signed_request, AuthIdentity};
+
+const MAX_WRAPPED_KEY_SIZE: usize = 1024;
+const THIRTY_DAYS_SECS: i64 = 30 * 24 * 3600;
 
 #[derive(Deserialize)]
 pub struct RevokeQuery {
     #[serde(default)]
     pub remote_wipe: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RekeyArtifactQuery {
+    /// Optional epoch to fetch. If omitted, uses the device's current epoch.
+    pub epoch: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,72 +74,60 @@ pub async fn list_devices(
 
 pub async fn delete_device(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(auth): Extension<AuthIdentity>,
     Path((path_sync_id, target_device_id)): Path<(String, String)>,
-    Query(query): Query<RevokeQuery>,
+    Query(_query): Query<RevokeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
+    }
+    if !auth::is_valid_device_id(&target_device_id) {
+        return Err(AppError::BadRequest("Invalid device ID"));
     }
 
     let sync_id = auth.sync_id.clone();
     let requester = auth.device_id.clone();
     let is_self = target_device_id == requester;
 
-    if is_self {
-        // Self-deregister: fully remove device row and associated data
-        let db = state.db.clone();
-        let sid = sync_id.clone();
-        let target = target_device_id.clone();
-
-        tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| Ok(do_self_deregister(conn, &sid, &target)))
-        })
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .map_err(|e| AppError::Internal(e.to_string()))??;
-
-        state
-            .notify_devices(
-                &sync_id,
-                Some(&requester),
-                &serde_json::json!({
-                    "type": "device_deregistered",
-                    "device_id": target_device_id,
-                })
-                .to_string(),
-            )
-            .await;
-    } else {
-        // Revoke another device
-        let db = state.db.clone();
-        let sid = sync_id.clone();
-        let did = requester.clone();
-        let target = target_device_id.clone();
-
-        let remote_wipe = query.remote_wipe;
-        tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| Ok(do_revoke_device(conn, &sid, &did, &target, remote_wipe)))
-        })
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .map_err(|e| AppError::Internal(e.to_string()))??;
-
-        state
-            .notify_devices(
-                &sync_id,
-                Some(&requester),
-                &serde_json::json!({
-                    "type": "device_revoked",
-                    "device_id": target_device_id,
-                    "remote_wipe": query.remote_wipe,
-                })
-                .to_string(),
-            )
-            .await;
+    if !is_self {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "use_atomic_revoke",
+                "message": "Use POST /v1/sync/{sync_id}/devices/{device_id}/revoke",
+            })),
+        )
+            .into_response());
     }
 
-    Ok(StatusCode::NO_CONTENT)
+    let path = format!("/v1/sync/{sync_id}/devices/{target_device_id}");
+    verify_signed_request(&state, &auth, &headers, "DELETE", &path, &[])?;
+
+    let db = state.db.clone();
+    let sid = sync_id.clone();
+    let target = target_device_id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| Ok(do_self_deregister(conn, &sid, &target)))
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))??;
+
+    state
+        .notify_devices(
+            &sync_id,
+            Some(&requester),
+            &serde_json::json!({
+                "type": "device_deregistered",
+                "device_id": target_device_id,
+            })
+            .to_string(),
+        )
+        .await;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 fn do_self_deregister(
@@ -151,69 +150,60 @@ fn do_self_deregister(
     Ok(())
 }
 
-fn do_revoke_device(
-    conn: &rusqlite::Connection,
-    sync_id: &str,
-    _requester_device_id: &str,
-    target_device_id: &str,
-    remote_wipe: bool,
-) -> Result<(), AppError> {
-    let changed = db::revoke_device(conn, sync_id, target_device_id, remote_wipe)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if !changed {
-        return Err(AppError::NotFound);
-    }
-
-    // Keep the revoked device's session with an extended TTL (30 days) so the
-    // auth middleware can look up the device and embed wipe status in the 401
-    // response even if the device has been offline for a while.
-    let thirty_days: i64 = 30 * 24 * 3600;
-    let _ = db::touch_session(conn, sync_id, target_device_id, thirty_days);
-
-    // Mark needs_rekey (epoch bump happens during rekey)
-    db::set_needs_rekey(conn, sync_id, true).map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
-// post_rekey — POST /v1/sync/{sync_id}/rekey
+// post_atomic_revoke — POST /v1/sync/{sync_id}/devices/{device_id}/revoke
 // ---------------------------------------------------------------------------
 
-pub async fn post_rekey(
+pub async fn post_atomic_revoke(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Extension(auth): Extension<AuthIdentity>,
-    Path(path_sync_id): Path<String>,
+    Path((path_sync_id, target_device_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
+    if !auth::is_valid_device_id(&target_device_id) {
+        return Err(AppError::BadRequest("Invalid device ID"));
+    }
+
+    let path = format!(
+        "/v1/sync/{}/devices/{}/revoke",
+        auth.sync_id, target_device_id
+    );
+    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+
+    if !state.revoke_rate_limiter.check(
+        &format!("revoke:{}", auth.sync_id),
+        state.config.revoke_rate_limit,
+        state.config.revoke_rate_window_secs,
+    ) {
+        return Err(AppError::TooManyRequests);
+    }
 
     let body_json: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
-
-    let epoch = body_json["epoch"]
+    let new_epoch = body_json["new_epoch"]
         .as_i64()
-        .ok_or(AppError::BadRequest("Missing epoch"))?;
-    let revoked_device_id = body_json["revoked_device_id"].as_str().map(str::to_string);
+        .ok_or(AppError::BadRequest("Missing new_epoch"))?;
+    let remote_wipe = body_json["remote_wipe"].as_bool().unwrap_or(false);
     let wrapped_keys = parse_wrapped_keys(&body_json)?;
 
     let sync_id = auth.sync_id.clone();
-    let device_id = auth.device_id.clone();
-
+    let requester = auth.device_id.clone();
+    let target = target_device_id.clone();
     let db = state.db.clone();
-    let sid = sync_id.clone();
-    let did = device_id;
 
-    let new_epoch = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            Ok(do_rekey(
+            Ok(do_atomic_revoke(
                 conn,
-                &sid,
-                &did,
-                epoch,
-                revoked_device_id.as_deref(),
+                &sync_id,
+                &requester,
+                &target,
+                new_epoch,
+                remote_wipe,
                 &wrapped_keys,
             ))
         })
@@ -222,7 +212,163 @@ pub async fn post_rekey(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
-    // Notify all devices
+    state
+        .notify_devices(
+            &auth.sync_id,
+            None,
+            &serde_json::json!({
+                "type": "device_revoked",
+                "device_id": target_device_id,
+                "remote_wipe": remote_wipe,
+            })
+            .to_string(),
+        )
+        .await;
+    state
+        .notify_devices(
+            &auth.sync_id,
+            None,
+            &serde_json::json!({
+                "type": "epoch_rotated",
+                "new_epoch": new_epoch,
+            })
+            .to_string(),
+        )
+        .await;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "new_epoch": new_epoch })),
+    ))
+}
+
+fn do_atomic_revoke(
+    conn: &rusqlite::Connection,
+    sync_id: &str,
+    requester_device_id: &str,
+    target_device_id: &str,
+    new_epoch: i64,
+    remote_wipe: bool,
+    wrapped_keys: &[(String, Vec<u8>)],
+) -> Result<i64, AppError> {
+    if target_device_id == requester_device_id {
+        return Err(AppError::BadRequest(
+            "Self-deregister must use DELETE /devices/{device_id}",
+        ));
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let current_epoch = db::get_sync_group_epoch(&tx, sync_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or(AppError::NotFound)?;
+    if new_epoch != current_epoch + 1 {
+        return Err(AppError::BadRequest("new_epoch must be current_epoch + 1"));
+    }
+
+    let requester = db::get_device(&tx, sync_id, requester_device_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or(AppError::NotFound)?;
+    if requester.status != "active" {
+        return Err(AppError::Forbidden("Requester device is not active"));
+    }
+
+    let target = db::get_device(&tx, sync_id, target_device_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or(AppError::NotFound)?;
+    if target.status != "active" {
+        return Err(AppError::Conflict("Target device is not active"));
+    }
+
+    let expected_survivors = active_survivor_set(&tx, sync_id, Some(target_device_id))?;
+    validate_wrapped_keys(&expected_survivors, wrapped_keys)?;
+
+    let changed = db::revoke_device(&tx, sync_id, target_device_id, remote_wipe)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if !changed {
+        return Err(AppError::Conflict("Target device is not active"));
+    }
+
+    let _ = db::touch_session(&tx, sync_id, target_device_id, THIRTY_DAYS_SECS);
+    db::update_sync_group_epoch(&tx, sync_id, new_epoch)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    db::set_needs_rekey(&tx, sync_id, false).map_err(|e| AppError::Internal(e.to_string()))?;
+    tx.execute(
+        "UPDATE devices SET epoch = ?1 WHERE sync_id = ?2 AND status = 'active'",
+        rusqlite::params![new_epoch, sync_id],
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    for (device_id, wrapped_key) in wrapped_keys {
+        db::store_rekey_artifact(&tx, sync_id, new_epoch, device_id, wrapped_key)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    db::insert_revocation_event(
+        &tx,
+        sync_id,
+        requester_device_id,
+        target_device_id,
+        new_epoch,
+        remote_wipe,
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(new_epoch)
+}
+
+// ---------------------------------------------------------------------------
+// post_rekey — POST /v1/sync/{sync_id}/rekey
+// ---------------------------------------------------------------------------
+
+pub async fn post_rekey(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(auth): Extension<AuthIdentity>,
+    Path(path_sync_id): Path<String>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    if path_sync_id != auth.sync_id {
+        return Err(AppError::Forbidden("sync_id mismatch"));
+    }
+
+    let path = format!("/v1/sync/{}/rekey", auth.sync_id);
+    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
+    if body_json.get("revoked_device_id").is_some() {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "use_atomic_revoke",
+                "message": "Rekey after revocation must use the atomic endpoint",
+            })),
+        ));
+    }
+
+    let epoch = body_json["epoch"]
+        .as_i64()
+        .ok_or(AppError::BadRequest("Missing epoch"))?;
+    let wrapped_keys = parse_wrapped_keys(&body_json)?;
+
+    let sync_id = auth.sync_id.clone();
+    let device_id = auth.device_id.clone();
+
+    let db = state.db.clone();
+    let sid = sync_id.clone();
+    let did = device_id.clone();
+
+    let new_epoch = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| Ok(do_rekey(conn, &sid, &did, epoch, &wrapped_keys)))
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))??;
+
     state
         .notify_devices(
             &sync_id,
@@ -244,12 +390,24 @@ pub async fn post_rekey(
 fn do_rekey(
     conn: &rusqlite::Connection,
     sync_id: &str,
-    _device_id: &str,
+    device_id: &str,
     epoch: i64,
-    revoked_device_id: Option<&str>,
     wrapped_keys: &[(String, Vec<u8>)],
 ) -> Result<i64, AppError> {
-    let current_epoch = db::get_sync_group_epoch(conn, sync_id)
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let needs_rekey = db::get_needs_rekey(&tx, sync_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .unwrap_or(false);
+    if needs_rekey {
+        return Err(AppError::Conflict(
+            "Rekey after revocation must use the atomic endpoint",
+        ));
+    }
+
+    let current_epoch = db::get_sync_group_epoch(&tx, sync_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::NotFound)?;
     if epoch != current_epoch + 1 {
@@ -258,53 +416,71 @@ fn do_rekey(
         ));
     }
 
-    // Revoke device if specified
-    if let Some(target) = revoked_device_id {
-        let changed = db::revoke_device(conn, sync_id, target, false)
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        if changed {
-            // Extend session TTL (30 days) so auth middleware can embed wipe
-            // status when the revoked device next connects.
-            let thirty_days: i64 = 30 * 24 * 3600;
-            let _ = db::touch_session(conn, sync_id, target, thirty_days);
-        }
-        // If already revoked, continue silently — idempotent
-    }
+    let expected_devices = active_survivor_set(&tx, sync_id, None)?;
+    validate_wrapped_keys(&expected_devices, wrapped_keys)?;
 
-    // Verify all active devices are covered
-    let active_devices: Vec<String> = db::list_devices(conn, sync_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .filter(|d| d.status == "active")
-        .map(|d| d.device_id)
-        .collect();
-    let artifact_ids: std::collections::HashSet<&str> =
-        wrapped_keys.iter().map(|(id, _)| id.as_str()).collect();
-    for active_id in &active_devices {
-        if !artifact_ids.contains(active_id.as_str()) {
-            return Err(AppError::BadRequest(
-                "Missing rekey artifact for active device",
-            ));
-        }
-    }
-
-    // Update epoch, clear needs_rekey
-    db::update_sync_group_epoch(conn, sync_id, epoch)
+    db::update_sync_group_epoch(&tx, sync_id, epoch)
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    db::set_needs_rekey(conn, sync_id, false).map_err(|e| AppError::Internal(e.to_string()))?;
-    conn.execute(
+    db::set_needs_rekey(&tx, sync_id, false).map_err(|e| AppError::Internal(e.to_string()))?;
+    tx.execute(
         "UPDATE devices SET epoch = ?1 WHERE sync_id = ?2 AND status = 'active'",
         rusqlite::params![epoch, sync_id],
     )
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // Store rekey artifacts
     for (dev_id, key_bytes) in wrapped_keys {
-        db::store_rekey_artifact(conn, sync_id, epoch, dev_id, key_bytes)
+        db::store_rekey_artifact(&tx, sync_id, epoch, dev_id, key_bytes)
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
+    db::insert_rekey_event(&tx, sync_id, device_id, epoch)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(epoch)
+}
+
+fn active_survivor_set(
+    conn: &rusqlite::Connection,
+    sync_id: &str,
+    excluded_device_id: Option<&str>,
+) -> Result<HashSet<String>, AppError> {
+    let devices = db::list_devices(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(devices
+        .into_iter()
+        .filter(|d| d.status == "active")
+        .filter(|d| excluded_device_id.is_none_or(|excluded| d.device_id != excluded))
+        .map(|d| d.device_id)
+        .collect())
+}
+
+fn validate_wrapped_keys(
+    expected_devices: &HashSet<String>,
+    wrapped_keys: &[(String, Vec<u8>)],
+) -> Result<(), AppError> {
+    let mut seen = HashSet::new();
+    for (device_id, wrapped_key) in wrapped_keys {
+        if !auth::is_valid_device_id(device_id) {
+            return Err(AppError::BadRequest("Invalid wrapped_keys device ID"));
+        }
+        if wrapped_key.len() > MAX_WRAPPED_KEY_SIZE {
+            return Err(AppError::BadRequest("wrapped_key exceeds maximum size"));
+        }
+        if !seen.insert(device_id.as_str()) {
+            return Err(AppError::BadRequest("Duplicate wrapped_key entry"));
+        }
+    }
+
+    if seen.len() != expected_devices.len()
+        || expected_devices
+            .iter()
+            .any(|id| !seen.contains(id.as_str()))
+    {
+        return Err(AppError::BadRequest(
+            "wrapped_keys must match the active device set exactly",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Parse wrapped_keys from the rekey body.
@@ -352,12 +528,6 @@ fn parse_wrapped_keys(body: &serde_json::Value) -> Result<Vec<(String, Vec<u8>)>
 // get_rekey_artifact — GET /v1/sync/{sync_id}/rekey/{device_id}
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-pub struct RekeyArtifactQuery {
-    /// Optional epoch to fetch. If omitted, uses the device's current epoch.
-    pub epoch: Option<i64>,
-}
-
 pub async fn get_rekey_artifact(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
@@ -367,13 +537,15 @@ pub async fn get_rekey_artifact(
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
+    if !auth::is_valid_device_id(&target_device_id) {
+        return Err(AppError::BadRequest("Invalid device ID"));
+    }
 
     let db = state.db.clone();
     let sid = auth.sync_id;
 
     let artifact = tokio::task::spawn_blocking(move || {
         db.with_read_conn(|conn| {
-            // Use client-specified epoch if provided, otherwise look up from device record
             let epoch = match query.epoch {
                 Some(e) => e,
                 None => {
@@ -450,4 +622,3 @@ pub async fn post_ack(
 
     Ok(StatusCode::NO_CONTENT)
 }
-

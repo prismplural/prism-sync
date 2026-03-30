@@ -56,14 +56,32 @@ impl Metrics {
     /// Snapshot current counter values for flushing to SQLite.
     pub fn snapshot_counters(&self) -> Vec<(&'static str, u64)> {
         vec![
-            ("changesets_pushed", self.changesets_pushed.load(Ordering::Relaxed)),
-            ("changesets_pulled", self.changesets_pulled.load(Ordering::Relaxed)),
-            ("changesets_pruned", self.changesets_pruned.load(Ordering::Relaxed)),
-            ("ws_notifications", self.ws_notifications.load(Ordering::Relaxed)),
+            (
+                "changesets_pushed",
+                self.changesets_pushed.load(Ordering::Relaxed),
+            ),
+            (
+                "changesets_pulled",
+                self.changesets_pulled.load(Ordering::Relaxed),
+            ),
+            (
+                "changesets_pruned",
+                self.changesets_pruned.load(Ordering::Relaxed),
+            ),
+            (
+                "ws_notifications",
+                self.ws_notifications.load(Ordering::Relaxed),
+            ),
             ("auth_failures", self.auth_failures.load(Ordering::Relaxed)),
-            ("snapshots_exchanged", self.snapshots_exchanged.load(Ordering::Relaxed)),
+            (
+                "snapshots_exchanged",
+                self.snapshots_exchanged.load(Ordering::Relaxed),
+            ),
             ("registrations", self.registrations.load(Ordering::Relaxed)),
-            ("vacuum_pages_freed", self.vacuum_pages_freed.load(Ordering::Relaxed)),
+            (
+                "vacuum_pages_freed",
+                self.vacuum_pages_freed.load(Ordering::Relaxed),
+            ),
         ]
     }
 }
@@ -120,6 +138,8 @@ pub struct AppState {
     pub ws_connections: Arc<RwLock<WsConnections>>,
     pub metrics: Arc<Metrics>,
     pub nonce_rate_limiter: RateLimiter,
+    pub revoke_rate_limiter: RateLimiter,
+    pub signed_request_replay_cache: RateLimiter,
 }
 
 impl AppState {
@@ -138,6 +158,8 @@ impl AppState {
             ws_connections: Arc::new(RwLock::new(HashMap::new())),
             metrics,
             nonce_rate_limiter: RateLimiter::default(),
+            revoke_rate_limiter: RateLimiter::default(),
+            signed_request_replay_cache: RateLimiter::default(),
         }
     }
 

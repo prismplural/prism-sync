@@ -66,10 +66,7 @@ impl SimulatedClient {
 
         let start = Instant::now();
         let resp = http
-            .put(format!(
-                "{base_url}/v1/sync/{}/changes",
-                self.sync_id
-            ))
+            .put(format!("{base_url}/v1/sync/{}/changes", self.sync_id))
             .bearer_auth(token)
             .header("X-Device-Id", &self.device_id)
             .header("X-Batch-Id", &batch_id)
@@ -89,12 +86,7 @@ impl SimulatedClient {
         Ok(server_seq)
     }
 
-    pub async fn pull(
-        &mut self,
-        http: &Client,
-        base_url: &str,
-        stats: &Stats,
-    ) -> Result<i64> {
+    pub async fn pull(&mut self, http: &Client, base_url: &str, stats: &Stats) -> Result<i64> {
         let token = self.token()?;
 
         let start = Instant::now();
@@ -183,8 +175,7 @@ impl SimulatedClient {
 
         // Wait for auth_ok
         use futures::StreamExt;
-        let timeout =
-            tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
         match timeout {
             Ok(Some(Ok(Message::Text(text)))) => {
                 let json: Value = serde_json::from_str(&text)?;

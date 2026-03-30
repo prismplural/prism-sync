@@ -483,13 +483,14 @@ mod tests {
             &self,
             _device_id: &str,
             _remote_wipe: bool,
-        ) -> std::result::Result<(), RelayError> {
+            _new_epoch: i32,
+            _wrapped_keys: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
         async fn post_rekey_artifacts(
             &self,
             _epoch: i32,
-            _revoked: &str,
             _keys: HashMap<String, Vec<u8>>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
@@ -810,13 +811,18 @@ mod tests {
             async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
                 unimplemented!()
             }
-            async fn revoke_device(&self, _: &str, _: bool) -> std::result::Result<(), RelayError> {
+            async fn revoke_device(
+                &self,
+                _: &str,
+                _: bool,
+                _: i32,
+                _: HashMap<String, Vec<u8>>,
+            ) -> std::result::Result<i32, RelayError> {
                 unimplemented!()
             }
             async fn post_rekey_artifacts(
                 &self,
                 _: i32,
-                _: &str,
                 _: HashMap<String, Vec<u8>>,
             ) -> std::result::Result<i32, RelayError> {
                 unimplemented!()

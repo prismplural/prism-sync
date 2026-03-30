@@ -136,5 +136,4 @@ mod tests {
         let key = derive_database_key(&dek).unwrap();
         assert_eq!(key.len(), 32);
     }
-
 }

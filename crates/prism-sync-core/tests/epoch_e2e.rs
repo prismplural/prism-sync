@@ -1,7 +1,7 @@
 //! Epoch rotation end-to-end test (C12).
 //!
-//! Verifies the full cycle: Device A generates a new epoch key via
-//! `post_rekey`, Device B recovers it via `handle_rotation`, and both
+//! Verifies the full cycle: Device A generates a new epoch key, posts it via
+//! atomic revoke, Device B recovers it via `handle_rotation`, and both
 //! can encrypt/decrypt with the same epoch key.
 
 use std::collections::HashMap;
@@ -63,13 +63,22 @@ impl SyncRelay for RekeyMockRelay {
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
         Ok(self.devices.clone())
     }
-    async fn revoke_device(&self, _: &str, _remote_wipe: bool) -> Result<(), RelayError> {
-        unimplemented!()
+    async fn revoke_device(
+        &self,
+        _: &str,
+        _remote_wipe: bool,
+        epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> Result<i32, RelayError> {
+        let mut artifacts = self.artifacts.lock().unwrap();
+        for (device_id, wrapped) in wrapped_keys {
+            artifacts.insert((epoch, device_id), wrapped);
+        }
+        Ok(epoch)
     }
     async fn post_rekey_artifacts(
         &self,
         epoch: i32,
-        _revoked: &str,
         keys: HashMap<String, Vec<u8>>,
     ) -> Result<i32, RelayError> {
         let mut artifacts = self.artifacts.lock().unwrap();
@@ -161,11 +170,16 @@ async fn epoch_rotation_full_cycle() {
     let mut kh_b = KeyHierarchy::new();
     kh_b.initialize("password", &[2u8; 16]).unwrap();
 
-    // ── Step 1: Device A generates new epoch key via post_rekey ──
-    // Device A revokes Device C and rotates to epoch 1
-    let epoch_key_a = EpochManager::post_rekey(&relay, &mut kh_a, 1, &xk_a, "device-c")
+    // ── Step 1: Device A generates a new epoch key and performs atomic revoke ──
+    let (epoch_key_a, wrapped_keys) =
+        EpochManager::prepare_wrapped_keys(&relay, &xk_a, Some("device-c"))
+            .await
+            .expect("prepare_wrapped_keys should succeed");
+    relay
+        .revoke_device("device-c", false, 1, wrapped_keys)
         .await
-        .expect("post_rekey should succeed");
+        .expect("atomic revoke should succeed");
+    kh_a.store_epoch_key(1, zeroize::Zeroizing::new(epoch_key_a.to_vec()));
 
     // Verify A has the new epoch key stored locally
     assert!(kh_a.has_epoch_key(1), "Device A should have epoch 1 key");
@@ -270,10 +284,14 @@ async fn revoked_device_cannot_recover_epoch_key() {
     let mut kh_a = KeyHierarchy::new();
     kh_a.initialize("password", &[1u8; 16]).unwrap();
 
-    // Device A revokes device-c (excluded from wrapped keys)
-    EpochManager::post_rekey(&relay, &mut kh_a, 1, &xk_a, "device-c")
+    let (_epoch_key, wrapped_keys) =
+        EpochManager::prepare_wrapped_keys(&relay, &xk_a, Some("device-c"))
+            .await
+            .expect("prepare_wrapped_keys should succeed");
+    relay
+        .revoke_device("device-c", false, 1, wrapped_keys)
         .await
-        .expect("post_rekey should succeed");
+        .expect("atomic revoke should succeed");
 
     // Device C tries to recover -- no artifact for it
     let mut kh_c = KeyHierarchy::new();

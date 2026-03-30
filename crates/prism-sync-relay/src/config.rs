@@ -15,6 +15,14 @@ pub struct Config {
     pub nonce_rate_limit: u32,
     /// Sliding window duration in seconds for nonce rate limiting.
     pub nonce_rate_window_secs: u64,
+    /// Max revoke operations per sync group within revoke_rate_window_secs.
+    pub revoke_rate_limit: u32,
+    /// Sliding window duration in seconds for revoke rate limiting.
+    pub revoke_rate_window_secs: u64,
+    /// Max allowed absolute clock skew for signed requests.
+    pub signed_request_max_skew_secs: i64,
+    /// Replay window (seconds) for signed request nonces.
+    pub signed_request_nonce_window_secs: u64,
     /// Default TTL in seconds for ephemeral snapshots (24 hours).
     pub snapshot_default_ttl_secs: u64,
     /// Number of read-only SQLite connections in the reader pool.
@@ -41,6 +49,10 @@ impl Config {
             nonce_expiry_secs: parse_env("NONCE_EXPIRY_SECS", 60),
             nonce_rate_limit: parse_env("NONCE_RATE_LIMIT", 10),
             nonce_rate_window_secs: parse_env("NONCE_RATE_WINDOW_SECS", 60),
+            revoke_rate_limit: parse_env("REVOKE_RATE_LIMIT", 2),
+            revoke_rate_window_secs: parse_env("REVOKE_RATE_WINDOW_SECS", 3600),
+            signed_request_max_skew_secs: parse_env("SIGNED_REQUEST_MAX_SKEW_SECS", 60),
+            signed_request_nonce_window_secs: parse_env("SIGNED_REQUEST_NONCE_WINDOW_SECS", 120),
             snapshot_default_ttl_secs: parse_env("SNAPSHOT_DEFAULT_TTL_SECS", 86400),
             reader_pool_size: parse_env("READER_POOL_SIZE", 4),
             node_exporter_url: std::env::var("NODE_EXPORTER_URL")

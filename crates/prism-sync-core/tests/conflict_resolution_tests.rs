@@ -75,7 +75,12 @@ fn make_delete_op(entity_id: &str, hlc: &Hlc, device_id: &str) -> CrdtChange {
 }
 
 /// No field versions exist — everything is new.
-fn no_field_versions(_sync_id: &str, _table: &str, _eid: &str, _field: &str) -> prism_sync_core::Result<Option<FieldVersion>> {
+fn no_field_versions(
+    _sync_id: &str,
+    _table: &str,
+    _eid: &str,
+    _field: &str,
+) -> prism_sync_core::Result<Option<FieldVersion>> {
     Ok(None)
 }
 
@@ -137,7 +142,11 @@ fn test_later_hlc_timestamp_wins_field_conflict() {
         .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
         .unwrap();
 
-    assert_eq!(winners.len(), 1, "only one op should win for the same field");
+    assert_eq!(
+        winners.len(),
+        1,
+        "only one op should win for the same field"
+    );
     let winner = winners.values().next().unwrap();
     assert_eq!(winner.op.encoded_value, "\"Late\"");
     assert_eq!(winner.op.device_id, "dev-b");
@@ -175,10 +184,21 @@ fn test_lower_hlc_loses_against_persisted_field_version() {
 
     let hlc_old = Hlc::new(500, 0, "dev-old");
 
-    let ops = vec![make_op("t1", "title", "\"OldValue\"", &hlc_old, "dev-old", None)];
+    let ops = vec![make_op(
+        "t1",
+        "title",
+        "\"OldValue\"",
+        &hlc_old,
+        "dev-old",
+        None,
+    )];
 
     // Persisted field version has a higher HLC
-    let get_fv = |_sync_id: &str, _table: &str, _eid: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+    let get_fv = |_sync_id: &str,
+                  _table: &str,
+                  _eid: &str,
+                  field: &str|
+     -> prism_sync_core::Result<Option<FieldVersion>> {
         if field == "title" {
             Ok(Some(FieldVersion {
                 sync_id: SYNC_ID.to_string(),
@@ -200,7 +220,10 @@ fn test_lower_hlc_loses_against_persisted_field_version() {
         .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
         .unwrap();
 
-    assert!(winners.is_empty(), "old HLC should not beat existing field version");
+    assert!(
+        winners.is_empty(),
+        "old HLC should not beat existing field version"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -217,8 +240,22 @@ fn test_higher_hlc_counter_wins() {
     let hlc_high_counter = Hlc::new(5000, 5, "dev-b");
 
     let ops = vec![
-        make_op("t1", "title", "\"LowCounter\"", &hlc_low_counter, "dev-a", None),
-        make_op("t1", "title", "\"HighCounter\"", &hlc_high_counter, "dev-b", None),
+        make_op(
+            "t1",
+            "title",
+            "\"LowCounter\"",
+            &hlc_low_counter,
+            "dev-a",
+            None,
+        ),
+        make_op(
+            "t1",
+            "title",
+            "\"HighCounter\"",
+            &hlc_high_counter,
+            "dev-b",
+            None,
+        ),
     ];
 
     let winners = merge
@@ -345,7 +382,10 @@ fn test_three_devices_same_field_deterministic_winner() {
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(winner.op.encoded_value, "\"FromB\"", "device B with HLC 3000 should win");
+    assert_eq!(
+        winner.op.encoded_value, "\"FromB\"",
+        "device B with HLC 3000 should win"
+    );
 }
 
 /// Three devices, same HLC timestamp — device_id tiebreaker should give
@@ -404,8 +444,18 @@ async fn test_soft_delete_wins_with_later_hlc() {
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
     setup_sync_metadata(&storage, local_device);
-    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
-    register_device(&relay, &storage, remote_device, &signing_key_remote.verifying_key());
+    register_device(
+        &relay,
+        &storage,
+        local_device,
+        &signing_key_local.verifying_key(),
+    );
+    register_device(
+        &relay,
+        &storage,
+        remote_device,
+        &signing_key_remote.verifying_key(),
+    );
 
     // Local has a field version for title at HLC 1000
     let hlc_local = Hlc::new(1000, 0, local_device);
@@ -456,7 +506,10 @@ async fn test_soft_delete_wins_with_later_hlc() {
     assert_eq!(result.merged, 1, "delete op should be merged");
 
     // Verify the entity was soft deleted
-    assert!(entity.is_deleted("t-del").await.unwrap(), "entity should be soft deleted");
+    assert!(
+        entity.is_deleted("t-del").await.unwrap(),
+        "entity should be soft deleted"
+    );
 }
 
 /// After a soft delete is tombstoned (is_deleted field_version exists),
@@ -468,7 +521,11 @@ fn test_tombstone_prevents_resurrection() {
 
     // is_deleted=true is already the winning field version
     let hlc_delete = Hlc::new(5000, 0, "dev-deleter");
-    let get_fv = |_sync_id: &str, _table: &str, _eid: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+    let get_fv = |_sync_id: &str,
+                  _table: &str,
+                  _eid: &str,
+                  field: &str|
+     -> prism_sync_core::Result<Option<FieldVersion>> {
         if field == "is_deleted" {
             Ok(Some(FieldVersion {
                 sync_id: SYNC_ID.to_string(),
@@ -488,13 +545,23 @@ fn test_tombstone_prevents_resurrection() {
 
     // Even with a very high HLC, a title update should be rejected
     let hlc_update = Hlc::new(9999, 0, "dev-updater");
-    let ops = vec![make_op("t-dead", "title", "\"Resurrected!\"", &hlc_update, "dev-updater", None)];
+    let ops = vec![make_op(
+        "t-dead",
+        "title",
+        "\"Resurrected!\"",
+        &hlc_update,
+        "dev-updater",
+        None,
+    )];
 
     let winners = merge
         .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
         .unwrap();
 
-    assert!(winners.is_empty(), "title update on tombstoned entity should be rejected");
+    assert!(
+        winners.is_empty(),
+        "title update on tombstoned entity should be rejected"
+    );
 }
 
 /// A delete op on a tombstoned entity IS allowed (e.g. re-confirming deletion
@@ -505,7 +572,11 @@ fn test_delete_op_allowed_on_tombstoned_entity() {
     let merge = MergeEngine::new(schema);
 
     let hlc_old_delete = Hlc::new(5000, 0, "dev-deleter");
-    let get_fv = |_sync_id: &str, _table: &str, _eid: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+    let get_fv = |_sync_id: &str,
+                  _table: &str,
+                  _eid: &str,
+                  field: &str|
+     -> prism_sync_core::Result<Option<FieldVersion>> {
         if field == "is_deleted" {
             Ok(Some(FieldVersion {
                 sync_id: SYNC_ID.to_string(),
@@ -531,7 +602,11 @@ fn test_delete_op_allowed_on_tombstoned_entity() {
         .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
         .unwrap();
 
-    assert_eq!(winners.len(), 1, "newer delete op should win over old delete");
+    assert_eq!(
+        winners.len(),
+        1,
+        "newer delete op should win over old delete"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -559,7 +634,10 @@ fn test_empty_string_vs_null_later_hlc_wins() {
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(winner.op.encoded_value, "\"\"", "later HLC (empty string) should win over null");
+    assert_eq!(
+        winner.op.encoded_value, "\"\"",
+        "later HLC (empty string) should win over null"
+    );
 }
 
 /// Null value with higher HLC wins over empty string with lower HLC.
@@ -582,7 +660,10 @@ fn test_null_wins_over_empty_string_with_later_hlc() {
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(winner.op.encoded_value, "null", "later HLC (null) should win over empty string");
+    assert_eq!(
+        winner.op.encoded_value, "null",
+        "later HLC (null) should win over empty string"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -605,9 +686,23 @@ fn test_rapid_successive_writes_counter_ordering() {
 
     let ops = vec![
         make_op("t1", "title", "\"First\"", &hlc_0, "dev-fast", Some("op-0")),
-        make_op("t1", "title", "\"Second\"", &hlc_1, "dev-fast", Some("op-1")),
+        make_op(
+            "t1",
+            "title",
+            "\"Second\"",
+            &hlc_1,
+            "dev-fast",
+            Some("op-1"),
+        ),
         make_op("t1", "title", "\"Third\"", &hlc_2, "dev-fast", Some("op-2")),
-        make_op("t1", "title", "\"Fourth\"", &hlc_3, "dev-fast", Some("op-3")),
+        make_op(
+            "t1",
+            "title",
+            "\"Fourth\"",
+            &hlc_3,
+            "dev-fast",
+            Some("op-3"),
+        ),
     ];
 
     let winners = merge
@@ -616,7 +711,10 @@ fn test_rapid_successive_writes_counter_ordering() {
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(winner.op.encoded_value, "\"Fourth\"", "highest counter should win");
+    assert_eq!(
+        winner.op.encoded_value, "\"Fourth\"",
+        "highest counter should win"
+    );
     assert_eq!(winner.op.client_hlc, hlc_3.to_string());
 }
 
@@ -631,11 +729,16 @@ fn test_already_applied_ops_skipped() {
     let merge = MergeEngine::new(schema);
 
     let hlc = Hlc::new(5000, 0, "dev-a");
-    let ops = vec![make_op("t1", "title", "\"Hello\"", &hlc, "dev-a", Some("already-done"))];
+    let ops = vec![make_op(
+        "t1",
+        "title",
+        "\"Hello\"",
+        &hlc,
+        "dev-a",
+        Some("already-done"),
+    )];
 
-    let is_applied = |op_id: &str| -> prism_sync_core::Result<bool> {
-        Ok(op_id == "already-done")
-    };
+    let is_applied = |op_id: &str| -> prism_sync_core::Result<bool> { Ok(op_id == "already-done") };
 
     let winners = merge
         .determine_winners(&ops, &no_field_versions, &is_applied, SYNC_ID)
@@ -716,8 +819,14 @@ fn test_multiple_entities_resolved_independently() {
         .map(|w| (w.op.entity_id.clone(), w.op.encoded_value.clone()))
         .collect();
 
-    assert_eq!(winner_values["t1"], "\"T1-DevB\"", "t1: dev-b with HLC 2000 wins");
-    assert_eq!(winner_values["t2"], "\"T2-DevA\"", "t2: dev-a with HLC 3000 wins");
+    assert_eq!(
+        winner_values["t1"], "\"T1-DevB\"",
+        "t1: dev-b with HLC 2000 wins"
+    );
+    assert_eq!(
+        winner_values["t2"], "\"T2-DevA\"",
+        "t2: dev-a with HLC 3000 wins"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -741,8 +850,18 @@ async fn test_full_sync_concurrent_write_conflict() {
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
     setup_sync_metadata(&storage, local_device);
-    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
-    register_device(&relay, &storage, remote_device, &signing_key_remote.verifying_key());
+    register_device(
+        &relay,
+        &storage,
+        local_device,
+        &signing_key_local.verifying_key(),
+    );
+    register_device(
+        &relay,
+        &storage,
+        remote_device,
+        &signing_key_remote.verifying_key(),
+    );
 
     // Local device has title="Local" at HLC 1000
     let hlc_local = Hlc::new(1000, 0, local_device);
@@ -832,8 +951,18 @@ async fn test_full_sync_different_fields_no_conflict() {
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
     setup_sync_metadata(&storage, local_device);
-    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
-    register_device(&relay, &storage, remote_device, &signing_key_remote.verifying_key());
+    register_device(
+        &relay,
+        &storage,
+        local_device,
+        &signing_key_local.verifying_key(),
+    );
+    register_device(
+        &relay,
+        &storage,
+        remote_device,
+        &signing_key_remote.verifying_key(),
+    );
 
     // Local has title field
     let hlc_local = Hlc::new(1000, 0, local_device);
@@ -915,10 +1044,21 @@ fn test_equal_op_does_not_win() {
     let merge = MergeEngine::new(schema);
 
     let hlc = Hlc::new(5000, 0, "dev-a");
-    let ops = vec![make_op("t1", "title", "\"Hello\"", &hlc, "dev-a", Some("same-op"))];
+    let ops = vec![make_op(
+        "t1",
+        "title",
+        "\"Hello\"",
+        &hlc,
+        "dev-a",
+        Some("same-op"),
+    )];
 
     // Persisted field version has exactly the same HLC and device
-    let get_fv = |_sync_id: &str, _table: &str, _eid: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+    let get_fv = |_sync_id: &str,
+                  _table: &str,
+                  _eid: &str,
+                  field: &str|
+     -> prism_sync_core::Result<Option<FieldVersion>> {
         if field == "title" {
             Ok(Some(FieldVersion {
                 sync_id: SYNC_ID.to_string(),
@@ -943,7 +1083,10 @@ fn test_equal_op_does_not_win() {
     // The op doesn't strictly win (equal is not greater), but it won't be
     // skipped by idempotency check since we're using no_ops_applied.
     // The merge engine's wins_over returns false for equal, so the op is skipped.
-    assert!(winners.is_empty(), "equal op should not win over existing field version");
+    assert!(
+        winners.is_empty(),
+        "equal op should not win over existing field version"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -989,7 +1132,11 @@ fn test_lower_hlc_delete_loses_against_existing_tombstone() {
     let merge = MergeEngine::new(schema);
 
     let hlc_existing_delete = Hlc::new(5000, 0, "dev-deleter");
-    let get_fv = |_sync_id: &str, _table: &str, _eid: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+    let get_fv = |_sync_id: &str,
+                  _table: &str,
+                  _eid: &str,
+                  field: &str|
+     -> prism_sync_core::Result<Option<FieldVersion>> {
         if field == "is_deleted" {
             Ok(Some(FieldVersion {
                 sync_id: SYNC_ID.to_string(),
@@ -1015,7 +1162,10 @@ fn test_lower_hlc_delete_loses_against_existing_tombstone() {
         .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
         .unwrap();
 
-    assert!(winners.is_empty(), "lower-HLC delete should lose against existing tombstone");
+    assert!(
+        winners.is_empty(),
+        "lower-HLC delete should lose against existing tombstone"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1030,7 +1180,11 @@ fn test_undeleted_entity_allows_field_updates() {
     let merge = MergeEngine::new(schema);
 
     let hlc_undelete = Hlc::new(5000, 0, "dev-undeleter");
-    let get_fv = |_sync_id: &str, _table: &str, _eid: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+    let get_fv = |_sync_id: &str,
+                  _table: &str,
+                  _eid: &str,
+                  field: &str|
+     -> prism_sync_core::Result<Option<FieldVersion>> {
         if field == "is_deleted" {
             // Entity was un-deleted: is_deleted field version exists with value "false"
             Ok(Some(FieldVersion {
@@ -1051,14 +1205,24 @@ fn test_undeleted_entity_allows_field_updates() {
 
     // Field update on the un-deleted entity should be accepted
     let hlc_update = Hlc::new(6000, 0, "dev-updater");
-    let ops = vec![make_op("t-revived", "title", "\"Alive Again\"", &hlc_update, "dev-updater", None)];
+    let ops = vec![make_op(
+        "t-revived",
+        "title",
+        "\"Alive Again\"",
+        &hlc_update,
+        "dev-updater",
+        None,
+    )];
 
     let winners = merge
         .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
         .unwrap();
 
-    assert_eq!(winners.len(), 1, "field update on un-deleted entity should be accepted");
+    assert_eq!(
+        winners.len(),
+        1,
+        "field update on un-deleted entity should be accepted"
+    );
     let winner = winners.values().next().unwrap();
     assert_eq!(winner.op.encoded_value, "\"Alive Again\"");
 }
-

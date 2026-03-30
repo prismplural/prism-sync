@@ -410,8 +410,7 @@ impl SasVerification {
         } else {
             &self.responder_ed25519_pk
         };
-        DeviceSigningKey::verify(pk, &self.transcript_hash, signature)
-            .map_err(CoreError::Crypto)
+        DeviceSigningKey::verify(pk, &self.transcript_hash, signature).map_err(CoreError::Crypto)
     }
 }
 
