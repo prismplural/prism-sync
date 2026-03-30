@@ -81,6 +81,15 @@ fn relay_error_kind_to_sync_error_kind(kind: &RelayErrorCategory) -> SyncErrorKi
     }
 }
 
+fn relay_error_details(error: &CoreError) -> (Option<String>, Option<bool>) {
+    match error {
+        CoreError::Relay {
+            code, remote_wipe, ..
+        } => (code.clone(), *remote_wipe),
+        _ => (None, None),
+    }
+}
+
 /// Spawn the auto-sync debounce background task.
 ///
 /// Waits for the first mutation signal on `rx`, then absorbs further signals
@@ -632,10 +641,22 @@ impl SyncService {
                             CoreError::Storage(_) => SyncErrorKind::Network,
                             _ => SyncErrorKind::Network,
                         };
+                        let (code, remote_wipe) = relay_error_details(&e);
+
+                        if code.as_deref() == Some("device_revoked") {
+                            let _ = self.event_tx.send(SyncEvent::DeviceRevoked {
+                                device_id: device_id.to_string(),
+                                remote_wipe: remote_wipe.unwrap_or(false),
+                            });
+                            return Err(e);
+                        }
+
                         let sync_err = SyncError {
                             kind: error_kind,
                             message: e.to_string(),
                             retryable,
+                            code,
+                            remote_wipe,
                         };
                         let _ = self.event_tx.send(SyncEvent::Error(sync_err));
                         return Err(e);
@@ -910,5 +931,21 @@ mod tests {
         assert!(!relay_error_retryable(
             &RelayErrorCategory::DeviceIdentityMismatch
         ));
+    }
+
+    #[test]
+    fn relay_error_details_extracts_revocation_metadata() {
+        let error = CoreError::Relay {
+            message: "device revoked".into(),
+            kind: RelayErrorCategory::Auth,
+            status: None,
+            code: Some("device_revoked".into()),
+            remote_wipe: Some(true),
+        };
+
+        assert_eq!(
+            relay_error_details(&error),
+            (Some("device_revoked".into()), Some(true))
+        );
     }
 }

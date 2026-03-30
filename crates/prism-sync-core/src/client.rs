@@ -576,11 +576,7 @@ impl PrismSync {
                 wrapped_keys,
             )
             .await
-            .map_err(|e| CoreError::Relay {
-                message: e.to_string(),
-                kind: crate::error::RelayErrorCategory::Other,
-                status: None,
-            })? as u32;
+            .map_err(CoreError::from_relay)? as u32;
 
         self.key_hierarchy_mut()
             .store_epoch_key(committed_epoch, zeroize::Zeroizing::new(epoch_key.to_vec()));

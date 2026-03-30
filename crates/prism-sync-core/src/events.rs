@@ -86,6 +86,8 @@ pub struct SyncError {
     pub kind: SyncErrorKind,
     pub message: String,
     pub retryable: bool,
+    pub code: Option<String>,
+    pub remote_wipe: Option<bool>,
 }
 
 /// Classification of sync error kinds.

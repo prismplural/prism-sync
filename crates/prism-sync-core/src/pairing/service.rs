@@ -140,11 +140,7 @@ impl PairingService {
             .relay
             .get_registration_nonce()
             .await
-            .map_err(|e| CoreError::Relay {
-                message: format!("nonce fetch: {e}"),
-                kind: crate::error::RelayErrorCategory::Network,
-                status: None,
-            })?;
+            .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
 
         // Build canonical challenge data matching the relay's verification format:
         // "PRISM_SYNC_CHALLENGE_V1" || 0x00 || len_prefixed(sync_id) || len_prefixed(device_id) || len_prefixed(nonce)
@@ -173,11 +169,7 @@ impl PairingService {
             .relay
             .register_device(register_req)
             .await
-            .map_err(|e| CoreError::Relay {
-                message: format!("registration failed: {e}"),
-                kind: crate::error::RelayErrorCategory::Other,
-                status: None,
-            })?;
+            .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
 
         // 11. Persist credentials and device identity to secure store
         self.secure_store.set(
@@ -268,11 +260,7 @@ impl PairingService {
             .relay
             .get_registration_nonce()
             .await
-            .map_err(|e| CoreError::Relay {
-                message: format!("nonce fetch: {e}"),
-                kind: crate::error::RelayErrorCategory::Network,
-                status: None,
-            })?;
+            .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
 
         // Build canonical challenge data matching the relay's verification format
         let mut challenge_data = Vec::new();
@@ -310,11 +298,7 @@ impl PairingService {
                 signed_invitation: Some(join_invitation),
             })
             .await
-            .map_err(|e| CoreError::Relay {
-                message: format!("registration failed: {e}"),
-                kind: crate::error::RelayErrorCategory::Other,
-                status: None,
-            })?;
+            .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
 
         // 6. Persist credentials to secure store (with rollback marker)
         self.secure_store

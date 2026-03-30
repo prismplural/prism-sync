@@ -1,3 +1,4 @@
+use crate::relay::traits::RelayError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -32,6 +33,8 @@ pub enum CoreError {
         message: String,
         kind: RelayErrorCategory,
         status: Option<u16>,
+        code: Option<String>,
+        remote_wipe: Option<bool>,
     },
 
     #[error("engine error: {0}")]
@@ -58,4 +61,89 @@ pub enum RelayErrorCategory {
     Other,
 }
 
+impl CoreError {
+    pub fn from_relay(error: RelayError) -> Self {
+        Self::from_relay_with_context(None, error)
+    }
+
+    pub fn from_relay_with_context(context: Option<&str>, error: RelayError) -> Self {
+        let message = match context {
+            Some(context) => format!("{context}: {error}"),
+            None => error.to_string(),
+        };
+
+        let (kind, status, code, remote_wipe) = match error {
+            RelayError::Network { .. } | RelayError::Timeout { .. } => {
+                (RelayErrorCategory::Network, None, None, None)
+            }
+            RelayError::Server { status_code, .. } => {
+                (RelayErrorCategory::Server, Some(status_code), None, None)
+            }
+            RelayError::Auth { .. } => (RelayErrorCategory::Auth, None, None, None),
+            RelayError::DeviceIdentityMismatch { .. } => (
+                RelayErrorCategory::DeviceIdentityMismatch,
+                None,
+                Some("device_identity_mismatch".to_string()),
+                None,
+            ),
+            RelayError::DeviceRevoked { remote_wipe } => (
+                RelayErrorCategory::Auth,
+                None,
+                Some("device_revoked".to_string()),
+                Some(remote_wipe),
+            ),
+            RelayError::Protocol { .. }
+            | RelayError::EpochRotation { .. }
+            | RelayError::ClockSkew { .. }
+            | RelayError::KeyChanged { .. } => (RelayErrorCategory::Protocol, None, None, None),
+        };
+
+        CoreError::Relay {
+            message,
+            kind,
+            status,
+            code,
+            remote_wipe,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::{CoreError, RelayErrorCategory};
+    use crate::relay::traits::RelayError;
+
+    #[test]
+    fn from_relay_preserves_device_identity_mismatch_code() {
+        let error = CoreError::from_relay(RelayError::DeviceIdentityMismatch {
+            message: "keys do not match".into(),
+        });
+
+        assert!(matches!(
+            error,
+            CoreError::Relay {
+                kind: RelayErrorCategory::DeviceIdentityMismatch,
+                code: Some(ref code),
+                remote_wipe: None,
+                ..
+            } if code == "device_identity_mismatch"
+        ));
+    }
+
+    #[test]
+    fn from_relay_preserves_device_revoked_remote_wipe() {
+        let error = CoreError::from_relay(RelayError::DeviceRevoked { remote_wipe: true });
+
+        assert!(matches!(
+            error,
+            CoreError::Relay {
+                kind: RelayErrorCategory::Auth,
+                code: Some(ref code),
+                remote_wipe: Some(true),
+                ..
+            } if code == "device_revoked"
+        ));
+    }
+}

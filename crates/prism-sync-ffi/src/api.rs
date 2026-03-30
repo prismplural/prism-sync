@@ -186,6 +186,51 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
     })
 }
 
+const STRUCTURED_ERROR_PREFIX: &str = "PRISM_SYNC_ERROR_JSON:";
+
+fn relay_error_category_to_json(kind: prism_sync_core::RelayErrorCategory) -> &'static str {
+    match kind {
+        prism_sync_core::RelayErrorCategory::Network => "network",
+        prism_sync_core::RelayErrorCategory::Auth => "auth",
+        prism_sync_core::RelayErrorCategory::DeviceIdentityMismatch => "device_identity_mismatch",
+        prism_sync_core::RelayErrorCategory::Server => "server",
+        prism_sync_core::RelayErrorCategory::Protocol => "protocol",
+        prism_sync_core::RelayErrorCategory::Other => "other",
+    }
+}
+
+fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> String {
+    let mut payload = serde_json::json!({
+        "operation": operation,
+        "message": error.to_string(),
+    });
+
+    if let prism_sync_core::CoreError::Relay {
+        kind,
+        status,
+        code,
+        remote_wipe,
+        ..
+    } = &error
+    {
+        payload["error_type"] = serde_json::json!("relay");
+        payload["relay_kind"] = serde_json::json!(relay_error_category_to_json(kind.clone()));
+        if let Some(status) = status {
+            payload["status"] = serde_json::json!(status);
+        }
+        if let Some(code) = code {
+            payload["code"] = serde_json::json!(code);
+        }
+        if let Some(remote_wipe) = remote_wipe {
+            payload["remote_wipe"] = serde_json::json!(remote_wipe);
+        }
+    } else {
+        payload["error_type"] = serde_json::json!("core");
+    }
+
+    format!("{STRUCTURED_ERROR_PREFIX}{payload}")
+}
+
 fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json::Value {
     use prism_sync_core::events::SyncEvent;
     match event {
@@ -204,6 +249,8 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "kind": format!("{:?}", err.kind),
             "message": err.message,
             "retryable": err.retryable,
+            "code": err.code,
+            "remote_wipe": err.remote_wipe,
         }),
         SyncEvent::RemoteChanges(changeset) => {
             let changes: Vec<serde_json::Value> = changeset
@@ -778,6 +825,8 @@ pub async fn set_auto_sync(
                                     kind: prism_sync_core::events::SyncErrorKind::Network,
                                     message: "Sync failed repeatedly for over 10 minutes".into(),
                                     retryable: false,
+                                    code: None,
+                                    remote_wipe: None,
                                 },
                             ));
                             // Reset so a future manual trigger starts fresh
@@ -844,7 +893,10 @@ pub async fn set_auto_sync(
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 pub async fn sync_now(handle: &PrismSyncHandle) -> Result<String, String> {
     let mut inner = handle.inner.lock().await;
-    let result = inner.sync_now().await.map_err(|e| e.to_string())?;
+    let result = inner
+        .sync_now()
+        .await
+        .map_err(|e| encode_core_error("sync_now", e))?;
     Ok(sync_result_to_json(&result).to_string())
 }
 
@@ -1095,7 +1147,7 @@ pub async fn create_sync_group(
     let (creds, invite) = pairing
         .create_sync_group(&password, &relay_url, mnemonic, Some(sync_id))
         .await
-        .map_err(|e| format!("create_sync_group failed: {e}"))?;
+        .map_err(|e| encode_core_error("create_sync_group", e))?;
 
     // Unlock the handle's key hierarchy using the credentials that
     // create_sync_group just produced, and restore the device_secret.
@@ -1333,7 +1385,7 @@ async fn join_with_response(
     let key_hierarchy = pairing
         .join_sync_group(response, password)
         .await
-        .map_err(|e| format!("join_sync_group failed: {e}"))?;
+        .map_err(|e| encode_core_error("join_sync_group", e))?;
 
     // Restore the unlocked key hierarchy and device secret into the handle
     // so subsequent calls (configureEngine, exportDek, etc.) work.

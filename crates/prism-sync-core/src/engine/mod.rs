@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use crate::batch_signature;
 use crate::crdt_change::CrdtChange;
-use crate::error::{CoreError, RelayErrorCategory, Result};
+use crate::error::{CoreError, Result};
 use crate::events::EntityChange;
 use crate::hlc::Hlc;
 use crate::pruning::TombstonePruner;
@@ -223,15 +223,11 @@ impl SyncEngine {
         let since_seq = meta.map(|m| m.last_pulled_server_seq).unwrap_or(0);
 
         // Pull from relay
-        let pull_response =
-            self.relay
-                .pull_changes(since_seq)
-                .await
-                .map_err(|e| CoreError::Relay {
-                    message: e.to_string(),
-                    kind: RelayErrorCategory::Network,
-                    status: None,
-                })?;
+        let pull_response = self
+            .relay
+            .pull_changes(since_seq)
+            .await
+            .map_err(CoreError::from_relay)?;
 
         let min_acked_seq = pull_response.min_acked_seq;
         let max_server_seq = pull_response.max_server_seq;
@@ -420,11 +416,7 @@ impl SyncEngine {
             .relay
             .list_devices()
             .await
-            .map_err(|e| CoreError::Relay {
-                message: e.to_string(),
-                kind: RelayErrorCategory::Network,
-                status: None,
-            })?;
+            .map_err(CoreError::from_relay)?;
 
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
@@ -792,11 +784,7 @@ impl SyncEngine {
             self.relay
                 .push_changes(outgoing)
                 .await
-                .map_err(|e| CoreError::Relay {
-                    message: e.to_string(),
-                    kind: RelayErrorCategory::Network,
-                    status: None,
-                })?;
+                .map_err(CoreError::from_relay)?;
 
             // Mark batch as pushed
             let storage = self.storage.clone();
@@ -861,11 +849,7 @@ impl SyncEngine {
         self.relay
             .put_snapshot(epoch, server_seq, encrypted, ttl_secs, for_device_id)
             .await
-            .map_err(|e| CoreError::Relay {
-                message: e.to_string(),
-                kind: RelayErrorCategory::Network,
-                status: None,
-            })?;
+            .map_err(CoreError::from_relay)?;
 
         Ok(())
     }
@@ -887,11 +871,7 @@ impl SyncEngine {
             .relay
             .get_snapshot()
             .await
-            .map_err(|e| CoreError::Relay {
-                message: e.to_string(),
-                kind: RelayErrorCategory::Network,
-                status: None,
-            })?;
+            .map_err(CoreError::from_relay)?;
 
         let snapshot = match snapshot {
             Some(s) => s,
