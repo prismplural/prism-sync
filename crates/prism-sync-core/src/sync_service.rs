@@ -63,6 +63,24 @@ impl Default for AutoSyncConfig {
     }
 }
 
+fn relay_error_retryable(kind: &RelayErrorCategory) -> bool {
+    matches!(
+        kind,
+        RelayErrorCategory::Network | RelayErrorCategory::Server
+    )
+}
+
+fn relay_error_kind_to_sync_error_kind(kind: &RelayErrorCategory) -> SyncErrorKind {
+    match kind {
+        RelayErrorCategory::Network => SyncErrorKind::Network,
+        RelayErrorCategory::Auth => SyncErrorKind::Auth,
+        RelayErrorCategory::DeviceIdentityMismatch => SyncErrorKind::DeviceIdentityMismatch,
+        RelayErrorCategory::Server => SyncErrorKind::Server,
+        RelayErrorCategory::Protocol => SyncErrorKind::Protocol,
+        RelayErrorCategory::Other => SyncErrorKind::Network,
+    }
+}
+
 /// Spawn the auto-sync debounce background task.
 ///
 /// Waits for the first mutation signal on `rx`, then absorbs further signals
@@ -600,23 +618,16 @@ impl SyncService {
                 }
                 Err(e) => {
                     let retryable = match &e {
-                        CoreError::Relay { kind, .. } => matches!(
-                            kind,
-                            RelayErrorCategory::Network | RelayErrorCategory::Server
-                        ),
+                        CoreError::Relay { kind, .. } => relay_error_retryable(kind),
                         _ => false,
                     };
 
                     attempts += 1;
                     if !retryable || attempts > self.auto_sync_config.max_retries {
                         let error_kind = match &e {
-                            CoreError::Relay { kind, .. } => match kind {
-                                RelayErrorCategory::Network => SyncErrorKind::Network,
-                                RelayErrorCategory::Auth => SyncErrorKind::Auth,
-                                RelayErrorCategory::Server => SyncErrorKind::Server,
-                                RelayErrorCategory::Protocol => SyncErrorKind::Protocol,
-                                RelayErrorCategory::Other => SyncErrorKind::Network,
-                            },
+                            CoreError::Relay { kind, .. } => {
+                                relay_error_kind_to_sync_error_kind(kind)
+                            }
                             CoreError::Engine(_) => SyncErrorKind::Network,
                             CoreError::Storage(_) => SyncErrorKind::Network,
                             _ => SyncErrorKind::Network,
@@ -884,5 +895,20 @@ mod tests {
         });
         assert!(trigger_rx.is_none());
         assert!(service.auto_sync_tx.is_none());
+    }
+
+    #[test]
+    fn relay_error_category_maps_device_identity_mismatch() {
+        assert_eq!(
+            relay_error_kind_to_sync_error_kind(&RelayErrorCategory::DeviceIdentityMismatch),
+            SyncErrorKind::DeviceIdentityMismatch
+        );
+    }
+
+    #[test]
+    fn relay_error_category_device_identity_mismatch_is_not_retryable() {
+        assert!(!relay_error_retryable(
+            &RelayErrorCategory::DeviceIdentityMismatch
+        ));
     }
 }

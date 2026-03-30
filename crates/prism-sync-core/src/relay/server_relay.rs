@@ -139,14 +139,25 @@ impl ServerRelay {
     fn classify_error(status: u16, body: &str) -> RelayError {
         match status {
             401 => {
-                // Check if this is a device_revoked response with wipe status
+                // Check if this is a structured auth response from the relay.
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-                    if json.get("error").and_then(|v| v.as_str()) == Some("device_revoked") {
-                        let remote_wipe = json
-                            .get("remote_wipe")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        return RelayError::DeviceRevoked { remote_wipe };
+                    match json.get("error").and_then(|v| v.as_str()) {
+                        Some("device_revoked") => {
+                            let remote_wipe = json
+                                .get("remote_wipe")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            return RelayError::DeviceRevoked { remote_wipe };
+                        }
+                        Some("device_identity_mismatch") => {
+                            let message = json
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+                            return RelayError::DeviceIdentityMismatch { message };
+                        }
+                        _ => {}
                     }
                 }
                 RelayError::Auth {
@@ -220,6 +231,44 @@ impl ServerRelay {
 fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
     buf.extend_from_slice(data);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerRelay;
+    use crate::relay::traits::RelayError;
+
+    #[test]
+    fn classify_error_keeps_device_revoked_response_structured() {
+        let err =
+            ServerRelay::classify_error(401, r#"{"error":"device_revoked","remote_wipe":true}"#);
+
+        assert!(matches!(
+            err,
+            RelayError::DeviceRevoked { remote_wipe: true }
+        ));
+    }
+
+    #[test]
+    fn classify_error_parses_device_identity_mismatch() {
+        let err = ServerRelay::classify_error(
+            401,
+            r#"{"error":"device_identity_mismatch","message":"keys do not match"}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::DeviceIdentityMismatch { ref message }
+                if message == "keys do not match"
+        ));
+    }
+
+    #[test]
+    fn classify_error_falls_back_to_auth_for_unknown_401_json() {
+        let err = ServerRelay::classify_error(401, r#"{"error":"something_else"}"#);
+
+        assert!(matches!(err, RelayError::Auth { .. }));
+    }
 }
 
 #[async_trait]

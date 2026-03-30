@@ -93,6 +93,7 @@ pub struct SyncError {
 pub enum SyncErrorKind {
     Network,
     Auth,
+    DeviceIdentityMismatch,
     Server,
     EpochRotation,
     Protocol,

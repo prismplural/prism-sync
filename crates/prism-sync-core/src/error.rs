@@ -52,6 +52,7 @@ pub enum CoreError {
 pub enum RelayErrorCategory {
     Network,
     Auth,
+    DeviceIdentityMismatch,
     Server,
     Protocol,
     Other,

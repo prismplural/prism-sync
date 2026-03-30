@@ -22,6 +22,9 @@ pub enum RelayError {
     #[error("auth error: {message}")]
     Auth { message: String },
 
+    #[error("device identity mismatch: {message}")]
+    DeviceIdentityMismatch { message: String },
+
     #[error("protocol error: {message}")]
     Protocol { message: String },
 
@@ -46,6 +49,7 @@ impl RelayError {
             RelayError::Server { .. } => RelayErrorKind::Server,
             RelayError::Timeout { .. } => RelayErrorKind::Timeout,
             RelayError::Auth { .. } => RelayErrorKind::Auth,
+            RelayError::DeviceIdentityMismatch { .. } => RelayErrorKind::DeviceIdentityMismatch,
             RelayError::Protocol { .. } => RelayErrorKind::Protocol,
             RelayError::EpochRotation { .. } => RelayErrorKind::EpochRotation,
             RelayError::ClockSkew { .. } => RelayErrorKind::ClockSkew,
@@ -70,6 +74,7 @@ pub enum RelayErrorKind {
     Server,
     Timeout,
     Auth,
+    DeviceIdentityMismatch,
     Protocol,
     EpochRotation,
     ClockSkew,
