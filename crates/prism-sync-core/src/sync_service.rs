@@ -86,6 +86,7 @@ fn relay_error_details(error: &CoreError) -> (Option<String>, Option<bool>) {
         CoreError::Relay {
             code, remote_wipe, ..
         } => (code.clone(), *remote_wipe),
+        CoreError::DeviceKeyChanged { .. } => (Some("device_key_changed".into()), None),
         _ => (None, None),
     }
 }
@@ -637,6 +638,7 @@ impl SyncService {
                             CoreError::Relay { kind, .. } => {
                                 relay_error_kind_to_sync_error_kind(kind)
                             }
+                            CoreError::DeviceKeyChanged { .. } => SyncErrorKind::KeyChanged,
                             CoreError::Engine(_) => SyncErrorKind::Network,
                             CoreError::Storage(_) => SyncErrorKind::Network,
                             _ => SyncErrorKind::Network,
@@ -946,6 +948,18 @@ mod tests {
         assert_eq!(
             relay_error_details(&error),
             (Some("device_revoked".into()), Some(true))
+        );
+    }
+
+    #[test]
+    fn relay_error_details_extracts_device_key_change_code() {
+        let error = CoreError::DeviceKeyChanged {
+            device_id: "dev-a".into(),
+        };
+
+        assert_eq!(
+            relay_error_details(&error),
+            (Some("device_key_changed".into()), None)
         );
     }
 }

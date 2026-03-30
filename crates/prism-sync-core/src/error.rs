@@ -37,6 +37,9 @@ pub enum CoreError {
         remote_wipe: Option<bool>,
     },
 
+    #[error("device {device_id} key changed")]
+    DeviceKeyChanged { device_id: String },
+
     #[error("engine error: {0}")]
     Engine(String),
 

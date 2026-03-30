@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 use crate::batch_signature;
 use crate::crdt_change::CrdtChange;
+use crate::device_registry::DeviceRegistryManager;
 use crate::error::{CoreError, Result};
 use crate::events::EntityChange;
 use crate::hlc::Hlc;
@@ -421,19 +422,27 @@ impl SyncEngine {
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut tx = storage.begin_tx()?;
-            for dev in &devices {
-                tx.upsert_device_record(&DeviceRecord {
-                    sync_id: sid.clone(),
-                    device_id: dev.device_id.clone(),
-                    ed25519_public_key: dev.ed25519_public_key.clone(),
-                    x25519_public_key: dev.x25519_public_key.clone(),
-                    status: dev.status.clone(),
-                    registered_at: chrono::Utc::now(),
-                    revoked_at: None,
-                })?;
-            }
-            tx.commit()
+            let device_records = devices
+                .into_iter()
+                .map(|dev| {
+                    let observed_at = chrono::Utc::now();
+                    DeviceRecord {
+                        sync_id: sid.clone(),
+                        device_id: dev.device_id,
+                        ed25519_public_key: dev.ed25519_public_key,
+                        x25519_public_key: dev.x25519_public_key,
+                        status: dev.status.clone(),
+                        registered_at: observed_at,
+                        revoked_at: if dev.status == "revoked" {
+                            Some(observed_at)
+                        } else {
+                            None
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            DeviceRegistryManager::merge_relay_devices(&*storage, &sid, &device_records)
         })
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))??;

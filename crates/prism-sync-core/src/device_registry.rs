@@ -14,18 +14,36 @@ use crate::storage::{DeviceRecord, SyncStorage};
 pub struct DeviceRegistryManager;
 
 impl DeviceRegistryManager {
+    fn keys_match(existing: &DeviceRecord, candidate: &DeviceRecord) -> bool {
+        existing.ed25519_public_key == candidate.ed25519_public_key
+            && existing.x25519_public_key == candidate.x25519_public_key
+    }
+
+    fn write_device_record(storage: &dyn SyncStorage, device: &DeviceRecord) -> Result<()> {
+        let mut tx = storage.begin_tx()?;
+        tx.upsert_device_record(device)?;
+        tx.commit()
+    }
+
     /// Pin a device's keys on first sight (Trust On First Use).
     ///
-    /// If the device already exists, its record is updated (upsert).
+    /// If the device already exists with the same keys, status metadata may be
+    /// updated. Key changes fail closed.
     pub fn pin_device(
         storage: &dyn SyncStorage,
         sync_id: &str,
         device: &DeviceRecord,
     ) -> Result<()> {
         let _ = sync_id; // sync_id is part of the DeviceRecord
-        let mut tx = storage.begin_tx()?;
-        tx.upsert_device_record(device)?;
-        tx.commit()
+        match storage.get_device_record(sync_id, &device.device_id)? {
+            None => Self::write_device_record(storage, device),
+            Some(existing) if Self::keys_match(&existing, device) => {
+                Self::write_device_record(storage, device)
+            }
+            Some(_) => Err(CoreError::DeviceKeyChanged {
+                device_id: device.device_id.clone(),
+            }),
+        }
     }
 
     /// Verify that a device's claimed Ed25519 public key matches the pinned key.
@@ -48,9 +66,11 @@ impl DeviceRegistryManager {
             Some(r) if r.status == "revoked" => Err(CoreError::Storage(format!(
                 "device {device_id} has been revoked"
             ))),
-            Some(r) if r.ed25519_public_key != claimed_ed25519_pk => Err(CoreError::Storage(
-                format!("device {device_id} key changed — verification required"),
-            )),
+            Some(r) if r.ed25519_public_key != claimed_ed25519_pk => {
+                Err(CoreError::DeviceKeyChanged {
+                    device_id: device_id.to_string(),
+                })
+            }
             Some(_) => Ok(()),
         }
     }
@@ -62,14 +82,70 @@ impl DeviceRegistryManager {
     /// device.
     pub fn import_keyring(
         storage: &dyn SyncStorage,
-        _sync_id: &str,
+        sync_id: &str,
         keyring: &[DeviceRecord],
     ) -> Result<()> {
-        let mut tx = storage.begin_tx()?;
         for device in keyring {
-            tx.upsert_device_record(device)?;
+            Self::pin_device(storage, sync_id, device)?;
         }
-        tx.commit()
+        Ok(())
+    }
+
+    /// Merge a relay-provided device record without allowing silent key
+    /// replacement for a known device.
+    ///
+    /// Current behavior still allows inserting unknown devices from the relay
+    /// so existing pair flows continue to work until signed registry updates are
+    /// fully wired. Known devices may only receive status/timestamp updates if
+    /// their keys are unchanged.
+    pub fn merge_relay_device(
+        storage: &dyn SyncStorage,
+        sync_id: &str,
+        device: &DeviceRecord,
+    ) -> Result<()> {
+        let _ = sync_id; // sync_id is part of the DeviceRecord
+        let existing = storage.get_device_record(sync_id, &device.device_id)?;
+        let merged = match existing {
+            None => device.clone(),
+            Some(existing) if !Self::keys_match(&existing, device) => {
+                return Err(CoreError::DeviceKeyChanged {
+                    device_id: device.device_id.clone(),
+                });
+            }
+            Some(existing) if existing.status == "revoked" && device.status != "revoked" => {
+                return Ok(());
+            }
+            Some(existing) => DeviceRecord {
+                sync_id: device.sync_id.clone(),
+                device_id: device.device_id.clone(),
+                ed25519_public_key: existing.ed25519_public_key,
+                x25519_public_key: existing.x25519_public_key,
+                status: device.status.clone(),
+                registered_at: existing.registered_at,
+                revoked_at: if device.status == "revoked" {
+                    existing
+                        .revoked_at
+                        .or(device.revoked_at)
+                        .or_else(|| Some(chrono::Utc::now()))
+                } else {
+                    None
+                },
+            },
+        };
+
+        Self::write_device_record(storage, &merged)
+    }
+
+    /// Merge a relay-provided device list using [`merge_relay_device`] rules.
+    pub fn merge_relay_devices(
+        storage: &dyn SyncStorage,
+        sync_id: &str,
+        devices: &[DeviceRecord],
+    ) -> Result<()> {
+        for device in devices {
+            Self::merge_relay_device(storage, sync_id, device)?;
+        }
+        Ok(())
     }
 
     /// Mark a device as revoked by setting its status to "revoked".
@@ -213,15 +289,66 @@ mod tests {
         let device1 = make_device("sync-1", "dev-a", &[1u8; 32]);
         DeviceRegistryManager::pin_device(&storage, "sync-1", &device1).unwrap();
 
-        // Update with new key (re-pin after SAS verification, for example)
+        // Re-pinning with a different key should fail closed.
         let device2 = make_device("sync-1", "dev-a", &[99u8; 32]);
-        DeviceRegistryManager::pin_device(&storage, "sync-1", &device2).unwrap();
+        let result = DeviceRegistryManager::pin_device(&storage, "sync-1", &device2);
+        assert!(matches!(
+            result,
+            Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-a"
+        ));
 
-        // New key should now verify
-        DeviceRegistryManager::verify_device_key(&storage, "sync-1", "dev-a", &[99u8; 32]).unwrap();
-        // Old key should fail
-        let result =
-            DeviceRegistryManager::verify_device_key(&storage, "sync-1", "dev-a", &[1u8; 32]);
-        assert!(result.is_err());
+        DeviceRegistryManager::verify_device_key(&storage, "sync-1", "dev-a", &[1u8; 32]).unwrap();
+    }
+
+    #[test]
+    fn merge_relay_device_updates_status_without_repinning() {
+        let storage = make_storage();
+        let original = make_device("sync-1", "dev-a", &[1u8; 32]);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &original).unwrap();
+
+        let mut revoked = original.clone();
+        revoked.status = "revoked".into();
+        revoked.revoked_at = Some(Utc::now());
+
+        DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &revoked).unwrap();
+
+        let stored = storage
+            .get_device_record("sync-1", "dev-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "revoked");
+        assert_eq!(stored.ed25519_public_key, original.ed25519_public_key);
+        assert_eq!(stored.x25519_public_key, original.x25519_public_key);
+    }
+
+    #[test]
+    fn merge_relay_device_rejects_key_change() {
+        let storage = make_storage();
+        let original = make_device("sync-1", "dev-a", &[1u8; 32]);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &original).unwrap();
+
+        let changed = make_device("sync-1", "dev-a", &[9u8; 32]);
+        let result = DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &changed);
+        assert!(matches!(
+            result,
+            Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-a"
+        ));
+    }
+
+    #[test]
+    fn merge_relay_device_does_not_unrevoke_local_tombstone() {
+        let storage = make_storage();
+        let device = make_device("sync-1", "dev-a", &[1u8; 32]);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
+        DeviceRegistryManager::revoke_device(&storage, "sync-1", "dev-a").unwrap();
+
+        let active_again = make_device("sync-1", "dev-a", &[1u8; 32]);
+        DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &active_again).unwrap();
+
+        let stored = storage
+            .get_device_record("sync-1", "dev-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "revoked");
     }
 }
