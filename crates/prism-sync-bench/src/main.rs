@@ -70,6 +70,7 @@ async fn start_in_process_relay(reader_pool_size: usize) -> Result<String> {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 86400,
+        first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
         stale_device_secs: 2_592_000,
@@ -83,8 +84,15 @@ async fn start_in_process_relay(reader_pool_size: usize) -> Result<String> {
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: false,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
     let db = Database::open(
