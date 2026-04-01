@@ -28,11 +28,25 @@ pub struct Config {
     pub signed_request_nonce_window_secs: u64,
     /// Default TTL in seconds for ephemeral snapshots (24 hours).
     pub snapshot_default_ttl_secs: u64,
+    /// How long revoked device tombstones should be retained before cleanup.
+    pub revoked_tombstone_retention_secs: u64,
     /// Number of read-only SQLite connections in the reader pool.
     pub reader_pool_size: usize,
     /// URL of node-exporter for /metrics/node proxy (e.g. http://node-exporter:9100).
     /// If unset, the endpoint returns 404.
     pub node_exporter_url: Option<String>,
+    /// Enable Apple App Attest as a first-device admission signal.
+    pub first_device_apple_attestation_enabled: bool,
+    /// Trust anchors for Apple App Attest verification, PEM-encoded.
+    pub first_device_apple_attestation_trust_roots_pem: Vec<String>,
+    /// Allowlisted Apple app IDs (TEAMID.bundle_id) that may present App Attest.
+    pub first_device_apple_attestation_allowed_app_ids: Vec<String>,
+    /// Enable Android hardware-backed attestation as a first-device admission signal.
+    pub first_device_android_attestation_enabled: bool,
+    /// Trust anchors for Android hardware attestation verification, PEM-encoded.
+    pub first_device_android_attestation_trust_roots_pem: Vec<String>,
+    /// Allowlisted verified boot keys (hex-encoded) that identify GrapheneOS devices.
+    pub grapheneos_verified_boot_key_allowlist: Vec<String>,
 }
 
 impl Config {
@@ -58,11 +72,91 @@ impl Config {
             signed_request_max_skew_secs: parse_env("SIGNED_REQUEST_MAX_SKEW_SECS", 60),
             signed_request_nonce_window_secs: parse_env("SIGNED_REQUEST_NONCE_WINDOW_SECS", 120),
             snapshot_default_ttl_secs: parse_env("SNAPSHOT_DEFAULT_TTL_SECS", 86400),
+            revoked_tombstone_retention_secs: parse_env(
+                "REVOKED_TOMBSTONE_RETENTION_SECS",
+                2_592_000,
+            ),
             reader_pool_size: parse_env("READER_POOL_SIZE", 4),
             node_exporter_url: std::env::var("NODE_EXPORTER_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            first_device_apple_attestation_enabled: parse_bool_env(
+                "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED",
+                false,
+            ),
+            first_device_apple_attestation_trust_roots_pem: parse_json_vec_env(
+                "FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM",
+                Vec::new(),
+            ),
+            first_device_apple_attestation_allowed_app_ids: parse_json_vec_env(
+                "FIRST_DEVICE_APPLE_ATTESTATION_ALLOWED_APP_IDS",
+                Vec::new(),
+            ),
+            first_device_android_attestation_enabled: parse_bool_env(
+                "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED",
+                true,
+            ),
+            first_device_android_attestation_trust_roots_pem: parse_json_vec_env(
+                "FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM",
+                default_android_attestation_roots(),
+            ),
+            grapheneos_verified_boot_key_allowlist: parse_json_vec_env(
+                "GRAPHENEOS_VERIFIED_BOOT_KEY_ALLOWLIST",
+                Vec::new(),
+            ),
         }
+    }
+
+    /// Maximum first-device nonce requests permitted per window.
+    pub fn first_device_nonce_rate_limit(&self) -> u32 {
+        parse_env("FIRST_DEVICE_NONCE_RATE_LIMIT", 3)
+    }
+
+    /// Sliding window for first-device nonce rate limiting.
+    pub fn first_device_nonce_rate_window_secs(&self) -> u64 {
+        parse_env("FIRST_DEVICE_NONCE_RATE_WINDOW_SECS", 60)
+    }
+
+    /// Maximum first-device registration attempts permitted per window.
+    pub fn first_device_registration_rate_limit(&self) -> u32 {
+        parse_env("FIRST_DEVICE_REGISTRATION_RATE_LIMIT", 3)
+    }
+
+    /// Sliding window for first-device registration rate limiting.
+    pub fn first_device_registration_rate_window_secs(&self) -> u64 {
+        parse_env("FIRST_DEVICE_REGISTRATION_RATE_WINDOW_SECS", 60)
+    }
+
+    /// Maximum new-group creations permitted per window.
+    pub fn first_device_group_rate_limit(&self) -> u32 {
+        parse_env("FIRST_DEVICE_GROUP_RATE_LIMIT", 3)
+    }
+
+    /// Sliding window for new-group creation rate limiting.
+    pub fn first_device_group_rate_window_secs(&self) -> u64 {
+        parse_env("FIRST_DEVICE_GROUP_RATE_WINDOW_SECS", 600)
+    }
+
+    /// Brand-new groups get a much smaller unpruned batch budget until they age out.
+    pub fn brand_new_group_max_unpruned_batches(&self) -> u64 {
+        let cap = parse_env(
+            "BRAND_NEW_GROUP_MAX_UNPRUNED_BATCHES",
+            self.max_unpruned_batches / 10,
+        );
+        cap.max(10).min(self.max_unpruned_batches.max(1))
+    }
+
+    /// Age threshold after which a group is no longer treated as brand-new.
+    pub fn brand_new_group_age_secs(&self) -> u64 {
+        parse_env("BRAND_NEW_GROUP_AGE_SECS", 86_400)
+    }
+
+    /// Abandoned brand-new groups are eligible for cleanup after this long.
+    pub fn abandoned_brand_new_group_ttl_secs(&self) -> u64 {
+        parse_env(
+            "ABANDONED_BRAND_NEW_GROUP_TTL_SECS",
+            self.sync_inactive_ttl_secs,
+        )
     }
 }
 
@@ -71,4 +165,30 @@ fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn parse_bool_env(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn parse_json_vec_env(key: &str, default: Vec<String>) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or(default)
+}
+
+fn default_android_attestation_roots() -> Vec<String> {
+    vec![
+        include_str!("android_attestation_roots/root_rsa.pem").to_string(),
+        include_str!("android_attestation_roots/root_p384.pem").to_string(),
+    ]
 }

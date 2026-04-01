@@ -1,5 +1,5 @@
 //! End-to-end tests for device registration, listing, status, authentication,
-//! revocation, rekey, and invitation flows against the actual prism-sync-relay
+//! revocation, and rekey flows against the actual prism-sync-relay
 //! server running in-process with an in-memory SQLite database.
 //!
 //! These tests use raw `reqwest` calls to exercise the relay HTTP API because
@@ -10,10 +10,12 @@
 mod common;
 
 use base64::Engine;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use reqwest::Client;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use prism_sync_relay::{
     config::Config,
@@ -35,41 +37,180 @@ async fn fetch_nonce(client: &Client, url: &str, sync_id: &str) -> String {
     nonce_json["nonce"].as_str().unwrap().to_string()
 }
 
-fn build_signed_invitation(
+fn is_first_device_pow_valid(
     sync_id: &str,
-    relay_url: &str,
-    inviter_device_id: &str,
-    inviter_key: &SigningKey,
-    joiner_device_id: &str,
-) -> Value {
-    let wrapped_dek = b"test-wrapped-dek";
-    let salt = b"test-salt-value-16";
-    let inviter_pk_bytes: [u8; 32] = *inviter_key.verifying_key().as_bytes();
-    let signing_data = prism_sync_relay::auth::build_invitation_signing_data(
-        sync_id,
-        relay_url,
-        wrapped_dek,
-        salt,
-        inviter_device_id,
-        &inviter_pk_bytes,
-        Some(joiner_device_id),
+    device_id: &str,
+    nonce: &str,
+    counter: u64,
+    difficulty_bits: u8,
+) -> bool {
+    let mut hasher = Sha256::new();
+    hasher.update(b"PRISM_SYNC_FIRST_DEVICE_POW_V1\x00");
+    hasher.update(sync_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(device_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(nonce.as_bytes());
+    hasher.update([0]);
+    hasher.update(counter.to_be_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+
+    let full_zero_bytes = (difficulty_bits / 8) as usize;
+    let remaining_bits = difficulty_bits % 8;
+    if hash[..full_zero_bytes].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+    if remaining_bits == 0 {
+        return true;
+    }
+    let mask = 0xFFu8 << (8 - remaining_bits);
+    hash.get(full_zero_bytes)
+        .is_some_and(|byte| byte & mask == 0)
+}
+
+fn apple_attestation_challenge(sync_id: &str, device_id: &str, nonce: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"PRISM_SYNC_APPLE_APP_ATTEST_V1\x00");
+    hasher.update(sync_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(device_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(nonce.as_bytes());
+    hasher.finalize().into()
+}
+
+fn build_apple_auth_data(app_id: &str, credential_id: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&Sha256::digest(app_id.as_bytes()));
+    data.push(0x41);
+    data.extend_from_slice(&0u32.to_be_bytes());
+    data.extend_from_slice(&[0u8; 16]);
+    data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+    data.extend_from_slice(credential_id);
+    data.extend_from_slice(&[0u8; 65]);
+    data
+}
+
+fn build_apple_certificate_nonce(auth_data: &[u8], client_data_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(auth_data);
+    hasher.update(client_data_hash);
+    hasher.finalize().into()
+}
+
+fn build_apple_attestation_extension(nonce: [u8; 32]) -> Vec<u8> {
+    use simple_asn1::{to_der, ASN1Block};
+    to_der(&ASN1Block::Sequence(
         0,
-        &[],
-    );
-    let signature = inviter_key.sign(&signing_data);
+        vec![ASN1Block::OctetString(0, nonce.to_vec())],
+    ))
+    .unwrap()
+}
+
+fn build_apple_app_attest_proof(
+    sync_id: &str,
+    device_id: &str,
+    nonce: &str,
+    app_id: &str,
+    key_id: &[u8],
+    root_cert: &rcgen::Certificate,
+    root_key: &rcgen::KeyPair,
+) -> Value {
+    use rcgen::{CertificateParams, CustomExtension, KeyPair};
+
+    let client_data_hash = apple_attestation_challenge(sync_id, device_id, nonce);
+    let auth_data = build_apple_auth_data(app_id, key_id);
+    let attestation_nonce = build_apple_certificate_nonce(&auth_data, &client_data_hash);
+
+    let mut leaf_params = CertificateParams::new(vec!["leaf".into()]).unwrap();
+    leaf_params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
+            &[1, 2, 840, 113635, 100, 8, 2],
+            build_apple_attestation_extension(attestation_nonce),
+        ));
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, root_cert, root_key)
+        .unwrap();
+
+    let attestation_object = serde_cbor::to_vec(&serde_cbor::Value::Map(BTreeMap::from([
+        (
+            serde_cbor::Value::Text("fmt".into()),
+            serde_cbor::Value::Text("apple-appattest".into()),
+        ),
+        (
+            serde_cbor::Value::Text("authData".into()),
+            serde_cbor::Value::Bytes(auth_data),
+        ),
+        (
+            serde_cbor::Value::Text("attStmt".into()),
+            serde_cbor::Value::Map(BTreeMap::from([(
+                serde_cbor::Value::Text("x5c".into()),
+                serde_cbor::Value::Array(vec![
+                    serde_cbor::Value::Bytes(leaf_cert.der().to_vec()),
+                    serde_cbor::Value::Bytes(root_cert.der().to_vec()),
+                ]),
+            )])),
+        ),
+    ])))
+    .unwrap();
 
     serde_json::json!({
-        "sync_id": sync_id,
-        "relay_url": relay_url,
-        "wrapped_dek": hex::encode(wrapped_dek),
-        "salt": hex::encode(salt),
-        "inviter_device_id": inviter_device_id,
-        "inviter_ed25519_pk": hex::encode(inviter_pk_bytes),
-        "signature": hex::encode(signature.to_bytes()),
-        "joiner_device_id": joiner_device_id,
-        "current_epoch": 0,
-        "epoch_key_hex": "",
+        "kind": "apple_app_attest",
+        "key_id": base64::engine::general_purpose::STANDARD.encode(key_id),
+        "attestation_object": base64::engine::general_purpose::STANDARD.encode(attestation_object),
     })
+}
+
+fn make_apple_test_root() -> (rcgen::Certificate, rcgen::KeyPair) {
+    use rcgen::{CertificateParams, IsCa, KeyPair};
+
+    let mut params = CertificateParams::new(vec!["Apple App Attest CA".into()]).unwrap();
+    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key_pair = KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    (cert, key_pair)
+}
+
+async fn fetch_nonce_json_with_ip(client: &Client, url: &str, sync_id: &str, ip: &str) -> Value {
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .header("X-Test-Client-Ip", ip)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    nonce_resp.json().await.unwrap()
+}
+
+async fn register_first_device_with_ip(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    signing_key: &SigningKey,
+    nonce_json: &Value,
+    ip: &str,
+) -> reqwest::Response {
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+    let challenge_sig = sign_challenge(signing_key, sync_id, device_id, nonce);
+    let mut x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut x25519_pk);
+
+    let req = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .header("X-Test-Client-Ip", ip)
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "pow_solution": pow_solution_from_nonce_json(sync_id, device_id, nonce_json),
+        }));
+
+    req.send().await.unwrap()
 }
 
 // ───────────────────────────── Test 1: Registration E2E ─────────────────
@@ -201,8 +342,15 @@ async fn test_registration_rejects_expired_nonce() {
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -283,25 +431,25 @@ async fn test_nonce_rate_limiting() {
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
-    let db = Database::in_memory().expect("in-memory db");
-    let state = AppState::new(db, config);
-    let app = routes::router(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("http://127.0.0.1:{}", addr.port());
-    let _handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (url, _server, db) = start_test_relay_with_config(config).await;
 
     let client = Client::new();
     let sync_id = generate_sync_id();
+    db.with_conn(|conn| db::create_sync_group(conn, &sync_id, 0))
+        .unwrap();
 
-    // First 3 requests should succeed
+    // Existing groups still use the per-sync nonce limiter.
     for i in 0..3 {
         let resp = client
             .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
@@ -311,25 +459,146 @@ async fn test_nonce_rate_limiting() {
         assert_eq!(resp.status(), 200, "request {i} should succeed");
     }
 
-    // 4th request should be rate-limited
     let resp = client
         .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 429, "4th request should be rate-limited");
+}
 
-    // Different sync_id should still work
-    let other_sync_id = generate_sync_id();
+#[tokio::test]
+#[cfg(feature = "test-helpers")]
+async fn test_first_device_nonce_rate_limiting_is_ip_scoped() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let ip = "203.0.113.10";
+
+    for i in 0..3 {
+        let sync_id = generate_sync_id();
+        let resp = client
+            .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+            .header("X-Test-Client-Ip", ip)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "request {i} should succeed");
+    }
+
+    let sync_id = generate_sync_id();
     let resp = client
-        .get(format!("{url}/v1/sync/{other_sync_id}/register-nonce"))
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .header("X-Test-Client-Ip", ip)
         .send()
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
-        200,
-        "different sync_id should not be rate-limited"
+        429,
+        "4th first-device nonce should be limited"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "test-helpers")]
+async fn test_first_device_registration_rate_limiting() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let ip = "198.51.100.9";
+
+    for i in 0..3 {
+        let sync_id = generate_sync_id();
+        let nonce_json = fetch_nonce_json_with_ip(&client, &url, &sync_id, ip).await;
+        let device_id = generate_device_id();
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let resp = register_first_device_with_ip(
+            &client,
+            &url,
+            &sync_id,
+            &device_id,
+            &signing_key,
+            &nonce_json,
+            ip,
+        )
+        .await;
+        assert_eq!(resp.status(), 201, "registration {i} should succeed");
+    }
+
+    let sync_id = generate_sync_id();
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        429,
+        "4th first-device admission should be limited"
+    );
+}
+
+#[tokio::test]
+async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
+    let config = Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 50,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
+    };
+
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+
+    for i in 0..10 {
+        let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
+        let resp = client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .json(&envelope)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "batch {i} should succeed");
+    }
+
+    let envelope = make_test_envelope(&sync_id, &device_id, "batch-010", 0);
+    let resp = client
+        .put(format!("{url}/v1/sync/{sync_id}/changes"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .json(&envelope)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        507,
+        "brand-new group should hit the smaller storage cap"
     );
 }
 
@@ -350,8 +619,15 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -461,6 +737,80 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
 }
 
 #[tokio::test]
+async fn test_first_device_registration_accepts_apple_app_attest() {
+    let (root_cert, root_key) = make_apple_test_root();
+    let app_id = "TEAMID.com.prism.prism_plurality";
+    let config = Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 8,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 10_000,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+        first_device_apple_attestation_enabled: true,
+        first_device_apple_attestation_trust_roots_pem: vec![root_cert.pem()],
+        first_device_apple_attestation_allowed_app_ids: vec![app_id.into()],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
+    };
+
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut x25519_pk);
+
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, nonce);
+    let proof = build_apple_app_attest_proof(
+        &sync_id,
+        &device_id,
+        nonce,
+        app_id,
+        &[0x42; 16],
+        &root_cert,
+        &root_key,
+    );
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "first_device_admission_proof": proof,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), 201);
+}
+
+#[tokio::test]
 async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
     let config = Config {
         port: 0,
@@ -477,17 +827,27 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 
-    let inviter_device_id = generate_device_id();
-    let inviter_key = SigningKey::generate(&mut rand::thread_rng());
-    let _token = register_device(&client, &url, &sync_id, &inviter_device_id, &inviter_key).await;
+    // Register first device (creates the sync group) — use _with_x25519 so we have the key
+    let approver_device_id = generate_device_id();
+    let approver_key = SigningKey::generate(&mut rand::thread_rng());
+    let (_approver_token, approver_x25519_pk) =
+        register_device_with_x25519(&client, &url, &sync_id, &approver_device_id, &approver_key)
+            .await;
 
     let joiner_device_id = generate_device_id();
     let joiner_key = SigningKey::generate(&mut rand::thread_rng());
@@ -505,14 +865,30 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
     let nonce = nonce_json["nonce"].as_str().unwrap();
 
     let challenge_sig = sign_challenge(&joiner_key, &sync_id, &joiner_device_id, nonce);
-    let mut x25519_pk = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut x25519_pk);
-    let signed_invitation = build_signed_invitation(
+    let mut joiner_x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut joiner_x25519_pk);
+
+    // Use registry_approval — existing groups don't need PoW
+    let registry_approval = build_registry_approval(
         &sync_id,
-        &url,
-        &inviter_device_id,
-        &inviter_key,
-        &joiner_device_id,
+        &approver_device_id,
+        &approver_key,
+        vec![
+            registry_snapshot_entry(
+                &sync_id,
+                &approver_device_id,
+                approver_key.verifying_key().as_bytes(),
+                &approver_x25519_pk,
+                "active",
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &joiner_device_id,
+                joiner_key.verifying_key().as_bytes(),
+                &joiner_x25519_pk,
+                "active",
+            ),
+        ],
     );
 
     let register_resp = client
@@ -520,15 +896,158 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         .json(&serde_json::json!({
             "device_id": joiner_device_id,
             "signing_public_key": hex::encode(joiner_key.verifying_key().as_bytes()),
-            "x25519_public_key": hex::encode(x25519_pk),
+            "x25519_public_key": hex::encode(joiner_x25519_pk),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
-            "signed_invitation": signed_invitation,
+            "registry_approval": registry_approval,
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(register_resp.status(), 201);
+}
+
+#[tokio::test]
+async fn test_existing_group_registration_accepts_registry_approval() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let approver_device_id = generate_device_id();
+    let approver_key = SigningKey::generate(&mut rand::thread_rng());
+    let (_approver_token, approver_x25519_pk) =
+        register_device_with_x25519(&client, &url, &sync_id, &approver_device_id, &approver_key)
+            .await;
+
+    let joiner_device_id = generate_device_id();
+    let joiner_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut joiner_x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut joiner_x25519_pk);
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&joiner_key, &sync_id, &joiner_device_id, &nonce);
+
+    let registry_approval = build_registry_approval(
+        &sync_id,
+        &approver_device_id,
+        &approver_key,
+        vec![
+            registry_snapshot_entry(
+                &sync_id,
+                &approver_device_id,
+                approver_key.verifying_key().as_bytes(),
+                &approver_x25519_pk,
+                "active",
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &joiner_device_id,
+                joiner_key.verifying_key().as_bytes(),
+                &joiner_x25519_pk,
+                "active",
+            ),
+        ],
+    );
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": joiner_device_id,
+            "signing_public_key": hex::encode(joiner_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(joiner_x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "registry_approval": registry_approval,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), 201);
+
+    db.with_conn(|conn| {
+        let devices = db::list_devices(conn, &sync_id)?;
+        assert_eq!(devices.len(), 2);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_existing_group_registration_rejects_stale_registry_approval_after_membership_change()
+{
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let approver_device_id = generate_device_id();
+    let approver_key = SigningKey::generate(&mut rand::thread_rng());
+    let (_approver_token, approver_x25519_pk) =
+        register_device_with_x25519(&client, &url, &sync_id, &approver_device_id, &approver_key)
+            .await;
+
+    let joiner_device_id = generate_device_id();
+    let joiner_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut joiner_x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut joiner_x25519_pk);
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let challenge_sig = sign_challenge(&joiner_key, &sync_id, &joiner_device_id, &nonce);
+
+    let stale_registry_approval = build_registry_approval(
+        &sync_id,
+        &approver_device_id,
+        &approver_key,
+        vec![
+            registry_snapshot_entry(
+                &sync_id,
+                &approver_device_id,
+                approver_key.verifying_key().as_bytes(),
+                &approver_x25519_pk,
+                "active",
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &joiner_device_id,
+                joiner_key.verifying_key().as_bytes(),
+                &joiner_x25519_pk,
+                "active",
+            ),
+        ],
+    );
+
+    let other_device_id = generate_device_id();
+    let other_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut other_x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut other_x25519_pk);
+    db.with_conn(|conn| {
+        db::register_device(
+            conn,
+            &sync_id,
+            &other_device_id,
+            other_key.verifying_key().as_bytes(),
+            &other_x25519_pk,
+            0,
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": joiner_device_id,
+            "signing_public_key": hex::encode(joiner_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(joiner_x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "registry_approval": stale_registry_approval,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), 409);
+    assert_eq!(
+        register_resp.text().await.unwrap(),
+        "Stale registry approval"
+    );
 }
 
 #[tokio::test]
@@ -548,8 +1067,15 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -600,9 +1126,10 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
     assert_eq!(nonce_resp.status(), 200);
     let first_nonce_json: Value = nonce_resp.json().await.unwrap();
     let first_nonce = first_nonce_json["nonce"].as_str().unwrap().to_string();
-    let replay_pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &first_nonce_json)
-        .expect("PoW solution should be present");
-
+    let mut replay_pow_solution =
+        pow_solution_from_nonce_json(&sync_id, &device_id, &first_nonce_json)
+            .expect("PoW solution should be present");
+    let mut replay_counter = replay_pow_solution["counter"].as_u64().unwrap();
     let nonce_resp = client
         .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
         .send()
@@ -612,6 +1139,10 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
     let second_nonce_json: Value = nonce_resp.json().await.unwrap();
     let second_nonce = second_nonce_json["nonce"].as_str().unwrap();
     assert_ne!(first_nonce, second_nonce);
+    while is_first_device_pow_valid(&sync_id, &device_id, second_nonce, replay_counter, 8) {
+        replay_counter += 1;
+    }
+    replay_pow_solution["counter"] = serde_json::json!(replay_counter);
     let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, second_nonce);
 
     let replay_nonce_resp = client
@@ -886,25 +1417,25 @@ async fn test_nonce_rate_limiting_window_expiry() {
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
-    let db = Database::in_memory().expect("in-memory db");
-    let state = AppState::new(db, config);
-    let app = routes::router(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("http://127.0.0.1:{}", addr.port());
-    let _handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (url, _server, db) = start_test_relay_with_config(config).await;
 
     let client = Client::new();
     let sync_id = generate_sync_id();
+    db.with_conn(|conn| db::create_sync_group(conn, &sync_id, 0))
+        .unwrap();
 
-    // First 2 requests should succeed
+    // First 2 requests after the initial registration should succeed
     for i in 0..2 {
         let resp = client
             .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
@@ -942,10 +1473,10 @@ async fn test_nonce_rate_limiting_window_expiry() {
     }
 }
 
-// ──────────────── Test: Registration rollback on missing invitation ──────
+// ──────────────── Test: Existing-group registration without registry_approval ──────
 
 #[tokio::test]
-async fn test_registration_rollback_no_invitation() {
+async fn test_existing_group_registration_without_registry_approval_returns_401() {
     let (url, _server, _db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
@@ -955,7 +1486,7 @@ async fn test_registration_rollback_no_invitation() {
     let signing_key_a = SigningKey::generate(&mut rand::thread_rng());
     let token_a = register_device(&client, &url, &sync_id, &device_a_id, &signing_key_a).await;
 
-    // Attempt to register a second device WITHOUT an invitation
+    // Attempt to register a second device WITHOUT registry_approval
     let device_b_id = generate_device_id();
     let signing_key_b = SigningKey::generate(&mut rand::thread_rng());
 
@@ -975,7 +1506,7 @@ async fn test_registration_rollback_no_invitation() {
     let mut x25519_pk = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut x25519_pk);
 
-    // Register device B without signed_invitation — should fail
+    // Register device B without registry_approval — should fail
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
         .json(&serde_json::json!({
@@ -991,7 +1522,7 @@ async fn test_registration_rollback_no_invitation() {
     assert_eq!(
         register_resp.status(),
         401,
-        "second device without invitation should be rejected"
+        "second device without registry_approval should be rejected"
     );
 
     // Verify the first device's sync group is still intact
@@ -1051,7 +1582,19 @@ async fn test_reregister_existing_device_with_same_keys_succeeds() {
         .unwrap();
     assert_eq!(first_resp.status(), 201);
 
-    let invitation = build_signed_invitation(&sync_id, &url, &device_id, &signing_key, &device_id);
+    // Re-register the same device using registry_approval
+    let registry_approval = build_registry_approval(
+        &sync_id,
+        &device_id,
+        &signing_key,
+        vec![registry_snapshot_entry(
+            &sync_id,
+            &device_id,
+            signing_key.verifying_key().as_bytes(),
+            &x25519_pk,
+            "active",
+        )],
+    );
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
     let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, &nonce);
 
@@ -1063,16 +1606,17 @@ async fn test_reregister_existing_device_with_same_keys_succeeds() {
             "x25519_public_key": hex::encode(x25519_pk),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
-            "signed_invitation": invitation,
+            "registry_approval": registry_approval,
         }))
         .send()
         .await
         .unwrap();
     let status = reregister_resp.status();
-    let body: Value = reregister_resp.json().await.unwrap();
+    let body_text = reregister_resp.text().await.unwrap();
+    let body: Value = serde_json::from_str(&body_text).unwrap_or_default();
     assert!(
         status.is_success(),
-        "re-register should succeed: {status} - {body}"
+        "re-register should succeed: {status} - {body_text}"
     );
     assert!(body["device_session_token"].as_str().is_some());
 }
@@ -1104,7 +1648,19 @@ async fn test_reregister_existing_device_with_changed_signing_key_is_rejected() 
         .unwrap();
     assert_eq!(first_resp.status(), 201);
 
-    let invitation = build_signed_invitation(&sync_id, &url, &device_id, &original_key, &device_id);
+    // Build registry_approval signed by original_key (the approver)
+    let registry_approval = build_registry_approval(
+        &sync_id,
+        &device_id,
+        &original_key,
+        vec![registry_snapshot_entry(
+            &sync_id,
+            &device_id,
+            original_key.verifying_key().as_bytes(),
+            &x25519_pk,
+            "active",
+        )],
+    );
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
     let challenge_sig = sign_challenge(&replacement_key, &sync_id, &device_id, &nonce);
 
@@ -1116,7 +1672,7 @@ async fn test_reregister_existing_device_with_changed_signing_key_is_rejected() 
             "x25519_public_key": hex::encode(x25519_pk),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
-            "signed_invitation": invitation,
+            "registry_approval": registry_approval,
         }))
         .send()
         .await
@@ -1153,7 +1709,19 @@ async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
         .unwrap();
     assert_eq!(first_resp.status(), 201);
 
-    let invitation = build_signed_invitation(&sync_id, &url, &device_id, &signing_key, &device_id);
+    // Build registry_approval with the original x25519 key
+    let registry_approval = build_registry_approval(
+        &sync_id,
+        &device_id,
+        &signing_key,
+        vec![registry_snapshot_entry(
+            &sync_id,
+            &device_id,
+            signing_key.verifying_key().as_bytes(),
+            &original_x25519_pk,
+            "active",
+        )],
+    );
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
     let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, &nonce);
 
@@ -1165,7 +1733,7 @@ async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
             "x25519_public_key": hex::encode(replacement_x25519_pk),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
-            "signed_invitation": invitation,
+            "registry_approval": registry_approval,
         }))
         .send()
         .await

@@ -50,6 +50,8 @@ pub async fn push_changes(
     let device_epoch = header.epoch;
     let data = body.to_vec();
     let max_unpruned = state.config.max_unpruned_batches;
+    let brand_new_group_max_unpruned_batches = state.config.brand_new_group_max_unpruned_batches();
+    let brand_new_group_age_secs = state.config.brand_new_group_age_secs();
 
     tracing::debug!(
         sync_id = %trunc(&sync_id),
@@ -77,6 +79,8 @@ pub async fn push_changes(
                 device_epoch,
                 &data,
                 max_unpruned,
+                brand_new_group_max_unpruned_batches,
+                brand_new_group_age_secs,
                 stale_threshold,
             ))
         })
@@ -116,6 +120,8 @@ fn do_push(
     device_epoch: i64,
     data: &[u8],
     max_unpruned: u64,
+    brand_new_group_max_unpruned_batches: u64,
+    brand_new_group_age_secs: u64,
     stale_threshold: i64,
 ) -> Result<i64, AppError> {
     // Epoch validation
@@ -132,6 +138,13 @@ fn do_push(
     let prune_floor = db::get_safe_prune_seq(conn, sync_id, stale_threshold)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .unwrap_or(0);
+    let created_at = get_sync_group_created_at(conn, sync_id)?.ok_or(AppError::NotFound)?;
+    let group_age_secs = (db::now_secs() - created_at).max(0) as u64;
+    let max_allowed = if group_age_secs <= brand_new_group_age_secs {
+        brand_new_group_max_unpruned_batches.min(max_unpruned)
+    } else {
+        max_unpruned
+    };
     let unpruned: u64 = conn
         .query_row(
             "SELECT COUNT(*) FROM batches WHERE sync_id = ?1 AND id > ?2",
@@ -139,7 +152,7 @@ fn do_push(
             |row| row.get(0),
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    if unpruned >= max_unpruned {
+    if unpruned >= max_allowed {
         return Err(AppError::StorageFull(
             "Too many unpruned batches; all devices must pull or a snapshot is needed",
         ));
@@ -489,4 +502,19 @@ fn do_delete_account(
 fn trunc(s: &str) -> &str {
     let end = s.len().min(16);
     &s[..end]
+}
+
+fn get_sync_group_created_at(
+    conn: &rusqlite::Connection,
+    sync_id: &str,
+) -> Result<Option<i64>, AppError> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT created_at FROM sync_groups WHERE sync_id = ?1",
+        rusqlite::params![sync_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| AppError::Internal(e.to_string()))
 }

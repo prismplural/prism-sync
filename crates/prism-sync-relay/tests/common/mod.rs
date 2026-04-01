@@ -10,6 +10,10 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use prism_sync_core::{
+    pairing::models::{RegistrySnapshotEntry, SignedRegistrySnapshot},
+    relay::traits::RegistryApproval,
+};
 use prism_sync_relay::{
     config::Config,
     db::{self, Database},
@@ -43,8 +47,15 @@ pub async fn start_test_relay() -> (
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
     start_test_relay_with_config(config).await
@@ -190,6 +201,19 @@ pub async fn register_device(
     device_id: &str,
     signing_key: &SigningKey,
 ) -> String {
+    register_device_with_x25519(client, url, sync_id, device_id, signing_key)
+        .await
+        .0
+}
+
+/// Full registration helper that also returns the generated X25519 key.
+pub async fn register_device_with_x25519(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    signing_key: &SigningKey,
+) -> (String, [u8; 32]) {
     // 1. Fetch nonce
     let nonce_resp = client
         .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
@@ -230,10 +254,13 @@ pub async fn register_device(
         status.is_success(),
         "registration failed: {status} - {token_json}"
     );
-    token_json["device_session_token"]
-        .as_str()
-        .expect("missing device_session_token in register response")
-        .to_string()
+    (
+        token_json["device_session_token"]
+            .as_str()
+            .expect("missing device_session_token in register response")
+            .to_string(),
+        x25519_pk,
+    )
 }
 
 /// Build a minimal valid `SignedBatchEnvelope` JSON for testing.
@@ -269,4 +296,71 @@ pub async fn prepare_device(
         Ok(token)
     })
     .expect("prepare device")
+}
+
+/// Build a registry snapshot entry for test payloads.
+pub fn registry_snapshot_entry(
+    sync_id: &str,
+    device_id: &str,
+    ed25519_public_key: &[u8],
+    x25519_public_key: &[u8],
+    status: &str,
+) -> RegistrySnapshotEntry {
+    RegistrySnapshotEntry {
+        sync_id: sync_id.to_string(),
+        device_id: device_id.to_string(),
+        ed25519_public_key: ed25519_public_key.to_vec(),
+        x25519_public_key: x25519_public_key.to_vec(),
+        status: status.to_string(),
+    }
+}
+
+/// Build a signed registry snapshot using the current core wire format.
+pub fn build_signed_registry_snapshot(
+    entries: Vec<RegistrySnapshotEntry>,
+    signing_key: &SigningKey,
+) -> Vec<u8> {
+    let snapshot = SignedRegistrySnapshot::new(entries);
+    let canonical_json = snapshot.canonical_json();
+
+    let mut signing_data =
+        Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V1\x00".len() + canonical_json.len());
+    signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V1\x00");
+    signing_data.extend_from_slice(&canonical_json);
+
+    let signature = signing_key.sign(&signing_data);
+    let mut wire = Vec::with_capacity(64 + canonical_json.len());
+    wire.extend_from_slice(&signature.to_bytes());
+    wire.extend_from_slice(&canonical_json);
+    wire
+}
+
+/// Deterministic hash for a signed registry snapshot wire payload.
+pub fn registry_snapshot_hash(signed_registry_snapshot: &[u8]) -> String {
+    hex::encode(Sha256::digest(signed_registry_snapshot))
+}
+
+/// Build the compact registry-approval payload used by `/register`.
+pub fn build_registry_approval(
+    sync_id: &str,
+    approver_device_id: &str,
+    approver_key: &SigningKey,
+    entries: Vec<RegistrySnapshotEntry>,
+) -> RegistryApproval {
+    let signed_registry_snapshot = build_signed_registry_snapshot(entries, approver_key);
+
+    let mut approval_data = Vec::new();
+    approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V1\x00");
+    write_len_prefixed(&mut approval_data, sync_id.as_bytes());
+    write_len_prefixed(&mut approval_data, approver_device_id.as_bytes());
+    write_len_prefixed(&mut approval_data, &signed_registry_snapshot);
+
+    let signature = approver_key.sign(&approval_data);
+
+    RegistryApproval {
+        approver_device_id: approver_device_id.to_string(),
+        approver_ed25519_pk: hex::encode(approver_key.verifying_key().as_bytes()),
+        approval_signature: hex::encode(signature.to_bytes()),
+        signed_registry_snapshot,
+    }
 }

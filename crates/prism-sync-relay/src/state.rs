@@ -102,20 +102,39 @@ impl RateLimiter {
     /// Returns `true` if under the limit, `false` if rate-limited.
     /// Automatically prunes timestamps outside the window.
     pub fn check(&self, key: &str, max_requests: u32, window_secs: u64) -> bool {
+        self.check_many(&[key], max_requests, window_secs)
+    }
+
+    /// Check whether a request for all `keys` is allowed, reserving a slot for
+    /// each key atomically if so.
+    pub fn check_many(&self, keys: &[&str], max_requests: u32, window_secs: u64) -> bool {
         let mut map = self.windows.lock().unwrap();
-        let cutoff = Instant::now() - std::time::Duration::from_secs(window_secs);
+        let now = Instant::now();
+        let cutoff = now - std::time::Duration::from_secs(window_secs);
 
-        // If this is a new key and we're at capacity, reject to bound memory.
-        if !map.contains_key(key) && map.len() >= Self::MAX_TRACKED_KEYS {
+        let mut missing = 0usize;
+        for key in keys {
+            if !map.contains_key(*key) {
+                missing += 1;
+            }
+        }
+        if map.len() + missing > Self::MAX_TRACKED_KEYS {
             return false;
         }
 
-        let timestamps = map.entry(key.to_string()).or_default();
-        timestamps.retain(|t| *t > cutoff);
-        if timestamps.len() >= max_requests as usize {
-            return false;
+        let mut candidates = Vec::with_capacity(keys.len());
+        for key in keys {
+            let timestamps = map.entry((*key).to_string()).or_default();
+            timestamps.retain(|t| *t > cutoff);
+            if timestamps.len() >= max_requests as usize {
+                return false;
+            }
+            candidates.push(key.to_string());
         }
-        timestamps.push(Instant::now());
+
+        for key in candidates {
+            map.get_mut(&key).unwrap().push(now);
+        }
         true
     }
 
@@ -140,6 +159,9 @@ pub struct AppState {
     pub nonce_rate_limiter: RateLimiter,
     pub revoke_rate_limiter: RateLimiter,
     pub signed_request_replay_cache: RateLimiter,
+    pub first_device_nonce_rate_limiter: RateLimiter,
+    pub first_device_registration_rate_limiter: RateLimiter,
+    pub first_device_group_rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -160,6 +182,9 @@ impl AppState {
             nonce_rate_limiter: RateLimiter::default(),
             revoke_rate_limiter: RateLimiter::default(),
             signed_request_replay_cache: RateLimiter::default(),
+            first_device_nonce_rate_limiter: RateLimiter::default(),
+            first_device_registration_rate_limiter: RateLimiter::default(),
+            first_device_group_rate_limiter: RateLimiter::default(),
         }
     }
 
@@ -252,6 +277,17 @@ mod tests {
         }
         // Window is 0s, so all previous timestamps are expired
         assert!(limiter.check("key", 5, 0));
+    }
+
+    #[test]
+    fn rate_limiter_check_many_is_atomic_across_keys() {
+        let limiter = RateLimiter::default();
+        assert!(limiter.check_many(&["global", "ip"], 1, 60));
+        assert!(!limiter.check_many(&["global", "ip"], 1, 60));
+
+        let map = limiter.windows.lock().unwrap();
+        assert_eq!(map.get("global").map(|v| v.len()), Some(1));
+        assert_eq!(map.get("ip").map(|v| v.len()), Some(1));
     }
 
     #[test]

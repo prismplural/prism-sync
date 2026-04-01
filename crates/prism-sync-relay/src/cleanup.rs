@@ -41,10 +41,29 @@ async fn run_cleanup(state: &AppState) {
             let pruned =
                 crate::db::prune_stale_sync_groups(conn, config.sync_inactive_ttl_secs as i64)?;
 
-            // 4. Delete expired ephemeral snapshots
+            // 5. Remove abandoned brand-new groups that never produced any
+            //    batches or snapshots and have been idle long enough.
+            let abandoned_new_groups = cleanup_abandoned_brand_new_groups(
+                conn,
+                config.abandoned_brand_new_group_ttl_secs() as i64,
+            )?;
+
+            // 6. Delete expired ephemeral snapshots
             let expired_snapshots = crate::db::cleanup_expired_snapshots(conn)?;
 
-            // 5. Reclaim freed pages (incremental auto_vacuum)
+            // 7. Remove superseded registry artifacts now that the current
+            //    registry state is persisted separately.
+            let superseded_registry_artifacts =
+                crate::db::cleanup_superseded_registry_state_artifacts(conn)?;
+
+            // 8. Garbage-collect revoked tombstones only after no retained
+            //    history rows still reference them.
+            let revoked_tombstones = crate::db::cleanup_revoked_device_tombstones(
+                conn,
+                config.revoked_tombstone_retention_secs as i64,
+            )?;
+
+            // 9. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 = conn
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -59,7 +78,10 @@ async fn run_cleanup(state: &AppState) {
                 stale,
                 revoked_groups,
                 pruned,
+                abandoned_new_groups,
                 expired_snapshots,
+                superseded_registry_artifacts,
+                revoked_tombstones,
                 pages_freed,
             ))
         })
@@ -73,7 +95,10 @@ async fn run_cleanup(state: &AppState) {
             stale,
             revoked_groups,
             pruned,
+            abandoned_new_groups,
             expired_snapshots,
+            superseded_registry_artifacts,
+            revoked_tombstones,
             pages_freed,
         ))) => {
             state.metrics.last_cleanup_epoch_secs.store(
@@ -90,7 +115,10 @@ async fn run_cleanup(state: &AppState) {
                 || stale > 0
                 || !revoked_groups.is_empty()
                 || pruned > 0
+                || abandoned_new_groups > 0
                 || expired_snapshots > 0
+                || superseded_registry_artifacts > 0
+                || revoked_tombstones > 0
                 || pages_freed > 0
             {
                 tracing::info!(
@@ -98,7 +126,10 @@ async fn run_cleanup(state: &AppState) {
                     revoked_sessions,
                     stale,
                     pruned,
+                    abandoned_new_groups,
                     expired_snapshots,
+                    superseded_registry_artifacts,
+                    revoked_tombstones,
                     pages_freed,
                     "cleanup cycle complete"
                 );
@@ -131,4 +162,72 @@ async fn run_cleanup(state: &AppState) {
         Ok(Err(e)) => tracing::error!("counter flush db error: {e}"),
         Err(e) => tracing::error!("counter flush task panic: {e}"),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{self, Database};
+    use rusqlite::params;
+
+    #[test]
+    fn abandoned_brand_new_groups_are_removed() {
+        let db = Database::in_memory().expect("in-memory db");
+        db.with_conn(|conn| {
+            db::create_sync_group(conn, "sg1", 0)?;
+            db::register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+
+            let old = db::now_secs() - 10_000;
+            conn.execute(
+                "UPDATE sync_groups SET created_at = ?1, updated_at = ?1 WHERE sync_id = ?2",
+                params![old, "sg1"],
+            )?;
+            conn.execute(
+                "UPDATE devices SET last_seen_at = ?1 WHERE sync_id = ?2",
+                params![old, "sg1"],
+            )?;
+
+            let removed = cleanup_abandoned_brand_new_groups(conn, 60)?;
+            assert_eq!(removed, 1);
+            assert!(db::get_sync_group_epoch(conn, "sg1")?.is_none());
+
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+fn cleanup_abandoned_brand_new_groups(
+    conn: &rusqlite::Connection,
+    abandon_secs: i64,
+) -> Result<usize, rusqlite::Error> {
+    let cutoff = crate::db::now_secs() - abandon_secs;
+    let mut stmt = conn.prepare(
+        "SELECT sg.sync_id
+         FROM sync_groups sg
+         WHERE sg.created_at <= ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM batches b WHERE b.sync_id = sg.sync_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM snapshots s WHERE s.sync_id = sg.sync_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM devices d
+               WHERE d.sync_id = sg.sync_id
+                 AND d.status = 'active'
+                 AND d.last_seen_at >= ?1
+           )",
+    )?;
+
+    let sync_ids: Vec<String> = stmt
+        .query_map([cutoff], |row| row.get(0))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    for sync_id in &sync_ids {
+        crate::db::delete_sync_group(conn, sync_id)?;
+    }
+
+    Ok(sync_ids.len())
 }

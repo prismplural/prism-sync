@@ -144,59 +144,6 @@ fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
-/// Build the canonical bytes that get signed for an invitation.
-///
-/// Uses a deterministic binary format with domain separation prefix
-/// `PRISM_SYNC_INVITE_V1\x00` to prevent signature reuse across protocols.
-/// Mirrors `prism-sync-core::pairing::models::build_invitation_signing_data`.
-#[allow(clippy::too_many_arguments)]
-pub fn build_invitation_signing_data(
-    sync_id: &str,
-    relay_url: &str,
-    wrapped_dek: &[u8],
-    salt: &[u8],
-    inviter_device_id: &str,
-    inviter_ed25519_pk: &[u8; 32],
-    joiner_device_id: Option<&str>,
-    current_epoch: u32,
-    epoch_key: &[u8],
-) -> Vec<u8> {
-    let mut data = Vec::new();
-    data.extend_from_slice(b"PRISM_SYNC_INVITE_V1\x00");
-    write_len_prefixed(&mut data, sync_id.as_bytes());
-    write_len_prefixed(&mut data, relay_url.as_bytes());
-    data.extend_from_slice(&(wrapped_dek.len() as u32).to_be_bytes());
-    data.extend_from_slice(wrapped_dek);
-    data.extend_from_slice(&(salt.len() as u32).to_be_bytes());
-    data.extend_from_slice(salt);
-    write_len_prefixed(&mut data, inviter_device_id.as_bytes());
-    data.extend_from_slice(inviter_ed25519_pk);
-    if let Some(jid) = joiner_device_id {
-        write_len_prefixed(&mut data, jid.as_bytes());
-    }
-    data.extend_from_slice(&current_epoch.to_be_bytes());
-    write_len_prefixed(&mut data, epoch_key);
-    data
-}
-
-/// Verify an Ed25519 signature over invitation signing data.
-pub fn verify_invitation_signature(
-    signing_public_key: &[u8],
-    signing_data: &[u8],
-    signature: &[u8],
-) -> bool {
-    let Ok(pk_bytes): Result<[u8; 32], _> = signing_public_key.try_into() else {
-        return false;
-    };
-    let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_bytes) else {
-        return false;
-    };
-    let Ok(sig) = Signature::from_slice(signature) else {
-        return false;
-    };
-    verifying_key.verify(signing_data, &sig).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

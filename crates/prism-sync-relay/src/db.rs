@@ -48,6 +48,24 @@ pub struct SnapshotRecord {
     pub uploaded_by_device_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegistryStateRecord {
+    pub sync_id: String,
+    pub registry_version: i64,
+    pub registry_hash: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryArtifactRecord {
+    pub sync_id: String,
+    pub registry_version: i64,
+    pub artifact_kind: String,
+    pub artifact_hash: String,
+    pub artifact_blob: Vec<u8>,
+    pub created_at: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -202,6 +220,28 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             created_at        INTEGER NOT NULL,
             updated_at        INTEGER NOT NULL
         );
+
+        -- Registry state (current version/hash only; latest artifacts stored separately)
+        CREATE TABLE IF NOT EXISTS registry_states (
+            sync_id            TEXT PRIMARY KEY,
+            registry_version   INTEGER NOT NULL DEFAULT 0,
+            registry_hash      TEXT NOT NULL DEFAULT '',
+            created_at         INTEGER NOT NULL,
+            updated_at         INTEGER NOT NULL,
+            FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+        );
+        CREATE TABLE IF NOT EXISTS registry_state_artifacts (
+            sync_id            TEXT NOT NULL,
+            registry_version   INTEGER NOT NULL,
+            artifact_kind      TEXT NOT NULL,
+            artifact_hash      TEXT NOT NULL,
+            artifact_blob      BLOB NOT NULL,
+            created_at         INTEGER NOT NULL,
+            PRIMARY KEY (sync_id, registry_version),
+            FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_registry_state_artifacts_sync_version
+            ON registry_state_artifacts(sync_id, registry_version DESC);
 
         -- Devices
         CREATE TABLE IF NOT EXISTS devices (
@@ -445,6 +485,245 @@ fn migrate_sync_groups_password_version(conn: &Connection) -> Result<(), rusqlit
         )?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registry state queries
+// ---------------------------------------------------------------------------
+
+pub fn get_registry_state(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<RegistryStateRecord>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT sync_id, registry_version, registry_hash, updated_at
+         FROM registry_states
+         WHERE sync_id = ?1",
+        params![sync_id],
+        |row| {
+            Ok(RegistryStateRecord {
+                sync_id: row.get(0)?,
+                registry_version: row.get(1)?,
+                registry_hash: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn get_registry_artifact(
+    conn: &Connection,
+    sync_id: &str,
+    registry_version: i64,
+) -> Result<Option<RegistryArtifactRecord>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT sync_id, registry_version, artifact_kind, artifact_hash, artifact_blob, created_at
+         FROM registry_state_artifacts
+         WHERE sync_id = ?1 AND registry_version = ?2",
+        params![sync_id, registry_version],
+        |row| {
+            Ok(RegistryArtifactRecord {
+                sync_id: row.get(0)?,
+                registry_version: row.get(1)?,
+                artifact_kind: row.get(2)?,
+                artifact_hash: row.get(3)?,
+                artifact_blob: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn upsert_registry_state(
+    conn: &Connection,
+    sync_id: &str,
+    registry_version: i64,
+    registry_hash: &str,
+) -> Result<(), rusqlite::Error> {
+    let now = now_secs();
+    conn.execute(
+        "INSERT INTO registry_states (sync_id, registry_version, registry_hash, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(sync_id) DO UPDATE SET
+            registry_version = excluded.registry_version,
+            registry_hash = excluded.registry_hash,
+            updated_at = excluded.updated_at",
+        params![sync_id, registry_version, registry_hash, now],
+    )?;
+    Ok(())
+}
+
+pub fn store_registry_artifact(
+    conn: &Connection,
+    sync_id: &str,
+    registry_version: i64,
+    registry_hash: &str,
+    artifact_kind: &str,
+    artifact_blob: &[u8],
+) -> Result<(), rusqlite::Error> {
+    let now = now_secs();
+    conn.execute(
+        "INSERT INTO registry_state_artifacts (
+            sync_id, registry_version, artifact_kind, artifact_hash, artifact_blob, created_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(sync_id, registry_version) DO UPDATE SET
+            artifact_kind = excluded.artifact_kind,
+            artifact_hash = excluded.artifact_hash,
+            artifact_blob = excluded.artifact_blob,
+            created_at = excluded.created_at",
+        params![
+            sync_id,
+            registry_version,
+            artifact_kind,
+            registry_hash,
+            artifact_blob,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Compare-and-set registry state. Returns `true` if the transition was applied.
+pub fn compare_and_set_registry_state(
+    conn: &Connection,
+    sync_id: &str,
+    expected_version: i64,
+    expected_hash: &str,
+    next_version: i64,
+    next_hash: &str,
+    artifact_kind: Option<&str>,
+    artifact_blob: Option<&[u8]>,
+) -> Result<bool, rusqlite::Error> {
+    if next_version <= expected_version {
+        return Ok(false);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let now = now_secs();
+
+    let current = tx
+        .query_row(
+            "SELECT registry_version, registry_hash
+             FROM registry_states
+             WHERE sync_id = ?1",
+            params![sync_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+
+    let current_matches = match current {
+        Some((version, hash)) => version == expected_version && hash == expected_hash,
+        None => expected_version == 0 && expected_hash.is_empty(),
+    };
+
+    if !current_matches {
+        return Ok(false);
+    }
+
+    tx.execute(
+        "INSERT INTO registry_states (sync_id, registry_version, registry_hash, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(sync_id) DO UPDATE SET
+            registry_version = excluded.registry_version,
+            registry_hash = excluded.registry_hash,
+            updated_at = excluded.updated_at",
+        params![sync_id, next_version, next_hash, now],
+    )?;
+
+    if let (Some(kind), Some(blob)) = (artifact_kind, artifact_blob) {
+        tx.execute(
+            "INSERT INTO registry_state_artifacts (
+                sync_id, registry_version, artifact_kind, artifact_hash, artifact_blob, created_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(sync_id, registry_version) DO UPDATE SET
+                artifact_kind = excluded.artifact_kind,
+                artifact_hash = excluded.artifact_hash,
+                artifact_blob = excluded.artifact_blob,
+                created_at = excluded.created_at",
+            params![sync_id, next_version, kind, next_hash, blob, now],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(true)
+}
+
+pub fn cleanup_superseded_registry_state_artifacts(
+    conn: &Connection,
+) -> Result<usize, rusqlite::Error> {
+    let rows = conn.execute(
+        "DELETE FROM registry_state_artifacts
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM registry_states rs
+             WHERE rs.sync_id = registry_state_artifacts.sync_id
+               AND rs.registry_version >= registry_state_artifacts.registry_version
+         )
+         OR EXISTS (
+             SELECT 1
+             FROM registry_states rs
+             WHERE rs.sync_id = registry_state_artifacts.sync_id
+               AND registry_state_artifacts.registry_version < rs.registry_version
+         )",
+        [],
+    )?;
+    Ok(rows)
+}
+
+/// Delete revoked-device tombstones only after retained history no longer references them.
+pub fn cleanup_revoked_device_tombstones(
+    conn: &Connection,
+    retention_secs: i64,
+) -> Result<usize, rusqlite::Error> {
+    let cutoff = now_secs() - retention_secs;
+    let mut stmt = conn.prepare(
+        "SELECT d.sync_id, d.device_id
+         FROM devices d
+         WHERE d.status = 'revoked'
+           AND d.revoked_at IS NOT NULL
+           AND d.revoked_at <= ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM device_sessions ds
+               WHERE ds.sync_id = d.sync_id AND ds.device_id = d.device_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM revoked_device_sessions rds
+               WHERE rds.sync_id = d.sync_id AND rds.device_id = d.device_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM batches b
+               WHERE b.sync_id = d.sync_id AND b.sender_device_id = d.device_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM snapshots s
+               WHERE s.sync_id = d.sync_id
+                 AND (s.target_device_id = d.device_id OR s.uploaded_by_device_id = d.device_id)
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM rekey_artifacts r
+               WHERE r.sync_id = d.sync_id AND r.target_device_id = d.device_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM password_change_artifacts p
+               WHERE p.sync_id = d.sync_id AND p.target_device_id = d.device_id
+           )",
+    )?;
+    let tombstones: Vec<(String, String)> = stmt
+        .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    let mut deleted = 0;
+    for (sync_id, device_id) in tombstones {
+        if delete_device(conn, &sync_id, &device_id)? {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1529,14 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlit
         params![sync_id],
     )?;
     tx.execute(
+        "DELETE FROM registry_state_artifacts WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
+    tx.execute(
+        "DELETE FROM registry_states WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
+    tx.execute(
         "DELETE FROM rekey_artifacts WHERE sync_id = ?1",
         params![sync_id],
     )?;
@@ -1423,6 +1710,71 @@ mod tests {
             // Non-existent
             let epoch = get_sync_group_epoch(conn, "nonexistent")?;
             assert_eq!(epoch, None);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_registry_state_compare_and_set_and_cleanup() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+
+            assert!(get_registry_state(conn, "sg1")?.is_none());
+
+            assert!(compare_and_set_registry_state(
+                conn,
+                "sg1",
+                0,
+                "",
+                1,
+                "hash-1",
+                Some("snapshot"),
+                Some(b"artifact-1"),
+            )?);
+
+            let state = get_registry_state(conn, "sg1")?.unwrap();
+            assert_eq!(state.registry_version, 1);
+            assert_eq!(state.registry_hash, "hash-1");
+
+            let artifact = get_registry_artifact(conn, "sg1", 1)?.unwrap();
+            assert_eq!(artifact.artifact_kind, "snapshot");
+            assert_eq!(artifact.artifact_hash, "hash-1");
+            assert_eq!(artifact.artifact_blob, b"artifact-1");
+
+            // Stale compare-and-set must fail without changing current state.
+            assert!(!compare_and_set_registry_state(
+                conn,
+                "sg1",
+                0,
+                "",
+                2,
+                "hash-2",
+                Some("approval"),
+                Some(b"artifact-2"),
+            )?);
+
+            // Advance successfully and leave behind a superseded artifact.
+            assert!(compare_and_set_registry_state(
+                conn,
+                "sg1",
+                1,
+                "hash-1",
+                2,
+                "hash-2",
+                Some("approval"),
+                Some(b"artifact-2"),
+            )?);
+
+            assert!(get_registry_artifact(conn, "sg1", 1)?.is_some());
+            assert!(get_registry_artifact(conn, "sg1", 2)?.is_some());
+
+            let cleaned = cleanup_superseded_registry_state_artifacts(conn)?;
+            assert_eq!(cleaned, 1);
+            assert!(get_registry_artifact(conn, "sg1", 1)?.is_none());
+            assert!(get_registry_artifact(conn, "sg1", 2)?.is_some());
 
             Ok(())
         })
@@ -1759,6 +2111,8 @@ mod tests {
             store_rekey_artifact(conn, "sg1", 1, "dev1", &[42; 32])?;
             insert_revocation_event(conn, "sg1", "dev1", "dev2", 1, false)?;
             insert_rekey_event(conn, "sg1", "dev1", 1)?;
+            upsert_registry_state(conn, "sg1", 3, "hash-3")?;
+            store_registry_artifact(conn, "sg1", 3, "hash-3", "snapshot", b"registry")?;
             create_nonce(conn, "sg1", 3600)?;
 
             // Delete everything
@@ -1782,6 +2136,8 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert_eq!(rekey_count, 0);
+            assert!(get_registry_state(conn, "sg1")?.is_none());
+            assert!(get_registry_artifact(conn, "sg1", 3)?.is_none());
             assert!(validate_revoked_session(conn, &token)?.is_none());
 
             Ok(())
@@ -1852,6 +2208,55 @@ mod tests {
             // Deleting again returns false
             let deleted = delete_device(conn, "sg1", "dev1")?;
             assert!(!deleted);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_revoked_device_tombstones_waits_for_history() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            let token = create_session(conn, "sg1", "dev1", 3600)?;
+            revoke_session(conn, "sg1", "dev1", 3600)?;
+            assert!(validate_revoked_session(conn, &token)?.is_some());
+            insert_batch(conn, "sg1", 0, "dev1", "b1", b"data")?;
+
+            revoke_device(conn, "sg1", "dev1", false)?;
+            let old = now_secs() - 10_000;
+            conn.execute(
+                "UPDATE devices SET revoked_at = ?1 WHERE sync_id = ?2 AND device_id = ?3",
+                params![old, "sg1", "dev1"],
+            )?;
+
+            let cleaned = cleanup_revoked_device_tombstones(conn, 3600)?;
+            assert_eq!(cleaned, 0, "batch history should keep tombstone alive");
+            assert!(get_device(conn, "sg1", "dev1")?.is_some());
+
+            let batches = get_batches_since(conn, "sg1", 0, 100)?;
+            let before = batches
+                .last()
+                .map(|batch| batch.server_seq + 1)
+                .unwrap_or(1);
+            prune_batches_before(conn, "sg1", before)?;
+
+            let cleaned = cleanup_revoked_device_tombstones(conn, 3600)?;
+            assert_eq!(cleaned, 0, "revoked-session retention should still apply");
+
+            let old_revoked_session = now_secs() - 10_000;
+            conn.execute(
+                "UPDATE revoked_device_sessions SET expires_at = ?1 WHERE sync_id = ?2 AND device_id = ?3",
+                params![old_revoked_session, "sg1", "dev1"],
+            )?;
+            let _ = cleanup_expired_revoked_sessions(conn)?;
+
+            let cleaned = cleanup_revoked_device_tombstones(conn, 3600)?;
+            assert_eq!(cleaned, 1, "tombstone should be removed after pruning");
+            assert!(get_device(conn, "sg1", "dev1")?.is_none());
+            assert!(validate_revoked_session(conn, &token)?.is_none());
 
             Ok(())
         })

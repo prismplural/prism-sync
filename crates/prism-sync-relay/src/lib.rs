@@ -1,3 +1,5 @@
+pub mod apple_attestation;
+pub mod attestation;
 pub mod auth;
 pub mod cleanup;
 pub mod config;

@@ -9,6 +9,9 @@ description = "V2 relay server for prism-sync encrypted CRDT sync"
 name = "prism-sync-relay"
 path = "src/main.rs"
 
+[features]
+test-helpers = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
@@ -30,9 +33,14 @@ sha2 = "0.10"
 rand = "0.8"
 thiserror = "2"
 reqwest = { version = "0.12", default-features = false }
+x509-parser = { version = "0.16", features = ["verify"] }
+simple_asn1 = "0.6"
+num-traits = "0.2"
+serde_cbor = "0.11"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = "0.24"
 prism-sync-core = { path = "../prism-sync-core" }
 prism-sync-crypto = { path = "../prism-sync-crypto" }
+rcgen = "0.13"
