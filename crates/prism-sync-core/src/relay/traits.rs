@@ -84,26 +84,52 @@ pub enum RelayErrorKind {
 
 // ── Request/Response types ──
 
-/// Structured signed invitation payload matching the relay server's expected format.
+/// Proof that an existing trusted device approved this registration.
+/// Sent by joiners whose PairingRequest was approved by a group member.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryApproval {
+    /// Device ID of the approving (existing) device.
+    pub approver_device_id: String,
+    /// Ed25519 public key of the approver (32 bytes, hex-encoded).
+    pub approver_ed25519_pk: String,
+    /// Ed25519 signature over the canonical approval data (hex-encoded).
+    pub approval_signature: String,
+    /// The signed registry snapshot (wire format: [sig || json]).
+    /// Allows the relay to verify group membership without seeing plaintext.
+    pub signed_registry_snapshot: Vec<u8>,
+}
+
+/// Optional first-device admission proof used by public relays to gate new
+/// sync-group creation without relying on bearer invites.
 ///
-/// Contains all fields the server needs to verify an invitation: the sync group
-/// identity, the inviter's credentials, and the Ed25519 signature over the
-/// canonical invitation signing data.
-#[derive(Debug, Clone)]
-pub struct SignedInvitationPayload {
-    pub sync_id: String,
-    pub relay_url: String,
-    pub wrapped_dek: String, // hex-encoded
-    pub salt: String,        // hex-encoded
-    pub inviter_device_id: String,
-    pub inviter_ed25519_pk: String, // hex-encoded
-    pub signature: String,          // hex-encoded Ed25519 signature
-    pub joiner_device_id: Option<String>,
-    pub current_epoch: u32,
-    pub epoch_key_hex: String,
+/// The relay treats these proofs as anti-abuse signals only. They do not
+/// become part of the long-term sync trust model after registration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FirstDeviceAdmissionProof {
+    /// Android hardware-backed key attestation certificate chain. Each element
+    /// is a base64-encoded DER certificate, leaf-first.
+    AndroidKeyAttestation {
+        certificate_chain: Vec<String>,
+    },
+
+    /// Apple App Attest attestation object, bound to the relay-issued nonce.
+    AppleAppAttest {
+        key_id: String,
+        attestation_object: String,
+    },
 }
 
 /// Registration request for a new device.
+///
+/// There are two admission paths:
+///
+/// - **First device (new group):** `first_device_admission_proof` may be
+///   supplied as a platform signal, and `pow_solution` remains the universal
+///   fallback. `registry_approval` is `None` because there is no existing group.
+///
+/// - **Existing group (joiner):** `registry_approval` carries the approver's
+///   attestation that this device was admitted via the pairing flow.
 #[derive(Debug, Clone)]
 pub struct RegisterRequest {
     pub device_id: String,
@@ -111,8 +137,9 @@ pub struct RegisterRequest {
     pub x25519_public_key: Vec<u8>,
     pub registration_challenge: Vec<u8>,
     pub nonce: String,
-    pub signed_invitation: Option<SignedInvitationPayload>,
     pub pow_solution: Option<ProofOfWorkSolution>,
+    pub first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
+    pub registry_approval: Option<RegistryApproval>,
 }
 
 /// Optional anti-abuse challenge returned with a registration nonce.

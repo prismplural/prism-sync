@@ -324,8 +324,9 @@ mod tests {
                 x25519_public_key: vec![],
                 registration_challenge: vec![],
                 nonce: "nonce".to_string(),
-                signed_invitation: None,
                 pow_solution: None,
+                registry_approval: None,
+                first_device_admission_proof: None,
             })
             .await
             .unwrap();

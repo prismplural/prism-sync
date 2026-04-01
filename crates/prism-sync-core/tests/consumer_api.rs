@@ -196,7 +196,14 @@ async fn test_pairing_create_and_join() {
     let service_a = PairingService::new(relay_a, store_a.clone());
 
     let (credentials, invite) = service_a
-        .create_sync_group("shared-password", "wss://relay.example.com", None, None)
+        .create_sync_group(
+            "shared-password",
+            "wss://relay.example.com",
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("create_sync_group should succeed");
 
@@ -228,6 +235,11 @@ async fn test_pairing_create_and_join() {
         "wss://relay.example.com",
         "invite relay_url must match"
     );
+    assert_eq!(
+        invite.response().admission_context(),
+        "first_device",
+        "initial invite should be a first-device snapshot"
+    );
 
     // Device A credentials must be persisted to the secure store.
     let stored_sync_id = store_a
@@ -245,7 +257,7 @@ async fn test_pairing_create_and_join() {
     let store_b = memory_secure_store();
     let service_b = PairingService::new(relay_b, store_b.clone());
 
-    let key_hierarchy_b = service_b
+    let (key_hierarchy_b, snapshot) = service_b
         .join_sync_group(invite.response(), "shared-password")
         .await
         .expect("join_sync_group with correct password should succeed");
@@ -262,6 +274,22 @@ async fn test_pairing_create_and_join() {
         !db_key_b.is_empty(),
         "database key on Device B must not be empty"
     );
+
+    let imported_snapshot = snapshot.to_device_records();
+    let registry = RusqliteSyncStorage::in_memory().expect("in-memory registry storage");
+    prism_sync_core::device_registry::DeviceRegistryManager::import_keyring(
+        &registry,
+        &credentials.sync_id,
+        &imported_snapshot,
+    )
+    .expect("joined snapshot should import cleanly");
+    prism_sync_core::device_registry::DeviceRegistryManager::verify_device_key(
+        &registry,
+        &credentials.sync_id,
+        &imported_snapshot[0].device_id,
+        &imported_snapshot[0].ed25519_public_key,
+    )
+    .expect("imported registry entry should verify");
 
     // Device B credentials must be persisted too.
     let stored_b_sync_id = store_b

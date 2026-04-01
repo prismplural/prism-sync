@@ -307,23 +307,20 @@ impl SyncRelay for ServerRelay {
             "x25519_public_key": hex::encode(&req.x25519_public_key),
             "registration_challenge": hex::encode(&req.registration_challenge),
             "nonce": req.nonce,
-            "signed_invitation": req.signed_invitation.as_ref().map(|inv| {
-                serde_json::json!({
-                    "sync_id": inv.sync_id,
-                    "relay_url": inv.relay_url,
-                    "wrapped_dek": inv.wrapped_dek,
-                    "salt": inv.salt,
-                    "inviter_device_id": inv.inviter_device_id,
-                    "inviter_ed25519_pk": inv.inviter_ed25519_pk,
-                    "signature": inv.signature,
-                    "joiner_device_id": inv.joiner_device_id,
-                    "current_epoch": inv.current_epoch,
-                    "epoch_key_hex": inv.epoch_key_hex,
-                })
-            }),
             "pow_solution": req.pow_solution.as_ref().map(|solution| {
                 serde_json::json!({
                     "counter": solution.counter,
+                })
+            }),
+            "first_device_admission_proof": req.first_device_admission_proof.as_ref().map(|proof| {
+                serde_json::to_value(proof).expect("first-device admission proof serializes")
+            }),
+            "registry_approval": req.registry_approval.as_ref().map(|approval| {
+                serde_json::json!({
+                    "approver_device_id": approval.approver_device_id,
+                    "approver_ed25519_pk": approval.approver_ed25519_pk,
+                    "approval_signature": approval.approval_signature,
+                    "signed_registry_snapshot": approval.signed_registry_snapshot,
                 })
             }),
         });
@@ -339,6 +336,11 @@ impl SyncRelay for ServerRelay {
         let status = resp.status().as_u16();
         if status >= 400 {
             let body_text = resp.text().await.unwrap_or_default();
+            if status == 409 {
+                return Err(RelayError::Protocol {
+                    message: format!("HTTP 409: {body_text}"),
+                });
+            }
             return Err(Self::classify_error(status, &body_text));
         }
 
