@@ -10,7 +10,7 @@
 mod common;
 
 use base64::Engine;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use reqwest::Client;
 use serde_json::Value;
@@ -554,6 +554,10 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         metrics_token: None,
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
         revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
@@ -618,6 +622,10 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         metrics_token: None,
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
         revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
@@ -754,6 +762,10 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         metrics_token: None,
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
         revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
@@ -826,6 +838,10 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         metrics_token: None,
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
         revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
@@ -1066,6 +1082,10 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         metrics_token: None,
         nonce_rate_limit: 100,
         nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
         revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
@@ -1756,16 +1776,13 @@ async fn test_revoked_device_token_is_invalidated_but_still_identifies_revocatio
     let target_id = generate_device_id();
     let target_token = prepare_device(&db, &sync_id, &target_id).await;
 
-    let revoke_resp = client
-        .delete(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}?remote_wipe=true"
-        ))
-        .header("Authorization", format!("Bearer {admin_token}"))
-        .header("X-Device-Id", &admin_id)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(revoke_resp.status(), 204);
+    // Revoke via DB (this test is about session invalidation, not the revoke endpoint)
+    db.with_conn(|conn| {
+        db::revoke_device(conn, &sync_id, &target_id, true)?;
+        db::revoke_session(conn, &sync_id, &target_id, 86400)?;
+        Ok::<_, rusqlite::Error>(())
+    })
+    .unwrap();
 
     db.with_read_conn(|conn| {
         assert!(db::validate_session(conn, &target_token)?.is_none());
@@ -1936,10 +1953,10 @@ async fn test_standalone_rekey_rejects_revoked_device_id() {
     );
 }
 
-// ────── Test: Invite after epoch rotation includes epoch fields ──────
+// ────── Test: Registration after epoch rotation via registry_approval ──────
 
 #[tokio::test]
-async fn test_invite_after_epoch_rotation_includes_epoch_fields() {
+async fn test_registration_after_epoch_rotation_via_registry_approval() {
     let (url, _server, db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
@@ -1947,7 +1964,8 @@ async fn test_invite_after_epoch_rotation_includes_epoch_fields() {
     // 1. Register admin device via HTTP
     let admin_id = generate_device_id();
     let admin_key = SigningKey::generate(&mut rand::thread_rng());
-    let admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_key).await;
+    let (admin_token, admin_x25519_pk) =
+        register_device_with_x25519(&client, &url, &sync_id, &admin_id, &admin_key).await;
 
     // 2. Register a second device (target to be revoked) directly via DB
     let target_id = generate_device_id();
@@ -1987,7 +2005,7 @@ async fn test_invite_after_epoch_rotation_includes_epoch_fields() {
         revoke_resp.text().await.ok()
     );
 
-    // 5. Verify the sync group is now at epoch 1
+    // 3. Verify the sync group is now at epoch 1
     let epoch = db
         .with_conn(|conn| db::get_sync_group_epoch(conn, &sync_id))
         .expect("get epoch");
@@ -1997,68 +2015,54 @@ async fn test_invite_after_epoch_rotation_includes_epoch_fields() {
         "sync group should be at epoch 1 after rekey"
     );
 
-    // 6. Construct a signed invitation at epoch 1 with epoch fields and register
-    //    a third device using it.
+    // 4. Register a third device using registry_approval from admin
     let joiner_id = generate_device_id();
     let joiner_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut joiner_x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut joiner_x25519_pk);
 
-    let wrapped_dek = b"fake-wrapped-dek-for-joiner";
-    let salt = b"fake-salt-value-16b!";
-    let epoch_key = [0xEE; 32];
-    let relay_url = &url;
-    let admin_pk_bytes: [u8; 32] = *admin_key.verifying_key().as_bytes();
-
-    // Build canonical signing data including epoch fields
-    let signing_data = prism_sync_relay::auth::build_invitation_signing_data(
-        &sync_id,
-        relay_url,
-        wrapped_dek,
-        salt,
-        &admin_id,
-        &admin_pk_bytes,
-        Some(&joiner_id),
-        1, // current_epoch
-        &epoch_key,
-    );
-    let invitation_sig = admin_key.sign(&signing_data);
-
-    // Fetch nonce for joiner
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(nonce_resp.status(), 200);
-    let nonce_json: Value = nonce_resp.json().await.unwrap();
-    let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
-
-    // Sign registration challenge for joiner
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
     let challenge_sig = sign_challenge(&joiner_key, &sync_id, &joiner_id, &nonce);
 
-    let mut x25519_pk = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut x25519_pk);
+    // Include the revoked target in the snapshot so it matches the relay's current registry
+    let registry_approval = build_registry_approval(
+        &sync_id,
+        &admin_id,
+        &admin_key,
+        vec![
+            registry_snapshot_entry(
+                &sync_id,
+                &admin_id,
+                admin_key.verifying_key().as_bytes(),
+                &admin_x25519_pk,
+                "active",
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &target_id,
+                &[7u8; 32], // matches prepare_device signing key
+                &[8u8; 32], // matches prepare_device x25519 key
+                "revoked",
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &joiner_id,
+                joiner_key.verifying_key().as_bytes(),
+                &joiner_x25519_pk,
+                "active",
+            ),
+        ],
+    );
 
-    // 7. Register the third device with the signed invitation including epoch fields
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
         .json(&serde_json::json!({
             "device_id": joiner_id,
             "signing_public_key": hex::encode(joiner_key.verifying_key().as_bytes()),
-            "x25519_public_key": hex::encode(x25519_pk),
+            "x25519_public_key": hex::encode(joiner_x25519_pk),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
-            "signed_invitation": {
-                "sync_id": sync_id,
-                "relay_url": relay_url,
-                "wrapped_dek": hex::encode(wrapped_dek),
-                "salt": hex::encode(salt),
-                "inviter_device_id": admin_id,
-                "inviter_ed25519_pk": hex::encode(admin_pk_bytes),
-                "signature": hex::encode(invitation_sig.to_bytes()),
-                "joiner_device_id": joiner_id,
-                "current_epoch": 1,
-                "epoch_key_hex": hex::encode(epoch_key),
-            },
+            "registry_approval": registry_approval,
         }))
         .send()
         .await
@@ -2067,7 +2071,7 @@ async fn test_invite_after_epoch_rotation_includes_epoch_fields() {
     let body: Value = register_resp.json().await.unwrap_or_default();
     assert!(
         status.is_success(),
-        "registration with epoch-1 invitation should succeed: {status} - {body}"
+        "registration after epoch rotation should succeed: {status} - {body}"
     );
     assert!(
         body["device_session_token"].as_str().is_some(),
@@ -2076,18 +2080,55 @@ async fn test_invite_after_epoch_rotation_includes_epoch_fields() {
 }
 
 #[tokio::test]
-async fn test_stale_invitation_epoch_is_rejected() {
+async fn test_stale_registry_approval_after_revoke_is_rejected() {
     let (url, _server, db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 
     let admin_id = generate_device_id();
     let admin_key = SigningKey::generate(&mut rand::thread_rng());
-    let admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_key).await;
+    let (admin_token, admin_x25519_pk) =
+        register_device_with_x25519(&client, &url, &sync_id, &admin_id, &admin_key).await;
 
     let target_id = generate_device_id();
     let _target_token = prepare_device(&db, &sync_id, &target_id).await;
 
+    // Build a stale registry_approval BEFORE the revocation that still lists the target
+    let joiner_id = generate_device_id();
+    let joiner_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut joiner_x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut joiner_x25519_pk);
+
+    let stale_registry_approval = build_registry_approval(
+        &sync_id,
+        &admin_id,
+        &admin_key,
+        vec![
+            registry_snapshot_entry(
+                &sync_id,
+                &admin_id,
+                admin_key.verifying_key().as_bytes(),
+                &admin_x25519_pk,
+                "active",
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &target_id,
+                &[7u8; 32], // matches prepare_device signing key
+                &[8u8; 32], // matches prepare_device x25519 key
+                "active",   // still listed as active — stale!
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &joiner_id,
+                joiner_key.verifying_key().as_bytes(),
+                &joiner_x25519_pk,
+                "active",
+            ),
+        ],
+    );
+
+    // Now revoke the target, advancing to epoch 1
     let b64 = base64::engine::general_purpose::STANDARD;
     let revoke_body = serde_json::json!({
         "new_epoch": 1,
@@ -2117,68 +2158,28 @@ async fn test_stale_invitation_epoch_is_rejected() {
     .unwrap();
     assert_eq!(revoke_resp.status(), 200);
 
-    let joiner_id = generate_device_id();
-    let joiner_key = SigningKey::generate(&mut rand::thread_rng());
-    let wrapped_dek = b"fake-wrapped-dek-for-joiner";
-    let salt = b"fake-salt-value-16b!";
-    let relay_url = &url;
-    let admin_pk_bytes: [u8; 32] = *admin_key.verifying_key().as_bytes();
-
-    let signing_data = prism_sync_relay::auth::build_invitation_signing_data(
-        &sync_id,
-        relay_url,
-        wrapped_dek,
-        salt,
-        &admin_id,
-        &admin_pk_bytes,
-        Some(&joiner_id),
-        0,
-        &[],
-    );
-    let invitation_sig = admin_key.sign(&signing_data);
-
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(nonce_resp.status(), 200);
-    let nonce_json: Value = nonce_resp.json().await.unwrap();
-    let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
-
+    // Try to register joiner with the stale registry_approval
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
     let challenge_sig = sign_challenge(&joiner_key, &sync_id, &joiner_id, &nonce);
-    let mut x25519_pk = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut x25519_pk);
 
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
         .json(&serde_json::json!({
             "device_id": joiner_id,
             "signing_public_key": hex::encode(joiner_key.verifying_key().as_bytes()),
-            "x25519_public_key": hex::encode(x25519_pk),
+            "x25519_public_key": hex::encode(joiner_x25519_pk),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
-            "signed_invitation": {
-                "sync_id": sync_id,
-                "relay_url": relay_url,
-                "wrapped_dek": hex::encode(wrapped_dek),
-                "salt": hex::encode(salt),
-                "inviter_device_id": admin_id,
-                "inviter_ed25519_pk": hex::encode(admin_pk_bytes),
-                "signature": hex::encode(invitation_sig.to_bytes()),
-                "joiner_device_id": joiner_id,
-                "current_epoch": 0,
-                "epoch_key_hex": "",
-            },
+            "registry_approval": stale_registry_approval,
         }))
         .send()
         .await
         .unwrap();
 
-    assert_eq!(
-        register_resp.status(),
-        401,
-        "stale epoch invitation should be rejected"
+    let status = register_resp.status().as_u16();
+    assert!(
+        status == 401 || status == 409,
+        "stale registry_approval after revoke should be rejected, got {status}"
     );
 }
 
@@ -2478,8 +2479,16 @@ async fn test_revoke_rate_limiting() {
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
         reader_pool_size: 2,
         node_exporter_url: None,
+        first_device_pow_difficulty_bits: 0,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -2636,10 +2645,10 @@ async fn test_atomic_revoke_audit_log() {
     assert_eq!(remote_wipe, 0, "remote_wipe should be false (0)");
 }
 
-// ─────────── Test: Joiner device ID mismatch rejected ───────────
+// ─────────── Test: Registry approval for wrong device rejected ───────────
 
 #[tokio::test]
-async fn test_joiner_device_id_mismatch_rejected() {
+async fn test_registry_approval_device_mismatch_rejected() {
     let (url, _server, _db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
@@ -2647,64 +2656,56 @@ async fn test_joiner_device_id_mismatch_rejected() {
     // Register admin
     let admin_id = generate_device_id();
     let admin_key = SigningKey::generate(&mut rand::thread_rng());
-    let _admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_key).await;
+    let (_admin_token, admin_x25519_pk) =
+        register_device_with_x25519(&client, &url, &sync_id, &admin_id, &admin_key).await;
 
-    // Create invitation signed for "device-X"
+    // Registry approval includes device-X, but device-Y tries to register
     let device_x_id = generate_device_id();
+    let device_x_key = SigningKey::generate(&mut rand::thread_rng());
     let device_y_id = generate_device_id();
     let device_y_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut device_x_x25519 = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut device_x_x25519);
+    let mut device_y_x25519 = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut device_y_x25519);
 
-    let wrapped_dek = b"fake-wrapped-dek";
-    let salt = b"fake-salt-value-16b!";
-    let admin_pk_bytes: [u8; 32] = *admin_key.verifying_key().as_bytes();
-
-    let signing_data = prism_sync_relay::auth::build_invitation_signing_data(
+    // Build registry_approval that approves device-X (not device-Y)
+    let registry_approval = build_registry_approval(
         &sync_id,
-        &url,
-        wrapped_dek,
-        salt,
         &admin_id,
-        &admin_pk_bytes,
-        Some(&device_x_id), // signed for device-X
-        0,
-        &[],
+        &admin_key,
+        vec![
+            registry_snapshot_entry(
+                &sync_id,
+                &admin_id,
+                admin_key.verifying_key().as_bytes(),
+                &admin_x25519_pk,
+                "active",
+            ),
+            registry_snapshot_entry(
+                &sync_id,
+                &device_x_id,
+                device_x_key.verifying_key().as_bytes(),
+                &device_x_x25519,
+                "active",
+            ),
+        ],
     );
-    let invitation_sig = admin_key.sign(&signing_data);
 
     // Fetch nonce for device-Y
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
-    let nonce_json: Value = nonce_resp.json().await.unwrap();
-    let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
-
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
     let challenge_sig = sign_challenge(&device_y_key, &sync_id, &device_y_id, &nonce);
-    let mut x25519_pk = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut x25519_pk);
 
-    // Try to register as device-Y with invitation signed for device-X
+    // Try to register as device-Y with registry_approval that only includes device-X
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
         .json(&serde_json::json!({
             "device_id": device_y_id,
             "signing_public_key": hex::encode(device_y_key.verifying_key().as_bytes()),
-            "x25519_public_key": hex::encode(x25519_pk),
+            "x25519_public_key": hex::encode(device_y_x25519),
             "registration_challenge": hex::encode(&challenge_sig),
             "nonce": nonce,
-            "signed_invitation": {
-                "sync_id": sync_id,
-                "relay_url": url,
-                "wrapped_dek": hex::encode(wrapped_dek),
-                "salt": hex::encode(salt),
-                "inviter_device_id": admin_id,
-                "inviter_ed25519_pk": hex::encode(admin_pk_bytes),
-                "signature": hex::encode(invitation_sig.to_bytes()),
-                "joiner_device_id": device_x_id, // mismatches the registering device
-                "current_epoch": 0,
-                "epoch_key_hex": "",
-            },
+            "registry_approval": registry_approval,
         }))
         .send()
         .await
@@ -2712,7 +2713,7 @@ async fn test_joiner_device_id_mismatch_rejected() {
     let status = register_resp.status().as_u16();
     assert!(
         status == 400 || status == 401,
-        "joiner device ID mismatch should be rejected, got {status}"
+        "device not in registry_approval should be rejected, got {status}"
     );
 }
 
