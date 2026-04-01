@@ -6,13 +6,14 @@ use tokio::task::JoinHandle;
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::models::{Invite, PairingResponse};
 use prism_sync_core::pairing::service::PairingService;
+use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
 use prism_sync_core::relay::ServerRelay;
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SyncRelay as _;
 use prism_sync_core::schema::{SyncSchema, SyncValue};
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::sync_service::AutoSyncConfig;
-use prism_sync_core::{background_runtime, spawn_notification_handler};
+use prism_sync_core::{background_runtime, spawn_notification_handler, DeviceRegistryManager};
 use prism_sync_crypto::DeviceSecret;
 
 /// Opaque handle wrapping PrismSync for FFI.
@@ -1126,10 +1127,51 @@ pub async fn create_sync_group(
     relay_url: String,
     mnemonic: Option<String>,
 ) -> Result<String, String> {
+    const PENDING_SYNC_ID_KEY: &str = "pending_sync_id";
+    const PENDING_NONCE_RESPONSE_KEY: &str = "pending_registration_nonce_response";
+    const PENDING_ADMISSION_PROOF_KEY: &str = "pending_first_device_admission_proof";
+    const PENDING_DEVICE_SECRET_KEY: &str = "pending_device_secret";
+    const PENDING_DEVICE_ID_KEY: &str = "pending_device_id";
+
+    let pending = {
+        let inner = handle.inner.lock().await;
+        let store = inner.secure_store();
+
+        let pending_sync_id = store
+            .get(PENDING_SYNC_ID_KEY)
+            .map_err(|e| e.to_string())?
+            .map(|bytes| String::from_utf8(bytes))
+            .transpose()
+            .map_err(|e| format!("invalid pending sync id: {e}"))?;
+
+        let pending_nonce_response = store
+            .get(PENDING_NONCE_RESPONSE_KEY)
+            .map_err(|e| e.to_string())?
+            .map(|bytes| serde_json::from_slice::<RegistrationNonceResponse>(&bytes))
+            .transpose()
+            .map_err(|e| format!("invalid pending nonce response: {e}"))?;
+
+        let pending_admission_proof = store
+            .get(PENDING_ADMISSION_PROOF_KEY)
+            .map_err(|e| e.to_string())?
+            .map(|bytes| serde_json::from_slice::<FirstDeviceAdmissionProof>(&bytes))
+            .transpose()
+            .map_err(|e| format!("invalid pending admission proof: {e}"))?;
+
+        (
+            pending_sync_id,
+            pending_nonce_response,
+            pending_admission_proof,
+        )
+    };
+
     // Generate the sync_id BEFORE constructing the relay, because
     // ServerRelay requires a valid 64-char hex sync_id at construction
     // and the relay validates it on every request.
-    let sync_id = prism_sync_core::epoch::EpochManager::generate_sync_id();
+    let sync_id = pending
+        .0
+        .clone()
+        .unwrap_or_else(prism_sync_core::epoch::EpochManager::generate_sync_id);
     let device_id = prism_sync_core::node_id::generate_node_id();
 
     let relay = build_relay(
@@ -1144,10 +1186,28 @@ pub async fn create_sync_group(
     let mut inner = handle.inner.lock().await;
     let pairing = PairingService::new(relay, inner.secure_store().clone());
 
-    let (creds, invite) = pairing
-        .create_sync_group(&password, &relay_url, mnemonic, Some(sync_id))
-        .await
-        .map_err(|e| encode_core_error("create_sync_group", e))?;
+    let create_result = pairing
+        .create_sync_group(
+            &password,
+            &relay_url,
+            mnemonic,
+            Some(sync_id),
+            pending.1.clone(),
+            pending.2.clone(),
+        )
+        .await;
+
+    for key in [
+        PENDING_SYNC_ID_KEY,
+        PENDING_NONCE_RESPONSE_KEY,
+        PENDING_ADMISSION_PROOF_KEY,
+        PENDING_DEVICE_SECRET_KEY,
+        PENDING_DEVICE_ID_KEY,
+    ] {
+        let _ = inner.secure_store().delete(key);
+    }
+
+    let (creds, invite) = create_result.map_err(|e| encode_core_error("create_sync_group", e))?;
 
     // Unlock the handle's key hierarchy using the credentials that
     // create_sync_group just produced, and restore the device_secret.
@@ -1180,20 +1240,87 @@ pub async fn create_sync_group(
     Ok(result.to_string())
 }
 
-/// Create an invite for the EXISTING sync group (for "Add Another Device").
+/// Generate a pairing request for a new device wanting to join a sync group.
 ///
-/// Unlike `createSyncGroup` which creates a brand new group, this reads
-/// the current credentials from SecureStore and builds an invite that
-/// another device can use to join the same sync group.
+/// The joiner device calls this to create a PairingRequest containing its
+/// device identity. The request is encoded as a QR code payload and JSON
+/// for flexible transport.
 ///
-/// Returns JSON with `qr_payload`, `words`, `url`, `sync_id`, `relay_url`.
+/// Returns JSON: `{ "qr_payload": [...], "request_json": "...", "device_id": "..." }`
+pub async fn generate_pairing_request(_handle: &PrismSyncHandle) -> Result<String, String> {
+    // Generate a fresh device identity for the joiner
+    let device_secret = prism_sync_crypto::DeviceSecret::generate();
+    let device_id = prism_sync_core::node_id::generate_node_id();
+    let signing_key = device_secret
+        .ed25519_keypair(&device_id)
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
+    let exchange_key = device_secret
+        .x25519_keypair(&device_id)
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
+
+    let request = prism_sync_core::pairing::models::PairingRequest {
+        device_id: device_id.clone(),
+        ed25519_public_key: signing_key.public_key_bytes().to_vec(),
+        x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+    };
+
+    let qr_payload = request
+        .to_compact_bytes()
+        .ok_or("Failed to encode pairing request")?;
+    let request_json = serde_json::to_string(&request)
+        .map_err(|e| format!("Failed to serialize pairing request: {e}"))?;
+
+    // Persist the device secret so that complete_join can use it later.
+    // The handle is not locked here because we only need to stash the
+    // pre-generated identity for the join step.
+    let handle_inner = _handle.inner.lock().await;
+    let store = handle_inner.secure_store();
+    store
+        .set("pending_device_secret", device_secret.as_bytes())
+        .map_err(|e| format!("Failed to persist pending device secret: {e}"))?;
+    store
+        .set("pending_device_id", device_id.as_bytes())
+        .map_err(|e| format!("Failed to persist pending device id: {e}"))?;
+
+    let result = serde_json::json!({
+        "qr_payload": qr_payload,
+        "request_json": request_json,
+        "device_id": device_id,
+    });
+
+    Ok(result.to_string())
+}
+
+/// Approve a pairing request from a joining device.
 ///
-/// Requires sync to be set up (sync_id, mnemonic, wrapped_dek, salt in SecureStore).
-pub async fn create_invite(handle: &PrismSyncHandle, _password: String) -> Result<String, String> {
+/// Called by an existing trusted device after scanning a joiner's QR code.
+/// Reads the current sync group credentials from SecureStore, builds a
+/// PairingResponse targeting the joiner's device, and returns it for
+/// transport back to the joiner (e.g. via QR, NFC, or paste).
+///
+/// Accepts the pairing request as either compact bytes (from QR scan) or JSON.
+///
+/// Returns JSON: `{ "qr_payload": [...], "response_json": "...", "url": "..." }`
+pub async fn approve_pairing_request(
+    handle: &PrismSyncHandle,
+    request_bytes: Option<Vec<u8>>,
+    request_json: Option<String>,
+) -> Result<String, String> {
+    // Parse the PairingRequest from whichever format was provided
+    let request = if let Some(bytes) = request_bytes {
+        prism_sync_core::pairing::models::PairingRequest::from_compact_bytes(&bytes)
+            .ok_or("Failed to parse pairing request QR payload")?
+    } else if let Some(json) = request_json {
+        serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse pairing request JSON: {e}"))?
+    } else {
+        return Err("Either request_bytes or request_json must be provided".into());
+    };
+
     let inner = handle.inner.lock().await;
     let store = inner.secure_store();
 
-    // Read existing credentials from SecureStore
+    // Read existing credentials from SecureStore (same as create_invite)
     let sync_id = store
         .get("sync_id")
         .map_err(|e| e.to_string())?
@@ -1227,7 +1354,6 @@ pub async fn create_invite(handle: &PrismSyncHandle, _password: String) -> Resul
         .map_err(|e| e.to_string())?
         .ok_or("No device_secret — set up sync first")?;
 
-    // Derive signing and exchange keys to sign the invitation
     let device_secret = prism_sync_crypto::DeviceSecret::from_bytes(device_secret_bytes)
         .map_err(|e| format!("Invalid device secret: {e}"))?;
     let signing_key = device_secret
@@ -1237,25 +1363,19 @@ pub async fn create_invite(handle: &PrismSyncHandle, _password: String) -> Resul
         .x25519_keypair(&device_id)
         .map_err(|e| format!("Key derivation failed: {e}"))?;
 
-    // Pre-generate a device_id for the joining device so the snapshot can
-    // target it specifically (snapshot targeting fix).
-    let joiner_device_id = prism_sync_core::node_id::generate_node_id();
+    // Use the joiner's device_id from their PairingRequest
+    let joiner_device_id = request.device_id.clone();
 
-    // Read the authoritative epoch from the runtime state set by configure_engine().
-    // Fail closed if the engine isn't configured — a stale fallback could produce
-    // an invite at the wrong epoch, which the joining device can't decrypt.
+    // Read epoch state
     let epoch: i32 = inner
         .epoch()
-        .ok_or("Cannot create invite: sync engine not configured (epoch unknown)".to_string())?;
-
-    // Read the current epoch key from the KeyHierarchy. Fail closed if
-    // epoch > 0 but the key is unavailable.
+        .ok_or("Cannot approve: sync engine not configured (epoch unknown)".to_string())?;
     let epoch_key_data: Vec<u8> = if epoch > 0 {
         inner
             .key_hierarchy()
             .epoch_key(epoch as u32)
             .map(|k| k.to_vec())
-            .map_err(|_| format!("Cannot create invite: missing epoch {epoch} key"))?
+            .map_err(|_| format!("Cannot approve: missing epoch {epoch} key"))?
     } else {
         vec![]
     };
@@ -1274,24 +1394,51 @@ pub async fn create_invite(handle: &PrismSyncHandle, _password: String) -> Resul
     );
     let signature = signing_key.sign(&signing_data);
 
-    // Build signed keyring containing the inviter's device record.
-    // Ideally this would include ALL devices fetched from the relay, but
-    // create_invite doesn't have an authenticated relay connection. Including
-    // at least the inviter's own device lets the joiner verify the inviter's
-    // identity. A full device list could be fetched post-join via list_devices.
-    // TODO: fetch full device list from relay once create_invite has relay access
-    let keyring_json = serde_json::to_vec(&serde_json::json!([{
-        "sync_id": &sync_id,
-        "device_id": &device_id,
-        "ed25519_public_key": signing_key.public_key_bytes().to_vec(),
-        "x25519_public_key": exchange_key.public_key_bytes().to_vec(),
-        "status": "active",
-    }]))
-    .unwrap_or_default();
-    let keyring_signature = signing_key.sign(&keyring_json);
-    let signed_keyring = [keyring_signature, keyring_json].concat();
+    let mut registry_entries: Vec<prism_sync_core::pairing::models::RegistrySnapshotEntry> = inner
+        .storage()
+        .list_device_records(&sync_id)
+        .map_err(|e| format!("Failed to read local device registry: {e}"))?
+        .into_iter()
+        .map(
+            |device| prism_sync_core::pairing::models::RegistrySnapshotEntry {
+                sync_id: device.sync_id,
+                device_id: device.device_id,
+                ed25519_public_key: device.ed25519_public_key,
+                x25519_public_key: device.x25519_public_key,
+                status: device.status,
+            },
+        )
+        .collect();
+    registry_entries
+        .retain(|entry| entry.device_id != device_id && entry.device_id != joiner_device_id);
+    registry_entries.push(prism_sync_core::pairing::models::RegistrySnapshotEntry {
+        sync_id: sync_id.clone(),
+        device_id: device_id.clone(),
+        ed25519_public_key: signing_key.public_key_bytes().to_vec(),
+        x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+        status: "active".into(),
+    });
+    registry_entries.push(prism_sync_core::pairing::models::RegistrySnapshotEntry {
+        sync_id: sync_id.clone(),
+        device_id: joiner_device_id.clone(),
+        ed25519_public_key: request.ed25519_public_key.clone(),
+        x25519_public_key: request.x25519_public_key.clone(),
+        status: "active".into(),
+    });
 
-    // Build the PairingResponse (same structure as createSyncGroup returns)
+    // Build signed registry snapshot for current membership plus the approved joiner.
+    let registry_snapshot =
+        prism_sync_core::pairing::models::SignedRegistrySnapshot::new(registry_entries);
+    let signed_keyring = registry_snapshot.sign(&signing_key);
+    let approval_signature = signing_key.sign(
+        &prism_sync_core::pairing::models::build_registry_approval_signing_data(
+            &sync_id,
+            &device_id,
+            &signed_keyring,
+        ),
+    );
+
+    // Build PairingResponse
     let response = prism_sync_core::pairing::models::PairingResponse {
         relay_url: relay_url.clone(),
         sync_id: sync_id.clone(),
@@ -1302,20 +1449,20 @@ pub async fn create_invite(handle: &PrismSyncHandle, _password: String) -> Resul
         signed_keyring,
         inviter_device_id: device_id,
         inviter_ed25519_pk: signing_key.public_key_bytes().to_vec(),
-        joiner_device_id: Some(joiner_device_id.clone()),
+        joiner_device_id: Some(joiner_device_id),
         current_epoch: epoch as u32,
         epoch_key: epoch_key_data,
+        registry_approval_signature: Some(prism_sync_crypto::hex::encode(&approval_signature)),
     };
 
     let invite = prism_sync_core::pairing::models::Invite::new(response);
 
     let result = serde_json::json!({
         "qr_payload": invite.qr_payload(),
-        "words": invite.words(),
+        "response_json": serde_json::to_string(invite.response()).unwrap_or_default(),
         "url": invite.url(),
         "sync_id": sync_id,
         "relay_url": relay_url,
-        "joiner_device_id": joiner_device_id,
     });
 
     Ok(result.to_string())
@@ -1382,10 +1529,17 @@ async fn join_with_response(
     let mut inner = handle.inner.lock().await;
     let pairing = PairingService::new(relay, inner.secure_store().clone());
 
-    let key_hierarchy = pairing
+    let (key_hierarchy, registry_snapshot) = pairing
         .join_sync_group(response, password)
         .await
         .map_err(|e| encode_core_error("join_sync_group", e))?;
+
+    DeviceRegistryManager::import_keyring(
+        inner.storage().as_ref(),
+        &response.sync_id,
+        &registry_snapshot.to_device_records(),
+    )
+    .map_err(|e| e.to_string())?;
 
     // Restore the unlocked key hierarchy and device secret into the handle
     // so subsequent calls (configureEngine, exportDek, etc.) work.
@@ -1445,6 +1599,15 @@ async fn join_with_response(
             }
         }
     }
+
+    inner
+        .secure_store()
+        .delete("pending_device_secret")
+        .map_err(|e| e.to_string())?;
+    inner
+        .secure_store()
+        .delete("pending_device_id")
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }

@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_relay`, `device_info_to_json`, `encoded_value_to_json`, `join_with_response`, `json_value_to_sync_value`, `parse_fields_json`, `parse_schema_json`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`
+// These functions are ignored because they are not marked as `pub`: `build_relay`, `device_info_to_json`, `encode_core_error`, `encoded_value_to_json`, `join_with_response`, `json_value_to_sync_value`, `parse_fields_json`, `parse_schema_json`, `relay_error_category_to_json`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `get`, `set`
 
 /// Build and configure a PrismSync instance.
@@ -298,21 +298,34 @@ Future<String> createSyncGroup({
   mnemonic: mnemonic,
 );
 
-/// Create an invite for the EXISTING sync group (for "Add Another Device").
+/// Generate a pairing request for a new device wanting to join a sync group.
 ///
-/// Unlike `createSyncGroup` which creates a brand new group, this reads
-/// the current credentials from SecureStore and builds an invite that
-/// another device can use to join the same sync group.
+/// The joiner device calls this to create a PairingRequest containing its
+/// device identity. The request is encoded as a QR code payload and JSON
+/// for flexible transport.
 ///
-/// Returns JSON with `qr_payload`, `words`, `url`, `sync_id`, `relay_url`.
+/// Returns JSON: `{ "qr_payload": [...], "request_json": "...", "device_id": "..." }`
+Future<String> generatePairingRequest({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiGeneratePairingRequest(handle: handle);
+
+/// Approve a pairing request from a joining device.
 ///
-/// Requires sync to be set up (sync_id, mnemonic, wrapped_dek, salt in SecureStore).
-Future<String> createInvite({
+/// Called by an existing trusted device after scanning a joiner's QR code.
+/// Reads the current sync group credentials from SecureStore, builds a
+/// PairingResponse targeting the joiner's device, and returns it for
+/// transport back to the joiner (e.g. via QR, NFC, or paste).
+///
+/// Accepts the pairing request as either compact bytes (from QR scan) or JSON.
+///
+/// Returns JSON: `{ "qr_payload": [...], "response_json": "...", "url": "..." }`
+Future<String> approvePairingRequest({
   required PrismSyncHandle handle,
-  required String password,
-}) => RustLib.instance.api.crateApiCreateInvite(
+  Uint8List? requestBytes,
+  String? requestJson,
+}) => RustLib.instance.api.crateApiApprovePairingRequest(
   handle: handle,
-  password: password,
+  requestBytes: requestBytes,
+  requestJson: requestJson,
 );
 
 /// Join an existing sync group from QR payload bytes.
@@ -419,13 +432,8 @@ Future<int> revokeAndRekey({
   remoteWipe: remoteWipe,
 );
 
-/// Check whether a device has been flagged for remote wipe.
-///
-/// This is a standalone HTTP call that does NOT require authentication —
-/// useful when the device has already been revoked and may not hold valid
-/// credentials.  Returns `Some(true)` if the relay confirms a remote-wipe
-/// flag, `Some(false)` if the device exists but is not flagged, or `None`
-/// if the device/sync-group is not found (HTTP 404).
+/// Deprecated: wipe status is now embedded in the 401 response from the relay.
+/// This stub is kept only for FFI binding compatibility until bindings are regenerated.
 Future<bool?> checkWipeStatus({
   required String relayUrl,
   required String syncId,
