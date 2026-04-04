@@ -15,6 +15,37 @@ use serde_json::Value;
 
 use common::*;
 
+/// Helper: push a batch with signed headers.
+async fn push_signed(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+    signing_key: &SigningKey,
+    envelope: &Value,
+) -> reqwest::Response {
+    let body_bytes = serde_json::to_vec(envelope).unwrap();
+    let path = format!("/v1/sync/{sync_id}/changes");
+    apply_signed_headers(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", device_id)
+            .header("Content-Type", "application/json"),
+        signing_key,
+        "PUT",
+        &path,
+        sync_id,
+        device_id,
+        &body_bytes,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap()
+}
+
 // ───────────────────────────── Test 2: Push + Pull Roundtrip ────────────
 
 #[tokio::test]
@@ -28,23 +59,18 @@ async fn test_push_pull_roundtrip() {
     let signing_key_a = SigningKey::generate(&mut rand::thread_rng());
     let token_a = register_device(&client, &url, &sync_id, &device_a_id, &signing_key_a).await;
 
-    // Register Device B (needs invitation for existing group... actually, let's check)
-    // The relay requires an invitation for non-first devices. For testing, we need
-    // to register B with a signed invitation. This is complex, so let's use a
-    // workaround: register both devices as "first" in separate sync groups and
-    // test push/pull within a single device. OR we can test that device A can
-    // push and pull its own data.
-
     // Device A pushes a batch
     let envelope = make_test_envelope(&sync_id, &device_a_id, "batch-001", 0);
-    let push_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/changes"))
-        .header("Authorization", format!("Bearer {token_a}"))
-        .header("X-Device-Id", &device_a_id)
-        .json(&envelope)
-        .send()
-        .await
-        .unwrap();
+    let push_resp = push_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_a_id,
+        &token_a,
+        &signing_key_a,
+        &envelope,
+    )
+    .await;
     assert!(
         push_resp.status().is_success(),
         "push failed: {}",
@@ -56,14 +82,16 @@ async fn test_push_pull_roundtrip() {
 
     // Device A pushes a second batch
     let envelope2 = make_test_envelope(&sync_id, &device_a_id, "batch-002", 0);
-    let push_resp2 = client
-        .put(format!("{url}/v1/sync/{sync_id}/changes"))
-        .header("Authorization", format!("Bearer {token_a}"))
-        .header("X-Device-Id", &device_a_id)
-        .json(&envelope2)
-        .send()
-        .await
-        .unwrap();
+    let push_resp2 = push_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_a_id,
+        &token_a,
+        &signing_key_a,
+        &envelope2,
+    )
+    .await;
     assert!(push_resp2.status().is_success());
     let push_json2: Value = push_resp2.json().await.unwrap();
     let server_seq2 = push_json2["server_seq"].as_i64().unwrap();
@@ -111,14 +139,16 @@ async fn test_push_pull_roundtrip() {
     );
 
     // Duplicate push should return same server_seq (idempotent)
-    let push_resp_dup = client
-        .put(format!("{url}/v1/sync/{sync_id}/changes"))
-        .header("Authorization", format!("Bearer {token_a}"))
-        .header("X-Device-Id", &device_a_id)
-        .json(&envelope)
-        .send()
-        .await
-        .unwrap();
+    let push_resp_dup = push_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_a_id,
+        &token_a,
+        &signing_key_a,
+        &envelope,
+    )
+    .await;
     assert!(push_resp_dup.status().is_success());
     let dup_json: Value = push_resp_dup.json().await.unwrap();
     assert_eq!(
@@ -144,40 +174,63 @@ async fn test_ack_triggers_pruning() {
     let mut last_seq = 0i64;
     for i in 0..5 {
         let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
-        let resp = client
-            .put(format!("{url}/v1/sync/{sync_id}/changes"))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("X-Device-Id", &device_id)
-            .json(&envelope)
-            .send()
-            .await
-            .unwrap();
+        let resp = push_signed(
+            &client,
+            &url,
+            &sync_id,
+            &device_id,
+            &token,
+            &signing_key,
+            &envelope,
+        )
+        .await;
         assert!(resp.status().is_success());
         let json: Value = resp.json().await.unwrap();
         last_seq = json["server_seq"].as_i64().unwrap();
     }
 
     // Upload a snapshot covering all batches (required for pruning)
-    let put_snap = client
-        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Device-Id", &device_id)
-        .header("X-Server-Seq-At", last_seq.to_string())
-        .body(b"snapshot-data".to_vec())
-        .send()
-        .await
-        .unwrap();
+    let snapshot_body = b"snapshot-data".to_vec();
+    let snapshot_path = format!("/v1/sync/{sync_id}/snapshot");
+    let put_snap = apply_signed_headers(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("X-Server-Seq-At", last_seq.to_string()),
+        &signing_key,
+        "PUT",
+        &snapshot_path,
+        &sync_id,
+        &device_id,
+        &snapshot_body,
+    )
+    .body(snapshot_body)
+    .send()
+    .await
+    .unwrap();
     assert_eq!(put_snap.status(), 204);
 
     // ACK up to last_seq (this is the only device, so min_acked = last_seq)
-    let ack_resp = client
-        .post(format!("{url}/v1/sync/{sync_id}/ack"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Device-Id", &device_id)
-        .json(&serde_json::json!({ "server_seq": last_seq }))
-        .send()
-        .await
-        .unwrap();
+    let ack_body = serde_json::to_vec(&serde_json::json!({ "server_seq": last_seq })).unwrap();
+    let ack_path = format!("/v1/sync/{sync_id}/ack");
+    let ack_resp = apply_signed_headers(
+        client
+            .post(format!("{url}/v1/sync/{sync_id}/ack"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &signing_key,
+        "POST",
+        &ack_path,
+        &sync_id,
+        &device_id,
+        &ack_body,
+    )
+    .body(ack_body)
+    .send()
+    .await
+    .unwrap();
     assert_eq!(ack_resp.status(), 204);
 
     // Pull from 0 — batches before the safe prune point should be gone
@@ -214,17 +267,100 @@ async fn test_push_rejects_wrong_epoch() {
 
     // Try to push with epoch 5 (current is 0)
     let envelope = make_test_envelope(&sync_id, &device_id, "batch-wrong-epoch", 5);
-    let push_resp = client
+    let push_resp = push_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &signing_key,
+        &envelope,
+    )
+    .await;
+    assert_eq!(
+        push_resp.status(),
+        403,
+        "push with wrong epoch should be rejected"
+    );
+}
+
+// ───────────────── Tests: unsigned mutation requests are rejected ──────────
+
+#[tokio::test]
+async fn test_push_rejects_unsigned_request() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+
+    let envelope = make_test_envelope(&sync_id, &device_id, "batch-unsigned", 0);
+    let resp = client
         .put(format!("{url}/v1/sync/{sync_id}/changes"))
         .header("Authorization", format!("Bearer {token}"))
         .header("X-Device-Id", &device_id)
+        .header("Content-Type", "application/json")
         .json(&envelope)
         .send()
         .await
         .unwrap();
     assert_eq!(
-        push_resp.status(),
-        403,
-        "push with wrong epoch should be rejected"
+        resp.status(),
+        400,
+        "push without signature headers should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_put_snapshot_rejects_unsigned_request() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+
+    let resp = client
+        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .header("X-Server-Seq-At", "1")
+        .body(b"snapshot-data".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "snapshot upload without signature headers should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_ack_rejects_unsigned_request() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/ack"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_vec(&serde_json::json!({ "server_seq": 1 })).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "ack without signature headers should be rejected"
     );
 }

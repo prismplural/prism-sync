@@ -31,11 +31,15 @@ pub async fn push_changes(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
     Path(path_sync_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
+
+    let path = format!("/v1/sync/{}/changes", auth.sync_id);
+    verify_signed_request(&state, &auth, &headers, "PUT", &path, &body)?;
 
     if body.len() > MAX_CHANGESET_SIZE {
         return Err(AppError::PayloadTooLarge("Batch exceeds 1 MB limit"));
@@ -313,6 +317,7 @@ pub async fn get_snapshot(
                 "epoch": snap.epoch,
                 "server_seq_at": snap.server_seq_at,
                 "data": b64.encode(&snap.data),
+                "sender_device_id": snap.uploaded_by_device_id.unwrap_or_default(),
             }))
             .into_response())
         }
@@ -338,6 +343,9 @@ pub async fn put_snapshot(
     if body.len() > MAX_SNAPSHOT_SIZE {
         return Err(AppError::PayloadTooLarge("Snapshot exceeds 25 MB limit"));
     }
+
+    let path = format!("/v1/sync/{}/snapshot", auth.sync_id);
+    verify_signed_request(&state, &auth, &headers, "PUT", &path, &body)?;
 
     let server_seq_at = headers
         .get("X-Server-Seq-At")

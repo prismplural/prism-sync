@@ -78,10 +78,13 @@ pub fn is_valid_sync_id(sync_id: &str) -> bool {
 /// - non-empty
 /// - <= 128 bytes
 /// - printable ASCII only (no control chars, no DEL)
+/// - no pipe `|` characters (used as AAD field separator)
 pub fn is_valid_device_id(device_id: &str) -> bool {
     !device_id.is_empty()
         && device_id.len() <= 128
-        && device_id.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        && device_id
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'|')
 }
 
 /// Build canonical bytes that get signed for destructive HTTP requests.

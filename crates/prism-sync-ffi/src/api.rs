@@ -392,6 +392,7 @@ pub fn create_prism_sync(
     db_path: String,
     allow_insecure: bool,
     schema_json: String,
+    database_key: Option<Vec<u8>>,
 ) -> Result<PrismSyncHandle, String> {
     let schema = if schema_json.is_empty() || schema_json == "{}" {
         SyncSchema::builder().build()
@@ -401,6 +402,47 @@ pub fn create_prism_sync(
 
     let storage = if db_path == ":memory:" {
         RusqliteSyncStorage::in_memory()
+    } else if let Some(ref key) = database_key {
+        // If the DB file exists, try opening encrypted first; if that fails
+        // assume it is a plaintext DB and migrate it in-place.
+        let path = std::path::Path::new(&db_path);
+        if path.exists() {
+            let conn = rusqlite::Connection::open(&db_path)
+                .map_err(|e| format!("Failed to open database: {e}"))?;
+            match RusqliteSyncStorage::new_encrypted(conn, key) {
+                Ok(s) => Ok(s),
+                Err(_) => {
+                    // Plaintext DB detected — migrate to encrypted with backup safety.
+                    let enc_path = format!("{db_path}.enc");
+                    let bak_path = format!("{db_path}.bak");
+                    RusqliteSyncStorage::migrate_to_encrypted(
+                        path,
+                        std::path::Path::new(&enc_path),
+                        key,
+                    )
+                    .map_err(|e| format!("Encryption migration failed: {e}"))?;
+
+                    // Keep the plaintext DB as a backup until we verify the encrypted copy.
+                    std::fs::rename(&db_path, &bak_path)
+                        .map_err(|e| format!("Failed to backup plaintext DB: {e}"))?;
+                    std::fs::rename(&enc_path, &db_path)
+                        .map_err(|e| format!("Failed to replace DB with encrypted copy: {e}"))?;
+
+                    let conn = rusqlite::Connection::open(&db_path)
+                        .map_err(|e| format!("Failed to open migrated database: {e}"))?;
+                    let storage = RusqliteSyncStorage::new_encrypted(conn, key)
+                        .map_err(|e| format!("Encrypted DB verification failed: {e}"))?;
+
+                    // Encrypted copy verified — remove the plaintext backup.
+                    let _ = std::fs::remove_file(&bak_path);
+                    Ok(storage)
+                }
+            }
+        } else {
+            let conn = rusqlite::Connection::open(&db_path)
+                .map_err(|e| format!("Failed to open database: {e}"))?;
+            RusqliteSyncStorage::new_encrypted(conn, key)
+        }
     } else {
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| format!("Failed to open database: {e}"))?;

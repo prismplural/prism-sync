@@ -7,7 +7,7 @@ description = "CRDT primitives, sync storage, and op emission for prism-sync"
 
 [dependencies]
 prism-sync-crypto = { path = "../prism-sync-crypto" }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 rusqlite_migration = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 serde = { version = "1", features = ["derive"] }

@@ -62,6 +62,7 @@ impl SyncRelay for RekeyMockRelay {
         _: Vec<u8>,
         _: Option<u64>,
         _: Option<String>,
+        _: String,
     ) -> Result<(), RelayError> {
         unimplemented!()
     }

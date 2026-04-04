@@ -821,12 +821,14 @@ impl SyncEngine {
     ///
     /// The existing device calls this after generating an invite. The snapshot
     /// is encrypted with the current epoch key and uploaded with a TTL.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upload_pairing_snapshot(
         &self,
         sync_id: &str,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         epoch: i32,
-        _device_id: &str,
+        device_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
     ) -> Result<()> {
@@ -847,16 +849,42 @@ impl SyncEngine {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))??;
 
-        // 3. Encrypt with epoch key (simple xchacha, no AAD needed for snapshots)
+        // 3. Encrypt with epoch key + snapshot AAD (binds metadata to ciphertext)
         let epoch_key = key_hierarchy
             .epoch_key(epoch as u32)
             .map_err(|e| CoreError::Engine(format!("no epoch key: {e}")))?;
-        let encrypted = prism_sync_crypto::aead::xchacha_encrypt(epoch_key, &snapshot_data)
-            .map_err(|e| CoreError::Engine(format!("snapshot encrypt failed: {e}")))?;
+        let aad = crate::sync_aad::build_snapshot_aad(sync_id, device_id, epoch, server_seq);
+        let (ciphertext, nonce) =
+            prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &snapshot_data, &aad)
+                .map_err(|e| CoreError::Engine(format!("snapshot encrypt failed: {e}")))?;
 
-        // 4. Upload to relay with TTL
+        // 4. Compute payload hash and sign the snapshot as a batch envelope
+        let payload_hash = crate::batch_signature::compute_payload_hash(&snapshot_data);
+        let batch_id = format!("snapshot-{}", chrono::Utc::now().timestamp_millis());
+        let envelope = crate::batch_signature::sign_batch(
+            signing_key,
+            sync_id,
+            epoch,
+            &batch_id,
+            "snapshot",
+            device_id,
+            &payload_hash,
+            nonce,
+            ciphertext,
+        )?;
+
+        // 5. Serialize the envelope to JSON bytes and upload
+        let envelope_bytes =
+            serde_json::to_vec(&envelope).map_err(|e| CoreError::Serialization(e.to_string()))?;
         self.relay
-            .put_snapshot(epoch, server_seq, encrypted, ttl_secs, for_device_id)
+            .put_snapshot(
+                epoch,
+                server_seq,
+                envelope_bytes,
+                ttl_secs,
+                for_device_id,
+                device_id.to_string(),
+            )
             .await
             .map_err(CoreError::from_relay)?;
 
@@ -887,12 +915,48 @@ impl SyncEngine {
             None => return Ok((0, Vec::new())),
         };
 
-        // 2. Decrypt with epoch key
+        // 2. Deserialize the signed envelope and verify signature
+        let envelope: crate::relay::traits::SignedBatchEnvelope =
+            serde_json::from_slice(&snapshot.data).map_err(|e| {
+                CoreError::Serialization(format!("snapshot envelope deserialization failed: {e}"))
+            })?;
+
+        // Look up the sender's public key and verify the batch signature
+        let sender_pk = self
+            .resolve_sender_public_key(sync_id, &envelope.sender_device_id)
+            .await?;
+
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&sender_pk)
+            .map_err(|e| CoreError::Engine(format!("invalid sender public key: {e}")))?;
+
+        crate::batch_signature::verify_batch_signature(&envelope, &verifying_key)?;
+
+        // Verify relay-reported metadata matches the signed envelope
+        if snapshot.epoch != envelope.epoch {
+            return Err(CoreError::Engine(format!(
+                "snapshot epoch mismatch: relay reported {} but sender signed {}",
+                snapshot.epoch, envelope.epoch,
+            )));
+        }
+
+        // 3. Decrypt with epoch key + snapshot AAD
         let epoch_key = key_hierarchy
             .epoch_key(snapshot.epoch as u32)
             .map_err(|e| CoreError::Engine(format!("no epoch key for snapshot: {e}")))?;
-        let compressed = prism_sync_crypto::aead::xchacha_decrypt(epoch_key, &snapshot.data)
-            .map_err(|e| CoreError::Engine(format!("snapshot decrypt failed: {e}")))?;
+        let aad = crate::sync_aad::build_snapshot_aad(
+            sync_id,
+            &envelope.sender_device_id,
+            snapshot.epoch,
+            snapshot.server_seq_at,
+        );
+        let compressed = prism_sync_crypto::aead::xchacha_decrypt_from_sync(
+            epoch_key,
+            &envelope.ciphertext,
+            &envelope.nonce,
+            &aad,
+        )
+        .map_err(|e| CoreError::Engine(format!("snapshot decrypt failed: {e}")))?;
+        crate::batch_signature::verify_payload_hash(&envelope, &compressed)?;
 
         // 3. Import into storage (within transaction)
         let storage = self.storage.clone();

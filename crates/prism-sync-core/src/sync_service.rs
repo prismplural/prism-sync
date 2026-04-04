@@ -529,6 +529,7 @@ impl SyncService {
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         epoch: i32,
         device_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
     ) -> Result<()> {
@@ -546,6 +547,7 @@ impl SyncService {
                 key_hierarchy,
                 epoch,
                 device_id,
+                signing_key,
                 ttl_secs,
                 for_device_id,
             )

@@ -583,11 +583,15 @@ pub async fn post_ack(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
     Path(path_sync_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
+
+    let path = format!("/v1/sync/{}/ack", auth.sync_id);
+    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
 
     let body_json: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;

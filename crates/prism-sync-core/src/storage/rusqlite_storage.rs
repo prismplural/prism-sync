@@ -767,6 +767,43 @@ impl RusqliteSyncStorage {
         })
     }
 
+    /// Create a new encrypted storage backed by an existing connection.
+    ///
+    /// The encryption key must be applied as the very first PRAGMA before any
+    /// other database operations. Uses SQLCipher's `PRAGMA key` for AES-256.
+    pub fn new_encrypted(conn: Connection, key: &[u8]) -> Result<Self> {
+        let hex_key = hex::encode(key);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .map_err(|e| CoreError::Storage(format!("PRAGMA key failed: {e}")))?;
+
+        // Now proceed with normal setup
+        Self::new(conn)
+    }
+
+    /// Migrate an existing unencrypted database to an encrypted one.
+    ///
+    /// Uses SQLCipher's ATTACH + sqlcipher_export pattern to copy all data
+    /// from the plaintext source to a new encrypted database.
+    pub fn migrate_to_encrypted(
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+        key: &[u8],
+    ) -> Result<()> {
+        let hex_key = hex::encode(key);
+        let escaped_path = new_path.display().to_string().replace('\'', "''");
+        let conn = Connection::open(old_path)
+            .map_err(|e| CoreError::Storage(format!("open old DB: {e}")))?;
+
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{escaped_path}' AS encrypted KEY \"x'{hex_key}'\";\n\
+             SELECT sqlcipher_export('encrypted');\n\
+             DETACH DATABASE encrypted;",
+        ))
+        .map_err(|e| CoreError::Storage(format!("encryption migration failed: {e}")))?;
+
+        Ok(())
+    }
+
     /// Create an in-memory storage instance for testing.
     pub fn in_memory() -> Result<Self> {
         Self::new(Connection::open_in_memory().map_err(CoreError::Sqlite)?)

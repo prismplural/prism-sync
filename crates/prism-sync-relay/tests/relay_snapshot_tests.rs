@@ -17,6 +17,42 @@ use prism_sync_relay::db;
 
 use common::*;
 
+/// Helper: PUT a snapshot with signed headers.
+async fn put_snapshot_signed(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+    signing_key: &SigningKey,
+    server_seq_at: &str,
+    snapshot_data: Vec<u8>,
+    extra_headers: &[(&str, &str)],
+) -> reqwest::Response {
+    let path = format!("/v1/sync/{sync_id}/snapshot");
+    let mut builder = client
+        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", device_id)
+        .header("X-Server-Seq-At", server_seq_at);
+    for (k, v) in extra_headers {
+        builder = builder.header(*k, *v);
+    }
+    apply_signed_headers(
+        builder,
+        signing_key,
+        "PUT",
+        &path,
+        sync_id,
+        device_id,
+        &snapshot_data,
+    )
+    .body(snapshot_data)
+    .send()
+    .await
+    .unwrap()
+}
+
 // ───────────────────────────── Test 4: Snapshot ─────────────────────────
 
 #[tokio::test]
@@ -41,15 +77,18 @@ async fn test_snapshot_put_get_roundtrip() {
 
     // Upload snapshot (epoch is looked up from device record, no X-Epoch header)
     let snapshot_data = b"encrypted-snapshot-payload-here";
-    let put_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Device-Id", &device_id)
-        .header("X-Server-Seq-At", "42")
-        .body(snapshot_data.to_vec())
-        .send()
-        .await
-        .unwrap();
+    let put_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &signing_key,
+        "42",
+        snapshot_data.to_vec(),
+        &[],
+    )
+    .await;
     assert_eq!(put_resp.status(), 204, "snapshot put should return 204");
 
     // Download snapshot (response is now JSON with base64-encoded data)
@@ -81,17 +120,18 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
     let device_b_id = generate_device_id();
     let token_b = prepare_device(&db, &sync_id, &device_b_id).await;
 
-    let upload_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
-        .header("Authorization", format!("Bearer {token_a}"))
-        .header("X-Device-Id", &device_a_id)
-        .header("X-Server-Seq-At", "42")
-        .header("X-Snapshot-TTL", "300")
-        .header("X-For-Device-Id", &device_b_id)
-        .body(b"targeted-snapshot".to_vec())
-        .send()
-        .await
-        .unwrap();
+    let upload_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_a_id,
+        &token_a,
+        &signing_key_a,
+        "42",
+        b"targeted-snapshot".to_vec(),
+        &[("X-Snapshot-TTL", "300"), ("X-For-Device-Id", &device_b_id)],
+    )
+    .await;
     assert_eq!(upload_resp.status(), 204);
 
     let denied_resp = client
@@ -146,17 +186,18 @@ async fn test_targeted_snapshot_expires() {
     let device_b_id = generate_device_id();
     let token_b = prepare_device(&db, &sync_id, &device_b_id).await;
 
-    let upload_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
-        .header("Authorization", format!("Bearer {token_a}"))
-        .header("X-Device-Id", &device_a_id)
-        .header("X-Server-Seq-At", "99")
-        .header("X-Snapshot-TTL", "1")
-        .header("X-For-Device-Id", &device_b_id)
-        .body(b"expiring-snapshot".to_vec())
-        .send()
-        .await
-        .unwrap();
+    let upload_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_a_id,
+        &token_a,
+        &signing_key_a,
+        "99",
+        b"expiring-snapshot".to_vec(),
+        &[("X-Snapshot-TTL", "1"), ("X-For-Device-Id", &device_b_id)],
+    )
+    .await;
     assert_eq!(upload_resp.status(), 204);
 
     db.with_conn(|conn| {

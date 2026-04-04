@@ -109,9 +109,7 @@ pub struct RegistryApproval {
 pub enum FirstDeviceAdmissionProof {
     /// Android hardware-backed key attestation certificate chain. Each element
     /// is a base64-encoded DER certificate, leaf-first.
-    AndroidKeyAttestation {
-        certificate_chain: Vec<String>,
-    },
+    AndroidKeyAttestation { certificate_chain: Vec<String> },
 
     /// Apple App Attest attestation object, bound to the relay-issued nonce.
     AppleAppAttest {
@@ -211,23 +209,27 @@ pub struct SignedBatchEnvelope {
     pub batch_id: String,
     pub batch_kind: String,
     pub sender_device_id: String,
+    #[serde(with = "base64_hash")]
     pub payload_hash: [u8; 32],
+    #[serde(with = "base64_bytes")]
     pub signature: Vec<u8>,
+    #[serde(with = "base64_nonce")]
     pub nonce: [u8; 24],
+    #[serde(with = "base64_bytes")]
     pub ciphertext: Vec<u8>,
 }
 
 /// Response from fetching a snapshot.
 ///
-/// Snapshots also use `SignedBatchEnvelope` with `batch_kind = "snapshot"`.
-/// The `data` field contains the full serialized `SignedBatchEnvelope` so
-/// that the receiver can verify the sender's Ed25519 signature before
-/// decrypting the snapshot content.
+/// The `data` field contains the full serialized `SignedBatchEnvelope`
+/// (with `batch_kind = "snapshot"`) so that the receiver can verify the
+/// sender's Ed25519 signature before decrypting the snapshot content.
 #[derive(Debug, Clone)]
 pub struct SnapshotResponse {
     pub epoch: i32,
     pub server_seq_at: i64,
     pub data: Vec<u8>,
+    pub sender_device_id: String,
 }
 
 /// Information about a device in the sync group (from relay).
@@ -247,6 +249,89 @@ pub struct DeviceInfo {
     pub permission: Option<String>,
 }
 
+/// Serde module for `Vec<u8>` that serializes as base64 and deserializes
+/// from either base64 strings or integer arrays (backward-compatible).
+///
+/// Use with `#[serde(with = "base64_bytes")]` on `Vec<u8>` fields.
+pub(crate) mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_any(Base64OrBytesVisitor)
+    }
+
+    struct Base64OrBytesVisitor;
+
+    impl<'de> de::Visitor<'de> for Base64OrBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a base64 string or byte array")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+            STANDARD.decode(v).map_err(de::Error::custom)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut bytes = Vec::new();
+            while let Some(b) = seq.next_element::<u8>()? {
+                bytes.push(b);
+            }
+            Ok(bytes)
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Vec<u8>, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Vec<u8>, E> {
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Serde module for `[u8; 32]` that serializes as base64 and deserializes
+/// from either base64 strings or integer arrays.
+pub(crate) mod base64_hash {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
+        let bytes: Vec<u8> = super::base64_bytes::deserialize(deserializer)?;
+        bytes
+            .try_into()
+            .map_err(|_| de::Error::custom("expected 32 bytes for hash"))
+    }
+}
+
+/// Serde module for `[u8; 24]` (nonce) that serializes as base64 and deserializes
+/// from either base64 strings or integer arrays.
+pub(crate) mod base64_nonce {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{de, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 24], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 24], D::Error> {
+        let bytes: Vec<u8> = super::base64_bytes::deserialize(deserializer)?;
+        bytes
+            .try_into()
+            .map_err(|_| de::Error::custom("expected 24 bytes for nonce"))
+    }
+}
+
 /// Deserialize a `Vec<u8>` from either a base64-encoded JSON string or a raw byte array.
 ///
 /// The relay server sends public keys as base64 strings, but in-memory / mock
@@ -255,43 +340,7 @@ fn deserialize_base64_or_bytes<'de, D>(deserializer: D) -> std::result::Result<V
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de;
-
-    struct Base64OrBytes;
-
-    impl<'de> de::Visitor<'de> for Base64OrBytes {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a base64 string or byte array")
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Vec<u8>, E> {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            STANDARD.decode(v).map_err(de::Error::custom)
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> std::result::Result<Vec<u8>, A::Error> {
-            let mut bytes = Vec::new();
-            while let Some(b) = seq.next_element::<u8>()? {
-                bytes.push(b);
-            }
-            Ok(bytes)
-        }
-
-        fn visit_none<E: de::Error>(self) -> std::result::Result<Vec<u8>, E> {
-            Ok(Vec::new())
-        }
-
-        fn visit_unit<E: de::Error>(self) -> std::result::Result<Vec<u8>, E> {
-            Ok(Vec::new())
-        }
-    }
-
-    deserializer.deserialize_any(Base64OrBytes)
+    base64_bytes::deserialize(deserializer)
 }
 
 /// Real-time notification from the relay WebSocket.
@@ -358,6 +407,7 @@ pub trait SyncRelay: Send + Sync {
         data: Vec<u8>,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
+        sender_device_id: String,
     ) -> std::result::Result<(), RelayError>;
 
     /// List all devices in this sync group.

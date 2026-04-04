@@ -410,13 +410,18 @@ impl SyncRelay for ServerRelay {
 
     async fn push_changes(&self, batch: OutgoingBatch) -> Result<i64, RelayError> {
         let url = format!("{}/changes", self.base_path());
+        let path = self.canonical_path("/changes");
         debug!("push_changes batch_id={}", batch.batch_id);
 
+        let body_bytes = serde_json::to_vec(&batch.envelope).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to serialize batch: {e}"),
+        })?;
+
         let resp = self
-            .apply_auth(self.client.put(&url))
+            .apply_signed_auth(self.client.put(&url), "PUT", &path, &body_bytes)
             .header("X-Batch-Id", &batch.batch_id)
             .header("Content-Type", "application/json")
-            .json(&batch.envelope)
+            .body(body_bytes)
             .timeout(self.request_timeout)
             .send()
             .await
@@ -466,10 +471,13 @@ impl SyncRelay for ServerRelay {
             .and_then(|s| BASE64.decode(s).ok())
             .unwrap_or_default();
 
+        let sender_device_id = json["sender_device_id"].as_str().unwrap_or("").to_string();
+
         Ok(Some(SnapshotResponse {
             epoch,
             server_seq_at,
             data,
+            sender_device_id,
         }))
     }
 
@@ -480,12 +488,14 @@ impl SyncRelay for ServerRelay {
         data: Vec<u8>,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
+        sender_device_id: String,
     ) -> Result<(), RelayError> {
         let url = format!("{}/snapshot", self.base_path());
+        let path = self.canonical_path("/snapshot");
         debug!("put_snapshot server_seq_at={server_seq_at}");
 
         let mut req = self
-            .apply_auth(self.client.put(&url))
+            .apply_signed_auth(self.client.put(&url), "PUT", &path, &data)
             .header("X-Server-Seq-At", server_seq_at.to_string());
 
         if let Some(ttl) = ttl_secs {
@@ -494,6 +504,7 @@ impl SyncRelay for ServerRelay {
         if let Some(ref device_id) = for_device_id {
             req = req.header("X-For-Device-Id", device_id);
         }
+        req = req.header("X-Sender-Device-Id", &sender_device_id);
 
         let resp = req
             .body(data)
@@ -707,13 +718,18 @@ impl SyncRelay for ServerRelay {
 
     async fn ack(&self, server_seq: i64) -> Result<(), RelayError> {
         let url = format!("{}/ack", self.base_path());
+        let path = self.canonical_path("/ack");
         debug!("ack server_seq={server_seq}");
 
-        let body = serde_json::json!({ "server_seq": server_seq });
+        let body_bytes = serde_json::to_vec(&serde_json::json!({ "server_seq": server_seq }))
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to serialize ack body: {e}"),
+            })?;
 
         let resp = self
-            .apply_auth(self.client.post(&url))
-            .json(&body)
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
             .timeout(self.request_timeout)
             .send()
             .await

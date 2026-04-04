@@ -508,6 +508,7 @@ fn wire__crate__api__create_prism_sync_impl(
             let api_db_path = <String>::sse_decode(&mut deserializer);
             let api_allow_insecure = <bool>::sse_decode(&mut deserializer);
             let api_schema_json = <String>::sse_decode(&mut deserializer);
+            let api_database_key = <Option<Vec<u8>>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, String>((move || {
@@ -516,6 +517,7 @@ fn wire__crate__api__create_prism_sync_impl(
                         api_db_path,
                         api_allow_insecure,
                         api_schema_json,
+                        api_database_key,
                     )?;
                     Ok(output_ok)
                 })())

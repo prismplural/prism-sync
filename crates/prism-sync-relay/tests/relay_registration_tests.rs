@@ -577,28 +577,49 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
 
+    let path = format!("/v1/sync/{sync_id}/changes");
     for i in 0..10 {
         let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
-        let resp = client
-            .put(format!("{url}/v1/sync/{sync_id}/changes"))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("X-Device-Id", &device_id)
-            .json(&envelope)
-            .send()
-            .await
-            .unwrap();
+        let body_bytes = serde_json::to_vec(&envelope).unwrap();
+        let resp = apply_signed_headers(
+            client
+                .put(format!("{url}/v1/sync/{sync_id}/changes"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Device-Id", &device_id)
+                .header("Content-Type", "application/json"),
+            &signing_key,
+            "PUT",
+            &path,
+            &sync_id,
+            &device_id,
+            &body_bytes,
+        )
+        .body(body_bytes)
+        .send()
+        .await
+        .unwrap();
         assert!(resp.status().is_success(), "batch {i} should succeed");
     }
 
     let envelope = make_test_envelope(&sync_id, &device_id, "batch-010", 0);
-    let resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/changes"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Device-Id", &device_id)
-        .json(&envelope)
-        .send()
-        .await
-        .unwrap();
+    let body_bytes = serde_json::to_vec(&envelope).unwrap();
+    let resp = apply_signed_headers(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &signing_key,
+        "PUT",
+        &path,
+        &sync_id,
+        &device_id,
+        &body_bytes,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap();
     assert_eq!(
         resp.status(),
         507,
@@ -1280,14 +1301,25 @@ async fn test_delete_sync_group() {
 
     // Push some data first
     let envelope = make_test_envelope(&sync_id, &device_id, "batch-delete-test", 0);
-    let push_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/changes"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Device-Id", &device_id)
-        .json(&envelope)
-        .send()
-        .await
-        .unwrap();
+    let body_bytes = serde_json::to_vec(&envelope).unwrap();
+    let path = format!("/v1/sync/{sync_id}/changes");
+    let push_resp = apply_signed_headers(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &signing_key,
+        "PUT",
+        &path,
+        &sync_id,
+        &device_id,
+        &body_bytes,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap();
     assert!(push_resp.status().is_success());
 
     // Delete the sync group (only sole admin can do this)
@@ -1561,14 +1593,25 @@ async fn test_existing_group_registration_without_registry_approval_returns_401(
 
     // Verify push still works for device A (sync group not corrupted)
     let envelope = make_test_envelope(&sync_id, &device_a_id, "batch-after-rollback", 0);
-    let push_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/changes"))
-        .header("Authorization", format!("Bearer {token_a}"))
-        .header("X-Device-Id", &device_a_id)
-        .json(&envelope)
-        .send()
-        .await
-        .unwrap();
+    let body_bytes = serde_json::to_vec(&envelope).unwrap();
+    let path = format!("/v1/sync/{sync_id}/changes");
+    let push_resp = apply_signed_headers(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token_a}"))
+            .header("X-Device-Id", &device_a_id)
+            .header("Content-Type", "application/json"),
+        &signing_key_a,
+        "PUT",
+        &path,
+        &sync_id,
+        &device_a_id,
+        &body_bytes,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap();
     assert!(
         push_resp.status().is_success(),
         "push should still work after failed registration: {}",
@@ -2038,9 +2081,7 @@ async fn test_registration_after_epoch_rotation_via_registry_approval() {
                 "active",
             ),
             registry_snapshot_entry(
-                &sync_id,
-                &target_id,
-                &[7u8; 32], // matches prepare_device signing key
+                &sync_id, &target_id, &[7u8; 32], // matches prepare_device signing key
                 &[8u8; 32], // matches prepare_device x25519 key
                 "revoked",
             ),
@@ -2112,9 +2153,7 @@ async fn test_stale_registry_approval_after_revoke_is_rejected() {
                 "active",
             ),
             registry_snapshot_entry(
-                &sync_id,
-                &target_id,
-                &[7u8; 32], // matches prepare_device signing key
+                &sync_id, &target_id, &[7u8; 32], // matches prepare_device signing key
                 &[8u8; 32], // matches prepare_device x25519 key
                 "active",   // still listed as active — stale!
             ),
@@ -2262,7 +2301,9 @@ async fn test_atomic_revoke_rejects_extra_device_id() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
+        client.post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        )),
         &admin_key,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2311,7 +2352,9 @@ async fn test_atomic_revoke_rejects_already_revoked_target() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp1 = apply_signed_headers(
-        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
+        client.post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        )),
         &admin_key,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2338,7 +2381,9 @@ async fn test_atomic_revoke_rejects_already_revoked_target() {
     });
     let revoke_body_bytes2 = serde_json::to_vec(&revoke_body2).unwrap();
     let resp2 = apply_signed_headers(
-        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
+        client.post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        )),
         &admin_key,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2386,7 +2431,9 @@ async fn test_atomic_revoke_rejects_wrong_epoch() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
+        client.post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        )),
         &admin_key,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2401,11 +2448,7 @@ async fn test_atomic_revoke_rejects_wrong_epoch() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "wrong epoch should be rejected"
-    );
+    assert_eq!(resp.status(), 400, "wrong epoch should be rejected");
 }
 
 // ─────────── Test: Atomic revoke rejects oversized wrapped key ───────────
@@ -2435,7 +2478,9 @@ async fn test_atomic_revoke_rejects_oversized_wrapped_key() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
+        client.post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        )),
         &admin_key,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2571,11 +2616,7 @@ async fn test_revoke_rate_limiting() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp2.status(),
-        429,
-        "second revoke should be rate-limited"
-    );
+    assert_eq!(resp2.status(), 429, "second revoke should be rate-limited");
 }
 
 // ─────────── Test: Atomic revoke audit log ───────────
@@ -2603,7 +2644,9 @@ async fn test_atomic_revoke_audit_log() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
+        client.post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        )),
         &admin_key,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2743,7 +2786,9 @@ async fn test_unsigned_request_rejected_on_atomic_revoke() {
 
     // Send with bearer token but NO X-Prism-* headers
     let resp = client
-        .post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"))
+        .post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        ))
         .header("Authorization", format!("Bearer {admin_token}"))
         .header("X-Device-Id", &admin_id)
         .header("Content-Type", "application/json")
@@ -2847,11 +2892,7 @@ async fn test_replayed_nonce_rejected() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp2.status(),
-        401,
-        "replayed nonce should be rejected"
-    );
+    assert_eq!(resp2.status(), 401, "replayed nonce should be rejected");
 }
 
 // ─────────── Test: Expired timestamp rejected ───────────
@@ -2907,11 +2948,7 @@ async fn test_expired_timestamp_rejected() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        401,
-        "expired timestamp should be rejected"
-    );
+    assert_eq!(resp.status(), 401, "expired timestamp should be rejected");
 }
 
 // ─────────── Test: Atomic revoke remote wipe true ───────────
@@ -2939,7 +2976,9 @@ async fn test_atomic_revoke_remote_wipe_true() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
+        client.post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        )),
         &admin_key,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -3205,15 +3244,24 @@ async fn test_snapshot_body_limit_allows_large_upload() {
     let big_payload = vec![0xAA_u8; 3 * 1024 * 1024];
 
     // PUT 3MB snapshot — should succeed (snapshot route has 25MB limit)
-    let snapshot_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Device-Id", &device_id)
-        .header("X-Server-Seq-At", "1")
-        .body(big_payload.clone())
-        .send()
-        .await
-        .unwrap();
+    let snap_path = format!("/v1/sync/{sync_id}/snapshot");
+    let snapshot_resp = apply_signed_headers(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("X-Server-Seq-At", "1"),
+        &signing_key,
+        "PUT",
+        &snap_path,
+        &sync_id,
+        &device_id,
+        &big_payload,
+    )
+    .body(big_payload.clone())
+    .send()
+    .await
+    .unwrap();
     assert!(
         snapshot_resp.status().is_success(),
         "3MB snapshot should be accepted, got {}",
@@ -3221,14 +3269,23 @@ async fn test_snapshot_body_limit_allows_large_upload() {
     );
 
     // POST 3MB to changes — should fail 413 (default body limit is 2MB)
-    let changes_resp = client
-        .put(format!("{url}/v1/sync/{sync_id}/changes"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Device-Id", &device_id)
-        .body(big_payload)
-        .send()
-        .await
-        .unwrap();
+    let changes_path = format!("/v1/sync/{sync_id}/changes");
+    let changes_resp = apply_signed_headers(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id),
+        &signing_key,
+        "PUT",
+        &changes_path,
+        &sync_id,
+        &device_id,
+        &big_payload,
+    )
+    .body(big_payload)
+    .send()
+    .await
+    .unwrap();
     assert_eq!(
         changes_resp.status(),
         413,
@@ -3262,7 +3319,9 @@ async fn test_bearer_token_without_signature_rejected_on_destructive_endpoints()
         },
     });
     let revoke_resp = client
-        .post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"))
+        .post(format!(
+            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
+        ))
         .header("Authorization", format!("Bearer {admin_token}"))
         .header("X-Device-Id", &admin_id)
         .header("Content-Type", "application/json")

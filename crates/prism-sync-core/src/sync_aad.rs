@@ -15,6 +15,22 @@ pub fn build_sync_aad(
     format!("prism_sync|{sync_id}|{device_id}|{epoch}|{batch_id}|{batch_kind}").into_bytes()
 }
 
+/// Build the Additional Authenticated Data (AAD) string for snapshot encryption.
+///
+/// Format: `prism_snapshot|{sync_id}|{device_id}|{epoch}|{server_seq_at}`
+///
+/// This binds the snapshot metadata to the ciphertext, preventing a malicious
+/// relay from replaying valid ciphertext with forged metadata (e.g. a different
+/// epoch or server_seq_at).
+pub fn build_snapshot_aad(
+    sync_id: &str,
+    device_id: &str,
+    epoch: i32,
+    server_seq_at: i64,
+) -> Vec<u8> {
+    format!("prism_snapshot|{sync_id}|{device_id}|{epoch}|{server_seq_at}").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +67,41 @@ mod tests {
     fn different_devices_produce_different_aads() {
         let aad1 = build_sync_aad("s1", "device-a", 0, "b1", "ops");
         let aad2 = build_sync_aad("s1", "device-b", 0, "b1", "ops");
+        assert_ne!(aad1, aad2);
+    }
+
+    #[test]
+    fn snapshot_aad_format() {
+        let aad = build_snapshot_aad("sync-123", "device-abc", 0, 42);
+        let aad_str = String::from_utf8(aad).unwrap();
+        assert_eq!(aad_str, "prism_snapshot|sync-123|device-abc|0|42");
+    }
+
+    #[test]
+    fn snapshot_aad_different_sync_ids() {
+        let aad1 = build_snapshot_aad("sync-a", "d1", 0, 10);
+        let aad2 = build_snapshot_aad("sync-b", "d1", 0, 10);
+        assert_ne!(aad1, aad2);
+    }
+
+    #[test]
+    fn snapshot_aad_different_epochs() {
+        let aad1 = build_snapshot_aad("s1", "d1", 0, 10);
+        let aad2 = build_snapshot_aad("s1", "d1", 1, 10);
+        assert_ne!(aad1, aad2);
+    }
+
+    #[test]
+    fn snapshot_aad_different_server_seqs() {
+        let aad1 = build_snapshot_aad("s1", "d1", 0, 10);
+        let aad2 = build_snapshot_aad("s1", "d1", 0, 20);
+        assert_ne!(aad1, aad2);
+    }
+
+    #[test]
+    fn snapshot_aad_different_devices() {
+        let aad1 = build_snapshot_aad("s1", "device-a", 0, 10);
+        let aad2 = build_snapshot_aad("s1", "device-b", 0, 10);
         assert_ne!(aad1, aad2);
     }
 }

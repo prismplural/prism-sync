@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 
+use prism_sync_core::batch_signature;
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
+use prism_sync_core::relay::traits::{SignedBatchEnvelope, SyncRelay};
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
@@ -181,7 +183,15 @@ async fn push_and_create_snapshot(
 
     // Device B uploads the snapshot
     engine_b
-        .upload_pairing_snapshot(SYNC_ID, &key_hierarchy, 0, device_b_id, Some(300), None)
+        .upload_pairing_snapshot(
+            SYNC_ID,
+            &key_hierarchy,
+            0,
+            device_b_id,
+            &signing_key_b,
+            Some(300),
+            None,
+        )
         .await
         .unwrap();
 
@@ -276,7 +286,15 @@ async fn test_snapshot_bootstrap_then_incremental() {
 
     // Device B uploads snapshot (has field_versions from merge)
     engine_b
-        .upload_pairing_snapshot(SYNC_ID, &key_hierarchy, 0, device_b_id, Some(300), None)
+        .upload_pairing_snapshot(
+            SYNC_ID,
+            &key_hierarchy,
+            0,
+            device_b_id,
+            &signing_key_b,
+            Some(300),
+            None,
+        )
         .await
         .unwrap();
 
@@ -714,4 +732,225 @@ async fn test_bootstrap_emits_remote_changes() {
         .find(|c| c.entity_id == "task-3")
         .unwrap();
     assert_eq!(gamma.fields.get("title"), Some(&"\"Gamma\"".to_string()));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Tampered signature rejection
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Upload a valid signed snapshot, corrupt the signature bytes in the relay's
+/// stored data, then attempt bootstrap — should fail with a signature error.
+#[tokio::test]
+async fn test_bootstrap_rejects_tampered_signature() {
+    let (relay, key_hierarchy, _sk_a, _sk_b, _storage_b) =
+        push_and_create_snapshot(vec![("task-1", "Signed task", false, "batch-1")]).await;
+
+    // Retrieve the snapshot from the relay and corrupt the signature
+    let snapshot = relay.get_snapshot().await.unwrap().unwrap();
+    let mut envelope: SignedBatchEnvelope =
+        serde_json::from_slice(&snapshot.data).expect("deserialize envelope");
+
+    // Flip every byte in the signature to ensure it's invalid
+    for byte in envelope.signature.iter_mut() {
+        *byte ^= 0xFF;
+    }
+
+    let tampered_data = serde_json::to_vec(&envelope).expect("re-serialize envelope");
+
+    // Replace the snapshot in the relay with the tampered version
+    relay
+        .put_snapshot(
+            snapshot.epoch,
+            snapshot.server_seq_at,
+            tampered_data,
+            None,
+            None,
+            snapshot.sender_device_id.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Device C attempts to bootstrap from the tampered snapshot
+    let key_hierarchy_c = shared_key_hierarchy(&key_hierarchy);
+    let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+    setup_sync_metadata(&storage_c, "device-ccc");
+
+    // Register Device B's key so signature lookup succeeds (but verification fails)
+    register_device(
+        &relay,
+        &storage_c,
+        &snapshot.sender_device_id,
+        &_sk_b.verifying_key(),
+    );
+
+    let engine_c = SyncEngine::new(
+        storage_c.clone(),
+        relay.clone(),
+        vec![entity_c],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine_c
+        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "bootstrap with tampered signature should fail"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("signature")
+            || err_msg.contains("Signature")
+            || err_msg.contains("verify")
+            || err_msg.contains("Verify"),
+        "error should mention signature verification failure, got: {err_msg}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Payload hash mismatch rejection
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Upload a valid signed snapshot, then re-sign the same ciphertext with an
+/// incorrect payload hash. Bootstrap should fail after decryption when the
+/// plaintext no longer matches the signed hash.
+#[tokio::test]
+async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
+    let (relay, key_hierarchy, _sk_a, sk_b, _storage_b) =
+        push_and_create_snapshot(vec![("task-1", "Signed task", false, "batch-1")]).await;
+
+    let snapshot = relay.get_snapshot().await.unwrap().unwrap();
+    let envelope: SignedBatchEnvelope =
+        serde_json::from_slice(&snapshot.data).expect("deserialize envelope");
+
+    let wrong_payload_hash = batch_signature::compute_payload_hash(b"not the snapshot bytes");
+    let tampered_envelope = batch_signature::sign_batch(
+        &sk_b,
+        &envelope.sync_id,
+        envelope.epoch,
+        &envelope.batch_id,
+        &envelope.batch_kind,
+        &envelope.sender_device_id,
+        &wrong_payload_hash,
+        envelope.nonce,
+        envelope.ciphertext.clone(),
+    )
+    .expect("re-sign envelope with mismatched payload hash");
+
+    relay
+        .put_snapshot(
+            snapshot.epoch,
+            snapshot.server_seq_at,
+            serde_json::to_vec(&tampered_envelope).expect("serialize tampered envelope"),
+            None,
+            None,
+            snapshot.sender_device_id.clone(),
+        )
+        .await
+        .unwrap();
+
+    let key_hierarchy_c = shared_key_hierarchy(&key_hierarchy);
+    let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+    setup_sync_metadata(&storage_c, "device-ccc");
+    register_device(
+        &relay,
+        &storage_c,
+        &snapshot.sender_device_id,
+        &sk_b.verifying_key(),
+    );
+
+    let engine_c = SyncEngine::new(
+        storage_c,
+        relay.clone(),
+        vec![entity_c],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine_c
+        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "bootstrap with mismatched snapshot payload hash should fail"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Payload hash mismatch"),
+        "error should mention payload hash mismatch, got: {err_msg}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: AAD mismatch rejection
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Upload a valid signed snapshot, then change `server_seq_at` in the relay's
+/// stored snapshot metadata (without touching the ciphertext). The AAD was
+/// bound to the original `server_seq_at`, so decryption should fail.
+#[tokio::test]
+async fn test_bootstrap_rejects_aad_mismatch() {
+    let (relay, key_hierarchy, _sk_a, _sk_b, _storage_b) =
+        push_and_create_snapshot(vec![("task-1", "AAD task", false, "batch-1")]).await;
+
+    // Retrieve the snapshot and re-store it with a different server_seq_at
+    let snapshot = relay.get_snapshot().await.unwrap().unwrap();
+    let original_seq = snapshot.server_seq_at;
+    let tampered_seq = original_seq + 999; // Different from the AAD-bound value
+
+    relay
+        .put_snapshot(
+            snapshot.epoch,
+            tampered_seq,
+            snapshot.data.clone(),
+            None,
+            None,
+            snapshot.sender_device_id.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Device C attempts to bootstrap — signature is valid but AAD won't match
+    let key_hierarchy_c = shared_key_hierarchy(&key_hierarchy);
+    let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+    setup_sync_metadata(&storage_c, "device-ccc");
+
+    // Register Device B's key so signature verification passes
+    register_device(
+        &relay,
+        &storage_c,
+        &snapshot.sender_device_id,
+        &_sk_b.verifying_key(),
+    );
+
+    let engine_c = SyncEngine::new(
+        storage_c.clone(),
+        relay.clone(),
+        vec![entity_c],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine_c
+        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "bootstrap with mismatched server_seq_at (AAD mismatch) should fail"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("decrypt")
+            || err_msg.contains("Decrypt")
+            || err_msg.contains("crypto")
+            || err_msg.contains("aead"),
+        "error should mention decryption failure, got: {err_msg}"
+    );
 }

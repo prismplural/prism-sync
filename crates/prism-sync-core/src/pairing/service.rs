@@ -591,6 +591,7 @@ mod tests {
             _data: Vec<u8>,
             _ttl_secs: Option<u64>,
             _for_device_id: Option<String>,
+            _sender_device_id: String,
         ) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
@@ -1007,6 +1008,7 @@ mod tests {
                 _: Vec<u8>,
                 _: Option<u64>,
                 _: Option<String>,
+                _: String,
             ) -> std::result::Result<(), RelayError> {
                 unimplemented!()
             }
@@ -1125,19 +1127,25 @@ mod tests {
                 _: Vec<u8>,
                 _: Option<u64>,
                 _: Option<String>,
+                _: String,
             ) -> std::result::Result<(), RelayError> {
                 unimplemented!()
             }
             async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
                 unimplemented!()
             }
-            async fn revoke_device(&self, _: &str, _: bool) -> std::result::Result<(), RelayError> {
+            async fn revoke_device(
+                &self,
+                _: &str,
+                _: bool,
+                _: i32,
+                _: HashMap<String, Vec<u8>>,
+            ) -> std::result::Result<i32, RelayError> {
                 unimplemented!()
             }
             async fn post_rekey_artifacts(
                 &self,
                 _: i32,
-                _: &str,
                 _: HashMap<String, Vec<u8>>,
             ) -> std::result::Result<i32, RelayError> {
                 unimplemented!()

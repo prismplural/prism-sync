@@ -115,6 +115,7 @@ abstract class RustLibApi extends BaseApi {
     required String dbPath,
     required bool allowInsecure,
     required String schemaJson,
+    Uint8List? databaseKey,
   });
 
   Future<String> crateApiCreateSyncGroup({
@@ -633,6 +634,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required String dbPath,
     required bool allowInsecure,
     required String schemaJson,
+    Uint8List? databaseKey,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -642,6 +644,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(dbPath, serializer);
           sse_encode_bool(allowInsecure, serializer);
           sse_encode_String(schemaJson, serializer);
+          sse_encode_opt_list_prim_u_8_strict(databaseKey, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -655,7 +658,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiCreatePrismSyncConstMeta,
-        argValues: [relayUrl, dbPath, allowInsecure, schemaJson],
+        argValues: [relayUrl, dbPath, allowInsecure, schemaJson, databaseKey],
         apiImpl: this,
       ),
     );
@@ -663,7 +666,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiCreatePrismSyncConstMeta => const TaskConstMeta(
     debugName: "create_prism_sync",
-    argNames: ["relayUrl", "dbPath", "allowInsecure", "schemaJson"],
+    argNames: [
+      "relayUrl",
+      "dbPath",
+      "allowInsecure",
+      "schemaJson",
+      "databaseKey",
+    ],
   );
 
   @override

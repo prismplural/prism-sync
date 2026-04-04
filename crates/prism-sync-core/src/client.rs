@@ -415,11 +415,15 @@ impl PrismSync {
         let epoch = self.epoch.ok_or_else(|| {
             CoreError::Engine("epoch not set — call configure_engine first".into())
         })?;
+        let signing_key = self.device_signing_key.as_ref().ok_or_else(|| {
+            CoreError::Engine("signing key not set — call configure_engine first".into())
+        })?;
         self.sync_service
             .upload_pairing_snapshot(
                 &self.key_hierarchy,
                 epoch,
                 device_id,
+                signing_key,
                 ttl_secs,
                 for_device_id,
             )
@@ -776,6 +780,7 @@ mod tests {
             _: Vec<u8>,
             _: Option<u64>,
             _: Option<String>,
+            _: String,
         ) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }

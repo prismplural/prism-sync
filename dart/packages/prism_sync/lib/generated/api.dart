@@ -25,11 +25,13 @@ Future<PrismSyncHandle> createPrismSync({
   required String dbPath,
   required bool allowInsecure,
   required String schemaJson,
+  Uint8List? databaseKey,
 }) => RustLib.instance.api.crateApiCreatePrismSync(
   relayUrl: relayUrl,
   dbPath: dbPath,
   allowInsecure: allowInsecure,
   schemaJson: schemaJson,
+  databaseKey: databaseKey,
 );
 
 /// Initialize (first-time setup).

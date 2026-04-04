@@ -181,7 +181,15 @@ async fn push_and_create_snapshot(
 
     // Device B uploads the snapshot
     engine_b
-        .upload_pairing_snapshot(SYNC_ID, &key_hierarchy, 0, device_b_id, Some(300), None)
+        .upload_pairing_snapshot(
+            SYNC_ID,
+            &key_hierarchy,
+            0,
+            device_b_id,
+            &signing_key_b,
+            Some(300),
+            None,
+        )
         .await
         .unwrap();
 
@@ -354,6 +362,7 @@ async fn test_snapshot_upload_with_device_targeting() {
             &key_hierarchy,
             0,
             device_b_id,
+            &signing_key_b,
             Some(300),
             Some("target-device-123".to_string()),
         )

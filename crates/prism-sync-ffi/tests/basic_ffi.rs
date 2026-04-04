@@ -3,6 +3,8 @@
 //! These tests verify that the public FFI API can be called successfully
 //! and that errors are surfaced correctly.
 
+use std::path::PathBuf;
+
 use prism_sync_ffi::api;
 
 /// Helper: create a handle with in-memory storage and memory secure store.
@@ -12,6 +14,7 @@ fn make_handle() -> prism_sync_ffi::api::PrismSyncHandle {
         ":memory:".into(),
         false,
         String::new(),
+        None,
     )
     .expect("create_prism_sync should succeed")
 }
@@ -41,6 +44,7 @@ fn make_handle_with_schema() -> prism_sync_ffi::api::PrismSyncHandle {
         ":memory:".into(),
         false,
         schema.into(),
+        None,
     )
     .expect("create_prism_sync with schema should succeed")
 }
@@ -54,6 +58,7 @@ async fn create_handle_succeeds() {
         ":memory:".into(),
         false,
         String::new(),
+        None,
     );
     assert!(
         result.is_ok(),
@@ -70,6 +75,7 @@ async fn create_handle_with_schema_json() {
         ":memory:".into(),
         false,
         schema.into(),
+        None,
     );
     assert!(
         result.is_ok(),
@@ -85,6 +91,7 @@ async fn create_handle_with_invalid_schema_fails() {
         ":memory:".into(),
         false,
         "not valid json".into(),
+        None,
     );
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Invalid schema JSON"));
@@ -97,8 +104,65 @@ async fn create_handle_noop_store() {
         ":memory:".into(),
         false,
         String::new(),
+        None,
     );
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn create_handle_with_database_key_encrypts_file_db() {
+    let db_key = vec![0x42; 32];
+    let db_path = temp_db_path("prism-sync-ffi-encrypted");
+
+    let handle = api::create_prism_sync(
+        "https://localhost:8080".into(),
+        db_path.to_string_lossy().into_owned(),
+        false,
+        String::new(),
+        Some(db_key.clone()),
+    )
+    .expect("create_prism_sync with database key should succeed");
+    drop(handle);
+
+    let plain_conn = rusqlite::Connection::open(&db_path).expect("open DB without key");
+    let plain_result: rusqlite::Result<i64> =
+        plain_conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0));
+    assert!(
+        plain_result.is_err(),
+        "unencrypted query should fail for encrypted DB"
+    );
+    drop(plain_conn);
+
+    let keyed_conn = rusqlite::Connection::open(&db_path).expect("open DB for keyed read");
+    let hex_key = db_key
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    keyed_conn
+        .execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("apply SQLCipher key");
+    let table_count: i64 = keyed_conn
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .expect("query encrypted DB with correct key");
+    assert!(
+        table_count > 0,
+        "encrypted DB should contain migrated tables"
+    );
+    drop(keyed_conn);
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+fn temp_db_path(prefix: &str) -> PathBuf {
+    let unique = format!(
+        "{prefix}-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos()
+    );
+    std::env::temp_dir().join(unique)
 }
 
 // ── Key lifecycle ──
@@ -129,6 +193,7 @@ async fn initialize_fails_without_secure_store() {
         ":memory:".into(),
         false,
         String::new(),
+        None,
     )
     .unwrap();
 

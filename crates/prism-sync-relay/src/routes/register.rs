@@ -396,9 +396,8 @@ fn do_register(
             // Another request created the group between our check and insert;
             // treat this as an existing group — require registry approval.
             let approval = registry_approval.as_ref().ok_or(AppError::Unauthorized)?;
-            let artifact = verify_registry_approval(
-                &tx, sync_id, device_id, signing_pk, x25519_pk, approval,
-            )?;
+            let artifact =
+                verify_registry_approval(&tx, sync_id, device_id, signing_pk, x25519_pk, approval)?;
             registry_artifact_kind = Some("registry_approval");
             registry_artifact_blob = Some(artifact);
         }
@@ -502,9 +501,7 @@ fn verify_first_device_admission_proof(
     config: &crate::config::Config,
 ) -> Result<(), AppError> {
     match proof {
-        FirstDeviceAdmissionProof::AndroidKeyAttestation {
-            certificate_chain,
-        } => {
+        FirstDeviceAdmissionProof::AndroidKeyAttestation { certificate_chain } => {
             let verification = attestation::verify_android_key_attestation(
                 sync_id,
                 device_id,

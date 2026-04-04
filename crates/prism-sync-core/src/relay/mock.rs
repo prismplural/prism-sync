@@ -211,12 +211,14 @@ impl SyncRelay for MockRelay {
         data: Vec<u8>,
         _ttl_secs: Option<u64>,
         for_device_id: Option<String>,
+        sender_device_id: String,
     ) -> Result<(), RelayError> {
         let mut state = self.state.lock().unwrap();
         state.snapshot = Some(SnapshotResponse {
             epoch,
             server_seq_at,
             data,
+            sender_device_id,
         });
         state.snapshot_target_device_id = for_device_id;
         Ok(())
@@ -382,13 +384,14 @@ mod tests {
         let relay = MockRelay::new();
         assert!(relay.get_snapshot().await.unwrap().is_none());
         relay
-            .put_snapshot(1, 10, vec![9, 8, 7], None, None)
+            .put_snapshot(1, 10, vec![9, 8, 7], None, None, "device-1".to_string())
             .await
             .unwrap();
         let snap = relay.get_snapshot().await.unwrap().unwrap();
         assert_eq!(snap.epoch, 1);
         assert_eq!(snap.server_seq_at, 10);
         assert_eq!(snap.data, vec![9, 8, 7]);
+        assert_eq!(snap.sender_device_id, "device-1");
     }
 
     #[tokio::test]
@@ -400,7 +403,14 @@ mod tests {
 
         // Upload with a specific target.
         relay
-            .put_snapshot(1, 5, vec![1, 2, 3], None, Some("device-a".to_string()))
+            .put_snapshot(
+                1,
+                5,
+                vec![1, 2, 3],
+                None,
+                Some("device-a".to_string()),
+                "sender-1".to_string(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -410,7 +420,7 @@ mod tests {
 
         // Replace with an untargeted snapshot.
         relay
-            .put_snapshot(1, 6, vec![4, 5, 6], None, None)
+            .put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string())
             .await
             .unwrap();
         assert_eq!(relay.snapshot_target_device_id(), None);
@@ -422,7 +432,14 @@ mod tests {
 
         // Upload snapshot targeted at "device-a".
         relay
-            .put_snapshot(1, 5, vec![1, 2, 3], None, Some("device-a".to_string()))
+            .put_snapshot(
+                1,
+                5,
+                vec![1, 2, 3],
+                None,
+                Some("device-a".to_string()),
+                "sender-1".to_string(),
+            )
             .await
             .unwrap();
 
@@ -437,7 +454,7 @@ mod tests {
 
         // Untargeted snapshot is served to any device.
         relay
-            .put_snapshot(1, 6, vec![4, 5, 6], None, None)
+            .put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string())
             .await
             .unwrap();
         assert!(relay.get_snapshot_for_device("device-b").is_some());
