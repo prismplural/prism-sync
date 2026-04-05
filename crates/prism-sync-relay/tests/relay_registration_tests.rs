@@ -351,6 +351,8 @@ async fn test_registration_rejects_expired_nonce() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -440,6 +442,8 @@ async fn test_nonce_rate_limiting() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -568,6 +572,8 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -657,6 +663,8 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -797,6 +805,8 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -873,6 +883,8 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1117,6 +1129,8 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1478,6 +1492,8 @@ async fn test_nonce_rate_limiting_window_expiry() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -2534,6 +2550,8 @@ async fn test_revoke_rate_limiting() {
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -3371,4 +3389,260 @@ async fn test_bearer_token_without_signature_rejected_on_destructive_endpoints()
         400,
         "delete sync group without signature should return 400"
     );
+}
+
+// ───────────────── Registration access control tests ──────────────────
+
+fn default_test_config() -> Config {
+    Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 10_000,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
+        snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
+    }
+}
+
+#[tokio::test]
+async fn test_open_mode_no_token_configured() {
+    let config = default_test_config();
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+
+    // Fetch nonce — no token header needed
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    assert!(!nonce.is_empty());
+
+    // Full registration succeeds without any token
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, &nonce);
+    let mut x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut x25519_pk);
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        register_resp.status().is_success(),
+        "open mode registration should succeed: {}",
+        register_resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_token_gated_correct_token() {
+    let mut config = default_test_config();
+    config.registration_token = Some("secret-token-123".to_string());
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+
+    // Fetch nonce with correct token
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .header("X-Registration-Token", "secret-token-123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+
+    // Register with correct token
+    let challenge_sig = sign_challenge(&signing_key, &sync_id, &device_id, nonce);
+    let mut x25519_pk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut x25519_pk);
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .header("X-Registration-Token", "secret-token-123")
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(x25519_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        register_resp.status().is_success(),
+        "token-gated registration with correct token should succeed: {}",
+        register_resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_token_gated_wrong_token() {
+    let mut config = default_test_config();
+    config.registration_token = Some("secret-token-123".to_string());
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // Nonce endpoint with wrong token should return 403
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .header("X-Registration-Token", "wrong-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        nonce_resp.status(),
+        403,
+        "wrong token should return 403"
+    );
+}
+
+#[tokio::test]
+async fn test_token_gated_missing_token() {
+    let mut config = default_test_config();
+    config.registration_token = Some("secret-token-123".to_string());
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // Nonce endpoint with no token header should return 403
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        nonce_resp.status(),
+        403,
+        "missing token should return 403"
+    );
+
+    // Register endpoint with no token header should also return 403
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": "fake",
+            "signing_public_key": hex::encode([0u8; 32]),
+            "x25519_public_key": hex::encode([0u8; 32]),
+            "registration_challenge": hex::encode([0u8; 64]),
+            "nonce": "fake",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        register_resp.status(),
+        403,
+        "missing token on register should return 403"
+    );
+}
+
+#[tokio::test]
+async fn test_registration_disabled() {
+    let mut config = default_test_config();
+    config.registration_enabled = false;
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // Nonce endpoint should return 403 when registration is disabled
+    let nonce_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        nonce_resp.status(),
+        403,
+        "disabled registration should return 403 on nonce endpoint"
+    );
+
+    // Register endpoint should also return 403
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": "fake",
+            "signing_public_key": hex::encode([0u8; 32]),
+            "x25519_public_key": hex::encode([0u8; 32]),
+            "registration_challenge": hex::encode([0u8; 64]),
+            "nonce": "fake",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        register_resp.status(),
+        403,
+        "disabled registration should return 403 on register endpoint"
+    );
+}
+
+#[tokio::test]
+async fn test_nonce_endpoint_checks_token() {
+    let mut config = default_test_config();
+    config.registration_token = Some("my-secret".to_string());
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // Without token — 403
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "nonce without token should be 403");
+
+    // With wrong token — 403
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .header("X-Registration-Token", "not-my-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "nonce with wrong token should be 403");
+
+    // With correct token — 200
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .header("X-Registration-Token", "my-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "nonce with correct token should be 200");
 }

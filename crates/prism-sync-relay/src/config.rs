@@ -47,6 +47,13 @@ pub struct Config {
     pub first_device_android_attestation_trust_roots_pem: Vec<String>,
     /// Allowlisted verified boot keys (hex-encoded) that identify GrapheneOS devices.
     pub grapheneos_verified_boot_key_allowlist: Vec<String>,
+    /// Registration token for access control. When set, both registration
+    /// endpoints require this token in the X-Registration-Token header.
+    /// When unset, registration is open (gated only by PoW/attestation).
+    pub registration_token: Option<String>,
+    /// Whether registration is enabled at all. When false, all registration
+    /// endpoints return 403. Use this to lock down a relay after initial setup.
+    pub registration_enabled: bool,
 }
 
 impl Config {
@@ -104,6 +111,10 @@ impl Config {
                 "GRAPHENEOS_VERIFIED_BOOT_KEY_ALLOWLIST",
                 Vec::new(),
             ),
+            registration_token: std::env::var("REGISTRATION_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            registration_enabled: parse_bool_env("REGISTRATION_ENABLED", true),
         }
     }
 

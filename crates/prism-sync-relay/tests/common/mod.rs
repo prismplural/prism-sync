@@ -56,6 +56,8 @@ pub async fn start_test_relay() -> (
         first_device_android_attestation_enabled: true,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
     };
 
     start_test_relay_with_config(config).await

@@ -518,6 +518,8 @@ mod tests {
             first_device_android_attestation_enabled: true,
             first_device_android_attestation_trust_roots_pem: vec![root_pem],
             grapheneos_verified_boot_key_allowlist: grapheneos_keys,
+            registration_token: None,
+            registration_enabled: true,
         }
     }
 

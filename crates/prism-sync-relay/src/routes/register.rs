@@ -53,6 +53,8 @@ async fn get_register_nonce(
     Path(sync_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
+    check_registration_access(&state, &headers)?;
+
     if !auth::is_valid_sync_id(&sync_id) {
         return Err(AppError::BadRequest("Invalid sync ID"));
     }
@@ -182,6 +184,8 @@ async fn register_device(
     headers: HeaderMap,
     axum::Json(body): axum::Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    check_registration_access(&state, &headers)?;
+
     if !auth::is_valid_sync_id(&sync_id) {
         return Err(AppError::BadRequest("Invalid sync ID"));
     }
@@ -295,6 +299,25 @@ async fn register_device(
             device_session_token: token,
         }),
     ))
+}
+
+fn check_registration_access(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    if !state.config.registration_enabled {
+        return Err(AppError::Forbidden("Registration is disabled"));
+    }
+    if let Some(expected_token) = &state.config.registration_token {
+        let provided = headers
+            .get("X-Registration-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        use subtle::ConstantTimeEq;
+        if bool::from(expected_token.as_bytes().ct_eq(provided.as_bytes())) {
+            // match — continue
+        } else {
+            return Err(AppError::Forbidden("Invalid registration token"));
+        }
+    }
+    Ok(())
 }
 
 /// Core registration logic, runs inside a DB connection lock.
