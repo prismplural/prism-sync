@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 const PAIRING_REQUEST_VERSION: u8 = 0x01;
 
 /// Version byte for the compact binary QR/URL encoding format.
-const COMPACT_VERSION: u8 = 0x05;
+const COMPACT_VERSION: u8 = 0x06;
 
 /// BIP39 12-word mnemonic entropy length in bytes.
 const MNEMONIC_ENTROPY_LEN: usize = 16;
@@ -314,6 +314,10 @@ impl PairingResponse {
         buf.extend_from_slice(&self.current_epoch.to_be_bytes());
         write_len16(&mut buf, &self.epoch_key)?;
         write_len16(&mut buf, &approval_sig_bytes)?;
+        write_len16(
+            &mut buf,
+            self.registration_token.as_deref().unwrap_or("").as_bytes(),
+        )?;
         Some(buf)
     }
 
@@ -323,7 +327,12 @@ impl PairingResponse {
 
         // Version check (accept current and previous versions for backward compat)
         let version = data.get(pos).copied()?;
-        if version != COMPACT_VERSION && version != 0x04 && version != 0x03 && version != 0x02 {
+        if version != COMPACT_VERSION
+            && version != 0x05
+            && version != 0x04
+            && version != 0x03
+            && version != 0x02
+        {
             return None;
         }
         pos += 1;
@@ -398,6 +407,17 @@ impl PairingResponse {
             None
         };
 
+        let registration_token = if version >= 0x06 {
+            let token_str = read_len16_str(data, &mut pos)?;
+            if token_str.is_empty() {
+                None
+            } else {
+                Some(token_str)
+            }
+        } else {
+            None
+        };
+
         // Reject trailing garbage — all bytes must be consumed
         if pos != data.len() {
             return None;
@@ -417,7 +437,7 @@ impl PairingResponse {
             current_epoch,
             epoch_key,
             registry_approval_signature,
-            registration_token: None,
+            registration_token,
         };
         response.validate_epoch_fields().ok()?;
         Some(response)
@@ -854,6 +874,20 @@ mod tests {
             decoded.registry_approval_signature,
             resp.registry_approval_signature
         );
+        assert_eq!(decoded.registration_token, None);
+    }
+
+    #[test]
+    fn compact_bytes_roundtrip_with_registration_token() {
+        let mut resp = sample_response();
+        resp.registration_token = Some("my-secret-token".into());
+        let bytes = resp.to_compact_bytes().unwrap();
+        let decoded = PairingResponse::from_compact_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.registration_token,
+            Some("my-secret-token".into()),
+            "registration_token should survive compact roundtrip"
+        );
     }
 
     #[test]
@@ -1006,7 +1040,8 @@ mod tests {
         resp.registry_approval_signature = None;
         let mut bytes = resp.to_compact_bytes().unwrap();
         bytes[0] = 0x04;
-        let trimmed = &bytes[..bytes.len() - 2];
+        // v0x04 lacks both the approval signature (2B len16) and registration token (2B len16)
+        let trimmed = &bytes[..bytes.len() - 4];
         let decoded = PairingResponse::from_compact_bytes(trimmed).expect("v0x04 decode");
         assert!(decoded.registry_approval_signature.is_none());
     }
