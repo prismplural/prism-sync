@@ -1266,6 +1266,15 @@ pub async fn create_sync_group(
 
     let (creds, invite) = create_result.map_err(|e| encode_core_error("create_sync_group", e))?;
 
+    // Persist registration token so it survives restarts and can be
+    // included when approving pairing requests from new devices.
+    if let Some(ref token) = pending.3 {
+        inner
+            .secure_store()
+            .set("registration_token", token.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+
     // Unlock the handle's key hierarchy using the credentials that
     // create_sync_group just produced, and restore the device_secret.
     // This ensures configureEngine can derive the signing key and
@@ -1495,6 +1504,12 @@ pub async fn approve_pairing_request(
         ),
     );
 
+    // Read registration token so the joiner can authenticate with the relay
+    let registration_token = store
+        .get("registration_token")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok());
+
     // Build PairingResponse
     let response = prism_sync_core::pairing::models::PairingResponse {
         relay_url: relay_url.clone(),
@@ -1510,7 +1525,7 @@ pub async fn approve_pairing_request(
         current_epoch: epoch as u32,
         epoch_key: epoch_key_data,
         registry_approval_signature: Some(prism_sync_crypto::hex::encode(&approval_signature)),
-        registration_token: None,
+        registration_token,
     };
 
     let invite = prism_sync_core::pairing::models::Invite::new(response);
@@ -1657,6 +1672,15 @@ async fn join_with_response(
                 return Err(format!("Failed to read epoch_key_{}: {e}", epoch_val,));
             }
         }
+    }
+
+    // Persist registration token from the invite so this device can
+    // include it when approving future pairing requests.
+    if let Some(ref token) = response.registration_token {
+        inner
+            .secure_store()
+            .set("registration_token", token.as_bytes())
+            .map_err(|e| e.to_string())?;
     }
 
     inner
@@ -1973,6 +1997,7 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         "relay_url",
         "mnemonic",
         "setup_rollback_marker",
+        "registration_token",
     ];
     let mut entries = serde_json::Map::new();
     for key in known_keys {
