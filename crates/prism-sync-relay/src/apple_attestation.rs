@@ -115,7 +115,7 @@ pub(crate) fn verify_apple_app_attest(
         .iter()
         .find(|ext| ext.oid == apple_extension_oid())
         .ok_or_else(|| "apple attestation extension missing".to_string())?;
-    let extension_nonce = parse_apple_certificate_nonce(&leaf_extension.value)?;
+    let extension_nonce = parse_apple_certificate_nonce(leaf_extension.value)?;
     if extension_nonce != expected_nonce {
         return Err("apple attestation challenge mismatch".into());
     }

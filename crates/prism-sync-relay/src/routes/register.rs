@@ -311,7 +311,9 @@ fn check_registration_access(state: &AppState, headers: &HeaderMap) -> Result<()
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         use subtle::ConstantTimeEq;
-        if bool::from(expected_token.as_bytes().ct_eq(provided.as_bytes())) {
+        let expected_hash = Sha256::digest(expected_token.as_bytes());
+        let provided_hash = Sha256::digest(provided.as_bytes());
+        if bool::from(expected_hash.ct_eq(&provided_hash)) {
             // match — continue
         } else {
             return Err(AppError::Forbidden("Invalid registration token"));

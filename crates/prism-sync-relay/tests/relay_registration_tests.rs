@@ -173,6 +173,7 @@ fn make_apple_test_root() -> (rcgen::Certificate, rcgen::KeyPair) {
     (cert, key_pair)
 }
 
+#[cfg(feature = "test-helpers")]
 async fn fetch_nonce_json_with_ip(client: &Client, url: &str, sync_id: &str, ip: &str) -> Value {
     let nonce_resp = client
         .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
@@ -184,6 +185,7 @@ async fn fetch_nonce_json_with_ip(client: &Client, url: &str, sync_id: &str, ip:
     nonce_resp.json().await.unwrap()
 }
 
+#[cfg(feature = "test-helpers")]
 async fn register_first_device_with_ip(
     client: &Client,
     url: &str,
@@ -1830,7 +1832,7 @@ async fn test_revoked_device_token_is_invalidated_but_still_identifies_revocatio
 
     let admin_id = generate_device_id();
     let admin_key = SigningKey::generate(&mut rand::thread_rng());
-    let admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_key).await;
+    let _admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_key).await;
 
     let target_id = generate_device_id();
     let target_token = prepare_device(&db, &sync_id, &target_id).await;

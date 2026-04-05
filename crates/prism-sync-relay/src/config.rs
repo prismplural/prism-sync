@@ -1,5 +1,5 @@
 /// Application configuration, loaded from environment variables.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub db_path: String,
@@ -54,6 +54,19 @@ pub struct Config {
     /// Whether registration is enabled at all. When false, all registration
     /// endpoints return 403. Use this to lock down a relay after initial setup.
     pub registration_enabled: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("db_path", &self.db_path)
+            .field("port", &self.port)
+            .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
+            .field("registration_enabled", &self.registration_enabled)
+            .field("metrics_token", &self.metrics_token.as_ref().map(|_| "[REDACTED]"))
+            .field("reader_pool_size", &self.reader_pool_size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
