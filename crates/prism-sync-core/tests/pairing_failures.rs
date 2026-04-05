@@ -678,3 +678,43 @@ async fn join_from_approval_roundtrip() {
         "rollback marker should be cleared after successful join"
     );
 }
+
+/// Creating a sync group with a registration_token propagates it into the
+/// PairingResponse so paired devices can use token-gated relays.
+#[tokio::test]
+async fn create_sync_group_with_registration_token() {
+    let relay = Arc::new(MockRelay::new());
+    let store = Arc::new(MemorySecureStore::new());
+    let service = PairingService::new(relay, store.clone());
+
+    let (_creds, invite) = service
+        .create_sync_group(
+            "test-password",
+            "wss://relay.example.com",
+            None,
+            None,
+            None,
+            None,
+            Some("test-token".into()),
+        )
+        .await
+        .expect("create_sync_group with registration_token should succeed");
+
+    let response = invite.response();
+
+    // The registration_token must be carried through to the PairingResponse
+    assert_eq!(
+        response.registration_token,
+        Some("test-token".to_string()),
+        "PairingResponse should carry the registration_token"
+    );
+
+    // Verify the invite JSON also contains the token
+    let json_str = serde_json::to_string(&response).expect("serialize PairingResponse");
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("parse JSON");
+    assert_eq!(
+        parsed["registration_token"].as_str(),
+        Some("test-token"),
+        "serialized PairingResponse JSON should include registration_token"
+    );
+}

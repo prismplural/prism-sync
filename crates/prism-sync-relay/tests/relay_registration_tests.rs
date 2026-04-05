@@ -3532,6 +3532,26 @@ async fn test_token_gated_wrong_token() {
         403,
         "wrong token should return 403"
     );
+
+    // Register endpoint with wrong token should also return 403
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .header("X-Registration-Token", "wrong-token")
+        .json(&serde_json::json!({
+            "device_id": "fake",
+            "signing_public_key": hex::encode([0u8; 32]),
+            "x25519_public_key": hex::encode([0u8; 32]),
+            "registration_challenge": hex::encode([0u8; 64]),
+            "nonce": "fake",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        register_resp.status(),
+        403,
+        "wrong token on register should return 403"
+    );
 }
 
 #[tokio::test]
