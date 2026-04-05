@@ -164,39 +164,6 @@ async fn run_cleanup(state: &AppState) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::{self, Database};
-    use rusqlite::params;
-
-    #[test]
-    fn abandoned_brand_new_groups_are_removed() {
-        let db = Database::in_memory().expect("in-memory db");
-        db.with_conn(|conn| {
-            db::create_sync_group(conn, "sg1", 0)?;
-            db::register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
-
-            let old = db::now_secs() - 10_000;
-            conn.execute(
-                "UPDATE sync_groups SET created_at = ?1, updated_at = ?1 WHERE sync_id = ?2",
-                params![old, "sg1"],
-            )?;
-            conn.execute(
-                "UPDATE devices SET last_seen_at = ?1 WHERE sync_id = ?2",
-                params![old, "sg1"],
-            )?;
-
-            let removed = cleanup_abandoned_brand_new_groups(conn, 60)?;
-            assert_eq!(removed, 1);
-            assert!(db::get_sync_group_epoch(conn, "sg1")?.is_none());
-
-            Ok(())
-        })
-        .unwrap();
-    }
-}
-
 fn cleanup_abandoned_brand_new_groups(
     conn: &rusqlite::Connection,
     abandon_secs: i64,
@@ -230,4 +197,37 @@ fn cleanup_abandoned_brand_new_groups(
     }
 
     Ok(sync_ids.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{self, Database};
+    use rusqlite::params;
+
+    #[test]
+    fn abandoned_brand_new_groups_are_removed() {
+        let db = Database::in_memory().expect("in-memory db");
+        db.with_conn(|conn| {
+            db::create_sync_group(conn, "sg1", 0)?;
+            db::register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+
+            let old = db::now_secs() - 10_000;
+            conn.execute(
+                "UPDATE sync_groups SET created_at = ?1, updated_at = ?1 WHERE sync_id = ?2",
+                params![old, "sg1"],
+            )?;
+            conn.execute(
+                "UPDATE devices SET last_seen_at = ?1 WHERE sync_id = ?2",
+                params![old, "sg1"],
+            )?;
+
+            let removed = cleanup_abandoned_brand_new_groups(conn, 60)?;
+            assert_eq!(removed, 1);
+            assert!(db::get_sync_group_epoch(conn, "sg1")?.is_none());
+
+            Ok(())
+        })
+        .unwrap();
+    }
 }

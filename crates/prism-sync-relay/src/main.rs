@@ -8,11 +8,15 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let config = Config::from_env();
+    let mut config = Config::from_env();
     let port = config.port;
 
     let db =
         Database::open(&config.db_path, config.reader_pool_size).expect("failed to open database");
+
+    // Resolve registration token (env var → file → auto-generate).
+    // Must run after Database::open so the data directory exists.
+    config.resolve_registration_token();
     tracing::info!(db_path = %config.db_path, "Database opened");
 
     let state = AppState::new(db, config);

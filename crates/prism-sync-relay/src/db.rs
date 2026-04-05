@@ -587,6 +587,7 @@ pub fn store_registry_artifact(
 }
 
 /// Compare-and-set registry state. Returns `true` if the transition was applied.
+#[allow(clippy::too_many_arguments)]
 pub fn compare_and_set_registry_state(
     conn: &Connection,
     sync_id: &str,

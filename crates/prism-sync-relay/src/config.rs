@@ -49,7 +49,13 @@ pub struct Config {
     pub grapheneos_verified_boot_key_allowlist: Vec<String>,
     /// Registration token for access control. When set, both registration
     /// endpoints require this token in the X-Registration-Token header.
-    /// When unset, registration is open (gated only by PoW/attestation).
+    ///
+    /// Resolution order (handled by [`resolve_registration_token`]):
+    /// 1. `REGISTRATION_TOKEN` env var (explicit config, highest priority)
+    /// 2. `{db_dir}/.registration-token` file (auto-generated on first boot)
+    /// 3. Neither → generate a random token, write it to the file, log it
+    ///
+    /// To explicitly run open registration, set `REGISTRATION_TOKEN=OPEN`.
     pub registration_token: Option<String>,
     /// Whether registration is enabled at all. When false, all registration
     /// endpoints return 403. Use this to lock down a relay after initial setup.
@@ -182,6 +188,78 @@ impl Config {
             self.sync_inactive_ttl_secs,
         )
     }
+
+    /// Resolve the registration token using the priority chain:
+    /// 1. `REGISTRATION_TOKEN` env var — if "OPEN", clears the token (open mode)
+    /// 2. `{db_dir}/.registration-token` file
+    /// 3. Generate a random token, write it to the file, log it
+    pub fn resolve_registration_token(&mut self) {
+        // If env var was set, it's already in self.registration_token from from_env().
+        if let Some(ref token) = self.registration_token {
+            if token.eq_ignore_ascii_case("OPEN") {
+                tracing::warn!(
+                    "REGISTRATION_TOKEN=OPEN — registration is open to anyone. \
+                     Only use this behind a VPN/firewall."
+                );
+                self.registration_token = None;
+                return;
+            }
+            tracing::info!("Registration token loaded from environment variable");
+            return;
+        }
+
+        // No env var — try the file next to the database.
+        let db_dir = std::path::Path::new(&self.db_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let token_path = db_dir.join(".registration-token");
+
+        if let Ok(contents) = std::fs::read_to_string(&token_path) {
+            let token = contents.trim().to_string();
+            if !token.is_empty() {
+                tracing::info!(
+                    path = %token_path.display(),
+                    "Registration token loaded from file"
+                );
+                self.registration_token = Some(token);
+                return;
+            }
+        }
+
+        // Neither env var nor file — generate, persist, and log.
+        let token = generate_random_token();
+        if let Some(parent) = token_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&token_path, &token) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %token_path.display(),
+                    "Generated and saved registration token to file"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %token_path.display(),
+                    error = %e,
+                    "Failed to write registration token file — token will be ephemeral"
+                );
+            }
+        }
+        tracing::warn!(
+            "\n\n\
+             ╔══════════════════════════════════════════════════════════════╗\n\
+             ║  AUTO-GENERATED REGISTRATION TOKEN                         ║\n\
+             ║                                                            ║\n\
+             ║  {token:<52}  ║\n\
+             ║                                                            ║\n\
+             ║  Enter this token in the Prism app when connecting.        ║\n\
+             ║  To use your own token, set the REGISTRATION_TOKEN         ║\n\
+             ║  environment variable.                                     ║\n\
+             ╚══════════════════════════════════════════════════════════════╝\n"
+        );
+        self.registration_token = Some(token);
+    }
 }
 
 fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -208,6 +286,13 @@ fn parse_json_vec_env(key: &str, default: Vec<String>) -> Vec<String> {
         .filter(|value| !value.trim().is_empty())
         .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
         .unwrap_or(default)
+}
+
+fn generate_random_token() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut bytes);
+    hex::encode(bytes)
 }
 
 fn default_android_attestation_roots() -> Vec<String> {
