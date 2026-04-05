@@ -189,6 +189,12 @@ pub struct PairingResponse {
     /// flows.
     #[serde(default)]
     pub registry_approval_signature: Option<String>,
+
+    /// Optional registration token for self-hosted relays with registration
+    /// gating enabled. Carried in the pairing response so that paired
+    /// devices automatically receive it.
+    #[serde(default)]
+    pub registration_token: Option<String>,
 }
 
 impl PairingResponse {
@@ -394,6 +400,7 @@ impl PairingResponse {
             current_epoch,
             epoch_key,
             registry_approval_signature,
+            registration_token: None,
         };
         response.validate_epoch_fields().ok()?;
         Some(response)
@@ -695,6 +702,7 @@ mod tests {
             current_epoch: 2,
             epoch_key: vec![0xBB; 32],
             registry_approval_signature: Some(hex::encode([0xDD; 64])),
+            registration_token: None,
         }
     }
 

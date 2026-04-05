@@ -26,6 +26,7 @@ pub struct ServerRelay {
     device_id: String,
     device_session_token: String,
     request_signing_key: SigningKey,
+    registration_token: Option<String>,
     client: Client,
     request_timeout: Duration,
     snapshot_timeout: Duration,
@@ -45,6 +46,7 @@ impl ServerRelay {
         device_id: String,
         device_session_token: String,
         request_signing_key: SigningKey,
+        registration_token: Option<String>,
     ) -> Result<Self, String> {
         if !base_url.starts_with("https://") && !base_url.starts_with("http://localhost") {
             return Err(format!(
@@ -67,6 +69,7 @@ impl ServerRelay {
             device_id,
             device_session_token,
             request_signing_key,
+            registration_token,
             client,
             request_timeout: Duration::from_secs(15),
             snapshot_timeout: Duration::from_secs(120),
@@ -233,54 +236,20 @@ fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ServerRelay;
-    use crate::relay::traits::RelayError;
-
-    #[test]
-    fn classify_error_keeps_device_revoked_response_structured() {
-        let err =
-            ServerRelay::classify_error(401, r#"{"error":"device_revoked","remote_wipe":true}"#);
-
-        assert!(matches!(
-            err,
-            RelayError::DeviceRevoked { remote_wipe: true }
-        ));
-    }
-
-    #[test]
-    fn classify_error_parses_device_identity_mismatch() {
-        let err = ServerRelay::classify_error(
-            401,
-            r#"{"error":"device_identity_mismatch","message":"keys do not match"}"#,
-        );
-
-        assert!(matches!(
-            err,
-            RelayError::DeviceIdentityMismatch { ref message }
-                if message == "keys do not match"
-        ));
-    }
-
-    #[test]
-    fn classify_error_falls_back_to_auth_for_unknown_401_json() {
-        let err = ServerRelay::classify_error(401, r#"{"error":"something_else"}"#);
-
-        assert!(matches!(err, RelayError::Auth { .. }));
-    }
-}
-
 #[async_trait]
 impl SyncRelay for ServerRelay {
     async fn get_registration_nonce(&self) -> Result<RegistrationNonceResponse, RelayError> {
         let url = format!("{}/register-nonce", self.base_path());
         debug!("get_registration_nonce");
 
-        let resp = self
+        let mut req = self
             .client
             .get(&url)
-            .timeout(self.request_timeout)
+            .timeout(self.request_timeout);
+        if let Some(token) = &self.registration_token {
+            req = req.header("X-Registration-Token", token);
+        }
+        let resp = req
             .send()
             .await
             .map_err(Self::classify_reqwest_error)?;
@@ -325,10 +294,14 @@ impl SyncRelay for ServerRelay {
             }),
         });
 
-        let resp = self
+        let mut req = self
             .apply_auth(self.client.post(&url))
             .json(&body)
-            .timeout(self.request_timeout)
+            .timeout(self.request_timeout);
+        if let Some(token) = &self.registration_token {
+            req = req.header("X-Registration-Token", token);
+        }
+        let resp = req
             .send()
             .await
             .map_err(Self::classify_reqwest_error)?;
@@ -785,5 +758,43 @@ impl SyncRelay for ServerRelay {
     async fn dispose(&self) -> Result<(), RelayError> {
         self.disconnect_websocket().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerRelay;
+    use crate::relay::traits::RelayError;
+
+    #[test]
+    fn classify_error_keeps_device_revoked_response_structured() {
+        let err =
+            ServerRelay::classify_error(401, r#"{"error":"device_revoked","remote_wipe":true}"#);
+
+        assert!(matches!(
+            err,
+            RelayError::DeviceRevoked { remote_wipe: true }
+        ));
+    }
+
+    #[test]
+    fn classify_error_parses_device_identity_mismatch() {
+        let err = ServerRelay::classify_error(
+            401,
+            r#"{"error":"device_identity_mismatch","message":"keys do not match"}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::DeviceIdentityMismatch { ref message }
+                if message == "keys do not match"
+        ));
+    }
+
+    #[test]
+    fn classify_error_falls_back_to_auth_for_unknown_401_json() {
+        let err = ServerRelay::classify_error(401, r#"{"error":"something_else"}"#);
+
+        assert!(matches!(err, RelayError::Auth { .. }));
     }
 }

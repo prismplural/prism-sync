@@ -203,6 +203,7 @@ async fn test_pairing_create_and_join() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("create_sync_group should succeed");

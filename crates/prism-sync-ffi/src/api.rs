@@ -674,6 +674,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         &session_token,
         device_secret,
         handle.allow_insecure,
+        None,
     )?;
 
     // Connect WebSocket for real-time relay notifications (best-effort;
@@ -1118,6 +1119,7 @@ fn build_relay(
     session_token: &str,
     device_secret: Option<Vec<u8>>,
     allow_insecure: bool,
+    registration_token: Option<String>,
 ) -> Result<Arc<ServerRelay>, String> {
     // ServerRelay::new only accepts https:// or http://localhost.
     // When allow_insecure is set we permit arbitrary http:// URLs by
@@ -1149,6 +1151,7 @@ fn build_relay(
         device_id.to_string(),
         session_token.to_string(),
         signing_key,
+        registration_token,
     )
     .map_err(|e| format!("Failed to create ServerRelay: {e}"))?;
     Ok(Arc::new(relay))
@@ -1174,6 +1177,7 @@ pub async fn create_sync_group(
     const PENDING_ADMISSION_PROOF_KEY: &str = "pending_first_device_admission_proof";
     const PENDING_DEVICE_SECRET_KEY: &str = "pending_device_secret";
     const PENDING_DEVICE_ID_KEY: &str = "pending_device_id";
+    const PENDING_REGISTRATION_TOKEN_KEY: &str = "pending_registration_token";
 
     let pending = {
         let inner = handle.inner.lock().await;
@@ -1182,7 +1186,7 @@ pub async fn create_sync_group(
         let pending_sync_id = store
             .get(PENDING_SYNC_ID_KEY)
             .map_err(|e| e.to_string())?
-            .map(|bytes| String::from_utf8(bytes))
+            .map(String::from_utf8)
             .transpose()
             .map_err(|e| format!("invalid pending sync id: {e}"))?;
 
@@ -1200,10 +1204,18 @@ pub async fn create_sync_group(
             .transpose()
             .map_err(|e| format!("invalid pending admission proof: {e}"))?;
 
+        let pending_registration_token = store
+            .get(PENDING_REGISTRATION_TOKEN_KEY)
+            .map_err(|e| e.to_string())?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|e| format!("invalid pending registration token: {e}"))?;
+
         (
             pending_sync_id,
             pending_nonce_response,
             pending_admission_proof,
+            pending_registration_token,
         )
     };
 
@@ -1223,6 +1235,7 @@ pub async fn create_sync_group(
         "", // no session token yet — registration will return one
         None,
         handle.allow_insecure,
+        pending.3.clone(),
     )?;
 
     let mut inner = handle.inner.lock().await;
@@ -1236,6 +1249,7 @@ pub async fn create_sync_group(
             Some(sync_id),
             pending.1.clone(),
             pending.2.clone(),
+            pending.3.clone(),
         )
         .await;
 
@@ -1245,6 +1259,7 @@ pub async fn create_sync_group(
         PENDING_ADMISSION_PROOF_KEY,
         PENDING_DEVICE_SECRET_KEY,
         PENDING_DEVICE_ID_KEY,
+        PENDING_REGISTRATION_TOKEN_KEY,
     ] {
         let _ = inner.secure_store().delete(key);
     }
@@ -1495,6 +1510,7 @@ pub async fn approve_pairing_request(
         current_epoch: epoch as u32,
         epoch_key: epoch_key_data,
         registry_approval_signature: Some(prism_sync_crypto::hex::encode(&approval_signature)),
+        registration_token: None,
     };
 
     let invite = prism_sync_core::pairing::models::Invite::new(response);
@@ -1566,6 +1582,7 @@ async fn join_with_response(
         "",        // no session token yet
         None,
         handle.allow_insecure,
+        response.registration_token.clone(),
     )?;
 
     let mut inner = handle.inner.lock().await;
@@ -1682,6 +1699,7 @@ pub async fn list_devices(
         &session_token,
         device_secret,
         handle.allow_insecure,
+        None,
     )?;
 
     let devices = relay
@@ -1718,6 +1736,7 @@ pub async fn revoke_device(
         &session_token,
         device_secret,
         handle.allow_insecure,
+        None,
     )?;
     let mut inner = handle.inner.lock().await;
     inner
@@ -1764,6 +1783,7 @@ pub async fn revoke_and_rekey(
         &session_token,
         device_secret,
         handle.allow_insecure,
+        None,
     )?;
     let mut inner = handle.inner.lock().await;
     inner
@@ -1827,6 +1847,7 @@ pub async fn deregister_device(
         &session_token,
         device_secret,
         handle.allow_insecure,
+        None,
     )?;
     relay
         .deregister()
@@ -1858,6 +1879,7 @@ pub async fn delete_sync_group(
         &session_token,
         device_secret,
         handle.allow_insecure,
+        None,
     )?;
     relay
         .delete_sync_group()

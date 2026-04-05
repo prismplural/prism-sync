@@ -33,7 +33,7 @@ async fn create_invite(password: &str) -> (PairingResponse, Arc<MemorySecureStor
     let service = PairingService::new(relay, store.clone());
 
     let (_creds, invite) = service
-        .create_sync_group(password, "wss://relay.example.com", None, None, None, None)
+        .create_sync_group(password, "wss://relay.example.com", None, None, None, None, None)
         .await
         .expect("create_sync_group should succeed");
 
@@ -370,7 +370,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
 
     let password = "test-password";
     let (_creds, _invite) = service_a
-        .create_sync_group(password, "wss://relay.example.com", None, None, None, None)
+        .create_sync_group(password, "wss://relay.example.com", None, None, None, None, None)
         .await
         .expect("create_sync_group should succeed");
 
@@ -445,6 +445,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         current_epoch: 0,
         epoch_key: vec![],
         registry_approval_signature: None,
+        registration_token: None,
     };
     assert_eq!(
         response.admission_context(),
@@ -509,7 +510,7 @@ async fn join_from_approval_roundtrip() {
     let service_a = PairingService::new(relay_a, store_a.clone());
 
     let (_creds, _invite) = service_a
-        .create_sync_group(password, "wss://relay.test", None, None, None, None)
+        .create_sync_group(password, "wss://relay.test", None, None, None, None, None)
         .await
         .expect("create_sync_group");
 
@@ -598,6 +599,7 @@ async fn join_from_approval_roundtrip() {
         current_epoch: 0,
         epoch_key: vec![],
         registry_approval_signature: None,
+        registration_token: None,
     };
     assert_eq!(
         response.admission_context(),
@@ -662,7 +664,7 @@ async fn join_from_approval_roundtrip() {
     prism_sync_core::device_registry::DeviceRegistryManager::verify_device_key(
         &storage,
         &sync_id,
-        &device_id_b,
+        device_id_b,
         &signing_key_b.public_key_bytes(),
     )
     .expect("imported joiner should verify");

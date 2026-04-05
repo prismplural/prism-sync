@@ -44,6 +44,7 @@ impl PairingService {
     /// 3. Generates a unique `sync_id`.
     /// 4. Builds `SyncGroupCredentials` and an `Invite`.
     /// 5. Generates a device identity and registers with the relay.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_sync_group(
         &self,
         password: &str,
@@ -52,6 +53,7 @@ impl PairingService {
         sync_id_override: Option<String>,
         nonce_response_override: Option<RegistrationNonceResponse>,
         first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
+        registration_token: Option<String>,
     ) -> Result<(SyncGroupCredentials, Invite)> {
         // 1. Generate or accept mnemonic
         let mnemonic_str = mnemonic_override.unwrap_or_else(mnemonic::generate);
@@ -129,6 +131,7 @@ impl PairingService {
             current_epoch: 0,
             epoch_key: vec![],
             registry_approval_signature: None,
+            registration_token,
         };
 
         // 9. Fetch registration nonce and build challenge-response (CRITICAL-2)
@@ -658,6 +661,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -691,6 +695,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -717,6 +722,7 @@ mod tests {
             .create_sync_group(
                 "my-password",
                 "wss://relay.example.com",
+                None,
                 None,
                 None,
                 None,
@@ -756,6 +762,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -788,6 +795,7 @@ mod tests {
             current_epoch: 1,
             epoch_key: vec![],
             registry_approval_signature: None,
+            registration_token: None,
         };
 
         let err = match join_service.join_sync_group(&response, "irrelevant").await {
@@ -817,6 +825,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -831,7 +840,7 @@ mod tests {
         let service = PairingService::new(relay, store);
 
         let (_creds, invite) = service
-            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None)
+            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None, None)
             .await
             .unwrap();
 
@@ -869,7 +878,7 @@ mod tests {
         let service = PairingService::new(relay, store);
 
         let (_creds, invite) = service
-            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None)
+            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None, None)
             .await
             .unwrap();
 
@@ -898,7 +907,7 @@ mod tests {
         let service = PairingService::new(relay, store);
 
         let (_creds, invite) = service
-            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None)
+            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None, None)
             .await
             .unwrap();
 
@@ -1068,7 +1077,7 @@ mod tests {
         let service = PairingService::new(relay.clone(), store);
 
         let (_creds, _invite) = service
-            .create_sync_group("pw", "wss://relay.example.com", None, None, None, None)
+            .create_sync_group("pw", "wss://relay.example.com", None, None, None, None, None)
             .await
             .unwrap();
 
@@ -1247,6 +1256,7 @@ mod tests {
             current_epoch: 0,
             epoch_key: vec![],
             registry_approval_signature: Some(approval_signature.clone()),
+            registration_token: None,
         };
 
         let relay = Arc::new(CapturingRelay {
@@ -1360,6 +1370,7 @@ mod tests {
             current_epoch: 0,
             epoch_key: vec![],
             registry_approval_signature: Some(approval_signature),
+            registration_token: None,
         };
 
         let service = PairingService::new(Arc::new(MockRelay), Arc::new(MemStore::default()));

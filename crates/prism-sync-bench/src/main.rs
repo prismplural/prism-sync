@@ -93,6 +93,8 @@ async fn start_in_process_relay(reader_pool_size: usize) -> Result<String> {
         first_device_android_attestation_enabled: false,
         first_device_android_attestation_trust_roots_pem: vec![],
         grapheneos_verified_boot_key_allowlist: vec![],
+        registration_enabled: true,
+        registration_token: None,
     };
 
     let db = Database::open(
