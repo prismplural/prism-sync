@@ -3527,11 +3527,7 @@ async fn test_token_gated_wrong_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        nonce_resp.status(),
-        403,
-        "wrong token should return 403"
-    );
+    assert_eq!(nonce_resp.status(), 403, "wrong token should return 403");
 
     // Register endpoint with wrong token should also return 403
     let register_resp = client
@@ -3568,11 +3564,7 @@ async fn test_token_gated_missing_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        nonce_resp.status(),
-        403,
-        "missing token should return 403"
-    );
+    assert_eq!(nonce_resp.status(), 403, "missing token should return 403");
 
     // Register endpoint with no token header should also return 403
     let register_resp = client

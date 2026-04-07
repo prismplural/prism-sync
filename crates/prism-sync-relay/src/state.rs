@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::db::Database;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
@@ -14,76 +14,7 @@ type WsConnections = HashMap<String, HashMap<String, WsSender>>;
 
 #[derive(Debug, Default)]
 pub struct Metrics {
-    pub changesets_pushed: AtomicU64,
-    pub changesets_pulled: AtomicU64,
-    pub changesets_pruned: AtomicU64,
-    pub ws_notifications: AtomicU64,
-    pub auth_failures: AtomicU64,
-    pub snapshots_exchanged: AtomicU64,
-    pub registrations: AtomicU64,
-    pub vacuum_pages_freed: AtomicU64,
     pub last_cleanup_epoch_secs: AtomicU64,
-}
-
-impl Metrics {
-    pub fn inc(&self, field: &AtomicU64) {
-        field.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_by(&self, field: &AtomicU64, n: u64) {
-        field.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Restore counter values from a name→value map (loaded from SQLite).
-    pub fn restore_from(&self, counters: &std::collections::HashMap<String, u64>) {
-        let fields: &[(&str, &AtomicU64)] = &[
-            ("changesets_pushed", &self.changesets_pushed),
-            ("changesets_pulled", &self.changesets_pulled),
-            ("changesets_pruned", &self.changesets_pruned),
-            ("ws_notifications", &self.ws_notifications),
-            ("auth_failures", &self.auth_failures),
-            ("snapshots_exchanged", &self.snapshots_exchanged),
-            ("registrations", &self.registrations),
-            ("vacuum_pages_freed", &self.vacuum_pages_freed),
-        ];
-        for (name, field) in fields {
-            if let Some(&value) = counters.get(*name) {
-                field.store(value, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Snapshot current counter values for flushing to SQLite.
-    pub fn snapshot_counters(&self) -> Vec<(&'static str, u64)> {
-        vec![
-            (
-                "changesets_pushed",
-                self.changesets_pushed.load(Ordering::Relaxed),
-            ),
-            (
-                "changesets_pulled",
-                self.changesets_pulled.load(Ordering::Relaxed),
-            ),
-            (
-                "changesets_pruned",
-                self.changesets_pruned.load(Ordering::Relaxed),
-            ),
-            (
-                "ws_notifications",
-                self.ws_notifications.load(Ordering::Relaxed),
-            ),
-            ("auth_failures", self.auth_failures.load(Ordering::Relaxed)),
-            (
-                "snapshots_exchanged",
-                self.snapshots_exchanged.load(Ordering::Relaxed),
-            ),
-            ("registrations", self.registrations.load(Ordering::Relaxed)),
-            (
-                "vacuum_pages_freed",
-                self.vacuum_pages_freed.load(Ordering::Relaxed),
-            ),
-        ]
-    }
 }
 
 /// Per-key sliding window rate limiter.
@@ -166,19 +97,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Database, config: Config) -> Self {
-        let metrics = Arc::new(Metrics::default());
-
-        // Restore persisted counters so lifetime totals survive restarts.
-        match db.with_read_conn(crate::db::load_counters) {
-            Ok(counters) => metrics.restore_from(&counters),
-            Err(e) => tracing::warn!("failed to load persisted counters: {e}"),
-        }
-
         Self {
             db: Arc::new(db),
             config: Arc::new(config),
             ws_connections: Arc::new(RwLock::new(HashMap::new())),
-            metrics,
+            metrics: Arc::new(Metrics::default()),
             nonce_rate_limiter: RateLimiter::default(),
             revoke_rate_limiter: RateLimiter::default(),
             signed_request_replay_cache: RateLimiter::default(),
@@ -203,7 +126,6 @@ impl AppState {
                     );
                 }
             }
-            self.metrics.inc(&self.metrics.ws_notifications);
         }
     }
 

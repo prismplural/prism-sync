@@ -840,7 +840,15 @@ mod tests {
         let service = PairingService::new(relay, store);
 
         let (_creds, invite) = service
-            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None, None)
+            .create_sync_group(
+                "test-pw",
+                "wss://relay.example.com",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -878,7 +886,15 @@ mod tests {
         let service = PairingService::new(relay, store);
 
         let (_creds, invite) = service
-            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None, None)
+            .create_sync_group(
+                "test-pw",
+                "wss://relay.example.com",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -907,7 +923,15 @@ mod tests {
         let service = PairingService::new(relay, store);
 
         let (_creds, invite) = service
-            .create_sync_group("test-pw", "wss://relay.example.com", None, None, None, None, None)
+            .create_sync_group(
+                "test-pw",
+                "wss://relay.example.com",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1077,7 +1101,15 @@ mod tests {
         let service = PairingService::new(relay.clone(), store);
 
         let (_creds, _invite) = service
-            .create_sync_group("pw", "wss://relay.example.com", None, None, None, None, None)
+            .create_sync_group(
+                "pw",
+                "wss://relay.example.com",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 

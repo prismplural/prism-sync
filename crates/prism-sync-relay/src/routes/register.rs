@@ -285,8 +285,6 @@ async fn register_device(
 
     let token = result?;
 
-    state.metrics.inc(&state.metrics.registrations);
-
     tracing::debug!(
         sync_id = %&sync_id[..16],
         device_id = %&body.device_id[..8.min(body.device_id.len())],

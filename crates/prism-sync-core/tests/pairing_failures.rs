@@ -33,7 +33,15 @@ async fn create_invite(password: &str) -> (PairingResponse, Arc<MemorySecureStor
     let service = PairingService::new(relay, store.clone());
 
     let (_creds, invite) = service
-        .create_sync_group(password, "wss://relay.example.com", None, None, None, None, None)
+        .create_sync_group(
+            password,
+            "wss://relay.example.com",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("create_sync_group should succeed");
 
@@ -370,7 +378,15 @@ async fn approve_flow_produces_verifiable_pairing_response() {
 
     let password = "test-password";
     let (_creds, _invite) = service_a
-        .create_sync_group(password, "wss://relay.example.com", None, None, None, None, None)
+        .create_sync_group(
+            password,
+            "wss://relay.example.com",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("create_sync_group should succeed");
 

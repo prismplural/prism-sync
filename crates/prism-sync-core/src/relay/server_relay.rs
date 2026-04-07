@@ -242,17 +242,11 @@ impl SyncRelay for ServerRelay {
         let url = format!("{}/register-nonce", self.base_path());
         debug!("get_registration_nonce");
 
-        let mut req = self
-            .client
-            .get(&url)
-            .timeout(self.request_timeout);
+        let mut req = self.client.get(&url).timeout(self.request_timeout);
         if let Some(token) = &self.registration_token {
             req = req.header("X-Registration-Token", token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
+        let resp = req.send().await.map_err(Self::classify_reqwest_error)?;
 
         let status = resp.status().as_u16();
         if status >= 400 {
@@ -301,10 +295,7 @@ impl SyncRelay for ServerRelay {
         if let Some(token) = &self.registration_token {
             req = req.header("X-Registration-Token", token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
+        let resp = req.send().await.map_err(Self::classify_reqwest_error)?;
 
         let status = resp.status().as_u16();
         if status >= 400 {

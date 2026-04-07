@@ -604,7 +604,7 @@ pub async fn post_ack(
     let did = auth.device_id;
     let stale_threshold = state.config.stale_device_secs as i64;
 
-    let pruned = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             db::upsert_device_receipt(conn, &sid, &did, server_seq)?;
             match db::get_safe_prune_seq(conn, &sid, stale_threshold)? {
@@ -616,13 +616,6 @@ pub async fn post_ack(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    if pruned > 0 {
-        state
-            .metrics
-            .changesets_pruned
-            .fetch_add(pruned as u64, std::sync::atomic::Ordering::Relaxed);
-    }
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1,6 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1652,36 +1651,6 @@ pub fn prune_stale_sync_groups(
     }
 
     Ok(stale_ids.len())
-}
-
-// ---------------------------------------------------------------------------
-// Persistent counters
-// ---------------------------------------------------------------------------
-
-/// Load persisted counter values from SQLite. Returns a map of name → value.
-pub fn load_counters(conn: &Connection) -> Result<HashMap<String, u64>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT name, value FROM counters")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-    })?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (name, value) = row?;
-        map.insert(name, value);
-    }
-    Ok(map)
-}
-
-/// Flush current counter values to SQLite (upsert).
-pub fn flush_counters(conn: &Connection, values: &[(&str, u64)]) -> Result<(), rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "INSERT INTO counters (name, value) VALUES (?1, ?2)
-         ON CONFLICT(name) DO UPDATE SET value = ?2",
-    )?;
-    for (name, value) in values {
-        stmt.execute(params![name, value])?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

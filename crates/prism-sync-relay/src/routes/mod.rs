@@ -191,7 +191,6 @@ async fn auth_middleware(
     };
 
     if token.len() < 32 {
-        state.metrics.inc(&state.metrics.auth_failures);
         return Err(AppError::Unauthorized.into_response());
     }
 
@@ -268,7 +267,6 @@ async fn auth_middleware(
                 remote_wipe,
                 "Auth REJECTED: device revoked"
             );
-            state.metrics.inc(&state.metrics.auth_failures);
             Err(AppError::DeviceRevoked { remote_wipe }.into_response())
         }
         AuthResult::Invalid => {
@@ -277,7 +275,6 @@ async fn auth_middleware(
                 path = %req.uri().path(),
                 "Auth REJECTED: invalid session or inactive device"
             );
-            state.metrics.inc(&state.metrics.auth_failures);
             Err(AppError::Unauthorized.into_response())
         }
     }

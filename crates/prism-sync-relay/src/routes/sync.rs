@@ -93,8 +93,6 @@ pub async fn push_changes(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
-    state.metrics.inc(&state.metrics.changesets_pushed);
-
     tracing::debug!(
         sync_id = %trunc(&sync_id),
         device_id = %trunc(&device_id),
@@ -214,8 +212,6 @@ pub async fn pull_changes(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    state.metrics.inc(&state.metrics.changesets_pulled);
 
     let max_server_seq = batches.iter().map(|b| b.server_seq).max().unwrap_or(since);
 
@@ -406,7 +402,6 @@ pub async fn put_snapshot(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
-    state.metrics.inc(&state.metrics.snapshots_exchanged);
     tracing::debug!(sync_id = %trunc(&sync_id), "Put snapshot stored");
     Ok(StatusCode::NO_CONTENT)
 }

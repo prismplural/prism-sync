@@ -67,9 +67,15 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("db_path", &self.db_path)
             .field("port", &self.port)
-            .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "registration_token",
+                &self.registration_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("registration_enabled", &self.registration_enabled)
-            .field("metrics_token", &self.metrics_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "metrics_token",
+                &self.metrics_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("reader_pool_size", &self.reader_pool_size)
             .finish_non_exhaustive()
     }

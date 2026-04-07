@@ -203,13 +203,19 @@ impl std::fmt::Debug for PairingResponse {
             .field("relay_url", &self.relay_url)
             .field("sync_id", &self.sync_id)
             .field("mnemonic", &"[REDACTED]")
-            .field("wrapped_dek", &format!("[{} bytes]", self.wrapped_dek.len()))
+            .field(
+                "wrapped_dek",
+                &format!("[{} bytes]", self.wrapped_dek.len()),
+            )
             .field("salt", &format!("[{} bytes]", self.salt.len()))
             .field("inviter_device_id", &self.inviter_device_id)
             .field("joiner_device_id", &self.joiner_device_id)
             .field("current_epoch", &self.current_epoch)
             .field("epoch_key", &format!("[{} bytes]", self.epoch_key.len()))
-            .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "registration_token",
+                &self.registration_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish_non_exhaustive()
     }
 }
