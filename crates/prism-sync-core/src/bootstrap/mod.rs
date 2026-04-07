@@ -4,18 +4,27 @@
 //! (Phase 3) and remote sharing bootstrap (Phase 4). Does not depend on
 //! pairing models, relay traits, or secure store.
 
+pub mod ceremony;
 pub mod confirmation;
 pub mod encrypted_envelope;
 pub mod handshake;
 mod integration_test;
 pub mod key_schedule;
+pub mod pairing_models;
+pub mod pairing_transcript;
 mod sas_words;
 pub mod transcript;
 
+pub use ceremony::{InitiatorCeremony, JoinerCeremony};
 pub use confirmation::{ConfirmationCode, PublicFingerprint};
 pub use encrypted_envelope::{EncryptedEnvelope, EnvelopeContext};
 pub use handshake::{BootstrapHandshake, BootstrapSecret, DefaultBootstrapHandshake};
 pub use key_schedule::BootstrapKeySchedule;
+pub use pairing_models::{
+    CredentialBundle, JoinerBootstrapRecord, JoinerBundle, PairingInit, PairingPublicKeys,
+    RendezvousToken, SasDisplay,
+};
+pub use pairing_transcript::build_sync_pairing_transcript;
 pub use transcript::BootstrapTranscript;
 
 /// Protocol version for the bootstrap handshake.

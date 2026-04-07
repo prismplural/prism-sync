@@ -1,9 +1,11 @@
 pub mod mock;
+pub mod pairing_relay;
 pub mod server_relay;
 pub mod traits;
 pub mod websocket;
 
 pub use mock::MockRelay;
+pub use pairing_relay::{MockPairingRelay, PairingRelay, PairingSlot, ServerPairingRelay};
 pub use server_relay::ServerRelay;
 pub use traits::*;
 
