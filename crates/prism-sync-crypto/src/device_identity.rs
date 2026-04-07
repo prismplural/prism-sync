@@ -1,4 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ml_dsa::MlDsa65;
+use ml_kem::MlKem768;
 use rand::{rngs::OsRng, RngCore};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -43,6 +45,40 @@ impl DeviceSecret {
         let signing_key = SigningKey::from_bytes(&seed_arr);
         seed_arr.zeroize();
         Ok(DeviceSigningKey { signing_key })
+    }
+
+    /// Derive ML-DSA-65 signing keypair.
+    /// HKDF: ikm=device_secret, salt=device_id, info="prism_device_ml_dsa_65"
+    /// Uses `ExpandedSigningKey` which implements `ZeroizeOnDrop`.
+    pub fn ml_dsa_65_keypair(&self, device_id: &str) -> Result<DevicePqSigningKey> {
+        let seed = kdf::derive_subkey(
+            &self.secret,
+            device_id.as_bytes(),
+            b"prism_device_ml_dsa_65",
+        )?;
+        let mut seed_arr = ml_dsa::B32::try_from(seed.as_slice())
+            .map_err(|_| CryptoError::KdfFailed("ML-DSA seed length mismatch".into()))?;
+        let signing_key = ml_dsa::ExpandedSigningKey::<MlDsa65>::from_seed(&seed_arr);
+        seed_arr.zeroize();
+        Ok(DevicePqSigningKey { signing_key })
+    }
+
+    /// Derive ML-KEM-768 key encapsulation keypair.
+    /// HKDF: ikm=device_secret, salt=device_id, info="prism_device_ml_kem_768"
+    pub fn ml_kem_768_keypair(&self, device_id: &str) -> Result<DevicePqKemKey> {
+        let seed_bytes = kdf::derive_subkey_long(
+            &self.secret,
+            device_id.as_bytes(),
+            b"prism_device_ml_kem_768",
+            64,
+        )?;
+        let mut seed = ml_kem::Seed::try_from(seed_bytes.as_slice())
+            .map_err(|_| CryptoError::KdfFailed("ML-KEM seed length mismatch".into()))?;
+        let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(core::mem::take(&mut seed));
+        seed.zeroize();
+        Ok(DevicePqKemKey {
+            decapsulation_key: dk,
+        })
     }
 
     /// Derive X25519 key exchange keypair.
@@ -92,8 +128,10 @@ impl DeviceSigningKey {
 }
 
 /// X25519 key exchange key for pairing and rekey artifact wrapping.
+#[derive(ZeroizeOnDrop)]
 pub struct DeviceExchangeKey {
     secret_key: StaticSecret,
+    #[zeroize(skip)]
     public_key: X25519PublicKey,
 }
 
@@ -105,6 +143,62 @@ impl DeviceExchangeKey {
     pub fn diffie_hellman(&self, peer_public_key: &[u8; 32]) -> Vec<u8> {
         let peer = X25519PublicKey::from(*peer_public_key);
         self.secret_key.diffie_hellman(&peer).to_bytes().to_vec()
+    }
+}
+
+/// ML-DSA-65 signing key for post-quantum signatures.
+/// Uses `ExpandedSigningKey` which implements `ZeroizeOnDrop` for secret material.
+pub struct DevicePqSigningKey {
+    signing_key: ml_dsa::ExpandedSigningKey<MlDsa65>,
+}
+
+impl DevicePqSigningKey {
+    /// Get the encoded verifying (public) key bytes (1952 bytes).
+    pub fn public_key_bytes(&self) -> Vec<u8> {
+        let vk = self.signing_key.verifying_key();
+        let encoded = vk.encode();
+        AsRef::<[u8]>::as_ref(&encoded).to_vec()
+    }
+
+    /// Sign a message, returning the ML-DSA-65 signature.
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        use ml_dsa::signature::Signer;
+        let sig = self.signing_key.sign(message);
+        let sig_bytes = sig.encode();
+        AsRef::<[u8]>::as_ref(&sig_bytes).to_vec()
+    }
+
+    /// Verify a ML-DSA-65 signature against a public key.
+    pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
+        use ml_dsa::signature::Verifier;
+
+        let enc = ml_dsa::EncodedVerifyingKey::<MlDsa65>::try_from(public_key).map_err(|_| {
+            CryptoError::InvalidKeyMaterial("invalid ML-DSA-65 public key length".into())
+        })?;
+        let vk = ml_dsa::VerifyingKey::<MlDsa65>::decode(&enc);
+
+        let sig = ml_dsa::Signature::<MlDsa65>::try_from(signature)
+            .map_err(|_| CryptoError::InvalidKeyMaterial("invalid ML-DSA-65 signature".into()))?;
+
+        vk.verify(message, &sig).map_err(|_| {
+            CryptoError::SignatureVerificationFailed("ML-DSA-65 signature does not match".into())
+        })
+    }
+}
+
+/// ML-KEM-768 key encapsulation key.
+pub struct DevicePqKemKey {
+    decapsulation_key: ml_kem::DecapsulationKey<MlKem768>,
+}
+
+impl DevicePqKemKey {
+    /// Get the encoded encapsulation (public) key bytes (1184 bytes).
+    pub fn public_key_bytes(&self) -> Vec<u8> {
+        use ml_kem::KeyExport;
+        self.decapsulation_key
+            .encapsulation_key()
+            .to_bytes()
+            .to_vec()
     }
 }
 
@@ -190,5 +284,79 @@ mod tests {
         let shared_b = kp_b.diffie_hellman(&kp_a.public_key_bytes());
         assert_eq!(shared_a, shared_b);
         assert_eq!(shared_a.len(), 32);
+    }
+
+    #[test]
+    fn ml_dsa_65_keypair_deterministic() {
+        let secret = DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let kp1 = secret.ml_dsa_65_keypair("device_abc").unwrap();
+        let kp2 = secret.ml_dsa_65_keypair("device_abc").unwrap();
+        assert_eq!(kp1.public_key_bytes(), kp2.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_dsa_65_different_devices_different_keys() {
+        let secret = DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let kp1 = secret.ml_dsa_65_keypair("device_a").unwrap();
+        let kp2 = secret.ml_dsa_65_keypair("device_b").unwrap();
+        assert_ne!(kp1.public_key_bytes(), kp2.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_dsa_65_sign_and_verify() {
+        let secret = DeviceSecret::generate();
+        let kp = secret.ml_dsa_65_keypair("my_device").unwrap();
+        let message = b"hello, world!";
+        let signature = kp.sign(message);
+        DevicePqSigningKey::verify(&kp.public_key_bytes(), message, &signature).unwrap();
+    }
+
+    #[test]
+    fn ml_dsa_65_wrong_message_fails() {
+        let secret = DeviceSecret::generate();
+        let kp = secret.ml_dsa_65_keypair("my_device").unwrap();
+        let signature = kp.sign(b"correct");
+        assert!(DevicePqSigningKey::verify(&kp.public_key_bytes(), b"wrong", &signature).is_err());
+    }
+
+    #[test]
+    fn ml_dsa_65_public_key_size() {
+        let secret = DeviceSecret::generate();
+        let kp = secret.ml_dsa_65_keypair("test").unwrap();
+        assert_eq!(kp.public_key_bytes().len(), 1952);
+    }
+
+    #[test]
+    fn ml_kem_768_keypair_deterministic() {
+        let secret = DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let kp1 = secret.ml_kem_768_keypair("device_abc").unwrap();
+        let kp2 = secret.ml_kem_768_keypair("device_abc").unwrap();
+        assert_eq!(kp1.public_key_bytes(), kp2.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_kem_768_different_devices_different_keys() {
+        let secret = DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let kp1 = secret.ml_kem_768_keypair("device_a").unwrap();
+        let kp2 = secret.ml_kem_768_keypair("device_b").unwrap();
+        assert_ne!(kp1.public_key_bytes(), kp2.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_kem_768_public_key_size() {
+        let secret = DeviceSecret::generate();
+        let kp = secret.ml_kem_768_keypair("test").unwrap();
+        assert_eq!(kp.public_key_bytes().len(), 1184);
+    }
+
+    #[test]
+    fn secret_key_types_impl_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<DeviceSecret>();
+        assert_zeroize_on_drop::<ed25519_dalek::SigningKey>();
+        assert_zeroize_on_drop::<ml_dsa::ExpandedSigningKey<MlDsa65>>();
+        assert_zeroize_on_drop::<ml_kem::DecapsulationKey<MlKem768>>();
+        assert_zeroize_on_drop::<DeviceExchangeKey>();
     }
 }

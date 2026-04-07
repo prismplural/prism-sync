@@ -66,6 +66,21 @@ pub fn derive_database_key(dek: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     derive_subkey(dek, &[], b"prism_database_key")
 }
 
+/// Derive an arbitrary-length subkey using HKDF-SHA256.
+pub fn derive_subkey_long(
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    len: usize,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let salt_opt = if salt.is_empty() { None } else { Some(salt) };
+    let hk = Hkdf::<Sha256>::new(salt_opt, ikm);
+    let mut output = Zeroizing::new(vec![0u8; len]);
+    hk.expand(info, &mut output)
+        .map_err(|e| CryptoError::KdfFailed(format!("HKDF expand failed: {e}")))?;
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +150,14 @@ mod tests {
         let dek = vec![42u8; 32];
         let key = derive_database_key(&dek).unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn derive_subkey_long_64_bytes_deterministic() {
+        let ikm = vec![42u8; 32];
+        let key1 = derive_subkey_long(&ikm, b"salt", b"info", 64).unwrap();
+        let key2 = derive_subkey_long(&ikm, b"salt", b"info", 64).unwrap();
+        assert_eq!(key1.len(), 64);
+        assert_eq!(*key1, *key2);
     }
 }

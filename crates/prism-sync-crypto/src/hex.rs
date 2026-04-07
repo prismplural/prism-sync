@@ -31,7 +31,7 @@ mod tests {
 
     #[test]
     fn decode_empty() {
-        assert_eq!(decode("").unwrap(), vec![]);
+        assert_eq!(decode("").unwrap(), Vec::<u8>::new());
     }
 
     #[test]

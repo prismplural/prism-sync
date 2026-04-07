@@ -5,8 +5,11 @@ pub mod hex;
 pub mod kdf;
 pub mod key_hierarchy;
 pub mod mnemonic;
+pub mod pq;
 
-pub use device_identity::{DeviceExchangeKey, DeviceSecret, DeviceSigningKey};
+pub use device_identity::{
+    DeviceExchangeKey, DevicePqKemKey, DevicePqSigningKey, DeviceSecret, DeviceSigningKey,
+};
 pub use error::CryptoError;
 pub use key_hierarchy::KeyHierarchy;
 
