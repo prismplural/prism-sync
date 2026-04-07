@@ -243,6 +243,13 @@ async fn test_pairing_expired_session_returns_404() {
         pairing_session_ttl_secs: 0, // Expire immediately
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -344,6 +351,13 @@ async fn test_pairing_payload_too_large_returns_413() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 64, // Very small limit
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -396,6 +410,13 @@ async fn test_pairing_put_slot_payload_too_large() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 64, // Very small limit
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;

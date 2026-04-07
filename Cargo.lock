@@ -2210,6 +2210,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "hmac",
+ "ml-dsa",
  "prism-sync-crypto",
  "rand 0.8.5",
  "rand_core 0.10.0",

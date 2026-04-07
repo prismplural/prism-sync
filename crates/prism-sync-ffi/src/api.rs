@@ -1,19 +1,32 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use prism_sync_core::bootstrap::sharing_trust::{
+    compute_sharing_fingerprint, evaluate_identity, TrustDecision,
+};
+use prism_sync_core::bootstrap::{
+    PrekeyStore, SharingIdentityBundle, SharingRecipient, SharingSender,
+};
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::models::{Invite, PairingResponse};
 use prism_sync_core::pairing::service::PairingService;
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
-use prism_sync_core::relay::ServerRelay;
+use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
+use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::SyncRelay as _;
 use prism_sync_core::schema::{SyncSchema, SyncValue};
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::sync_service::AutoSyncConfig;
-use prism_sync_core::{background_runtime, spawn_notification_handler, DeviceRegistryManager};
+use prism_sync_core::{
+    background_runtime, spawn_notification_handler, DeviceRegistryManager,
+    SecureStore as PrismSecureStore,
+};
 use prism_sync_crypto::DeviceSecret;
 
 /// Opaque handle wrapping PrismSync for FFI.
@@ -317,6 +330,245 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
         "epoch": info.epoch,
         "status": info.status,
         "permission": info.permission,
+    })
+}
+
+const SHARING_ID_CACHE_KEY: &str = "sharing_id_cache";
+const SHARING_ID_LEN_BYTES: usize = 16;
+const PAIRWISE_SECRET_LEN_BYTES: usize = 32;
+
+struct SharingHandleContext {
+    relay: Arc<ServerSharingRelay>,
+    secure_store: Arc<dyn PrismSecureStore>,
+    dek: Vec<u8>,
+    device_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SharingProcessPendingInputsObject {
+    #[serde(default)]
+    pub existing_relationships: Vec<String>,
+    #[serde(default, alias = "pinned_identities_b64")]
+    pub pinned_identities: HashMap<String, String>,
+    #[serde(default, alias = "verified_by_peer")]
+    pub verified_peers: HashMap<String, bool>,
+}
+
+#[derive(Debug, Default)]
+pub struct SharingProcessPendingInputs {
+    pub existing_relationships: Vec<String>,
+    pub pinned_identities: HashMap<String, Vec<u8>>,
+    pub verified_peers: HashMap<String, bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct SharingPendingResultJson {
+    status: String,
+    init_id: String,
+    sender_sharing_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offered_scopes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairwise_secret_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairwise_secret_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_identity_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_identity_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn now_unix_timestamp() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("System clock is before UNIX_EPOCH: {e}"))?;
+    Ok(duration.as_secs() as i64)
+}
+
+fn decode_binary_string(value: &str, field_name: &str) -> Result<Vec<u8>, String> {
+    if value.len().is_multiple_of(2) && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return prism_sync_crypto::hex::decode(value)
+            .map_err(|e| format!("Invalid hex in {field_name}: {e}"));
+    }
+
+    BASE64
+        .decode(value)
+        .map_err(|e| format!("Invalid base64 in {field_name}: {e}"))
+}
+
+fn parse_sharing_id_bytes(sharing_id: &str) -> Result<[u8; SHARING_ID_LEN_BYTES], String> {
+    let decoded = prism_sync_crypto::hex::decode(sharing_id)
+        .map_err(|e| format!("sharing_id must be 32 hex chars (decode failed: {e})"))?;
+    if decoded.len() != SHARING_ID_LEN_BYTES {
+        return Err(format!(
+            "sharing_id must be 32 hex chars (got {} bytes)",
+            decoded.len()
+        ));
+    }
+    let mut bytes = [0u8; SHARING_ID_LEN_BYTES];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+fn trust_decision_to_str(decision: TrustDecision) -> &'static str {
+    match decision {
+        TrustDecision::Accept => "accept",
+        TrustDecision::WarnKeyChange => "warn_key_change",
+        TrustDecision::BlockKeyChange => "block_key_change",
+    }
+}
+
+fn decode_optional_utf8(store: &dyn PrismSecureStore, key: &str) -> Result<Option<String>, String> {
+    store
+        .get(key)
+        .map_err(|e| e.to_string())?
+        .map(|bytes| String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8 in {key}: {e}")))
+        .transpose()
+}
+
+fn require_secure_string(store: &dyn PrismSecureStore, key: &str) -> Result<String, String> {
+    decode_optional_utf8(store, key)?.ok_or_else(|| format!("{key} not found in secure store"))
+}
+
+fn cache_sharing_id(store: &dyn PrismSecureStore, sharing_id: &str) -> Result<(), String> {
+    store
+        .set(SHARING_ID_CACHE_KEY, sharing_id.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+fn clear_sharing_id_cache(store: &dyn PrismSecureStore) -> Result<(), String> {
+    store
+        .delete(SHARING_ID_CACHE_KEY)
+        .map_err(|e| e.to_string())
+}
+
+fn validate_cached_sharing_id(
+    store: &dyn PrismSecureStore,
+    sharing_id: &str,
+) -> Result<(), String> {
+    if let Some(cached) = decode_optional_utf8(store, SHARING_ID_CACHE_KEY)? {
+        if cached != sharing_id {
+            return Err(format!(
+                "secure-store sharing state is bound to a different sharing_id: expected {sharing_id}, found {cached}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_string_array_json(input: &str, field_name: &str) -> Result<Vec<String>, String> {
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(input).map_err(|e| format!("Invalid {field_name} JSON: {e}"))
+}
+
+fn parse_sharing_process_pending_inputs(
+    input: &str,
+) -> Result<SharingProcessPendingInputs, String> {
+    if input.trim().is_empty() {
+        return Ok(SharingProcessPendingInputs::default());
+    }
+
+    if let Ok(existing_relationships) = serde_json::from_str::<Vec<String>>(input) {
+        return Ok(SharingProcessPendingInputs {
+            existing_relationships,
+            ..SharingProcessPendingInputs::default()
+        });
+    }
+
+    let parsed: SharingProcessPendingInputsObject = serde_json::from_str(input)
+        .map_err(|e| format!("Invalid sharing_process_pending context JSON: {e}"))?;
+    let mut pinned_identities = HashMap::with_capacity(parsed.pinned_identities.len());
+    for (peer_id, encoded_identity) in parsed.pinned_identities {
+        pinned_identities.insert(
+            peer_id,
+            decode_binary_string(&encoded_identity, "pinned_identities")?,
+        );
+    }
+
+    Ok(SharingProcessPendingInputs {
+        existing_relationships: parsed.existing_relationships,
+        pinned_identities,
+        verified_peers: parsed.verified_peers,
+    })
+}
+
+fn build_sharing_relay(
+    relay_url: String,
+    sync_id: String,
+    device_id: String,
+    session_token: String,
+    device_secret_bytes: Vec<u8>,
+) -> Result<Arc<ServerSharingRelay>, String> {
+    let device_secret = DeviceSecret::from_bytes(device_secret_bytes)
+        .map_err(|e| format!("Invalid device secret: {e}"))?;
+    let signing_key = device_secret
+        .ed25519_keypair(&device_id)
+        .map_err(|e| format!("Failed to derive sharing signing key: {e}"))?
+        .into_signing_key();
+    let relay = ServerSharingRelay::new(relay_url, session_token, sync_id, device_id, signing_key)
+        .map_err(|e| format!("Failed to create ServerSharingRelay: {e}"))?;
+    Ok(Arc::new(relay))
+}
+
+async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandleContext, String> {
+    let (
+        secure_store,
+        fallback_relay_url,
+        fallback_sync_id,
+        fallback_device_id,
+        fallback_secret,
+        dek,
+    ) = {
+        let inner = handle.inner.lock().await;
+        (
+            inner.secure_store().clone(),
+            inner.relay_url().map(str::to_string),
+            inner.sync_service().sync_id().map(str::to_string),
+            inner.device_id().map(str::to_string),
+            inner
+                .device_secret()
+                .map(|secret| secret.as_bytes().to_vec()),
+            inner.export_dek().map_err(|e| e.to_string())?,
+        )
+    };
+
+    let relay_url = decode_optional_utf8(secure_store.as_ref(), "relay_url")?
+        .or(fallback_relay_url)
+        .ok_or_else(|| "relay_url not configured".to_string())?;
+    let sync_id = decode_optional_utf8(secure_store.as_ref(), "sync_id")?
+        .or(fallback_sync_id)
+        .ok_or_else(|| "sync_id not configured".to_string())?;
+    let device_id = decode_optional_utf8(secure_store.as_ref(), "device_id")?
+        .or(fallback_device_id)
+        .ok_or_else(|| "device_id not configured".to_string())?;
+    let session_token = require_secure_string(secure_store.as_ref(), "session_token")?;
+    let device_secret_bytes = secure_store
+        .get("device_secret")
+        .map_err(|e| e.to_string())?
+        .or(fallback_secret)
+        .ok_or_else(|| "device_secret not configured".to_string())?;
+
+    Ok(SharingHandleContext {
+        relay: build_sharing_relay(
+            relay_url,
+            sync_id,
+            device_id.clone(),
+            session_token,
+            device_secret_bytes,
+        )?,
+        secure_store,
+        dek,
+        device_id,
     })
 }
 
@@ -1998,6 +2250,8 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         "mnemonic",
         "setup_rollback_marker",
         "registration_token",
+        "sharing_prekey_store",
+        "sharing_id_cache",
     ];
     let mut entries = serde_json::Map::new();
     for key in known_keys {
@@ -2016,6 +2270,374 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         }
     }
     Ok(serde_json::Value::Object(entries).to_string())
+}
+
+// ── Phase 4 sharing bootstrap ──
+
+/// Ensure a local sharing identity exists for the provided synced sharing_id.
+///
+/// If `current_sharing_id` is `None`, this reuses any cached sharing_id in
+/// secure storage or generates a new 16-byte random sharing_id and returns it
+/// for the app to persist to synced settings.
+pub async fn sharing_enable(
+    handle: &PrismSyncHandle,
+    current_sharing_id: Option<String>,
+) -> Result<String, String> {
+    let context = build_sharing_context(handle).await?;
+
+    let sharing_id = if let Some(sharing_id) = current_sharing_id {
+        parse_sharing_id_bytes(&sharing_id)?;
+        validate_cached_sharing_id(context.secure_store.as_ref(), &sharing_id)?;
+        sharing_id
+    } else if let Some(cached) =
+        decode_optional_utf8(context.secure_store.as_ref(), SHARING_ID_CACHE_KEY)?
+    {
+        parse_sharing_id_bytes(&cached)?;
+        cached
+    } else {
+        let device_secret = DeviceSecret::generate();
+        prism_sync_crypto::hex::encode(&device_secret.as_bytes()[..SHARING_ID_LEN_BYTES])
+    };
+
+    let sharing_id_bytes = parse_sharing_id_bytes(&sharing_id)?;
+    let mut recipient = SharingRecipient::load_from_secure_store(
+        &context.dek,
+        &sharing_id,
+        &sharing_id_bytes,
+        0,
+        context.secure_store.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    context
+        .relay
+        .publish_identity(&sharing_id, &recipient.identity().to_bytes())
+        .await
+        .map_err(|e| format!("publish_identity failed: {e}"))?;
+
+    recipient
+        .ensure_prekey_fresh_and_persist(
+            context.relay.as_ref(),
+            context.secure_store.as_ref(),
+            &context.device_id,
+            now_unix_timestamp()?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    cache_sharing_id(context.secure_store.as_ref(), &sharing_id)?;
+    Ok(sharing_id)
+}
+
+/// Disable sharing by removing the identity bundle and signed prekeys from the relay.
+pub async fn sharing_disable(handle: &PrismSyncHandle, sharing_id: String) -> Result<(), String> {
+    parse_sharing_id_bytes(&sharing_id)?;
+    let context = build_sharing_context(handle).await?;
+    validate_cached_sharing_id(context.secure_store.as_ref(), &sharing_id)?;
+
+    context
+        .relay
+        .remove_identity()
+        .await
+        .map_err(|e| format!("remove_identity failed: {e}"))?;
+
+    PrekeyStore::clear_persisted(context.secure_store.as_ref()).map_err(|e| e.to_string())?;
+    clear_sharing_id_cache(context.secure_store.as_ref())?;
+    Ok(())
+}
+
+/// Rotate and publish a new signed prekey if the current one is stale or missing.
+pub async fn sharing_ensure_prekey(
+    handle: &PrismSyncHandle,
+    sharing_id: String,
+) -> Result<(), String> {
+    let context = build_sharing_context(handle).await?;
+    let sharing_id_bytes = parse_sharing_id_bytes(&sharing_id)?;
+    validate_cached_sharing_id(context.secure_store.as_ref(), &sharing_id)?;
+
+    let mut recipient = SharingRecipient::load_from_secure_store(
+        &context.dek,
+        &sharing_id,
+        &sharing_id_bytes,
+        0,
+        context.secure_store.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    recipient
+        .ensure_prekey_fresh_and_persist(
+            context.relay.as_ref(),
+            context.secure_store.as_ref(),
+            &context.device_id,
+            now_unix_timestamp()?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    cache_sharing_id(context.secure_store.as_ref(), &sharing_id)?;
+    Ok(())
+}
+
+/// Initiate sharing with a remote recipient and return the established pairwise secret.
+pub async fn sharing_initiate(
+    handle: &PrismSyncHandle,
+    sender_sharing_id: String,
+    recipient_sharing_id: String,
+    display_name: String,
+    offered_scopes: String,
+) -> Result<String, String> {
+    let context = build_sharing_context(handle).await?;
+    let sender_sharing_id_bytes = parse_sharing_id_bytes(&sender_sharing_id)?;
+    parse_sharing_id_bytes(&recipient_sharing_id)?;
+    validate_cached_sharing_id(context.secure_store.as_ref(), &sender_sharing_id)?;
+
+    let sender = SharingSender::from_dek(
+        &context.dek,
+        &sender_sharing_id,
+        &sender_sharing_id_bytes,
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    let offered_scopes = parse_string_array_json(&offered_scopes, "offered_scopes")?;
+
+    let result = sender
+        .initiate(
+            context.relay.as_ref(),
+            &recipient_sharing_id,
+            &display_name,
+            offered_scopes,
+            now_unix_timestamp()?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let recipient_identity_bytes = result.recipient_identity.to_bytes();
+    let response = serde_json::json!({
+        "init_id": result.init_id,
+        "pairwise_secret_b64": BASE64.encode(&result.pairwise_secret[..]),
+        "pairwise_secret_hex": prism_sync_crypto::hex::encode(result.pairwise_secret.as_ref()),
+        "recipient_identity_b64": BASE64.encode(&recipient_identity_bytes),
+        "recipient_identity_hex": prism_sync_crypto::hex::encode(&recipient_identity_bytes),
+    });
+    Ok(response.to_string())
+}
+
+/// Fetch and process all pending sharing-init payloads for the authenticated user.
+///
+/// `existing_relationships_json` accepts either:
+/// - a JSON array of known peer sharing_ids, or
+/// - a JSON object with `existing_relationships`, optional `pinned_identities`,
+///   and optional `verified_peers`
+pub async fn sharing_process_pending(
+    handle: &PrismSyncHandle,
+    recipient_sharing_id: String,
+    existing_relationships_json: String,
+    seen_init_ids_json: String,
+) -> Result<String, String> {
+    let context = build_sharing_context(handle).await?;
+    let recipient_sharing_id_bytes = parse_sharing_id_bytes(&recipient_sharing_id)?;
+    validate_cached_sharing_id(context.secure_store.as_ref(), &recipient_sharing_id)?;
+
+    let recipient = SharingRecipient::load_from_secure_store(
+        &context.dek,
+        &recipient_sharing_id,
+        &recipient_sharing_id_bytes,
+        0,
+        context.secure_store.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let pending = context
+        .relay
+        .fetch_pending_inits()
+        .await
+        .map_err(|e| format!("fetch_pending_inits failed: {e}"))?;
+
+    let inputs = parse_sharing_process_pending_inputs(&existing_relationships_json)?;
+    let mut existing_relationships = inputs.existing_relationships;
+    let mut seen_init_ids = parse_string_array_json(&seen_init_ids_json, "seen_init_ids")?;
+    let mut results = Vec::with_capacity(pending.len());
+
+    for pending_init in pending {
+        let existing_refs: Vec<&str> = existing_relationships.iter().map(String::as_str).collect();
+        let seen_refs: Vec<&str> = seen_init_ids.iter().map(String::as_str).collect();
+
+        let result = match recipient.process_sharing_init(
+            &pending_init.payload,
+            &pending_init.init_id,
+            &existing_refs,
+            &seen_refs,
+        ) {
+            Ok(processed) => {
+                let sender_identity_bytes = processed.sender_identity.to_bytes();
+                if pending_init.sender_id != processed.sender_identity.sharing_id {
+                    SharingPendingResultJson {
+                        status: "error".to_string(),
+                        init_id: pending_init.init_id.clone(),
+                        sender_sharing_id: pending_init.sender_id.clone(),
+                        display_name: None,
+                        offered_scopes: None,
+                        pairwise_secret_b64: None,
+                        pairwise_secret_hex: None,
+                        sender_identity_b64: None,
+                        sender_identity_hex: None,
+                        fingerprint: None,
+                        trust_decision: None,
+                        error: Some(format!(
+                            "relay sender_id does not match signed sender identity: relay={}, signed={}",
+                            pending_init.sender_id, processed.sender_identity.sharing_id
+                        )),
+                    }
+                } else {
+                    let trust_decision = evaluate_identity(
+                        inputs
+                            .pinned_identities
+                            .get(&processed.sender_identity.sharing_id)
+                            .map(Vec::as_slice),
+                        &sender_identity_bytes,
+                        inputs
+                            .verified_peers
+                            .get(&processed.sender_identity.sharing_id)
+                            .copied()
+                            .unwrap_or(false),
+                    );
+                    let status = trust_decision_to_str(trust_decision).to_string();
+                    let fingerprint = compute_sharing_fingerprint(
+                        &processed.sender_identity.sharing_id,
+                        processed.sender_identity.identity_generation,
+                        &processed.sender_identity.ed25519_public_key,
+                        &processed.sender_identity.ml_dsa_65_public_key,
+                    );
+
+                    existing_relationships.push(processed.sender_identity.sharing_id.clone());
+
+                    SharingPendingResultJson {
+                        status: status.clone(),
+                        init_id: processed.init_id,
+                        sender_sharing_id: processed.sender_identity.sharing_id.clone(),
+                        display_name: Some(processed.display_name),
+                        offered_scopes: Some(processed.offered_scopes),
+                        pairwise_secret_b64: Some(BASE64.encode(&processed.pairwise_secret[..])),
+                        pairwise_secret_hex: Some(prism_sync_crypto::hex::encode(
+                            processed.pairwise_secret.as_ref(),
+                        )),
+                        sender_identity_b64: Some(BASE64.encode(&sender_identity_bytes)),
+                        sender_identity_hex: Some(prism_sync_crypto::hex::encode(
+                            &sender_identity_bytes,
+                        )),
+                        fingerprint: Some(fingerprint),
+                        trust_decision: Some(status),
+                        error: None,
+                    }
+                }
+            }
+            Err(error) => SharingPendingResultJson {
+                status: "error".to_string(),
+                init_id: pending_init.init_id.clone(),
+                sender_sharing_id: pending_init.sender_id.clone(),
+                display_name: None,
+                offered_scopes: None,
+                pairwise_secret_b64: None,
+                pairwise_secret_hex: None,
+                sender_identity_b64: None,
+                sender_identity_hex: None,
+                fingerprint: None,
+                trust_decision: None,
+                error: Some(error.to_string()),
+            },
+        };
+
+        if !seen_init_ids
+            .iter()
+            .any(|seen| seen == &pending_init.init_id)
+        {
+            seen_init_ids.push(pending_init.init_id);
+        }
+        results.push(result);
+    }
+
+    serde_json::to_string(&results).map_err(|e| format!("JSON serialization failed: {e}"))
+}
+
+/// Compute a user-visible fingerprint for a canonical sharing identity bundle.
+pub fn sharing_fingerprint(identity_bundle_b64: String) -> Result<String, String> {
+    let identity_bytes = decode_binary_string(&identity_bundle_b64, "identity_bundle")?;
+    let identity = SharingIdentityBundle::from_bytes(&identity_bytes)
+        .ok_or_else(|| "Invalid sharing identity bundle".to_string())?;
+    identity
+        .verify()
+        .map_err(|e| format!("Invalid sharing identity signature: {e}"))?;
+
+    Ok(compute_sharing_fingerprint(
+        &identity.sharing_id,
+        identity.identity_generation,
+        &identity.ed25519_public_key,
+        &identity.ml_dsa_65_public_key,
+    ))
+}
+
+/// Wrap resource keys under pairwise-secret-derived per-scope wrapping keys.
+pub fn sharing_wrap_keys(
+    pairwise_secret_b64: String,
+    scope_keys: String,
+) -> Result<String, String> {
+    let pairwise_secret = decode_binary_string(&pairwise_secret_b64, "pairwise_secret")?;
+    if pairwise_secret.len() != PAIRWISE_SECRET_LEN_BYTES {
+        return Err(format!(
+            "pairwise_secret must be {PAIRWISE_SECRET_LEN_BYTES} bytes, got {}",
+            pairwise_secret.len()
+        ));
+    }
+
+    let scope_keys: HashMap<String, String> =
+        serde_json::from_str(&scope_keys).map_err(|e| format!("Invalid scope_keys JSON: {e}"))?;
+    let mut wrapped_keys = serde_json::Map::new();
+    for (scope, encoded_key) in scope_keys {
+        let key_bytes = decode_binary_string(&encoded_key, "scope_keys")?;
+        let wrap_key = prism_sync_crypto::kdf::derive_subkey(
+            &pairwise_secret,
+            scope.as_bytes(),
+            b"prism_sharing_scope_wrap_v1",
+        )
+        .map_err(|e| e.to_string())?;
+        let wrapped = prism_sync_crypto::aead::xchacha_encrypt(wrap_key.as_ref(), &key_bytes)
+            .map_err(|e| e.to_string())?;
+        wrapped_keys.insert(scope, serde_json::Value::String(BASE64.encode(&wrapped)));
+    }
+
+    Ok(serde_json::json!({ "wrapped_keys": wrapped_keys }).to_string())
+}
+
+/// Unwrap resource keys previously wrapped by `sharing_wrap_keys`.
+pub fn sharing_unwrap_keys(
+    pairwise_secret_b64: String,
+    wrapped_keys: String,
+) -> Result<String, String> {
+    let pairwise_secret = decode_binary_string(&pairwise_secret_b64, "pairwise_secret")?;
+    if pairwise_secret.len() != PAIRWISE_SECRET_LEN_BYTES {
+        return Err(format!(
+            "pairwise_secret must be {PAIRWISE_SECRET_LEN_BYTES} bytes, got {}",
+            pairwise_secret.len()
+        ));
+    }
+
+    let wrapped_keys: HashMap<String, String> = serde_json::from_str(&wrapped_keys)
+        .map_err(|e| format!("Invalid wrapped_keys JSON: {e}"))?;
+    let mut unwrapped_keys = serde_json::Map::new();
+    for (scope, encoded_wrapped_key) in wrapped_keys {
+        let wrapped_key = decode_binary_string(&encoded_wrapped_key, "wrapped_keys")?;
+        let wrap_key = prism_sync_crypto::kdf::derive_subkey(
+            &pairwise_secret,
+            scope.as_bytes(),
+            b"prism_sharing_scope_wrap_v1",
+        )
+        .map_err(|e| e.to_string())?;
+        let unwrapped = prism_sync_crypto::aead::xchacha_decrypt(wrap_key.as_ref(), &wrapped_key)
+            .map_err(|e| e.to_string())?;
+        unwrapped_keys.insert(scope, serde_json::Value::String(BASE64.encode(&unwrapped)));
+    }
+
+    Ok(serde_json::json!({ "unwrapped_keys": unwrapped_keys }).to_string())
 }
 
 // ── Sharing crypto primitives ──
@@ -2087,6 +2709,89 @@ pub fn hex_decode(hex_str: String) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_binary_string_accepts_hex_and_base64() {
+        let bytes = b"hello world";
+        let hex_encoded = prism_sync_crypto::hex::encode(bytes);
+        let b64_encoded = BASE64.encode(bytes);
+
+        assert_eq!(decode_binary_string(&hex_encoded, "field").unwrap(), bytes);
+        assert_eq!(decode_binary_string(&b64_encoded, "field").unwrap(), bytes);
+    }
+
+    #[test]
+    fn parse_sharing_process_pending_inputs_accepts_rich_context() {
+        let identity_bytes = vec![0xAB; 32];
+        let json = serde_json::json!({
+            "existing_relationships": ["peer-a"],
+            "pinned_identities": {
+                "peer-a": BASE64.encode(&identity_bytes),
+            },
+            "verified_peers": {
+                "peer-a": true,
+            },
+        })
+        .to_string();
+
+        let parsed = parse_sharing_process_pending_inputs(&json).unwrap();
+        assert_eq!(parsed.existing_relationships, vec!["peer-a"]);
+        assert_eq!(parsed.pinned_identities["peer-a"], identity_bytes);
+        assert!(parsed.verified_peers["peer-a"]);
+    }
+
+    #[test]
+    fn sharing_wrap_and_unwrap_round_trip() {
+        let pairwise_secret = vec![0x42; 32];
+        let scope_keys = serde_json::json!({
+            "read:members": BASE64.encode([0x11; 32]),
+            "read:fronting": BASE64.encode([0x22; 32]),
+        })
+        .to_string();
+
+        let wrapped = sharing_wrap_keys(BASE64.encode(&pairwise_secret), scope_keys).unwrap();
+        let wrapped_json: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
+        let unwrapped = sharing_unwrap_keys(
+            BASE64.encode(&pairwise_secret),
+            wrapped_json["wrapped_keys"].to_string(),
+        )
+        .unwrap();
+        let unwrapped_json: serde_json::Value = serde_json::from_str(&unwrapped).unwrap();
+
+        assert_eq!(
+            BASE64
+                .decode(
+                    unwrapped_json["unwrapped_keys"]["read:members"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            vec![0x11; 32]
+        );
+        assert_eq!(
+            BASE64
+                .decode(
+                    unwrapped_json["unwrapped_keys"]["read:fronting"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            vec![0x22; 32]
+        );
+    }
+
+    #[test]
+    fn sharing_fingerprint_matches_valid_identity_bundle() {
+        let dek = [0x55; 32];
+        let sharing_id_bytes = [0xAA; SHARING_ID_LEN_BYTES];
+        let sharing_id = prism_sync_crypto::hex::encode(&sharing_id_bytes);
+        let sender = SharingSender::from_dek(&dek, &sharing_id, &sharing_id_bytes, 0).unwrap();
+        let identity_b64 = BASE64.encode(sender.identity().to_bytes());
+
+        let fingerprint = sharing_fingerprint(identity_b64).unwrap();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

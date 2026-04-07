@@ -12,7 +12,16 @@ mod integration_test;
 pub mod key_schedule;
 pub mod pairing_models;
 pub mod pairing_transcript;
+pub mod prekey_store;
 mod sas_words;
+pub mod sharing_identity;
+#[cfg(test)]
+mod sharing_integration_test;
+pub mod sharing_models;
+pub mod sharing_recipient;
+pub mod sharing_sender;
+pub mod sharing_transcript;
+pub mod sharing_trust;
 pub mod transcript;
 
 pub use ceremony::{InitiatorCeremony, JoinerCeremony};
@@ -25,6 +34,17 @@ pub use pairing_models::{
     RendezvousToken, SasDisplay,
 };
 pub use pairing_transcript::build_sync_pairing_transcript;
+pub use prekey_store::PrekeyStore;
+pub use sharing_identity::{
+    derive_sharing_ed25519_keypair, derive_sharing_identity_seed, derive_sharing_ml_dsa_keypair,
+};
+pub use sharing_models::{
+    SharingIdentityBundle, SharingInit, SharingInitPayload, SharingPrekeyBundle,
+    SharingRelationship, SignedPrekey as SharingSignedPrekey,
+};
+pub use sharing_recipient::{ProcessedSharingInit, SharingRecipient};
+pub use sharing_sender::{SharingInitResult, SharingSender};
+pub use sharing_transcript::build_sharing_transcript;
 pub use transcript::BootstrapTranscript;
 
 /// Protocol version for the bootstrap handshake.

@@ -61,6 +61,13 @@ pub async fn start_test_relay() -> (
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     start_test_relay_with_config(config).await
@@ -83,7 +90,12 @@ pub async fn start_test_relay_with_config(
     let url = format!("http://127.0.0.1:{}", addr.port());
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (url, handle, db)

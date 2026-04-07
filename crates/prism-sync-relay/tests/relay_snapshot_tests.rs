@@ -18,6 +18,7 @@ use prism_sync_relay::db;
 use common::*;
 
 /// Helper: PUT a snapshot with signed headers.
+#[allow(clippy::too_many_arguments)]
 async fn put_snapshot_signed(
     client: &Client,
     url: &str,

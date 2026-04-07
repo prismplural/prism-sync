@@ -2,6 +2,7 @@ pub mod devices;
 pub mod metrics;
 pub mod pairing;
 pub mod register;
+pub mod sharing;
 pub mod sync;
 pub mod ws;
 
@@ -125,6 +126,14 @@ pub fn router(state: AppState) -> Router {
             get(devices::get_rekey_artifact),
         )
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
+        // Sharing routes (auth + signed)
+        .route(
+            "/v1/sharing/identity",
+            put(sharing::put_identity).delete(sharing::delete_identity),
+        )
+        .route("/v1/sharing/prekey", put(sharing::put_prekey))
+        .route("/v1/sharing/init", post(sharing::post_init))
+        .route("/v1/sharing/init/pending", get(sharing::get_pending_inits))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -135,7 +144,9 @@ pub fn router(state: AppState) -> Router {
     let public_routes = Router::new()
         .merge(register::routes())
         .merge(pairing::routes())
-        .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade));
+        .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade))
+        // Public sharing route (no auth, rate-limited by IP)
+        .route("/v1/sharing/{sharing_id}/bundle", get(sharing::get_bundle));
 
     // Relay is accessed only by native clients — no browser origin is expected.
     // Default CorsLayer rejects all cross-origin requests.
@@ -193,6 +204,7 @@ async fn auth_middleware(
     };
 
     if token.len() < 32 {
+        state.metrics.inc(&state.metrics.auth_failures);
         return Err(AppError::Unauthorized.into_response());
     }
 
@@ -269,6 +281,7 @@ async fn auth_middleware(
                 remote_wipe,
                 "Auth REJECTED: device revoked"
             );
+            state.metrics.inc(&state.metrics.auth_failures);
             Err(AppError::DeviceRevoked { remote_wipe }.into_response())
         }
         AuthResult::Invalid => {
@@ -277,6 +290,7 @@ async fn auth_middleware(
                 path = %req.uri().path(),
                 "Auth REJECTED: invalid session or inactive device"
             );
+            state.metrics.inc(&state.metrics.auth_failures);
             Err(AppError::Unauthorized.into_response())
         }
     }

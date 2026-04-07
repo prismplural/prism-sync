@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,6 +54,14 @@ pub struct RegistryStateRecord {
     pub registry_version: i64,
     pub registry_hash: String,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingSharingInit {
+    pub init_id: String,
+    pub sender_id: String,
+    pub payload: Vec<u8>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +402,49 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS idx_pairing_sessions_expires
             ON pairing_sessions(expires_at);
+
+        -- Sharing identity bundles (post-quantum sharing bootstrap)
+        CREATE TABLE IF NOT EXISTS sharing_identity_bundles (
+            sharing_id       TEXT PRIMARY KEY,
+            identity_bundle  BLOB NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );
+
+        -- Sharing signed prekeys
+        CREATE TABLE IF NOT EXISTS sharing_signed_prekeys (
+            sharing_id    TEXT NOT NULL,
+            device_id     TEXT NOT NULL,
+            prekey_id     TEXT NOT NULL,
+            prekey_bundle BLOB NOT NULL,
+            created_at    INTEGER NOT NULL,
+            PRIMARY KEY (sharing_id, device_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sharing_prekeys_created
+            ON sharing_signed_prekeys(sharing_id, created_at DESC);
+
+        -- Sharing-init payloads (ephemeral key exchange messages)
+        CREATE TABLE IF NOT EXISTS sharing_init_payloads (
+            init_id          TEXT PRIMARY KEY,
+            recipient_id     TEXT NOT NULL,
+            sender_id        TEXT NOT NULL,
+            payload          BLOB NOT NULL,
+            created_at       INTEGER NOT NULL,
+            consumed_at      INTEGER,
+            expires_at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sharing_init_recipient
+            ON sharing_init_payloads(recipient_id, consumed_at);
+        CREATE INDEX IF NOT EXISTS idx_sharing_init_expires
+            ON sharing_init_payloads(expires_at);
+
+        -- Sharing ID mappings (one-to-one binding between sync_id and sharing_id)
+        CREATE TABLE IF NOT EXISTS sharing_id_mappings (
+            sync_id     TEXT NOT NULL,
+            sharing_id  TEXT NOT NULL,
+            PRIMARY KEY (sync_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sharing_id_map_unique_sharing
+            ON sharing_id_mappings(sharing_id);
         ",
     )?;
 
@@ -1828,6 +1880,305 @@ pub fn pairing_session_exists(
     )
     .optional()
     .map(|opt| opt.is_some())
+}
+
+// ---------------------------------------------------------------------------
+// Counters (persistent metrics)
+// ---------------------------------------------------------------------------
+
+/// Load persisted counter values from SQLite. Returns a map of name → value.
+pub fn load_counters(conn: &Connection) -> Result<HashMap<String, u64>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT name, value FROM counters")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (name, value) = row?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+/// Flush current counter values to SQLite (upsert).
+pub fn flush_counters(conn: &Connection, values: &[(&str, u64)]) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO counters (name, value) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET value = ?2",
+    )?;
+    for (name, value) in values {
+        stmt.execute(params![name, value])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sharing identity bundles
+// ---------------------------------------------------------------------------
+
+pub fn upsert_sharing_identity(
+    conn: &Connection,
+    sharing_id: &str,
+    bundle: &[u8],
+    now: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO sharing_identity_bundles (sharing_id, identity_bundle, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(sharing_id) DO UPDATE SET
+            identity_bundle = excluded.identity_bundle,
+            updated_at = excluded.updated_at",
+        params![sharing_id, bundle, now],
+    )?;
+    Ok(())
+}
+
+pub fn get_sharing_identity(
+    conn: &Connection,
+    sharing_id: &str,
+) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT identity_bundle FROM sharing_identity_bundles WHERE sharing_id = ?1",
+        params![sharing_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub fn delete_sharing_identity(conn: &Connection, sharing_id: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM sharing_identity_bundles WHERE sharing_id = ?1",
+        params![sharing_id],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sharing signed prekeys
+// ---------------------------------------------------------------------------
+
+pub fn upsert_sharing_prekey(
+    conn: &Connection,
+    sharing_id: &str,
+    device_id: &str,
+    prekey_id: &str,
+    bundle: &[u8],
+    created_at: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO sharing_signed_prekeys (sharing_id, device_id, prekey_id, prekey_bundle, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(sharing_id, device_id) DO UPDATE SET
+            prekey_id = excluded.prekey_id,
+            prekey_bundle = excluded.prekey_bundle,
+            created_at = excluded.created_at",
+        params![sharing_id, device_id, prekey_id, bundle, created_at],
+    )?;
+    Ok(())
+}
+
+/// Returns (device_id, prekey_id, prekey_bundle) for the most recently created
+/// prekey belonging to an active device.
+pub fn get_best_sharing_prekey(
+    conn: &Connection,
+    sharing_id: &str,
+) -> Result<Option<(String, String, Vec<u8>)>, rusqlite::Error> {
+    // Look up the sync_id for this sharing_id, then join against devices
+    // to only return prekeys from active devices.
+    conn.query_row(
+        "SELECT sp.device_id, sp.prekey_id, sp.prekey_bundle
+         FROM sharing_signed_prekeys sp
+         INNER JOIN sharing_id_mappings sm ON sm.sharing_id = sp.sharing_id
+         INNER JOIN devices d ON d.sync_id = sm.sync_id AND d.device_id = sp.device_id
+         WHERE sp.sharing_id = ?1
+           AND d.status = 'active'
+         ORDER BY sp.created_at DESC
+         LIMIT 1",
+        params![sharing_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+pub fn delete_sharing_prekeys(conn: &Connection, sharing_id: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM sharing_signed_prekeys WHERE sharing_id = ?1",
+        params![sharing_id],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sharing ID mappings
+// ---------------------------------------------------------------------------
+
+/// Upsert a sync_id <-> sharing_id binding. Returns `true` if the mapping is
+/// new or unchanged, `false` if there is a conflict (sync_id already maps to a
+/// different sharing_id, or sharing_id already maps to a different sync_id).
+pub fn upsert_sharing_id_mapping(
+    conn: &Connection,
+    sync_id: &str,
+    sharing_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    // Check for existing mapping by sync_id
+    let existing_by_sync: Option<String> = conn
+        .query_row(
+            "SELECT sharing_id FROM sharing_id_mappings WHERE sync_id = ?1",
+            params![sync_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(ref existing) = existing_by_sync {
+        if existing != sharing_id {
+            return Ok(false); // sync_id maps to different sharing_id
+        }
+        return Ok(true); // same mapping already exists
+    }
+
+    // Check for existing mapping by sharing_id (unique index)
+    let existing_by_sharing: Option<String> = conn
+        .query_row(
+            "SELECT sync_id FROM sharing_id_mappings WHERE sharing_id = ?1",
+            params![sharing_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(ref existing) = existing_by_sharing {
+        if existing != sync_id {
+            return Ok(false); // sharing_id maps to different sync_id
+        }
+        return Ok(true); // same mapping
+    }
+
+    // New mapping
+    conn.execute(
+        "INSERT INTO sharing_id_mappings (sync_id, sharing_id) VALUES (?1, ?2)",
+        params![sync_id, sharing_id],
+    )?;
+    Ok(true)
+}
+
+pub fn get_sharing_id_for_sync(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT sharing_id FROM sharing_id_mappings WHERE sync_id = ?1",
+        params![sync_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub fn get_sync_id_for_sharing_id(
+    conn: &Connection,
+    sharing_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT sync_id FROM sharing_id_mappings WHERE sharing_id = ?1",
+        params![sharing_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+// ---------------------------------------------------------------------------
+// Sharing-init payloads
+// ---------------------------------------------------------------------------
+
+/// Insert a sharing-init payload. Returns `false` if the init_id already exists.
+pub fn insert_sharing_init(
+    conn: &Connection,
+    init_id: &str,
+    recipient_id: &str,
+    sender_id: &str,
+    payload: &[u8],
+    ttl_secs: u64,
+) -> Result<bool, rusqlite::Error> {
+    let now = now_secs();
+    let expires_at = now + ttl_secs as i64;
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO sharing_init_payloads
+         (init_id, recipient_id, sender_id, payload, created_at, consumed_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+        params![init_id, recipient_id, sender_id, payload, now, expires_at],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Atomically select and consume all pending (unconsumed, unexpired) sharing-inits
+/// for a recipient. Sets `consumed_at = now` on the returned rows.
+pub fn fetch_and_consume_pending_sharing_inits(
+    conn: &Connection,
+    recipient_id: &str,
+) -> Result<Vec<PendingSharingInit>, rusqlite::Error> {
+    let now = now_secs();
+    let tx = conn.unchecked_transaction()?;
+
+    let results: Vec<PendingSharingInit> = {
+        let mut stmt = tx.prepare(
+            "SELECT init_id, sender_id, payload, created_at
+             FROM sharing_init_payloads
+             WHERE recipient_id = ?1
+               AND consumed_at IS NULL
+               AND expires_at > ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![recipient_id, now], |row| {
+                Ok(PendingSharingInit {
+                    init_id: row.get(0)?,
+                    sender_id: row.get(1)?,
+                    payload: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    if !results.is_empty() {
+        tx.execute(
+            "UPDATE sharing_init_payloads
+             SET consumed_at = ?1
+             WHERE recipient_id = ?2
+               AND consumed_at IS NULL
+               AND expires_at > ?1",
+            params![now, recipient_id],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(results)
+}
+
+pub fn count_pending_sharing_inits(
+    conn: &Connection,
+    recipient_id: &str,
+) -> Result<u32, rusqlite::Error> {
+    let now = now_secs();
+    conn.query_row(
+        "SELECT COUNT(*) FROM sharing_init_payloads
+         WHERE recipient_id = ?1
+           AND consumed_at IS NULL
+           AND expires_at > ?2",
+        params![recipient_id, now],
+        |row| row.get(0),
+    )
+}
+
+/// Delete expired payloads and old consumed payloads. Returns the number of rows deleted.
+pub fn cleanup_expired_sharing_init_payloads(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    let consumed_cutoff = now - 86400; // 24 hours
+    let rows = conn.execute(
+        "DELETE FROM sharing_init_payloads
+         WHERE expires_at <= ?1
+            OR (consumed_at IS NOT NULL AND consumed_at <= ?2)",
+        params![now, consumed_cutoff],
+    )?;
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------

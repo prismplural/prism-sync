@@ -1,12 +1,16 @@
 pub mod mock;
+pub mod mock_sharing_relay;
 pub mod pairing_relay;
 pub mod server_relay;
+pub mod sharing_relay;
 pub mod traits;
 pub mod websocket;
 
 pub use mock::MockRelay;
+pub use mock_sharing_relay::MockSharingRelay;
 pub use pairing_relay::{MockPairingRelay, PairingRelay, PairingSlot, ServerPairingRelay};
 pub use server_relay::ServerRelay;
+pub use sharing_relay::{PendingSharingInit, ServerSharingRelay, SharingRelay};
 pub use traits::*;
 
 /// Redact sync_id from a WebSocket URL for safe logging.

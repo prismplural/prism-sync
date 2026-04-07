@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 795820887;
+  int get rustContentHash => 1794779101;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -277,6 +277,56 @@ abstract class RustLibApi extends BaseApi {
     required BigInt debounceMs,
     required BigInt retryDelayMs,
     required int maxRetries,
+  });
+
+  Future<void> crateApiSharingDisable({
+    required PrismSyncHandle handle,
+    required String sharingId,
+  });
+
+  Future<String> crateApiSharingEnable({
+    required PrismSyncHandle handle,
+    String? currentSharingId,
+  });
+
+  Future<void> crateApiSharingEnsurePrekey({
+    required PrismSyncHandle handle,
+    required String sharingId,
+  });
+
+  Future<String> crateApiSharingFingerprint({
+    required String identityBundleB64,
+  });
+
+  Future<String> crateApiSharingInitiate({
+    required PrismSyncHandle handle,
+    required String senderSharingId,
+    required String recipientSharingId,
+    required String displayName,
+    required String offeredScopes,
+  });
+
+  Future<String> crateApiSharingProcessPending({
+    required PrismSyncHandle handle,
+    required String recipientSharingId,
+    required String existingRelationshipsJson,
+    required String seenInitIdsJson,
+  });
+
+  Future<SharingProcessPendingInputs>
+  crateApiSharingProcessPendingInputsDefault();
+
+  Future<SharingProcessPendingInputsObject>
+  crateApiSharingProcessPendingInputsObjectDefault();
+
+  Future<String> crateApiSharingUnwrapKeys({
+    required String pairwiseSecretB64,
+    required String wrappedKeys,
+  });
+
+  Future<String> crateApiSharingWrapKeys({
+    required String pairwiseSecretB64,
+    required String scopeKeys,
   });
 
   Future<String> crateApiStatus({required PrismSyncHandle handle});
@@ -1980,6 +2030,388 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<void> crateApiSharingDisable({
+    required PrismSyncHandle handle,
+    required String sharingId,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPrismSyncHandle(
+            handle,
+            serializer,
+          );
+          sse_encode_String(sharingId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 47,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingDisableConstMeta,
+        argValues: [handle, sharingId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingDisableConstMeta => const TaskConstMeta(
+    debugName: "sharing_disable",
+    argNames: ["handle", "sharingId"],
+  );
+
+  @override
+  Future<String> crateApiSharingEnable({
+    required PrismSyncHandle handle,
+    String? currentSharingId,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPrismSyncHandle(
+            handle,
+            serializer,
+          );
+          sse_encode_opt_String(currentSharingId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 48,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingEnableConstMeta,
+        argValues: [handle, currentSharingId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingEnableConstMeta => const TaskConstMeta(
+    debugName: "sharing_enable",
+    argNames: ["handle", "currentSharingId"],
+  );
+
+  @override
+  Future<void> crateApiSharingEnsurePrekey({
+    required PrismSyncHandle handle,
+    required String sharingId,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPrismSyncHandle(
+            handle,
+            serializer,
+          );
+          sse_encode_String(sharingId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 49,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingEnsurePrekeyConstMeta,
+        argValues: [handle, sharingId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingEnsurePrekeyConstMeta =>
+      const TaskConstMeta(
+        debugName: "sharing_ensure_prekey",
+        argNames: ["handle", "sharingId"],
+      );
+
+  @override
+  Future<String> crateApiSharingFingerprint({
+    required String identityBundleB64,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(identityBundleB64, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 50,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingFingerprintConstMeta,
+        argValues: [identityBundleB64],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingFingerprintConstMeta => const TaskConstMeta(
+    debugName: "sharing_fingerprint",
+    argNames: ["identityBundleB64"],
+  );
+
+  @override
+  Future<String> crateApiSharingInitiate({
+    required PrismSyncHandle handle,
+    required String senderSharingId,
+    required String recipientSharingId,
+    required String displayName,
+    required String offeredScopes,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPrismSyncHandle(
+            handle,
+            serializer,
+          );
+          sse_encode_String(senderSharingId, serializer);
+          sse_encode_String(recipientSharingId, serializer);
+          sse_encode_String(displayName, serializer);
+          sse_encode_String(offeredScopes, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 51,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingInitiateConstMeta,
+        argValues: [
+          handle,
+          senderSharingId,
+          recipientSharingId,
+          displayName,
+          offeredScopes,
+        ],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingInitiateConstMeta => const TaskConstMeta(
+    debugName: "sharing_initiate",
+    argNames: [
+      "handle",
+      "senderSharingId",
+      "recipientSharingId",
+      "displayName",
+      "offeredScopes",
+    ],
+  );
+
+  @override
+  Future<String> crateApiSharingProcessPending({
+    required PrismSyncHandle handle,
+    required String recipientSharingId,
+    required String existingRelationshipsJson,
+    required String seenInitIdsJson,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPrismSyncHandle(
+            handle,
+            serializer,
+          );
+          sse_encode_String(recipientSharingId, serializer);
+          sse_encode_String(existingRelationshipsJson, serializer);
+          sse_encode_String(seenInitIdsJson, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 52,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingProcessPendingConstMeta,
+        argValues: [
+          handle,
+          recipientSharingId,
+          existingRelationshipsJson,
+          seenInitIdsJson,
+        ],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingProcessPendingConstMeta =>
+      const TaskConstMeta(
+        debugName: "sharing_process_pending",
+        argNames: [
+          "handle",
+          "recipientSharingId",
+          "existingRelationshipsJson",
+          "seenInitIdsJson",
+        ],
+      );
+
+  @override
+  Future<SharingProcessPendingInputs>
+  crateApiSharingProcessPendingInputsDefault() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 53,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_sharing_process_pending_inputs,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSharingProcessPendingInputsDefaultConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingProcessPendingInputsDefaultConstMeta =>
+      const TaskConstMeta(
+        debugName: "sharing_process_pending_inputs_default",
+        argNames: [],
+      );
+
+  @override
+  Future<SharingProcessPendingInputsObject>
+  crateApiSharingProcessPendingInputsObjectDefault() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 54,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_sharing_process_pending_inputs_object,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSharingProcessPendingInputsObjectDefaultConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta
+  get kCrateApiSharingProcessPendingInputsObjectDefaultConstMeta =>
+      const TaskConstMeta(
+        debugName: "sharing_process_pending_inputs_object_default",
+        argNames: [],
+      );
+
+  @override
+  Future<String> crateApiSharingUnwrapKeys({
+    required String pairwiseSecretB64,
+    required String wrappedKeys,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(pairwiseSecretB64, serializer);
+          sse_encode_String(wrappedKeys, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 55,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingUnwrapKeysConstMeta,
+        argValues: [pairwiseSecretB64, wrappedKeys],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingUnwrapKeysConstMeta => const TaskConstMeta(
+    debugName: "sharing_unwrap_keys",
+    argNames: ["pairwiseSecretB64", "wrappedKeys"],
+  );
+
+  @override
+  Future<String> crateApiSharingWrapKeys({
+    required String pairwiseSecretB64,
+    required String scopeKeys,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(pairwiseSecretB64, serializer);
+          sse_encode_String(scopeKeys, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 56,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSharingWrapKeysConstMeta,
+        argValues: [pairwiseSecretB64, scopeKeys],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingWrapKeysConstMeta => const TaskConstMeta(
+    debugName: "sharing_wrap_keys",
+    argNames: ["pairwiseSecretB64", "scopeKeys"],
+  );
+
+  @override
   Future<String> crateApiStatus({required PrismSyncHandle handle}) {
     return handler.executeNormal(
       NormalTask(
@@ -1992,7 +2424,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 47,
+            funcId: 57,
             port: port_,
           );
         },
@@ -2026,7 +2458,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 48,
+              funcId: 58,
               port: port_,
             );
           },
@@ -2061,7 +2493,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 49,
+            funcId: 59,
             port: port_,
           );
         },
@@ -2098,7 +2530,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 50,
+            funcId: 60,
             port: port_,
           );
         },
@@ -2137,7 +2569,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 51,
+            funcId: 61,
             port: port_,
           );
         },
@@ -2217,6 +2649,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  Map<String, String> dco_decode_Map_String_String_None(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return Map.fromEntries(
+      dco_decode_list_record_string_string(
+        raw,
+      ).map((e) => MapEntry(e.$1, e.$2)),
+    );
+  }
+
+  @protected
+  Map<String, bool> dco_decode_Map_String_bool_None(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return Map.fromEntries(
+      dco_decode_list_record_string_bool(raw).map((e) => MapEntry(e.$1, e.$2)),
+    );
+  }
+
+  @protected
   Map<String, Uint8List> dco_decode_Map_String_list_prim_u_8_strict_None(
     dynamic raw,
   ) {
@@ -2271,6 +2721,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<String> dco_decode_list_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_String).toList();
+  }
+
+  @protected
   List<int> dco_decode_list_prim_u_8_loose(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as List<int>;
@@ -2283,6 +2739,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<(String, bool)> dco_decode_list_record_string_bool(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_record_string_bool).toList();
+  }
+
+  @protected
   List<(String, Uint8List)> dco_decode_list_record_string_list_prim_u_8_strict(
     dynamic raw,
   ) {
@@ -2290,6 +2752,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     return (raw as List<dynamic>)
         .map(dco_decode_record_string_list_prim_u_8_strict)
         .toList();
+  }
+
+  @protected
+  List<(String, String)> dco_decode_list_record_string_string(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_record_string_string).toList();
   }
 
   @protected
@@ -2311,6 +2779,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  (String, bool) dco_decode_record_string_bool(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2) {
+      throw Exception('Expected 2 elements, got ${arr.length}');
+    }
+    return (dco_decode_String(arr[0]), dco_decode_bool(arr[1]));
+  }
+
+  @protected
   (String, Uint8List) dco_decode_record_string_list_prim_u_8_strict(
     dynamic raw,
   ) {
@@ -2320,6 +2798,45 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       throw Exception('Expected 2 elements, got ${arr.length}');
     }
     return (dco_decode_String(arr[0]), dco_decode_list_prim_u_8_strict(arr[1]));
+  }
+
+  @protected
+  (String, String) dco_decode_record_string_string(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2) {
+      throw Exception('Expected 2 elements, got ${arr.length}');
+    }
+    return (dco_decode_String(arr[0]), dco_decode_String(arr[1]));
+  }
+
+  @protected
+  SharingProcessPendingInputs dco_decode_sharing_process_pending_inputs(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return SharingProcessPendingInputs(
+      existingRelationships: dco_decode_list_String(arr[0]),
+      pinnedIdentities: dco_decode_Map_String_list_prim_u_8_strict_None(arr[1]),
+      verifiedPeers: dco_decode_Map_String_bool_None(arr[2]),
+    );
+  }
+
+  @protected
+  SharingProcessPendingInputsObject
+  dco_decode_sharing_process_pending_inputs_object(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return SharingProcessPendingInputsObject(
+      existingRelationships: dco_decode_list_String(arr[0]),
+      pinnedIdentities: dco_decode_Map_String_String_None(arr[1]),
+      verifiedPeers: dco_decode_Map_String_bool_None(arr[2]),
+    );
   }
 
   @protected
@@ -2408,6 +2925,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  Map<String, String> sse_decode_Map_String_String_None(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_list_record_string_string(deserializer);
+    return Map.fromEntries(inner.map((e) => MapEntry(e.$1, e.$2)));
+  }
+
+  @protected
+  Map<String, bool> sse_decode_Map_String_bool_None(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_list_record_string_bool(deserializer);
+    return Map.fromEntries(inner.map((e) => MapEntry(e.$1, e.$2)));
+  }
+
+  @protected
   Map<String, Uint8List> sse_decode_Map_String_list_prim_u_8_strict_None(
     SseDeserializer deserializer,
   ) {
@@ -2470,6 +3005,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <String>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_String(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<int> sse_decode_list_prim_u_8_loose(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
@@ -2484,6 +3031,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<(String, bool)> sse_decode_list_record_string_bool(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <(String, bool)>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_record_string_bool(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<(String, Uint8List)> sse_decode_list_record_string_list_prim_u_8_strict(
     SseDeserializer deserializer,
   ) {
@@ -2493,6 +3054,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var ans_ = <(String, Uint8List)>[];
     for (var idx_ = 0; idx_ < len_; ++idx_) {
       ans_.add(sse_decode_record_string_list_prim_u_8_strict(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<(String, String)> sse_decode_list_record_string_string(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <(String, String)>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_record_string_string(deserializer));
     }
     return ans_;
   }
@@ -2531,6 +3106,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  (String, bool) sse_decode_record_string_bool(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_field0 = sse_decode_String(deserializer);
+    var var_field1 = sse_decode_bool(deserializer);
+    return (var_field0, var_field1);
+  }
+
+  @protected
   (String, Uint8List) sse_decode_record_string_list_prim_u_8_strict(
     SseDeserializer deserializer,
   ) {
@@ -2538,6 +3121,49 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_field0 = sse_decode_String(deserializer);
     var var_field1 = sse_decode_list_prim_u_8_strict(deserializer);
     return (var_field0, var_field1);
+  }
+
+  @protected
+  (String, String) sse_decode_record_string_string(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_field0 = sse_decode_String(deserializer);
+    var var_field1 = sse_decode_String(deserializer);
+    return (var_field0, var_field1);
+  }
+
+  @protected
+  SharingProcessPendingInputs sse_decode_sharing_process_pending_inputs(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_existingRelationships = sse_decode_list_String(deserializer);
+    var var_pinnedIdentities = sse_decode_Map_String_list_prim_u_8_strict_None(
+      deserializer,
+    );
+    var var_verifiedPeers = sse_decode_Map_String_bool_None(deserializer);
+    return SharingProcessPendingInputs(
+      existingRelationships: var_existingRelationships,
+      pinnedIdentities: var_pinnedIdentities,
+      verifiedPeers: var_verifiedPeers,
+    );
+  }
+
+  @protected
+  SharingProcessPendingInputsObject
+  sse_decode_sharing_process_pending_inputs_object(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_existingRelationships = sse_decode_list_String(deserializer);
+    var var_pinnedIdentities = sse_decode_Map_String_String_None(deserializer);
+    var var_verifiedPeers = sse_decode_Map_String_bool_None(deserializer);
+    return SharingProcessPendingInputsObject(
+      existingRelationships: var_existingRelationships,
+      pinnedIdentities: var_pinnedIdentities,
+      verifiedPeers: var_verifiedPeers,
+    );
   }
 
   @protected
@@ -2637,6 +3263,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_Map_String_String_None(
+    Map<String, String> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_record_string_string(
+      self.entries.map((e) => (e.key, e.value)).toList(),
+      serializer,
+    );
+  }
+
+  @protected
+  void sse_encode_Map_String_bool_None(
+    Map<String, bool> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_record_string_bool(
+      self.entries.map((e) => (e.key, e.value)).toList(),
+      serializer,
+    );
+  }
+
+  @protected
   void sse_encode_Map_String_list_prim_u_8_strict_None(
     Map<String, Uint8List> self,
     SseSerializer serializer,
@@ -2710,6 +3360,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_String(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_prim_u_8_loose(
     List<int> self,
     SseSerializer serializer,
@@ -2732,6 +3391,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_record_string_bool(
+    List<(String, bool)> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_record_string_bool(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_record_string_list_prim_u_8_strict(
     List<(String, Uint8List)> self,
     SseSerializer serializer,
@@ -2740,6 +3411,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
       sse_encode_record_string_list_prim_u_8_strict(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_record_string_string(
+    List<(String, String)> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_record_string_string(item, serializer);
     }
   }
 
@@ -2777,6 +3460,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_record_string_bool(
+    (String, bool) self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.$1, serializer);
+    sse_encode_bool(self.$2, serializer);
+  }
+
+  @protected
   void sse_encode_record_string_list_prim_u_8_strict(
     (String, Uint8List) self,
     SseSerializer serializer,
@@ -2784,6 +3477,41 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.$1, serializer);
     sse_encode_list_prim_u_8_strict(self.$2, serializer);
+  }
+
+  @protected
+  void sse_encode_record_string_string(
+    (String, String) self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.$1, serializer);
+    sse_encode_String(self.$2, serializer);
+  }
+
+  @protected
+  void sse_encode_sharing_process_pending_inputs(
+    SharingProcessPendingInputs self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_String(self.existingRelationships, serializer);
+    sse_encode_Map_String_list_prim_u_8_strict_None(
+      self.pinnedIdentities,
+      serializer,
+    );
+    sse_encode_Map_String_bool_None(self.verifiedPeers, serializer);
+  }
+
+  @protected
+  void sse_encode_sharing_process_pending_inputs_object(
+    SharingProcessPendingInputsObject self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_list_String(self.existingRelationships, serializer);
+    sse_encode_Map_String_String_None(self.pinnedIdentities, serializer);
+    sse_encode_Map_String_bool_None(self.verifiedPeers, serializer);
   }
 
   @protected

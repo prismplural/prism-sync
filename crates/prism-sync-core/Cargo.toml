@@ -30,6 +30,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 zeroize = "1"
 rand_core = { version = "0.10", default-features = false }
+ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize"] }
 zstd = "0.13"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 

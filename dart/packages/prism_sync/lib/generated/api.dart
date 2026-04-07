@@ -6,8 +6,9 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_relay`, `device_info_to_json`, `encode_core_error`, `encoded_value_to_json`, `join_with_response`, `json_value_to_sync_value`, `parse_fields_json`, `parse_schema_json`, `relay_error_category_to_json`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `get`, `set`
+// These functions are ignored because they are not marked as `pub`: `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encoded_value_to_json`, `join_with_response`, `json_value_to_sync_value`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `relay_error_category_to_json`, `require_secure_string`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `trust_decision_to_str`, `validate_cached_sharing_id`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `SharingHandleContext`, `SharingPendingResultJson`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`
 
 /// Build and configure a PrismSync instance.
 ///
@@ -517,6 +518,94 @@ Future<void> seedSecureStore({
 Future<String> drainSecureStore({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiDrainSecureStore(handle: handle);
 
+/// Ensure a local sharing identity exists for the provided synced sharing_id.
+///
+/// If `current_sharing_id` is `None`, this reuses any cached sharing_id in
+/// secure storage or generates a new 16-byte random sharing_id and returns it
+/// for the app to persist to synced settings.
+Future<String> sharingEnable({
+  required PrismSyncHandle handle,
+  String? currentSharingId,
+}) => RustLib.instance.api.crateApiSharingEnable(
+  handle: handle,
+  currentSharingId: currentSharingId,
+);
+
+/// Disable sharing by removing the identity bundle and signed prekeys from the relay.
+Future<void> sharingDisable({
+  required PrismSyncHandle handle,
+  required String sharingId,
+}) => RustLib.instance.api.crateApiSharingDisable(
+  handle: handle,
+  sharingId: sharingId,
+);
+
+/// Rotate and publish a new signed prekey if the current one is stale or missing.
+Future<void> sharingEnsurePrekey({
+  required PrismSyncHandle handle,
+  required String sharingId,
+}) => RustLib.instance.api.crateApiSharingEnsurePrekey(
+  handle: handle,
+  sharingId: sharingId,
+);
+
+/// Initiate sharing with a remote recipient and return the established pairwise secret.
+Future<String> sharingInitiate({
+  required PrismSyncHandle handle,
+  required String senderSharingId,
+  required String recipientSharingId,
+  required String displayName,
+  required String offeredScopes,
+}) => RustLib.instance.api.crateApiSharingInitiate(
+  handle: handle,
+  senderSharingId: senderSharingId,
+  recipientSharingId: recipientSharingId,
+  displayName: displayName,
+  offeredScopes: offeredScopes,
+);
+
+/// Fetch and process all pending sharing-init payloads for the authenticated user.
+///
+/// `existing_relationships_json` accepts either:
+/// - a JSON array of known peer sharing_ids, or
+/// - a JSON object with `existing_relationships`, optional `pinned_identities`,
+///   and optional `verified_peers`
+Future<String> sharingProcessPending({
+  required PrismSyncHandle handle,
+  required String recipientSharingId,
+  required String existingRelationshipsJson,
+  required String seenInitIdsJson,
+}) => RustLib.instance.api.crateApiSharingProcessPending(
+  handle: handle,
+  recipientSharingId: recipientSharingId,
+  existingRelationshipsJson: existingRelationshipsJson,
+  seenInitIdsJson: seenInitIdsJson,
+);
+
+/// Compute a user-visible fingerprint for a canonical sharing identity bundle.
+Future<String> sharingFingerprint({required String identityBundleB64}) =>
+    RustLib.instance.api.crateApiSharingFingerprint(
+      identityBundleB64: identityBundleB64,
+    );
+
+/// Wrap resource keys under pairwise-secret-derived per-scope wrapping keys.
+Future<String> sharingWrapKeys({
+  required String pairwiseSecretB64,
+  required String scopeKeys,
+}) => RustLib.instance.api.crateApiSharingWrapKeys(
+  pairwiseSecretB64: pairwiseSecretB64,
+  scopeKeys: scopeKeys,
+);
+
+/// Unwrap resource keys previously wrapped by `sharing_wrap_keys`.
+Future<String> sharingUnwrapKeys({
+  required String pairwiseSecretB64,
+  required String wrappedKeys,
+}) => RustLib.instance.api.crateApiSharingUnwrapKeys(
+  pairwiseSecretB64: pairwiseSecretB64,
+  wrappedKeys: wrappedKeys,
+);
+
 /// Returns the 32-byte X25519 public key for this device's identity.
 /// Used by the sharing/friend-invite system to exchange public keys.
 Future<Uint8List> getIdentityPublicKey({required PrismSyncHandle handle}) =>
@@ -575,3 +664,63 @@ abstract class MemorySecureStore implements RustOpaqueInterface {
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>>
 abstract class PrismSyncHandle implements RustOpaqueInterface {}
+
+class SharingProcessPendingInputs {
+  final List<String> existingRelationships;
+  final Map<String, Uint8List> pinnedIdentities;
+  final Map<String, bool> verifiedPeers;
+
+  const SharingProcessPendingInputs({
+    required this.existingRelationships,
+    required this.pinnedIdentities,
+    required this.verifiedPeers,
+  });
+
+  static Future<SharingProcessPendingInputs> default_() =>
+      RustLib.instance.api.crateApiSharingProcessPendingInputsDefault();
+
+  @override
+  int get hashCode =>
+      existingRelationships.hashCode ^
+      pinnedIdentities.hashCode ^
+      verifiedPeers.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SharingProcessPendingInputs &&
+          runtimeType == other.runtimeType &&
+          existingRelationships == other.existingRelationships &&
+          pinnedIdentities == other.pinnedIdentities &&
+          verifiedPeers == other.verifiedPeers;
+}
+
+class SharingProcessPendingInputsObject {
+  final List<String> existingRelationships;
+  final Map<String, String> pinnedIdentities;
+  final Map<String, bool> verifiedPeers;
+
+  const SharingProcessPendingInputsObject({
+    required this.existingRelationships,
+    required this.pinnedIdentities,
+    required this.verifiedPeers,
+  });
+
+  static Future<SharingProcessPendingInputsObject> default_() =>
+      RustLib.instance.api.crateApiSharingProcessPendingInputsObjectDefault();
+
+  @override
+  int get hashCode =>
+      existingRelationships.hashCode ^
+      pinnedIdentities.hashCode ^
+      verifiedPeers.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SharingProcessPendingInputsObject &&
+          runtimeType == other.runtimeType &&
+          existingRelationships == other.existingRelationships &&
+          pinnedIdentities == other.pinnedIdentities &&
+          verifiedPeers == other.verifiedPeers;
+}

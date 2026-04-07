@@ -358,6 +358,13 @@ async fn test_registration_rejects_expired_nonce() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -368,7 +375,12 @@ async fn test_registration_rejects_expired_nonce() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://127.0.0.1:{}", addr.port());
     let _handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let client = Client::new();
@@ -452,6 +464,13 @@ async fn test_nonce_rate_limiting() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -585,6 +604,13 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -679,6 +705,13 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -824,6 +857,13 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -905,6 +945,13 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1154,6 +1201,13 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1520,6 +1574,13 @@ async fn test_nonce_rate_limiting_window_expiry() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -2581,6 +2642,13 @@ async fn test_revoke_rate_limiting() {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -2592,7 +2660,12 @@ async fn test_revoke_rate_limiting() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://127.0.0.1:{}", addr.port());
     let _handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let client = Client::new();
@@ -3456,6 +3529,13 @@ fn default_test_config() -> Config {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
     }
 }
 

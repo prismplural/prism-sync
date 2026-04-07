@@ -60,12 +60,26 @@ pub struct Config {
     /// Whether registration is enabled at all. When false, all registration
     /// endpoints return 403. Use this to lock down a relay after initial setup.
     pub registration_enabled: bool,
-    /// TTL for pairing sessions in seconds (default 300 = 5 minutes).
+    /// TTL for pairing sessions in seconds. Default: 300 (5 minutes).
     pub pairing_session_ttl_secs: u64,
-    /// Max pairing session creation requests per IP within the rate window.
+    /// Maximum pairing session creation rate per IP per minute.
     pub pairing_session_rate_limit: u32,
-    /// Max payload size in bytes for pairing session data (default 32768).
+    /// Maximum payload size for pairing session slots (bytes).
     pub pairing_session_max_payload_bytes: usize,
+    /// TTL in seconds for sharing-init payloads (default 7 days).
+    pub sharing_init_ttl_secs: u64,
+    /// Maximum size in bytes for sharing-init payloads.
+    pub sharing_init_max_payload_bytes: usize,
+    /// Maximum size in bytes for sharing identity bundles.
+    pub sharing_identity_max_bytes: usize,
+    /// Maximum size in bytes for sharing signed prekey bundles.
+    pub sharing_prekey_max_bytes: usize,
+    /// Max fetch-bundle requests per IP within 300s window.
+    pub sharing_fetch_rate_limit: u32,
+    /// Max sharing-init uploads per sync_id within 3600s window.
+    pub sharing_init_rate_limit: u32,
+    /// Max pending (unconsumed) sharing-init payloads per recipient.
+    pub sharing_init_max_pending: u32,
 }
 
 impl std::fmt::Debug for Config {
@@ -152,6 +166,13 @@ impl Config {
                 "PAIRING_SESSION_MAX_PAYLOAD_BYTES",
                 32768,
             ),
+            sharing_init_ttl_secs: parse_env("SHARING_INIT_TTL_SECS", 604800),
+            sharing_init_max_payload_bytes: parse_env("SHARING_INIT_MAX_PAYLOAD_BYTES", 65536),
+            sharing_identity_max_bytes: parse_env("SHARING_IDENTITY_MAX_BYTES", 8192),
+            sharing_prekey_max_bytes: parse_env("SHARING_PREKEY_MAX_BYTES", 4096),
+            sharing_fetch_rate_limit: parse_env("SHARING_FETCH_RATE_LIMIT", 20),
+            sharing_init_rate_limit: parse_env("SHARING_INIT_RATE_LIMIT", 10),
+            sharing_init_max_pending: parse_env("SHARING_INIT_MAX_PENDING", 50),
         }
     }
 
