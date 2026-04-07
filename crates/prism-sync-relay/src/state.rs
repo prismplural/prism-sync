@@ -93,6 +93,7 @@ pub struct AppState {
     pub first_device_nonce_rate_limiter: RateLimiter,
     pub first_device_registration_rate_limiter: RateLimiter,
     pub first_device_group_rate_limiter: RateLimiter,
+    pub pairing_rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -108,6 +109,7 @@ impl AppState {
             first_device_nonce_rate_limiter: RateLimiter::default(),
             first_device_registration_rate_limiter: RateLimiter::default(),
             first_device_group_rate_limiter: RateLimiter::default(),
+            pairing_rate_limiter: RateLimiter::default(),
         }
     }
 

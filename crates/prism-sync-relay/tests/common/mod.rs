@@ -58,6 +58,9 @@ pub async fn start_test_relay() -> (
         grapheneos_verified_boot_key_allowlist: vec![],
         registration_token: None,
         registration_enabled: true,
+        pairing_session_ttl_secs: 300,
+        pairing_session_rate_limit: 100,
+        pairing_session_max_payload_bytes: 32768,
     };
 
     start_test_relay_with_config(config).await

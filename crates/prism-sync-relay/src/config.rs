@@ -60,6 +60,12 @@ pub struct Config {
     /// Whether registration is enabled at all. When false, all registration
     /// endpoints return 403. Use this to lock down a relay after initial setup.
     pub registration_enabled: bool,
+    /// TTL for pairing sessions in seconds (default 300 = 5 minutes).
+    pub pairing_session_ttl_secs: u64,
+    /// Max pairing session creation requests per IP within the rate window.
+    pub pairing_session_rate_limit: u32,
+    /// Max payload size in bytes for pairing session data (default 32768).
+    pub pairing_session_max_payload_bytes: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -140,6 +146,12 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             registration_enabled: parse_bool_env("REGISTRATION_ENABLED", true),
+            pairing_session_ttl_secs: parse_env("PAIRING_SESSION_TTL_SECS", 300),
+            pairing_session_rate_limit: parse_env("PAIRING_SESSION_RATE_LIMIT", 5),
+            pairing_session_max_payload_bytes: parse_env(
+                "PAIRING_SESSION_MAX_PAYLOAD_BYTES",
+                32768,
+            ),
         }
     }
 

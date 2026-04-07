@@ -95,6 +95,9 @@ async fn start_in_process_relay(reader_pool_size: usize) -> Result<String> {
         grapheneos_verified_boot_key_allowlist: vec![],
         registration_enabled: true,
         registration_token: None,
+        pairing_session_ttl_secs: 300,
+        pairing_session_rate_limit: 5,
+        pairing_session_max_payload_bytes: 32768,
     };
 
     let db = Database::open(

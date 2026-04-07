@@ -379,6 +379,20 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             wrapped_blob     BLOB NOT NULL,
             PRIMARY KEY (sync_id, version, target_device_id)
         );
+
+        -- Pairing sessions (PQ hybrid device pairing ceremony)
+        CREATE TABLE IF NOT EXISTS pairing_sessions (
+            rendezvous_id       TEXT PRIMARY KEY,
+            joiner_bootstrap    BLOB,
+            pairing_init        BLOB,
+            joiner_confirmation BLOB,
+            credential_bundle   BLOB,
+            joiner_bundle       BLOB,
+            created_at          INTEGER NOT NULL,
+            expires_at          INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pairing_sessions_expires
+            ON pairing_sessions(expires_at);
         ",
     )?;
 
@@ -1651,6 +1665,169 @@ pub fn prune_stale_sync_groups(
     }
 
     Ok(stale_ids.len())
+}
+
+// ---------------------------------------------------------------------------
+// Pairing sessions
+// ---------------------------------------------------------------------------
+
+/// Valid pairing slot column names.
+const PAIRING_SLOTS: &[&str] = &[
+    "pairing_init",
+    "joiner_confirmation",
+    "credential_bundle",
+    "joiner_bundle",
+];
+
+fn validate_pairing_slot(slot: &str) -> Result<&'static str, rusqlite::Error> {
+    PAIRING_SLOTS
+        .iter()
+        .find(|&&s| s == slot)
+        .copied()
+        .ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(format!("invalid pairing slot: {slot}"))
+        })
+}
+
+/// Create a new pairing session with the given rendezvous ID and joiner bootstrap data.
+pub fn create_pairing_session(
+    conn: &Connection,
+    rendezvous_id: &str,
+    joiner_bootstrap: &[u8],
+    ttl_secs: u64,
+) -> Result<(), rusqlite::Error> {
+    let now = now_secs();
+    let expires_at = now + ttl_secs as i64;
+    conn.execute(
+        "INSERT INTO pairing_sessions (rendezvous_id, joiner_bootstrap, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![rendezvous_id, joiner_bootstrap, now, expires_at],
+    )?;
+    Ok(())
+}
+
+/// Get the joiner bootstrap data for a non-expired pairing session.
+pub fn get_pairing_bootstrap(
+    conn: &Connection,
+    rendezvous_id: &str,
+) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+    let now = now_secs();
+    conn.query_row(
+        "SELECT joiner_bootstrap FROM pairing_sessions
+         WHERE rendezvous_id = ?1 AND expires_at > ?2",
+        params![rendezvous_id, now],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Set a pairing slot column if it is currently NULL and the session is not expired.
+/// Returns `true` if the update succeeded, `false` if the slot was already set or
+/// the session does not exist / is expired.
+pub fn set_pairing_slot(
+    conn: &Connection,
+    rendezvous_id: &str,
+    slot: &str,
+    data: &[u8],
+) -> Result<bool, rusqlite::Error> {
+    let col = validate_pairing_slot(slot)?;
+    let now = now_secs();
+    // Use a match to build the correct SQL for each column, avoiding string interpolation.
+    let sql = match col {
+        "pairing_init" => {
+            "UPDATE pairing_sessions SET pairing_init = ?1
+             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND pairing_init IS NULL"
+        }
+        "joiner_confirmation" => {
+            "UPDATE pairing_sessions SET joiner_confirmation = ?1
+             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND joiner_confirmation IS NULL"
+        }
+        "credential_bundle" => {
+            "UPDATE pairing_sessions SET credential_bundle = ?1
+             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND credential_bundle IS NULL"
+        }
+        "joiner_bundle" => {
+            "UPDATE pairing_sessions SET joiner_bundle = ?1
+             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND joiner_bundle IS NULL"
+        }
+        _ => unreachable!(),
+    };
+    let changed = conn.execute(sql, params![data, rendezvous_id, now])?;
+    Ok(changed > 0)
+}
+
+/// Get the value of a pairing slot column for a non-expired session.
+/// Returns `None` if the session does not exist, is expired, or the slot is NULL.
+pub fn get_pairing_slot(
+    conn: &Connection,
+    rendezvous_id: &str,
+    slot: &str,
+) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+    let col = validate_pairing_slot(slot)?;
+    let now = now_secs();
+    let sql = match col {
+        "pairing_init" => {
+            "SELECT pairing_init FROM pairing_sessions
+             WHERE rendezvous_id = ?1 AND expires_at > ?2"
+        }
+        "joiner_confirmation" => {
+            "SELECT joiner_confirmation FROM pairing_sessions
+             WHERE rendezvous_id = ?1 AND expires_at > ?2"
+        }
+        "credential_bundle" => {
+            "SELECT credential_bundle FROM pairing_sessions
+             WHERE rendezvous_id = ?1 AND expires_at > ?2"
+        }
+        "joiner_bundle" => {
+            "SELECT joiner_bundle FROM pairing_sessions
+             WHERE rendezvous_id = ?1 AND expires_at > ?2"
+        }
+        _ => unreachable!(),
+    };
+    // The column may be NULL (not yet set) — query_row returns the row,
+    // and row.get::<_, Option<Vec<u8>>> handles the NULL -> None mapping.
+    conn.query_row(sql, params![rendezvous_id, now], |row| {
+        row.get::<_, Option<Vec<u8>>>(0)
+    })
+    .optional()
+    .map(|opt| opt.flatten())
+}
+
+/// Delete a pairing session. Returns `true` if a row was deleted.
+pub fn delete_pairing_session(
+    conn: &Connection,
+    rendezvous_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let changed = conn.execute(
+        "DELETE FROM pairing_sessions WHERE rendezvous_id = ?1",
+        params![rendezvous_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Delete all expired pairing sessions. Returns the number of rows deleted.
+pub fn cleanup_expired_pairing_sessions(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    let deleted = conn.execute(
+        "DELETE FROM pairing_sessions WHERE expires_at <= ?1",
+        params![now],
+    )?;
+    Ok(deleted)
+}
+
+/// Check whether a non-expired pairing session exists for the given rendezvous ID.
+pub fn pairing_session_exists(
+    conn: &Connection,
+    rendezvous_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let now = now_secs();
+    conn.query_row(
+        "SELECT 1 FROM pairing_sessions WHERE rendezvous_id = ?1 AND expires_at > ?2",
+        params![rendezvous_id, now],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|opt| opt.is_some())
 }
 
 // ---------------------------------------------------------------------------

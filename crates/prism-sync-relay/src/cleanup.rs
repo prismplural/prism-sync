@@ -56,14 +56,17 @@ async fn run_cleanup(state: &AppState) {
             let superseded_registry_artifacts =
                 crate::db::cleanup_superseded_registry_state_artifacts(conn)?;
 
-            // 8. Garbage-collect revoked tombstones only after no retained
+            // 8. Remove expired pairing sessions.
+            let expired_pairing_sessions = crate::db::cleanup_expired_pairing_sessions(conn)?;
+
+            // 9. Garbage-collect revoked tombstones only after no retained
             //    history rows still reference them.
             let revoked_tombstones = crate::db::cleanup_revoked_device_tombstones(
                 conn,
                 config.revoked_tombstone_retention_secs as i64,
             )?;
 
-            // 9. Reclaim freed pages (incremental auto_vacuum)
+            // 10. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 = conn
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -81,6 +84,7 @@ async fn run_cleanup(state: &AppState) {
                 abandoned_new_groups,
                 expired_snapshots,
                 superseded_registry_artifacts,
+                expired_pairing_sessions,
                 revoked_tombstones,
                 pages_freed,
             ))
@@ -98,6 +102,7 @@ async fn run_cleanup(state: &AppState) {
             abandoned_new_groups,
             expired_snapshots,
             superseded_registry_artifacts,
+            expired_pairing_sessions,
             revoked_tombstones,
             pages_freed,
         ))) => {
@@ -113,6 +118,7 @@ async fn run_cleanup(state: &AppState) {
                 || abandoned_new_groups > 0
                 || expired_snapshots > 0
                 || superseded_registry_artifacts > 0
+                || expired_pairing_sessions > 0
                 || revoked_tombstones > 0
                 || pages_freed > 0
             {
@@ -124,6 +130,7 @@ async fn run_cleanup(state: &AppState) {
                     abandoned_new_groups,
                     expired_snapshots,
                     superseded_registry_artifacts,
+                    expired_pairing_sessions,
                     revoked_tombstones,
                     pages_freed,
                     "cleanup cycle complete"
@@ -144,6 +151,7 @@ async fn run_cleanup(state: &AppState) {
     state
         .signed_request_replay_cache
         .prune_stale(state.config.signed_request_nonce_window_secs);
+    state.pairing_rate_limiter.prune_stale(300);
 }
 
 fn cleanup_abandoned_brand_new_groups(

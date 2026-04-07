@@ -1,5 +1,6 @@
 pub mod devices;
 pub mod metrics;
+pub mod pairing;
 pub mod register;
 pub mod sync;
 pub mod ws;
@@ -133,6 +134,7 @@ pub fn router(state: AppState) -> Router {
     // (WebSocket does message-based auth after upgrade)
     let public_routes = Router::new()
         .merge(register::routes())
+        .merge(pairing::routes())
         .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade));
 
     // Relay is accessed only by native clients — no browser origin is expected.
