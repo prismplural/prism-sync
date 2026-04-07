@@ -9,6 +9,7 @@
 //! See the threat model section of the design spec for full details.
 
 pub mod batch_signature;
+pub mod bootstrap;
 pub mod client;
 pub mod crdt_change;
 pub mod debug_log;
