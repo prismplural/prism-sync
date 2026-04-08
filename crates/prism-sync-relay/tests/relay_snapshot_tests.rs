@@ -10,7 +10,6 @@
 mod common;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::SigningKey;
 use reqwest::Client;
 
 use prism_sync_relay::db;
@@ -25,7 +24,7 @@ async fn put_snapshot_signed(
     sync_id: &str,
     device_id: &str,
     token: &str,
-    signing_key: &SigningKey,
+    keys: &TestDeviceKeys,
     server_seq_at: &str,
     snapshot_data: Vec<u8>,
     extra_headers: &[(&str, &str)],
@@ -41,7 +40,7 @@ async fn put_snapshot_signed(
     }
     apply_signed_headers(
         builder,
-        signing_key,
+        keys,
         "PUT",
         &path,
         sync_id,
@@ -63,8 +62,8 @@ async fn test_snapshot_put_get_roundtrip() {
     let sync_id = generate_sync_id();
 
     let device_id = generate_device_id();
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     // Initially no snapshot
     let get_resp = client
@@ -84,7 +83,7 @@ async fn test_snapshot_put_get_roundtrip() {
         &sync_id,
         &device_id,
         &token,
-        &signing_key,
+        &keys,
         "42",
         snapshot_data.to_vec(),
         &[],
@@ -115,11 +114,11 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
     let sync_id = generate_sync_id();
 
     let device_a_id = generate_device_id();
-    let signing_key_a = SigningKey::generate(&mut rand::thread_rng());
-    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &signing_key_a).await;
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
 
     let device_b_id = generate_device_id();
-    let token_b = prepare_device(&db, &sync_id, &device_b_id).await;
+    let (token_b, _keys_b) = prepare_device(&db, &sync_id, &device_b_id).await;
 
     let upload_resp = put_snapshot_signed(
         &client,
@@ -127,7 +126,7 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
         &sync_id,
         &device_a_id,
         &token_a,
-        &signing_key_a,
+        &keys_a,
         "42",
         b"targeted-snapshot".to_vec(),
         &[("X-Snapshot-TTL", "300"), ("X-For-Device-Id", &device_b_id)],
@@ -181,11 +180,11 @@ async fn test_targeted_snapshot_expires() {
     let sync_id = generate_sync_id();
 
     let device_a_id = generate_device_id();
-    let signing_key_a = SigningKey::generate(&mut rand::thread_rng());
-    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &signing_key_a).await;
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
 
     let device_b_id = generate_device_id();
-    let token_b = prepare_device(&db, &sync_id, &device_b_id).await;
+    let (token_b, _keys_b) = prepare_device(&db, &sync_id, &device_b_id).await;
 
     let upload_resp = put_snapshot_signed(
         &client,
@@ -193,7 +192,7 @@ async fn test_targeted_snapshot_expires() {
         &sync_id,
         &device_a_id,
         &token_a,
-        &signing_key_a,
+        &keys_a,
         "99",
         b"expiring-snapshot".to_vec(),
         &[("X-Snapshot-TTL", "1"), ("X-For-Device-Id", &device_b_id)],

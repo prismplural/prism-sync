@@ -9,7 +9,6 @@
 
 mod common;
 
-use ed25519_dalek::SigningKey;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -22,7 +21,7 @@ async fn push_signed(
     sync_id: &str,
     device_id: &str,
     token: &str,
-    signing_key: &SigningKey,
+    keys: &TestDeviceKeys,
     envelope: &Value,
 ) -> reqwest::Response {
     let body_bytes = serde_json::to_vec(envelope).unwrap();
@@ -33,7 +32,7 @@ async fn push_signed(
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Device-Id", device_id)
             .header("Content-Type", "application/json"),
-        signing_key,
+        keys,
         "PUT",
         &path,
         sync_id,
@@ -56,8 +55,8 @@ async fn test_push_pull_roundtrip() {
 
     // Register Device A
     let device_a_id = generate_device_id();
-    let signing_key_a = SigningKey::generate(&mut rand::thread_rng());
-    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &signing_key_a).await;
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
 
     // Device A pushes a batch
     let envelope = make_test_envelope(&sync_id, &device_a_id, "batch-001", 0);
@@ -67,7 +66,7 @@ async fn test_push_pull_roundtrip() {
         &sync_id,
         &device_a_id,
         &token_a,
-        &signing_key_a,
+        &keys_a,
         &envelope,
     )
     .await;
@@ -88,7 +87,7 @@ async fn test_push_pull_roundtrip() {
         &sync_id,
         &device_a_id,
         &token_a,
-        &signing_key_a,
+        &keys_a,
         &envelope2,
     )
     .await;
@@ -145,7 +144,7 @@ async fn test_push_pull_roundtrip() {
         &sync_id,
         &device_a_id,
         &token_a,
-        &signing_key_a,
+        &keys_a,
         &envelope,
     )
     .await;
@@ -167,8 +166,8 @@ async fn test_ack_triggers_pruning() {
     let sync_id = generate_sync_id();
 
     let device_id = generate_device_id();
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     // Push several batches
     let mut last_seq = 0i64;
@@ -180,7 +179,7 @@ async fn test_ack_triggers_pruning() {
             &sync_id,
             &device_id,
             &token,
-            &signing_key,
+            &keys,
             &envelope,
         )
         .await;
@@ -198,7 +197,7 @@ async fn test_ack_triggers_pruning() {
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Device-Id", &device_id)
             .header("X-Server-Seq-At", last_seq.to_string()),
-        &signing_key,
+        &keys,
         "PUT",
         &snapshot_path,
         &sync_id,
@@ -220,7 +219,7 @@ async fn test_ack_triggers_pruning() {
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Device-Id", &device_id)
             .header("Content-Type", "application/json"),
-        &signing_key,
+        &keys,
         "POST",
         &ack_path,
         &sync_id,
@@ -262,8 +261,8 @@ async fn test_push_rejects_wrong_epoch() {
     let sync_id = generate_sync_id();
 
     let device_id = generate_device_id();
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     // Try to push with epoch 5 (current is 0)
     let envelope = make_test_envelope(&sync_id, &device_id, "batch-wrong-epoch", 5);
@@ -273,7 +272,7 @@ async fn test_push_rejects_wrong_epoch() {
         &sync_id,
         &device_id,
         &token,
-        &signing_key,
+        &keys,
         &envelope,
     )
     .await;
@@ -293,8 +292,8 @@ async fn test_push_rejects_unsigned_request() {
     let sync_id = generate_sync_id();
 
     let device_id = generate_device_id();
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     let envelope = make_test_envelope(&sync_id, &device_id, "batch-unsigned", 0);
     let resp = client
@@ -320,8 +319,8 @@ async fn test_put_snapshot_rejects_unsigned_request() {
     let sync_id = generate_sync_id();
 
     let device_id = generate_device_id();
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     let resp = client
         .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
@@ -346,8 +345,8 @@ async fn test_ack_rejects_unsigned_request() {
     let sync_id = generate_sync_id();
 
     let device_id = generate_device_id();
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     let resp = client
         .post(format!("{url}/v1/sync/{sync_id}/ack"))

@@ -68,49 +68,32 @@ pub(crate) fn verify_signed_request(
         .decode(signature_b64)
         .map_err(|_| AppError::BadRequest("Invalid X-Prism-Signature"))?;
 
-    // Detect V2 hybrid vs V1 legacy based on version prefix byte.
-    // V1 Ed25519 signatures are exactly 64 bytes; V2 hybrid is 1 + 64 + 4 + ML-DSA (~3300+).
-    // Check length > 64 to avoid false positives when a V1 signature happens to start with 0x02.
-    if signature.len() > 64
-        && signature[0] == 0x02
-        && !auth_identity.ml_dsa_65_public_key.is_empty()
-    {
-        // V2 hybrid verification
-        let signing_data = auth::build_request_signing_data_v2(
-            method,
-            path,
-            &auth_identity.sync_id,
-            &auth_identity.device_id,
-            body,
-            timestamp,
-            nonce,
-        );
-        if !auth::verify_hybrid_request_signature(
-            &auth_identity.signing_public_key,
-            &auth_identity.ml_dsa_65_public_key,
-            &signing_data,
-            &signature,
-        ) {
-            return Err(AppError::Unauthorized);
-        }
-    } else {
-        // V1 legacy fallback (for devices registered without PQ keys)
-        let signing_data = auth::build_request_signing_data(
-            method,
-            path,
-            &auth_identity.sync_id,
-            &auth_identity.device_id,
-            body,
-            timestamp,
-            nonce,
-        );
-        if !auth::verify_request_signature(
-            &auth_identity.signing_public_key,
-            &signing_data,
-            &signature,
-        ) {
-            return Err(AppError::Unauthorized);
-        }
+    // Reject devices without PQ keys (should not exist after V1 removal)
+    if auth_identity.ml_dsa_65_public_key.is_empty() {
+        return Err(AppError::Unauthorized);
+    }
+
+    // Only accept hybrid signatures (version prefix 0x02 or 0x03)
+    if signature.len() <= 64 || (signature[0] != 0x02 && signature[0] != 0x03) {
+        return Err(AppError::Unauthorized);
+    }
+
+    let signing_data = auth::build_request_signing_data_v2(
+        method,
+        path,
+        &auth_identity.sync_id,
+        &auth_identity.device_id,
+        body,
+        timestamp,
+        nonce,
+    );
+    if !auth::verify_hybrid_request_signature(
+        &auth_identity.signing_public_key,
+        &auth_identity.ml_dsa_65_public_key,
+        &signing_data,
+        &signature,
+    ) {
+        return Err(AppError::Unauthorized);
     }
 
     let replay_key = format!("sig:{}\x00{}", auth_identity.device_id, nonce);

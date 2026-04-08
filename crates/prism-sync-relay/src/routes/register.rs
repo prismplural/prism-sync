@@ -5,7 +5,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -252,26 +251,20 @@ async fn register_device(
         "Register request"
     );
 
-    // Verify challenge signature: hybrid V2 when ML-DSA key present, V1 otherwise
-    let challenge_valid = if !ml_dsa_pk.is_empty() {
-        auth::verify_hybrid_challenge(
-            &signing_pk,
-            &ml_dsa_pk,
-            &sync_id,
-            &body.device_id,
-            &body.nonce,
-            &challenge_sig,
-        )
-    } else {
-        auth::verify_ed25519_challenge(
-            &signing_pk,
-            &sync_id,
-            &body.device_id,
-            &body.nonce,
-            &challenge_sig,
-        )
-    };
-    if !challenge_valid {
+    // ML-DSA-65 public key is now required for registration
+    if ml_dsa_pk.is_empty() {
+        return Err(AppError::BadRequest("ML-DSA-65 public key is required"));
+    }
+
+    // Verify hybrid challenge signature (V2/V3)
+    if !auth::verify_hybrid_challenge(
+        &signing_pk,
+        &ml_dsa_pk,
+        &sync_id,
+        &body.device_id,
+        &body.nonce,
+        &challenge_sig,
+    ) {
         tracing::warn!(
             sync_id = %&sync_id[..16],
             device_id = %&body.device_id[..8.min(body.device_id.len())],
@@ -705,48 +698,34 @@ fn verify_registry_approval(
     let approval_signature_bytes = hex::decode(&approval.approval_signature)
         .map_err(|_| AppError::BadRequest("Invalid approval_signature hex"))?;
 
-    // Detect hybrid approval: signature starts with 0x02 (V2) or 0x03 (V3) version byte
+    // Only accept hybrid approval signatures (V2/V3 version prefix)
     let version_byte = approval_signature_bytes.first().copied();
-    if version_byte == Some(0x02) || version_byte == Some(0x03) {
-        // V2/V3 hybrid approval verification
-        let sig_rest = &approval_signature_bytes[1..];
-        let hybrid_sig = prism_sync_crypto::pq::HybridSignature::from_bytes(sig_rest)
-            .map_err(|_| AppError::BadRequest("Invalid hybrid approval_signature"))?;
-        let mut approval_data = Vec::new();
-        approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V2\x00");
-        write_len_prefixed(&mut approval_data, sync_id.as_bytes());
-        write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
-        write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
-        if version_byte == Some(0x03) {
-            hybrid_sig
-                .verify_v3(
-                    &approval_data,
-                    b"registry_approval",
-                    &approver_pk_bytes,
-                    &approver_ml_dsa_pk,
-                )
-                .map_err(|_| AppError::Unauthorized)?;
-        } else {
-            hybrid_sig
-                .verify(&approval_data, &approver_pk_bytes, &approver_ml_dsa_pk)
-                .map_err(|_| AppError::Unauthorized)?;
-        }
+    if version_byte != Some(0x02) && version_byte != Some(0x03) {
+        return Err(AppError::BadRequest(
+            "Hybrid approval signature required (V2 or V3)",
+        ));
+    }
+
+    let sig_rest = &approval_signature_bytes[1..];
+    let hybrid_sig = prism_sync_crypto::pq::HybridSignature::from_bytes(sig_rest)
+        .map_err(|_| AppError::BadRequest("Invalid hybrid approval_signature"))?;
+    let mut approval_data = Vec::new();
+    approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V2\x00");
+    write_len_prefixed(&mut approval_data, sync_id.as_bytes());
+    write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
+    write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
+    if version_byte == Some(0x03) {
+        hybrid_sig
+            .verify_v3(
+                &approval_data,
+                b"registry_approval",
+                &approver_pk_bytes,
+                &approver_ml_dsa_pk,
+            )
+            .map_err(|_| AppError::Unauthorized)?;
     } else {
-        // V1 Ed25519-only approval verification
-        if approval_signature_bytes.len() != 64 {
-            return Err(AppError::BadRequest("approval_signature must be 64 bytes"));
-        }
-        let approval_signature = Signature::from_slice(&approval_signature_bytes)
-            .map_err(|_| AppError::BadRequest("Invalid approval_signature"))?;
-        let approver_verifying_key = VerifyingKey::from_bytes(&approver_pk_bytes)
-            .map_err(|_| AppError::BadRequest("Invalid approver_ed25519_pk"))?;
-        let mut approval_data = Vec::new();
-        approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V1\x00");
-        write_len_prefixed(&mut approval_data, sync_id.as_bytes());
-        write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
-        write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
-        approver_verifying_key
-            .verify(&approval_data, &approval_signature)
+        hybrid_sig
+            .verify(&approval_data, &approver_pk_bytes, &approver_ml_dsa_pk)
             .map_err(|_| AppError::Unauthorized)?;
     }
 
@@ -814,34 +793,15 @@ fn verify_registry_snapshot(
     approver_ed25519_pk: &[u8; 32],
     approver_ml_dsa_pk: &[u8],
 ) -> Result<Vec<RegistrySnapshotEntry>, AppError> {
-    // Detect V2/V3 hybrid format: first byte is 0x02 or 0x03
+    // Only accept hybrid format: first byte must be 0x02 or 0x03
     let first = signed_snapshot.first().copied();
-    if first == Some(0x02) || first == Some(0x03) {
-        return verify_registry_snapshot_hybrid(signed_snapshot, approver_ed25519_pk, approver_ml_dsa_pk);
+    if first != Some(0x02) && first != Some(0x03) {
+        return Err(AppError::BadRequest(
+            "Hybrid signed registry snapshot required (V2 or V3)",
+        ));
     }
 
-    // V1 Ed25519-only format: [64B signature][JSON]
-    if signed_snapshot.len() < 64 {
-        return Err(AppError::BadRequest("signed_registry_snapshot too short"));
-    }
-
-    let (signature_bytes, json_bytes) = signed_snapshot.split_at(64);
-    let signature = Signature::from_slice(signature_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid signed_registry_snapshot signature"))?;
-    let verifying_key = VerifyingKey::from_bytes(approver_ed25519_pk)
-        .map_err(|_| AppError::BadRequest("Invalid approver_ed25519_pk"))?;
-
-    let mut signing_data =
-        Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V1\x00".len() + json_bytes.len());
-    signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V1\x00");
-    signing_data.extend_from_slice(json_bytes);
-    verifying_key
-        .verify(&signing_data, &signature)
-        .map_err(|_| AppError::Unauthorized)?;
-
-    let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid signed_registry_snapshot JSON"))?;
-    Ok(entries)
+    verify_registry_snapshot_hybrid(signed_snapshot, approver_ed25519_pk, approver_ml_dsa_pk)
 }
 
 fn verify_registry_snapshot_hybrid(
