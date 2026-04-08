@@ -167,13 +167,17 @@ impl ServerSharingRelay {
         let signing_data =
             self.build_request_signing_data(method, canonical_path, body, &timestamp, &nonce);
 
-        // V2 hybrid signature: Ed25519 + ML-DSA-65
+        // V3 hybrid signature: Ed25519 + ML-DSA-65 with labeled WNS
+        let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"http_request",
+            &signing_data,
+        );
         let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-            ed25519_sig: self.signing_key.sign(&signing_data).to_bytes().to_vec(),
-            ml_dsa_65_sig: self.ml_dsa_signing_key.sign(&signing_data),
+            ed25519_sig: self.signing_key.sign(&m_prime).to_bytes().to_vec(),
+            ml_dsa_65_sig: self.ml_dsa_signing_key.sign(&m_prime),
         };
         let mut wire = Vec::with_capacity(1 + hybrid_sig.to_bytes().len());
-        wire.push(0x02);
+        wire.push(0x03);
         wire.extend_from_slice(&hybrid_sig.to_bytes());
         let signature_b64 = BASE64.encode(&wire);
 
