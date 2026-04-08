@@ -78,6 +78,13 @@ pub(crate) fn verify_signed_request(
         return Err(AppError::Unauthorized);
     }
 
+    // Enforce minimum signature version for downgrade resistance
+    if signature[0] < state.config.min_signature_version {
+        return Err(AppError::Forbidden(
+            "Signature version below server minimum",
+        ));
+    }
+
     let signing_data = auth::build_request_signing_data_v2(
         method,
         path,

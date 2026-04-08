@@ -375,6 +375,7 @@ async fn test_registration_rejects_expired_nonce() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -489,6 +490,7 @@ async fn test_nonce_rate_limiting() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -632,6 +634,7 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -736,6 +739,7 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -904,6 +908,7 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1000,6 +1005,7 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1264,6 +1270,7 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1648,6 +1655,7 @@ async fn test_nonce_rate_limiting_window_expiry() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -2751,6 +2759,7 @@ async fn test_revoke_rate_limiting() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -3673,6 +3682,7 @@ fn default_test_config() -> Config {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     }
 }
 

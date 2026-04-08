@@ -533,6 +533,7 @@ mod tests {
             prekey_upload_max_age_secs: 604800,
             prekey_serve_max_age_secs: 2_592_000,
             prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
         }
     }
 

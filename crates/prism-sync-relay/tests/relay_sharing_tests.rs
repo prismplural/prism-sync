@@ -564,6 +564,7 @@ async fn test_max_pending_limit_enforced() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _handle, _db) = start_test_relay_with_config(config).await;
@@ -818,6 +819,7 @@ async fn test_bundle_fetch_rate_limiting_ignores_spoofed_forwarded_headers() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _handle, _db) = start_test_relay_with_config(config).await;
@@ -924,6 +926,7 @@ async fn test_sharing_init_upload_rate_limiting() {
         prekey_upload_max_age_secs: 604800,
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let (url, _handle, _db) = start_test_relay_with_config(config).await;

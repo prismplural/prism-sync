@@ -89,6 +89,9 @@ pub struct Config {
     /// Maximum clock skew (in seconds) allowed for prekey timestamps in the
     /// future. Default: 300 (5 minutes).
     pub prekey_max_future_skew_secs: i64,
+    /// Minimum accepted signature version byte (default: 3).
+    /// Signatures with a version below this are rejected with 403.
+    pub min_signature_version: u8,
 }
 
 impl std::fmt::Debug for Config {
@@ -185,6 +188,7 @@ impl Config {
             prekey_upload_max_age_secs: parse_env("PREKEY_UPLOAD_MAX_AGE_SECS", 604800),
             prekey_serve_max_age_secs: parse_env("PREKEY_SERVE_MAX_AGE_SECS", 2_592_000),
             prekey_max_future_skew_secs: parse_env("PREKEY_MAX_FUTURE_SKEW_SECS", 300),
+            min_signature_version: parse_env("MIN_SIGNATURE_VERSION", 3),
         }
     }
 
