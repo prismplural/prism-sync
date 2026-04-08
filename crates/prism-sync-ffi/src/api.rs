@@ -10,8 +10,10 @@ use prism_sync_core::bootstrap::sharing_trust::{
     compute_sharing_fingerprint, evaluate_identity, TrustDecision,
 };
 use prism_sync_core::bootstrap::{
-    PrekeyStore, SharingIdentityBundle, SharingRecipient, SharingSender,
+    InitiatorCeremony, JoinerCeremony, PrekeyStore, RendezvousToken, SharingIdentityBundle,
+    SharingRecipient, SharingSender,
 };
+use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::models::{Invite, PairingResponse};
 use prism_sync_core::pairing::service::PairingService;
@@ -50,6 +52,10 @@ pub struct PrismSyncHandle {
     notification_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// Abort handle for the pending backoff delay task (if any).
     backoff_handle: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    /// In-progress joiner ceremony state (relay-based PQ pairing).
+    joiner_ceremony: std::sync::Mutex<Option<JoinerCeremony>>,
+    /// In-progress initiator ceremony state (relay-based PQ pairing).
+    initiator_ceremony: std::sync::Mutex<Option<InitiatorCeremony>>,
 }
 
 impl std::fmt::Debug for PrismSyncHandle {
@@ -735,6 +741,8 @@ pub fn create_prism_sync(
         driver_handle: std::sync::Mutex::new(None),
         notification_handle: std::sync::Mutex::new(None),
         backoff_handle: Arc::new(std::sync::Mutex::new(None)),
+        joiner_ceremony: std::sync::Mutex::new(None),
+        initiator_ceremony: std::sync::Mutex::new(None),
     })
 }
 
@@ -2744,6 +2752,427 @@ pub fn hex_encode(bytes: Vec<u8>) -> String {
 /// Hex-decode a string to bytes.
 pub fn hex_decode(hex_str: String) -> Result<Vec<u8>, String> {
     prism_sync_crypto::hex::decode(&hex_str).map_err(|e| e.to_string())
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Relay-based PQ pairing ceremony (Phase 3 bootstrap)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Build a `ServerPairingRelay` from the handle's relay URL.
+fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, String> {
+    let relay_url = &handle.relay_url;
+    if !handle.allow_insecure
+        && !relay_url.starts_with("https://")
+        && !relay_url.starts_with("http://localhost")
+    {
+        return Err(format!(
+            "PairingRelay requires HTTPS (got {relay_url:?}). \
+             Set allow_insecure=true for development."
+        ));
+    }
+    ServerPairingRelay::new(relay_url.clone())
+        .map_err(|e| format!("Failed to create PairingRelay: {e}"))
+}
+
+/// Start the joiner side of the relay-based PQ pairing ceremony.
+///
+/// Generates bootstrap keys, uploads them to the relay, and returns
+/// a JSON object with token bytes and a deep-link URL for QR encoding:
+///
+/// ```json
+/// {
+///   "token_bytes": [1, 2, ...],
+///   "token_url": "prismsync://pair?d=...",
+///   "device_id": "generated-device-id"
+/// }
+/// ```
+///
+/// The `JoinerCeremony` state is stored in the handle for subsequent calls
+/// to [`get_joiner_sas`] and [`complete_joiner_ceremony`].
+pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, String> {
+    let pairing_relay = build_pairing_relay(handle)?;
+
+    let inner = handle.inner.lock().await;
+    let pairing = PairingService::new(
+        // PairingService needs a SyncRelay for registration, but start_bootstrap_pairing
+        // only uses the PairingRelay argument. Build a temporary relay for the service.
+        build_relay(
+            &handle.relay_url,
+            "pending",
+            "pending",
+            "",
+            None,
+            handle.allow_insecure,
+            None,
+        )?,
+        inner.secure_store().clone(),
+    );
+    drop(inner);
+
+    let (ceremony, token) = pairing
+        .start_bootstrap_pairing(&pairing_relay, &handle.relay_url)
+        .await
+        .map_err(|e| encode_core_error("start_bootstrap_pairing", e))?;
+
+    let device_id = ceremony.device_id().to_string();
+
+    // Store ceremony state for later use
+    handle
+        .joiner_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
+        .replace(ceremony);
+
+    let result = serde_json::json!({
+        "token_bytes": token.to_bytes(),
+        "token_url": token.to_url(),
+        "device_id": device_id,
+    });
+    Ok(result.to_string())
+}
+
+/// Wait for the initiator's PairingInit and return the SAS display codes.
+///
+/// Polls the relay for the PairingInit slot until it arrives, then derives
+/// the shared secret and SAS codes. Returns JSON:
+///
+/// ```json
+/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// ```
+///
+/// Must be called after [`start_joiner_ceremony`].
+pub async fn get_joiner_sas(handle: &PrismSyncHandle) -> Result<String, String> {
+    let pairing_relay = build_pairing_relay(handle)?;
+
+    // Take the ceremony out so we can mutate it (process_pairing_init requires &mut self)
+    let mut ceremony = handle
+        .joiner_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
+        .take()
+        .ok_or_else(|| "no joiner ceremony in progress — call start_joiner_ceremony first".to_string())?;
+
+    // Poll for the PairingInit slot
+    use prism_sync_core::relay::PairingSlot;
+    let rendezvous_hex = ceremony.rendezvous_id_hex();
+    let init_bytes = poll_pairing_slot(&pairing_relay, &rendezvous_hex, PairingSlot::Init)
+        .await
+        .map_err(|e| format!("failed waiting for PairingInit: {e}"))?;
+
+    // Process the init to derive SAS
+    let sas = ceremony
+        .process_pairing_init(&init_bytes)
+        .map_err(|e| encode_core_error("process_pairing_init", e))?;
+
+    // Put ceremony back
+    handle
+        .joiner_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
+        .replace(ceremony);
+
+    let result = serde_json::json!({
+        "sas_words": sas.words,
+        "sas_decimal": sas.decimal,
+    });
+    Ok(result.to_string())
+}
+
+/// Complete the joiner side of the ceremony after SAS verification.
+///
+/// Sends the confirmation MAC, waits for encrypted credentials from the
+/// initiator, decrypts them, registers with the relay, and persists all
+/// credentials. Returns JSON:
+///
+/// ```json
+/// { "sync_id": "..." }
+/// ```
+///
+/// Must be called after [`get_joiner_sas`] and user SAS verification.
+pub async fn complete_joiner_ceremony(
+    handle: &PrismSyncHandle,
+    password: String,
+) -> Result<String, String> {
+    let pairing_relay = build_pairing_relay(handle)?;
+
+    // Take the ceremony out — it won't be needed again after completion
+    let ceremony = handle
+        .joiner_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
+        .take()
+        .ok_or_else(|| "no joiner ceremony in progress — call get_joiner_sas first".to_string())?;
+
+    // Build a SyncRelay for registration
+    let relay = build_relay(
+        &handle.relay_url,
+        "pending",
+        "pending",
+        "",
+        None,
+        handle.allow_insecure,
+        None,
+    )?;
+
+    let inner = handle.inner.lock().await;
+    let pairing = PairingService::new(relay, inner.secure_store().clone());
+    drop(inner);
+
+    // complete_bootstrap_join handles: confirmation MAC, wait for credentials,
+    // decrypt, register, persist, post joiner bundle
+    let (key_hierarchy, registry_snapshot) = pairing
+        .complete_bootstrap_join(&ceremony, &pairing_relay, &[], &password)
+        .await
+        .map_err(|e| encode_core_error("complete_bootstrap_join", e))?;
+
+    // Read sync_id from secure store (persisted by complete_bootstrap_join)
+    let mut inner = handle.inner.lock().await;
+    let sync_id = inner
+        .secure_store()
+        .get("sync_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or("sync_id not found after bootstrap join")?;
+
+    // Import the registry snapshot
+    DeviceRegistryManager::import_keyring(
+        inner.storage().as_ref(),
+        &sync_id,
+        &registry_snapshot.to_device_records(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Restore runtime keys so configureEngine etc. work
+    let dek = key_hierarchy.dek().map_err(|e| e.to_string())?;
+    let device_secret_bytes = inner
+        .secure_store()
+        .get("device_secret")
+        .map_err(|e| e.to_string())?
+        .ok_or("device_secret not found after join")?;
+    inner
+        .restore_runtime_keys(dek, &device_secret_bytes)
+        .map_err(|e| e.to_string())?;
+
+    // Restore epoch keys into the live key hierarchy
+    let epoch_val = inner
+        .secure_store()
+        .get("epoch")
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    if epoch_val > 0 {
+        let key_name = format!("epoch_key_{}", epoch_val);
+        match inner.secure_store().get(&key_name) {
+            Ok(Some(stored)) => {
+                match BASE64.decode(&stored) {
+                    Ok(decoded) if decoded.len() == 32 => {
+                        inner
+                            .key_hierarchy_mut()
+                            .store_epoch_key(epoch_val, zeroize::Zeroizing::new(decoded));
+                    }
+                    Ok(decoded) => {
+                        return Err(format!(
+                            "epoch_key_{} has wrong length ({}, expected 32)",
+                            epoch_val,
+                            decoded.len(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "epoch_key_{} base64 decode failed: {e}",
+                            epoch_val,
+                        ));
+                    }
+                }
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "epoch_key_{} not found in secure store",
+                    epoch_val,
+                ));
+            }
+            Err(e) => {
+                return Err(format!("Failed to read epoch_key_{}: {e}", epoch_val));
+            }
+        }
+    }
+
+    let result = serde_json::json!({ "sync_id": sync_id });
+    Ok(result.to_string())
+}
+
+/// Start the initiator side of the relay-based PQ pairing ceremony.
+///
+/// Parses the rendezvous token from QR/deep-link bytes, fetches the joiner's
+/// bootstrap, verifies the commitment, and posts the PairingInit. Returns
+/// the SAS display codes for user verification:
+///
+/// ```json
+/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// ```
+///
+/// The `InitiatorCeremony` state is stored in the handle for the subsequent
+/// call to [`complete_initiator_ceremony`].
+pub async fn start_initiator_ceremony(
+    handle: &PrismSyncHandle,
+    token_bytes: Vec<u8>,
+) -> Result<String, String> {
+    let token = RendezvousToken::from_bytes(&token_bytes)
+        .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
+
+    let pairing_relay = build_pairing_relay(handle)?;
+
+    // Build a SyncRelay so PairingService can load the current device identity
+    let inner = handle.inner.lock().await;
+    let secure_store = inner.secure_store().clone();
+    let device_id = inner
+        .secure_store()
+        .get("device_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "pending".to_string());
+    let sync_id = inner
+        .secure_store()
+        .get("sync_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "pending".to_string());
+    let session_token = inner
+        .secure_store()
+        .get("session_token")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    let device_secret_bytes = inner
+        .secure_store()
+        .get("device_secret")
+        .map_err(|e| e.to_string())?;
+    drop(inner);
+
+    let relay = build_relay(
+        &handle.relay_url,
+        &sync_id,
+        &device_id,
+        &session_token,
+        device_secret_bytes,
+        handle.allow_insecure,
+        None,
+    )?;
+
+    let pairing = PairingService::new(relay, secure_store);
+    let (ceremony, sas) = pairing
+        .start_bootstrap_initiator(token, &pairing_relay)
+        .await
+        .map_err(|e| encode_core_error("start_bootstrap_initiator", e))?;
+
+    // Store ceremony state for complete_initiator_ceremony
+    handle
+        .initiator_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
+        .replace(ceremony);
+
+    let result = serde_json::json!({
+        "sas_words": sas.words,
+        "sas_decimal": sas.decimal,
+    });
+    Ok(result.to_string())
+}
+
+/// Complete the initiator side of the ceremony after SAS verification.
+///
+/// Waits for the joiner's confirmation MAC, verifies it, then sends
+/// encrypted credentials to the joiner. Returns `"ok"` on success.
+///
+/// Must be called after [`start_initiator_ceremony`] and user SAS verification.
+pub async fn complete_initiator_ceremony(
+    handle: &PrismSyncHandle,
+    password: String,
+) -> Result<String, String> {
+    let pairing_relay = build_pairing_relay(handle)?;
+
+    // Take the ceremony out — it won't be needed again after completion
+    let ceremony = handle
+        .initiator_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
+        .take()
+        .ok_or_else(|| {
+            "no initiator ceremony in progress — call start_initiator_ceremony first".to_string()
+        })?;
+
+    // Build a SyncRelay for the PairingService (needs device identity + relay access)
+    let inner = handle.inner.lock().await;
+    let secure_store = inner.secure_store().clone();
+    let device_id = inner
+        .secure_store()
+        .get("device_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "pending".to_string());
+    let sync_id = inner
+        .secure_store()
+        .get("sync_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "pending".to_string());
+    let session_token = inner
+        .secure_store()
+        .get("session_token")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    let device_secret_bytes = inner
+        .secure_store()
+        .get("device_secret")
+        .map_err(|e| e.to_string())?;
+    drop(inner);
+
+    let relay = build_relay(
+        &handle.relay_url,
+        &sync_id,
+        &device_id,
+        &session_token,
+        device_secret_bytes,
+        handle.allow_insecure,
+        None,
+    )?;
+
+    let pairing = PairingService::new(relay, secure_store);
+    pairing
+        .complete_bootstrap_initiator(&ceremony, &pairing_relay, &password)
+        .await
+        .map_err(|e| encode_core_error("complete_bootstrap_initiator", e))?;
+
+    // Drain the store so Dart can pick up any updated values
+    // (epoch keys, registration token, etc.)
+    Ok("ok".to_string())
+}
+
+/// Poll a pairing relay slot with exponential backoff.
+///
+/// Retries up to ~60s with increasing delays before giving up.
+async fn poll_pairing_slot(
+    relay: &ServerPairingRelay,
+    rendezvous_id: &str,
+    slot: prism_sync_core::relay::PairingSlot,
+) -> Result<Vec<u8>, String> {
+    use prism_sync_core::relay::pairing_relay::PairingRelay;
+    use std::time::Duration;
+
+    let delays = [1, 1, 2, 2, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]; // ~60s total
+    for delay in &delays {
+        match relay.get_slot(rendezvous_id, slot).await {
+            Ok(Some(data)) => return Ok(data),
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_secs(*delay)).await;
+            }
+            Err(e) => return Err(format!("relay error polling {slot:?}: {e}")),
+        }
+    }
+    Err(format!("timeout waiting for pairing slot {slot:?}"))
 }
 
 #[cfg(test)]
