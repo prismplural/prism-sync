@@ -311,6 +311,7 @@ async fn successful_join_has_no_rollback_marker() {
 /// PairingRequest compact bytes encode and decode to identical fields, and
 /// public key sizes are correct (32 bytes each).
 #[test]
+#[allow(deprecated)]
 fn generate_pairing_request_compact_bytes_roundtrip() {
     let device_secret = DeviceSecret::generate();
     let device_id = "test-device-42";
@@ -345,6 +346,7 @@ fn generate_pairing_request_compact_bytes_roundtrip() {
 
 /// Compact bytes reject wrong-length public keys.
 #[test]
+#[allow(deprecated)]
 fn pairing_request_compact_bytes_rejects_bad_key_lengths() {
     let request = PairingRequest {
         device_id: "dev-1".into(),
@@ -519,6 +521,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
 /// Full roundtrip: Device A creates group, Device B generates request,
 /// Device A approves targeting B's device_id, Device B joins, and the
 /// registry snapshot contains both Device A and Device B entries.
+#[allow(deprecated)]
 #[tokio::test]
 async fn join_from_approval_roundtrip() {
     let password = "roundtrip-password";

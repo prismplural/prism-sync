@@ -47,6 +47,9 @@ impl PairingRequest {
     /// [32B ed25519_public_key]
     /// [32B x25519_public_key]
     /// ```
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
     pub fn to_compact_bytes(&self) -> Option<Vec<u8>> {
         if self.ed25519_public_key.len() != ED25519_PK_LEN {
             return None;
@@ -65,6 +68,9 @@ impl PairingRequest {
     }
 
     /// Decode from the compact binary format produced by [`to_compact_bytes`].
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
     pub fn from_compact_bytes(data: &[u8]) -> Option<Self> {
         let mut pos = 0;
 
@@ -314,6 +320,9 @@ impl PairingResponse {
     /// [2B epoch_key len][epoch_key]                — v0x04+; 0 or 32 bytes
     /// [2B registry_approval_sig len][raw sig]      — v0x05+; 0 or 64 bytes
     /// ```
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
     pub fn to_compact_bytes(&self) -> Option<Vec<u8>> {
         let mnemonic_entropy = prism_sync_crypto::mnemonic::to_bytes(&self.mnemonic).ok()?;
         if mnemonic_entropy.len() != MNEMONIC_ENTROPY_LEN {
@@ -366,6 +375,9 @@ impl PairingResponse {
     }
 
     /// Decode from the compact binary format produced by [`to_compact_bytes`].
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
     pub fn from_compact_bytes(data: &[u8]) -> Option<Self> {
         let mut pos = 0;
 
@@ -839,6 +851,10 @@ impl Invite {
     }
 
     /// Compact binary payload suitable for embedding in a QR code.
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
+    #[allow(deprecated)]
     pub fn qr_payload(&self) -> Vec<u8> {
         self.response.to_compact_bytes().expect(
             "PairingResponse must have valid BIP39 mnemonic, Ed25519 signature, and public key",
@@ -856,6 +872,10 @@ impl Invite {
 
     /// A deep-link URL (`prismsync://join?d=<base64url>`) that encodes the
     /// full [`PairingResponse`] in compact binary format.
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
+    #[allow(deprecated)]
     pub fn url(&self) -> String {
         let compact = self.response.to_compact_bytes().expect(
             "PairingResponse must have valid BIP39 mnemonic, Ed25519 signature, and public key",
@@ -865,6 +885,10 @@ impl Invite {
     }
 
     /// Parse an [`Invite`] back from a URL produced by [`Invite::url`].
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
+    #[allow(deprecated)]
     pub fn from_url(url: &str) -> Option<Self> {
         let data = url.strip_prefix("prismsync://join?d=")?;
         let bytes = URL_SAFE_NO_PAD.decode(data).ok()?;
@@ -873,6 +897,10 @@ impl Invite {
     }
 
     /// Parse an [`Invite`] from raw QR bytes produced by [`Invite::qr_payload`].
+    #[deprecated(
+        note = "QR-inline payloads exceed QR capacity with PQ keys. Use relay-based pairing flow."
+    )]
+    #[allow(deprecated)]
     pub fn from_qr_payload(bytes: &[u8]) -> Option<Self> {
         let response = PairingResponse::from_compact_bytes(bytes)?;
         Some(Self { response })
@@ -902,6 +930,7 @@ impl std::fmt::Debug for Invite {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

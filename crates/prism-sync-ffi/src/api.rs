@@ -1438,6 +1438,7 @@ fn build_relay(
 /// A placeholder `sync_id` is used for the registration call because the
 /// real `sync_id` is generated inside `PairingService::create_sync_group`.
 /// The relay server must accept registration at any sync-group path.
+#[allow(deprecated)]
 pub async fn create_sync_group(
     handle: &PrismSyncHandle,
     password: String,
@@ -1585,6 +1586,7 @@ pub async fn create_sync_group(
 /// for flexible transport.
 ///
 /// Returns JSON: `{ "qr_payload": [...], "request_json": "...", "device_id": "..." }`
+#[allow(deprecated)]
 pub async fn generate_pairing_request(_handle: &PrismSyncHandle) -> Result<String, String> {
     // Generate a fresh device identity for the joiner
     let device_secret = prism_sync_crypto::DeviceSecret::generate();
@@ -1639,6 +1641,7 @@ pub async fn generate_pairing_request(_handle: &PrismSyncHandle) -> Result<Strin
 /// Accepts the pairing request as either compact bytes (from QR scan) or JSON.
 ///
 /// Returns JSON: `{ "qr_payload": [...], "response_json": "...", "url": "..." }`
+#[allow(deprecated)]
 pub async fn approve_pairing_request(
     handle: &PrismSyncHandle,
     request_bytes: Option<Vec<u8>>,
@@ -1816,6 +1819,7 @@ pub async fn approve_pairing_request(
 /// Join an existing sync group from QR payload bytes.
 ///
 /// The relay is constructed on the Rust side from the invite's `relay_url`.
+#[allow(deprecated)]
 pub async fn join_from_qr(
     handle: &PrismSyncHandle,
     qr_bytes: Vec<u8>,
@@ -1829,6 +1833,7 @@ pub async fn join_from_qr(
 /// Join an existing sync group from a deep link URL.
 ///
 /// The relay is constructed on the Rust side from the invite's `relay_url`.
+#[allow(deprecated)]
 pub async fn join_from_url(
     handle: &PrismSyncHandle,
     url: String,
