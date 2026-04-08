@@ -336,6 +336,9 @@ pub struct CredentialBundle {
     pub signed_keyring: Vec<u8>,
     pub inviter_device_id: String,
     pub inviter_ed25519_pk: Vec<u8>,
+    /// ML-DSA-65 public key of the inviter (Phase 5 hybrid verification).
+    #[serde(default)]
+    pub inviter_ml_dsa_65_pk: Vec<u8>,
     pub registry_approval_signature: Option<String>,
     pub registration_token: Option<String>,
 }
@@ -648,6 +651,7 @@ mod tests {
             signed_keyring: vec![0xDD; 128],
             inviter_device_id: "inviter-device".to_string(),
             inviter_ed25519_pk: vec![0xEE; 32],
+            inviter_ml_dsa_65_pk: vec![0xFF; 1952],
             registry_approval_signature: Some("sig-hex".to_string()),
             registration_token: None,
         };
@@ -665,6 +669,7 @@ mod tests {
         assert_eq!(parsed.signed_keyring, bundle.signed_keyring);
         assert_eq!(parsed.inviter_device_id, bundle.inviter_device_id);
         assert_eq!(parsed.inviter_ed25519_pk, bundle.inviter_ed25519_pk);
+        assert_eq!(parsed.inviter_ml_dsa_65_pk, bundle.inviter_ml_dsa_65_pk);
         assert_eq!(
             parsed.registry_approval_signature,
             bundle.registry_approval_signature

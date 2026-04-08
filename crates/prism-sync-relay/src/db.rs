@@ -908,6 +908,7 @@ pub fn register_device(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn register_device_with_pq(
     conn: &Connection,
     sync_id: &str,

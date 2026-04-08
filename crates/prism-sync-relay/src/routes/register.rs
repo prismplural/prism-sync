@@ -252,18 +252,31 @@ async fn register_device(
         "Register request"
     );
 
-    // Verify Ed25519 challenge: proves the client holds the private key
-    if !auth::verify_ed25519_challenge(
-        &signing_pk,
-        &sync_id,
-        &body.device_id,
-        &body.nonce,
-        &challenge_sig,
-    ) {
+    // Verify challenge signature: hybrid V2 when ML-DSA key present, V1 otherwise
+    let challenge_valid = if !ml_dsa_pk.is_empty() {
+        auth::verify_hybrid_challenge(
+            &signing_pk,
+            &ml_dsa_pk,
+            &sync_id,
+            &body.device_id,
+            &body.nonce,
+            &challenge_sig,
+        )
+    } else {
+        auth::verify_ed25519_challenge(
+            &signing_pk,
+            &sync_id,
+            &body.device_id,
+            &body.nonce,
+            &challenge_sig,
+        )
+    };
+    if !challenge_valid {
         tracing::warn!(
             sync_id = %&sync_id[..16],
             device_id = %&body.device_id[..8.min(body.device_id.len())],
-            "Registration rejected: Ed25519 challenge verification failed"
+            has_pq_keys = !ml_dsa_pk.is_empty(),
+            "Registration rejected: challenge verification failed"
         );
         return Err(AppError::Unauthorized);
     }
@@ -512,7 +525,7 @@ fn do_register(
             "New device registered"
         );
         db::register_device_with_pq(
-            &tx, sync_id, device_id, signing_pk, x25519_pk, &ml_dsa_pk, &ml_kem_pk, epoch,
+            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, epoch,
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
         new_device_added = true;
@@ -683,27 +696,53 @@ fn verify_registry_approval(
     let approver_pk_bytes: [u8; 32] = approver_ed25519_pk
         .try_into()
         .map_err(|_| AppError::BadRequest("approver_ed25519_pk must be 32 bytes"))?;
+    let approver_ml_dsa_pk = if approval.approver_ml_dsa_65_pk.is_empty() {
+        Vec::new()
+    } else {
+        hex::decode(&approval.approver_ml_dsa_65_pk)
+            .map_err(|_| AppError::BadRequest("Invalid approver_ml_dsa_65_pk hex"))?
+    };
     let approval_signature_bytes = hex::decode(&approval.approval_signature)
         .map_err(|_| AppError::BadRequest("Invalid approval_signature hex"))?;
-    if approval_signature_bytes.len() != 64 {
-        return Err(AppError::BadRequest("approval_signature must be 64 bytes"));
+
+    // Detect V2 hybrid approval: signature starts with 0x02 version byte
+    if approval_signature_bytes.first() == Some(&0x02) {
+        // V2 hybrid approval verification
+        let sig_rest = &approval_signature_bytes[1..];
+        let hybrid_sig = prism_sync_crypto::pq::HybridSignature::from_bytes(sig_rest)
+            .map_err(|_| AppError::BadRequest("Invalid hybrid approval_signature"))?;
+        let mut approval_data = Vec::new();
+        approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V2\x00");
+        write_len_prefixed(&mut approval_data, sync_id.as_bytes());
+        write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
+        write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
+        hybrid_sig
+            .verify(&approval_data, &approver_pk_bytes, &approver_ml_dsa_pk)
+            .map_err(|_| AppError::Unauthorized)?;
+    } else {
+        // V1 Ed25519-only approval verification
+        if approval_signature_bytes.len() != 64 {
+            return Err(AppError::BadRequest("approval_signature must be 64 bytes"));
+        }
+        let approval_signature = Signature::from_slice(&approval_signature_bytes)
+            .map_err(|_| AppError::BadRequest("Invalid approval_signature"))?;
+        let approver_verifying_key = VerifyingKey::from_bytes(&approver_pk_bytes)
+            .map_err(|_| AppError::BadRequest("Invalid approver_ed25519_pk"))?;
+        let mut approval_data = Vec::new();
+        approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V1\x00");
+        write_len_prefixed(&mut approval_data, sync_id.as_bytes());
+        write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
+        write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
+        approver_verifying_key
+            .verify(&approval_data, &approval_signature)
+            .map_err(|_| AppError::Unauthorized)?;
     }
-    let approval_signature = Signature::from_slice(&approval_signature_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid approval_signature"))?;
-    let approver_verifying_key = VerifyingKey::from_bytes(&approver_pk_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid approver_ed25519_pk"))?;
 
-    let mut approval_data = Vec::new();
-    approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V1\x00");
-    write_len_prefixed(&mut approval_data, sync_id.as_bytes());
-    write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
-    write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
-    approver_verifying_key
-        .verify(&approval_data, &approval_signature)
-        .map_err(|_| AppError::Unauthorized)?;
-
-    let snapshot_entries =
-        verify_registry_snapshot(&approval.signed_registry_snapshot, &approver_pk_bytes)?;
+    let snapshot_entries = verify_registry_snapshot(
+        &approval.signed_registry_snapshot,
+        &approver_pk_bytes,
+        &approver_ml_dsa_pk,
+    )?;
     let snapshot_map = snapshot_entries_by_device(snapshot_entries, sync_id)?;
 
     let approver_entry = snapshot_map
@@ -760,8 +799,15 @@ fn verify_registry_approval(
 
 fn verify_registry_snapshot(
     signed_snapshot: &[u8],
-    approver_pk: &[u8; 32],
+    approver_ed25519_pk: &[u8; 32],
+    approver_ml_dsa_pk: &[u8],
 ) -> Result<Vec<RegistrySnapshotEntry>, AppError> {
+    // Detect V2 hybrid format: first byte is 0x02
+    if signed_snapshot.first() == Some(&0x02) {
+        return verify_registry_snapshot_v2(signed_snapshot, approver_ed25519_pk, approver_ml_dsa_pk);
+    }
+
+    // V1 Ed25519-only format: [64B signature][JSON]
     if signed_snapshot.len() < 64 {
         return Err(AppError::BadRequest("signed_registry_snapshot too short"));
     }
@@ -769,7 +815,7 @@ fn verify_registry_snapshot(
     let (signature_bytes, json_bytes) = signed_snapshot.split_at(64);
     let signature = Signature::from_slice(signature_bytes)
         .map_err(|_| AppError::BadRequest("Invalid signed_registry_snapshot signature"))?;
-    let verifying_key = VerifyingKey::from_bytes(approver_pk)
+    let verifying_key = VerifyingKey::from_bytes(approver_ed25519_pk)
         .map_err(|_| AppError::BadRequest("Invalid approver_ed25519_pk"))?;
 
     let mut signing_data =
@@ -778,6 +824,57 @@ fn verify_registry_snapshot(
     signing_data.extend_from_slice(json_bytes);
     verifying_key
         .verify(&signing_data, &signature)
+        .map_err(|_| AppError::Unauthorized)?;
+
+    let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
+        .map_err(|_| AppError::BadRequest("Invalid signed_registry_snapshot JSON"))?;
+    Ok(entries)
+}
+
+fn verify_registry_snapshot_v2(
+    signed_snapshot: &[u8],
+    approver_ed25519_pk: &[u8; 32],
+    approver_ml_dsa_pk: &[u8],
+) -> Result<Vec<RegistrySnapshotEntry>, AppError> {
+    use prism_sync_crypto::pq::HybridSignature;
+
+    // Wire format: [0x02][HybridSignature::to_bytes()][JSON]
+    let Some((_, remaining)) = signed_snapshot.split_first() else {
+        return Err(AppError::BadRequest("signed_registry_snapshot too short"));
+    };
+
+    // Parse the length-prefixed hybrid signature to find JSON start
+    if remaining.len() < 8 {
+        return Err(AppError::BadRequest("signed_registry_snapshot too short"));
+    }
+    let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap()) as usize;
+    if remaining.len() < 4 + ed_len + 4 {
+        return Err(AppError::BadRequest("signed_registry_snapshot truncated"));
+    }
+    let ml_len_offset = 4 + ed_len;
+    let ml_len = u32::from_le_bytes(
+        remaining[ml_len_offset..ml_len_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let signature_len = ml_len_offset + 4 + ml_len;
+    if remaining.len() <= signature_len {
+        return Err(AppError::BadRequest(
+            "signed_registry_snapshot missing JSON payload",
+        ));
+    }
+
+    let signature = HybridSignature::from_bytes(&remaining[..signature_len])
+        .map_err(|_| AppError::BadRequest("Invalid hybrid registry snapshot signature"))?;
+    let json_bytes = &remaining[signature_len..];
+
+    let mut signing_data =
+        Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V2\x00".len() + json_bytes.len());
+    signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V2\x00");
+    signing_data.extend_from_slice(json_bytes);
+
+    signature
+        .verify(&signing_data, approver_ed25519_pk, approver_ml_dsa_pk)
         .map_err(|_| AppError::Unauthorized)?;
 
     let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)

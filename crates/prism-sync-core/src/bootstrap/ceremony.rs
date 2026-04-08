@@ -484,6 +484,7 @@ mod tests {
             signed_keyring: vec![0xDD; 128],
             inviter_device_id: "inviter-dev".to_string(),
             inviter_ed25519_pk: vec![0xEE; 32],
+            inviter_ml_dsa_65_pk: Vec::new(),
             registry_approval_signature: None,
             registration_token: None,
         }

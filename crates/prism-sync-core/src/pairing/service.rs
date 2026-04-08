@@ -94,24 +94,36 @@ impl PairingService {
         let exchange_key = device_secret
             .x25519_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let pq_signing_key = device_secret
+            .ml_dsa_65_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
+        let pq_kem_key = device_secret
+            .ml_kem_768_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
         // 5b. Pre-generate a device_id for the joining device (snapshot targeting)
         let joiner_device_id = crate::node_id::generate_node_id();
 
-        // 6. Sign the invitation with the inviter's Ed25519 key (CRITICAL-1)
-        let signing_data = build_invitation_signing_data(
+        // 6. Sign the invitation with hybrid keys (CRITICAL-1)
+        let signing_data = build_invitation_signing_data_v2(
             &sync_id,
             relay_url,
             &wrapped_dek,
             &salt,
             &device_id,
             &signing_key.public_key_bytes(),
+            &pq_signing_key.public_key_bytes(),
             Some(&joiner_device_id),
             0,
             &[],
         );
-        let signature = signing_key.sign(&signing_data);
-        let signed_invitation_hex = hex::encode(&signature);
+        let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: signing_key.sign(&signing_data),
+            ml_dsa_65_sig: pq_signing_key.sign(&signing_data),
+        };
+        let mut invitation_wire = vec![0x02u8];
+        invitation_wire.extend_from_slice(&hybrid_sig.to_bytes());
+        let signed_invitation_hex = hex::encode(&invitation_wire);
 
         // 7. Build signed registry snapshot (typed, verifiable device records)
         let registry_snapshot = SignedRegistrySnapshot::new(vec![RegistrySnapshotEntry {
@@ -119,11 +131,11 @@ impl PairingService {
             device_id: device_id.clone(),
             ed25519_public_key: signing_key.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
+            ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
             status: "active".into(),
         }]);
-        let signed_keyring = registry_snapshot.sign(&signing_key);
+        let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
         // 8. Build PairingResponse for the Invite
         let response = PairingResponse {
@@ -136,6 +148,7 @@ impl PairingService {
             signed_keyring,
             inviter_device_id: device_id.clone(),
             inviter_ed25519_pk: signing_key.public_key_bytes().to_vec(),
+            inviter_ml_dsa_65_pk: pq_signing_key.public_key_bytes(),
             joiner_device_id: Some(joiner_device_id.clone()),
             current_epoch: 0,
             epoch_key: vec![],
@@ -155,26 +168,22 @@ impl PairingService {
         let pow_solution = solve_registration_pow(&sync_id, &device_id, &nonce_response)?;
         let nonce = nonce_response.nonce;
 
-        // Build canonical challenge data matching the relay's verification format:
-        // "PRISM_SYNC_CHALLENGE_V1" || 0x00 || len_prefixed(sync_id) || len_prefixed(device_id) || len_prefixed(nonce)
-        let mut challenge_data = Vec::new();
-        challenge_data.extend_from_slice(b"PRISM_SYNC_CHALLENGE_V1\x00");
-        fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
-            buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            buf.extend_from_slice(data);
-        }
-        write_len_prefixed(&mut challenge_data, sync_id.as_bytes());
-        write_len_prefixed(&mut challenge_data, device_id.as_bytes());
-        write_len_prefixed(&mut challenge_data, nonce.as_bytes());
-        let challenge_signature = signing_key.sign(&challenge_data);
+        // Build V2 hybrid challenge signature
+        let challenge_signature = build_hybrid_challenge_signature(
+            &signing_key,
+            &pq_signing_key,
+            &sync_id,
+            &device_id,
+            &nonce,
+        );
 
         // 10. Register with relay using signed challenge
         let register_req = crate::relay::traits::RegisterRequest {
             device_id: device_id.clone(),
             signing_public_key: signing_key.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
+            ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
             registration_challenge: challenge_signature,
             nonce,
             pow_solution,
@@ -239,28 +248,55 @@ impl PairingService {
             .try_into()
             .map_err(|_| CoreError::Engine("invalid inviter public key length".into()))?;
 
-        let signing_data = build_invitation_signing_data(
-            &response.sync_id,
-            &response.relay_url,
-            &response.wrapped_dek,
-            &response.salt,
-            &response.inviter_device_id,
-            &inviter_pk,
-            response.joiner_device_id.as_deref(),
-            response.current_epoch,
-            &response.epoch_key,
-        );
+        let has_inviter_pq = !response.inviter_ml_dsa_65_pk.is_empty();
 
         let sig_bytes = prism_sync_crypto::hex::decode(&response.signed_invitation)
             .map_err(CoreError::Crypto)?;
 
-        DeviceSigningKey::verify(&inviter_pk, &signing_data, &sig_bytes)
-            .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?;
+        if has_inviter_pq {
+            // V2 hybrid invitation verification
+            let signing_data = build_invitation_signing_data_v2(
+                &response.sync_id,
+                &response.relay_url,
+                &response.wrapped_dek,
+                &response.salt,
+                &response.inviter_device_id,
+                &inviter_pk,
+                &response.inviter_ml_dsa_65_pk,
+                response.joiner_device_id.as_deref(),
+                response.current_epoch,
+                &response.epoch_key,
+            );
+            verify_hybrid_invitation(&signing_data, &sig_bytes, &inviter_pk, &response.inviter_ml_dsa_65_pk)?;
+        } else {
+            // V1 Ed25519-only invitation verification (backward compat)
+            let signing_data = build_invitation_signing_data(
+                &response.sync_id,
+                &response.relay_url,
+                &response.wrapped_dek,
+                &response.salt,
+                &response.inviter_device_id,
+                &inviter_pk,
+                response.joiner_device_id.as_deref(),
+                response.current_epoch,
+                &response.epoch_key,
+            );
+            DeviceSigningKey::verify(&inviter_pk, &signing_data, &sig_bytes)
+                .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?;
+        }
 
         // 1b. Verify and decode the signed registry snapshot
-        let registry_snapshot =
+        let registry_snapshot = if has_inviter_pq {
+            SignedRegistrySnapshot::verify_and_decode_hybrid(
+                &response.signed_keyring,
+                &inviter_pk,
+                &response.inviter_ml_dsa_65_pk,
+            )
+            .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
+        } else {
             SignedRegistrySnapshot::verify_and_decode(&response.signed_keyring, &inviter_pk)
-                .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?;
+                .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
+        };
 
         // 2. Unlock key hierarchy
         let secret_key = mnemonic::to_bytes(&response.mnemonic).map_err(CoreError::Crypto)?;
@@ -280,8 +316,14 @@ impl PairingService {
         let exchange_key = device_secret
             .x25519_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let pq_signing_key = device_secret
+            .ml_dsa_65_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
+        let pq_kem_key = device_secret
+            .ml_kem_768_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
-        // 4. Fetch registration nonce and build challenge-response (CRITICAL-2)
+        // 4. Fetch registration nonce and build V2 hybrid challenge (CRITICAL-2)
         let nonce_response = self
             .relay
             .get_registration_nonce()
@@ -290,17 +332,13 @@ impl PairingService {
         let pow_solution = solve_registration_pow(&response.sync_id, &device_id, &nonce_response)?;
         let nonce = nonce_response.nonce;
 
-        // Build canonical challenge data matching the relay's verification format
-        let mut challenge_data = Vec::new();
-        challenge_data.extend_from_slice(b"PRISM_SYNC_CHALLENGE_V1\x00");
-        fn write_len_prefixed_join(buf: &mut Vec<u8>, data: &[u8]) {
-            buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            buf.extend_from_slice(data);
-        }
-        write_len_prefixed_join(&mut challenge_data, response.sync_id.as_bytes());
-        write_len_prefixed_join(&mut challenge_data, device_id.as_bytes());
-        write_len_prefixed_join(&mut challenge_data, nonce.as_bytes());
-        let challenge_signature = signing_key.sign(&challenge_data);
+        let challenge_signature = build_hybrid_challenge_signature(
+            &signing_key,
+            &pq_signing_key,
+            &response.sync_id,
+            &device_id,
+            &nonce,
+        );
 
         // 5. Register with relay
         let registry_approval =
@@ -310,7 +348,7 @@ impl PairingService {
                 .map(|approval_signature| RegistryApproval {
                     approver_device_id: response.inviter_device_id.clone(),
                     approver_ed25519_pk: hex::encode(&response.inviter_ed25519_pk),
-                    approver_ml_dsa_65_pk: String::new(),
+                    approver_ml_dsa_65_pk: hex::encode(&response.inviter_ml_dsa_65_pk),
                     approval_signature: approval_signature.clone(),
                     signed_registry_snapshot: response.signed_keyring.clone(),
                 });
@@ -320,8 +358,8 @@ impl PairingService {
                 device_id: device_id.clone(),
                 signing_public_key: signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
+                ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
                 registration_challenge: challenge_signature,
                 nonce,
                 pow_solution,
@@ -427,9 +465,18 @@ impl PairingService {
             .clone()
             .try_into()
             .map_err(|_| CoreError::Engine("invalid inviter public key length".into()))?;
-        let registry_snapshot =
+        let has_inviter_pq = !bundle.inviter_ml_dsa_65_pk.is_empty();
+        let registry_snapshot = if has_inviter_pq {
+            SignedRegistrySnapshot::verify_and_decode_hybrid(
+                &bundle.signed_keyring,
+                &inviter_pk,
+                &bundle.inviter_ml_dsa_65_pk,
+            )
+            .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
+        } else {
             SignedRegistrySnapshot::verify_and_decode(&bundle.signed_keyring, &inviter_pk)
-                .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?;
+                .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
+        };
 
         let secret_key = mnemonic::to_bytes(&bundle.mnemonic).map_err(CoreError::Crypto)?;
         let mut key_hierarchy = KeyHierarchy::new();
@@ -445,6 +492,12 @@ impl PairingService {
         let exchange_key = device_secret
             .x25519_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let pq_signing_key = device_secret
+            .ml_dsa_65_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
+        let pq_kem_key = device_secret
+            .ml_kem_768_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
         let sync_id = bundle.sync_id.clone();
         let nonce_response = self
@@ -454,16 +507,14 @@ impl PairingService {
             .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
         let pow_solution = solve_registration_pow(&sync_id, &device_id, &nonce_response)?;
         let nonce = nonce_response.nonce;
-        let mut challenge_data = Vec::new();
-        challenge_data.extend_from_slice(b"PRISM_SYNC_CHALLENGE_V1\x00");
-        fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
-            buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            buf.extend_from_slice(data);
-        }
-        write_len_prefixed(&mut challenge_data, sync_id.as_bytes());
-        write_len_prefixed(&mut challenge_data, device_id.as_bytes());
-        write_len_prefixed(&mut challenge_data, nonce.as_bytes());
-        let challenge_signature = signing_key.sign(&challenge_data);
+
+        let challenge_signature = build_hybrid_challenge_signature(
+            &signing_key,
+            &pq_signing_key,
+            &sync_id,
+            &device_id,
+            &nonce,
+        );
 
         let registry_approval =
             bundle
@@ -472,7 +523,7 @@ impl PairingService {
                 .map(|approval_signature| RegistryApproval {
                     approver_device_id: bundle.inviter_device_id.clone(),
                     approver_ed25519_pk: hex::encode(&bundle.inviter_ed25519_pk),
-                    approver_ml_dsa_65_pk: String::new(),
+                    approver_ml_dsa_65_pk: hex::encode(&bundle.inviter_ml_dsa_65_pk),
                     approval_signature: approval_signature.clone(),
                     signed_registry_snapshot: bundle.signed_keyring.clone(),
                 });
@@ -483,8 +534,8 @@ impl PairingService {
                 device_id: device_id.clone(),
                 signing_public_key: signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
+                ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
                 registration_challenge: challenge_signature,
                 nonce,
                 pow_solution,
@@ -581,6 +632,12 @@ impl PairingService {
         let exchange_key = device_secret
             .x25519_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let pq_signing_key = device_secret
+            .ml_dsa_65_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
+        let pq_kem_key = device_secret
+            .ml_kem_768_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
         let mut key_hierarchy = KeyHierarchy::new();
         let sync_id = self.load_secure_string("sync_id")?;
@@ -630,8 +687,8 @@ impl PairingService {
             device_id: device_id.clone(),
             ed25519_public_key: signing_key.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
+            ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
             status: "active".into(),
         });
         snapshot_entries.push(RegistrySnapshotEntry {
@@ -639,16 +696,24 @@ impl PairingService {
             device_id: bootstrap_record.device_id.clone(),
             ed25519_public_key: bootstrap_record.ed25519_public_key.to_vec(),
             x25519_public_key: bootstrap_record.x25519_public_key.to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
+            ml_dsa_65_public_key: bootstrap_record.ml_dsa_65_public_key.clone(),
+            ml_kem_768_public_key: bootstrap_record.ml_kem_768_ek().to_vec(),
             status: "active".into(),
         });
 
         let registry_snapshot = SignedRegistrySnapshot::new(snapshot_entries);
-        let signed_keyring = registry_snapshot.sign(&signing_key);
-        let approval_signature = hex::encode(signing_key.sign(
-            &build_registry_approval_signing_data(&sync_id, &device_id, &signed_keyring),
-        ));
+        let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+
+        // V2 hybrid registry approval signature
+        let approval_data =
+            build_registry_approval_signing_data_v2(&sync_id, &device_id, &signed_keyring);
+        let hybrid_approval = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: signing_key.sign(&approval_data),
+            ml_dsa_65_sig: pq_signing_key.sign(&approval_data),
+        };
+        let mut approval_wire = vec![0x02u8];
+        approval_wire.extend_from_slice(&hybrid_approval.to_bytes());
+        let approval_signature = hex::encode(&approval_wire);
 
         let credential_bundle = BootstrapCredentialBundle {
             sync_id: sync_id.clone(),
@@ -661,6 +726,7 @@ impl PairingService {
             signed_keyring: signed_keyring.clone(),
             inviter_device_id: device_id.clone(),
             inviter_ed25519_pk: signing_key.public_key_bytes().to_vec(),
+            inviter_ml_dsa_65_pk: pq_signing_key.public_key_bytes(),
             registry_approval_signature: Some(approval_signature),
             registration_token: self.load_optional_secure_string("registration_token")?,
         };
@@ -828,6 +894,60 @@ impl PairingService {
         let device_id = expected_device_id.unwrap_or_else(crate::node_id::generate_node_id);
         Ok((DeviceSecret::generate(), device_id))
     }
+}
+
+/// Verify a V2 hybrid invitation signature.
+///
+/// The signature wire format is `[0x02][HybridSignature::to_bytes()]`.
+fn verify_hybrid_invitation(
+    signing_data: &[u8],
+    sig_bytes: &[u8],
+    inviter_ed25519_pk: &[u8; 32],
+    inviter_ml_dsa_65_pk: &[u8],
+) -> Result<()> {
+    let Some((&version, sig_rest)) = sig_bytes.split_first() else {
+        return Err(CoreError::Engine("invitation signature too short".into()));
+    };
+    if version != 0x02 {
+        return Err(CoreError::Engine(format!(
+            "unsupported invitation signature version: 0x{version:02x}"
+        )));
+    }
+    let hybrid_sig = prism_sync_crypto::pq::HybridSignature::from_bytes(sig_rest)
+        .map_err(|e| CoreError::Engine(format!("invitation hybrid signature invalid: {e}")))?;
+    hybrid_sig
+        .verify(signing_data, inviter_ed25519_pk, inviter_ml_dsa_65_pk)
+        .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?;
+    Ok(())
+}
+
+/// Build a V2 hybrid challenge signature for relay registration.
+///
+/// Wire format: `[0x02][HybridSignature::to_bytes()]`
+fn build_hybrid_challenge_signature(
+    signing_key: &prism_sync_crypto::DeviceSigningKey,
+    pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    sync_id: &str,
+    device_id: &str,
+    nonce: &str,
+) -> Vec<u8> {
+    fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
+        buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        buf.extend_from_slice(data);
+    }
+    let mut challenge_data = Vec::new();
+    challenge_data.extend_from_slice(b"PRISM_SYNC_CHALLENGE_V2\x00");
+    write_len_prefixed(&mut challenge_data, sync_id.as_bytes());
+    write_len_prefixed(&mut challenge_data, device_id.as_bytes());
+    write_len_prefixed(&mut challenge_data, nonce.as_bytes());
+
+    let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
+        ed25519_sig: signing_key.sign(&challenge_data),
+        ml_dsa_65_sig: pq_signing_key.sign(&challenge_data),
+    };
+    let mut wire = vec![0x02u8];
+    wire.extend_from_slice(&hybrid_sig.to_bytes());
+    wire
 }
 
 fn solve_registration_pow(
@@ -1629,6 +1749,7 @@ mod tests {
             signed_keyring: vec![0xCC; 200],
             inviter_device_id: "device-001".into(),
             inviter_ed25519_pk: vec![0xAA; 32],
+            inviter_ml_dsa_65_pk: Vec::new(),
             joiner_device_id: Some("abcdef123456".to_string()),
             current_epoch: 1,
             epoch_key: vec![],
@@ -1692,29 +1813,30 @@ mod tests {
 
         let resp = invite.response();
 
-        // The signed_invitation should be non-empty (hex-encoded Ed25519 signature)
+        // The signed_invitation should be non-empty (hex-encoded V2 hybrid signature)
         assert!(!resp.signed_invitation.is_empty());
-        assert_eq!(resp.signed_invitation.len(), 128); // 64-byte signature hex-encoded
 
         // The inviter fields should be populated
         assert!(!resp.inviter_device_id.is_empty());
         assert_eq!(resp.inviter_ed25519_pk.len(), 32);
+        assert!(!resp.inviter_ml_dsa_65_pk.is_empty());
 
-        // Verify the signature manually
+        // Verify the V2 hybrid invitation signature manually
         let inviter_pk: [u8; 32] = resp.inviter_ed25519_pk.clone().try_into().unwrap();
-        let signing_data = build_invitation_signing_data(
+        let signing_data = build_invitation_signing_data_v2(
             &resp.sync_id,
             &resp.relay_url,
             &resp.wrapped_dek,
             &resp.salt,
             &resp.inviter_device_id,
             &inviter_pk,
+            &resp.inviter_ml_dsa_65_pk,
             resp.joiner_device_id.as_deref(),
             resp.current_epoch,
             &resp.epoch_key,
         );
         let sig_bytes = prism_sync_crypto::hex::decode(&resp.signed_invitation).unwrap();
-        DeviceSigningKey::verify(&inviter_pk, &signing_data, &sig_bytes).unwrap();
+        verify_hybrid_invitation(&signing_data, &sig_bytes, &inviter_pk, &resp.inviter_ml_dsa_65_pk).unwrap();
     }
 
     #[tokio::test]
@@ -1954,8 +2076,11 @@ mod tests {
         let captured = relay.captured_req.lock().unwrap();
         let req = captured.as_ref().expect("registration request captured");
 
-        // Challenge signature should be 64 bytes (Ed25519)
-        assert_eq!(req.registration_challenge.len(), 64);
+        // Challenge signature should be V2 hybrid format: [0x02][HybridSignature]
+        assert_eq!(req.registration_challenge[0], 0x02);
+        // HybridSignature = 4B ed_len + 64B ed_sig + 4B ml_len + 3309B ml_sig = 3381
+        // plus 1B version prefix = 3382
+        assert_eq!(req.registration_challenge.len(), 3382);
         // Nonce should be the one we returned
         assert_eq!(req.nonce, "test-nonce-12345");
         assert!(req.pow_solution.is_none());
@@ -2126,6 +2251,7 @@ mod tests {
             signed_keyring: signed_keyring.clone(),
             inviter_device_id: inviter_device_id.clone(),
             inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
+            inviter_ml_dsa_65_pk: Vec::new(),
             joiner_device_id: Some(joiner_device_id.clone()),
             current_epoch: 0,
             epoch_key: vec![],
@@ -2244,6 +2370,7 @@ mod tests {
             signed_keyring,
             inviter_device_id,
             inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
+            inviter_ml_dsa_65_pk: Vec::new(),
             joiner_device_id: Some(joiner_device_id),
             current_epoch: 0,
             epoch_key: vec![],

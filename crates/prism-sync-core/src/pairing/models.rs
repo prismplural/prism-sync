@@ -169,6 +169,12 @@ pub struct PairingResponse {
     /// `signed_invitation` and the signature inside `signed_keyring`.
     pub inviter_ed25519_pk: Vec<u8>,
 
+    /// ML-DSA-65 public key of the inviter (1952 bytes). Used together with
+    /// `inviter_ed25519_pk` for Phase 5 hybrid verification of
+    /// `signed_invitation` and `signed_keyring`.
+    #[serde(default)]
+    pub inviter_ml_dsa_65_pk: Vec<u8>,
+
     /// Device ID of the joining device, if the invitation targets a
     /// specific device. `None` for open invitations.
     #[serde(default)]
@@ -235,10 +241,38 @@ impl PairingResponse {
     /// * `"existing_group"` -- all other cases (multiple devices, or a
     ///   single device that does not match the inviter).
     pub fn admission_context(&self) -> &'static str {
-        if self.signed_keyring.len() <= ED25519_SIG_LEN {
-            return "existing_group";
-        }
-        let json_bytes = &self.signed_keyring[ED25519_SIG_LEN..];
+        let json_bytes = if self.signed_keyring.first() == Some(&HYBRID_SIGNATURE_VERSION_V2) {
+            // V2 hybrid format: [0x02][HybridSignature][JSON]
+            // Parse length-prefixed hybrid sig to find JSON start
+            let remaining = &self.signed_keyring[1..];
+            if remaining.len() < 8 {
+                return "existing_group";
+            }
+            let ed_len = u32::from_le_bytes(
+                remaining[0..4].try_into().unwrap_or([0; 4]),
+            ) as usize;
+            if remaining.len() < 4 + ed_len + 4 {
+                return "existing_group";
+            }
+            let ml_len_offset = 4 + ed_len;
+            let ml_len = u32::from_le_bytes(
+                remaining[ml_len_offset..ml_len_offset + 4]
+                    .try_into()
+                    .unwrap_or([0; 4]),
+            ) as usize;
+            let signature_len = ml_len_offset + 4 + ml_len;
+            if remaining.len() <= signature_len {
+                return "existing_group";
+            }
+            &remaining[signature_len..]
+        } else {
+            // V1 Ed25519-only format: [64B signature][JSON]
+            if self.signed_keyring.len() <= ED25519_SIG_LEN {
+                return "existing_group";
+            }
+            &self.signed_keyring[ED25519_SIG_LEN..]
+        };
+
         let entries: Vec<RegistrySnapshotEntry> = match serde_json::from_slice(json_bytes) {
             Ok(e) => e,
             Err(_) => return "existing_group",
@@ -443,6 +477,7 @@ impl PairingResponse {
             signed_keyring,
             inviter_device_id,
             inviter_ed25519_pk,
+            inviter_ml_dsa_65_pk: Vec::new(),
             joiner_device_id,
             current_epoch,
             epoch_key,
@@ -883,6 +918,7 @@ mod tests {
             signed_keyring: vec![0xCC; 200], // sig + keyring JSON
             inviter_device_id: "device-001".into(),
             inviter_ed25519_pk: vec![0xAA; 32],
+            inviter_ml_dsa_65_pk: Vec::new(),
             joiner_device_id: Some("abcdef123456".to_string()),
             current_epoch: 2,
             epoch_key: vec![0xBB; 32],
