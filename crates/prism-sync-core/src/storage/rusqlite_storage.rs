@@ -114,6 +114,8 @@ fn row_to_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecor
         device_id: row.get("device_id")?,
         ed25519_public_key: row.get("ed25519_public_key")?,
         x25519_public_key: row.get("x25519_public_key")?,
+        ml_dsa_65_public_key: row.get("ml_dsa_65_public_key")?,
+        ml_kem_768_public_key: row.get("ml_kem_768_public_key")?,
         status: row.get("status")?,
         registered_at: DateTime::parse_from_rfc3339(&registered_str)
             .map(|d| d.with_timezone(&Utc))
@@ -431,14 +433,17 @@ fn exec_upsert_field_version(conn: &Connection, fv: &FieldVersion) -> Result<()>
 fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO device_registry \
-         (sync_id, device_id, ed25519_public_key, x25519_public_key, status, \
+         (sync_id, device_id, ed25519_public_key, x25519_public_key, \
+          ml_dsa_65_public_key, ml_kem_768_public_key, status, \
           registered_at, revoked_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             device.sync_id,
             device.device_id,
             device.ed25519_public_key,
             device.x25519_public_key,
+            device.ml_dsa_65_public_key,
+            device.ml_kem_768_public_key,
             device.status,
             device.registered_at.to_rfc3339(),
             device.revoked_at.map(|d| d.to_rfc3339()),
@@ -553,10 +558,14 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
         .query_map(params![sync_id], |row| {
             let ed25519: Vec<u8> = row.get("ed25519_public_key")?;
             let x25519: Vec<u8> = row.get("x25519_public_key")?;
+            let ml_dsa: Vec<u8> = row.get("ml_dsa_65_public_key")?;
+            let ml_kem: Vec<u8> = row.get("ml_kem_768_public_key")?;
             Ok(DeviceRegistryEntry {
                 device_id: row.get("device_id")?,
                 ed25519_public_key: hex::encode(ed25519),
                 x25519_public_key: hex::encode(x25519),
+                ml_dsa_65_public_key: hex::encode(ml_dsa),
+                ml_kem_768_public_key: hex::encode(ml_kem),
                 status: row.get("status")?,
                 registered_at: row.get("registered_at")?,
                 revoked_at: row.get("revoked_at")?,
@@ -668,16 +677,23 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
             .map_err(|e| CoreError::Storage(format!("bad hex in ed25519_public_key: {e}")))?;
         let x25519 = hex::decode(&dr.x25519_public_key)
             .map_err(|e| CoreError::Storage(format!("bad hex in x25519_public_key: {e}")))?;
+        let ml_dsa = hex::decode(&dr.ml_dsa_65_public_key)
+            .map_err(|e| CoreError::Storage(format!("bad hex in ml_dsa_65_public_key: {e}")))?;
+        let ml_kem = hex::decode(&dr.ml_kem_768_public_key)
+            .map_err(|e| CoreError::Storage(format!("bad hex in ml_kem_768_public_key: {e}")))?;
         conn.execute(
             "INSERT OR REPLACE INTO device_registry \
-             (sync_id, device_id, ed25519_public_key, x25519_public_key, status, \
+             (sync_id, device_id, ed25519_public_key, x25519_public_key, \
+              ml_dsa_65_public_key, ml_kem_768_public_key, status, \
               registered_at, revoked_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 sync_id,
                 dr.device_id,
                 ed25519,
                 x25519,
+                ml_dsa,
+                ml_kem,
                 dr.status,
                 dr.registered_at,
                 dr.revoked_at,
@@ -1110,6 +1126,8 @@ mod tests {
             device_id: device_id.to_string(),
             ed25519_public_key: vec![1, 2, 3, 4],
             x25519_public_key: vec![5, 6, 7, 8],
+            ml_dsa_65_public_key: vec![9u8; 1952],
+            ml_kem_768_public_key: vec![10u8; 1184],
             status: "active".to_string(),
             registered_at: Utc::now(),
             revoked_at: None,
@@ -1756,6 +1774,8 @@ mod tests {
         let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
         assert_eq!(d1.ed25519_public_key, vec![1, 2, 3, 4]);
         assert_eq!(d1.x25519_public_key, vec![5, 6, 7, 8]);
+        assert_eq!(d1.ml_dsa_65_public_key, vec![9u8; 1952]);
+        assert_eq!(d1.ml_kem_768_public_key, vec![10u8; 1184]);
 
         // Verify applied_ops were imported
         assert!(dst.is_op_applied("applied-1").unwrap());
@@ -1815,6 +1835,8 @@ mod tests {
         for dr in &snapshot.device_registry {
             assert_eq!(dr.ed25519_public_key, "01020304");
             assert_eq!(dr.x25519_public_key, "05060708");
+            assert_eq!(dr.ml_dsa_65_public_key, hex::encode(vec![9u8; 1952]));
+            assert_eq!(dr.ml_kem_768_public_key, hex::encode(vec![10u8; 1184]));
         }
     }
 

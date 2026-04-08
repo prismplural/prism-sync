@@ -17,6 +17,8 @@ impl DeviceRegistryManager {
     fn keys_match(existing: &DeviceRecord, candidate: &DeviceRecord) -> bool {
         existing.ed25519_public_key == candidate.ed25519_public_key
             && existing.x25519_public_key == candidate.x25519_public_key
+            && existing.ml_dsa_65_public_key == candidate.ml_dsa_65_public_key
+            && existing.ml_kem_768_public_key == candidate.ml_kem_768_public_key
     }
 
     fn write_device_record(storage: &dyn SyncStorage, device: &DeviceRecord) -> Result<()> {
@@ -120,6 +122,8 @@ impl DeviceRegistryManager {
                 device_id: device.device_id.clone(),
                 ed25519_public_key: existing.ed25519_public_key,
                 x25519_public_key: existing.x25519_public_key,
+                ml_dsa_65_public_key: existing.ml_dsa_65_public_key,
+                ml_kem_768_public_key: existing.ml_kem_768_public_key,
                 status: device.status.clone(),
                 registered_at: existing.registered_at,
                 revoked_at: if device.status == "revoked" {
@@ -194,6 +198,8 @@ mod tests {
             device_id: device_id.into(),
             ed25519_public_key: ed_pk.to_vec(),
             x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: vec![0u8; 1952],
+            ml_kem_768_public_key: vec![0u8; 1184],
             status: "active".into(),
             registered_at: Utc::now(),
             revoked_at: None,

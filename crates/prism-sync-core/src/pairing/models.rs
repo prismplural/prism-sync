@@ -643,6 +643,8 @@ impl SignedRegistrySnapshot {
                 device_id: e.device_id.clone(),
                 ed25519_public_key: e.ed25519_public_key.clone(),
                 x25519_public_key: e.x25519_public_key.clone(),
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: e.status.clone(),
                 registered_at: chrono::Utc::now(),
                 revoked_at: None,

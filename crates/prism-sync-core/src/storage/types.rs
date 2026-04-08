@@ -69,6 +69,8 @@ pub struct DeviceRecord {
     pub device_id: String,
     pub ed25519_public_key: Vec<u8>,
     pub x25519_public_key: Vec<u8>,
+    pub ml_dsa_65_public_key: Vec<u8>,
+    pub ml_kem_768_public_key: Vec<u8>,
     pub status: String, // "active" or "revoked"
     pub registered_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,

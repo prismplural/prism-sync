@@ -234,6 +234,8 @@ pub fn register_device(
         device_id: device_id.to_string(),
         ed25519_public_key: pk_bytes,
         x25519_public_key: vec![0u8; 32],
+        ml_dsa_65_public_key: Vec::new(),
+        ml_kem_768_public_key: Vec::new(),
         status: "active".to_string(),
         registered_at: chrono::Utc::now(),
         revoked_at: None,

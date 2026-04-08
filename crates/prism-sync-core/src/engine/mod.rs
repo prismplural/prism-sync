@@ -431,6 +431,8 @@ impl SyncEngine {
                         device_id: dev.device_id,
                         ed25519_public_key: dev.ed25519_public_key,
                         x25519_public_key: dev.x25519_public_key,
+                        ml_dsa_65_public_key: Vec::new(),
+                        ml_kem_768_public_key: Vec::new(),
                         status: dev.status.clone(),
                         registered_at: observed_at,
                         revoked_at: if dev.status == "revoked" {

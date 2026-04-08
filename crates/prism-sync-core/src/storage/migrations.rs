@@ -75,6 +75,8 @@ pub fn migrations() -> Migrations<'static> {
                 device_id TEXT NOT NULL,
                 ed25519_public_key BLOB NOT NULL,
                 x25519_public_key BLOB NOT NULL,
+                ml_dsa_65_public_key BLOB NOT NULL,
+                ml_kem_768_public_key BLOB NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 registered_at TEXT NOT NULL,
                 revoked_at TEXT,

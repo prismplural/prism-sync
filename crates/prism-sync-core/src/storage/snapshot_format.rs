@@ -30,8 +30,10 @@ pub struct FieldVersionEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceRegistryEntry {
     pub device_id: String,
-    pub ed25519_public_key: String, // hex-encoded
-    pub x25519_public_key: String,  // hex-encoded
+    pub ed25519_public_key: String,    // hex-encoded
+    pub x25519_public_key: String,     // hex-encoded
+    pub ml_dsa_65_public_key: String,  // hex-encoded
+    pub ml_kem_768_public_key: String, // hex-encoded
     pub status: String,
     pub registered_at: String,
     pub revoked_at: Option<String>,
