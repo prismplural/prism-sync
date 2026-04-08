@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use prism_sync_relay::{cleanup, config::Config, db::Database, routes, state::AppState};
 
+#[cfg(all(feature = "test-helpers", not(debug_assertions)))]
+compile_error!("test-helpers feature must not be enabled in release builds");
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
