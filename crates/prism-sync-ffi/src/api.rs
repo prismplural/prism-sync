@@ -1703,6 +1703,12 @@ pub async fn approve_pairing_request(
     let exchange_key = device_secret
         .x25519_keypair(&device_id)
         .map_err(|e| format!("Key derivation failed: {e}"))?;
+    let pq_signing_key = device_secret
+        .ml_dsa_65_keypair(&device_id)
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
+    let pq_kem_key = device_secret
+        .ml_kem_768_keypair(&device_id)
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
 
     // Use the joiner's device_id from their PairingRequest
     let joiner_device_id = request.device_id.clone();
@@ -1746,6 +1752,8 @@ pub async fn approve_pairing_request(
                 device_id: device.device_id,
                 ed25519_public_key: device.ed25519_public_key,
                 x25519_public_key: device.x25519_public_key,
+                ml_dsa_65_public_key: device.ml_dsa_65_public_key,
+                ml_kem_768_public_key: device.ml_kem_768_public_key,
                 status: device.status,
             },
         )
@@ -1757,6 +1765,8 @@ pub async fn approve_pairing_request(
         device_id: device_id.clone(),
         ed25519_public_key: signing_key.public_key_bytes().to_vec(),
         x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+        ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
         status: "active".into(),
     });
     registry_entries.push(prism_sync_core::pairing::models::RegistrySnapshotEntry {
@@ -1764,6 +1774,9 @@ pub async fn approve_pairing_request(
         device_id: joiner_device_id.clone(),
         ed25519_public_key: request.ed25519_public_key.clone(),
         x25519_public_key: request.x25519_public_key.clone(),
+        // Deprecated compact QR requests do not carry PQ joiner keys.
+        ml_dsa_65_public_key: Vec::new(),
+        ml_kem_768_public_key: Vec::new(),
         status: "active".into(),
     });
 
@@ -1796,6 +1809,8 @@ pub async fn approve_pairing_request(
         signed_keyring,
         inviter_device_id: device_id,
         inviter_ed25519_pk: signing_key.public_key_bytes().to_vec(),
+        // Deprecated compact approvals still use the legacy invitation format.
+        inviter_ml_dsa_65_pk: Vec::new(),
         joiner_device_id: Some(joiner_device_id),
         current_epoch: epoch as u32,
         epoch_key: epoch_key_data,

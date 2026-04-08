@@ -464,16 +464,18 @@ fn do_register(
             // Another request created the group between our check and insert;
             // treat this as an existing group — require registry approval.
             let approval = registry_approval.as_ref().ok_or(AppError::Unauthorized)?;
-            let artifact =
-                verify_registry_approval(&tx, sync_id, device_id, signing_pk, x25519_pk, approval)?;
+            let artifact = verify_registry_approval(
+                &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, approval,
+            )?;
             registry_artifact_kind = Some("registry_approval");
             registry_artifact_blob = Some(artifact);
         }
     } else {
         // Existing group: require registry approval.
         let approval = registry_approval.as_ref().ok_or(AppError::Unauthorized)?;
-        let artifact =
-            verify_registry_approval(&tx, sync_id, device_id, signing_pk, x25519_pk, approval)?;
+        let artifact = verify_registry_approval(
+            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, approval,
+        )?;
         registry_artifact_kind = Some("registry_approval");
         registry_artifact_blob = Some(artifact);
     }
@@ -676,12 +678,15 @@ fn client_ip_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_registry_approval(
     conn: &rusqlite::Connection,
     sync_id: &str,
     device_id: &str,
     signing_pk: &[u8],
     x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
     approval: &RegistryApproval,
 ) -> Result<Vec<u8>, AppError> {
     let approver_ed25519_pk = hex::decode(&approval.approver_ed25519_pk)
@@ -733,7 +738,10 @@ fn verify_registry_approval(
     let approver_entry = snapshot_map
         .get(&approval.approver_device_id)
         .ok_or(AppError::Unauthorized)?;
-    if approver_entry.status != "active" || approver_entry.ed25519_public_key != approver_pk_bytes {
+    if approver_entry.status != "active"
+        || approver_entry.ed25519_public_key != approver_pk_bytes
+        || approver_entry.ml_dsa_65_public_key != approver_ml_dsa_pk
+    {
         return Err(AppError::Unauthorized);
     }
 
@@ -743,6 +751,8 @@ fn verify_registry_approval(
     if approver.status != "active"
         || approver.signing_public_key != approver_pk_bytes
         || approver.x25519_public_key != approver_entry.x25519_public_key
+        || approver.ml_dsa_65_public_key != approver_ml_dsa_pk
+        || approver.ml_kem_768_public_key != approver_entry.ml_kem_768_public_key
     {
         return Err(AppError::Unauthorized);
     }
@@ -753,6 +763,8 @@ fn verify_registry_approval(
     }
     if approved_device.ed25519_public_key != signing_pk
         || approved_device.x25519_public_key != x25519_pk
+        || approved_device.ml_dsa_65_public_key != ml_dsa_pk
+        || approved_device.ml_kem_768_public_key != ml_kem_pk
     {
         return Err(AppError::DeviceIdentityMismatch);
     }
@@ -765,6 +777,8 @@ fn verify_registry_approval(
         };
         if snapshot_entry.ed25519_public_key != current.ed25519_public_key
             || snapshot_entry.x25519_public_key != current.x25519_public_key
+            || snapshot_entry.ml_dsa_65_public_key != current.ml_dsa_65_public_key
+            || snapshot_entry.ml_kem_768_public_key != current.ml_kem_768_public_key
             || snapshot_entry.status != current.status
         {
             return Err(AppError::Conflict("Stale registry approval"));

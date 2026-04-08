@@ -71,7 +71,7 @@ pub fn verify_ed25519_challenge(
 /// Verify a hybrid registration challenge signature.
 ///
 /// Wire format for `versioned_signature`:
-/// `[0x02][HybridSignature::to_bytes()]`
+/// `[0x03][HybridSignature::to_bytes()]`
 pub fn verify_hybrid_challenge(
     ed25519_public_key: &[u8],
     ml_dsa_public_key: &[u8],
@@ -209,7 +209,7 @@ pub fn verify_request_signature(
 /// Verify a hybrid signature over canonical request signing data.
 ///
 /// Wire format for `versioned_signature`:
-/// `[0x02][HybridSignature::to_bytes()]`
+/// `[0x03][HybridSignature::to_bytes()]`
 pub fn verify_hybrid_request_signature(
     ed25519_public_key: &[u8],
     ml_dsa_public_key: &[u8],

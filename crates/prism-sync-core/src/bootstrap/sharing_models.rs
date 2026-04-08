@@ -14,6 +14,8 @@ const ML_DSA_65_PK_LEN: usize = 1952;
 const XWING_EK_LEN: usize = 1216;
 const KEM_CIPHERTEXT_LEN: usize = 1120;
 const CONFIRMATION_MAC_LEN: usize = 32;
+const SHARING_IDENTITY_SIGNATURE_CONTEXT: &[u8] = b"sharing_identity_bundle";
+const SIGNED_PREKEY_SIGNATURE_CONTEXT: &[u8] = b"signed_prekey_bundle";
 
 /// 30 days in seconds.
 const PREKEY_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -126,7 +128,12 @@ impl SharingIdentityBundle {
         };
 
         let message = bundle.signed_content_bytes();
-        let hybrid_sig = HybridSignature::sign(&message, ed25519_sk, ml_dsa_sk);
+        let hybrid_sig = HybridSignature::sign_v3(
+            &message,
+            SHARING_IDENTITY_SIGNATURE_CONTEXT,
+            ed25519_sk,
+            ml_dsa_sk,
+        );
         bundle.signature = hybrid_sig.to_bytes();
         bundle
     }
@@ -135,8 +142,9 @@ impl SharingIdentityBundle {
     pub fn verify(&self) -> Result<(), prism_sync_crypto::CryptoError> {
         let message = self.signed_content_bytes();
         let hybrid_sig = HybridSignature::from_bytes(&self.signature)?;
-        hybrid_sig.verify(
+        hybrid_sig.verify_v3(
             &message,
+            SHARING_IDENTITY_SIGNATURE_CONTEXT,
             &self.ed25519_public_key,
             &self.ml_dsa_65_public_key,
         )
@@ -237,7 +245,12 @@ impl SignedPrekey {
         };
 
         let message = prekey.signed_content_bytes();
-        let hybrid_sig = HybridSignature::sign(&message, ed25519_sk, ml_dsa_sk);
+        let hybrid_sig = HybridSignature::sign_v3(
+            &message,
+            SIGNED_PREKEY_SIGNATURE_CONTEXT,
+            ed25519_sk,
+            ml_dsa_sk,
+        );
         prekey.signature = hybrid_sig.to_bytes();
         prekey
     }
@@ -249,8 +262,9 @@ impl SignedPrekey {
     ) -> Result<(), prism_sync_crypto::CryptoError> {
         let message = self.signed_content_bytes();
         let hybrid_sig = HybridSignature::from_bytes(&self.signature)?;
-        hybrid_sig.verify(
+        hybrid_sig.verify_v3(
             &message,
+            SIGNED_PREKEY_SIGNATURE_CONTEXT,
             &identity.ed25519_public_key,
             &identity.ml_dsa_65_public_key,
         )
@@ -576,6 +590,15 @@ mod tests {
     }
 
     #[test]
+    fn identity_bundle_rejects_v2_signature_format() {
+        let (mut bundle, ed_sk, ml_sk) = sample_identity_bundle();
+        let message = bundle.signed_content_bytes();
+        let legacy_sig = HybridSignature::sign(&message, &ed_sk, &ml_sk);
+        bundle.signature = legacy_sig.to_bytes();
+        assert!(bundle.verify().is_err());
+    }
+
+    #[test]
     fn identity_bundle_rejects_trailing_data() {
         let (bundle, _, _) = sample_identity_bundle();
         let mut bytes = bundle.to_bytes();
@@ -637,6 +660,22 @@ mod tests {
         // Create a different identity
         let (other_bundle, _, _) = sample_identity_bundle();
         assert!(prekey.verify(&other_bundle).is_err());
+    }
+
+    #[test]
+    fn signed_prekey_rejects_v2_signature_format() {
+        let (bundle, ed_sk, ml_sk) = sample_identity_bundle();
+        let mut prekey = SignedPrekey {
+            prekey_id: "prekey-legacy".to_string(),
+            device_id: "device-xyz".to_string(),
+            xwing_ek: vec![0xDD; XWING_EK_LEN],
+            created_at: 1_700_000_000,
+            signature: Vec::new(),
+        };
+        let message = prekey.signed_content_bytes();
+        let legacy_sig = HybridSignature::sign(&message, &ed_sk, &ml_sk);
+        prekey.signature = legacy_sig.to_bytes();
+        assert!(prekey.verify(&bundle).is_err());
     }
 
     #[test]

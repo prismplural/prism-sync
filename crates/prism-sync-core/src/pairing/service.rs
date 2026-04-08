@@ -258,7 +258,7 @@ impl PairingService {
             .map_err(CoreError::Crypto)?;
 
         if has_inviter_pq {
-            // V2 hybrid invitation verification
+            // V3 hybrid invitation verification
             let signing_data = build_invitation_signing_data_v2(
                 &response.sync_id,
                 &response.relay_url,
@@ -271,7 +271,12 @@ impl PairingService {
                 response.current_epoch,
                 &response.epoch_key,
             );
-            verify_hybrid_invitation(&signing_data, &sig_bytes, &inviter_pk, &response.inviter_ml_dsa_65_pk)?;
+            verify_hybrid_invitation(
+                &signing_data,
+                &sig_bytes,
+                &inviter_pk,
+                &response.inviter_ml_dsa_65_pk,
+            )?;
         } else {
             // V1 Ed25519-only invitation verification (backward compat)
             let signing_data = build_invitation_signing_data(
@@ -906,7 +911,7 @@ impl PairingService {
 
 /// Verify a hybrid invitation signature.
 ///
-/// Accepts both V2 (bare WNS) and V3 (labeled WNS) wire formats.
+/// Accepts only the Phase 6 V3 labeled-WNS wire format.
 fn verify_hybrid_invitation(
     signing_data: &[u8],
     sig_bytes: &[u8],
@@ -926,9 +931,6 @@ fn verify_hybrid_invitation(
                 inviter_ed25519_pk,
                 inviter_ml_dsa_65_pk,
             )
-            .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?,
-        0x02 => hybrid_sig
-            .verify(signing_data, inviter_ed25519_pk, inviter_ml_dsa_65_pk)
             .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?,
         _ => {
             return Err(CoreError::Engine(format!(
@@ -1835,7 +1837,7 @@ mod tests {
 
         let resp = invite.response();
 
-        // The signed_invitation should be non-empty (hex-encoded V2 hybrid signature)
+        // The signed_invitation should be non-empty (hex-encoded V3 hybrid signature)
         assert!(!resp.signed_invitation.is_empty());
 
         // The inviter fields should be populated
@@ -1843,7 +1845,7 @@ mod tests {
         assert_eq!(resp.inviter_ed25519_pk.len(), 32);
         assert!(!resp.inviter_ml_dsa_65_pk.is_empty());
 
-        // Verify the V2 hybrid invitation signature manually
+        // Verify the V3 hybrid invitation signature manually
         let inviter_pk: [u8; 32] = resp.inviter_ed25519_pk.clone().try_into().unwrap();
         let signing_data = build_invitation_signing_data_v2(
             &resp.sync_id,
@@ -1858,7 +1860,49 @@ mod tests {
             &resp.epoch_key,
         );
         let sig_bytes = prism_sync_crypto::hex::decode(&resp.signed_invitation).unwrap();
-        verify_hybrid_invitation(&signing_data, &sig_bytes, &inviter_pk, &resp.inviter_ml_dsa_65_pk).unwrap();
+        verify_hybrid_invitation(
+            &signing_data,
+            &sig_bytes,
+            &inviter_pk,
+            &resp.inviter_ml_dsa_65_pk,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v2_hybrid_invitation_wire_rejected() {
+        let secret = DeviceSecret::generate();
+        let device_id = "inviter-v2";
+        let signing_key = secret.ed25519_keypair(device_id).unwrap();
+        let pq_signing_key = secret.ml_dsa_65_keypair(device_id).unwrap();
+        let inviter_pk = signing_key.public_key_bytes();
+        let inviter_ml_dsa_pk = pq_signing_key.public_key_bytes();
+
+        let signing_data = build_invitation_signing_data_v2(
+            "sync-v2",
+            "wss://relay.example.com",
+            b"wrapped-dek",
+            b"salt",
+            device_id,
+            &inviter_pk,
+            &inviter_ml_dsa_pk,
+            Some("joiner-v2"),
+            0,
+            &[],
+        );
+        let legacy_sig = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: signing_key.sign(&signing_data),
+            ml_dsa_65_sig: pq_signing_key.sign(&signing_data),
+        };
+        let mut legacy_wire = vec![0x02u8];
+        legacy_wire.extend_from_slice(&legacy_sig.to_bytes());
+
+        let err =
+            verify_hybrid_invitation(&signing_data, &legacy_wire, &inviter_pk, &inviter_ml_dsa_pk)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported invitation signature version"));
     }
 
     #[tokio::test]
