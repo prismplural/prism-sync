@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encoded_value_to_json`, `join_with_response`, `json_value_to_sync_value`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `relay_error_category_to_json`, `require_secure_string`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `trust_decision_to_str`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encoded_value_to_json`, `join_with_response`, `json_value_to_sync_value`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `relay_error_category_to_json`, `require_secure_string`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `trust_decision_to_str`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`
 
@@ -648,6 +648,90 @@ Future<String> hexEncode({required List<int> bytes}) =>
 /// Hex-decode a string to bytes.
 Future<Uint8List> hexDecode({required String hexStr}) =>
     RustLib.instance.api.crateApiHexDecode(hexStr: hexStr);
+
+/// Start the joiner side of the relay-based PQ pairing ceremony.
+///
+/// Generates bootstrap keys, uploads them to the relay, and returns
+/// a JSON object with token bytes and a deep-link URL for QR encoding:
+///
+/// ```json
+/// {
+///   "token_bytes": [1, 2, ...],
+///   "token_url": "prismsync://pair?d=...",
+///   "device_id": "generated-device-id"
+/// }
+/// ```
+///
+/// The `JoinerCeremony` state is stored in the handle for subsequent calls
+/// to [`get_joiner_sas`] and [`complete_joiner_ceremony`].
+Future<String> startJoinerCeremony({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiStartJoinerCeremony(handle: handle);
+
+/// Wait for the initiator's PairingInit and return the SAS display codes.
+///
+/// Polls the relay for the PairingInit slot until it arrives, then derives
+/// the shared secret and SAS codes. Returns JSON:
+///
+/// ```json
+/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// ```
+///
+/// Must be called after [`start_joiner_ceremony`].
+Future<String> getJoinerSas({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiGetJoinerSas(handle: handle);
+
+/// Complete the joiner side of the ceremony after SAS verification.
+///
+/// Sends the confirmation MAC, waits for encrypted credentials from the
+/// initiator, decrypts them, registers with the relay, and persists all
+/// credentials. Returns JSON:
+///
+/// ```json
+/// { "sync_id": "..." }
+/// ```
+///
+/// Must be called after [`get_joiner_sas`] and user SAS verification.
+Future<String> completeJoinerCeremony({
+  required PrismSyncHandle handle,
+  required String password,
+}) => RustLib.instance.api.crateApiCompleteJoinerCeremony(
+  handle: handle,
+  password: password,
+);
+
+/// Start the initiator side of the relay-based PQ pairing ceremony.
+///
+/// Parses the rendezvous token from QR/deep-link bytes, fetches the joiner's
+/// bootstrap, verifies the commitment, and posts the PairingInit. Returns
+/// the SAS display codes for user verification:
+///
+/// ```json
+/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// ```
+///
+/// The `InitiatorCeremony` state is stored in the handle for the subsequent
+/// call to [`complete_initiator_ceremony`].
+Future<String> startInitiatorCeremony({
+  required PrismSyncHandle handle,
+  required List<int> tokenBytes,
+}) => RustLib.instance.api.crateApiStartInitiatorCeremony(
+  handle: handle,
+  tokenBytes: tokenBytes,
+);
+
+/// Complete the initiator side of the ceremony after SAS verification.
+///
+/// Waits for the joiner's confirmation MAC, verifies it, then sends
+/// encrypted credentials to the joiner. Returns `"ok"` on success.
+///
+/// Must be called after [`start_initiator_ceremony`] and user SAS verification.
+Future<String> completeInitiatorCeremony({
+  required PrismSyncHandle handle,
+  required String password,
+}) => RustLib.instance.api.crateApiCompleteInitiatorCeremony(
+  handle: handle,
+  password: password,
+);
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<MemorySecureStore>>
 abstract class MemorySecureStore implements RustOpaqueInterface {
