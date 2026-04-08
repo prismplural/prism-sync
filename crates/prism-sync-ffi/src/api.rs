@@ -515,8 +515,18 @@ fn build_sharing_relay(
         .ed25519_keypair(&device_id)
         .map_err(|e| format!("Failed to derive sharing signing key: {e}"))?
         .into_signing_key();
-    let relay = ServerSharingRelay::new(relay_url, session_token, sync_id, device_id, signing_key)
-        .map_err(|e| format!("Failed to create ServerSharingRelay: {e}"))?;
+    let ml_dsa_signing_key = device_secret
+        .ml_dsa_65_keypair(&device_id)
+        .map_err(|e| format!("Failed to derive sharing ML-DSA signing key: {e}"))?;
+    let relay = ServerSharingRelay::new(
+        relay_url,
+        session_token,
+        sync_id,
+        device_id,
+        signing_key,
+        ml_dsa_signing_key,
+    )
+    .map_err(|e| format!("Failed to create ServerSharingRelay: {e}"))?;
     Ok(Arc::new(relay))
 }
 
@@ -1384,8 +1394,9 @@ fn build_relay(
              Set allow_insecure=true for development."
         ));
     }
-    let signing_key = device_secret
-        .and_then(|bytes| DeviceSecret::from_bytes(bytes).ok())
+    let parsed_secret = device_secret.and_then(|bytes| DeviceSecret::from_bytes(bytes).ok());
+    let signing_key = parsed_secret
+        .as_ref()
         .and_then(|secret| secret.ed25519_keypair(device_id).ok())
         .map(|kp| kp.into_signing_key())
         .unwrap_or_else(|| {
@@ -1397,12 +1408,21 @@ fn build_relay(
                 .expect("ephemeral signing key")
                 .into_signing_key()
         });
+    let ml_dsa_signing_key = parsed_secret
+        .as_ref()
+        .and_then(|secret| secret.ml_dsa_65_keypair(device_id).ok())
+        .unwrap_or_else(|| {
+            DeviceSecret::generate()
+                .ml_dsa_65_keypair(device_id)
+                .expect("ephemeral ML-DSA signing key")
+        });
     let relay = ServerRelay::new(
         url,
         sync_id.to_string(),
         device_id.to_string(),
         session_token.to_string(),
         signing_key,
+        ml_dsa_signing_key,
         registration_token,
     )
     .map_err(|e| format!("Failed to create ServerRelay: {e}"))?;

@@ -59,6 +59,8 @@ pub async fn list_devices(
                 "device_id": d.device_id,
                 "signing_public_key": b64.encode(&d.signing_public_key),
                 "x25519_public_key": b64.encode(&d.x25519_public_key),
+                "ml_dsa_65_public_key": b64.encode(&d.ml_dsa_65_public_key),
+                "ml_kem_768_public_key": b64.encode(&d.ml_kem_768_public_key),
                 "epoch": d.epoch,
                 "status": d.status,
             })

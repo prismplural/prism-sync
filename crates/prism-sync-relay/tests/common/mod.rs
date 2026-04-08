@@ -190,6 +190,38 @@ pub fn apply_signed_headers(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn apply_signed_headers_hybrid(
+    builder: RequestBuilder,
+    ed25519_key: &SigningKey,
+    ml_dsa_key: &prism_sync_crypto::DevicePqSigningKey,
+    method: &str,
+    path: &str,
+    sync_id: &str,
+    device_id: &str,
+    body: &[u8],
+) -> RequestBuilder {
+    let timestamp = db::now_secs().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
+        method, path, sync_id, device_id, body, &timestamp, &nonce,
+    );
+    let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
+        ed25519_sig: ed25519_key.sign(&signing_data).to_bytes().to_vec(),
+        ml_dsa_65_sig: ml_dsa_key.sign(&signing_data),
+    };
+    let mut wire = vec![0x02u8];
+    wire.extend_from_slice(&hybrid_sig.to_bytes());
+
+    builder
+        .header("X-Prism-Timestamp", timestamp)
+        .header("X-Prism-Nonce", nonce)
+        .header(
+            "X-Prism-Signature",
+            base64::engine::general_purpose::STANDARD.encode(&wire),
+        )
+}
+
 fn solve_first_device_pow(sync_id: &str, device_id: &str, nonce: &str, difficulty_bits: u8) -> u64 {
     for counter in 0..=u64::MAX {
         let mut hasher = Sha256::new();

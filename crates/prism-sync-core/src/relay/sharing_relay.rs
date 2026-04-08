@@ -96,6 +96,7 @@ pub struct ServerSharingRelay {
     sync_id: String,
     device_id: String,
     signing_key: SigningKey,
+    ml_dsa_signing_key: prism_sync_crypto::DevicePqSigningKey,
     request_timeout: Duration,
 }
 
@@ -121,6 +122,7 @@ impl ServerSharingRelay {
         sync_id: String,
         device_id: String,
         signing_key: SigningKey,
+        ml_dsa_signing_key: prism_sync_crypto::DevicePqSigningKey,
     ) -> Result<Self, String> {
         if !base_url.starts_with("https://") && !base_url.starts_with("http://localhost") {
             return Err(format!(
@@ -140,6 +142,7 @@ impl ServerSharingRelay {
             sync_id,
             device_id,
             signing_key,
+            ml_dsa_signing_key,
             request_timeout: Duration::from_secs(15),
         })
     }
@@ -163,8 +166,16 @@ impl ServerSharingRelay {
         let nonce = hex::encode(nonce_bytes);
         let signing_data =
             self.build_request_signing_data(method, canonical_path, body, &timestamp, &nonce);
-        let signature = self.signing_key.sign(&signing_data);
-        let signature_b64 = BASE64.encode(signature.to_bytes());
+
+        // V2 hybrid signature: Ed25519 + ML-DSA-65
+        let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: self.signing_key.sign(&signing_data).to_bytes().to_vec(),
+            ml_dsa_65_sig: self.ml_dsa_signing_key.sign(&signing_data),
+        };
+        let mut wire = Vec::with_capacity(1 + hybrid_sig.to_bytes().len());
+        wire.push(0x02);
+        wire.extend_from_slice(&hybrid_sig.to_bytes());
+        let signature_b64 = BASE64.encode(&wire);
 
         self.apply_auth(builder)
             .header("X-Prism-Timestamp", timestamp)
@@ -182,7 +193,7 @@ impl ServerSharingRelay {
     ) -> Vec<u8> {
         let body_hash = Sha256::digest(body);
         let mut data = Vec::new();
-        data.extend_from_slice(b"PRISM_SYNC_HTTP_V1\x00");
+        data.extend_from_slice(b"PRISM_SYNC_HTTP_V2\x00");
         write_len_prefixed(&mut data, method.as_bytes());
         write_len_prefixed(&mut data, canonical_path.as_bytes());
         write_len_prefixed(&mut data, self.sync_id.as_bytes());
@@ -494,6 +505,11 @@ mod tests {
         format!("http://localhost:{}", addr.port())
     }
 
+    fn test_ml_dsa_key() -> prism_sync_crypto::DevicePqSigningKey {
+        let ds = prism_sync_crypto::DeviceSecret::generate();
+        ds.ml_dsa_65_keypair("test-device").unwrap()
+    }
+
     #[test]
     fn rejects_non_https_url() {
         let key = SigningKey::from_bytes(&[1u8; 32]);
@@ -503,6 +519,7 @@ mod tests {
             "sync-id".to_string(),
             "device-id".to_string(),
             key,
+            test_ml_dsa_key(),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("HTTPS"));
@@ -517,6 +534,7 @@ mod tests {
             "sync-id".to_string(),
             "device-id".to_string(),
             key,
+            test_ml_dsa_key(),
         );
         assert!(result.is_ok());
     }
@@ -530,6 +548,7 @@ mod tests {
             "sync-id".to_string(),
             "device-id".to_string(),
             key,
+            test_ml_dsa_key(),
         );
         assert!(result.is_ok());
     }
@@ -570,6 +589,7 @@ mod tests {
             "sync-id".to_string(),
             "device-id".to_string(),
             SigningKey::from_bytes(&[1u8; 32]),
+            test_ml_dsa_key(),
         )
         .unwrap();
 
@@ -589,6 +609,7 @@ mod tests {
             "sync-id".to_string(),
             "device-id".to_string(),
             SigningKey::from_bytes(&[1u8; 32]),
+            test_ml_dsa_key(),
         )
         .unwrap();
 
