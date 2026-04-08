@@ -26,6 +26,9 @@ const X25519_PK_LEN: usize = 32;
 /// Hybrid signature version byte for Phase 5 wire formats.
 const HYBRID_SIGNATURE_VERSION_V2: u8 = 0x02;
 
+/// Hybrid signature version byte for Phase 6 V3 labeled WNS wire formats.
+const HYBRID_SIGNATURE_VERSION_V3: u8 = 0x03;
+
 /// Sent by the joining device (Device B → Device A) to initiate pairing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingRequest {
@@ -247,8 +250,11 @@ impl PairingResponse {
     /// * `"existing_group"` -- all other cases (multiple devices, or a
     ///   single device that does not match the inviter).
     pub fn admission_context(&self) -> &'static str {
-        let json_bytes = if self.signed_keyring.first() == Some(&HYBRID_SIGNATURE_VERSION_V2) {
-            // V2 hybrid format: [0x02][HybridSignature][JSON]
+        let first_byte = self.signed_keyring.first().copied();
+        let json_bytes = if first_byte == Some(HYBRID_SIGNATURE_VERSION_V2)
+            || first_byte == Some(HYBRID_SIGNATURE_VERSION_V3)
+        {
+            // V2/V3 hybrid format: [version][HybridSignature][JSON]
             // Parse length-prefixed hybrid sig to find JSON start
             let remaining = &self.signed_keyring[1..];
             if remaining.len() < 8 {
@@ -721,23 +727,27 @@ impl SignedRegistrySnapshot {
         [signature, json].concat()
     }
 
-    /// Sign the snapshot with both Ed25519 and ML-DSA-65.
+    /// Sign the snapshot with both Ed25519 and ML-DSA-65 using V3 labeled WNS.
     ///
-    /// Returns the Phase 5 wire format:
-    /// `[0x02][HybridSignature::to_bytes()][canonical JSON]`.
+    /// Returns the wire format:
+    /// `[0x03][HybridSignature::to_bytes()][canonical JSON]`.
     pub fn sign_hybrid(
         &self,
         signing_key: &prism_sync_crypto::DeviceSigningKey,
         pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     ) -> Vec<u8> {
         let data = self.signing_data_v2();
+        let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"registry_snapshot",
+            &data,
+        );
         let hybrid_sig = HybridSignature {
-            ed25519_sig: signing_key.sign(&data),
-            ml_dsa_65_sig: pq_signing_key.sign(&data),
+            ed25519_sig: signing_key.sign(&m_prime),
+            ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
         };
         let json = self.canonical_json();
         let mut out = Vec::with_capacity(1 + hybrid_sig.to_bytes().len() + json.len());
-        out.push(HYBRID_SIGNATURE_VERSION_V2);
+        out.push(HYBRID_SIGNATURE_VERSION_V3);
         out.extend_from_slice(&hybrid_sig.to_bytes());
         out.extend_from_slice(&json);
         out
@@ -772,7 +782,9 @@ impl SignedRegistrySnapshot {
         Ok(Self { entries })
     }
 
-    /// Verify and decode a Phase 5 hybrid-signed snapshot from its wire format.
+    /// Verify and decode a hybrid-signed snapshot from its wire format.
+    ///
+    /// Accepts both V2 (bare WNS) and V3 (labeled WNS) signatures.
     pub fn verify_and_decode_hybrid(
         signed_bytes: &[u8],
         expected_ed25519_pk: &[u8; 32],
@@ -781,8 +793,8 @@ impl SignedRegistrySnapshot {
         let Some((&version, remaining)) = signed_bytes.split_first() else {
             return Err("signed snapshot too short".into());
         };
-        if version != HYBRID_SIGNATURE_VERSION_V2 {
-            return Err("signed snapshot missing V2 hybrid signature version".into());
+        if version != HYBRID_SIGNATURE_VERSION_V2 && version != HYBRID_SIGNATURE_VERSION_V3 {
+            return Err("signed snapshot missing hybrid signature version (expected V2 or V3)".into());
         }
 
         if remaining.len() < 8 {
@@ -811,9 +823,19 @@ impl SignedRegistrySnapshot {
         signing_data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V2);
         signing_data.extend_from_slice(json_bytes);
 
-        signature
-            .verify(&signing_data, expected_ed25519_pk, expected_ml_dsa_pk)
-            .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
+        match version {
+            HYBRID_SIGNATURE_VERSION_V3 => signature
+                .verify_v3(
+                    &signing_data,
+                    b"registry_snapshot",
+                    expected_ed25519_pk,
+                    expected_ml_dsa_pk,
+                )
+                .map_err(|e| format!("registry snapshot signature invalid: {e}"))?,
+            _ => signature
+                .verify(&signing_data, expected_ed25519_pk, expected_ml_dsa_pk)
+                .map_err(|e| format!("registry snapshot signature invalid: {e}"))?,
+        }
 
         let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
             .map_err(|e| format!("registry snapshot JSON invalid: {e}"))?;
