@@ -104,7 +104,7 @@ impl PairingService {
         // 5b. Pre-generate a device_id for the joining device (snapshot targeting)
         let joiner_device_id = crate::node_id::generate_node_id();
 
-        // 6. Sign the invitation with hybrid keys (CRITICAL-1)
+        // 6. Sign the invitation with hybrid keys (CRITICAL-1) — V3 labeled WNS
         let signing_data = build_invitation_signing_data_v2(
             &sync_id,
             relay_url,
@@ -117,11 +117,15 @@ impl PairingService {
             0,
             &[],
         );
+        let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"invitation",
+            &signing_data,
+        );
         let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-            ed25519_sig: signing_key.sign(&signing_data),
-            ml_dsa_65_sig: pq_signing_key.sign(&signing_data),
+            ed25519_sig: signing_key.sign(&m_prime),
+            ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
         };
-        let mut invitation_wire = vec![0x02u8];
+        let mut invitation_wire = vec![0x03u8];
         invitation_wire.extend_from_slice(&hybrid_sig.to_bytes());
         let signed_invitation_hex = hex::encode(&invitation_wire);
 
@@ -704,14 +708,18 @@ impl PairingService {
         let registry_snapshot = SignedRegistrySnapshot::new(snapshot_entries);
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
-        // V2 hybrid registry approval signature
+        // V3 hybrid registry approval signature (labeled WNS)
         let approval_data =
             build_registry_approval_signing_data_v2(&sync_id, &device_id, &signed_keyring);
+        let m_prime_approval = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"registry_approval",
+            &approval_data,
+        );
         let hybrid_approval = prism_sync_crypto::pq::HybridSignature {
-            ed25519_sig: signing_key.sign(&approval_data),
-            ml_dsa_65_sig: pq_signing_key.sign(&approval_data),
+            ed25519_sig: signing_key.sign(&m_prime_approval),
+            ml_dsa_65_sig: pq_signing_key.sign(&m_prime_approval),
         };
-        let mut approval_wire = vec![0x02u8];
+        let mut approval_wire = vec![0x03u8];
         approval_wire.extend_from_slice(&hybrid_approval.to_bytes());
         let approval_signature = hex::encode(&approval_wire);
 
@@ -896,9 +904,9 @@ impl PairingService {
     }
 }
 
-/// Verify a V2 hybrid invitation signature.
+/// Verify a hybrid invitation signature.
 ///
-/// The signature wire format is `[0x02][HybridSignature::to_bytes()]`.
+/// Accepts both V2 (bare WNS) and V3 (labeled WNS) wire formats.
 fn verify_hybrid_invitation(
     signing_data: &[u8],
     sig_bytes: &[u8],
@@ -908,22 +916,32 @@ fn verify_hybrid_invitation(
     let Some((&version, sig_rest)) = sig_bytes.split_first() else {
         return Err(CoreError::Engine("invitation signature too short".into()));
     };
-    if version != 0x02 {
-        return Err(CoreError::Engine(format!(
-            "unsupported invitation signature version: 0x{version:02x}"
-        )));
-    }
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature::from_bytes(sig_rest)
         .map_err(|e| CoreError::Engine(format!("invitation hybrid signature invalid: {e}")))?;
-    hybrid_sig
-        .verify(signing_data, inviter_ed25519_pk, inviter_ml_dsa_65_pk)
-        .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?;
+    match version {
+        0x03 => hybrid_sig
+            .verify_v3(
+                signing_data,
+                b"invitation",
+                inviter_ed25519_pk,
+                inviter_ml_dsa_65_pk,
+            )
+            .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?,
+        0x02 => hybrid_sig
+            .verify(signing_data, inviter_ed25519_pk, inviter_ml_dsa_65_pk)
+            .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?,
+        _ => {
+            return Err(CoreError::Engine(format!(
+                "unsupported invitation signature version: 0x{version:02x}"
+            )))
+        }
+    }
     Ok(())
 }
 
-/// Build a V2 hybrid challenge signature for relay registration.
+/// Build a V3 hybrid challenge signature for relay registration.
 ///
-/// Wire format: `[0x02][HybridSignature::to_bytes()]`
+/// Wire format: `[0x03][HybridSignature::to_bytes()]`
 fn build_hybrid_challenge_signature(
     signing_key: &prism_sync_crypto::DeviceSigningKey,
     pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
@@ -941,11 +959,15 @@ fn build_hybrid_challenge_signature(
     write_len_prefixed(&mut challenge_data, device_id.as_bytes());
     write_len_prefixed(&mut challenge_data, nonce.as_bytes());
 
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        b"device_challenge",
+        &challenge_data,
+    );
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-        ed25519_sig: signing_key.sign(&challenge_data),
-        ml_dsa_65_sig: pq_signing_key.sign(&challenge_data),
+        ed25519_sig: signing_key.sign(&m_prime),
+        ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
     };
-    let mut wire = vec![0x02u8];
+    let mut wire = vec![0x03u8];
     wire.extend_from_slice(&hybrid_sig.to_bytes());
     wire
 }
@@ -2076,8 +2098,8 @@ mod tests {
         let captured = relay.captured_req.lock().unwrap();
         let req = captured.as_ref().expect("registration request captured");
 
-        // Challenge signature should be V2 hybrid format: [0x02][HybridSignature]
-        assert_eq!(req.registration_challenge[0], 0x02);
+        // Challenge signature should be V3 hybrid format: [0x03][HybridSignature]
+        assert_eq!(req.registration_challenge[0], 0x03);
         // HybridSignature = 4B ed_len + 64B ed_sig + 4B ml_len + 3309B ml_sig = 3381
         // plus 1B version prefix = 3382
         assert_eq!(req.registration_challenge.len(), 3382);
