@@ -38,10 +38,10 @@ simple_asn1 = "0.6"
 num-traits = "0.2"
 serde_cbor = "0.11"
 subtle = "2"
+prism-sync-crypto = { path = "../prism-sync-crypto" }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = "0.24"
 prism-sync-core = { path = "../prism-sync-core" }
-prism-sync-crypto = { path = "../prism-sync-crypto" }
 rcgen = "0.13"

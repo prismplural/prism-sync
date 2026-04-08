@@ -443,6 +443,8 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         device_id: device_id_a.clone(),
         ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
         x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: Vec::new(),
+        ml_kem_768_public_key: Vec::new(),
         status: "active".into(),
     }]);
     let signed_keyring = registry_snapshot.sign(&signing_key_a);
@@ -589,6 +591,8 @@ async fn join_from_approval_roundtrip() {
             device_id: device_id_a.clone(),
             ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         },
         RegistrySnapshotEntry {
@@ -596,6 +600,8 @@ async fn join_from_approval_roundtrip() {
             device_id: device_id_b.to_string(),
             ed25519_public_key: signing_key_b.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key_b.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         },
     ]);

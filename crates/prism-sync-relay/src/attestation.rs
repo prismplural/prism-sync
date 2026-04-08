@@ -523,6 +523,13 @@ mod tests {
             pairing_session_ttl_secs: 300,
             pairing_session_rate_limit: 5,
             pairing_session_max_payload_bytes: 32768,
+            sharing_init_ttl_secs: 604800,
+            sharing_init_max_payload_bytes: 65536,
+            sharing_identity_max_bytes: 8192,
+            sharing_prekey_max_bytes: 4096,
+            sharing_fetch_rate_limit: 100,
+            sharing_init_rate_limit: 100,
+            sharing_init_max_pending: 50,
         }
     }
 

@@ -2,6 +2,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use prism_sync_crypto::pq::HybridSignature;
 use serde::{Deserialize, Serialize};
 
 /// Version byte for the compact binary PairingRequest encoding format.
@@ -21,6 +22,9 @@ const ED25519_PK_LEN: usize = 32;
 
 /// X25519 public key length in bytes.
 const X25519_PK_LEN: usize = 32;
+
+/// Hybrid signature version byte for Phase 5 wire formats.
+const HYBRID_SIGNATURE_VERSION_V2: u8 = 0x02;
 
 /// Sent by the joining device (Device B → Device A) to initiate pairing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -510,6 +514,42 @@ pub fn build_invitation_signing_data(
     data
 }
 
+/// Build the canonical bytes that get signed for a hybrid invitation.
+///
+/// V2 extends the signed payload with the inviter's ML-DSA-65 public key so
+/// that the invitation binds the full hybrid device identity.
+#[allow(clippy::too_many_arguments)]
+pub fn build_invitation_signing_data_v2(
+    sync_id: &str,
+    relay_url: &str,
+    wrapped_dek: &[u8],
+    salt: &[u8],
+    inviter_device_id: &str,
+    inviter_ed25519_pk: &[u8; 32],
+    inviter_ml_dsa_65_pk: &[u8],
+    joiner_device_id: Option<&str>,
+    current_epoch: u32,
+    epoch_key: &[u8],
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"PRISM_SYNC_INVITATION_V2\x00");
+    write_len_prefixed(&mut data, sync_id.as_bytes());
+    write_len_prefixed(&mut data, relay_url.as_bytes());
+    data.extend_from_slice(&(wrapped_dek.len() as u32).to_be_bytes());
+    data.extend_from_slice(wrapped_dek);
+    data.extend_from_slice(&(salt.len() as u32).to_be_bytes());
+    data.extend_from_slice(salt);
+    write_len_prefixed(&mut data, inviter_device_id.as_bytes());
+    data.extend_from_slice(inviter_ed25519_pk);
+    write_len_prefixed(&mut data, inviter_ml_dsa_65_pk);
+    if let Some(jid) = joiner_device_id {
+        write_len_prefixed(&mut data, jid.as_bytes());
+    }
+    data.extend_from_slice(&current_epoch.to_be_bytes());
+    write_len_prefixed(&mut data, epoch_key);
+    data
+}
+
 /// Build the canonical bytes that get signed for an existing-group
 /// registry approval.
 pub fn build_registry_approval_signing_data(
@@ -519,6 +559,21 @@ pub fn build_registry_approval_signing_data(
 ) -> Vec<u8> {
     let mut data = Vec::new();
     data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V1\x00");
+    write_len_prefixed(&mut data, sync_id.as_bytes());
+    write_len_prefixed(&mut data, approver_device_id.as_bytes());
+    write_len_prefixed(&mut data, signed_registry_snapshot);
+    data
+}
+
+/// Build the canonical bytes that get signed for a hybrid existing-group
+/// registry approval.
+pub fn build_registry_approval_signing_data_v2(
+    sync_id: &str,
+    approver_device_id: &str,
+    signed_registry_snapshot: &[u8],
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V2\x00");
     write_len_prefixed(&mut data, sync_id.as_bytes());
     write_len_prefixed(&mut data, approver_device_id.as_bytes());
     write_len_prefixed(&mut data, signed_registry_snapshot);
@@ -542,6 +597,7 @@ pub struct SyncGroupCredentials {
 
 /// Domain separation prefix for registry snapshot signatures.
 const REGISTRY_SNAPSHOT_DOMAIN: &[u8] = b"PRISM_SYNC_REGISTRY_V1\x00";
+const REGISTRY_SNAPSHOT_DOMAIN_V2: &[u8] = b"PRISM_SYNC_REGISTRY_V2\x00";
 
 /// A single device entry inside a [`SignedRegistrySnapshot`].
 ///
@@ -599,6 +655,15 @@ impl SignedRegistrySnapshot {
         data
     }
 
+    /// Build the Phase 5 hybrid signing payload: versioned domain + canonical JSON.
+    fn signing_data_v2(&self) -> Vec<u8> {
+        let json = self.canonical_json();
+        let mut data = Vec::with_capacity(REGISTRY_SNAPSHOT_DOMAIN_V2.len() + json.len());
+        data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V2);
+        data.extend_from_slice(&json);
+        data
+    }
+
     /// Sign the snapshot with the given Ed25519 signing key.
     ///
     /// Returns the wire format: `[64-byte signature || canonical JSON]`.
@@ -607,6 +672,28 @@ impl SignedRegistrySnapshot {
         let signature = signing_key.sign(&data);
         let json = self.canonical_json();
         [signature, json].concat()
+    }
+
+    /// Sign the snapshot with both Ed25519 and ML-DSA-65.
+    ///
+    /// Returns the Phase 5 wire format:
+    /// `[0x02][HybridSignature::to_bytes()][canonical JSON]`.
+    pub fn sign_hybrid(
+        &self,
+        signing_key: &prism_sync_crypto::DeviceSigningKey,
+        pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    ) -> Vec<u8> {
+        let data = self.signing_data_v2();
+        let hybrid_sig = HybridSignature {
+            ed25519_sig: signing_key.sign(&data),
+            ml_dsa_65_sig: pq_signing_key.sign(&data),
+        };
+        let json = self.canonical_json();
+        let mut out = Vec::with_capacity(1 + hybrid_sig.to_bytes().len() + json.len());
+        out.push(HYBRID_SIGNATURE_VERSION_V2);
+        out.extend_from_slice(&hybrid_sig.to_bytes());
+        out.extend_from_slice(&json);
+        out
     }
 
     /// Verify and decode a signed snapshot from its wire format.
@@ -630,6 +717,55 @@ impl SignedRegistrySnapshot {
         signing_data.extend_from_slice(json_bytes);
 
         prism_sync_crypto::DeviceSigningKey::verify(expected_signer_pk, &signing_data, sig_bytes)
+            .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
+
+        let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
+            .map_err(|e| format!("registry snapshot JSON invalid: {e}"))?;
+
+        Ok(Self { entries })
+    }
+
+    /// Verify and decode a Phase 5 hybrid-signed snapshot from its wire format.
+    pub fn verify_and_decode_hybrid(
+        signed_bytes: &[u8],
+        expected_ed25519_pk: &[u8; 32],
+        expected_ml_dsa_pk: &[u8],
+    ) -> std::result::Result<Self, String> {
+        let Some((&version, remaining)) = signed_bytes.split_first() else {
+            return Err("signed snapshot too short".into());
+        };
+        if version != HYBRID_SIGNATURE_VERSION_V2 {
+            return Err("signed snapshot missing V2 hybrid signature version".into());
+        }
+
+        if remaining.len() < 8 {
+            return Err("registry snapshot signature invalid: hybrid signature too short".into());
+        }
+        let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap()) as usize;
+        if remaining.len() < 4 + ed_len + 4 {
+            return Err("registry snapshot signature invalid: hybrid signature truncated".into());
+        }
+        let ml_len_offset = 4 + ed_len;
+        let ml_len = u32::from_le_bytes(
+            remaining[ml_len_offset..ml_len_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let signature_len = ml_len_offset + 4 + ml_len;
+        if remaining.len() <= signature_len {
+            return Err("signed snapshot missing JSON payload".into());
+        }
+        let signature = HybridSignature::from_bytes(&remaining[..signature_len])
+            .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
+        let json_bytes = &remaining[signature_len..];
+
+        let mut signing_data =
+            Vec::with_capacity(REGISTRY_SNAPSHOT_DOMAIN_V2.len() + json_bytes.len());
+        signing_data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V2);
+        signing_data.extend_from_slice(json_bytes);
+
+        signature
+            .verify(&signing_data, expected_ed25519_pk, expected_ml_dsa_pk)
             .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
 
         let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
@@ -1153,6 +1289,13 @@ mod tests {
         (key, pk)
     }
 
+    fn make_pq_signing_key() -> (prism_sync_crypto::DevicePqSigningKey, Vec<u8>) {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pk = key.public_key_bytes();
+        (key, pk)
+    }
+
     fn sample_snapshot() -> SignedRegistrySnapshot {
         SignedRegistrySnapshot::new(vec![
             RegistrySnapshotEntry {
@@ -1184,6 +1327,24 @@ mod tests {
         let decoded = SignedRegistrySnapshot::verify_and_decode(&signed, &pk).unwrap();
         assert_eq!(decoded.entries.len(), 2);
         // Entries are sorted by device_id in canonical form
+        assert_eq!(decoded.entries[0].device_id, "dev-a");
+        assert_eq!(decoded.entries[1].device_id, "dev-b");
+    }
+
+    #[test]
+    fn snapshot_hybrid_sign_and_verify_roundtrip() {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let ed_pk = signing_key.public_key_bytes();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pq_pk = pq_signing_key.public_key_bytes();
+        let snapshot = sample_snapshot();
+
+        let signed = snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        let decoded =
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &ed_pk, &pq_pk).unwrap();
+
+        assert_eq!(decoded.entries.len(), 2);
         assert_eq!(decoded.entries[0].device_id, "dev-a");
         assert_eq!(decoded.entries[1].device_id, "dev-b");
     }
@@ -1273,6 +1434,24 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_hybrid_rejects_wrong_signer() {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let snapshot = sample_snapshot();
+        let signed = snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+
+        let (_other_pq_key, other_pq_pk) = make_pq_signing_key();
+        let err = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &signed,
+            &signing_key.public_key_bytes(),
+            &other_pq_pk,
+        )
+        .unwrap_err();
+        assert!(err.contains("signature invalid"));
+    }
+
+    #[test]
     fn snapshot_to_device_records_preserves_fields() {
         let snapshot = sample_snapshot();
         let records = snapshot.to_device_records();
@@ -1298,5 +1477,42 @@ mod tests {
         let json = serde_json::to_vec(&entry).unwrap();
         let decoded: RegistrySnapshotEntry = serde_json::from_slice(&json).unwrap();
         assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn invitation_signing_data_v2_binds_ml_dsa_key() {
+        let base = build_invitation_signing_data_v2(
+            "sync",
+            "https://relay.example",
+            &[1, 2, 3],
+            &[4, 5, 6],
+            "device-a",
+            &[7u8; 32],
+            &[8u8; 1952],
+            Some("device-b"),
+            1,
+            &[9u8; 32],
+        );
+        let changed = build_invitation_signing_data_v2(
+            "sync",
+            "https://relay.example",
+            &[1, 2, 3],
+            &[4, 5, 6],
+            "device-a",
+            &[7u8; 32],
+            &[10u8; 1952],
+            Some("device-b"),
+            1,
+            &[9u8; 32],
+        );
+
+        assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn registry_approval_signing_data_v2_uses_distinct_domain() {
+        let v1 = build_registry_approval_signing_data("sync", "device-a", b"snapshot");
+        let v2 = build_registry_approval_signing_data_v2("sync", "device-a", b"snapshot");
+        assert_ne!(v1, v2);
     }
 }
