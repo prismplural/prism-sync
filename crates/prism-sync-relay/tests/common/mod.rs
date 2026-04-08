@@ -69,6 +69,9 @@ pub async fn start_test_relay() -> (
         sharing_fetch_rate_limit: 100,
         sharing_init_rate_limit: 100,
         sharing_init_max_pending: 50,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
     };
 
     start_test_relay_with_config(config).await
@@ -169,29 +172,30 @@ pub fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
+/// Apply V3 hybrid signed request headers using `TestDeviceKeys`.
 pub fn apply_signed_headers(
     builder: RequestBuilder,
-    signing_key: &SigningKey,
+    keys: &TestDeviceKeys,
     method: &str,
     path: &str,
     sync_id: &str,
     device_id: &str,
     body: &[u8],
 ) -> RequestBuilder {
-    let timestamp = db::now_secs().to_string();
-    let nonce = uuid::Uuid::new_v4().to_string();
-    let signing_data = prism_sync_relay::auth::build_request_signing_data(
-        method, path, sync_id, device_id, body, &timestamp, &nonce,
-    );
-    let signature = signing_key.sign(&signing_data);
-
-    builder
-        .header("X-Prism-Timestamp", timestamp)
-        .header("X-Prism-Nonce", nonce)
-        .header(
-            "X-Prism-Signature",
-            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
-        )
+    let ml_dsa_kp = keys
+        .device_secret
+        .ml_dsa_65_keypair(device_id)
+        .unwrap();
+    apply_signed_headers_hybrid(
+        builder,
+        &keys.ed25519_signing_key,
+        &ml_dsa_kp,
+        method,
+        path,
+        sync_id,
+        device_id,
+        body,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,82 +279,16 @@ pub fn pow_solution_from_nonce_json(
     Some(serde_json::json!({ "counter": counter }))
 }
 
-/// Full registration helper: fetches nonce, signs challenge, registers device.
+/// Full V3 hybrid registration helper using `TestDeviceKeys`.
 /// Returns the session token.
-///
-/// Generates PQ keys internally from a fresh `DeviceSecret` and uses V2 hybrid
-/// challenge when the derived Ed25519 key matches `signing_key`. If you pass an
-/// arbitrary `SigningKey` not derived from a `DeviceSecret`, falls back to V1.
 pub async fn register_device(
     client: &Client,
     url: &str,
     sync_id: &str,
     device_id: &str,
-    signing_key: &SigningKey,
+    keys: &TestDeviceKeys,
 ) -> String {
-    register_device_with_x25519(client, url, sync_id, device_id, signing_key)
-        .await
-        .0
-}
-
-/// Full registration helper that also returns the generated X25519 key.
-///
-/// Uses V1 Ed25519-only challenge (for tests that only have a bare SigningKey).
-/// For V2 hybrid testing, use `register_device_hybrid`.
-pub async fn register_device_with_x25519(
-    client: &Client,
-    url: &str,
-    sync_id: &str,
-    device_id: &str,
-    signing_key: &SigningKey,
-) -> (String, [u8; 32]) {
-    // 1. Fetch nonce
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(nonce_resp.status(), 200, "nonce request failed");
-    let nonce_json: Value = nonce_resp.json().await.unwrap();
-    let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
-    let pow_solution = pow_solution_from_nonce_json(sync_id, device_id, &nonce_json);
-
-    // 2. Sign challenge (V1)
-    let challenge_sig = sign_challenge(signing_key, sync_id, device_id, &nonce);
-
-    // 3. Generate X25519 key (just random 32 bytes for testing)
-    let mut x25519_pk = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut x25519_pk);
-
-    // 4. Register — relay expects hex-encoded keys
-    let register_resp = client
-        .post(format!("{url}/v1/sync/{sync_id}/register"))
-        .json(&serde_json::json!({
-            "device_id": device_id,
-            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
-            "x25519_public_key": hex::encode(x25519_pk),
-            "registration_challenge": hex::encode(&challenge_sig),
-            "nonce": nonce,
-            "pow_solution": pow_solution,
-        }))
-        .send()
-        .await
-        .unwrap();
-    let status = register_resp.status();
-    let token_json: Value = register_resp.json().await.unwrap_or_else(|e| {
-        panic!("registration failed (status {status}): {e}");
-    });
-    assert!(
-        status.is_success(),
-        "registration failed: {status} - {token_json}"
-    );
-    (
-        token_json["device_session_token"]
-            .as_str()
-            .expect("missing device_session_token in register response")
-            .to_string(),
-        x25519_pk,
-    )
+    register_device_hybrid(client, url, sync_id, device_id, keys).await
 }
 
 /// Registration keys derived from a `DeviceSecret`, for V2 hybrid tests.
@@ -463,28 +401,37 @@ pub fn make_test_envelope(sync_id: &str, device_id: &str, batch_id: &str, epoch:
     })
 }
 
+/// Insert a device directly into the DB with real PQ keys, returning
+/// both the session token and the `TestDeviceKeys` needed for signed requests.
 pub async fn prepare_device(
     db: &std::sync::Arc<Database>,
     sync_id: &str,
     device_id: &str,
-) -> String {
+) -> (String, TestDeviceKeys) {
+    let keys = TestDeviceKeys::generate(device_id);
     let device_id = device_id.to_string();
     let sync_id = sync_id.to_string();
-    db.with_conn(|conn| {
-        db::register_device_with_pq(
-            conn,
-            &sync_id,
-            &device_id,
-            &[7u8; 32],
-            &[8u8; 32],
-            &[7u8; 1952],
-            &[8u8; 1184],
-            0,
-        )?;
-        let token = db::create_session(conn, &sync_id, &device_id, 3600)?;
-        Ok(token)
-    })
-    .expect("prepare device")
+    let signing_pk = keys.ed25519_signing_key.verifying_key().to_bytes().to_vec();
+    let x25519_pk = keys.x25519_pk.to_vec();
+    let ml_dsa_pk = keys.ml_dsa_pk.clone();
+    let ml_kem_pk = keys.ml_kem_pk.clone();
+    let token = db
+        .with_conn(|conn| {
+            db::register_device_with_pq(
+                conn,
+                &sync_id,
+                &device_id,
+                &signing_pk,
+                &x25519_pk,
+                &ml_dsa_pk,
+                &ml_kem_pk,
+                0,
+            )?;
+            let token = db::create_session(conn, &sync_id, &device_id, 3600)?;
+            Ok(token)
+        })
+        .expect("prepare device");
+    (token, keys)
 }
 
 /// Build a registry snapshot entry for test payloads.
@@ -502,6 +449,24 @@ pub fn registry_snapshot_entry(
         x25519_public_key: x25519_public_key.to_vec(),
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
+        status: status.to_string(),
+    }
+}
+
+/// Build a registry snapshot entry with PQ keys for hybrid test payloads.
+pub fn registry_snapshot_entry_hybrid(
+    sync_id: &str,
+    device_id: &str,
+    keys: &TestDeviceKeys,
+    status: &str,
+) -> RegistrySnapshotEntry {
+    RegistrySnapshotEntry {
+        sync_id: sync_id.to_string(),
+        device_id: device_id.to_string(),
+        ed25519_public_key: keys.ed25519_signing_key.verifying_key().to_bytes().to_vec(),
+        x25519_public_key: keys.x25519_pk.to_vec(),
+        ml_dsa_65_public_key: keys.ml_dsa_pk.clone(),
+        ml_kem_768_public_key: keys.ml_kem_pk.clone(),
         status: status.to_string(),
     }
 }
@@ -561,30 +526,26 @@ pub fn registry_snapshot_hash(signed_registry_snapshot: &[u8]) -> String {
     hex::encode(Sha256::digest(signed_registry_snapshot))
 }
 
-/// Build a V1 compact registry-approval payload used by `/register`.
+/// Build a V3 hybrid registry-approval payload used by `/register`.
+///
+/// This delegates to `build_registry_approval_hybrid` using `TestDeviceKeys`.
 pub fn build_registry_approval(
     sync_id: &str,
     approver_device_id: &str,
-    approver_key: &SigningKey,
+    approver_keys: &TestDeviceKeys,
     entries: Vec<RegistrySnapshotEntry>,
 ) -> RegistryApproval {
-    let signed_registry_snapshot = build_signed_registry_snapshot(entries, approver_key);
-
-    let mut approval_data = Vec::new();
-    approval_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_APPROVAL_V1\x00");
-    write_len_prefixed(&mut approval_data, sync_id.as_bytes());
-    write_len_prefixed(&mut approval_data, approver_device_id.as_bytes());
-    write_len_prefixed(&mut approval_data, &signed_registry_snapshot);
-
-    let signature = approver_key.sign(&approval_data);
-
-    RegistryApproval {
-        approver_device_id: approver_device_id.to_string(),
-        approver_ed25519_pk: hex::encode(approver_key.verifying_key().as_bytes()),
-        approver_ml_dsa_65_pk: String::new(),
-        approval_signature: hex::encode(signature.to_bytes()),
-        signed_registry_snapshot,
-    }
+    let ml_dsa_kp = approver_keys
+        .device_secret
+        .ml_dsa_65_keypair(approver_device_id)
+        .unwrap();
+    build_registry_approval_hybrid(
+        sync_id,
+        approver_device_id,
+        &approver_keys.ed25519_signing_key,
+        &ml_dsa_kp,
+        entries,
+    )
 }
 
 /// Build a V3 hybrid registry-approval payload used by `/register`.

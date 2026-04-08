@@ -146,6 +146,10 @@ pub async fn put_prekey(
                 Some(ref s) if s == &sharing_id => {}
                 _ => return Err(rusqlite::Error::QueryReturnedNoRows), // sentinel
             }
+            // Record relay-side upload time as created_at for freshness enforcement.
+            // The relay does not parse the opaque prekey bundle — it uses its own
+            // clock to timestamp the upload, then enforces upload-age and serve-age
+            // limits against that timestamp.
             let now = db::now_secs();
             db::upsert_sharing_prekey(conn, &sharing_id, &device_id, &prekey_id, &bundle, now)?;
             Ok(true)
@@ -172,7 +176,7 @@ pub async fn get_bundle(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Path(sharing_id): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let key = format!("sharing_fetch:{}", client_ip_key(peer_addr));
     if !state
         .sharing_fetch_rate_limiter
@@ -205,9 +209,21 @@ pub async fn get_bundle(
     let Some(identity_bundle) = identity else {
         return Err(AppError::NotFound);
     };
-    let Some((device_id, prekey_id, prekey_bundle)) = prekey else {
+    let Some((device_id, prekey_id, prekey_bundle, created_at)) = prekey else {
         return Err(AppError::NotFound);
     };
+
+    // Freshness gate: reject stale prekeys so senders don't encrypt to
+    // an abandoned recipient.
+    let now = db::now_secs();
+    let max_age = state.config.prekey_serve_max_age_secs;
+    if created_at < now - max_age {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recipient_prekey_stale"})),
+        )
+            .into_response());
+    }
 
     let b64 = base64::engine::general_purpose::STANDARD;
     Ok(Json(serde_json::json!({
@@ -215,7 +231,8 @@ pub async fn get_bundle(
         "signed_prekey": b64.encode(&prekey_bundle),
         "device_id": device_id,
         "prekey_id": prekey_id,
-    })))
+    }))
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------

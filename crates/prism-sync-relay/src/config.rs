@@ -80,6 +80,15 @@ pub struct Config {
     pub sharing_init_rate_limit: u32,
     /// Max pending (unconsumed) sharing-init payloads per recipient.
     pub sharing_init_max_pending: u32,
+    /// Maximum age (in seconds) for a prekey upload. Reject prekeys with
+    /// `created_at` older than this. Default: 604800 (7 days).
+    pub prekey_upload_max_age_secs: i64,
+    /// Maximum age (in seconds) for serving a prekey to a sender. Return 404
+    /// if the best prekey is older than this. Default: 2592000 (30 days).
+    pub prekey_serve_max_age_secs: i64,
+    /// Maximum clock skew (in seconds) allowed for prekey timestamps in the
+    /// future. Default: 300 (5 minutes).
+    pub prekey_max_future_skew_secs: i64,
 }
 
 impl std::fmt::Debug for Config {
@@ -173,6 +182,9 @@ impl Config {
             sharing_fetch_rate_limit: parse_env("SHARING_FETCH_RATE_LIMIT", 20),
             sharing_init_rate_limit: parse_env("SHARING_INIT_RATE_LIMIT", 10),
             sharing_init_max_pending: parse_env("SHARING_INIT_MAX_PENDING", 50),
+            prekey_upload_max_age_secs: parse_env("PREKEY_UPLOAD_MAX_AGE_SECS", 604800),
+            prekey_serve_max_age_secs: parse_env("PREKEY_SERVE_MAX_AGE_SECS", 2_592_000),
+            prekey_max_future_skew_secs: parse_env("PREKEY_MAX_FUTURE_SKEW_SECS", 300),
         }
     }
 

@@ -66,7 +66,13 @@ async fn run_cleanup(state: &AppState) {
                 config.revoked_tombstone_retention_secs as i64,
             )?;
 
-            // 10. Reclaim freed pages (incremental auto_vacuum)
+            // 10. Delete stale sharing prekeys past the serve-age limit.
+            let stale_prekeys = crate::db::cleanup_stale_sharing_prekeys(
+                conn,
+                config.prekey_serve_max_age_secs,
+            )?;
+
+            // 11. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 = conn
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -86,6 +92,7 @@ async fn run_cleanup(state: &AppState) {
                 superseded_registry_artifacts,
                 expired_pairing_sessions,
                 revoked_tombstones,
+                stale_prekeys,
                 pages_freed,
             ))
         })
@@ -104,6 +111,7 @@ async fn run_cleanup(state: &AppState) {
             superseded_registry_artifacts,
             expired_pairing_sessions,
             revoked_tombstones,
+            stale_prekeys,
             pages_freed,
         ))) => {
             state.metrics.last_cleanup_epoch_secs.store(
@@ -120,6 +128,7 @@ async fn run_cleanup(state: &AppState) {
                 || superseded_registry_artifacts > 0
                 || expired_pairing_sessions > 0
                 || revoked_tombstones > 0
+                || stale_prekeys > 0
                 || pages_freed > 0
             {
                 tracing::info!(
@@ -132,6 +141,7 @@ async fn run_cleanup(state: &AppState) {
                     superseded_registry_artifacts,
                     expired_pairing_sessions,
                     revoked_tombstones,
+                    stale_prekeys,
                     pages_freed,
                     "cleanup cycle complete"
                 );

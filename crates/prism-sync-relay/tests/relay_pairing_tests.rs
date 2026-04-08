@@ -250,6 +250,9 @@ async fn test_pairing_expired_session_returns_404() {
         sharing_fetch_rate_limit: 100,
         sharing_init_rate_limit: 100,
         sharing_init_max_pending: 50,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -358,6 +361,9 @@ async fn test_pairing_payload_too_large_returns_413() {
         sharing_fetch_rate_limit: 100,
         sharing_init_rate_limit: 100,
         sharing_init_max_pending: 50,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -417,6 +423,9 @@ async fn test_pairing_put_slot_payload_too_large() {
         sharing_fetch_rate_limit: 100,
         sharing_init_rate_limit: 100,
         sharing_init_max_pending: 50,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;

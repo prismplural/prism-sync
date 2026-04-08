@@ -2034,16 +2034,17 @@ pub fn upsert_sharing_prekey(
     Ok(())
 }
 
-/// Returns (device_id, prekey_id, prekey_bundle) for the most recently created
-/// prekey belonging to an active device.
+/// Returns (device_id, prekey_id, prekey_bundle, created_at) for the most
+/// recently created prekey belonging to an active device.
+#[allow(clippy::type_complexity)]
 pub fn get_best_sharing_prekey(
     conn: &Connection,
     sharing_id: &str,
-) -> Result<Option<(String, String, Vec<u8>)>, rusqlite::Error> {
+) -> Result<Option<(String, String, Vec<u8>, i64)>, rusqlite::Error> {
     // Look up the sync_id for this sharing_id, then join against devices
     // to only return prekeys from active devices.
     conn.query_row(
-        "SELECT sp.device_id, sp.prekey_id, sp.prekey_bundle
+        "SELECT sp.device_id, sp.prekey_id, sp.prekey_bundle, sp.created_at
          FROM sharing_signed_prekeys sp
          INNER JOIN sharing_id_mappings sm ON sm.sharing_id = sp.sharing_id
          INNER JOIN devices d ON d.sync_id = sm.sync_id AND d.device_id = sp.device_id
@@ -2052,9 +2053,22 @@ pub fn get_best_sharing_prekey(
          ORDER BY sp.created_at DESC
          LIMIT 1",
         params![sharing_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )
     .optional()
+}
+
+/// Delete prekeys older than `max_age_secs` and return the number removed.
+pub fn cleanup_stale_sharing_prekeys(
+    conn: &Connection,
+    max_age_secs: i64,
+) -> Result<usize, rusqlite::Error> {
+    let cutoff = now_secs() - max_age_secs;
+    let deleted = conn.execute(
+        "DELETE FROM sharing_signed_prekeys WHERE created_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(deleted)
 }
 
 pub fn delete_sharing_prekeys(conn: &Connection, sharing_id: &str) -> Result<(), rusqlite::Error> {

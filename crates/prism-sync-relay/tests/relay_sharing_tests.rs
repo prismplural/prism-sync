@@ -3,10 +3,11 @@
 mod common;
 
 use base64::Engine;
-use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use reqwest::Client;
 use serde_json::Value;
+
+use rusqlite::params;
 
 use prism_sync_relay::{
     config::Config,
@@ -32,7 +33,7 @@ async fn publish_identity(
     client: &Client,
     url: &str,
     token: &str,
-    signing_key: &SigningKey,
+    keys: &TestDeviceKeys,
     sync_id: &str,
     device_id: &str,
     sharing_id: &str,
@@ -51,7 +52,7 @@ async fn publish_identity(
 
     let builder = apply_signed_headers(
         builder,
-        signing_key,
+        keys,
         "PUT",
         "/v1/sharing/identity",
         sync_id,
@@ -66,7 +67,7 @@ async fn publish_prekey(
     client: &Client,
     url: &str,
     token: &str,
-    signing_key: &SigningKey,
+    keys: &TestDeviceKeys,
     sync_id: &str,
     device_id: &str,
     sharing_id: &str,
@@ -88,7 +89,7 @@ async fn publish_prekey(
 
     let builder = apply_signed_headers(
         builder,
-        signing_key,
+        keys,
         "PUT",
         "/v1/sharing/prekey",
         sync_id,
@@ -105,8 +106,8 @@ async fn test_publish_identity_and_fetch_bundle() {
 
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &signing_key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
     let identity_bundle = b"test-identity-bundle";
     let prekey_bundle = b"test-prekey-bundle";
@@ -116,7 +117,7 @@ async fn test_publish_identity_and_fetch_bundle() {
         &client,
         &url,
         &token,
-        &signing_key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -130,7 +131,7 @@ async fn test_publish_identity_and_fetch_bundle() {
         &client,
         &url,
         &token,
-        &signing_key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -167,13 +168,13 @@ async fn test_sharing_id_conflict_different_sync_group() {
 
     let sync_id_1 = generate_sync_id();
     let device_id_1 = generate_device_id();
-    let key_1 = SigningKey::generate(&mut rand::thread_rng());
-    let token_1 = register_device(&client, &url, &sync_id_1, &device_id_1, &key_1).await;
+    let keys_1 = TestDeviceKeys::generate(&device_id_1);
+    let token_1 = register_device(&client, &url, &sync_id_1, &device_id_1, &keys_1).await;
 
     let sync_id_2 = generate_sync_id();
     let device_id_2 = generate_device_id();
-    let key_2 = SigningKey::generate(&mut rand::thread_rng());
-    let token_2 = register_device(&client, &url, &sync_id_2, &device_id_2, &key_2).await;
+    let keys_2 = TestDeviceKeys::generate(&device_id_2);
+    let token_2 = register_device(&client, &url, &sync_id_2, &device_id_2, &keys_2).await;
 
     let sharing_id = generate_sharing_id();
 
@@ -182,7 +183,7 @@ async fn test_sharing_id_conflict_different_sync_group() {
         &client,
         &url,
         &token_1,
-        &key_1,
+        &keys_1,
         &sync_id_1,
         &device_id_1,
         &sharing_id,
@@ -196,7 +197,7 @@ async fn test_sharing_id_conflict_different_sync_group() {
         &client,
         &url,
         &token_2,
-        &key_2,
+        &keys_2,
         &sync_id_2,
         &device_id_2,
         &sharing_id,
@@ -217,8 +218,8 @@ async fn test_same_sync_group_cannot_switch_sharing_id() {
 
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     let sharing_id_1 = generate_sharing_id();
     let sharing_id_2 = generate_sharing_id();
@@ -228,7 +229,7 @@ async fn test_same_sync_group_cannot_switch_sharing_id() {
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id_1,
@@ -242,7 +243,7 @@ async fn test_same_sync_group_cannot_switch_sharing_id() {
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id_2,
@@ -259,12 +260,12 @@ async fn test_fetch_bundle_returns_most_recent_active_prekey() {
 
     let sync_id = generate_sync_id();
     let device_id_1 = generate_device_id();
-    let key_1 = SigningKey::generate(&mut rand::thread_rng());
-    let token_1 = register_device(&client, &url, &sync_id, &device_id_1, &key_1).await;
+    let keys_1 = TestDeviceKeys::generate(&device_id_1);
+    let token_1 = register_device(&client, &url, &sync_id, &device_id_1, &keys_1).await;
 
     // Register a second device in the same sync group (via direct DB)
     let device_id_2 = generate_device_id();
-    let _token_2 = prepare_device(&db, &sync_id, &device_id_2).await;
+    let (_token_2, _keys_2) = prepare_device(&db, &sync_id, &device_id_2).await;
 
     let sharing_id = generate_sharing_id();
 
@@ -273,7 +274,7 @@ async fn test_fetch_bundle_returns_most_recent_active_prekey() {
         &client,
         &url,
         &token_1,
-        &key_1,
+        &keys_1,
         &sync_id,
         &device_id_1,
         &sharing_id,
@@ -330,13 +331,13 @@ async fn test_sharing_init_upload_fetch_consume() {
     // Set up sender
     let sender_sync_id = generate_sync_id();
     let sender_device_id = generate_device_id();
-    let sender_key = SigningKey::generate(&mut rand::thread_rng());
+    let sender_keys = TestDeviceKeys::generate(&sender_device_id);
     let sender_token = register_device(
         &client,
         &url,
         &sender_sync_id,
         &sender_device_id,
-        &sender_key,
+        &sender_keys,
     )
     .await;
     let sender_sharing_id = generate_sharing_id();
@@ -346,7 +347,7 @@ async fn test_sharing_init_upload_fetch_consume() {
         &client,
         &url,
         &sender_token,
-        &sender_key,
+        &sender_keys,
         &sender_sync_id,
         &sender_device_id,
         &sender_sharing_id,
@@ -358,13 +359,13 @@ async fn test_sharing_init_upload_fetch_consume() {
     // Set up recipient
     let recipient_sync_id = generate_sync_id();
     let recipient_device_id = generate_device_id();
-    let recipient_key = SigningKey::generate(&mut rand::thread_rng());
+    let recipient_keys = TestDeviceKeys::generate(&recipient_device_id);
     let recipient_token = register_device(
         &client,
         &url,
         &recipient_sync_id,
         &recipient_device_id,
-        &recipient_key,
+        &recipient_keys,
     )
     .await;
     let recipient_sharing_id = generate_sharing_id();
@@ -374,7 +375,7 @@ async fn test_sharing_init_upload_fetch_consume() {
         &client,
         &url,
         &recipient_token,
-        &recipient_key,
+        &recipient_keys,
         &recipient_sync_id,
         &recipient_device_id,
         &recipient_sharing_id,
@@ -400,7 +401,7 @@ async fn test_sharing_init_upload_fetch_consume() {
         .body(body_bytes.clone());
     let builder = apply_signed_headers(
         builder,
-        &sender_key,
+        &sender_keys,
         "POST",
         "/v1/sharing/init",
         &sender_sync_id,
@@ -416,7 +417,7 @@ async fn test_sharing_init_upload_fetch_consume() {
         .header("Authorization", format!("Bearer {recipient_token}"));
     let builder = apply_signed_headers(
         builder,
-        &recipient_key,
+        &recipient_keys,
         "GET",
         "/v1/sharing/init/pending",
         &recipient_sync_id,
@@ -441,7 +442,7 @@ async fn test_sharing_init_upload_fetch_consume() {
         .header("Authorization", format!("Bearer {recipient_token}"));
     let builder = apply_signed_headers(
         builder,
-        &recipient_key,
+        &recipient_keys,
         "GET",
         "/v1/sharing/init/pending",
         &recipient_sync_id,
@@ -465,8 +466,8 @@ async fn test_duplicate_init_id_returns_409() {
 
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
 
     // Bind sharing_id
@@ -474,7 +475,7 @@ async fn test_duplicate_init_id_returns_409() {
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -501,7 +502,7 @@ async fn test_duplicate_init_id_returns_409() {
             .body(body_bytes.clone());
         apply_signed_headers(
             builder,
-            &key,
+            &keys,
             "POST",
             "/v1/sharing/init",
             &sync_id,
@@ -560,6 +561,9 @@ async fn test_max_pending_limit_enforced() {
         sharing_fetch_rate_limit: 100,
         sharing_init_rate_limit: 1000,
         sharing_init_max_pending: 3, // very low limit for testing
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
     };
 
     let (url, _handle, _db) = start_test_relay_with_config(config).await;
@@ -567,15 +571,15 @@ async fn test_max_pending_limit_enforced() {
 
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
 
     let resp = publish_identity(
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -602,7 +606,7 @@ async fn test_max_pending_limit_enforced() {
             .body(body_bytes.clone());
         let builder = apply_signed_headers(
             builder,
-            &key,
+            &keys,
             "POST",
             "/v1/sharing/init",
             &sync_id,
@@ -629,7 +633,7 @@ async fn test_max_pending_limit_enforced() {
         .body(body_bytes.clone());
     let builder = apply_signed_headers(
         builder,
-        &key,
+        &keys,
         "POST",
         "/v1/sharing/init",
         &sync_id,
@@ -651,8 +655,8 @@ async fn test_delete_identity_removes_identity_and_prekeys() {
 
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
 
     // Publish identity + prekey
@@ -660,7 +664,7 @@ async fn test_delete_identity_removes_identity_and_prekeys() {
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -673,7 +677,7 @@ async fn test_delete_identity_removes_identity_and_prekeys() {
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -697,7 +701,7 @@ async fn test_delete_identity_removes_identity_and_prekeys() {
         .header("Authorization", format!("Bearer {token}"));
     let builder = apply_signed_headers(
         builder,
-        &key,
+        &keys,
         "DELETE",
         "/v1/sharing/identity",
         &sync_id,
@@ -811,6 +815,9 @@ async fn test_bundle_fetch_rate_limiting_ignores_spoofed_forwarded_headers() {
         sharing_fetch_rate_limit: 2,
         sharing_init_rate_limit: 100,
         sharing_init_max_pending: 50,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
     };
 
     let (url, _handle, _db) = start_test_relay_with_config(config).await;
@@ -818,8 +825,8 @@ async fn test_bundle_fetch_rate_limiting_ignores_spoofed_forwarded_headers() {
 
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
 
     // Publish identity + prekey so bundle is fetchable
@@ -827,7 +834,7 @@ async fn test_bundle_fetch_rate_limiting_ignores_spoofed_forwarded_headers() {
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -840,7 +847,7 @@ async fn test_bundle_fetch_rate_limiting_ignores_spoofed_forwarded_headers() {
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -914,6 +921,9 @@ async fn test_sharing_init_upload_rate_limiting() {
         sharing_fetch_rate_limit: 100,
         sharing_init_rate_limit: 2,
         sharing_init_max_pending: 50,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
     };
 
     let (url, _handle, _db) = start_test_relay_with_config(config).await;
@@ -921,15 +931,15 @@ async fn test_sharing_init_upload_rate_limiting() {
 
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
 
     let resp = publish_identity(
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -957,7 +967,7 @@ async fn test_sharing_init_upload_rate_limiting() {
             .body(body_bytes.clone());
         let builder = apply_signed_headers(
             builder,
-            &key,
+            &keys,
             "POST",
             "/v1/sharing/init",
             &sync_id,
@@ -984,7 +994,7 @@ async fn test_sharing_init_upload_rate_limiting() {
         .body(body_bytes.clone());
     let builder = apply_signed_headers(
         builder,
-        &key,
+        &keys,
         "POST",
         "/v1/sharing/init",
         &sync_id,
@@ -1004,12 +1014,12 @@ async fn test_revoked_device_prekey_not_returned() {
 
     // Register device_a via HTTP
     let device_id_a = generate_device_id();
-    let key_a = SigningKey::generate(&mut rand::thread_rng());
-    let token_a = register_device(&client, &url, &sync_id, &device_id_a, &key_a).await;
+    let keys_a = TestDeviceKeys::generate(&device_id_a);
+    let token_a = register_device(&client, &url, &sync_id, &device_id_a, &keys_a).await;
 
     // Register device_b via direct DB (same sync group)
     let device_id_b = generate_device_id();
-    let _token_b = prepare_device(&db, &sync_id, &device_id_b).await;
+    let (_token_b, _keys_b) = prepare_device(&db, &sync_id, &device_id_b).await;
 
     let sharing_id = generate_sharing_id();
 
@@ -1018,7 +1028,7 @@ async fn test_revoked_device_prekey_not_returned() {
         &client,
         &url,
         &token_a,
-        &key_a,
+        &keys_a,
         &sync_id,
         &device_id_a,
         &sharing_id,
@@ -1092,15 +1102,15 @@ async fn test_bundle_404_no_presence_probing() {
     // Scenario B: publish identity but NO prekeys
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let key = SigningKey::generate(&mut rand::thread_rng());
-    let token = register_device(&client, &url, &sync_id, &device_id, &key).await;
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
 
     let resp = publish_identity(
         &client,
         &url,
         &token,
-        &key,
+        &keys,
         &sync_id,
         &device_id,
         &sharing_id,
@@ -1123,4 +1133,191 @@ async fn test_bundle_404_no_presence_probing() {
         resp_b.status(),
         "both scenarios must return identical status to prevent presence probing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Prekey freshness enforcement tests
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a device with identity + prekey and return handles for
+/// further manipulation. Returns (sharing_id, sync_id, device_id).
+async fn setup_device_with_prekey(
+    client: &Client,
+    url: &str,
+    _db: &std::sync::Arc<Database>,
+) -> (String, String, String) {
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(client, url, &sync_id, &device_id, &keys).await;
+    let sharing_id = generate_sharing_id();
+
+    // Publish identity
+    let resp = publish_identity(
+        client,
+        url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        b"test-identity",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // Publish prekey (relay stamps created_at = now)
+    let resp = publish_prekey(
+        client,
+        url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        "pk-fresh",
+        b"test-prekey",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    (sharing_id, sync_id, device_id)
+}
+
+#[tokio::test]
+async fn test_stale_prekey_not_served() {
+    let (url, _handle, db) = start_test_relay().await;
+    let client = Client::new();
+    let (sharing_id, _sync_id, device_id) = setup_device_with_prekey(&client, &url, &db).await;
+
+    // Backdate the prekey to 31 days ago (default serve limit is 30 days)
+    let stale_time = db::now_secs() - (31 * 86400);
+    let sid = sharing_id.clone();
+    let did = device_id.clone();
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE sharing_signed_prekeys SET created_at = ?1
+             WHERE sharing_id = ?2 AND device_id = ?3",
+            params![stale_time, sid, did],
+        )
+    })
+    .unwrap();
+
+    // Fetch bundle should return 404 with stale error
+    let resp = client
+        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"].as_str().unwrap(),
+        "recipient_prekey_stale",
+        "stale prekey should return recipient_prekey_stale error"
+    );
+}
+
+#[tokio::test]
+async fn test_fresh_prekey_served_normally() {
+    let (url, _handle, db) = start_test_relay().await;
+    let client = Client::new();
+    let (sharing_id, _sync_id, device_id) = setup_device_with_prekey(&client, &url, &db).await;
+
+    // Backdate to 6 days ago (within 7-day upload limit and 30-day serve limit)
+    let recent_time = db::now_secs() - (6 * 86400);
+    let sid = sharing_id.clone();
+    let did = device_id.clone();
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE sharing_signed_prekeys SET created_at = ?1
+             WHERE sharing_id = ?2 AND device_id = ?3",
+            params![recent_time, sid, did],
+        )
+    })
+    .unwrap();
+
+    // Fetch bundle should succeed
+    let resp = client
+        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["device_id"].as_str().unwrap(), device_id);
+    assert_eq!(body["prekey_id"].as_str().unwrap(), "pk-fresh");
+}
+
+#[tokio::test]
+async fn test_prekey_at_serve_boundary_still_served() {
+    let (url, _handle, db) = start_test_relay().await;
+    let client = Client::new();
+    let (sharing_id, _sync_id, device_id) = setup_device_with_prekey(&client, &url, &db).await;
+
+    // Set to exactly 29 days ago (just within 30-day limit)
+    let boundary_time = db::now_secs() - (29 * 86400);
+    let sid = sharing_id.clone();
+    let did = device_id.clone();
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE sharing_signed_prekeys SET created_at = ?1
+             WHERE sharing_id = ?2 AND device_id = ?3",
+            params![boundary_time, sid, did],
+        )
+    })
+    .unwrap();
+
+    let resp = client
+        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "prekey within serve limit should be served");
+}
+
+#[tokio::test]
+async fn test_cleanup_removes_stale_prekeys() {
+    let db = Database::in_memory().expect("in-memory db");
+    let sharing_id = generate_sharing_id();
+    let device_id = generate_device_id();
+    let sync_id = generate_sync_id();
+
+    db.with_conn(|conn| {
+        // Set up the device and sharing mapping
+        db::create_sync_group(conn, &sync_id, 0)?;
+        db::register_device(conn, &sync_id, &device_id, &[1; 32], &[2; 32], 0)?;
+        db::upsert_sharing_id_mapping(conn, &sync_id, &sharing_id)?;
+
+        let now = db::now_secs();
+
+        // Insert a fresh prekey
+        db::upsert_sharing_prekey(conn, &sharing_id, &device_id, "pk-fresh", b"fresh", now)?;
+
+        // Insert a stale prekey (for a different device) older than serve limit
+        let stale_time = now - 2_592_001; // 30 days + 1 second
+        let stale_device = generate_device_id();
+        db::register_device(conn, &sync_id, &stale_device, &[3; 32], &[4; 32], 0)?;
+        db::upsert_sharing_prekey(
+            conn,
+            &sharing_id,
+            &stale_device,
+            "pk-stale",
+            b"stale",
+            stale_time,
+        )?;
+
+        // Cleanup should remove the stale prekey
+        let removed = db::cleanup_stale_sharing_prekeys(conn, 2_592_000)?;
+        assert_eq!(removed, 1, "one stale prekey should be removed");
+
+        // Fresh prekey should remain
+        let best = db::get_best_sharing_prekey(conn, &sharing_id)?;
+        assert!(best.is_some(), "fresh prekey should still exist");
+        let (_, pk_id, _, _) = best.unwrap();
+        assert_eq!(pk_id, "pk-fresh");
+
+        Ok(())
+    })
+    .unwrap();
 }
