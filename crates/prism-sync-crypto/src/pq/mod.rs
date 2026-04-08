@@ -14,6 +14,32 @@ use ml_dsa::signature::Signer as MlDsaSigner;
 use ml_dsa::signature::Verifier as MlDsaVerifier;
 use ml_dsa::MlDsa65;
 
+/// IETF composite-signatures draft prefix.
+const COMPOSITE_PREFIX: &[u8] = b"CompositeAlgorithmSignatures2025";
+
+/// Prism-specific label (not an X.509 OID, but follows the draft pattern).
+const PRISM_LABEL: &[u8] = b"PrismHybridSig-v3";
+
+/// Build the labeled message representative per IETF composite-sigs-15 pattern.
+///
+/// M' = Prefix || Label || u8(context.len()) || context || SHA-512(message)
+///
+/// The context must be <= 255 bytes.
+pub fn build_hybrid_message_representative(context: &[u8], message: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    assert!(context.len() <= 255, "context must be <= 255 bytes");
+    let hash = Sha512::digest(message);
+    let mut m_prime = Vec::with_capacity(
+        COMPOSITE_PREFIX.len() + PRISM_LABEL.len() + 1 + context.len() + 64,
+    );
+    m_prime.extend_from_slice(COMPOSITE_PREFIX);
+    m_prime.extend_from_slice(PRISM_LABEL);
+    m_prime.push(context.len() as u8);
+    m_prime.extend_from_slice(context);
+    m_prime.extend_from_slice(&hash);
+    m_prime
+}
+
 /// Expected size of an Ed25519 signature in bytes.
 const ED25519_SIG_LEN: usize = 64;
 
@@ -109,6 +135,43 @@ impl HybridSignature {
         buf.extend_from_slice(&ml_len.to_le_bytes());
         buf.extend_from_slice(&self.ml_dsa_65_sig);
         buf
+    }
+
+    /// Sign with V3 labeled WNS construction.
+    ///
+    /// Both algorithms sign the same message representative M', built from the
+    /// IETF composite-signatures draft pattern with a Prism-specific label and
+    /// caller-supplied context string.
+    pub fn sign_v3(
+        message: &[u8],
+        context: &[u8],
+        ed25519_sk: &ed25519_dalek::SigningKey,
+        ml_dsa_sk: &impl MlDsaSigner<ml_dsa::Signature<MlDsa65>>,
+    ) -> Self {
+        let m_prime = build_hybrid_message_representative(context, message);
+        let ed_sig = ed25519_sk.sign(&m_prime);
+        let ml_sig: ml_dsa::Signature<MlDsa65> = ml_dsa_sk.sign(&m_prime);
+        let ml_sig_encoded = ml_sig.encode();
+
+        HybridSignature {
+            ed25519_sig: ed_sig.to_bytes().to_vec(),
+            ml_dsa_65_sig: AsRef::<[u8]>::as_ref(&ml_sig_encoded).to_vec(),
+        }
+    }
+
+    /// Verify V3 labeled WNS signature.
+    ///
+    /// Reconstructs the message representative M' from the supplied context and
+    /// message, then delegates to [`verify`].
+    pub fn verify_v3(
+        &self,
+        message: &[u8],
+        context: &[u8],
+        ed25519_pk: &[u8; 32],
+        ml_dsa_pk: &[u8],
+    ) -> Result<()> {
+        let m_prime = build_hybrid_message_representative(context, message);
+        self.verify(&m_prime, ed25519_pk, ml_dsa_pk)
     }
 
     /// Deserialize from wire format, validating expected signature sizes.
@@ -320,5 +383,101 @@ mod tests {
         let mut bytes = sig.to_bytes();
         bytes.push(0xFF); // append trailing byte
         assert!(HybridSignature::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn v3_sign_verify_round_trip() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let msg = b"V3 round trip test";
+        let ctx = b"test_context";
+
+        let sig = HybridSignature::sign_v3(msg, ctx, &ed_sk, &ml_sk);
+
+        let ed_pk = ed_sk.verifying_key().to_bytes();
+        let ml_vk = ml_sk.verifying_key();
+        let ml_pk_encoded = ml_vk.encode();
+        let ml_pk_bytes = AsRef::<[u8]>::as_ref(&ml_pk_encoded);
+
+        sig.verify_v3(msg, ctx, &ed_pk, ml_pk_bytes)
+            .expect("V3 verification should succeed");
+    }
+
+    #[test]
+    fn v3_rejects_tampered_message() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let ctx = b"test_context";
+
+        let sig = HybridSignature::sign_v3(b"original", ctx, &ed_sk, &ml_sk);
+
+        let ed_pk = ed_sk.verifying_key().to_bytes();
+        let ml_vk = ml_sk.verifying_key();
+        let ml_pk_encoded = ml_vk.encode();
+        let ml_pk_bytes = AsRef::<[u8]>::as_ref(&ml_pk_encoded);
+
+        assert!(sig.verify_v3(b"tampered", ctx, &ed_pk, ml_pk_bytes).is_err());
+    }
+
+    #[test]
+    fn v3_rejects_wrong_context() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let msg = b"context test";
+
+        let sig = HybridSignature::sign_v3(msg, b"context_a", &ed_sk, &ml_sk);
+
+        let ed_pk = ed_sk.verifying_key().to_bytes();
+        let ml_vk = ml_sk.verifying_key();
+        let ml_pk_encoded = ml_vk.encode();
+        let ml_pk_bytes = AsRef::<[u8]>::as_ref(&ml_pk_encoded);
+
+        assert!(
+            sig.verify_v3(msg, b"context_b", &ed_pk, ml_pk_bytes)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v2_signature_does_not_verify_under_v3() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let msg = b"cross-version test";
+        let ctx = b"test_context";
+
+        // Sign with V2 (bare WNS — signs message directly)
+        let v2_sig = HybridSignature::sign(msg, &ed_sk, &ml_sk);
+
+        let ed_pk = ed_sk.verifying_key().to_bytes();
+        let ml_vk = ml_sk.verifying_key();
+        let ml_pk_encoded = ml_vk.encode();
+        let ml_pk_bytes = AsRef::<[u8]>::as_ref(&ml_pk_encoded);
+
+        // V2 sig should fail V3 verification (different message construction)
+        assert!(v2_sig.verify_v3(msg, ctx, &ed_pk, ml_pk_bytes).is_err());
+    }
+
+    #[test]
+    fn build_hybrid_message_representative_pinned_vector() {
+        use sha2::{Digest, Sha512};
+
+        let context = b"test";
+        let message = b"hello";
+
+        let m_prime = build_hybrid_message_representative(context, message);
+
+        // Verify structure: prefix || label || len(context) || context || SHA-512(message)
+        let hash = Sha512::digest(message);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"CompositeAlgorithmSignatures2025");
+        expected.extend_from_slice(b"PrismHybridSig-v3");
+        expected.push(4); // context.len()
+        expected.extend_from_slice(b"test");
+        expected.extend_from_slice(&hash);
+
+        assert_eq!(m_prime, expected);
+        // Total length: 32 + 17 + 1 + 4 + 64 = 118
+        assert_eq!(m_prime.len(), 118);
     }
 }
