@@ -119,6 +119,8 @@ impl PairingService {
             device_id: device_id.clone(),
             ed25519_public_key: signing_key.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         }]);
         let signed_keyring = registry_snapshot.sign(&signing_key);
@@ -171,6 +173,8 @@ impl PairingService {
             device_id: device_id.clone(),
             signing_public_key: signing_key.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             registration_challenge: challenge_signature,
             nonce,
             pow_solution,
@@ -306,6 +310,7 @@ impl PairingService {
                 .map(|approval_signature| RegistryApproval {
                     approver_device_id: response.inviter_device_id.clone(),
                     approver_ed25519_pk: hex::encode(&response.inviter_ed25519_pk),
+                    approver_ml_dsa_65_pk: String::new(),
                     approval_signature: approval_signature.clone(),
                     signed_registry_snapshot: response.signed_keyring.clone(),
                 });
@@ -315,6 +320,8 @@ impl PairingService {
                 device_id: device_id.clone(),
                 signing_public_key: signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 registration_challenge: challenge_signature,
                 nonce,
                 pow_solution,
@@ -465,6 +472,7 @@ impl PairingService {
                 .map(|approval_signature| RegistryApproval {
                     approver_device_id: bundle.inviter_device_id.clone(),
                     approver_ed25519_pk: hex::encode(&bundle.inviter_ed25519_pk),
+                    approver_ml_dsa_65_pk: String::new(),
                     approval_signature: approval_signature.clone(),
                     signed_registry_snapshot: bundle.signed_keyring.clone(),
                 });
@@ -475,6 +483,8 @@ impl PairingService {
                 device_id: device_id.clone(),
                 signing_public_key: signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 registration_challenge: challenge_signature,
                 nonce,
                 pow_solution,
@@ -610,6 +620,8 @@ impl PairingService {
                 device_id: device.device_id,
                 ed25519_public_key: device.ed25519_public_key,
                 x25519_public_key: device.x25519_public_key,
+                ml_dsa_65_public_key: device.ml_dsa_65_public_key,
+                ml_kem_768_public_key: device.ml_kem_768_public_key,
                 status: device.status,
             })
             .collect();
@@ -618,6 +630,8 @@ impl PairingService {
             device_id: device_id.clone(),
             ed25519_public_key: signing_key.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         });
         snapshot_entries.push(RegistrySnapshotEntry {
@@ -625,6 +639,8 @@ impl PairingService {
             device_id: bootstrap_record.device_id.clone(),
             ed25519_public_key: bootstrap_record.ed25519_public_key.to_vec(),
             x25519_public_key: bootstrap_record.x25519_public_key.to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         });
 
@@ -1125,6 +1141,8 @@ mod tests {
                 status: "active".to_string(),
                 ed25519_public_key: req.signing_public_key,
                 x25519_public_key: req.x25519_public_key,
+                ml_dsa_65_public_key: req.ml_dsa_65_public_key,
+                ml_kem_768_public_key: req.ml_kem_768_public_key,
                 permission: None,
             });
             Ok(RegisterResponse {
@@ -1263,6 +1281,8 @@ mod tests {
             status: "active".to_string(),
             ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
             x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             permission: None,
         }]));
 
@@ -1408,6 +1428,8 @@ mod tests {
             status: "active".to_string(),
             ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
             x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             permission: None,
         }]));
 
@@ -2053,6 +2075,8 @@ mod tests {
                 device_id: inviter_device_id.clone(),
                 ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -2060,6 +2084,8 @@ mod tests {
                 device_id: joiner_device_id.clone(),
                 ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
         ]);
@@ -2167,6 +2193,8 @@ mod tests {
                 device_id: inviter_device_id.clone(),
                 ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -2174,6 +2202,8 @@ mod tests {
                 device_id: joiner_device_id.clone(),
                 ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
         ]);

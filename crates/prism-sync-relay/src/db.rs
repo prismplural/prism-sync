@@ -15,6 +15,8 @@ pub struct DeviceRecord {
     pub device_id: String,
     pub signing_public_key: Vec<u8>,
     pub x25519_public_key: Vec<u8>,
+    pub ml_dsa_65_public_key: Vec<u8>,
+    pub ml_kem_768_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
     pub last_seen_at: i64,
@@ -25,6 +27,8 @@ pub struct DeviceListEntry {
     pub device_id: String,
     pub signing_public_key: Vec<u8>,
     pub x25519_public_key: Vec<u8>,
+    pub ml_dsa_65_public_key: Vec<u8>,
+    pub ml_kem_768_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
 }
@@ -257,6 +261,8 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             device_id           TEXT NOT NULL,
             signing_public_key  BLOB NOT NULL,
             x25519_public_key   BLOB NOT NULL,
+            ml_dsa_65_public_key BLOB NOT NULL DEFAULT X'',
+            ml_kem_768_public_key BLOB NOT NULL DEFAULT X'',
             epoch               INTEGER NOT NULL DEFAULT 0,
             status              TEXT NOT NULL DEFAULT 'active',
             registered_at       INTEGER NOT NULL,
@@ -461,6 +467,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     // with the columns already present. For pre-existing tables we need to add them.
     migrate_snapshots_ephemeral(conn)?;
     migrate_devices_remote_wipe(conn)?;
+    migrate_devices_pq_columns(conn)?;
     migrate_sync_groups_password_version(conn)?;
 
     Ok(())
@@ -504,6 +511,24 @@ fn migrate_devices_remote_wipe(conn: &Connection) -> Result<(), rusqlite::Error>
             "ALTER TABLE devices ADD COLUMN remote_wipe INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    Ok(())
+}
+
+fn migrate_devices_pq_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_ml_dsa = device_has_column(conn, "ml_dsa_65_public_key")?;
+    let has_ml_kem = device_has_column(conn, "ml_kem_768_public_key")?;
+
+    if !has_ml_dsa {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN ml_dsa_65_public_key BLOB NOT NULL DEFAULT X'';",
+        )?;
+    }
+    if !has_ml_kem {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN ml_kem_768_public_key BLOB NOT NULL DEFAULT X'';",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -871,13 +896,36 @@ pub fn register_device(
     x25519_pk: &[u8],
     epoch: i64,
 ) -> Result<(), rusqlite::Error> {
+    register_device_with_pq(
+        conn,
+        sync_id,
+        device_id,
+        signing_pk,
+        x25519_pk,
+        &[],
+        &[],
+        epoch,
+    )
+}
+
+pub fn register_device_with_pq(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    signing_pk: &[u8],
+    x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
+    epoch: i64,
+) -> Result<(), rusqlite::Error> {
     let now = now_secs();
     conn.execute(
         "INSERT INTO devices (
             sync_id, device_id, signing_public_key, x25519_public_key,
+            ml_dsa_65_public_key, ml_kem_768_public_key,
             epoch, status, registered_at, last_seen_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
-        params![sync_id, device_id, signing_pk, x25519_pk, epoch, now],
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?8)",
+        params![sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, epoch, now],
     )?;
     Ok(())
 }
@@ -888,7 +936,9 @@ pub fn get_device(
     device_id: &str,
 ) -> Result<Option<DeviceRecord>, rusqlite::Error> {
     conn.query_row(
-        "SELECT device_id, signing_public_key, x25519_public_key, epoch, status, last_seen_at
+        "SELECT device_id, signing_public_key, x25519_public_key,
+                ml_dsa_65_public_key, ml_kem_768_public_key,
+                epoch, status, last_seen_at
          FROM devices
          WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
@@ -897,9 +947,11 @@ pub fn get_device(
                 device_id: row.get(0)?,
                 signing_public_key: row.get(1)?,
                 x25519_public_key: row.get(2)?,
-                epoch: row.get(3)?,
-                status: row.get(4)?,
-                last_seen_at: row.get(5)?,
+                ml_dsa_65_public_key: row.get(3)?,
+                ml_kem_768_public_key: row.get(4)?,
+                epoch: row.get(5)?,
+                status: row.get(6)?,
+                last_seen_at: row.get(7)?,
             })
         },
     )
@@ -911,7 +963,9 @@ pub fn list_devices(
     sync_id: &str,
 ) -> Result<Vec<DeviceListEntry>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT device_id, signing_public_key, x25519_public_key, epoch, status
+        "SELECT device_id, signing_public_key, x25519_public_key,
+                ml_dsa_65_public_key, ml_kem_768_public_key,
+                epoch, status
          FROM devices
          WHERE sync_id = ?1
          ORDER BY registered_at ASC",
@@ -921,8 +975,10 @@ pub fn list_devices(
             device_id: row.get(0)?,
             signing_public_key: row.get(1)?,
             x25519_public_key: row.get(2)?,
-            epoch: row.get(3)?,
-            status: row.get(4)?,
+            ml_dsa_65_public_key: row.get(3)?,
+            ml_kem_768_public_key: row.get(4)?,
+            epoch: row.get(5)?,
+            status: row.get(6)?,
         })
     })?;
     rows.collect()

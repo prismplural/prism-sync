@@ -225,6 +225,8 @@ pub fn register_device(
         status: "active".to_string(),
         ed25519_public_key: pk_bytes.clone(),
         x25519_public_key: vec![0u8; 32],
+        ml_dsa_65_public_key: Vec::new(),
+        ml_kem_768_public_key: Vec::new(),
         permission: None,
     });
 

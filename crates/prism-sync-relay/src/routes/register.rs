@@ -134,6 +134,10 @@ struct RegisterRequest {
     device_id: String,
     signing_public_key: String,
     x25519_public_key: String,
+    #[serde(default)]
+    ml_dsa_65_public_key: String,
+    #[serde(default)]
+    ml_kem_768_public_key: String,
     registration_challenge: String,
     nonce: String,
     #[serde(default)]
@@ -160,6 +164,9 @@ enum FirstDeviceAdmissionProof {
 struct RegistryApproval {
     approver_device_id: String,
     approver_ed25519_pk: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    approver_ml_dsa_65_pk: String,
     approval_signature: String,
     signed_registry_snapshot: Vec<u8>,
 }
@@ -170,6 +177,10 @@ struct RegistrySnapshotEntry {
     device_id: String,
     ed25519_public_key: Vec<u8>,
     x25519_public_key: Vec<u8>,
+    #[serde(default)]
+    ml_dsa_65_public_key: Vec<u8>,
+    #[serde(default)]
+    ml_kem_768_public_key: Vec<u8>,
     status: String,
 }
 
@@ -205,6 +216,30 @@ async fn register_device(
     if x25519_pk.len() != 32 {
         return Err(AppError::BadRequest("x25519_public_key must be 32 bytes"));
     }
+    let ml_dsa_pk = if body.ml_dsa_65_public_key.is_empty() {
+        Vec::new()
+    } else {
+        let decoded = hex::decode(&body.ml_dsa_65_public_key)
+            .map_err(|_| AppError::BadRequest("Invalid ml_dsa_65_public_key hex"))?;
+        if decoded.len() != 1952 {
+            return Err(AppError::BadRequest(
+                "ml_dsa_65_public_key must be 1952 bytes",
+            ));
+        }
+        decoded
+    };
+    let ml_kem_pk = if body.ml_kem_768_public_key.is_empty() {
+        Vec::new()
+    } else {
+        let decoded = hex::decode(&body.ml_kem_768_public_key)
+            .map_err(|_| AppError::BadRequest("Invalid ml_kem_768_public_key hex"))?;
+        if decoded.len() != 1184 {
+            return Err(AppError::BadRequest(
+                "ml_kem_768_public_key must be 1184 bytes",
+            ));
+        }
+        decoded
+    };
 
     // Decode the challenge signature from hex
     let challenge_sig = hex::decode(&body.registration_challenge)
@@ -261,6 +296,8 @@ async fn register_device(
                 &nonce,
                 &signing_pk,
                 &x25519_pk,
+                &ml_dsa_pk,
+                &ml_kem_pk,
                 registry_approval,
                 pow_solution,
                 first_device_admission_proof,
@@ -329,6 +366,8 @@ fn do_register(
     nonce: &str,
     signing_pk: &[u8],
     x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
     registry_approval: Option<RegistryApproval>,
     pow_solution: Option<PowSolution>,
     first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
@@ -440,12 +479,18 @@ fn do_register(
         if existing.status != "active" {
             return Err(AppError::Forbidden("Device has been revoked"));
         }
-        if existing.signing_public_key != signing_pk || existing.x25519_public_key != x25519_pk {
+        if existing.signing_public_key != signing_pk
+            || existing.x25519_public_key != x25519_pk
+            || existing.ml_dsa_65_public_key != ml_dsa_pk
+            || existing.ml_kem_768_public_key != ml_kem_pk
+        {
             tracing::warn!(
                 sync_id = %&sync_id[..16],
                 device_id = %&device_id[..8.min(device_id.len())],
                 signing_key_mismatch = existing.signing_public_key != signing_pk,
                 x25519_key_mismatch = existing.x25519_public_key != x25519_pk,
+                ml_dsa_key_mismatch = existing.ml_dsa_65_public_key != ml_dsa_pk,
+                ml_kem_key_mismatch = existing.ml_kem_768_public_key != ml_kem_pk,
                 "Registration rejected: existing device keys do not match stored identity"
             );
             return Err(AppError::DeviceIdentityMismatch);
@@ -466,8 +511,10 @@ fn do_register(
             epoch,
             "New device registered"
         );
-        db::register_device(&tx, sync_id, device_id, signing_pk, x25519_pk, epoch)
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        db::register_device_with_pq(
+            &tx, sync_id, device_id, signing_pk, x25519_pk, &ml_dsa_pk, &ml_kem_pk, epoch,
+        )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
         new_device_added = true;
 
         // Initialize device receipt
@@ -773,6 +820,8 @@ fn current_registry_entries(
                 device_id: device.device_id,
                 ed25519_public_key: device.signing_public_key,
                 x25519_public_key: device.x25519_public_key,
+                ml_dsa_65_public_key: device.ml_dsa_65_public_key,
+                ml_kem_768_public_key: device.ml_kem_768_public_key,
                 status: normalize_registry_status(&device.status)?.to_string(),
             })
         })

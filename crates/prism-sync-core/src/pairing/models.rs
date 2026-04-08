@@ -554,6 +554,10 @@ pub struct RegistrySnapshotEntry {
     pub device_id: String,
     pub ed25519_public_key: Vec<u8>,
     pub x25519_public_key: Vec<u8>,
+    #[serde(default)]
+    pub ml_dsa_65_public_key: Vec<u8>,
+    #[serde(default)]
+    pub ml_kem_768_public_key: Vec<u8>,
     pub status: String,
 }
 
@@ -643,8 +647,8 @@ impl SignedRegistrySnapshot {
                 device_id: e.device_id.clone(),
                 ed25519_public_key: e.ed25519_public_key.clone(),
                 x25519_public_key: e.x25519_public_key.clone(),
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
+                ml_dsa_65_public_key: e.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: e.ml_kem_768_public_key.clone(),
                 status: e.status.clone(),
                 registered_at: chrono::Utc::now(),
                 revoked_at: None,
@@ -1076,6 +1080,8 @@ mod tests {
             device_id: "device-001".into(),
             ed25519_public_key: vec![0xAA; 32],
             x25519_public_key: vec![0xBB; 32],
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         }]);
         let mut resp = sample_response();
@@ -1093,6 +1099,8 @@ mod tests {
                 device_id: "device-001".into(),
                 ed25519_public_key: vec![0xAA; 32],
                 x25519_public_key: vec![0xBB; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -1100,6 +1108,8 @@ mod tests {
                 device_id: "device-002".into(),
                 ed25519_public_key: vec![0xCC; 32],
                 x25519_public_key: vec![0xDD; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
         ]);
@@ -1117,6 +1127,8 @@ mod tests {
             device_id: "device-999".into(),
             ed25519_public_key: vec![0xAA; 32],
             x25519_public_key: vec![0xBB; 32],
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         }]);
         let mut resp = sample_response();
@@ -1148,6 +1160,8 @@ mod tests {
                 device_id: "dev-a".into(),
                 ed25519_public_key: vec![1u8; 32],
                 x25519_public_key: vec![2u8; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -1155,6 +1169,8 @@ mod tests {
                 device_id: "dev-b".into(),
                 ed25519_public_key: vec![3u8; 32],
                 x25519_public_key: vec![4u8; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
         ])
@@ -1181,6 +1197,8 @@ mod tests {
                 device_id: "b".into(),
                 ed25519_public_key: vec![2u8; 32],
                 x25519_public_key: vec![2u8; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -1188,6 +1206,8 @@ mod tests {
                 device_id: "a".into(),
                 ed25519_public_key: vec![1u8; 32],
                 x25519_public_key: vec![1u8; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
         ]);
@@ -1197,6 +1217,8 @@ mod tests {
                 device_id: "a".into(),
                 ed25519_public_key: vec![1u8; 32],
                 x25519_public_key: vec![1u8; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -1204,6 +1226,8 @@ mod tests {
                 device_id: "b".into(),
                 ed25519_public_key: vec![2u8; 32],
                 x25519_public_key: vec![2u8; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
             },
         ]);
@@ -1267,6 +1291,8 @@ mod tests {
             device_id: "dev-a".into(),
             ed25519_public_key: vec![1u8; 32],
             x25519_public_key: vec![2u8; 32],
+            ml_dsa_65_public_key: Vec::new(),
+            ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
         };
         let json = serde_json::to_vec(&entry).unwrap();

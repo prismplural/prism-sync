@@ -339,6 +339,8 @@ mod tests {
                 status: "active".to_string(),
                 ed25519_public_key: vec![],
                 x25519_public_key: sender_xk.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
                 permission: None,
             },
             DeviceInfo {
@@ -347,6 +349,8 @@ mod tests {
                 status: "active".to_string(),
                 ed25519_public_key: vec![],
                 x25519_public_key: receiver_xk.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
                 permission: None,
             },
             DeviceInfo {
@@ -355,6 +359,8 @@ mod tests {
                 status: "revoked".to_string(),
                 ed25519_public_key: vec![],
                 x25519_public_key: vec![0u8; 32],
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
                 permission: None,
             },
         ]

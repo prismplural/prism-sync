@@ -328,6 +328,8 @@ pub fn registry_snapshot_entry(
         device_id: device_id.to_string(),
         ed25519_public_key: ed25519_public_key.to_vec(),
         x25519_public_key: x25519_public_key.to_vec(),
+        ml_dsa_65_public_key: Vec::new(),
+        ml_kem_768_public_key: Vec::new(),
         status: status.to_string(),
     }
 }
@@ -377,6 +379,7 @@ pub fn build_registry_approval(
     RegistryApproval {
         approver_device_id: approver_device_id.to_string(),
         approver_ed25519_pk: hex::encode(approver_key.verifying_key().as_bytes()),
+        approver_ml_dsa_65_pk: String::new(),
         approval_signature: hex::encode(signature.to_bytes()),
         signed_registry_snapshot,
     }

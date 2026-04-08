@@ -147,6 +147,8 @@ async fn epoch_rotation_full_cycle() {
             status: "active".to_string(),
             ed25519_public_key: vec![],
             x25519_public_key: xk_a.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
             permission: None,
         },
         DeviceInfo {
@@ -155,6 +157,8 @@ async fn epoch_rotation_full_cycle() {
             status: "active".to_string(),
             ed25519_public_key: vec![],
             x25519_public_key: xk_b.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
             permission: None,
         },
         DeviceInfo {
@@ -163,6 +167,8 @@ async fn epoch_rotation_full_cycle() {
             status: "revoked".to_string(),
             ed25519_public_key: vec![],
             x25519_public_key: xk_c.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
             permission: None,
         },
     ];
@@ -273,6 +279,8 @@ async fn revoked_device_cannot_recover_epoch_key() {
             status: "active".to_string(),
             ed25519_public_key: vec![],
             x25519_public_key: xk_a.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
             permission: None,
         },
         DeviceInfo {
@@ -281,6 +289,8 @@ async fn revoked_device_cannot_recover_epoch_key() {
             status: "active".to_string(), // still listed as active in device list
             ed25519_public_key: vec![],
             x25519_public_key: xk_c.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
             permission: None,
         },
     ];

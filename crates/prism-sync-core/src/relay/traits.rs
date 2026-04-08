@@ -92,6 +92,9 @@ pub struct RegistryApproval {
     pub approver_device_id: String,
     /// Ed25519 public key of the approver (32 bytes, hex-encoded).
     pub approver_ed25519_pk: String,
+    /// ML-DSA-65 public key of the approver (1952 bytes, hex-encoded).
+    #[serde(default)]
+    pub approver_ml_dsa_65_pk: String,
     /// Ed25519 signature over the canonical approval data (hex-encoded).
     pub approval_signature: String,
     /// The signed registry snapshot (wire format: [sig || json]).
@@ -133,6 +136,8 @@ pub struct RegisterRequest {
     pub device_id: String,
     pub signing_public_key: Vec<u8>,
     pub x25519_public_key: Vec<u8>,
+    pub ml_dsa_65_public_key: Vec<u8>,
+    pub ml_kem_768_public_key: Vec<u8>,
     pub registration_challenge: Vec<u8>,
     pub nonce: String,
     pub pow_solution: Option<ProofOfWorkSolution>,
@@ -246,6 +251,10 @@ pub struct DeviceInfo {
     pub ed25519_public_key: Vec<u8>,
     #[serde(default, deserialize_with = "deserialize_base64_or_bytes")]
     pub x25519_public_key: Vec<u8>,
+    #[serde(default, deserialize_with = "deserialize_base64_or_bytes")]
+    pub ml_dsa_65_public_key: Vec<u8>,
+    #[serde(default, deserialize_with = "deserialize_base64_or_bytes")]
+    pub ml_kem_768_public_key: Vec<u8>,
     pub permission: Option<String>,
 }
 

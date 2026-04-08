@@ -324,6 +324,8 @@ mod tests {
                 device_id: "d1".to_string(),
                 signing_public_key: vec![],
                 x25519_public_key: vec![],
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
                 registration_challenge: vec![],
                 nonce: "nonce".to_string(),
                 pow_solution: None,
@@ -470,6 +472,8 @@ mod tests {
             status: "active".to_string(),
             ed25519_public_key: vec![],
             x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
             permission: None,
         });
         relay.add_device(DeviceInfo {
@@ -478,6 +482,8 @@ mod tests {
             status: "active".to_string(),
             ed25519_public_key: vec![],
             x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
             permission: None,
         });
 
