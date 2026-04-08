@@ -135,9 +135,9 @@ pub fn sign_challenge(
     sig.to_bytes().to_vec()
 }
 
-/// Build a V2 hybrid challenge signature.
+/// Build a V3 hybrid challenge signature.
 ///
-/// Wire format: `[0x02][HybridSignature::to_bytes()]`
+/// Wire format: `[0x03][HybridSignature::to_bytes()]`
 pub fn sign_hybrid_challenge(
     ed25519_key: &SigningKey,
     ml_dsa_key: &prism_sync_crypto::DevicePqSigningKey,
@@ -151,11 +151,15 @@ pub fn sign_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        b"device_challenge",
+        &data,
+    );
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-        ed25519_sig: ed25519_key.sign(&data).to_bytes().to_vec(),
-        ml_dsa_65_sig: ml_dsa_key.sign(&data),
+        ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
+        ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
     };
-    let mut wire = vec![0x02];
+    let mut wire = vec![0x03];
     wire.extend_from_slice(&hybrid_sig.to_bytes());
     wire
 }
@@ -206,11 +210,15 @@ pub fn apply_signed_headers_hybrid(
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
         method, path, sync_id, device_id, body, &timestamp, &nonce,
     );
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        b"http_request",
+        &signing_data,
+    );
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-        ed25519_sig: ed25519_key.sign(&signing_data).to_bytes().to_vec(),
-        ml_dsa_65_sig: ml_dsa_key.sign(&signing_data),
+        ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
+        ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
     };
-    let mut wire = vec![0x02u8];
+    let mut wire = vec![0x03u8];
     wire.extend_from_slice(&hybrid_sig.to_bytes());
 
     builder
@@ -518,7 +526,7 @@ pub fn build_signed_registry_snapshot(
     wire
 }
 
-/// Build a V2 hybrid signed registry snapshot.
+/// Build a V3 hybrid signed registry snapshot.
 pub fn build_signed_registry_snapshot_hybrid(
     entries: Vec<RegistrySnapshotEntry>,
     ed25519_key: &SigningKey,
@@ -532,13 +540,17 @@ pub fn build_signed_registry_snapshot_hybrid(
     signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V2\x00");
     signing_data.extend_from_slice(&canonical_json);
 
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        b"registry_snapshot",
+        &signing_data,
+    );
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-        ed25519_sig: ed25519_key.sign(&signing_data).to_bytes().to_vec(),
-        ml_dsa_65_sig: ml_dsa_key.sign(&signing_data),
+        ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
+        ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
     };
     let sig_bytes = hybrid_sig.to_bytes();
     let mut wire = Vec::with_capacity(1 + sig_bytes.len() + canonical_json.len());
-    wire.push(0x02);
+    wire.push(0x03);
     wire.extend_from_slice(&sig_bytes);
     wire.extend_from_slice(&canonical_json);
     wire
@@ -575,7 +587,7 @@ pub fn build_registry_approval(
     }
 }
 
-/// Build a V2 hybrid registry-approval payload used by `/register`.
+/// Build a V3 hybrid registry-approval payload used by `/register`.
 pub fn build_registry_approval_hybrid(
     sync_id: &str,
     approver_device_id: &str,
@@ -592,14 +604,18 @@ pub fn build_registry_approval_hybrid(
     write_len_prefixed(&mut approval_data, approver_device_id.as_bytes());
     write_len_prefixed(&mut approval_data, &signed_registry_snapshot);
 
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        b"registry_approval",
+        &approval_data,
+    );
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: approver_ed25519_key
-            .sign(&approval_data)
+            .sign(&m_prime)
             .to_bytes()
             .to_vec(),
-        ml_dsa_65_sig: approver_ml_dsa_key.sign(&approval_data),
+        ml_dsa_65_sig: approver_ml_dsa_key.sign(&m_prime),
     };
-    let mut sig_wire = vec![0x02u8];
+    let mut sig_wire = vec![0x03u8];
     sig_wire.extend_from_slice(&hybrid_sig.to_bytes());
 
     RegistryApproval {
