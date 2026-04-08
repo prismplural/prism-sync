@@ -3,8 +3,6 @@ use prism_sync_crypto::pq::HybridSignature;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-const HYBRID_SIGNATURE_VERSION_V2: u8 = 0x02;
-
 /// Generate a secure session token (32 random bytes, hex encoded = 64 chars).
 pub fn generate_session_token() -> String {
     let mut bytes = [0u8; 32];
@@ -99,15 +97,14 @@ pub fn verify_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    match version {
-        0x03 => signature
-            .verify_v3(&data, b"device_challenge", &pk_bytes, ml_dsa_public_key)
-            .is_ok(),
-        HYBRID_SIGNATURE_VERSION_V2 => signature
-            .verify(&data, &pk_bytes, ml_dsa_public_key)
-            .is_ok(),
-        _ => false,
+    // Only V3 signatures are accepted
+    if version != 0x03 {
+        return false;
     }
+
+    signature
+        .verify_v3(&data, b"device_challenge", &pk_bytes, ml_dsa_public_key)
+        .is_ok()
 }
 
 /// Validate that a sync ID is a 64-char hex string (32 bytes).
@@ -230,15 +227,14 @@ pub fn verify_hybrid_request_signature(
         return false;
     };
 
-    match version {
-        0x03 => signature
-            .verify_v3(signing_data, b"http_request", &pk_bytes, ml_dsa_public_key)
-            .is_ok(),
-        HYBRID_SIGNATURE_VERSION_V2 => signature
-            .verify(signing_data, &pk_bytes, ml_dsa_public_key)
-            .is_ok(),
-        _ => false,
+    // Only V3 signatures are accepted
+    if version != 0x03 {
+        return false;
     }
+
+    signature
+        .verify_v3(signing_data, b"http_request", &pk_bytes, ml_dsa_public_key)
+        .is_ok()
 }
 
 /// Write a length-prefixed field: `(data.len() as u32).to_be_bytes() || data`.
@@ -274,7 +270,7 @@ mod tests {
             ml_dsa_65_sig: pq_signing_key.sign(message),
         };
 
-        let mut versioned = vec![HYBRID_SIGNATURE_VERSION_V2];
+        let mut versioned = vec![0x02]; // V2 (now rejected)
         versioned.extend_from_slice(&hybrid_sig.to_bytes());
         (versioned, ed_public_key, pq_public_key)
     }
@@ -404,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_hybrid_challenge() {
+    fn test_verify_hybrid_challenge_rejects_v2() {
         let sync_id = "a".repeat(64);
         let device_id = "test-device";
         let nonce = "test-nonce-123";
@@ -417,7 +413,8 @@ mod tests {
 
         let (versioned_sig, ed_pk, ml_pk) = make_versioned_hybrid_signature(&data, device_id);
 
-        assert!(verify_hybrid_challenge(
+        // V2 signatures are now rejected after sunset
+        assert!(!verify_hybrid_challenge(
             &ed_pk,
             &ml_pk,
             &sync_id,
@@ -425,18 +422,10 @@ mod tests {
             nonce,
             &versioned_sig,
         ));
-        assert!(!verify_hybrid_challenge(
-            &ed_pk,
-            &ml_pk,
-            &sync_id,
-            device_id,
-            "wrong-nonce",
-            &versioned_sig,
-        ));
     }
 
     #[test]
-    fn test_verify_hybrid_request_signature() {
+    fn test_verify_hybrid_request_signature_rejects_v2() {
         let device_id = "device-1";
         let data = build_request_signing_data_v2(
             "POST",
@@ -449,7 +438,8 @@ mod tests {
         );
 
         let (versioned_sig, ed_pk, ml_pk) = make_versioned_hybrid_signature(&data, device_id);
-        assert!(verify_hybrid_request_signature(
+        // V2 signatures are now rejected after sunset
+        assert!(!verify_hybrid_request_signature(
             &ed_pk,
             &ml_pk,
             &data,

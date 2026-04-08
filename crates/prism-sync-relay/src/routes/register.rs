@@ -698,11 +698,11 @@ fn verify_registry_approval(
     let approval_signature_bytes = hex::decode(&approval.approval_signature)
         .map_err(|_| AppError::BadRequest("Invalid approval_signature hex"))?;
 
-    // Only accept hybrid approval signatures (V2/V3 version prefix)
+    // Only accept V3 hybrid approval signatures
     let version_byte = approval_signature_bytes.first().copied();
-    if version_byte != Some(0x02) && version_byte != Some(0x03) {
+    if version_byte != Some(0x03) {
         return Err(AppError::BadRequest(
-            "Hybrid approval signature required (V2 or V3)",
+            "V3 hybrid approval signature required",
         ));
     }
 
@@ -714,20 +714,14 @@ fn verify_registry_approval(
     write_len_prefixed(&mut approval_data, sync_id.as_bytes());
     write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
     write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
-    if version_byte == Some(0x03) {
-        hybrid_sig
-            .verify_v3(
-                &approval_data,
-                b"registry_approval",
-                &approver_pk_bytes,
-                &approver_ml_dsa_pk,
-            )
-            .map_err(|_| AppError::Unauthorized)?;
-    } else {
-        hybrid_sig
-            .verify(&approval_data, &approver_pk_bytes, &approver_ml_dsa_pk)
-            .map_err(|_| AppError::Unauthorized)?;
-    }
+    hybrid_sig
+        .verify_v3(
+            &approval_data,
+            b"registry_approval",
+            &approver_pk_bytes,
+            &approver_ml_dsa_pk,
+        )
+        .map_err(|_| AppError::Unauthorized)?;
 
     let snapshot_entries = verify_registry_snapshot(
         &approval.signed_registry_snapshot,
@@ -793,11 +787,11 @@ fn verify_registry_snapshot(
     approver_ed25519_pk: &[u8; 32],
     approver_ml_dsa_pk: &[u8],
 ) -> Result<Vec<RegistrySnapshotEntry>, AppError> {
-    // Only accept hybrid format: first byte must be 0x02 or 0x03
+    // Only accept V3 hybrid format
     let first = signed_snapshot.first().copied();
-    if first != Some(0x02) && first != Some(0x03) {
+    if first != Some(0x03) {
         return Err(AppError::BadRequest(
-            "Hybrid signed registry snapshot required (V2 or V3)",
+            "V3 hybrid signed registry snapshot required",
         ));
     }
 
@@ -846,20 +840,18 @@ fn verify_registry_snapshot_hybrid(
     signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V2\x00");
     signing_data.extend_from_slice(json_bytes);
 
-    if version == 0x03 {
-        signature
-            .verify_v3(
-                &signing_data,
-                b"registry_snapshot",
-                approver_ed25519_pk,
-                approver_ml_dsa_pk,
-            )
-            .map_err(|_| AppError::Unauthorized)?;
-    } else {
-        signature
-            .verify(&signing_data, approver_ed25519_pk, approver_ml_dsa_pk)
-            .map_err(|_| AppError::Unauthorized)?;
+    // Only V3 is accepted (V2 sunset)
+    if version != 0x03 {
+        return Err(AppError::Unauthorized);
     }
+    signature
+        .verify_v3(
+            &signing_data,
+            b"registry_snapshot",
+            approver_ed25519_pk,
+            approver_ml_dsa_pk,
+        )
+        .map_err(|_| AppError::Unauthorized)?;
 
     let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
         .map_err(|_| AppError::BadRequest("Invalid signed_registry_snapshot JSON"))?;

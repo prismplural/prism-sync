@@ -73,8 +73,8 @@ pub(crate) fn verify_signed_request(
         return Err(AppError::Unauthorized);
     }
 
-    // Only accept hybrid signatures (version prefix 0x02 or 0x03)
-    if signature.len() <= 64 || (signature[0] != 0x02 && signature[0] != 0x03) {
+    // Only accept V3 hybrid signatures
+    if signature.len() <= 64 || signature[0] != 0x03 {
         return Err(AppError::Unauthorized);
     }
 
