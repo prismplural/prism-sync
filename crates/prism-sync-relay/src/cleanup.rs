@@ -37,7 +37,9 @@ async fn run_cleanup(state: &AppState) {
                 crate::db::auto_revoke_devices(conn, config.sync_inactive_ttl_secs as i64)?;
 
             // 4. Prune sync groups where no device has been seen within the
-            //    sync_inactive_ttl_secs window.
+            //    sync_inactive_ttl_secs window. Collect media_ids for disk cleanup.
+            let stale_group_media_ids =
+                collect_stale_group_media(conn, config.sync_inactive_ttl_secs as i64)?;
             let pruned =
                 crate::db::prune_stale_sync_groups(conn, config.sync_inactive_ttl_secs as i64)?;
 
@@ -75,7 +77,15 @@ async fn run_cleanup(state: &AppState) {
             // 11. Delete expired or long-consumed sharing-init payloads.
             let expired_sharing_inits = crate::db::cleanup_expired_sharing_init_payloads(conn)?;
 
-            // 12. Reclaim freed pages (incremental auto_vacuum)
+            // 12. Clear expired ML-DSA grace keys (post-rotation old keys).
+            let expired_grace_keys =
+                crate::db::cleanup_expired_ml_dsa_grace_keys(conn, crate::db::now_secs())?;
+
+            // 13. Expire old media blobs past retention period.
+            let expired_media =
+                crate::db::cleanup_expired_media(conn, config.media_retention_days)?;
+
+            // 14. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 = conn
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -90,6 +100,7 @@ async fn run_cleanup(state: &AppState) {
                 stale,
                 revoked_groups,
                 pruned,
+                stale_group_media_ids,
                 abandoned_new_groups,
                 expired_snapshots,
                 superseded_registry_artifacts,
@@ -97,6 +108,8 @@ async fn run_cleanup(state: &AppState) {
                 revoked_tombstones,
                 stale_prekeys,
                 expired_sharing_inits,
+                expired_grace_keys,
+                expired_media,
                 pages_freed,
             ))
         })
@@ -110,6 +123,7 @@ async fn run_cleanup(state: &AppState) {
             stale,
             revoked_groups,
             pruned,
+            stale_group_media_ids,
             abandoned_new_groups,
             expired_snapshots,
             superseded_registry_artifacts,
@@ -117,12 +131,35 @@ async fn run_cleanup(state: &AppState) {
             revoked_tombstones,
             stale_prekeys,
             expired_sharing_inits,
+            expired_grace_keys,
+            expired_media,
             pages_freed,
         ))) => {
+            // Clean up media files from disk for pruned sync groups
+            let stale_media_items: Vec<(String, String)> = stale_group_media_ids
+                .into_iter()
+                .flat_map(|(sync_id, media_ids)| {
+                    media_ids
+                        .into_iter()
+                        .map(move |mid| (sync_id.clone(), mid))
+                })
+                .collect();
+            let stale_media_cleaned =
+                cleanup_media_files(&state.config.media_storage_path, &stale_media_items);
+
+            // Clean up expired media files from disk
+            let expired_media_cleaned =
+                cleanup_media_files(&state.config.media_storage_path, &expired_media);
+
+            // Try to remove empty sync_id directories left after media cleanup
+            cleanup_empty_media_dirs(&state.config.media_storage_path, &stale_media_items);
+            cleanup_empty_media_dirs(&state.config.media_storage_path, &expired_media);
+
             state.metrics.last_cleanup_epoch_secs.store(
                 crate::db::now_secs() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            let expired_media_count = expired_media_cleaned + stale_media_cleaned;
             if nonces > 0
                 || revoked_sessions > 0
                 || stale > 0
@@ -135,6 +172,8 @@ async fn run_cleanup(state: &AppState) {
                 || revoked_tombstones > 0
                 || stale_prekeys > 0
                 || expired_sharing_inits > 0
+                || expired_grace_keys > 0
+                || expired_media_count > 0
                 || pages_freed > 0
             {
                 tracing::info!(
@@ -149,6 +188,8 @@ async fn run_cleanup(state: &AppState) {
                     revoked_tombstones,
                     stale_prekeys,
                     expired_sharing_inits,
+                    expired_grace_keys,
+                    expired_media_count,
                     pages_freed,
                     "cleanup cycle complete"
                 );
@@ -169,6 +210,65 @@ async fn run_cleanup(state: &AppState) {
         .signed_request_replay_cache
         .prune_stale(state.config.signed_request_nonce_window_secs);
     state.pairing_rate_limiter.prune_stale(60);
+    state
+        .media_upload_rate_limiter
+        .prune_stale(state.config.media_upload_rate_window_secs);
+}
+
+/// Collect media_ids for sync groups that are about to be pruned.
+/// Must be called BEFORE `prune_stale_sync_groups` so the data still exists.
+fn collect_stale_group_media(
+    conn: &rusqlite::Connection,
+    inactive_threshold_secs: i64,
+) -> Result<Vec<(String, Vec<String>)>, rusqlite::Error> {
+    let cutoff = crate::db::now_secs() - inactive_threshold_secs;
+    let mut stmt = conn.prepare(
+        "SELECT sg.sync_id
+         FROM sync_groups sg
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM devices d
+             WHERE d.sync_id = sg.sync_id AND d.last_seen_at >= ?1
+         )",
+    )?;
+    let stale_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![cutoff], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut results = Vec::new();
+    for sync_id in stale_ids {
+        let media_ids = crate::db::delete_media_for_sync_group(conn, &sync_id)?;
+        if !media_ids.is_empty() {
+            results.push((sync_id, media_ids));
+        }
+    }
+    Ok(results)
+}
+
+/// Delete media files from disk. Returns the number of files successfully removed.
+fn cleanup_media_files(storage_path: &str, items: &[(String, String)]) -> usize {
+    items
+        .iter()
+        .filter(|(sync_id, media_id)| {
+            let path = std::path::Path::new(storage_path)
+                .join(sync_id)
+                .join(media_id);
+            std::fs::remove_file(&path).is_ok()
+        })
+        .count()
+}
+
+/// Try to remove empty sync_id directories after media files have been cleaned up.
+fn cleanup_empty_media_dirs(storage_path: &str, items: &[(String, String)]) {
+    let mut seen = std::collections::HashSet::new();
+    for (sync_id, _) in items {
+        if seen.insert(sync_id.clone()) {
+            let dir = std::path::Path::new(storage_path).join(sync_id);
+            // remove_dir only succeeds if the directory is empty
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
 }
 
 fn cleanup_abandoned_brand_new_groups(

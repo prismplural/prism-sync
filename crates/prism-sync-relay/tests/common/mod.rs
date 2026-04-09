@@ -73,6 +73,17 @@ pub async fn start_test_relay() -> (
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     start_test_relay_with_config(config).await
@@ -452,6 +463,7 @@ pub fn registry_snapshot_entry(
         x25519_public_key: x25519_public_key.to_vec(),
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
+        ml_dsa_key_generation: 0,
         status: status.to_string(),
     }
 }
@@ -470,6 +482,7 @@ pub fn registry_snapshot_entry_hybrid(
         x25519_public_key: keys.x25519_pk.to_vec(),
         ml_dsa_65_public_key: keys.ml_dsa_pk.clone(),
         ml_kem_768_public_key: keys.ml_kem_pk.clone(),
+        ml_dsa_key_generation: 0,
         status: status.to_string(),
     }
 }

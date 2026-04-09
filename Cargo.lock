@@ -2283,6 +2283,7 @@ dependencies = [
  "sha2",
  "simple_asn1",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.24.0",

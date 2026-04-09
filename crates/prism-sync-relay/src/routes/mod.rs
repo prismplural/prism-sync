@@ -1,4 +1,5 @@
 pub mod devices;
+pub mod media;
 pub mod metrics;
 pub mod pairing;
 pub mod register;
@@ -29,6 +30,9 @@ pub struct AuthIdentity {
     pub device_id: String,
     pub signing_public_key: Vec<u8>,
     pub ml_dsa_65_public_key: Vec<u8>,
+    /// Previous ML-DSA key accepted during a 30-day grace period after rotation.
+    /// `None` if no grace key exists or the grace period has expired.
+    pub prev_ml_dsa_65_public_key: Option<Vec<u8>>,
 }
 
 pub(crate) fn verify_signed_request(
@@ -94,12 +98,24 @@ pub(crate) fn verify_signed_request(
         timestamp,
         nonce,
     );
-    if !auth::verify_hybrid_request_signature(
+    let verified = auth::verify_hybrid_request_signature(
         &auth_identity.signing_public_key,
         &auth_identity.ml_dsa_65_public_key,
         &signing_data,
         &signature,
-    ) {
+    ) || auth_identity
+        .prev_ml_dsa_65_public_key
+        .as_ref()
+        .is_some_and(|prev_pk| {
+            auth::verify_hybrid_request_signature(
+                &auth_identity.signing_public_key,
+                prev_pk,
+                &signing_data,
+                &signature,
+            )
+        });
+
+    if !verified {
         return Err(AppError::Unauthorized);
     }
 
@@ -124,6 +140,17 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
 
+    let media_routes = Router::new()
+        .route(
+            "/v1/sync/{sync_id}/media",
+            post(media::upload_media),
+        )
+        .route(
+            "/v1/sync/{sync_id}/media/{media_id}",
+            get(media::download_media),
+        )
+        .layer(DefaultBodyLimit::max(state.config.media_max_file_bytes));
+
     // Routes that require authentication
     let authenticated_routes = Router::new()
         // Sync routes (push/pull/snapshot/delete)
@@ -132,6 +159,7 @@ pub fn router(state: AppState) -> Router {
             put(sync::push_changes).get(sync::pull_changes),
         )
         .merge(snapshot_routes)
+        .merge(media_routes)
         .route("/v1/sync/{sync_id}", delete(sync::delete_account))
         // Device routes (list/revoke/rekey/ack)
         .route("/v1/sync/{sync_id}/devices", get(devices::list_devices))
@@ -142,6 +170,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/sync/{sync_id}/devices/{device_id}/revoke",
             post(devices::post_atomic_revoke),
+        )
+        .route(
+            "/v1/sync/{sync_id}/devices/{device_id}/rotate-ml-dsa",
+            post(devices::post_rotate_ml_dsa),
         )
         .route("/v1/sync/{sync_id}/rekey", post(devices::post_rekey))
         .route(
@@ -248,11 +280,22 @@ async fn auth_middleware(
                             .unwrap_or(false);
                         return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
                     }
+                    let prev_ml_dsa_65_public_key =
+                        if !device.prev_ml_dsa_65_public_key.is_empty()
+                            && device
+                                .prev_ml_dsa_65_expires_at
+                                .is_some_and(|exp| exp > db::now_secs())
+                        {
+                            Some(device.prev_ml_dsa_65_public_key)
+                        } else {
+                            None
+                        };
                     return Ok(AuthResult::Ok(AuthIdentity {
                         sync_id,
                         device_id,
                         signing_public_key: device.signing_public_key,
                         ml_dsa_65_public_key: device.ml_dsa_65_public_key,
+                        prev_ml_dsa_65_public_key,
                     }));
                 }
 

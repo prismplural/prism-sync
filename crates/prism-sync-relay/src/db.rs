@@ -20,6 +20,9 @@ pub struct DeviceRecord {
     pub epoch: i64,
     pub status: String,
     pub last_seen_at: i64,
+    pub ml_dsa_key_generation: i64,
+    pub prev_ml_dsa_65_public_key: Vec<u8>,
+    pub prev_ml_dsa_65_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,7 @@ pub struct DeviceListEntry {
     pub ml_kem_768_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
+    pub ml_dsa_key_generation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,18 @@ pub struct RegistryArtifactRecord {
     pub artifact_hash: String,
     pub artifact_blob: Vec<u8>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaRow {
+    pub media_id: String,
+    pub sync_id: String,
+    pub device_id: String,
+    pub size_bytes: i64,
+    pub content_hash: String,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub deleted_at: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +291,9 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             last_seen_at        INTEGER NOT NULL,
             revoked_at          INTEGER,
             remote_wipe         INTEGER NOT NULL DEFAULT 0,
+            ml_dsa_key_generation INTEGER NOT NULL DEFAULT 0,
+            prev_ml_dsa_65_public_key BLOB NOT NULL DEFAULT X'',
+            prev_ml_dsa_65_expires_at INTEGER,
             PRIMARY KEY (sync_id, device_id),
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
@@ -468,6 +487,21 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_sharing_id_map_unique_sharing
             ON sharing_id_mappings(sharing_id);
+
+        -- Media blob metadata
+        CREATE TABLE IF NOT EXISTS media_metadata (
+            media_id      TEXT PRIMARY KEY,
+            sync_id       TEXT NOT NULL,
+            device_id     TEXT NOT NULL,
+            size_bytes    INTEGER NOT NULL,
+            content_hash  TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            expires_at    INTEGER,
+            deleted_at    INTEGER,
+            FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_sync_id ON media_metadata(sync_id);
+        CREATE INDEX IF NOT EXISTS idx_media_expires ON media_metadata(expires_at) WHERE expires_at IS NOT NULL;
         ",
     )?;
 
@@ -488,6 +522,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_sharing_identity_generation(conn)?;
     migrate_sharing_identity_generation_floors(conn)?;
     migrate_sync_groups_password_version(conn)?;
+    migrate_devices_ml_dsa_rotation(conn)?;
 
     Ok(())
 }
@@ -627,6 +662,31 @@ fn migrate_sharing_identity_generation(conn: &Connection) -> Result<(), rusqlite
         conn.execute_batch(
             "ALTER TABLE sharing_identity_bundles
              ADD COLUMN identity_generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Add ML-DSA key rotation columns to an existing `devices` table.
+/// Safe to call repeatedly — checks for column existence first.
+fn migrate_devices_ml_dsa_rotation(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_gen = device_has_column(conn, "ml_dsa_key_generation")?;
+    let has_prev = device_has_column(conn, "prev_ml_dsa_65_public_key")?;
+    let has_expires = device_has_column(conn, "prev_ml_dsa_65_expires_at")?;
+
+    if !has_gen {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN ml_dsa_key_generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !has_prev {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN prev_ml_dsa_65_public_key BLOB NOT NULL DEFAULT X'';",
+        )?;
+    }
+    if !has_expires {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN prev_ml_dsa_65_expires_at INTEGER;",
         )?;
     }
     Ok(())
@@ -1086,7 +1146,9 @@ pub fn get_device(
     conn.query_row(
         "SELECT device_id, signing_public_key, x25519_public_key,
                 ml_dsa_65_public_key, ml_kem_768_public_key,
-                epoch, status, last_seen_at
+                epoch, status, last_seen_at,
+                ml_dsa_key_generation, prev_ml_dsa_65_public_key,
+                prev_ml_dsa_65_expires_at
          FROM devices
          WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
@@ -1100,6 +1162,9 @@ pub fn get_device(
                 epoch: row.get(5)?,
                 status: row.get(6)?,
                 last_seen_at: row.get(7)?,
+                ml_dsa_key_generation: row.get(8)?,
+                prev_ml_dsa_65_public_key: row.get(9)?,
+                prev_ml_dsa_65_expires_at: row.get(10)?,
             })
         },
     )
@@ -1113,7 +1178,7 @@ pub fn list_devices(
     let mut stmt = conn.prepare(
         "SELECT device_id, signing_public_key, x25519_public_key,
                 ml_dsa_65_public_key, ml_kem_768_public_key,
-                epoch, status
+                epoch, status, ml_dsa_key_generation
          FROM devices
          WHERE sync_id = ?1
          ORDER BY registered_at ASC",
@@ -1127,6 +1192,7 @@ pub fn list_devices(
             ml_kem_768_public_key: row.get(4)?,
             epoch: row.get(5)?,
             status: row.get(6)?,
+            ml_dsa_key_generation: row.get(7)?,
         })
     })?;
     rows.collect()
@@ -1219,6 +1285,43 @@ pub fn count_active_devices(conn: &Connection, sync_id: &str) -> Result<u64, rus
         params![sync_id],
         |row| row.get(0),
     )
+}
+
+/// Rotate a device's ML-DSA key, shifting the current key to the grace slot.
+///
+/// Returns `true` if the rotation was applied, `false` if the device already
+/// has an equal or higher generation (concurrent or replayed rotation).
+pub fn rotate_device_ml_dsa(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    new_ml_dsa_pk: &[u8],
+    new_generation: i64,
+    grace_expires_at: i64,
+) -> Result<bool, rusqlite::Error> {
+    let count = conn.execute(
+        "UPDATE devices SET
+            prev_ml_dsa_65_public_key = ml_dsa_65_public_key,
+            prev_ml_dsa_65_expires_at = ?1,
+            ml_dsa_65_public_key = ?2,
+            ml_dsa_key_generation = ?3
+         WHERE sync_id = ?4 AND device_id = ?5 AND ml_dsa_key_generation < ?3",
+        params![grace_expires_at, new_ml_dsa_pk, new_generation, sync_id, device_id],
+    )?;
+    Ok(count > 0)
+}
+
+/// Clean up expired ML-DSA grace keys.
+pub fn cleanup_expired_ml_dsa_grace_keys(
+    conn: &Connection,
+    now: i64,
+) -> Result<usize, rusqlite::Error> {
+    let count = conn.execute(
+        "UPDATE devices SET prev_ml_dsa_65_public_key = X'', prev_ml_dsa_65_expires_at = NULL
+         WHERE prev_ml_dsa_65_expires_at IS NOT NULL AND prev_ml_dsa_65_expires_at < ?1",
+        [now],
+    )?;
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,6 +1936,10 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlit
     tx.execute("DELETE FROM batches WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM snapshots WHERE sync_id = ?1", params![sync_id])?;
     tx.execute(
+        "DELETE FROM media_metadata WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
+    tx.execute(
         "DELETE FROM registration_nonces WHERE sync_id = ?1",
         params![sync_id],
     )?;
@@ -2084,6 +2191,116 @@ pub fn pairing_session_exists(
     )
     .optional()
     .map(|opt| opt.is_some())
+}
+
+// ---------------------------------------------------------------------------
+// Media metadata
+// ---------------------------------------------------------------------------
+
+pub fn insert_media_metadata(
+    conn: &Connection,
+    media_id: &str,
+    sync_id: &str,
+    device_id: &str,
+    size_bytes: i64,
+    content_hash: &str,
+    expires_at: Option<i64>,
+) -> Result<(), rusqlite::Error> {
+    let now = now_secs();
+    conn.execute(
+        "INSERT INTO media_metadata (media_id, sync_id, device_id, size_bytes, content_hash, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![media_id, sync_id, device_id, size_bytes, content_hash, now, expires_at],
+    )?;
+    Ok(())
+}
+
+pub fn get_media_metadata(
+    conn: &Connection,
+    media_id: &str,
+) -> Result<Option<MediaRow>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT media_id, sync_id, device_id, size_bytes, content_hash, created_at, expires_at, deleted_at
+         FROM media_metadata WHERE media_id = ?1",
+        params![media_id],
+        |row| {
+            Ok(MediaRow {
+                media_id: row.get(0)?,
+                sync_id: row.get(1)?,
+                device_id: row.get(2)?,
+                size_bytes: row.get(3)?,
+                content_hash: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                deleted_at: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn get_group_media_usage(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(size_bytes), 0) FROM media_metadata WHERE sync_id = ?1 AND deleted_at IS NULL",
+        params![sync_id],
+        |row| row.get(0),
+    )
+}
+
+pub fn mark_media_deleted(conn: &Connection, media_id: &str) -> Result<(), rusqlite::Error> {
+    let now = now_secs();
+    conn.execute(
+        "UPDATE media_metadata SET deleted_at = ?1 WHERE media_id = ?2",
+        params![now, media_id],
+    )?;
+    Ok(())
+}
+
+/// Find media that has exceeded the retention period and mark it as deleted.
+/// Returns the (sync_id, media_id) pairs for disk cleanup.
+pub fn cleanup_expired_media(
+    conn: &Connection,
+    retention_days: u64,
+) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    let cutoff = now_secs() - (retention_days * 86400) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT sync_id, media_id FROM media_metadata
+         WHERE deleted_at IS NULL AND created_at < ?1",
+    )?;
+    let pairs: Vec<(String, String)> = stmt
+        .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let now = now_secs();
+    for (_, media_id) in &pairs {
+        conn.execute(
+            "UPDATE media_metadata SET deleted_at = ?1 WHERE media_id = ?2 AND deleted_at IS NULL",
+            params![now, media_id],
+        )?;
+    }
+
+    Ok(pairs)
+}
+
+/// Delete all media metadata rows for a sync group.
+/// Returns the media_ids for disk cleanup.
+pub fn delete_media_for_sync_group(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT media_id FROM media_metadata WHERE sync_id = ?1")?;
+    let media_ids: Vec<String> = stmt
+        .query_map(params![sync_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    conn.execute(
+        "DELETE FROM media_metadata WHERE sync_id = ?1",
+        params![sync_id],
+    )?;
+
+    Ok(media_ids)
 }
 
 // ---------------------------------------------------------------------------
@@ -3657,6 +3874,53 @@ mod tests {
 
             let batches = get_batches_since(conn, "sg1", 0, 100)?;
             assert_eq!(batches.len(), 12, "11 remaining + 1 new");
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_expired_ml_dsa_grace_keys() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            let ml_dsa_pk = vec![0xAA; 1952];
+            let ml_kem_pk = vec![0xBB; 1184];
+            register_device_with_pq(
+                conn, "sg1", "dev1", &[1; 32], &[2; 32], &ml_dsa_pk, &ml_kem_pk, 0,
+            )?;
+
+            // Rotate the key so the old key lands in the grace slot.
+            let new_ml_dsa_pk = vec![0xCC; 1952];
+            let grace_expires_at = now_secs() + 3600; // 1 hour from now
+            let rotated = rotate_device_ml_dsa(conn, "sg1", "dev1", &new_ml_dsa_pk, 1, grace_expires_at)?;
+            assert!(rotated, "rotation should apply");
+
+            // Verify the grace key is present.
+            let device = get_device(conn, "sg1", "dev1")?.expect("device exists");
+            assert_eq!(device.prev_ml_dsa_65_public_key, ml_dsa_pk);
+            assert_eq!(device.prev_ml_dsa_65_expires_at, Some(grace_expires_at));
+
+            // Cleanup with "now" before the expiry — should NOT clear the grace key.
+            let cleaned = cleanup_expired_ml_dsa_grace_keys(conn, now_secs())?;
+            assert_eq!(cleaned, 0, "non-expired grace key should not be cleared");
+
+            let device = get_device(conn, "sg1", "dev1")?.expect("device exists");
+            assert_eq!(device.prev_ml_dsa_65_public_key, ml_dsa_pk, "grace key still present");
+            assert_eq!(device.prev_ml_dsa_65_expires_at, Some(grace_expires_at));
+
+            // Cleanup with a timestamp after the expiry — should clear the grace key.
+            let cleaned = cleanup_expired_ml_dsa_grace_keys(conn, grace_expires_at + 1)?;
+            assert_eq!(cleaned, 1, "expired grace key should be cleared");
+
+            let device = get_device(conn, "sg1", "dev1")?.expect("device exists");
+            assert!(device.prev_ml_dsa_65_public_key.is_empty(), "grace key should be empty");
+            assert_eq!(device.prev_ml_dsa_65_expires_at, None, "expiry should be NULL");
+
+            // The current key should be untouched.
+            assert_eq!(device.ml_dsa_65_public_key, new_ml_dsa_pk);
+            assert_eq!(device.ml_dsa_key_generation, 1);
 
             Ok(())
         })

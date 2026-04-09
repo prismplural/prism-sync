@@ -254,6 +254,17 @@ async fn test_pairing_expired_session_returns_404() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -366,6 +377,17 @@ async fn test_pairing_rate_limiting_ignores_spoofed_forwarded_headers() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
     let (url, _server, _db) = start_test_relay_with_config(config).await;
     let client = Client::new();
@@ -440,6 +462,17 @@ async fn test_pairing_payload_too_large_returns_413() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -503,6 +536,17 @@ async fn test_pairing_put_slot_payload_too_large() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;

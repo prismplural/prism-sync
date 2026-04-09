@@ -23,6 +23,9 @@ pub struct Metrics {
     pub registrations: AtomicU64,
     pub vacuum_pages_freed: AtomicU64,
     pub last_cleanup_epoch_secs: AtomicU64,
+    pub media_uploads: AtomicU64,
+    pub media_downloads: AtomicU64,
+    pub media_bytes_uploaded: AtomicU64,
 }
 
 impl Metrics {
@@ -45,6 +48,9 @@ impl Metrics {
             ("snapshots_exchanged", &self.snapshots_exchanged),
             ("registrations", &self.registrations),
             ("vacuum_pages_freed", &self.vacuum_pages_freed),
+            ("media_uploads", &self.media_uploads),
+            ("media_downloads", &self.media_downloads),
+            ("media_bytes_uploaded", &self.media_bytes_uploaded),
         ];
         for (name, field) in fields {
             if let Some(&value) = counters.get(*name) {
@@ -81,6 +87,18 @@ impl Metrics {
             (
                 "vacuum_pages_freed",
                 self.vacuum_pages_freed.load(Ordering::Relaxed),
+            ),
+            (
+                "media_uploads",
+                self.media_uploads.load(Ordering::Relaxed),
+            ),
+            (
+                "media_downloads",
+                self.media_downloads.load(Ordering::Relaxed),
+            ),
+            (
+                "media_bytes_uploaded",
+                self.media_bytes_uploaded.load(Ordering::Relaxed),
             ),
         ]
     }
@@ -165,6 +183,7 @@ pub struct AppState {
     pub pairing_rate_limiter: RateLimiter,
     pub sharing_fetch_rate_limiter: RateLimiter,
     pub sharing_init_rate_limiter: RateLimiter,
+    pub media_upload_rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -191,6 +210,7 @@ impl AppState {
             pairing_rate_limiter: RateLimiter::default(),
             sharing_fetch_rate_limiter: RateLimiter::default(),
             sharing_init_rate_limiter: RateLimiter::default(),
+            media_upload_rate_limiter: RateLimiter::default(),
         }
     }
 

@@ -92,6 +92,20 @@ pub struct Config {
     /// Minimum accepted signature version byte (default: 3).
     /// Signatures with a version below this are rejected with 403.
     pub min_signature_version: u8,
+    /// Directory where uploaded media blobs are stored on disk.
+    pub media_storage_path: String,
+    /// Maximum size in bytes for a single media upload.
+    pub media_max_file_bytes: usize,
+    /// Per-sync-group storage quota in bytes.
+    pub media_quota_bytes_per_group: u64,
+    /// Number of days before unreferenced media is eligible for cleanup.
+    pub media_retention_days: u64,
+    /// Maximum media uploads per sync group within the rate window.
+    pub media_upload_rate_limit: u32,
+    /// Sliding window duration in seconds for media upload rate limiting.
+    pub media_upload_rate_window_secs: u64,
+    /// Interval in seconds for cleaning up orphaned media files.
+    pub media_orphan_cleanup_secs: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -189,6 +203,14 @@ impl Config {
             prekey_serve_max_age_secs: parse_env("PREKEY_SERVE_MAX_AGE_SECS", 2_592_000),
             prekey_max_future_skew_secs: parse_env("PREKEY_MAX_FUTURE_SKEW_SECS", 300),
             min_signature_version: parse_env("MIN_SIGNATURE_VERSION", 3),
+            media_storage_path: std::env::var("MEDIA_STORAGE_PATH")
+                .unwrap_or_else(|_| "data/media".into()),
+            media_max_file_bytes: parse_env("MEDIA_MAX_FILE_BYTES", 10_485_760),
+            media_quota_bytes_per_group: parse_env("MEDIA_QUOTA_BYTES_PER_GROUP", 1_073_741_824),
+            media_retention_days: parse_env("MEDIA_RETENTION_DAYS", 90),
+            media_upload_rate_limit: parse_env("MEDIA_UPLOAD_RATE_LIMIT", 10),
+            media_upload_rate_window_secs: parse_env("MEDIA_UPLOAD_RATE_WINDOW_SECS", 60),
+            media_orphan_cleanup_secs: parse_env("MEDIA_ORPHAN_CLEANUP_SECS", 86400),
         }
     }
 

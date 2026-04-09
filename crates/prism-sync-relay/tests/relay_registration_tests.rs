@@ -391,6 +391,17 @@ async fn test_registration_rejects_expired_nonce() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -513,6 +524,17 @@ async fn test_nonce_rate_limiting() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -657,6 +679,17 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -762,6 +795,17 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -956,6 +1000,17 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1060,6 +1115,17 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1309,6 +1375,17 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1714,6 +1791,17 @@ async fn test_nonce_rate_limiting_window_expiry() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -2073,6 +2161,7 @@ async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
             x25519_public_key: original_x25519_pk.to_vec(),
             ml_dsa_65_public_key: test_keys.ml_dsa_pk.clone(),
             ml_kem_768_public_key: test_keys.ml_kem_pk.clone(),
+            ml_dsa_key_generation: 0,
             status: "active".into(),
         }],
     );
@@ -2859,6 +2948,17 @@ async fn test_revoke_rate_limiting() {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -3931,6 +4031,17 @@ fn default_test_config() -> Config {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     }
 }
 
