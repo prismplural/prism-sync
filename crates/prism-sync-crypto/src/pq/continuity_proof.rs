@@ -33,10 +33,15 @@ pub struct MlDsaContinuityProof {
 impl MlDsaContinuityProof {
     /// Build the proof message for one direction of the cross-signature.
     ///
-    /// Format: `device_id_bytes || from_gen (LE u32) || to_gen (LE u32) || target_pk`
+    /// Format: `len(device_id) (LE u32) || device_id_bytes || from_gen (LE u32) || to_gen (LE u32) || target_pk`
+    ///
+    /// The device_id is length-prefixed to prevent ambiguity at field boundaries
+    /// (e.g., a device_id ending in bytes that look like a generation number).
     fn proof_message(device_id: &str, from_gen: u32, to_gen: u32, target_pk: &[u8]) -> Vec<u8> {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(device_id.as_bytes());
+        let id_bytes = device_id.as_bytes();
+        let mut msg = Vec::with_capacity(4 + id_bytes.len() + 4 + 4 + target_pk.len());
+        msg.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        msg.extend_from_slice(id_bytes);
         msg.extend_from_slice(&from_gen.to_le_bytes());
         msg.extend_from_slice(&to_gen.to_le_bytes());
         msg.extend_from_slice(target_pk);

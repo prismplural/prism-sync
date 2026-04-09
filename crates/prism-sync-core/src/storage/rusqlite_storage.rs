@@ -125,6 +125,7 @@ fn row_to_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecor
                 .ok()
                 .map(|d| d.with_timezone(&Utc))
         }),
+        // SQLite stores as INTEGER (i64); safe for practical generation counts
         ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
     })
 }

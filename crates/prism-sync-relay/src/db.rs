@@ -1261,6 +1261,9 @@ pub fn count_active_devices(conn: &Connection, sync_id: &str) -> Result<u64, rus
 }
 
 /// Rotate a device's ML-DSA key, shifting the current key to the grace slot.
+///
+/// Returns `true` if the rotation was applied, `false` if the device already
+/// has an equal or higher generation (concurrent or replayed rotation).
 pub fn rotate_device_ml_dsa(
     conn: &Connection,
     sync_id: &str,
@@ -1268,8 +1271,8 @@ pub fn rotate_device_ml_dsa(
     new_ml_dsa_pk: &[u8],
     new_generation: i64,
     grace_expires_at: i64,
-) -> Result<(), rusqlite::Error> {
-    conn.execute(
+) -> Result<bool, rusqlite::Error> {
+    let count = conn.execute(
         "UPDATE devices SET
             prev_ml_dsa_65_public_key = ml_dsa_65_public_key,
             prev_ml_dsa_65_expires_at = ?1,
@@ -1278,7 +1281,7 @@ pub fn rotate_device_ml_dsa(
          WHERE sync_id = ?4 AND device_id = ?5 AND ml_dsa_key_generation < ?3",
         params![grace_expires_at, new_ml_dsa_pk, new_generation, sync_id, device_id],
     )?;
-    Ok(())
+    Ok(count > 0)
 }
 
 /// Clean up expired ML-DSA grace keys.
