@@ -63,6 +63,7 @@ pub async fn list_devices(
                 "ml_kem_768_public_key": b64.encode(&d.ml_kem_768_public_key),
                 "epoch": d.epoch,
                 "status": d.status,
+                "ml_dsa_key_generation": d.ml_dsa_key_generation,
             })
         })
         .collect();
@@ -702,8 +703,10 @@ pub async fn post_rotate_ml_dsa(
     // Build and verify the continuity proof
     let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof {
         device_id: device_id.clone(),
-        old_generation: current_gen as u32,
-        new_generation: req.ml_dsa_key_generation as u32,
+        old_generation: u32::try_from(current_gen)
+            .map_err(|_| AppError::Internal("invalid generation in database".into()))?,
+        new_generation: u32::try_from(req.ml_dsa_key_generation)
+            .map_err(|_| AppError::BadRequest("ml_dsa_key_generation out of range"))?,
         new_ml_dsa_pk: new_pk.clone(),
         old_signs_new,
         new_signs_old,

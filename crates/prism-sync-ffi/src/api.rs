@@ -3124,7 +3124,62 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("device {device_id} not in local registry"))?;
 
-    let current_gen = current_record.ml_dsa_key_generation;
+    let mut current_gen = current_record.ml_dsa_key_generation;
+
+    // 2b. Check relay's generation to handle crash recovery.
+    // If the relay is ahead of local (e.g., previous rotation succeeded on
+    // relay but client crashed before updating local registry), sync local
+    // state forward so we rotate from the relay's generation.
+    let relay = build_relay(
+        &relay_url,
+        &sync_id,
+        &device_id,
+        &session_token,
+        Some(device_secret.as_bytes().to_vec()),
+        allow_insecure,
+        None,
+    )?;
+
+    let relay_devices = match relay.list_devices().await {
+        Ok(devices) => devices,
+        Err(_) => vec![], // If list fails, proceed with local state
+    };
+    if let Some(relay_self) = relay_devices.iter().find(|d| d.device_id == device_id) {
+        if relay_self.ml_dsa_key_generation > current_gen {
+            // Relay is ahead — re-derive the key at relay's generation and
+            // update local registry so our next rotation starts from there.
+            let relay_gen = relay_self.ml_dsa_key_generation;
+            let synced_ml_dsa = device_secret
+                .ml_dsa_65_keypair_v(&device_id, relay_gen)
+                .map_err(|e| format!("failed to derive ML-DSA key at relay gen {relay_gen}: {e}"))?;
+            let synced_pk = synced_ml_dsa.public_key_bytes();
+
+            let inner = handle.inner.lock().await;
+            let storage = inner.storage().clone();
+            let sid = sync_id.clone();
+            let did = device_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut record = storage
+                    .get_device_record(&sid, &did)?
+                    .ok_or_else(|| {
+                        prism_sync_core::error::CoreError::Storage(
+                            "device not in registry".into(),
+                        )
+                    })?;
+                record.ml_dsa_65_public_key = synced_pk;
+                record.ml_dsa_key_generation = relay_gen;
+                let mut tx = storage.begin_tx()?;
+                tx.upsert_device_record(&record)?;
+                tx.commit()
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+
+            current_gen = relay_gen;
+        }
+    }
+
     let new_gen = current_gen + 1;
 
     // 3. Create continuity proof (cross-signed by old and new ML-DSA keys)
@@ -3141,17 +3196,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         .map_err(|e| format!("failed to derive new ML-DSA key: {e}"))?;
     let new_pk = new_ml_dsa.public_key_bytes();
 
-    // 4. Build relay and submit rotation
-    let relay = build_relay(
-        &relay_url,
-        &sync_id,
-        &device_id,
-        &session_token,
-        Some(device_secret.as_bytes().to_vec()),
-        allow_insecure,
-        None,
-    )?;
-
+    // 4. Submit rotation to relay
     let response = match relay
         .rotate_ml_dsa(&device_id, &new_pk, new_gen, &proof)
         .await

@@ -117,7 +117,15 @@ impl DeviceRegistryManager {
                     && device.x25519_public_key == existing.x25519_public_key
                     && device.ml_kem_768_public_key == existing.ml_kem_768_public_key
                 {
-                    // Accept ML-DSA rotation from relay (trusted source, generation monotonically increasing)
+                    // Accept ML-DSA rotation from relay device list without proof verification.
+                    //
+                    // TRUST ASSUMPTION: The relay is trusted to propagate legitimate key
+                    // rotations. The relay verifies the continuity proof at rotation time
+                    // (POST /rotate-ml-dsa) — we accept the result here without re-verifying.
+                    // A compromised relay could inject a fake ML-DSA key via this path.
+                    // This matches the existing relay trust model for initial key distribution
+                    // during registration. To close this gap, the relay would need to
+                    // broadcast the continuity proof alongside device list updates.
                     return Self::write_device_record(storage, device);
                 } else {
                     return Err(CoreError::DeviceKeyChanged {
