@@ -235,6 +235,32 @@ Future<void> reconnectWebsocket({required PrismSyncHandle handle}) =>
 Future<void> onResume({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiOnResume(handle: handle);
 
+/// Upload an encrypted media blob to the relay.
+///
+/// Requires `configure_engine` to have been called after `initialize`/`unlock`.
+Future<void> uploadMedia({
+  required PrismSyncHandle handle,
+  required String mediaId,
+  required String contentHash,
+  required List<int> data,
+}) => RustLib.instance.api.crateApiUploadMedia(
+  handle: handle,
+  mediaId: mediaId,
+  contentHash: contentHash,
+  data: data,
+);
+
+/// Download an encrypted media blob from the relay.
+///
+/// Requires `configure_engine` to have been called after `initialize`/`unlock`.
+Future<Uint8List> downloadMedia({
+  required PrismSyncHandle handle,
+  required String mediaId,
+}) => RustLib.instance.api.crateApiDownloadMedia(
+  handle: handle,
+  mediaId: mediaId,
+);
+
 /// Upload an ephemeral snapshot for device pairing.
 ///
 /// Called by the existing device after generating an invite. The snapshot
@@ -309,13 +335,11 @@ Future<String> createSyncGroup({
   mnemonic: mnemonic,
 );
 
-/// Generate a pairing request for a new device wanting to join a sync group.
+/// Generate and persist a pending joiner identity for the relay ceremony.
 ///
-/// The joiner device calls this to create a PairingRequest containing its
-/// device identity. The request is encoded as a QR code payload and JSON
-/// for flexible transport.
-///
-/// Returns JSON: `{ "qr_payload": [...], "request_json": "...", "device_id": "..." }`
+/// The joiner device uses the resulting device id and secret to start the
+/// rendezvous-token pairing flow. No compact QR payload or URL transport is
+/// produced here; the app now exchanges only the relay rendezvous token.
 Future<String> preparePendingDeviceIdentity({
   required PrismSyncHandle handle,
 }) => RustLib.instance.api.crateApiPreparePendingDeviceIdentity(handle: handle);
@@ -688,6 +712,22 @@ Future<String> completeInitiatorCeremony({
   handle: handle,
   password: password,
 );
+
+/// Rotate this device's ML-DSA-65 signing key.
+///
+/// Generates a new ML-DSA keypair at the next generation, creates a
+/// cross-signed continuity proof, submits it to the relay, and updates
+/// the local device registry.
+///
+/// Returns JSON: `{"ml_dsa_key_generation": N, "device_id": "..."}`
+Future<String> rotateMlDsaKey({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiRotateMlDsaKey(handle: handle);
+
+/// Get the current ML-DSA key generation for this device.
+///
+/// Returns the generation number (0 for initial key, increments on each rotation).
+Future<int> getMlDsaKeyGeneration({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiGetMlDsaKeyGeneration(handle: handle);
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<MemorySecureStore>>
 abstract class MemorySecureStore implements RustOpaqueInterface {
