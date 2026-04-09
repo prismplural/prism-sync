@@ -21,23 +21,22 @@ fn b64() -> base64::engine::GeneralPurpose {
 fn build_rotation_request(
     device_id: &str,
     keys: &TestDeviceKeys,
-    new_device_secret: &DeviceSecret,
+    _new_device_secret: &DeviceSecret,
     old_generation: u32,
     new_generation: u32,
 ) -> (Vec<u8>, Vec<u8>) {
-    let ed25519_pk = keys.ed25519_signing_key.verifying_key().to_bytes();
-    let old_sk = keys.device_secret.ml_dsa_65_keypair(device_id).unwrap();
-    let new_sk = new_device_secret.ml_dsa_65_keypair(device_id).unwrap();
-
     let proof = MlDsaContinuityProof::create(
+        &keys.device_secret,
         device_id,
-        &ed25519_pk,
         old_generation,
         new_generation,
-        &old_sk,
-        &new_sk,
-    );
+    )
+    .expect("continuity proof creation should succeed");
 
+    let new_sk = keys
+        .device_secret
+        .ml_dsa_65_keypair_v(device_id, new_generation)
+        .unwrap();
     let new_pk = new_sk.public_key_bytes();
     let body = serde_json::json!({
         "new_ml_dsa_pk": b64().encode(&new_pk),
@@ -174,24 +173,16 @@ async fn test_rollback_generation_returns_409() {
     // Now try to roll back to generation 0 — should fail with 409.
     // After the first rotation, the DB has the gen-1 ML-DSA key.
     // We need to sign the HTTP request with the gen-1 key so auth passes.
-    let ed25519_pk = keys.ed25519_signing_key.verifying_key().to_bytes();
-    let gen1_sk = new_secret_1.ml_dsa_65_keypair(&device_id).unwrap();
+    let gen1_sk = keys.device_secret.ml_dsa_65_keypair_v(&device_id, 1).unwrap();
 
-    let new_secret_rollback = DeviceSecret::generate();
-    let rollback_sk = new_secret_rollback.ml_dsa_65_keypair(&device_id).unwrap();
-    let proof = MlDsaContinuityProof::create(
-        &device_id,
-        &ed25519_pk,
-        1,
-        0,
-        &gen1_sk,
-        &rollback_sk,
-    );
+    // Craft a request body with generation 0 (rollback) — the relay should reject this
+    // even before proof verification since generation <= current.
+    let gen0_sk = keys.device_secret.ml_dsa_65_keypair_v(&device_id, 0).unwrap();
     let body = serde_json::to_vec(&serde_json::json!({
-        "new_ml_dsa_pk": b64().encode(&rollback_sk.public_key_bytes()),
+        "new_ml_dsa_pk": b64().encode(&gen0_sk.public_key_bytes()),
         "ml_dsa_key_generation": 0,
-        "old_signs_new": b64().encode(&proof.old_signs_new),
-        "new_signs_old": b64().encode(&proof.new_signs_old),
+        "old_signs_new": b64().encode(&[0u8; 64]),
+        "new_signs_old": b64().encode(&[0u8; 64]),
     }))
     .unwrap();
 
@@ -294,12 +285,11 @@ async fn test_double_rotation_succeeds() {
     // Rotation 1 -> 2
     // After the first rotation, the DB has the gen-1 ML-DSA key.
     // We need to sign the HTTP request with the gen-1 key.
-    let ed25519_pk = keys.ed25519_signing_key.verifying_key().to_bytes();
-    let gen1_sk = new_secret_1.ml_dsa_65_keypair(&device_id).unwrap();
-    let new_secret_2 = DeviceSecret::generate();
-    let gen2_sk = new_secret_2.ml_dsa_65_keypair(&device_id).unwrap();
-
-    let proof = MlDsaContinuityProof::create(&device_id, &ed25519_pk, 1, 2, &gen1_sk, &gen2_sk);
+    let gen1_sk = keys.device_secret.ml_dsa_65_keypair_v(&device_id, 1).unwrap();
+    // Build proof for gen 1→2 using the same device secret
+    let proof = MlDsaContinuityProof::create(&keys.device_secret, &device_id, 1, 2)
+        .expect("proof gen 1→2 should succeed");
+    let gen2_sk = keys.device_secret.ml_dsa_65_keypair_v(&device_id, 2).unwrap();
     let body = serde_json::to_vec(&serde_json::json!({
         "new_ml_dsa_pk": b64().encode(&gen2_sk.public_key_bytes()),
         "ml_dsa_key_generation": 2,
