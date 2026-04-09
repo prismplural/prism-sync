@@ -117,7 +117,7 @@ impl Stats {
         let mut p99_str = String::new();
         if let Some(s) = self.ops.get(&OpType::WsConnect) {
             let h = s.histogram.lock().unwrap();
-            if h.len() > 0 {
+            if !h.is_empty() {
                 p99_str = format!(
                     "  connect_p99={:.1}ms",
                     h.value_at_quantile(0.99) as f64 / 1000.0

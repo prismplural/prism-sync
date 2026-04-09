@@ -109,6 +109,13 @@ async fn start_in_process_relay(reader_pool_size: usize) -> Result<String> {
         prekey_serve_max_age_secs: 2_592_000,
         prekey_max_future_skew_secs: 300,
         min_signature_version: 3,
+        media_storage_path: "data/media".into(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 10,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
     };
 
     let db = Database::open(
