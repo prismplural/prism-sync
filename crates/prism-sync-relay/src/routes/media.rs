@@ -380,16 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn upload_rejected_when_body_exceeds_max() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let state = test_state(tmp.path());
-
-        // max is 1024 bytes in test config
-        let body = vec![0u8; 2048];
-        assert!(body.len() > state.config.media_max_file_bytes);
-    }
-
-    #[test]
     fn upload_rejected_when_quota_exceeded() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = test_state(tmp.path());
@@ -428,18 +418,6 @@ mod tests {
             Ok(true)
         });
         assert!(!result.unwrap());
-    }
-
-    #[test]
-    fn content_hash_mismatch_detected() {
-        let data = b"hello world";
-        let wrong_hash = "a".repeat(64);
-
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let correct_hash = hex::encode(hasher.finalize());
-
-        assert_ne!(wrong_hash, correct_hash);
     }
 
     #[test]

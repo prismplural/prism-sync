@@ -583,3 +583,50 @@ async fn upload_duplicate_media_id_returns_409() {
         "duplicate media_id should return 409 Conflict (or 500 if duplicate handling not yet implemented), got {status}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upload_rate_limited() {
+    let mut config = base_test_config();
+    config.media_upload_rate_limit = 2;
+    config.media_upload_rate_window_secs = 60;
+
+    let (url, _handle, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+
+    db.with_conn(|conn| {
+        db::create_sync_group(conn, &sync_id, 0)?;
+        Ok(())
+    })
+    .unwrap();
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    // Upload 1: should succeed
+    let data1 = vec![0x01u8; 64];
+    let resp = upload_media(
+        &client, &url, &token, &keys, &sync_id, &device_id, "rate-media-001", &data1,
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "first upload should succeed");
+
+    // Upload 2: should succeed (at the limit)
+    let data2 = vec![0x02u8; 64];
+    let resp = upload_media(
+        &client, &url, &token, &keys, &sync_id, &device_id, "rate-media-002", &data2,
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "second upload should succeed");
+
+    // Upload 3: should be rate limited
+    let data3 = vec![0x03u8; 64];
+    let resp = upload_media(
+        &client, &url, &token, &keys, &sync_id, &device_id, "rate-media-003", &data3,
+    )
+    .await;
+    assert_eq!(resp.status(), 429, "third upload should be rate limited");
+}
