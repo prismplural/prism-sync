@@ -796,6 +796,7 @@ impl SyncRelay for ServerRelay {
         let body = serde_json::json!({
             "new_ml_dsa_pk": BASE64.encode(new_ml_dsa_pk),
             "ml_dsa_key_generation": new_generation,
+            "timestamp": proof.timestamp,
             "old_signs_new": BASE64.encode(&proof.old_signs_new),
             "new_signs_old": BASE64.encode(&proof.new_signs_old),
         });

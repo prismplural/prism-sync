@@ -3140,10 +3140,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         None,
     )?;
 
-    let relay_devices = match relay.list_devices().await {
-        Ok(devices) => devices,
-        Err(_) => vec![], // If list fails, proceed with local state
-    };
+    let relay_devices = relay.list_devices().await.unwrap_or_default();
     if let Some(relay_self) = relay_devices.iter().find(|d| d.device_id == device_id) {
         if relay_self.ml_dsa_key_generation > current_gen {
             // Relay is ahead — re-derive the key at relay's generation and

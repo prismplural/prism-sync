@@ -11,39 +11,60 @@ use super::HybridSignature;
 use crate::device_identity::{DevicePqSigningKey, DeviceSecret};
 use crate::error::{CryptoError, Result};
 
+/// Maximum age of a continuity proof for verification (48 hours).
+const PROOF_MAX_AGE_SECS: i64 = 48 * 3600;
+
+/// Domain separator for rotation proof messages, following the project's
+/// established convention from `auth.rs` (`PRISM_SYNC_CHALLENGE_V2\x00`, etc.).
+const ROTATION_PROOF_DOMAIN: &[u8] = b"PRISM_KEY_ROTATION_PROOF_V1\x00";
+
 /// Cross-signed proof that an ML-DSA key rotation is legitimate.
 ///
-/// Both the old and new keys sign each other, bound to the device ID
-/// and generation numbers. This prevents unauthorized key replacement.
+/// Both the old and new keys sign each other, bound to the device ID,
+/// generation numbers, and a timestamp. This prevents unauthorized key
+/// replacement and limits replay windows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlDsaContinuityProof {
     pub device_id: String,
     pub old_generation: u32,
     pub new_generation: u32,
+    /// Unix timestamp (seconds) when the proof was created.
+    #[serde(default)]
+    pub timestamp: i64,
     /// The new ML-DSA-65 public key (raw bytes).
     pub new_ml_dsa_pk: Vec<u8>,
     /// HybridSignature::sign_v3(proof_message, "ml_dsa_rotation", ed25519_sk, old_ml_dsa_sk)
-    /// where proof_message = device_id || old_generation || new_generation || new_ml_dsa_pk
     pub old_signs_new: Vec<u8>,
     /// ML-DSA.sign(proof_message_reverse, new_ml_dsa_sk)
-    /// where proof_message_reverse = device_id || new_generation || old_generation || old_ml_dsa_pk
     pub new_signs_old: Vec<u8>,
 }
 
 impl MlDsaContinuityProof {
     /// Build the proof message for one direction of the cross-signature.
     ///
-    /// Format: `len(device_id) (LE u32) || device_id_bytes || from_gen (LE u32) || to_gen (LE u32) || target_pk`
+    /// Format: `DOMAIN_SEP || len(device_id) (LE u32) || device_id_bytes
+    ///          || from_gen (LE u32) || to_gen (LE u32) || timestamp (LE i64)
+    ///          || target_pk`
     ///
-    /// The device_id is length-prefixed to prevent ambiguity at field boundaries
-    /// (e.g., a device_id ending in bytes that look like a generation number).
-    fn proof_message(device_id: &str, from_gen: u32, to_gen: u32, target_pk: &[u8]) -> Vec<u8> {
+    /// Domain separator follows the project's auth.rs convention. Timestamp
+    /// bounds replay window. Device_id is length-prefixed for unambiguous parsing.
+    fn proof_message(
+        device_id: &str,
+        from_gen: u32,
+        to_gen: u32,
+        timestamp: i64,
+        target_pk: &[u8],
+    ) -> Vec<u8> {
         let id_bytes = device_id.as_bytes();
-        let mut msg = Vec::with_capacity(4 + id_bytes.len() + 4 + 4 + target_pk.len());
+        let mut msg = Vec::with_capacity(
+            ROTATION_PROOF_DOMAIN.len() + 4 + id_bytes.len() + 4 + 4 + 8 + target_pk.len(),
+        );
+        msg.extend_from_slice(ROTATION_PROOF_DOMAIN);
         msg.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
         msg.extend_from_slice(id_bytes);
         msg.extend_from_slice(&from_gen.to_le_bytes());
         msg.extend_from_slice(&to_gen.to_le_bytes());
+        msg.extend_from_slice(&timestamp.to_le_bytes());
         msg.extend_from_slice(target_pk);
         msg
     }
@@ -73,10 +94,14 @@ impl MlDsaContinuityProof {
 
         let new_pk = new_ml_dsa.public_key_bytes();
         let old_pk = old_ml_dsa.public_key_bytes();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         // Old signs new: hybrid V3 signature with context "ml_dsa_rotation"
         let msg_old_signs_new =
-            Self::proof_message(device_id, old_generation, new_generation, &new_pk);
+            Self::proof_message(device_id, old_generation, new_generation, timestamp, &new_pk);
         let hybrid_sig = HybridSignature::sign_v3(
             &msg_old_signs_new,
             b"ml_dsa_rotation",
@@ -87,13 +112,14 @@ impl MlDsaContinuityProof {
 
         // New signs old: ML-DSA only (proves possession of new key)
         let msg_new_signs_old =
-            Self::proof_message(device_id, new_generation, old_generation, &old_pk);
+            Self::proof_message(device_id, new_generation, old_generation, timestamp, &old_pk);
         let new_signs_old = new_ml_dsa.sign(&msg_new_signs_old);
 
         Ok(Self {
             device_id: device_id.to_string(),
             old_generation,
             new_generation,
+            timestamp,
             new_ml_dsa_pk: new_pk,
             old_signs_new,
             new_signs_old,
@@ -113,11 +139,27 @@ impl MlDsaContinuityProof {
             ));
         }
 
+        // Check timestamp freshness (reject proofs older than 48 hours)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if self.timestamp > 0 && (now - self.timestamp) > PROOF_MAX_AGE_SECS {
+            return Err(CryptoError::InvalidKeyMaterial(
+                format!(
+                    "continuity proof expired: created {}s ago, max {}s",
+                    now - self.timestamp,
+                    PROOF_MAX_AGE_SECS
+                ),
+            ));
+        }
+
         // Verify old-signs-new (hybrid V3 with context "ml_dsa_rotation")
         let msg_old_signs_new = Self::proof_message(
             &self.device_id,
             self.old_generation,
             self.new_generation,
+            self.timestamp,
             &self.new_ml_dsa_pk,
         );
         let hybrid_sig = HybridSignature::from_bytes(&self.old_signs_new)?;
@@ -133,6 +175,7 @@ impl MlDsaContinuityProof {
             &self.device_id,
             self.new_generation,
             self.old_generation,
+            self.timestamp,
             old_ml_dsa_pk,
         );
         DevicePqSigningKey::verify(&self.new_ml_dsa_pk, &msg_new_signs_old, &self.new_signs_old)?;

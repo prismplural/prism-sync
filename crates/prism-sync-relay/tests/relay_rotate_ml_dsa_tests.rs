@@ -41,6 +41,7 @@ fn build_rotation_request(
     let body = serde_json::json!({
         "new_ml_dsa_pk": b64().encode(&new_pk),
         "ml_dsa_key_generation": new_generation,
+        "timestamp": proof.timestamp,
         "old_signs_new": b64().encode(&proof.old_signs_new),
         "new_signs_old": b64().encode(&proof.new_signs_old),
     });
@@ -181,6 +182,7 @@ async fn test_rollback_generation_returns_409() {
     let body = serde_json::to_vec(&serde_json::json!({
         "new_ml_dsa_pk": b64().encode(gen0_sk.public_key_bytes()),
         "ml_dsa_key_generation": 0,
+        "timestamp": 0,
         "old_signs_new": b64().encode([0u8; 64]),
         "new_signs_old": b64().encode([0u8; 64]),
     }))
@@ -293,6 +295,7 @@ async fn test_double_rotation_succeeds() {
     let body = serde_json::to_vec(&serde_json::json!({
         "new_ml_dsa_pk": b64().encode(gen2_sk.public_key_bytes()),
         "ml_dsa_key_generation": 2,
+        "timestamp": proof.timestamp,
         "old_signs_new": b64().encode(&proof.old_signs_new),
         "new_signs_old": b64().encode(&proof.new_signs_old),
     }))

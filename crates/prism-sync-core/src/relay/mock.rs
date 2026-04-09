@@ -556,6 +556,7 @@ mod tests {
             device_id: "d1".to_string(),
             old_generation: 0,
             new_generation: 1,
+            timestamp: 1700000000,
             new_ml_dsa_pk: vec![0x42; 1952],
             old_signs_new: vec![0xAA; 64],
             new_signs_old: vec![0xBB; 64],

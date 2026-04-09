@@ -631,6 +631,8 @@ pub async fn post_ack(
 pub struct RotateMlDsaRequest {
     pub new_ml_dsa_pk: String,
     pub ml_dsa_key_generation: i64,
+    #[serde(default)]
+    pub timestamp: i64,
     pub old_signs_new: String,
     pub new_signs_old: String,
 }
@@ -707,6 +709,7 @@ pub async fn post_rotate_ml_dsa(
             .map_err(|_| AppError::Internal("invalid generation in database".into()))?,
         new_generation: u32::try_from(req.ml_dsa_key_generation)
             .map_err(|_| AppError::BadRequest("ml_dsa_key_generation out of range"))?,
+        timestamp: req.timestamp,
         new_ml_dsa_pk: new_pk.clone(),
         old_signs_new,
         new_signs_old,
