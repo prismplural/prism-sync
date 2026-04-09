@@ -212,6 +212,10 @@ impl ServerRelay {
             409 => RelayError::EpochRotation {
                 new_epoch: 0, // caller should parse from body
             },
+            413 => RelayError::Server {
+                status_code: status,
+                message: format!("Payload too large: {body}"),
+            },
             500..=599 => RelayError::Server {
                 status_code: status,
                 message: body.to_string(),
@@ -826,6 +830,57 @@ impl SyncRelay for ServerRelay {
             .map_err(|e| RelayError::Protocol {
                 message: format!("Failed to parse rotate-ml-dsa response: {e}"),
             })
+    }
+
+    async fn upload_media(
+        &self,
+        media_id: &str,
+        content_hash: &str,
+        data: Vec<u8>,
+    ) -> Result<(), RelayError> {
+        let url = format!("{}/media", self.base_path());
+        let path = self.canonical_path("/media");
+        debug!("upload_media media_id={media_id}");
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &data)
+            .header("X-Media-Id", media_id)
+            .header("X-Content-Hash", content_hash)
+            .header("Content-Type", "application/octet-stream")
+            .body(data)
+            .timeout(self.snapshot_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        Ok(())
+    }
+
+    async fn download_media(&self, media_id: &str) -> Result<Vec<u8>, RelayError> {
+        let url = format!("{}/media/{}", self.base_path(), media_id);
+        debug!("download_media media_id={media_id}");
+
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .timeout(self.snapshot_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let bytes = resp.bytes().await.map_err(Self::classify_reqwest_error)?;
+        Ok(bytes.to_vec())
     }
 
     async fn dispose(&self) -> Result<(), RelayError> {
