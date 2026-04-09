@@ -1,6 +1,6 @@
 # Sync Pairing Protocol Contract
 
-**Status:** Refreshed to match the shipped contract as of 2026-03-30
+**Status:** Refreshed 2026-04-08 — compact QR/URL transport removed; pairing now uses relay-based ceremony with SAS verification
 
 This document describes the current sync-pairing and registration wire shape,
 including the compatibility fields that still exist during rollout.
@@ -16,11 +16,11 @@ than a live ownership boundary.
 
 ---
 
-## 1. PairingRequest (Joiner → Approver)
+## 1. PairingRequest (Joiner → Approver) — REMOVED
 
-Sent by the joining device to initiate pairing. Transported via QR code.
+> **Removed:** The compact QR-based `PairingRequest` transport has been replaced by the relay-based pairing ceremony with SAS verification. The JSON shape is retained here for historical reference only.
 
-### JSON Shape
+### JSON Shape (historical)
 
 ```json
 {
@@ -30,7 +30,7 @@ Sent by the joining device to initiate pairing. Transported via QR code.
 }
 ```
 
-### Compact Binary (QR transport, version 0x01)
+### Compact Binary (QR transport, version 0x01) — REMOVED
 
 ```
 [1B  version = 0x01]
@@ -41,9 +41,10 @@ Sent by the joining device to initiate pairing. Transported via QR code.
 
 ---
 
-## 2. PairingResponse (Approver → Joiner)
+## 2. PairingResponse (Approver → Joiner) — compact transport REMOVED
 
 Sent by the existing trusted device after approving a PairingRequest.
+The JSON shape is still used internally by the relay-based ceremony, but the compact binary encoding and QR/URL transport have been removed.
 
 ### JSON Shape
 
@@ -68,29 +69,9 @@ Sent by the existing trusted device after approving a PairingRequest.
 `registry_approval_signature` is present for existing-group approvals and absent
 for first-device bootstrap and older compatibility flows.
 
-### Compact Binary (QR/URL transport, version 0x05)
+### Compact Binary (QR/URL transport) — REMOVED
 
-```
-[1B  version = 0x05]
-[2B  relay_url len][relay_url]
-[2B  sync_id len][sync_id]
-[16B mnemonic entropy (BIP39)]
-[2B  wrapped_dek len][wrapped_dek]
-[2B  salt len][salt]
-[64B signed_invitation (raw Ed25519 sig)]
-[2B  signed_keyring len][signed_keyring]
-[2B  inviter_device_id len][inviter_device_id]
-[32B inviter_ed25519_pk]
-[2B  joiner_device_id len][joiner_device_id]  (len=0 if absent)
-[4B  current_epoch (u32 big-endian)]
-[2B  epoch_key len][epoch_key]
-[2B  registry_approval_signature len][registry_approval_signature raw bytes]
-```
-
-Backward compatibility:
-
-- decoders accept compact versions `0x02`, `0x03`, `0x04`, and `0x05`
-- encoders emit `0x05`
+The compact binary encoding (`to_compact_bytes` / `from_compact_bytes`) and the QR/URL transport have been removed. Pairing now uses the relay-based ceremony with SAS verification, which transmits pairing data as JSON through relay slots.
 
 ### Admission Context
 
@@ -259,8 +240,7 @@ From `CoreError` in `sync/crates/prism-sync-core/src/error.rs`:
 
 ## Backward Compatibility
 
-- `PairingResponse` compact decoding accepts versions `0x02`, `0x03`, `0x04`,
-  and `0x05`
+- Compact binary encoding for `PairingRequest` and `PairingResponse` has been removed; pairing uses the relay-based ceremony exclusively
 - new fields use `#[serde(default)]`, so older responses decode with defaults
 - `signed_keyring` wire format remains stable: `[64B sig || JSON array]`
 - `signed_invitation` remains in the register contract as a temporary

@@ -28,10 +28,9 @@ const PRISM_LABEL: &[u8] = b"PrismHybridSig-v3";
 /// The context must be <= 255 bytes.
 pub fn build_hybrid_message_representative(context: &[u8], message: &[u8]) -> Result<Vec<u8>> {
     use sha2::{Digest, Sha512};
-    if context.len() > u8::MAX as usize {
+    if context.len() > 255 {
         return Err(CryptoError::InvalidKeyMaterial(format!(
-            "hybrid signature context must be <= {} bytes, got {}",
-            u8::MAX,
+            "context must be <= 255 bytes, got {}",
             context.len()
         )));
     }
@@ -95,11 +94,8 @@ impl HybridSignature {
                 .map_err(|e| CryptoError::InvalidKeyMaterial(format!("ed25519 public key: {e}")))?;
             let sig = ed25519_dalek::Signature::from_slice(&self.ed25519_sig)
                 .map_err(|e| CryptoError::InvalidKeyMaterial(format!("ed25519 signature: {e}")))?;
-            vk.verify(message, &sig).map_err(|_| {
-                CryptoError::SignatureVerificationFailed(
-                    "hybrid signature verification failed".into(),
-                )
-            })?;
+            vk.verify(message, &sig)
+                .map_err(|e| CryptoError::SignatureVerificationFailed(format!("ed25519: {e}")))?;
             Ok(())
         })();
 
@@ -119,11 +115,8 @@ impl HybridSignature {
                 .map_err(|e| {
                     CryptoError::InvalidKeyMaterial(format!("ml-dsa-65 signature: {e}"))
                 })?;
-            vk.verify(message, &sig).map_err(|_| {
-                CryptoError::SignatureVerificationFailed(
-                    "hybrid signature verification failed".into(),
-                )
-            })?;
+            vk.verify(message, &sig)
+                .map_err(|e| CryptoError::SignatureVerificationFailed(format!("ml-dsa-65: {e}")))?;
             Ok(())
         })();
 
@@ -155,9 +148,6 @@ impl HybridSignature {
     /// Both algorithms sign the same message representative M', built from the
     /// IETF composite-signatures draft pattern with a Prism-specific label and
     /// caller-supplied context string.
-    ///
-    /// Note: Prism signs the pre-hashed representative `M'` with ordinary
-    /// Ed25519, not the distinct `Ed25519ph` algorithm.
     pub fn sign_v3(
         message: &[u8],
         context: &[u8],
@@ -198,9 +188,7 @@ impl HybridSignature {
             ));
         }
 
-        let ed_len = u32::from_le_bytes(data[0..4].try_into().map_err(|_| {
-            CryptoError::InvalidKeyMaterial("hybrid signature missing ed25519 length".into())
-        })?) as usize;
+        let ed_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
 
         if data.len() < 4 + ed_len + 4 {
             return Err(CryptoError::InvalidKeyMaterial(format!(
@@ -212,15 +200,8 @@ impl HybridSignature {
         let ed_sig = data[4..4 + ed_len].to_vec();
 
         let ml_offset = 4 + ed_len;
-        let ml_len = u32::from_le_bytes(
-            data[ml_offset..ml_offset + 4]
-                .try_into()
-                .map_err(|_| {
-                    CryptoError::InvalidKeyMaterial(
-                        "hybrid signature missing ml-dsa-65 length".into(),
-                    )
-                })?,
-        ) as usize;
+        let ml_len =
+            u32::from_le_bytes(data[ml_offset..ml_offset + 4].try_into().unwrap()) as usize;
 
         if data.len() < ml_offset + 4 + ml_len {
             return Err(CryptoError::InvalidKeyMaterial(format!(
@@ -417,8 +398,8 @@ mod tests {
         let msg = b"V3 round trip test";
         let ctx = b"test_context";
 
-        let sig =
-            HybridSignature::sign_v3(msg, ctx, &ed_sk, &ml_sk).expect("V3 signing should work");
+        let sig = HybridSignature::sign_v3(msg, ctx, &ed_sk, &ml_sk)
+            .expect("sign_v3 should succeed");
 
         let ed_pk = ed_sk.verifying_key().to_bytes();
         let ml_vk = ml_sk.verifying_key();
@@ -436,7 +417,7 @@ mod tests {
         let ctx = b"test_context";
 
         let sig = HybridSignature::sign_v3(b"original", ctx, &ed_sk, &ml_sk)
-            .expect("V3 signing should work");
+            .expect("sign_v3 should succeed");
 
         let ed_pk = ed_sk.verifying_key().to_bytes();
         let ml_vk = ml_sk.verifying_key();
@@ -453,7 +434,7 @@ mod tests {
         let msg = b"context test";
 
         let sig = HybridSignature::sign_v3(msg, b"context_a", &ed_sk, &ml_sk)
-            .expect("V3 signing should work");
+            .expect("sign_v3 should succeed");
 
         let ed_pk = ed_sk.verifying_key().to_bytes();
         let ml_vk = ml_sk.verifying_key();
@@ -493,7 +474,7 @@ mod tests {
         let message = b"hello";
 
         let m_prime = build_hybrid_message_representative(context, message)
-            .expect("representative should build");
+            .expect("should succeed with small context");
 
         // Verify structure: prefix || label || len(context) || context || SHA-512(message)
         let hash = Sha512::digest(message);
@@ -508,5 +489,27 @@ mod tests {
         assert_eq!(m_prime, expected);
         // Total length: 32 + 17 + 1 + 4 + 64 = 118
         assert_eq!(m_prime.len(), 118);
+    }
+
+    #[test]
+    fn oversize_context_returns_error_not_panic() {
+        let big_context = vec![0x42u8; 256]; // 1 byte over the limit
+        let message = b"test message";
+        let result = build_hybrid_message_representative(&big_context, message);
+        assert!(result.is_err(), "context > 255 bytes should return Err, not panic");
+
+        // Exactly 255 should still work
+        let max_context = vec![0x42u8; 255];
+        let result = build_hybrid_message_representative(&max_context, message);
+        assert!(result.is_ok(), "context of exactly 255 bytes should succeed");
+    }
+
+    #[test]
+    fn sign_v3_oversize_context_returns_error() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let big_context = vec![0x42u8; 256];
+        let result = HybridSignature::sign_v3(b"msg", &big_context, &ed_sk, &ml_sk);
+        assert!(result.is_err(), "sign_v3 with oversize context should return Err");
     }
 }
