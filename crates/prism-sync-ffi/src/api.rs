@@ -7,17 +7,17 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use prism_sync_core::bootstrap::sharing_trust::{
-    compute_sharing_fingerprint, evaluate_identity, TrustDecision,
+    compute_sharing_fingerprint, evaluate_identity_with_generation_floor,
+    GenerationAwareTrustDecision,
 };
 use prism_sync_core::bootstrap::{
     InitiatorCeremony, JoinerCeremony, PrekeyStore, RendezvousToken, SharingIdentityBundle,
     SharingRecipient, SharingSender,
 };
-use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::client::PrismSync;
-use prism_sync_core::pairing::models::{Invite, PairingResponse};
 use prism_sync_core::pairing::service::PairingService;
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
+use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
@@ -229,6 +229,7 @@ fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> Stri
         kind,
         status,
         code,
+        min_signature_version,
         remote_wipe,
         ..
     } = &error
@@ -241,6 +242,9 @@ fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> Stri
         if let Some(code) = code {
             payload["code"] = serde_json::json!(code);
         }
+        if let Some(min_signature_version) = min_signature_version {
+            payload["min_signature_version"] = serde_json::json!(min_signature_version);
+        }
         if let Some(remote_wipe) = remote_wipe {
             payload["remote_wipe"] = serde_json::json!(remote_wipe);
         }
@@ -249,6 +253,36 @@ fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> Stri
     }
 
     format!("{STRUCTURED_ERROR_PREFIX}{payload}")
+}
+
+async fn encode_handle_core_error(
+    handle: &PrismSyncHandle,
+    operation: &str,
+    error: prism_sync_core::CoreError,
+) -> String {
+    if let prism_sync_core::CoreError::Relay {
+        min_signature_version,
+        ..
+    } = &error
+    {
+        let _ = ratchet_handle_min_signature_version(handle, *min_signature_version).await;
+    }
+    encode_core_error(operation, error)
+}
+
+async fn format_handle_relay_error(
+    handle: &PrismSyncHandle,
+    operation: &str,
+    error: prism_sync_core::relay::traits::RelayError,
+) -> String {
+    if let prism_sync_core::relay::traits::RelayError::UpgradeRequired {
+        min_signature_version,
+        ..
+    } = &error
+    {
+        let _ = ratchet_handle_min_signature_version(handle, Some(*min_signature_version)).await;
+    }
+    format!("{operation} failed: {error}")
 }
 
 fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json::Value {
@@ -340,6 +374,8 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
 }
 
 const SHARING_ID_CACHE_KEY: &str = "sharing_id_cache";
+const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
+const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 const SHARING_ID_LEN_BYTES: usize = 16;
 const PAIRWISE_SECRET_LEN_BYTES: usize = 32;
 
@@ -424,11 +460,16 @@ fn parse_sharing_id_bytes(sharing_id: &str) -> Result<[u8; SHARING_ID_LEN_BYTES]
     Ok(bytes)
 }
 
-fn trust_decision_to_str(decision: TrustDecision) -> &'static str {
+fn generation_aware_trust_decision_to_str(
+    decision: &GenerationAwareTrustDecision,
+) -> Option<&'static str> {
     match decision {
-        TrustDecision::Accept => "accept",
-        TrustDecision::WarnKeyChange => "warn_key_change",
-        TrustDecision::BlockKeyChange => "block_key_change",
+        GenerationAwareTrustDecision::Accept => Some("accept"),
+        GenerationAwareTrustDecision::WarnKeyChange => Some("warn_key_change"),
+        GenerationAwareTrustDecision::BlockKeyChange => Some("block_key_change"),
+        GenerationAwareTrustDecision::RejectStaleGenerationReplay
+        | GenerationAwareTrustDecision::RejectSharingIdMismatch
+        | GenerationAwareTrustDecision::RejectMalformedIdentity => None,
     }
 }
 
@@ -442,6 +483,46 @@ fn decode_optional_utf8(store: &dyn PrismSecureStore, key: &str) -> Result<Optio
 
 fn require_secure_string(store: &dyn PrismSecureStore, key: &str) -> Result<String, String> {
     decode_optional_utf8(store, key)?.ok_or_else(|| format!("{key} not found in secure store"))
+}
+
+fn decode_optional_u8(store: &dyn PrismSecureStore, key: &str) -> Result<Option<u8>, String> {
+    decode_optional_utf8(store, key)?
+        .map(|value| {
+            value
+                .parse::<u8>()
+                .map_err(|e| format!("invalid integer in {key}: {e}"))
+        })
+        .transpose()
+}
+
+fn ratchet_min_signature_version(
+    store: &dyn PrismSecureStore,
+    observed: Option<u8>,
+) -> Result<(), String> {
+    let Some(observed) = observed else {
+        return Ok(());
+    };
+    let current = decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)?.unwrap_or(0);
+    if observed > current {
+        store
+            .set(
+                MIN_SIGNATURE_VERSION_FLOOR_KEY,
+                observed.to_string().as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn enforce_supported_signature_version_floor(store: &dyn PrismSecureStore) -> Result<(), String> {
+    if let Some(required) = decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)? {
+        if required > SUPPORTED_SIGNATURE_VERSION {
+            return Err(format!(
+                "relay requires signature version {required}, but this app supports up to {SUPPORTED_SIGNATURE_VERSION}. Please update."
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn cache_sharing_id(store: &dyn PrismSecureStore, sharing_id: &str) -> Result<(), String> {
@@ -467,6 +548,63 @@ fn validate_cached_sharing_id(
             ));
         }
     }
+    Ok(())
+}
+
+fn sharing_rotation_needed(store: &dyn PrismSecureStore, sharing_id: &str) -> Result<bool, String> {
+    if let Some(cached) = decode_optional_utf8(store, SHARING_ID_CACHE_KEY)? {
+        if cached != sharing_id {
+            return Err(format!(
+                "secure-store sharing state is bound to a different sharing_id: expected {sharing_id}, found {cached}"
+            ));
+        }
+        return Ok(true);
+    }
+
+    store
+        .get("sharing_prekey_store")
+        .map_err(|e| e.to_string())
+        .map(|value| value.is_some())
+}
+
+async fn republish_sharing_identity(
+    handle: &PrismSyncHandle,
+    sharing_id: &str,
+    identity_generation: u32,
+) -> Result<(), String> {
+    let context = build_sharing_context(handle).await?;
+    let sharing_id_bytes = parse_sharing_id_bytes(sharing_id)?;
+    validate_cached_sharing_id(context.secure_store.as_ref(), sharing_id)?;
+
+    PrekeyStore::clear_persisted(context.secure_store.as_ref()).map_err(|e| e.to_string())?;
+
+    let mut recipient = SharingRecipient::from_dek(
+        &context.dek,
+        sharing_id,
+        &sharing_id_bytes,
+        identity_generation,
+    )
+    .map_err(|e| e.to_string())?;
+
+    if let Err(error) = context
+        .relay
+        .publish_identity(sharing_id, &recipient.identity().to_bytes())
+        .await
+    {
+        return Err(format_handle_relay_error(handle, "publish_identity", error).await);
+    }
+
+    recipient
+        .ensure_prekey_fresh_and_persist(
+            context.relay.as_ref(),
+            context.secure_store.as_ref(),
+            &context.device_id,
+            now_unix_timestamp()?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    cache_sharing_id(context.secure_store.as_ref(), sharing_id)?;
     Ok(())
 }
 
@@ -558,6 +696,8 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
         )
     };
 
+    enforce_supported_signature_version_floor(secure_store.as_ref())?;
+
     let relay_url = decode_optional_utf8(secure_store.as_ref(), "relay_url")?
         .or(fallback_relay_url)
         .ok_or_else(|| "relay_url not configured".to_string())?;
@@ -586,6 +726,25 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
         dek,
         device_id,
     })
+}
+
+async fn enforce_handle_signature_version_floor(handle: &PrismSyncHandle) -> Result<(), String> {
+    let secure_store = {
+        let inner = handle.inner.lock().await;
+        inner.secure_store().clone()
+    };
+    enforce_supported_signature_version_floor(secure_store.as_ref())
+}
+
+async fn ratchet_handle_min_signature_version(
+    handle: &PrismSyncHandle,
+    observed: Option<u8>,
+) -> Result<(), String> {
+    let secure_store = match handle.inner.try_lock() {
+        Ok(inner) => inner.secure_store().clone(),
+        Err(_) => return Ok(()),
+    };
+    ratchet_min_signature_version(secure_store.as_ref(), observed)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -878,6 +1037,7 @@ pub async fn database_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
 /// If the secure store contains an `epoch` key, that value is used instead.
 pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
+    enforce_supported_signature_version_floor(inner.secure_store().as_ref())?;
 
     // Read credentials from secure store
     let sync_id = inner
@@ -923,7 +1083,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         })
     };
 
-    // Prefer relay_url from secure store (set by joinFromUrl / createSyncGroup)
+    // Prefer relay_url from secure store (set by pairing / createSyncGroup)
     // over handle.relay_url (set at handle creation, may be stale default).
     let relay_url = inner
         .secure_store()
@@ -970,12 +1130,45 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 /// The `old_password` parameter is accepted for API symmetry but is not
 /// used — `change_password` operates on the already-unlocked key hierarchy.
 /// The secret key is required to derive the new wrapping key.
+///
+/// Returns the next `identity_generation` value that the app should persist
+/// to synced settings. If local sharing is currently active, this also
+/// republishes the sharing identity and rotates the signed prekey under the
+/// incremented generation before re-wrapping the DEK.
 pub async fn change_password(
     handle: &PrismSyncHandle,
     _old_password: String,
     new_password: String,
     secret_key: Vec<u8>,
-) -> Result<(), String> {
+    sharing_id: Option<String>,
+    current_identity_generation: u32,
+) -> Result<u32, String> {
+    let next_identity_generation = current_identity_generation
+        .checked_add(1)
+        .ok_or_else(|| "identity_generation overflow".to_string())?;
+    let normalized_sharing_id = sharing_id.filter(|value| !value.is_empty());
+
+    let sharing_rotation_needed = {
+        let inner = handle.inner.lock().await;
+        let secure_store = inner.secure_store().clone();
+        if let Some(ref sharing_id) = normalized_sharing_id {
+            sharing_rotation_needed(secure_store.as_ref(), sharing_id)?
+        } else {
+            false
+        }
+    };
+
+    if sharing_rotation_needed {
+        republish_sharing_identity(
+            handle,
+            normalized_sharing_id
+                .as_deref()
+                .ok_or_else(|| "missing sharing_id for sharing rotation".to_string())?,
+            next_identity_generation,
+        )
+        .await?;
+    }
+
     let inner = handle.inner.lock().await;
     let (new_wrapped_dek, new_salt) = inner
         .key_hierarchy()
@@ -991,7 +1184,7 @@ pub async fn change_password(
         .set("dek_salt", &new_salt)
         .map_err(|e| format!("Failed to persist dek_salt: {e}"))?;
 
-    Ok(())
+    Ok(next_identity_generation)
 }
 
 // ── Mutation recording ──
@@ -1207,10 +1400,21 @@ pub async fn set_auto_sync(
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 pub async fn sync_now(handle: &PrismSyncHandle) -> Result<String, String> {
     let mut inner = handle.inner.lock().await;
-    let result = inner
-        .sync_now()
-        .await
-        .map_err(|e| encode_core_error("sync_now", e))?;
+    let secure_store = inner.secure_store().clone();
+    let result = match inner.sync_now().await {
+        Ok(result) => result,
+        Err(error) => {
+            if let prism_sync_core::CoreError::Relay {
+                min_signature_version,
+                ..
+            } = &error
+            {
+                let _ =
+                    ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
+            }
+            return Err(encode_core_error("sync_now", error));
+        }
+    };
     Ok(sync_result_to_json(&result).to_string())
 }
 
@@ -1439,20 +1643,19 @@ fn build_relay(
 
 /// Create a new sync group (first device).
 ///
-/// Returns JSON with `qr_payload` (byte array), `words` (string array),
-/// `url` (deep link string), `sync_id`, and `relay_url`.
+/// Returns JSON containing `sync_id` and `relay_url`.
 ///
 /// The relay is constructed internally from the handle's `relay_url`.
 /// A placeholder `sync_id` is used for the registration call because the
 /// real `sync_id` is generated inside `PairingService::create_sync_group`.
 /// The relay server must accept registration at any sync-group path.
-#[allow(deprecated)]
 pub async fn create_sync_group(
     handle: &PrismSyncHandle,
     password: String,
     relay_url: String,
     mnemonic: Option<String>,
 ) -> Result<String, String> {
+    enforce_handle_signature_version_floor(handle).await?;
     const PENDING_SYNC_ID_KEY: &str = "pending_sync_id";
     const PENDING_NONCE_RESPONSE_KEY: &str = "pending_registration_nonce_response";
     const PENDING_ADMISSION_PROOF_KEY: &str = "pending_first_device_admission_proof";
@@ -1520,7 +1723,8 @@ pub async fn create_sync_group(
     )?;
 
     let mut inner = handle.inner.lock().await;
-    let pairing = PairingService::new(relay, inner.secure_store().clone());
+    let secure_store = inner.secure_store().clone();
+    let pairing = PairingService::new(relay, secure_store.clone());
 
     let create_result = pairing
         .create_sync_group(
@@ -1545,7 +1749,20 @@ pub async fn create_sync_group(
         let _ = inner.secure_store().delete(key);
     }
 
-    let (creds, invite) = create_result.map_err(|e| encode_core_error("create_sync_group", e))?;
+    let (creds, response) = match create_result {
+        Ok(value) => value,
+        Err(error) => {
+            if let prism_sync_core::CoreError::Relay {
+                min_signature_version,
+                ..
+            } = &error
+            {
+                let _ =
+                    ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
+            }
+            return Err(encode_core_error("create_sync_group", error));
+        }
+    };
 
     // Persist registration token so it survives restarts and can be
     // included when approving pairing requests from new devices.
@@ -1577,51 +1794,23 @@ pub async fn create_sync_group(
         .map_err(|e| e.to_string())?;
 
     let result = serde_json::json!({
-        "qr_payload": invite.qr_payload(),
-        "words": invite.words(),
-        "url": invite.url(),
-        "sync_id": invite.response().sync_id,
-        "relay_url": invite.response().relay_url,
+        "sync_id": response.sync_id,
+        "relay_url": response.relay_url,
     });
 
     Ok(result.to_string())
 }
 
-/// Generate a pairing request for a new device wanting to join a sync group.
+/// Generate and persist a pending joiner identity for the relay ceremony.
 ///
-/// The joiner device calls this to create a PairingRequest containing its
-/// device identity. The request is encoded as a QR code payload and JSON
-/// for flexible transport.
-///
-/// Returns JSON: `{ "qr_payload": [...], "request_json": "...", "device_id": "..." }`
-#[allow(deprecated)]
-pub async fn generate_pairing_request(_handle: &PrismSyncHandle) -> Result<String, String> {
-    // Generate a fresh device identity for the joiner
+/// The joiner device uses the resulting device id and secret to start the
+/// rendezvous-token pairing flow. No compact QR payload or URL transport is
+/// produced here; the app now exchanges only the relay rendezvous token.
+pub async fn prepare_pending_device_identity(handle: &PrismSyncHandle) -> Result<String, String> {
     let device_secret = prism_sync_crypto::DeviceSecret::generate();
     let device_id = prism_sync_core::node_id::generate_node_id();
-    let signing_key = device_secret
-        .ed25519_keypair(&device_id)
-        .map_err(|e| format!("Key derivation failed: {e}"))?;
-    let exchange_key = device_secret
-        .x25519_keypair(&device_id)
-        .map_err(|e| format!("Key derivation failed: {e}"))?;
 
-    let request = prism_sync_core::pairing::models::PairingRequest {
-        device_id: device_id.clone(),
-        ed25519_public_key: signing_key.public_key_bytes().to_vec(),
-        x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-    };
-
-    let qr_payload = request
-        .to_compact_bytes()
-        .ok_or("Failed to encode pairing request")?;
-    let request_json = serde_json::to_string(&request)
-        .map_err(|e| format!("Failed to serialize pairing request: {e}"))?;
-
-    // Persist the device secret so that complete_join can use it later.
-    // The handle is not locked here because we only need to stash the
-    // pre-generated identity for the join step.
-    let handle_inner = _handle.inner.lock().await;
+    let handle_inner = handle.inner.lock().await;
     let store = handle_inner.secure_store();
     store
         .set("pending_device_secret", device_secret.as_bytes())
@@ -1630,370 +1819,9 @@ pub async fn generate_pairing_request(_handle: &PrismSyncHandle) -> Result<Strin
         .set("pending_device_id", device_id.as_bytes())
         .map_err(|e| format!("Failed to persist pending device id: {e}"))?;
 
-    let result = serde_json::json!({
-        "qr_payload": qr_payload,
-        "request_json": request_json,
-        "device_id": device_id,
-    });
-
-    Ok(result.to_string())
+    Ok(device_id)
 }
 
-/// Approve a pairing request from a joining device.
-///
-/// Called by an existing trusted device after scanning a joiner's QR code.
-/// Reads the current sync group credentials from SecureStore, builds a
-/// PairingResponse targeting the joiner's device, and returns it for
-/// transport back to the joiner (e.g. via QR, NFC, or paste).
-///
-/// Accepts the pairing request as either compact bytes (from QR scan) or JSON.
-///
-/// Returns JSON: `{ "qr_payload": [...], "response_json": "...", "url": "..." }`
-#[allow(deprecated)]
-pub async fn approve_pairing_request(
-    handle: &PrismSyncHandle,
-    request_bytes: Option<Vec<u8>>,
-    request_json: Option<String>,
-) -> Result<String, String> {
-    // Parse the PairingRequest from whichever format was provided
-    let request = if let Some(bytes) = request_bytes {
-        prism_sync_core::pairing::models::PairingRequest::from_compact_bytes(&bytes)
-            .ok_or("Failed to parse pairing request QR payload")?
-    } else if let Some(json) = request_json {
-        serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to parse pairing request JSON: {e}"))?
-    } else {
-        return Err("Either request_bytes or request_json must be provided".into());
-    };
-
-    let inner = handle.inner.lock().await;
-    let store = inner.secure_store();
-
-    // Read existing credentials from SecureStore (same as create_invite)
-    let sync_id = store
-        .get("sync_id")
-        .map_err(|e| e.to_string())?
-        .map(|b| String::from_utf8(b).unwrap_or_default())
-        .ok_or("No sync_id — set up sync first")?;
-    let relay_url = store
-        .get("relay_url")
-        .map_err(|e| e.to_string())?
-        .map(|b| String::from_utf8(b).unwrap_or_default())
-        .ok_or("No relay_url — set up sync first")?;
-    let mnemonic = store
-        .get("mnemonic")
-        .map_err(|e| e.to_string())?
-        .map(|b| String::from_utf8(b).unwrap_or_default())
-        .ok_or("No mnemonic — set up sync first")?;
-    let wrapped_dek = store
-        .get("wrapped_dek")
-        .map_err(|e| e.to_string())?
-        .ok_or("No wrapped_dek — set up sync first")?;
-    let salt = store
-        .get("dek_salt")
-        .map_err(|e| e.to_string())?
-        .ok_or("No salt — set up sync first")?;
-    let device_id = store
-        .get("device_id")
-        .map_err(|e| e.to_string())?
-        .map(|b| String::from_utf8(b).unwrap_or_default())
-        .ok_or("No device_id — set up sync first")?;
-    let device_secret_bytes = store
-        .get("device_secret")
-        .map_err(|e| e.to_string())?
-        .ok_or("No device_secret — set up sync first")?;
-
-    let device_secret = prism_sync_crypto::DeviceSecret::from_bytes(device_secret_bytes)
-        .map_err(|e| format!("Invalid device secret: {e}"))?;
-    let signing_key = device_secret
-        .ed25519_keypair(&device_id)
-        .map_err(|e| format!("Key derivation failed: {e}"))?;
-    let exchange_key = device_secret
-        .x25519_keypair(&device_id)
-        .map_err(|e| format!("Key derivation failed: {e}"))?;
-    let pq_signing_key = device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .map_err(|e| format!("Key derivation failed: {e}"))?;
-    let pq_kem_key = device_secret
-        .ml_kem_768_keypair(&device_id)
-        .map_err(|e| format!("Key derivation failed: {e}"))?;
-
-    // Use the joiner's device_id from their PairingRequest
-    let joiner_device_id = request.device_id.clone();
-
-    // Read epoch state
-    let epoch: i32 = inner
-        .epoch()
-        .ok_or("Cannot approve: sync engine not configured (epoch unknown)".to_string())?;
-    let epoch_key_data: Vec<u8> = if epoch > 0 {
-        inner
-            .key_hierarchy()
-            .epoch_key(epoch as u32)
-            .map(|k| k.to_vec())
-            .map_err(|_| format!("Cannot approve: missing epoch {epoch} key"))?
-    } else {
-        vec![]
-    };
-
-    // Sign the invitation
-    let signing_data = prism_sync_core::pairing::models::build_invitation_signing_data(
-        &sync_id,
-        &relay_url,
-        &wrapped_dek,
-        &salt,
-        &device_id,
-        &signing_key.public_key_bytes(),
-        Some(joiner_device_id.as_str()),
-        epoch as u32,
-        &epoch_key_data,
-    );
-    let signature = signing_key.sign(&signing_data);
-
-    let mut registry_entries: Vec<prism_sync_core::pairing::models::RegistrySnapshotEntry> = inner
-        .storage()
-        .list_device_records(&sync_id)
-        .map_err(|e| format!("Failed to read local device registry: {e}"))?
-        .into_iter()
-        .map(
-            |device| prism_sync_core::pairing::models::RegistrySnapshotEntry {
-                sync_id: device.sync_id,
-                device_id: device.device_id,
-                ed25519_public_key: device.ed25519_public_key,
-                x25519_public_key: device.x25519_public_key,
-                ml_dsa_65_public_key: device.ml_dsa_65_public_key,
-                ml_kem_768_public_key: device.ml_kem_768_public_key,
-                status: device.status,
-            },
-        )
-        .collect();
-    registry_entries
-        .retain(|entry| entry.device_id != device_id && entry.device_id != joiner_device_id);
-    registry_entries.push(prism_sync_core::pairing::models::RegistrySnapshotEntry {
-        sync_id: sync_id.clone(),
-        device_id: device_id.clone(),
-        ed25519_public_key: signing_key.public_key_bytes().to_vec(),
-        x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-        ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
-        ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-        status: "active".into(),
-    });
-    registry_entries.push(prism_sync_core::pairing::models::RegistrySnapshotEntry {
-        sync_id: sync_id.clone(),
-        device_id: joiner_device_id.clone(),
-        ed25519_public_key: request.ed25519_public_key.clone(),
-        x25519_public_key: request.x25519_public_key.clone(),
-        // Deprecated compact QR requests do not carry PQ joiner keys.
-        ml_dsa_65_public_key: Vec::new(),
-        ml_kem_768_public_key: Vec::new(),
-        status: "active".into(),
-    });
-
-    // Build signed registry snapshot for current membership plus the approved joiner.
-    let registry_snapshot =
-        prism_sync_core::pairing::models::SignedRegistrySnapshot::new(registry_entries);
-    let signed_keyring = registry_snapshot.sign(&signing_key);
-    let approval_signature = signing_key.sign(
-        &prism_sync_core::pairing::models::build_registry_approval_signing_data(
-            &sync_id,
-            &device_id,
-            &signed_keyring,
-        ),
-    );
-
-    // Read registration token so the joiner can authenticate with the relay
-    let registration_token = store
-        .get("registration_token")
-        .map_err(|e| e.to_string())?
-        .and_then(|b| String::from_utf8(b).ok());
-
-    // Build PairingResponse
-    let response = prism_sync_core::pairing::models::PairingResponse {
-        relay_url: relay_url.clone(),
-        sync_id: sync_id.clone(),
-        mnemonic,
-        wrapped_dek: wrapped_dek.to_vec(),
-        salt: salt.to_vec(),
-        signed_invitation: prism_sync_crypto::hex::encode(&signature),
-        signed_keyring,
-        inviter_device_id: device_id,
-        inviter_ed25519_pk: signing_key.public_key_bytes().to_vec(),
-        // Deprecated compact approvals still use the legacy invitation format.
-        inviter_ml_dsa_65_pk: Vec::new(),
-        joiner_device_id: Some(joiner_device_id),
-        current_epoch: epoch as u32,
-        epoch_key: epoch_key_data,
-        registry_approval_signature: Some(prism_sync_crypto::hex::encode(&approval_signature)),
-        registration_token,
-    };
-
-    let invite = prism_sync_core::pairing::models::Invite::new(response);
-
-    let result = serde_json::json!({
-        "qr_payload": invite.qr_payload(),
-        "response_json": serde_json::to_string(invite.response()).unwrap_or_default(),
-        "url": invite.url(),
-        "sync_id": sync_id,
-        "relay_url": relay_url,
-    });
-
-    Ok(result.to_string())
-}
-
-/// Join an existing sync group from QR payload bytes.
-///
-/// The relay is constructed on the Rust side from the invite's `relay_url`.
-#[allow(deprecated)]
-pub async fn join_from_qr(
-    handle: &PrismSyncHandle,
-    qr_bytes: Vec<u8>,
-    password: String,
-) -> Result<(), String> {
-    let invite = Invite::from_qr_payload(&qr_bytes)
-        .ok_or_else(|| "Failed to parse QR payload".to_string())?;
-    join_with_response(handle, invite.response(), &password).await
-}
-
-/// Join an existing sync group from a deep link URL.
-///
-/// The relay is constructed on the Rust side from the invite's `relay_url`.
-#[allow(deprecated)]
-pub async fn join_from_url(
-    handle: &PrismSyncHandle,
-    url: String,
-    password: String,
-) -> Result<(), String> {
-    let invite = Invite::from_url(&url).ok_or_else(|| "Failed to parse invite URL".to_string())?;
-    join_with_response(handle, invite.response(), &password).await
-}
-
-/// Join from a raw PairingResponse JSON string.
-///
-/// This is the most flexible join method — use it when you have the full
-/// pairing response (e.g. from a word-list lookup or manual entry).
-/// The relay is constructed on the Rust side from the response's `relay_url`.
-pub async fn join_from_response_json(
-    handle: &PrismSyncHandle,
-    response_json: String,
-    password: String,
-) -> Result<(), String> {
-    let response: PairingResponse = serde_json::from_str(&response_json)
-        .map_err(|e| format!("Failed to parse PairingResponse JSON: {e}"))?;
-    join_with_response(handle, &response, &password).await
-}
-
-/// Internal helper for all join flows.
-///
-/// Constructs a `ServerRelay` from the pairing response's `relay_url` and
-/// `sync_id`, then delegates to `PairingService::join_sync_group`.
-async fn join_with_response(
-    handle: &PrismSyncHandle,
-    response: &PairingResponse,
-    password: &str,
-) -> Result<(), String> {
-    let relay = build_relay(
-        &response.relay_url,
-        &response.sync_id,
-        "pending", // device_id not known yet — generated by PairingService
-        "",        // no session token yet
-        None,
-        handle.allow_insecure,
-        response.registration_token.clone(),
-    )?;
-
-    let mut inner = handle.inner.lock().await;
-    let pairing = PairingService::new(relay, inner.secure_store().clone());
-
-    let (key_hierarchy, registry_snapshot) = pairing
-        .join_sync_group(response, password)
-        .await
-        .map_err(|e| encode_core_error("join_sync_group", e))?;
-
-    DeviceRegistryManager::import_keyring(
-        inner.storage().as_ref(),
-        &response.sync_id,
-        &registry_snapshot.to_device_records(),
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Restore the unlocked key hierarchy and device secret into the handle
-    // so subsequent calls (configureEngine, exportDek, etc.) work.
-    let dek = key_hierarchy.dek().map_err(|e| e.to_string())?;
-    let device_secret_bytes = inner
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?
-        .ok_or("device_secret not found after join")?;
-    inner
-        .restore_runtime_keys(dek, &device_secret_bytes)
-        .map_err(|e| e.to_string())?;
-
-    // Restore epoch keys that were stored during join into the live handle's
-    // key hierarchy so configureEngine / bootstrapFromSnapshot / syncNow see them.
-    let epoch_val = inner
-        .secure_store()
-        .get("epoch")
-        .ok()
-        .flatten()
-        .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    if epoch_val > 0 {
-        let key_name = format!("epoch_key_{}", epoch_val);
-        match inner.secure_store().get(&key_name) {
-            Ok(Some(stored)) => {
-                use base64::{engine::general_purpose::STANDARD, Engine};
-                match STANDARD.decode(&stored) {
-                    Ok(decoded) if decoded.len() == 32 => {
-                        inner
-                            .key_hierarchy_mut()
-                            .store_epoch_key(epoch_val, zeroize::Zeroizing::new(decoded));
-                    }
-                    Ok(decoded) => {
-                        return Err(format!(
-                            "epoch_key_{} has wrong length ({}, expected 32) — device cannot decrypt at epoch {}",
-                            epoch_val, decoded.len(), epoch_val,
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "epoch_key_{} base64 decode failed: {e} — device cannot decrypt at epoch {}",
-                            epoch_val, epoch_val,
-                        ));
-                    }
-                }
-            }
-            Ok(None) => {
-                return Err(format!(
-                    "epoch_key_{} not found in secure store — device cannot decrypt at epoch {}",
-                    epoch_val, epoch_val,
-                ));
-            }
-            Err(e) => {
-                return Err(format!("Failed to read epoch_key_{}: {e}", epoch_val,));
-            }
-        }
-    }
-
-    // Persist registration token from the invite so this device can
-    // include it when approving future pairing requests.
-    if let Some(ref token) = response.registration_token {
-        inner
-            .secure_store()
-            .set("registration_token", token.as_bytes())
-            .map_err(|e| e.to_string())?;
-    }
-
-    inner
-        .secure_store()
-        .delete("pending_device_secret")
-        .map_err(|e| e.to_string())?;
-    inner
-        .secure_store()
-        .delete("pending_device_id")
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
 
 // ── Device management ──
 
@@ -2009,6 +1837,7 @@ pub async fn list_devices(
     device_id: String,
     session_token: String,
 ) -> Result<String, String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let device_secret = handle
         .inner
         .lock()
@@ -2026,10 +1855,10 @@ pub async fn list_devices(
         None,
     )?;
 
-    let devices = relay
-        .list_devices()
-        .await
-        .map_err(|e| format!("list_devices failed: {e}"))?;
+    let devices = match relay.list_devices().await {
+        Ok(devices) => devices,
+        Err(error) => return Err(format_handle_relay_error(handle, "list_devices", error).await),
+    };
 
     let json: Vec<serde_json::Value> = devices.iter().map(device_info_to_json).collect();
     serde_json::to_string(&json).map_err(|e| format!("JSON serialization failed: {e}"))
@@ -2046,6 +1875,7 @@ pub async fn revoke_device(
     session_token: String,
     target_device_id: String,
 ) -> Result<(), String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let device_secret = handle
         .inner
         .lock()
@@ -2063,15 +1893,17 @@ pub async fn revoke_device(
         None,
     )?;
     let mut inner = handle.inner.lock().await;
-    inner
+    match inner
         .revoke_and_rekey(
             relay as std::sync::Arc<dyn prism_sync_core::relay::SyncRelay>,
             &target_device_id,
             false,
         )
         .await
-        .map(|_| ())
-        .map_err(|e| format!("revoke_device failed: {e}"))
+    {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("revoke_device failed: {error}")),
+    }
 }
 
 /// Revoke a device and perform epoch key rotation.
@@ -2093,6 +1925,7 @@ pub async fn revoke_and_rekey(
     target_device_id: String,
     remote_wipe: bool,
 ) -> Result<u32, String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let device_secret = handle
         .inner
         .lock()
@@ -2110,14 +1943,17 @@ pub async fn revoke_and_rekey(
         None,
     )?;
     let mut inner = handle.inner.lock().await;
-    inner
+    match inner
         .revoke_and_rekey(
             relay as std::sync::Arc<dyn prism_sync_core::relay::SyncRelay>,
             &target_device_id,
             remote_wipe,
         )
         .await
-        .map_err(|e| format!("revoke_and_rekey failed: {e}"))
+    {
+        Ok(epoch) => Ok(epoch),
+        Err(error) => Err(format!("revoke_and_rekey failed: {error}")),
+    }
 }
 
 /// Deprecated: wipe status is now embedded in the 401 response from the relay.
@@ -2157,6 +1993,7 @@ pub async fn deregister_device(
     device_id: String,
     session_token: String,
 ) -> Result<(), String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let device_secret = handle
         .inner
         .lock()
@@ -2173,10 +2010,10 @@ pub async fn deregister_device(
         handle.allow_insecure,
         None,
     )?;
-    relay
-        .deregister()
-        .await
-        .map_err(|e| format!("deregister failed: {e}"))
+    match relay.deregister().await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format_handle_relay_error(handle, "deregister", error).await),
+    }
 }
 
 /// Delete the entire sync group and all data on the relay.
@@ -2189,6 +2026,7 @@ pub async fn delete_sync_group(
     device_id: String,
     session_token: String,
 ) -> Result<(), String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let device_secret = handle
         .inner
         .lock()
@@ -2205,10 +2043,10 @@ pub async fn delete_sync_group(
         handle.allow_insecure,
         None,
     )?;
-    relay
-        .delete_sync_group()
-        .await
-        .map_err(|e| format!("delete_sync_group failed: {e}"))
+    match relay.delete_sync_group().await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format_handle_relay_error(handle, "delete_sync_group", error).await),
+    }
 }
 
 // ── Device info ──
@@ -2300,6 +2138,7 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         "registration_token",
         "sharing_prekey_store",
         "sharing_id_cache",
+        "min_signature_version_floor",
     ];
     let mut entries = serde_json::Map::new();
     for key in known_keys {
@@ -2330,6 +2169,7 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
 pub async fn sharing_enable(
     handle: &PrismSyncHandle,
     current_sharing_id: Option<String>,
+    identity_generation: u32,
 ) -> Result<String, String> {
     let context = build_sharing_context(handle).await?;
 
@@ -2352,16 +2192,18 @@ pub async fn sharing_enable(
         &context.dek,
         &sharing_id,
         &sharing_id_bytes,
-        0,
+        identity_generation,
         context.secure_store.as_ref(),
     )
     .map_err(|e| e.to_string())?;
 
-    context
+    if let Err(error) = context
         .relay
         .publish_identity(&sharing_id, &recipient.identity().to_bytes())
         .await
-        .map_err(|e| format!("publish_identity failed: {e}"))?;
+    {
+        return Err(format_handle_relay_error(handle, "publish_identity", error).await);
+    }
 
     recipient
         .ensure_prekey_fresh_and_persist(
@@ -2383,11 +2225,9 @@ pub async fn sharing_disable(handle: &PrismSyncHandle, sharing_id: String) -> Re
     let context = build_sharing_context(handle).await?;
     validate_cached_sharing_id(context.secure_store.as_ref(), &sharing_id)?;
 
-    context
-        .relay
-        .remove_identity()
-        .await
-        .map_err(|e| format!("remove_identity failed: {e}"))?;
+    if let Err(error) = context.relay.remove_identity().await {
+        return Err(format_handle_relay_error(handle, "remove_identity", error).await);
+    }
 
     PrekeyStore::clear_persisted(context.secure_store.as_ref()).map_err(|e| e.to_string())?;
     clear_sharing_id_cache(context.secure_store.as_ref())?;
@@ -2398,6 +2238,7 @@ pub async fn sharing_disable(handle: &PrismSyncHandle, sharing_id: String) -> Re
 pub async fn sharing_ensure_prekey(
     handle: &PrismSyncHandle,
     sharing_id: String,
+    identity_generation: u32,
 ) -> Result<(), String> {
     let context = build_sharing_context(handle).await?;
     let sharing_id_bytes = parse_sharing_id_bytes(&sharing_id)?;
@@ -2407,7 +2248,7 @@ pub async fn sharing_ensure_prekey(
         &context.dek,
         &sharing_id,
         &sharing_id_bytes,
-        0,
+        identity_generation,
         context.secure_store.as_ref(),
     )
     .map_err(|e| e.to_string())?;
@@ -2430,6 +2271,7 @@ pub async fn sharing_ensure_prekey(
 pub async fn sharing_initiate(
     handle: &PrismSyncHandle,
     sender_sharing_id: String,
+    identity_generation: u32,
     recipient_sharing_id: String,
     display_name: String,
     offered_scopes: String,
@@ -2443,7 +2285,7 @@ pub async fn sharing_initiate(
         &context.dek,
         &sender_sharing_id,
         &sender_sharing_id_bytes,
-        0,
+        identity_generation,
     )
     .map_err(|e| e.to_string())?;
     let offered_scopes = parse_string_array_json(&offered_scopes, "offered_scopes")?;
@@ -2479,6 +2321,7 @@ pub async fn sharing_initiate(
 pub async fn sharing_process_pending(
     handle: &PrismSyncHandle,
     recipient_sharing_id: String,
+    identity_generation: u32,
     existing_relationships_json: String,
     seen_init_ids_json: String,
 ) -> Result<String, String> {
@@ -2490,16 +2333,17 @@ pub async fn sharing_process_pending(
         &context.dek,
         &recipient_sharing_id,
         &recipient_sharing_id_bytes,
-        0,
+        identity_generation,
         context.secure_store.as_ref(),
     )
     .map_err(|e| e.to_string())?;
 
-    let pending = context
-        .relay
-        .fetch_pending_inits()
-        .await
-        .map_err(|e| format!("fetch_pending_inits failed: {e}"))?;
+    let pending = match context.relay.fetch_pending_inits().await {
+        Ok(pending) => pending,
+        Err(error) => {
+            return Err(format_handle_relay_error(handle, "fetch_pending_inits", error).await);
+        }
+    };
 
     let inputs = parse_sharing_process_pending_inputs(&existing_relationships_json)?;
     let mut existing_relationships = inputs.existing_relationships;
@@ -2537,45 +2381,85 @@ pub async fn sharing_process_pending(
                         )),
                     }
                 } else {
-                    let trust_decision = evaluate_identity(
-                        inputs
-                            .pinned_identities
-                            .get(&processed.sender_identity.sharing_id)
-                            .map(Vec::as_slice),
+                    let pinned_identity = inputs
+                        .pinned_identities
+                        .get(&processed.sender_identity.sharing_id)
+                        .map(Vec::as_slice);
+                    let highest_generation = pinned_identity
+                        .and_then(SharingIdentityBundle::parse_metadata)
+                        .map(|metadata| metadata.identity_generation);
+                    let trust_decision = evaluate_identity_with_generation_floor(
+                        pinned_identity,
                         &sender_identity_bytes,
+                        &processed.sender_identity.sharing_id,
+                        highest_generation,
                         inputs
                             .verified_peers
                             .get(&processed.sender_identity.sharing_id)
                             .copied()
                             .unwrap_or(false),
                     );
-                    let status = trust_decision_to_str(trust_decision).to_string();
-                    let fingerprint = compute_sharing_fingerprint(
-                        &processed.sender_identity.sharing_id,
-                        processed.sender_identity.identity_generation,
-                        &processed.sender_identity.ed25519_public_key,
-                        &processed.sender_identity.ml_dsa_65_public_key,
-                    );
+                    if let Some(status) = generation_aware_trust_decision_to_str(&trust_decision) {
+                        let status = status.to_string();
+                        let fingerprint = compute_sharing_fingerprint(
+                            &processed.sender_identity.sharing_id,
+                            processed.sender_identity.identity_generation,
+                            &processed.sender_identity.ed25519_public_key,
+                            &processed.sender_identity.ml_dsa_65_public_key,
+                        );
 
-                    existing_relationships.push(processed.sender_identity.sharing_id.clone());
+                        existing_relationships.push(processed.sender_identity.sharing_id.clone());
 
-                    SharingPendingResultJson {
-                        status: status.clone(),
-                        init_id: processed.init_id,
-                        sender_sharing_id: processed.sender_identity.sharing_id.clone(),
-                        display_name: Some(processed.display_name),
-                        offered_scopes: Some(processed.offered_scopes),
-                        pairwise_secret_b64: Some(BASE64.encode(&processed.pairwise_secret[..])),
-                        pairwise_secret_hex: Some(prism_sync_crypto::hex::encode(
-                            processed.pairwise_secret.as_ref(),
-                        )),
-                        sender_identity_b64: Some(BASE64.encode(&sender_identity_bytes)),
-                        sender_identity_hex: Some(prism_sync_crypto::hex::encode(
-                            &sender_identity_bytes,
-                        )),
-                        fingerprint: Some(fingerprint),
-                        trust_decision: Some(status),
-                        error: None,
+                        SharingPendingResultJson {
+                            status: status.clone(),
+                            init_id: processed.init_id,
+                            sender_sharing_id: processed.sender_identity.sharing_id.clone(),
+                            display_name: Some(processed.display_name),
+                            offered_scopes: Some(processed.offered_scopes),
+                            pairwise_secret_b64: Some(
+                                BASE64.encode(&processed.pairwise_secret[..]),
+                            ),
+                            pairwise_secret_hex: Some(prism_sync_crypto::hex::encode(
+                                processed.pairwise_secret.as_ref(),
+                            )),
+                            sender_identity_b64: Some(BASE64.encode(&sender_identity_bytes)),
+                            sender_identity_hex: Some(prism_sync_crypto::hex::encode(
+                                &sender_identity_bytes,
+                            )),
+                            fingerprint: Some(fingerprint),
+                            trust_decision: Some(status),
+                            error: None,
+                        }
+                    } else {
+                        SharingPendingResultJson {
+                            status: "error".to_string(),
+                            init_id: processed.init_id,
+                            sender_sharing_id: processed.sender_identity.sharing_id,
+                            display_name: None,
+                            offered_scopes: None,
+                            pairwise_secret_b64: None,
+                            pairwise_secret_hex: None,
+                            sender_identity_b64: None,
+                            sender_identity_hex: None,
+                            fingerprint: None,
+                            trust_decision: None,
+                            error: Some(match trust_decision {
+                                GenerationAwareTrustDecision::RejectStaleGenerationReplay => {
+                                    format!(
+                                        "stale identity generation replay: highest accepted={}, received={}",
+                                        highest_generation.unwrap_or_default(),
+                                        processed.sender_identity.identity_generation
+                                    )
+                                }
+                                GenerationAwareTrustDecision::RejectSharingIdMismatch => {
+                                    "signed identity claims unexpected sharing_id".to_string()
+                                }
+                                GenerationAwareTrustDecision::RejectMalformedIdentity => {
+                                    "invalid sharing identity bundle".to_string()
+                                }
+                                _ => "unexpected trust-evaluation rejection".to_string(),
+                            }),
+                        }
                     }
                 }
             }
@@ -2790,6 +2674,7 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
 /// The `JoinerCeremony` state is stored in the handle for subsequent calls
 /// to [`get_joiner_sas`] and [`complete_joiner_ceremony`].
 pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     let inner = handle.inner.lock().await;
@@ -2809,10 +2694,17 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
     );
     drop(inner);
 
-    let (ceremony, token) = pairing
+    let (ceremony, token) = match pairing
         .start_bootstrap_pairing(&pairing_relay, &handle.relay_url)
         .await
-        .map_err(|e| encode_core_error("start_bootstrap_pairing", e))?;
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(
+                encode_handle_core_error(handle, "start_bootstrap_pairing", error).await,
+            );
+        }
+    };
 
     let device_id = ceremony.device_id().to_string();
 
@@ -2850,7 +2742,9 @@ pub async fn get_joiner_sas(handle: &PrismSyncHandle) -> Result<String, String> 
         .lock()
         .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
         .take()
-        .ok_or_else(|| "no joiner ceremony in progress — call start_joiner_ceremony first".to_string())?;
+        .ok_or_else(|| {
+            "no joiner ceremony in progress — call start_joiner_ceremony first".to_string()
+        })?;
 
     // Poll for the PairingInit slot
     use prism_sync_core::relay::PairingSlot;
@@ -2860,9 +2754,12 @@ pub async fn get_joiner_sas(handle: &PrismSyncHandle) -> Result<String, String> 
         .map_err(|e| format!("failed waiting for PairingInit: {e}"))?;
 
     // Process the init to derive SAS
-    let sas = ceremony
-        .process_pairing_init(&init_bytes)
-        .map_err(|e| encode_core_error("process_pairing_init", e))?;
+    let sas = match ceremony.process_pairing_init(&init_bytes) {
+        Ok(sas) => sas,
+        Err(error) => {
+            return Err(encode_handle_core_error(handle, "process_pairing_init", error).await);
+        }
+    };
 
     // Put ceremony back
     handle
@@ -2893,6 +2790,7 @@ pub async fn complete_joiner_ceremony(
     handle: &PrismSyncHandle,
     password: String,
 ) -> Result<String, String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     // Take the ceremony out — it won't be needed again after completion
@@ -2920,10 +2818,17 @@ pub async fn complete_joiner_ceremony(
 
     // complete_bootstrap_join handles: confirmation MAC, wait for credentials,
     // decrypt, register, persist, post joiner bundle
-    let (key_hierarchy, registry_snapshot) = pairing
+    let (key_hierarchy, registry_snapshot) = match pairing
         .complete_bootstrap_join(&ceremony, &pairing_relay, &[], &password)
         .await
-        .map_err(|e| encode_core_error("complete_bootstrap_join", e))?;
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(
+                encode_handle_core_error(handle, "complete_bootstrap_join", error).await,
+            );
+        }
+    };
 
     // Read sync_id from secure store (persisted by complete_bootstrap_join)
     let mut inner = handle.inner.lock().await;
@@ -2965,33 +2870,25 @@ pub async fn complete_joiner_ceremony(
     if epoch_val > 0 {
         let key_name = format!("epoch_key_{}", epoch_val);
         match inner.secure_store().get(&key_name) {
-            Ok(Some(stored)) => {
-                match BASE64.decode(&stored) {
-                    Ok(decoded) if decoded.len() == 32 => {
-                        inner
-                            .key_hierarchy_mut()
-                            .store_epoch_key(epoch_val, zeroize::Zeroizing::new(decoded));
-                    }
-                    Ok(decoded) => {
-                        return Err(format!(
-                            "epoch_key_{} has wrong length ({}, expected 32)",
-                            epoch_val,
-                            decoded.len(),
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "epoch_key_{} base64 decode failed: {e}",
-                            epoch_val,
-                        ));
-                    }
+            Ok(Some(stored)) => match BASE64.decode(&stored) {
+                Ok(decoded) if decoded.len() == 32 => {
+                    inner
+                        .key_hierarchy_mut()
+                        .store_epoch_key(epoch_val, zeroize::Zeroizing::new(decoded));
                 }
-            }
+                Ok(decoded) => {
+                    return Err(format!(
+                        "epoch_key_{} has wrong length ({}, expected 32)",
+                        epoch_val,
+                        decoded.len(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("epoch_key_{} base64 decode failed: {e}", epoch_val,));
+                }
+            },
             Ok(None) => {
-                return Err(format!(
-                    "epoch_key_{} not found in secure store",
-                    epoch_val,
-                ));
+                return Err(format!("epoch_key_{} not found in secure store", epoch_val,));
             }
             Err(e) => {
                 return Err(format!("Failed to read epoch_key_{}: {e}", epoch_val));
@@ -3019,6 +2916,7 @@ pub async fn start_initiator_ceremony(
     handle: &PrismSyncHandle,
     token_bytes: Vec<u8>,
 ) -> Result<String, String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let token = RendezvousToken::from_bytes(&token_bytes)
         .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
 
@@ -3062,10 +2960,14 @@ pub async fn start_initiator_ceremony(
     )?;
 
     let pairing = PairingService::new(relay, secure_store);
-    let (ceremony, sas) = pairing
-        .start_bootstrap_initiator(token, &pairing_relay)
-        .await
-        .map_err(|e| encode_core_error("start_bootstrap_initiator", e))?;
+    let (ceremony, sas) = match pairing.start_bootstrap_initiator(token, &pairing_relay).await {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(
+                encode_handle_core_error(handle, "start_bootstrap_initiator", error).await,
+            );
+        }
+    };
 
     // Store ceremony state for complete_initiator_ceremony
     handle
@@ -3091,6 +2993,7 @@ pub async fn complete_initiator_ceremony(
     handle: &PrismSyncHandle,
     password: String,
 ) -> Result<String, String> {
+    enforce_handle_signature_version_floor(handle).await?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     // Take the ceremony out — it won't be needed again after completion
@@ -3141,10 +3044,12 @@ pub async fn complete_initiator_ceremony(
     )?;
 
     let pairing = PairingService::new(relay, secure_store);
-    pairing
+    if let Err(error) = pairing
         .complete_bootstrap_initiator(&ceremony, &pairing_relay, &password)
         .await
-        .map_err(|e| encode_core_error("complete_bootstrap_initiator", e))?;
+    {
+        return Err(encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await);
+    }
 
     // Drain the store so Dart can pick up any updated values
     // (epoch keys, registration token, etc.)
@@ -3178,6 +3083,7 @@ async fn poll_pairing_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_sync_core::secure_store::SecureStore;
 
     #[test]
     fn decode_binary_string_accepts_hex_and_base64() {
@@ -3260,6 +3166,45 @@ mod tests {
         let fingerprint = sharing_fingerprint(identity_b64).unwrap();
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sharing_rotation_needed_requires_matching_cached_identity() {
+        let store = MemorySecureStore::new();
+        store
+            .set(SHARING_ID_CACHE_KEY, b"feedfacefeedfacefeedfacefeedface")
+            .unwrap();
+
+        let err = sharing_rotation_needed(&store, "deadbeefdeadbeefdeadbeefdeadbeef").unwrap_err();
+        assert!(err.contains("bound to a different sharing_id"));
+    }
+
+    #[test]
+    fn sharing_rotation_needed_detects_cached_active_sharing() {
+        let store = MemorySecureStore::new();
+        let sharing_id = "feedfacefeedfacefeedfacefeedface";
+        store
+            .set(SHARING_ID_CACHE_KEY, sharing_id.as_bytes())
+            .unwrap();
+
+        assert!(sharing_rotation_needed(&store, sharing_id).unwrap());
+    }
+
+    #[test]
+    fn sharing_rotation_needed_detects_persisted_prekey_state_without_cache() {
+        let store = MemorySecureStore::new();
+        store
+            .set("sharing_prekey_store", br#"{"current":null,"previous":[]}"#)
+            .unwrap();
+
+        assert!(sharing_rotation_needed(&store, "feedfacefeedfacefeedfacefeedface").unwrap());
+    }
+
+    #[test]
+    fn sharing_rotation_needed_false_when_local_sharing_is_disabled() {
+        let store = MemorySecureStore::new();
+
+        assert!(!sharing_rotation_needed(&store, "feedfacefeedfacefeedfacefeedface").unwrap());
     }
 
     #[test]

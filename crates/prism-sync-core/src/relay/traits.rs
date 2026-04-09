@@ -22,6 +22,14 @@ pub enum RelayError {
     #[error("auth error: {message}")]
     Auth { message: String },
 
+    #[error(
+        "upgrade required: min_signature_version={min_signature_version}, {message}"
+    )]
+    UpgradeRequired {
+        min_signature_version: u8,
+        message: String,
+    },
+
     #[error("device identity mismatch: {message}")]
     DeviceIdentityMismatch { message: String },
 
@@ -49,6 +57,7 @@ impl RelayError {
             RelayError::Server { .. } => RelayErrorKind::Server,
             RelayError::Timeout { .. } => RelayErrorKind::Timeout,
             RelayError::Auth { .. } => RelayErrorKind::Auth,
+            RelayError::UpgradeRequired { .. } => RelayErrorKind::UpgradeRequired,
             RelayError::DeviceIdentityMismatch { .. } => RelayErrorKind::DeviceIdentityMismatch,
             RelayError::Protocol { .. } => RelayErrorKind::Protocol,
             RelayError::EpochRotation { .. } => RelayErrorKind::EpochRotation,
@@ -74,6 +83,7 @@ pub enum RelayErrorKind {
     Server,
     Timeout,
     Auth,
+    UpgradeRequired,
     DeviceIdentityMismatch,
     Protocol,
     EpochRotation,
@@ -164,12 +174,16 @@ pub struct RegistrationNonceResponse {
     pub nonce: String,
     #[serde(default)]
     pub pow_challenge: Option<ProofOfWorkChallenge>,
+    #[serde(default)]
+    pub min_signature_version: Option<u8>,
 }
 
 /// Registration response with device session token.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterResponse {
     pub device_session_token: String,
+    #[serde(default)]
+    pub min_signature_version: Option<u8>,
 }
 
 /// Response from pulling changes.

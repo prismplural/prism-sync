@@ -34,6 +34,7 @@ pub enum CoreError {
         kind: RelayErrorCategory,
         status: Option<u16>,
         code: Option<String>,
+        min_signature_version: Option<u8>,
         remote_wipe: Option<bool>,
     },
 
@@ -75,30 +76,44 @@ impl CoreError {
             None => error.to_string(),
         };
 
-        let (kind, status, code, remote_wipe) = match error {
+        let (kind, status, code, min_signature_version, remote_wipe) = match error {
             RelayError::Network { .. } | RelayError::Timeout { .. } => {
-                (RelayErrorCategory::Network, None, None, None)
+                (RelayErrorCategory::Network, None, None, None, None)
             }
             RelayError::Server { status_code, .. } => {
-                (RelayErrorCategory::Server, Some(status_code), None, None)
+                (RelayErrorCategory::Server, Some(status_code), None, None, None)
             }
-            RelayError::Auth { .. } => (RelayErrorCategory::Auth, None, None, None),
+            RelayError::Auth { .. } => (RelayErrorCategory::Auth, None, None, None, None),
+            RelayError::UpgradeRequired {
+                min_signature_version,
+                ..
+            } => (
+                RelayErrorCategory::Auth,
+                Some(403),
+                Some("upgrade_required".to_string()),
+                Some(min_signature_version),
+                None,
+            ),
             RelayError::DeviceIdentityMismatch { .. } => (
                 RelayErrorCategory::DeviceIdentityMismatch,
                 None,
                 Some("device_identity_mismatch".to_string()),
+                None,
                 None,
             ),
             RelayError::DeviceRevoked { remote_wipe } => (
                 RelayErrorCategory::Auth,
                 None,
                 Some("device_revoked".to_string()),
+                None,
                 Some(remote_wipe),
             ),
             RelayError::Protocol { .. }
             | RelayError::EpochRotation { .. }
             | RelayError::ClockSkew { .. }
-            | RelayError::KeyChanged { .. } => (RelayErrorCategory::Protocol, None, None, None),
+            | RelayError::KeyChanged { .. } => {
+                (RelayErrorCategory::Protocol, None, None, None, None)
+            }
         };
 
         CoreError::Relay {
@@ -106,6 +121,7 @@ impl CoreError {
             kind,
             status,
             code,
+            min_signature_version,
             remote_wipe,
         }
     }

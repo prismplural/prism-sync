@@ -80,14 +80,9 @@ pub(crate) fn verify_signed_request(
     // Enforce minimum signature version for downgrade resistance before
     // rejecting unknown older formats generically.
     if signature_version < state.config.min_signature_version {
-        return Err(AppError::Forbidden(
-            "Signature version below server minimum",
-        ));
-    }
-
-    // Only accept V3 hybrid signatures
-    if signature.len() <= 64 || signature_version != 0x03 {
-        return Err(AppError::Unauthorized);
+        return Err(AppError::UpgradeRequired {
+            min_signature_version: state.config.min_signature_version,
+        });
     }
 
     let signing_data = auth::build_request_signing_data_v2(

@@ -944,6 +944,7 @@ mod tests {
             kind: RelayErrorCategory::Auth,
             status: None,
             code: Some("device_revoked".into()),
+            min_signature_version: None,
             remote_wipe: Some(true),
         };
 

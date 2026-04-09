@@ -34,6 +34,7 @@ struct NonceResponse {
     nonce: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pow_challenge: Option<PowChallenge>,
+    min_signature_version: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +122,7 @@ async fn get_register_nonce(
     Ok(axum::Json(NonceResponse {
         nonce,
         pow_challenge,
+        min_signature_version: state.config.min_signature_version,
     }))
 }
 
@@ -186,6 +188,7 @@ struct RegistrySnapshotEntry {
 #[derive(Serialize)]
 struct RegisterResponse {
     device_session_token: String,
+    min_signature_version: u8,
 }
 
 async fn register_device(
@@ -338,6 +341,7 @@ async fn register_device(
         axum::http::StatusCode::CREATED,
         axum::Json(RegisterResponse {
             device_session_token: token,
+            min_signature_version: state.config.min_signature_version,
         }),
     ))
 }

@@ -215,19 +215,14 @@ After a mutation, the service waits for `debounce` duration of quiet time before
 ### Create sync group (first device)
 1. Generate sync_id, node_id, device secret
 2. Initialize key hierarchy (password + generated BIP39 secret key)
-3. Register with relay via Ed25519 challenge-response
-4. Generate invite (QR payload, word list, deep link URL)
+3. Register with relay via hybrid challenge-response
+4. Persist the first-device pairing response and local credentials
 
 ### Join sync group (additional devices)
-1. Parse invite (from QR, URL, or word list)
-2. Register with relay via challenge-response
+1. Start a relay-backed rendezvous ceremony
+2. Exchange bootstrap material through the pairing mailbox
 3. Verify pairing via SAS (Short Authentication String)
-4. Receive signed keyring with DEK and epoch keys
-
-### Invite formats
-- **QR payload:** Compact binary format
-- **Word list:** Human-readable word sequence
-- **Deep link URL:** `prism://join?...` URL with encoded parameters
+4. Receive signed registry material plus DEK/epoch keys
 
 ## Epoch Rotation
 

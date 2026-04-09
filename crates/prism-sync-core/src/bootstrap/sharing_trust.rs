@@ -3,7 +3,9 @@
 //! Implements Trust-On-First-Use (TOFU) with key-change detection for
 //! peer sharing identities in the post-quantum sharing bootstrap protocol.
 
-use super::{BootstrapProfile, BootstrapVersion, PublicFingerprint};
+use super::{
+    sharing_models::SharingIdentityBundle, BootstrapProfile, BootstrapVersion, PublicFingerprint,
+};
 
 /// Trust decision for a sharing identity evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +18,28 @@ pub enum TrustDecision {
     /// Keys differ from pinned identity, and the relationship WAS previously
     /// verified. The app MUST block the operation and require re-verification.
     BlockKeyChange,
+}
+
+/// Trust decision that also distinguishes replayed older generations from a
+/// normal identity rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationAwareTrustDecision {
+    /// First contact or keys match the pinned identity. Safe to proceed.
+    Accept,
+    /// Keys differ from the pinned identity, but the relationship was not
+    /// previously verified.
+    WarnKeyChange,
+    /// Keys differ from the pinned identity, and the relationship was
+    /// previously verified.
+    BlockKeyChange,
+    /// The incoming identity claims the expected `sharing_id`, but its
+    /// `identity_generation` is lower than the highest generation previously
+    /// accepted for that `sharing_id`.
+    RejectStaleGenerationReplay,
+    /// The incoming identity does not claim the expected `sharing_id`.
+    RejectSharingIdMismatch,
+    /// The incoming identity bytes are malformed and could not be parsed.
+    RejectMalformedIdentity,
 }
 
 /// Evaluate trust for a peer's sharing identity.
@@ -70,6 +94,45 @@ pub fn evaluate_identity(
     }
 }
 
+/// Evaluate trust for a peer's sharing identity while enforcing a generation
+/// floor for the expected `sharing_id`.
+///
+/// This is intended for call sites that track the highest previously accepted
+/// `identity_generation` for each `sharing_id` and want to reject stale replay
+/// attempts before classifying the identity as a normal key rotation.
+///
+/// The new identity is parsed and validated up front. If its claimed
+/// `sharing_id` does not match `expected_sharing_id`, or if the wire encoding
+/// is malformed, the identity is rejected immediately.
+pub fn evaluate_identity_with_generation_floor(
+    pinned_identity_bytes: Option<&[u8]>,
+    new_identity_bytes: &[u8],
+    expected_sharing_id: &str,
+    highest_accepted_generation: Option<u32>,
+    is_verified: bool,
+) -> GenerationAwareTrustDecision {
+    let metadata = match SharingIdentityBundle::parse_metadata(new_identity_bytes) {
+        Some(metadata) => metadata,
+        None => return GenerationAwareTrustDecision::RejectMalformedIdentity,
+    };
+
+    if metadata.sharing_id != expected_sharing_id {
+        return GenerationAwareTrustDecision::RejectSharingIdMismatch;
+    }
+
+    if let Some(highest_generation) = highest_accepted_generation {
+        if metadata.identity_generation < highest_generation {
+            return GenerationAwareTrustDecision::RejectStaleGenerationReplay;
+        }
+    }
+
+    match evaluate_identity(pinned_identity_bytes, new_identity_bytes, is_verified) {
+        TrustDecision::Accept => GenerationAwareTrustDecision::Accept,
+        TrustDecision::WarnKeyChange => GenerationAwareTrustDecision::WarnKeyChange,
+        TrustDecision::BlockKeyChange => GenerationAwareTrustDecision::BlockKeyChange,
+    }
+}
+
 /// Extract the signed-content prefix from a `SharingIdentityBundle`'s
 /// canonical wire bytes.
 ///
@@ -86,65 +149,7 @@ pub fn evaluate_identity(
 /// Returns the bytes before the trailing `[4B sig_len][sig]`, or `None` if
 /// the format is invalid.
 fn extract_signed_content(bundle_bytes: &[u8]) -> Option<&[u8]> {
-    let mut pos: usize = 0;
-
-    // [1B version]
-    if bundle_bytes.is_empty() {
-        return None;
-    }
-    pos += 1;
-
-    // [2B sharing_id_len BE][sharing_id]
-    if pos + 2 > bundle_bytes.len() {
-        return None;
-    }
-    let sid_len = u16::from_be_bytes([bundle_bytes[pos], bundle_bytes[pos + 1]]) as usize;
-    pos += 2;
-    if pos + sid_len > bundle_bytes.len() {
-        return None;
-    }
-    pos += sid_len;
-
-    // [4B identity_generation BE]
-    if pos + 4 > bundle_bytes.len() {
-        return None;
-    }
-    pos += 4;
-
-    // [32B ed25519_public_key]
-    if pos + 32 > bundle_bytes.len() {
-        return None;
-    }
-    pos += 32;
-
-    // [2B ml_dsa_65_pk_len BE][ml_dsa_65_public_key]
-    if pos + 2 > bundle_bytes.len() {
-        return None;
-    }
-    let ml_len = u16::from_be_bytes([bundle_bytes[pos], bundle_bytes[pos + 1]]) as usize;
-    pos += 2;
-    if pos + ml_len > bundle_bytes.len() {
-        return None;
-    }
-    pos += ml_len;
-
-    // pos now points at the start of [4B sig_len][sig].
-    // Validate that there is at least a 4-byte length field remaining.
-    if pos + 4 > bundle_bytes.len() {
-        return None;
-    }
-    let sig_len = u32::from_be_bytes([
-        bundle_bytes[pos],
-        bundle_bytes[pos + 1],
-        bundle_bytes[pos + 2],
-        bundle_bytes[pos + 3],
-    ]) as usize;
-    // Validate that the signature data is fully present.
-    if pos + 4 + sig_len != bundle_bytes.len() {
-        return None;
-    }
-
-    Some(&bundle_bytes[..pos])
+    SharingIdentityBundle::signed_content_from_bytes(bundle_bytes)
 }
 
 /// Compute the public fingerprint for a `SharingIdentityBundle`.
@@ -194,6 +199,8 @@ mod tests {
         ed25519_pk: &[u8; 32],
         ml_dsa_pk: &[u8],
     ) -> Vec<u8> {
+        const TEST_ML_DSA_65_PK_LEN: usize = 1952;
+
         let mut buf = Vec::new();
         buf.push(1u8); // version V1
         let sid_bytes = sharing_id.as_bytes();
@@ -201,8 +208,14 @@ mod tests {
         buf.extend_from_slice(sid_bytes);
         buf.extend_from_slice(&generation.to_be_bytes());
         buf.extend_from_slice(ed25519_pk);
-        buf.extend_from_slice(&(ml_dsa_pk.len() as u16).to_be_bytes());
-        buf.extend_from_slice(ml_dsa_pk);
+        let mut normalized_ml_dsa_pk = vec![0u8; TEST_ML_DSA_65_PK_LEN];
+        if !ml_dsa_pk.is_empty() {
+            for (index, byte) in normalized_ml_dsa_pk.iter_mut().enumerate() {
+                *byte = ml_dsa_pk[index % ml_dsa_pk.len()];
+            }
+        }
+        buf.extend_from_slice(&(normalized_ml_dsa_pk.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&normalized_ml_dsa_pk);
         // Dummy signature (4B len + 64B dummy sig)
         let dummy_sig = vec![0xABu8; 64];
         buf.extend_from_slice(&(dummy_sig.len() as u32).to_be_bytes());
@@ -307,6 +320,74 @@ mod tests {
         assert_eq!(
             evaluate_identity(Some(&bundle_a), &bundle_b, true),
             TrustDecision::Accept
+        );
+    }
+
+    #[test]
+    fn test_generation_aware_stale_generation_rejected() {
+        let pinned = make_test_bundle_bytes("alice", 2, &[1u8; 32], &[2u8; 48]);
+        let stale = make_test_bundle_bytes("alice", 1, &[9u8; 32], &[8u8; 48]);
+
+        assert_eq!(
+            evaluate_identity_with_generation_floor(Some(&pinned), &stale, "alice", Some(2), false),
+            GenerationAwareTrustDecision::RejectStaleGenerationReplay
+        );
+    }
+
+    #[test]
+    fn test_generation_aware_higher_generation_is_normal_key_change() {
+        let pinned = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
+        let rotated = make_test_bundle_bytes("alice", 2, &[9u8; 32], &[8u8; 48]);
+
+        assert_eq!(
+            evaluate_identity_with_generation_floor(
+                Some(&pinned),
+                &rotated,
+                "alice",
+                Some(1),
+                false
+            ),
+            GenerationAwareTrustDecision::WarnKeyChange
+        );
+        assert_eq!(
+            evaluate_identity_with_generation_floor(
+                Some(&pinned),
+                &rotated,
+                "alice",
+                Some(1),
+                true
+            ),
+            GenerationAwareTrustDecision::BlockKeyChange
+        );
+    }
+
+    #[test]
+    fn test_generation_aware_sharing_id_mismatch_rejected() {
+        let new = make_test_bundle_bytes("mallory", 1, &[1u8; 32], &[2u8; 48]);
+
+        assert_eq!(
+            evaluate_identity_with_generation_floor(None, &new, "alice", None, false),
+            GenerationAwareTrustDecision::RejectSharingIdMismatch
+        );
+    }
+
+    #[test]
+    fn test_generation_aware_malformed_new_rejected() {
+        let malformed = vec![0xFF, 0x01];
+
+        assert_eq!(
+            evaluate_identity_with_generation_floor(None, &malformed, "alice", None, false),
+            GenerationAwareTrustDecision::RejectMalformedIdentity
+        );
+    }
+
+    #[test]
+    fn test_generation_aware_exact_match_still_accepts() {
+        let bundle = make_test_bundle_bytes("alice", 2, &[1u8; 32], &[2u8; 48]);
+
+        assert_eq!(
+            evaluate_identity_with_generation_floor(Some(&bundle), &bundle, "alice", Some(2), true),
+            GenerationAwareTrustDecision::Accept
         );
     }
 

@@ -157,6 +157,7 @@ impl SyncRelay for MockRelay {
         Ok(RegistrationNonceResponse {
             nonce: uuid::Uuid::new_v4().to_string(),
             pow_challenge: None,
+            min_signature_version: None,
         })
     }
 
@@ -164,6 +165,7 @@ impl SyncRelay for MockRelay {
         self.state.lock().unwrap().registered = true;
         Ok(RegisterResponse {
             device_session_token: "mock-session-token".to_string(),
+            min_signature_version: None,
         })
     }
 

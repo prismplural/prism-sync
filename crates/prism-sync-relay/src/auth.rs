@@ -1,7 +1,10 @@
+#[cfg(test)]
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use prism_sync_crypto::pq::HybridSignature;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+
+const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 
 /// Generate a secure session token (32 random bytes, hex encoded = 64 chars).
 pub fn generate_session_token() -> String {
@@ -42,6 +45,7 @@ pub fn timing_safe_eq(a: &str, b: &str) -> bool {
 /// || len_prefixed_utf8(device_id)
 /// || len_prefixed_utf8(nonce)
 /// ```
+#[cfg(test)]
 pub fn verify_ed25519_challenge(
     public_key: &[u8],
     sync_id: &str,
@@ -87,6 +91,10 @@ pub fn verify_hybrid_challenge(
         return false;
     };
 
+    if version != SUPPORTED_SIGNATURE_VERSION {
+        return false;
+    }
+
     let Ok(signature) = HybridSignature::from_bytes(signature_bytes) else {
         return false;
     };
@@ -96,11 +104,6 @@ pub fn verify_hybrid_challenge(
     write_len_prefixed(&mut data, sync_id.as_bytes());
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
-
-    // Only V3 signatures are accepted
-    if version != 0x03 {
-        return false;
-    }
 
     signature
         .verify_v3(&data, b"device_challenge", &pk_bytes, ml_dsa_public_key)
@@ -141,6 +144,7 @@ pub fn is_valid_device_id(device_id: &str) -> bool {
 /// || len_prefixed_utf8(nonce)
 /// ```
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_request_signing_data(
     method: &str,
     path: &str,
@@ -189,6 +193,7 @@ pub fn build_request_signing_data_v2(
 }
 
 /// Verify an Ed25519 signature over canonical request signing data.
+#[cfg(test)]
 pub fn verify_request_signature(
     signing_public_key: &[u8],
     signing_data: &[u8],
@@ -223,14 +228,13 @@ pub fn verify_hybrid_request_signature(
         return false;
     };
 
+    if version != SUPPORTED_SIGNATURE_VERSION {
+        return false;
+    }
+
     let Ok(signature) = HybridSignature::from_bytes(signature_bytes) else {
         return false;
     };
-
-    // Only V3 signatures are accepted
-    if version != 0x03 {
-        return false;
-    }
 
     signature
         .verify_v3(signing_data, b"http_request", &pk_bytes, ml_dsa_public_key)
@@ -461,7 +465,8 @@ mod tests {
         let pq_signing_key = secret.ml_dsa_65_keypair(device_id).unwrap();
         let pq_public_key = pq_signing_key.public_key_bytes();
 
-        let m_prime = build_hybrid_message_representative(context, message);
+        let m_prime = build_hybrid_message_representative(context, message)
+            .expect("hardcoded test context should be <= 255 bytes");
         let hybrid_sig = HybridSignature {
             ed25519_sig: ed_signing_key
                 .into_signing_key()

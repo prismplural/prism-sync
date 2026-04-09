@@ -12,6 +12,7 @@ pub enum AppError {
     DeviceRevoked { remote_wipe: bool },
     FirstDeviceAdmissionRequired,
     FirstDeviceAdmissionInvalid,
+    UpgradeRequired { min_signature_version: u8 },
     Forbidden(&'static str),
     NotFound,
     Conflict(&'static str),
@@ -30,6 +31,7 @@ impl IntoResponse for AppError {
             AppError::DeviceRevoked { .. } => StatusCode::UNAUTHORIZED,
             AppError::FirstDeviceAdmissionRequired => StatusCode::FORBIDDEN,
             AppError::FirstDeviceAdmissionInvalid => StatusCode::FORBIDDEN,
+            AppError::UpgradeRequired { .. } => StatusCode::FORBIDDEN,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Conflict(_) => StatusCode::CONFLICT,
@@ -46,6 +48,7 @@ impl IntoResponse for AppError {
                 Json(ErrorBody {
                     error: "device_identity_mismatch",
                     message: Some("Registered device identity does not match stored keys"),
+                    min_signature_version: None,
                     remote_wipe: None,
                 }),
             )
@@ -55,6 +58,7 @@ impl IntoResponse for AppError {
                 Json(ErrorBody {
                     error: "device_revoked",
                     message: Some("Device has been revoked"),
+                    min_signature_version: None,
                     remote_wipe: Some(*remote_wipe),
                 }),
             )
@@ -64,6 +68,7 @@ impl IntoResponse for AppError {
                 Json(ErrorBody {
                     error: "first_device_admission_required",
                     message: Some("First-device admission proof is required"),
+                    min_signature_version: None,
                     remote_wipe: None,
                 }),
             )
@@ -73,6 +78,19 @@ impl IntoResponse for AppError {
                 Json(ErrorBody {
                     error: "first_device_admission_invalid",
                     message: Some("First-device admission proof is invalid"),
+                    min_signature_version: None,
+                    remote_wipe: None,
+                }),
+            )
+                .into_response(),
+            AppError::UpgradeRequired {
+                min_signature_version,
+            } => (
+                status,
+                Json(ErrorBody {
+                    error: "upgrade_required",
+                    message: Some("This app version is too old. Please update to continue syncing."),
+                    min_signature_version: Some(*min_signature_version),
                     remote_wipe: None,
                 }),
             )
@@ -99,6 +117,8 @@ struct ErrorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    min_signature_version: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     remote_wipe: Option<bool>,
 }
 
@@ -115,6 +135,9 @@ impl Display for AppError {
                 write!(f, "FirstDeviceAdmissionRequired")
             }
             AppError::FirstDeviceAdmissionInvalid => write!(f, "FirstDeviceAdmissionInvalid"),
+            AppError::UpgradeRequired {
+                min_signature_version,
+            } => write!(f, "UpgradeRequired(min_signature_version={min_signature_version})"),
             AppError::Forbidden(msg) => write!(f, "Forbidden({msg})"),
             AppError::NotFound => write!(f, "NotFound"),
             AppError::Conflict(msg) => write!(f, "Conflict({msg})"),

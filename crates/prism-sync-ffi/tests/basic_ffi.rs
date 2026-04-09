@@ -252,12 +252,13 @@ async fn change_password_succeeds() {
         "old_pw".into(),
         "new_pw".into(),
         secret_bytes.clone(),
+        None,
+        0,
     )
     .await;
     assert!(
-        result.is_ok(),
-        "change_password should succeed: {:?}",
-        result.err()
+        matches!(result, Ok(1)),
+        "change_password should return next identity_generation: {result:?}",
     );
 
     // Lock and unlock with new password
@@ -353,29 +354,6 @@ async fn parse_fields_handles_all_types() {
         api::record_create(&handle, "members".into(), "e1".into(), "not json".into()).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Invalid fields JSON"));
-}
-
-// ── Pairing (join_from_url) ──
-
-#[tokio::test]
-async fn join_from_url_rejects_invalid_url() {
-    let handle = make_handle();
-    let result = api::join_from_url(
-        &handle,
-        "https://not-a-prismsync-url.com".into(),
-        "pw".into(),
-    )
-    .await;
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Failed to parse invite URL"));
-}
-
-#[tokio::test]
-async fn join_from_qr_rejects_invalid_bytes() {
-    let handle = make_handle();
-    let result = api::join_from_qr(&handle, vec![0xFF, 0xFE], "pw".into()).await;
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Failed to parse QR payload"));
 }
 
 #[tokio::test]

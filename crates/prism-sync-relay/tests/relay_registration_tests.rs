@@ -3315,7 +3315,8 @@ async fn test_replayed_nonce_rejected() {
         &fixed_nonce,
     );
     let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data);
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
+            .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: keys.ed25519_signing_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_kp.sign(&m_prime),
@@ -3361,7 +3362,11 @@ async fn test_replayed_nonce_rejected() {
         &fixed_nonce, // same nonce
     );
     let m_prime2 =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data2);
+        prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"http_request",
+            &signing_data2,
+        )
+        .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig2 = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: keys.ed25519_signing_key.sign(&m_prime2).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_kp.sign(&m_prime2),
@@ -3428,7 +3433,8 @@ async fn test_expired_timestamp_rejected() {
         &nonce,
     );
     let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data);
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
+            .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: admin_keys
             .ed25519_signing_key

@@ -62,6 +62,9 @@ pub trait PairingRelay: Send + Sync {
     ) -> Result<Option<Vec<u8>>, RelayError>;
 
     /// Delete the pairing session.
+    ///
+    /// This operation is idempotent. The HTTP relay returns `204 No Content`
+    /// even if the session was already absent.
     async fn delete_session(&self, rendezvous_id: &str) -> Result<(), RelayError>;
 }
 

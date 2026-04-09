@@ -23,8 +23,30 @@ fn generate_sharing_id() -> String {
     hex::encode(bytes)
 }
 
+const ML_DSA_65_PK_LEN: usize = 1952;
+
 fn b64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+fn encode_test_identity_bundle(
+    sharing_id: &str,
+    identity_generation: u32,
+    signature_payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        1 + 2 + sharing_id.len() + 4 + 32 + 2 + ML_DSA_65_PK_LEN + 4 + signature_payload.len(),
+    );
+    out.push(0x01);
+    out.extend_from_slice(&(sharing_id.len() as u16).to_be_bytes());
+    out.extend_from_slice(sharing_id.as_bytes());
+    out.extend_from_slice(&identity_generation.to_be_bytes());
+    out.extend_from_slice(&[0xAA; 32]);
+    out.extend_from_slice(&(ML_DSA_65_PK_LEN as u16).to_be_bytes());
+    out.extend_from_slice(&vec![0xBB; ML_DSA_65_PK_LEN]);
+    out.extend_from_slice(&(signature_payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(signature_payload);
+    out
 }
 
 /// Helper: publish identity bundle for a device and return the sharing_id.
@@ -39,9 +61,28 @@ async fn publish_identity(
     sharing_id: &str,
     bundle: &[u8],
 ) -> reqwest::Response {
+    publish_identity_with_generation(
+        client, url, token, keys, sync_id, device_id, sharing_id, 0, bundle,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_identity_with_generation(
+    client: &Client,
+    url: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    sync_id: &str,
+    device_id: &str,
+    sharing_id: &str,
+    identity_generation: u32,
+    bundle: &[u8],
+) -> reqwest::Response {
+    let identity_bundle = encode_test_identity_bundle(sharing_id, identity_generation, bundle);
     let body = serde_json::json!({
         "sharing_id": sharing_id,
-        "identity_bundle": b64_encode(bundle),
+        "identity_bundle": b64_encode(&identity_bundle),
     });
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let builder = client
@@ -109,7 +150,8 @@ async fn test_publish_identity_and_fetch_bundle() {
     let keys = TestDeviceKeys::generate(&device_id);
     let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
     let sharing_id = generate_sharing_id();
-    let identity_bundle = b"test-identity-bundle";
+    let identity_payload = b"test-identity-bundle";
+    let identity_bundle = encode_test_identity_bundle(&sharing_id, 0, identity_payload);
     let prekey_bundle = b"test-prekey-bundle";
 
     // 1. Publish identity
@@ -121,7 +163,7 @@ async fn test_publish_identity_and_fetch_bundle() {
         &sync_id,
         &device_id,
         &sharing_id,
-        identity_bundle,
+        identity_payload,
     )
     .await;
     assert_eq!(resp.status(), 204, "publish identity should return 204");
@@ -251,6 +293,174 @@ async fn test_same_sync_group_cannot_switch_sharing_id() {
     )
     .await;
     assert_eq!(resp.status(), 409, "switching sharing_id should 409");
+}
+
+#[tokio::test]
+async fn test_identity_publish_rejects_generation_rollback() {
+    let (url, _handle, _db) = start_test_relay().await;
+    let client = Client::new();
+
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+    let sharing_id = generate_sharing_id();
+
+    let accepted_bundle = encode_test_identity_bundle(&sharing_id, 2, b"sig-v2");
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        1,
+        b"sig-v1",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        2,
+        b"sig-v2",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        1,
+        b"sig-v1-rollback",
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "rollback publish should 409");
+
+    let resp = publish_prekey(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        "pk1",
+        b"prekey",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let resp = client
+        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let fetched_identity = base64::engine::general_purpose::STANDARD
+        .decode(body["identity_bundle"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(fetched_identity, accepted_bundle);
+}
+
+#[tokio::test]
+async fn test_identity_delete_preserves_generation_floor_and_bundle_hash() {
+    let (url, _handle, _db) = start_test_relay().await;
+    let client = Client::new();
+
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+    let sharing_id = generate_sharing_id();
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        3,
+        b"sig-v3",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let builder = client
+        .delete(format!("{url}/v1/sharing/identity"))
+        .header("Authorization", format!("Bearer {token}"));
+    let builder = apply_signed_headers(
+        builder,
+        &keys,
+        "DELETE",
+        "/v1/sharing/identity",
+        &sync_id,
+        &device_id,
+        &[],
+    );
+    let resp = builder.send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        2,
+        b"sig-v2",
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "deleted identity must still reject rollback");
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        3,
+        b"sig-v3-mutated",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        409,
+        "equal-generation republish must be byte-identical to prior identity"
+    );
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        3,
+        b"sig-v3",
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "same bundle at same generation should replay cleanly");
 }
 
 #[tokio::test]
@@ -722,6 +932,79 @@ async fn test_delete_identity_removes_identity_and_prekeys() {
 }
 
 #[tokio::test]
+async fn test_delete_identity_preserves_generation_floor_for_identical_republish() {
+    let (url, _handle, _db) = start_test_relay().await;
+    let client = Client::new();
+
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+    let sharing_id = generate_sharing_id();
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        3,
+        b"sig-v3",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let builder = client
+        .delete(format!("{url}/v1/sharing/identity"))
+        .header("Authorization", format!("Bearer {token}"));
+    let builder = apply_signed_headers(
+        builder,
+        &keys,
+        "DELETE",
+        "/v1/sharing/identity",
+        &sync_id,
+        &device_id,
+        &[],
+    );
+    let resp = builder.send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        2,
+        b"sig-v2-rollback",
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "delete should not reset generation floor");
+
+    let resp = publish_identity_with_generation(
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        &sharing_id,
+        3,
+        b"sig-v3",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        204,
+        "same bundle at the same generation should be republishable after delete"
+    );
+}
+
+#[tokio::test]
 async fn test_cleanup_removes_expired_and_consumed_sharing_inits() {
     let db = Database::in_memory().expect("in-memory db");
     db.with_conn(|conn| {
@@ -768,6 +1051,54 @@ async fn test_cleanup_removes_expired_and_consumed_sharing_inits() {
                 row.get(0)
             })?;
         assert_eq!(count, 2, "valid + recently consumed should remain");
+
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_fetch_and_consume_pending_sharing_inits_is_stable_and_ordered() {
+    let db = Database::in_memory().expect("in-memory db");
+    db.with_conn(|conn| {
+        let now = db::now_secs();
+
+        conn.execute(
+            "INSERT INTO sharing_init_payloads
+             (init_id, recipient_id, sender_id, payload, created_at, consumed_at, expires_at)
+             VALUES ('late', 'recipient', 's1', X'AA', ?1, NULL, ?2)",
+            params![now + 20, now + 3600],
+        )?;
+        conn.execute(
+            "INSERT INTO sharing_init_payloads
+             (init_id, recipient_id, sender_id, payload, created_at, consumed_at, expires_at)
+             VALUES ('early', 'recipient', 's2', X'BB', ?1, NULL, ?2)",
+            params![now + 10, now + 3600],
+        )?;
+        conn.execute(
+            "INSERT INTO sharing_init_payloads
+             (init_id, recipient_id, sender_id, payload, created_at, consumed_at, expires_at)
+             VALUES ('middle', 'recipient', 's3', X'CC', ?1, NULL, ?2)",
+            params![now + 15, now + 3600],
+        )?;
+        conn.execute(
+            "INSERT INTO sharing_init_payloads
+             (init_id, recipient_id, sender_id, payload, created_at, consumed_at, expires_at)
+             VALUES ('other', 'other-recipient', 's4', X'DD', ?1, NULL, ?2)",
+            params![now + 5, now + 3600],
+        )?;
+
+        let fetched = db::fetch_and_consume_pending_sharing_inits(conn, "recipient")?;
+        let ids: Vec<_> = fetched.into_iter().map(|pending| pending.init_id).collect();
+        assert_eq!(ids, vec!["early", "middle", "late"]);
+
+        let remaining_other: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sharing_init_payloads
+             WHERE recipient_id = 'other-recipient' AND consumed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining_other, 1, "other recipients must remain untouched");
 
         Ok(())
     })
@@ -1206,19 +1537,16 @@ async fn test_stale_prekey_not_served() {
     })
     .unwrap();
 
-    // Fetch bundle should return 404 with stale error
+    // Fetch bundle should return a generic 404 so callers cannot distinguish
+    // stale prekeys from other "recipient unavailable" states.
     let resp = client
         .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(
-        body["error"].as_str().unwrap(),
-        "recipient_prekey_stale",
-        "stale prekey should return recipient_prekey_stale error"
-    );
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "Not Found");
 }
 
 #[tokio::test]
@@ -1276,7 +1604,11 @@ async fn test_prekey_at_serve_boundary_still_served() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "prekey within serve limit should be served");
+    assert_eq!(
+        resp.status(),
+        200,
+        "prekey within serve limit should be served"
+    );
 }
 
 #[tokio::test]

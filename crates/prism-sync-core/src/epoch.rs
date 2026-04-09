@@ -194,6 +194,7 @@ mod tests {
             Ok(crate::relay::traits::RegistrationNonceResponse {
                 nonce: uuid::Uuid::new_v4().to_string(),
                 pow_challenge: None,
+                min_signature_version: None,
             })
         }
         async fn register_device(
@@ -202,6 +203,7 @@ mod tests {
         ) -> std::result::Result<RegisterResponse, RelayError> {
             Ok(RegisterResponse {
                 device_session_token: "mock-token".to_string(),
+                min_signature_version: None,
             })
         }
         async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> {

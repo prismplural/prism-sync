@@ -1,9 +1,9 @@
 //! Data models for the PQ hybrid device pairing ceremony.
 //!
 //! Provides binary-serializable structs for the bootstrap handshake messages
-//! exchanged during sync pairing (Phase 3). All binary formats use big-endian
-//! length prefixes consistent with [`super::transcript`] and the legacy
-//! pairing models in [`crate::pairing::models`].
+//! exchanged during sync pairing (Phase 3). These pairing message formats use
+//! explicit big-endian length prefixes where needed; they are stable message
+//! encodings, not byte-for-byte aliases of transcript framing.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;

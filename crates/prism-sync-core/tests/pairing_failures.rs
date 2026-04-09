@@ -6,7 +6,6 @@
 //! - Rollback marker cleanup
 //!
 //! Also covers pairing happy-path roundtrips (Agent A security plan):
-//! - PairingRequest compact bytes encode/decode
 //! - Approve flow produces verifiable PairingResponse
 //! - Join from approval roundtrip
 
@@ -14,14 +13,16 @@ mod common;
 
 use std::sync::Arc;
 
+use ed25519_dalek::Signer as _;
 use prism_sync_core::pairing::models::{
-    build_invitation_signing_data, PairingRequest, PairingResponse, RegistrySnapshotEntry,
+    build_invitation_signing_data_v2, PairingRequest, PairingResponse, RegistrySnapshotEntry,
     SignedRegistrySnapshot,
 };
 use prism_sync_core::pairing::service::{cleanup_failed_setup, PairingService};
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::secure_store::SecureStore;
 use prism_sync_crypto::DeviceSecret;
+use prism_sync_crypto::pq::HybridSignature;
 
 use common::MemorySecureStore;
 
@@ -32,7 +33,7 @@ async fn create_invite(password: &str) -> (PairingResponse, Arc<MemorySecureStor
     let store = Arc::new(MemorySecureStore::new());
     let service = PairingService::new(relay, store.clone());
 
-    let (_creds, invite) = service
+    let (_creds, response) = service
         .create_sync_group(
             password,
             "wss://relay.example.com",
@@ -45,7 +46,7 @@ async fn create_invite(password: &str) -> (PairingResponse, Arc<MemorySecureStor
         .await
         .expect("create_sync_group should succeed");
 
-    (invite.response().clone(), store)
+    (response, store)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -308,67 +309,6 @@ async fn successful_join_has_no_rollback_marker() {
 // Pairing happy-path roundtrip tests (Agent A security plan)
 // ══════════════════════════════════════════════════════════════════════════
 
-/// PairingRequest compact bytes encode and decode to identical fields, and
-/// public key sizes are correct (32 bytes each).
-#[test]
-#[allow(deprecated)]
-fn generate_pairing_request_compact_bytes_roundtrip() {
-    let device_secret = DeviceSecret::generate();
-    let device_id = "test-device-42";
-    let signing_key = device_secret
-        .ed25519_keypair(device_id)
-        .expect("ed25519 keypair");
-    let exchange_key = device_secret
-        .x25519_keypair(device_id)
-        .expect("x25519 keypair");
-
-    let request = PairingRequest {
-        device_id: device_id.to_string(),
-        ed25519_public_key: signing_key.public_key_bytes().to_vec(),
-        x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-    };
-
-    // Verify key sizes
-    assert_eq!(request.ed25519_public_key.len(), 32);
-    assert_eq!(request.x25519_public_key.len(), 32);
-
-    // Encode to compact bytes and decode back
-    let compact = request
-        .to_compact_bytes()
-        .expect("compact encoding should succeed");
-    let decoded =
-        PairingRequest::from_compact_bytes(&compact).expect("compact decoding should succeed");
-
-    assert_eq!(decoded.device_id, request.device_id);
-    assert_eq!(decoded.ed25519_public_key, request.ed25519_public_key);
-    assert_eq!(decoded.x25519_public_key, request.x25519_public_key);
-}
-
-/// Compact bytes reject wrong-length public keys.
-#[test]
-#[allow(deprecated)]
-fn pairing_request_compact_bytes_rejects_bad_key_lengths() {
-    let request = PairingRequest {
-        device_id: "dev-1".into(),
-        ed25519_public_key: vec![0u8; 16], // too short
-        x25519_public_key: vec![0u8; 32],
-    };
-    assert!(
-        request.to_compact_bytes().is_none(),
-        "should reject ed25519 key with wrong length"
-    );
-
-    let request2 = PairingRequest {
-        device_id: "dev-1".into(),
-        ed25519_public_key: vec![0u8; 32],
-        x25519_public_key: vec![0u8; 48], // too long
-    };
-    assert!(
-        request2.to_compact_bytes().is_none(),
-        "should reject x25519 key with wrong length"
-    );
-}
-
 /// Manually construct an approve flow (as approve_pairing_request does in
 /// the FFI layer) and verify the resulting PairingResponse can be joined.
 #[tokio::test]
@@ -419,6 +359,16 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     let exchange_key_b = device_secret_b
         .x25519_keypair(device_id_b)
         .expect("x25519 keypair");
+    let ed_signing_key_a = device_secret_a
+        .ed25519_keypair(&device_id_a)
+        .expect("ed25519 signing key")
+        .into_signing_key();
+    let pq_signing_key_a = device_secret_a
+        .ml_dsa_65_keypair(&device_id_a)
+        .expect("ml-dsa keypair");
+    let pq_kem_key_a = device_secret_a
+        .ml_kem_768_keypair(&device_id_a)
+        .expect("ml-kem keypair");
 
     let _request = PairingRequest {
         device_id: device_id_b.to_string(),
@@ -427,29 +377,38 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     };
 
     // Device A: approve the request (mirrors FFI approve_pairing_request logic)
-    let signing_data = build_invitation_signing_data(
+    let signing_data = build_invitation_signing_data_v2(
         &sync_id,
         &relay_url,
         &wrapped_dek,
         &salt,
         &device_id_a,
         &signing_key_a.public_key_bytes(),
+        &pq_signing_key_a.public_key_bytes(),
         Some(device_id_b),
         0,
         &[],
     );
-    let signature = signing_key_a.sign(&signing_data);
+    let m_prime =
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"invitation", &signing_data)
+            .expect("hardcoded invitation context should be <= 255 bytes");
+    let hybrid_invitation = HybridSignature {
+        ed25519_sig: ed_signing_key_a.sign(&m_prime).to_bytes().to_vec(),
+        ml_dsa_65_sig: pq_signing_key_a.sign(&m_prime),
+    };
+    let mut signature = vec![0x03];
+    signature.extend_from_slice(&hybrid_invitation.to_bytes());
 
     let registry_snapshot = SignedRegistrySnapshot::new(vec![RegistrySnapshotEntry {
         sync_id: sync_id.clone(),
         device_id: device_id_a.clone(),
         ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
         x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
-        ml_dsa_65_public_key: Vec::new(),
-        ml_kem_768_public_key: Vec::new(),
+        ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
+        ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
         status: "active".into(),
     }]);
-    let signed_keyring = registry_snapshot.sign(&signing_key_a);
+    let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {
         relay_url: relay_url.clone(),
@@ -461,7 +420,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         signed_keyring,
         inviter_device_id: device_id_a.clone(),
         inviter_ed25519_pk: signing_key_a.public_key_bytes().to_vec(),
-        inviter_ml_dsa_65_pk: Vec::new(),
+        inviter_ml_dsa_65_pk: pq_signing_key_a.public_key_bytes(),
         joiner_device_id: Some(device_id_b.to_string()),
         current_epoch: 0,
         epoch_key: vec![],
@@ -475,29 +434,35 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     );
 
     // Verify: invitation signature is valid
-    let verify_signing_data = build_invitation_signing_data(
+    let verify_signing_data = build_invitation_signing_data_v2(
         &response.sync_id,
         &response.relay_url,
         &response.wrapped_dek,
         &response.salt,
         &response.inviter_device_id,
         &signing_key_a.public_key_bytes(),
+        &pq_signing_key_a.public_key_bytes(),
         response.joiner_device_id.as_deref(),
         response.current_epoch,
         &response.epoch_key,
     );
     let sig_bytes = prism_sync_crypto::hex::decode(&response.signed_invitation).expect("valid hex");
-    prism_sync_crypto::DeviceSigningKey::verify(
-        &signing_key_a.public_key_bytes(),
-        &verify_signing_data,
-        &sig_bytes,
-    )
-    .expect("invitation signature should verify");
+    assert_eq!(sig_bytes[0], 0x03);
+    let hybrid_sig = HybridSignature::from_bytes(&sig_bytes[1..]).expect("valid hybrid signature");
+    hybrid_sig
+        .verify_v3(
+            &verify_signing_data,
+            b"invitation",
+            &signing_key_a.public_key_bytes(),
+            &pq_signing_key_a.public_key_bytes(),
+        )
+        .expect("invitation signature should verify");
 
     // Verify: registry snapshot is valid
-    let snapshot = SignedRegistrySnapshot::verify_and_decode(
+    let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
         &response.signed_keyring,
         &signing_key_a.public_key_bytes(),
+        &pq_signing_key_a.public_key_bytes(),
     )
     .expect("registry snapshot should verify");
     assert_eq!(snapshot.entries.len(), 1);
@@ -521,7 +486,6 @@ async fn approve_flow_produces_verifiable_pairing_response() {
 /// Full roundtrip: Device A creates group, Device B generates request,
 /// Device A approves targeting B's device_id, Device B joins, and the
 /// registry snapshot contains both Device A and Device B entries.
-#[allow(deprecated)]
 #[tokio::test]
 async fn join_from_approval_roundtrip() {
     let password = "roundtrip-password";
@@ -550,6 +514,16 @@ async fn join_from_approval_roundtrip() {
     let exchange_key_a = device_secret_a
         .x25519_keypair(&device_id_a)
         .expect("keypair");
+    let ed_signing_key_a = device_secret_a
+        .ed25519_keypair(&device_id_a)
+        .expect("keypair")
+        .into_signing_key();
+    let pq_signing_key_a = device_secret_a
+        .ml_dsa_65_keypair(&device_id_a)
+        .expect("keypair");
+    let pq_kem_key_a = device_secret_a
+        .ml_kem_768_keypair(&device_id_a)
+        .expect("keypair");
 
     // ── Device B: generate PairingRequest ──
     let device_secret_b = DeviceSecret::generate();
@@ -560,6 +534,12 @@ async fn join_from_approval_roundtrip() {
     let exchange_key_b = device_secret_b
         .x25519_keypair(device_id_b)
         .expect("keypair");
+    let pq_signing_key_b = device_secret_b
+        .ml_dsa_65_keypair(device_id_b)
+        .expect("keypair");
+    let pq_kem_key_b = device_secret_b
+        .ml_kem_768_keypair(device_id_b)
+        .expect("keypair");
 
     let request = PairingRequest {
         device_id: device_id_b.to_string(),
@@ -567,27 +547,32 @@ async fn join_from_approval_roundtrip() {
         x25519_public_key: exchange_key_b.public_key_bytes().to_vec(),
     };
 
-    // Verify request encodes/decodes via compact bytes (QR transport)
-    let qr_bytes = request
-        .to_compact_bytes()
-        .expect("request compact encoding");
-    let decoded_request =
-        PairingRequest::from_compact_bytes(&qr_bytes).expect("request compact decoding");
-    assert_eq!(decoded_request.device_id, device_id_b);
+    // Verify request fields carry the expected classical identity lengths.
+    assert_eq!(request.ed25519_public_key.len(), 32);
+    assert_eq!(request.x25519_public_key.len(), 32);
 
     // ── Device A: approve the request ──
-    let signing_data = build_invitation_signing_data(
+    let signing_data = build_invitation_signing_data_v2(
         &sync_id,
         &relay_url,
         &wrapped_dek,
         &salt,
         &device_id_a,
         &signing_key_a.public_key_bytes(),
+        &pq_signing_key_a.public_key_bytes(),
         Some(device_id_b),
         0,
         &[],
     );
-    let signature = signing_key_a.sign(&signing_data);
+    let m_prime =
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"invitation", &signing_data)
+            .expect("hardcoded invitation context should be <= 255 bytes");
+    let hybrid_invitation = HybridSignature {
+        ed25519_sig: ed_signing_key_a.sign(&m_prime).to_bytes().to_vec(),
+        ml_dsa_65_sig: pq_signing_key_a.sign(&m_prime),
+    };
+    let mut signature = vec![0x03];
+    signature.extend_from_slice(&hybrid_invitation.to_bytes());
 
     let registry_snapshot = SignedRegistrySnapshot::new(vec![
         RegistrySnapshotEntry {
@@ -595,8 +580,8 @@ async fn join_from_approval_roundtrip() {
             device_id: device_id_a.clone(),
             ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
+            ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
             status: "active".into(),
         },
         RegistrySnapshotEntry {
@@ -604,12 +589,12 @@ async fn join_from_approval_roundtrip() {
             device_id: device_id_b.to_string(),
             ed25519_public_key: signing_key_b.public_key_bytes().to_vec(),
             x25519_public_key: exchange_key_b.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
+            ml_dsa_65_public_key: pq_signing_key_b.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key_b.public_key_bytes(),
             status: "active".into(),
         },
     ]);
-    let signed_keyring = registry_snapshot.sign(&signing_key_a);
+    let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {
         relay_url: relay_url.clone(),
@@ -621,7 +606,7 @@ async fn join_from_approval_roundtrip() {
         signed_keyring,
         inviter_device_id: device_id_a.clone(),
         inviter_ed25519_pk: signing_key_a.public_key_bytes().to_vec(),
-        inviter_ml_dsa_65_pk: Vec::new(),
+        inviter_ml_dsa_65_pk: pq_signing_key_a.public_key_bytes(),
         joiner_device_id: Some(device_id_b.to_string()),
         current_epoch: 0,
         epoch_key: vec![],
@@ -632,18 +617,6 @@ async fn join_from_approval_roundtrip() {
         response.admission_context(),
         "existing_group",
         "full membership snapshot should be treated as existing-group admission"
-    );
-
-    // Verify the response encodes to compact bytes and back (QR transport)
-    let response_compact = response
-        .to_compact_bytes()
-        .expect("response compact encoding");
-    let decoded_response =
-        PairingResponse::from_compact_bytes(&response_compact).expect("response compact decoding");
-    assert_eq!(decoded_response.sync_id, sync_id);
-    assert_eq!(
-        decoded_response.joiner_device_id.as_deref(),
-        Some(device_id_b)
     );
 
     // ── Device B: join using the approved response ──
@@ -714,7 +687,7 @@ async fn create_sync_group_with_registration_token() {
     let store = Arc::new(MemorySecureStore::new());
     let service = PairingService::new(relay, store.clone());
 
-    let (_creds, invite) = service
+    let (_creds, response) = service
         .create_sync_group(
             "test-password",
             "wss://relay.example.com",
@@ -726,8 +699,6 @@ async fn create_sync_group_with_registration_token() {
         )
         .await
         .expect("create_sync_group with registration_token should succeed");
-
-    let response = invite.response();
 
     // The registration_token must be carried through to the PairingResponse
     assert_eq!(

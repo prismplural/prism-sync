@@ -72,7 +72,10 @@ async fn run_cleanup(state: &AppState) {
                 config.prekey_serve_max_age_secs,
             )?;
 
-            // 11. Reclaim freed pages (incremental auto_vacuum)
+            // 11. Delete expired or long-consumed sharing-init payloads.
+            let expired_sharing_inits = crate::db::cleanup_expired_sharing_init_payloads(conn)?;
+
+            // 12. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 = conn
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -93,6 +96,7 @@ async fn run_cleanup(state: &AppState) {
                 expired_pairing_sessions,
                 revoked_tombstones,
                 stale_prekeys,
+                expired_sharing_inits,
                 pages_freed,
             ))
         })
@@ -112,6 +116,7 @@ async fn run_cleanup(state: &AppState) {
             expired_pairing_sessions,
             revoked_tombstones,
             stale_prekeys,
+            expired_sharing_inits,
             pages_freed,
         ))) => {
             state.metrics.last_cleanup_epoch_secs.store(
@@ -129,6 +134,7 @@ async fn run_cleanup(state: &AppState) {
                 || expired_pairing_sessions > 0
                 || revoked_tombstones > 0
                 || stale_prekeys > 0
+                || expired_sharing_inits > 0
                 || pages_freed > 0
             {
                 tracing::info!(
@@ -142,6 +148,7 @@ async fn run_cleanup(state: &AppState) {
                     expired_pairing_sessions,
                     revoked_tombstones,
                     stale_prekeys,
+                    expired_sharing_inits,
                     pages_freed,
                     "cleanup cycle complete"
                 );
@@ -161,7 +168,7 @@ async fn run_cleanup(state: &AppState) {
     state
         .signed_request_replay_cache
         .prune_stale(state.config.signed_request_nonce_window_secs);
-    state.pairing_rate_limiter.prune_stale(300);
+    state.pairing_rate_limiter.prune_stale(60);
 }
 
 fn cleanup_abandoned_brand_new_groups(

@@ -39,11 +39,13 @@ impl SyncRelay for RekeyMockRelay {
         Ok(prism_sync_core::relay::traits::RegistrationNonceResponse {
             nonce: uuid::Uuid::new_v4().to_string(),
             pow_challenge: None,
+            min_signature_version: None,
         })
     }
     async fn register_device(&self, _req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
         Ok(RegisterResponse {
             device_session_token: "mock".to_string(),
+            min_signature_version: None,
         })
     }
     async fn pull_changes(&self, _: i64) -> Result<PullResponse, RelayError> {

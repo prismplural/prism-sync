@@ -1,13 +1,14 @@
 use axum::{
     body::Bytes,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Path, State},
+    http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, put},
     Router,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::{db, errors::AppError, state::AppState};
 
@@ -50,18 +51,17 @@ struct CreateSessionResponse {
 
 async fn create_session(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     axum::Json(body): axum::Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Rate limit by client IP
-    if let Some(ip) = client_ip_key(&headers) {
-        if !state.pairing_rate_limiter.check(
-            &ip,
-            state.config.pairing_session_rate_limit,
-            300, // 5-minute window
-        ) {
-            return Err(AppError::TooManyRequests);
-        }
+    // Rate limit by the actual peer address. Pairing rendezvous IDs are bearer
+    // capabilities, so spoofable forwarded headers are not trusted here.
+    if !state.pairing_rate_limiter.check(
+        &client_ip_key(peer_addr),
+        state.config.pairing_session_rate_limit,
+        60,
+    ) {
+        return Err(AppError::TooManyRequests);
     }
 
     // Decode and validate bootstrap data
@@ -305,29 +305,6 @@ async fn delete_session(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn client_ip_key(headers: &HeaderMap) -> Option<String> {
-    for header_name in [
-        #[cfg(feature = "test-helpers")]
-        "x-test-client-ip",
-        "cf-connecting-ip",
-        "x-forwarded-for",
-        "x-real-ip",
-        "forwarded",
-    ] {
-        if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
-            let candidate = if header_name == "forwarded" {
-                value
-                    .split(';')
-                    .find_map(|part| part.trim().strip_prefix("for="))
-                    .unwrap_or(value)
-            } else {
-                value.split(',').next().unwrap_or(value)
-            };
-            let trimmed = candidate.trim().trim_matches('"');
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
+fn client_ip_key(peer_addr: SocketAddr) -> String {
+    peer_addr.ip().to_string()
 }

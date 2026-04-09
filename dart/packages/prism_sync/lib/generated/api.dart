@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encoded_value_to_json`, `join_with_response`, `json_value_to_sync_value`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `relay_error_category_to_json`, `require_secure_string`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `trust_decision_to_str`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `json_value_to_sync_value`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`
 
@@ -115,16 +115,25 @@ Future<void> configureEngine({required PrismSyncHandle handle}) =>
 /// The `old_password` parameter is accepted for API symmetry but is not
 /// used — `change_password` operates on the already-unlocked key hierarchy.
 /// The secret key is required to derive the new wrapping key.
-Future<void> changePassword({
+///
+/// Returns the next `identity_generation` value that the app should persist
+/// to synced settings. If local sharing is currently active, this also
+/// republishes the sharing identity and rotates the signed prekey under the
+/// incremented generation before re-wrapping the DEK.
+Future<int> changePassword({
   required PrismSyncHandle handle,
   required String oldPassword,
   required String newPassword,
   required List<int> secretKey,
+  String? sharingId,
+  required int currentIdentityGeneration,
 }) => RustLib.instance.api.crateApiChangePassword(
   handle: handle,
   oldPassword: oldPassword,
   newPassword: newPassword,
   secretKey: secretKey,
+  sharingId: sharingId,
+  currentIdentityGeneration: currentIdentityGeneration,
 );
 
 /// Record a new entity creation.
@@ -282,8 +291,7 @@ Future<String?> pollEvent({required PrismSyncHandle handle}) =>
 
 /// Create a new sync group (first device).
 ///
-/// Returns JSON with `qr_payload` (byte array), `words` (string array),
-/// `url` (deep link string), `sync_id`, and `relay_url`.
+/// Returns JSON containing `sync_id` and `relay_url`.
 ///
 /// The relay is constructed internally from the handle's `relay_url`.
 /// A placeholder `sync_id` is used for the registration call because the
@@ -308,69 +316,9 @@ Future<String> createSyncGroup({
 /// for flexible transport.
 ///
 /// Returns JSON: `{ "qr_payload": [...], "request_json": "...", "device_id": "..." }`
-Future<String> generatePairingRequest({required PrismSyncHandle handle}) =>
-    RustLib.instance.api.crateApiGeneratePairingRequest(handle: handle);
-
-/// Approve a pairing request from a joining device.
-///
-/// Called by an existing trusted device after scanning a joiner's QR code.
-/// Reads the current sync group credentials from SecureStore, builds a
-/// PairingResponse targeting the joiner's device, and returns it for
-/// transport back to the joiner (e.g. via QR, NFC, or paste).
-///
-/// Accepts the pairing request as either compact bytes (from QR scan) or JSON.
-///
-/// Returns JSON: `{ "qr_payload": [...], "response_json": "...", "url": "..." }`
-Future<String> approvePairingRequest({
+Future<String> preparePendingDeviceIdentity({
   required PrismSyncHandle handle,
-  Uint8List? requestBytes,
-  String? requestJson,
-}) => RustLib.instance.api.crateApiApprovePairingRequest(
-  handle: handle,
-  requestBytes: requestBytes,
-  requestJson: requestJson,
-);
-
-/// Join an existing sync group from QR payload bytes.
-///
-/// The relay is constructed on the Rust side from the invite's `relay_url`.
-Future<void> joinFromQr({
-  required PrismSyncHandle handle,
-  required List<int> qrBytes,
-  required String password,
-}) => RustLib.instance.api.crateApiJoinFromQr(
-  handle: handle,
-  qrBytes: qrBytes,
-  password: password,
-);
-
-/// Join an existing sync group from a deep link URL.
-///
-/// The relay is constructed on the Rust side from the invite's `relay_url`.
-Future<void> joinFromUrl({
-  required PrismSyncHandle handle,
-  required String url,
-  required String password,
-}) => RustLib.instance.api.crateApiJoinFromUrl(
-  handle: handle,
-  url: url,
-  password: password,
-);
-
-/// Join from a raw PairingResponse JSON string.
-///
-/// This is the most flexible join method — use it when you have the full
-/// pairing response (e.g. from a word-list lookup or manual entry).
-/// The relay is constructed on the Rust side from the response's `relay_url`.
-Future<void> joinFromResponseJson({
-  required PrismSyncHandle handle,
-  required String responseJson,
-  required String password,
-}) => RustLib.instance.api.crateApiJoinFromResponseJson(
-  handle: handle,
-  responseJson: responseJson,
-  password: password,
-);
+}) => RustLib.instance.api.crateApiPreparePendingDeviceIdentity(handle: handle);
 
 /// List devices in the sync group. Returns JSON array.
 ///
@@ -526,9 +474,11 @@ Future<String> drainSecureStore({required PrismSyncHandle handle}) =>
 Future<String> sharingEnable({
   required PrismSyncHandle handle,
   String? currentSharingId,
+  required int identityGeneration,
 }) => RustLib.instance.api.crateApiSharingEnable(
   handle: handle,
   currentSharingId: currentSharingId,
+  identityGeneration: identityGeneration,
 );
 
 /// Disable sharing by removing the identity bundle and signed prekeys from the relay.
@@ -544,21 +494,25 @@ Future<void> sharingDisable({
 Future<void> sharingEnsurePrekey({
   required PrismSyncHandle handle,
   required String sharingId,
+  required int identityGeneration,
 }) => RustLib.instance.api.crateApiSharingEnsurePrekey(
   handle: handle,
   sharingId: sharingId,
+  identityGeneration: identityGeneration,
 );
 
 /// Initiate sharing with a remote recipient and return the established pairwise secret.
 Future<String> sharingInitiate({
   required PrismSyncHandle handle,
   required String senderSharingId,
+  required int identityGeneration,
   required String recipientSharingId,
   required String displayName,
   required String offeredScopes,
 }) => RustLib.instance.api.crateApiSharingInitiate(
   handle: handle,
   senderSharingId: senderSharingId,
+  identityGeneration: identityGeneration,
   recipientSharingId: recipientSharingId,
   displayName: displayName,
   offeredScopes: offeredScopes,
@@ -573,11 +527,13 @@ Future<String> sharingInitiate({
 Future<String> sharingProcessPending({
   required PrismSyncHandle handle,
   required String recipientSharingId,
+  required int identityGeneration,
   required String existingRelationshipsJson,
   required String seenInitIdsJson,
 }) => RustLib.instance.api.crateApiSharingProcessPending(
   handle: handle,
   recipientSharingId: recipientSharingId,
+  identityGeneration: identityGeneration,
   existingRelationshipsJson: existingRelationshipsJson,
   seenInitIdsJson: seenInitIdsJson,
 );

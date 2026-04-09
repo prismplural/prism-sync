@@ -130,8 +130,12 @@ pub struct PublicFingerprint(pub [u8; 32]);
 impl PublicFingerprint {
     /// Fingerprint canonical public fields.
     ///
-    /// Uses labeled length-prefixed encoding consistent with
-    /// [`BootstrapTranscript`](super::transcript::BootstrapTranscript).
+    /// Uses a stable labeled public-field encoding:
+    /// `u16-BE(label_len) || label || u32-BE(data_len) || data`.
+    ///
+    /// This is intentionally separate from bootstrap transcript framing so
+    /// Phase 4 TOFU fingerprints remain stable even if transcript internals
+    /// evolve.
     pub fn from_public_fields(
         profile: BootstrapProfile,
         version: BootstrapVersion,

@@ -756,6 +756,7 @@ mod tests {
             Ok(crate::relay::traits::RegistrationNonceResponse {
                 nonce: "nonce".to_string(),
                 pow_challenge: None,
+                min_signature_version: None,
             })
         }
         async fn register_device(

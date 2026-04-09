@@ -39,6 +39,17 @@ pub struct SharingIdentityBundle {
     pub signature: Vec<u8>,
 }
 
+/// Public metadata extracted from a `SharingIdentityBundle` wire encoding.
+///
+/// This is useful when a caller needs to inspect the claimed `sharing_id` and
+/// `identity_generation` before deciding whether to pin or reject an identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharingIdentityMetadata {
+    pub version: BootstrapVersion,
+    pub sharing_id: String,
+    pub identity_generation: u32,
+}
+
 impl SharingIdentityBundle {
     /// Canonical binary encoding of the signed fields (everything except signature).
     ///
@@ -76,36 +87,38 @@ impl SharingIdentityBundle {
         buf
     }
 
+    /// Parse only the public metadata from wire-format bytes.
+    ///
+    /// This validates the full bundle framing, including the trailing signature
+    /// length and the absence of trailing data.
+    pub fn parse_metadata(data: &[u8]) -> Option<SharingIdentityMetadata> {
+        let parsed = parse_sharing_identity_wire(data)?;
+        Some(SharingIdentityMetadata {
+            version: parsed.version,
+            sharing_id: parsed.sharing_id.to_string(),
+            identity_generation: parsed.identity_generation,
+        })
+    }
+
+    /// Return the signed-content prefix from wire-format bytes.
+    ///
+    /// This validates the full bundle framing before returning the portion that
+    /// is covered by the hybrid self-signature.
+    pub fn signed_content_from_bytes(data: &[u8]) -> Option<&[u8]> {
+        let parsed = parse_sharing_identity_wire(data)?;
+        Some(&data[..parsed.signed_content_end])
+    }
+
     /// Parse from wire format with strict validation.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        let mut pos = 0;
-
-        let version = BootstrapVersion::from_byte(*data.get(pos)?)?;
-        pos += 1;
-
-        let sharing_id = read_len16_str(data, &mut pos)?;
-        let identity_generation = read_u32_be(data, &mut pos)?;
-        let ed25519_public_key = read_fixed::<ED25519_PK_LEN>(data, &mut pos)?;
-
-        let ml_dsa_65_public_key = read_len16_bytes(data, &mut pos)?;
-        if ml_dsa_65_public_key.len() != ML_DSA_65_PK_LEN {
-            return None;
-        }
-
-        let signature = read_len32_bytes(data, &mut pos)?;
-
-        // Reject trailing data
-        if pos != data.len() {
-            return None;
-        }
-
+        let parsed = parse_sharing_identity_wire(data)?;
         Some(Self {
-            version,
-            sharing_id,
-            identity_generation,
-            ed25519_public_key,
-            ml_dsa_65_public_key,
-            signature,
+            version: parsed.version,
+            sharing_id: parsed.sharing_id.to_string(),
+            identity_generation: parsed.identity_generation,
+            ed25519_public_key: parsed.ed25519_public_key,
+            ml_dsa_65_public_key: parsed.ml_dsa_65_public_key.to_vec(),
+            signature: parsed.signature.to_vec(),
         })
     }
 
@@ -133,7 +146,8 @@ impl SharingIdentityBundle {
             SHARING_IDENTITY_SIGNATURE_CONTEXT,
             ed25519_sk,
             ml_dsa_sk,
-        );
+        )
+        .expect("hardcoded sharing identity context should be <= 255 bytes");
         bundle.signature = hybrid_sig.to_bytes();
         bundle
     }
@@ -250,7 +264,8 @@ impl SignedPrekey {
             SIGNED_PREKEY_SIGNATURE_CONTEXT,
             ed25519_sk,
             ml_dsa_sk,
-        );
+        )
+        .expect("hardcoded signed prekey context should be <= 255 bytes");
         prekey.signature = hybrid_sig.to_bytes();
         prekey
     }
@@ -483,15 +498,6 @@ fn read_fixed<const N: usize>(data: &[u8], pos: &mut usize) -> Option<[u8; N]> {
     Some(arr)
 }
 
-fn read_u32_be(data: &[u8], pos: &mut usize) -> Option<u32> {
-    if *pos + 4 > data.len() {
-        return None;
-    }
-    let val = u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-    *pos += 4;
-    Some(val)
-}
-
 fn read_i64_be(data: &[u8], pos: &mut usize) -> Option<i64> {
     if *pos + 8 > data.len() {
         return None;
@@ -508,6 +514,82 @@ fn read_i64_be(data: &[u8], pos: &mut usize) -> Option<i64> {
     ]);
     *pos += 8;
     Some(val)
+}
+
+struct ParsedSharingIdentityWire<'a> {
+    version: BootstrapVersion,
+    sharing_id: &'a str,
+    identity_generation: u32,
+    ed25519_public_key: [u8; ED25519_PK_LEN],
+    ml_dsa_65_public_key: &'a [u8],
+    signature: &'a [u8],
+    signed_content_end: usize,
+}
+
+fn parse_sharing_identity_wire(data: &[u8]) -> Option<ParsedSharingIdentityWire<'_>> {
+    let mut pos = 0;
+
+    let version = BootstrapVersion::from_byte(*data.get(pos)?)?;
+    pos += 1;
+
+    if pos + 2 > data.len() {
+        return None;
+    }
+    let sharing_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    if pos + sharing_id_len > data.len() {
+        return None;
+    }
+    let sharing_id = std::str::from_utf8(&data[pos..pos + sharing_id_len]).ok()?;
+    pos += sharing_id_len;
+
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let identity_generation =
+        u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+    pos += 4;
+
+    if pos + ED25519_PK_LEN > data.len() {
+        return None;
+    }
+    let ed25519_public_key: [u8; ED25519_PK_LEN] =
+        data[pos..pos + ED25519_PK_LEN].try_into().ok()?;
+    pos += ED25519_PK_LEN;
+
+    if pos + 2 > data.len() {
+        return None;
+    }
+    let ml_dsa_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    if ml_dsa_len != ML_DSA_65_PK_LEN || pos + ml_dsa_len > data.len() {
+        return None;
+    }
+    let ml_dsa_65_public_key = &data[pos..pos + ml_dsa_len];
+    pos += ml_dsa_len;
+
+    let signed_content_end = pos;
+
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let signature_len =
+        u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+    pos += 4;
+    if pos + signature_len != data.len() {
+        return None;
+    }
+    let signature = &data[pos..pos + signature_len];
+
+    Some(ParsedSharingIdentityWire {
+        version,
+        sharing_id,
+        identity_generation,
+        ed25519_public_key,
+        ml_dsa_65_public_key,
+        signature,
+        signed_content_end,
+    })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -567,6 +649,26 @@ mod tests {
     }
 
     #[test]
+    fn identity_bundle_parse_metadata_round_trip() {
+        let (bundle, _, _) = sample_identity_bundle();
+        let bytes = bundle.to_bytes();
+        let metadata = SharingIdentityBundle::parse_metadata(&bytes).unwrap();
+
+        assert_eq!(metadata.version, bundle.version);
+        assert_eq!(metadata.sharing_id, bundle.sharing_id);
+        assert_eq!(metadata.identity_generation, bundle.identity_generation);
+    }
+
+    #[test]
+    fn identity_bundle_signed_content_from_bytes_matches_struct_encoding() {
+        let (bundle, _, _) = sample_identity_bundle();
+        let bytes = bundle.to_bytes();
+        let signed_content = SharingIdentityBundle::signed_content_from_bytes(&bytes).unwrap();
+
+        assert_eq!(signed_content, bundle.signed_content_bytes());
+    }
+
+    #[test]
     fn identity_bundle_sign_verify_happy() {
         let (bundle, _, _) = sample_identity_bundle();
         bundle.verify().unwrap();
@@ -604,6 +706,8 @@ mod tests {
         let mut bytes = bundle.to_bytes();
         bytes.push(0xFF);
         assert!(SharingIdentityBundle::from_bytes(&bytes).is_none());
+        assert!(SharingIdentityBundle::parse_metadata(&bytes).is_none());
+        assert!(SharingIdentityBundle::signed_content_from_bytes(&bytes).is_none());
     }
 
     #[test]

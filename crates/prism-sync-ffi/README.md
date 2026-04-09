@@ -57,10 +57,13 @@ Never edit files in `dart/packages/prism_sync/lib/generated/` manually -- they a
 ### Pairing
 | Function | Description |
 |----------|-------------|
-| `create_sync_group(handle, password, relay_url)` | Create new sync group, returns invite JSON |
-| `join_from_qr(handle, qr_bytes, password)` | Join from QR payload |
-| `join_from_url(handle, url, password)` | Join from deep link URL |
-| `join_from_response_json(handle, response_json, password)` | Join from raw pairing response |
+| `create_sync_group(handle, password, relay_url)` | Create a new sync group, returns sync metadata JSON |
+| `prepare_pending_device_identity(handle)` | Persist a pending joiner identity before relay-based pairing |
+| `create_pairing_session(handle)` | Create initiator-side relay rendezvous metadata |
+| `start_joiner_pairing(handle, relay_url, rendezvous_token)` | Start the relay-based joiner ceremony |
+| `start_initiator_pairing(handle, rendezvous_token)` | Start the relay-based initiator ceremony |
+| `poll_pairing_status(handle, rendezvous_token)` | Poll pairing state until SAS/credentials are ready |
+| `complete_pairing(handle, rendezvous_token, sas_confirmed, password)` | Complete the relay-based pairing ceremony |
 
 ### Device Management
 | Function | Description |

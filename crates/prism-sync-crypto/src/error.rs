@@ -27,6 +27,9 @@ pub enum CryptoError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("signature verification failed: {0}")]
     SignatureVerificationFailed(String),
 }

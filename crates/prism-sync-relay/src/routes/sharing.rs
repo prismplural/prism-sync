@@ -18,8 +18,77 @@ fn is_valid_sharing_id(sharing_id: &str) -> bool {
     sharing_id.len() == 32 && sharing_id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+const SHARING_BUNDLE_VERSION_V1: u8 = 0x01;
+const ED25519_PK_LEN: usize = 32;
+const ML_DSA_65_PK_LEN: usize = 1952;
+
 fn client_ip_key(peer_addr: SocketAddr) -> String {
     peer_addr.ip().to_string()
+}
+
+fn read_len16_bytes(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    if *pos + 2 > data.len() {
+        return None;
+    }
+    let len = u16::from_be_bytes([data[*pos], data[*pos + 1]]) as usize;
+    *pos += 2;
+    if *pos + len > data.len() {
+        return None;
+    }
+    let out = data[*pos..*pos + len].to_vec();
+    *pos += len;
+    Some(out)
+}
+
+fn read_len32_bytes(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    if *pos + 4 > data.len() {
+        return None;
+    }
+    let len =
+        u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+    *pos += 4;
+    if *pos + len > data.len() {
+        return None;
+    }
+    let out = data[*pos..*pos + len].to_vec();
+    *pos += len;
+    Some(out)
+}
+
+fn parse_identity_bundle_metadata(data: &[u8]) -> Option<(String, u32)> {
+    let mut pos = 0;
+
+    if *data.get(pos)? != SHARING_BUNDLE_VERSION_V1 {
+        return None;
+    }
+    pos += 1;
+
+    let sharing_id = String::from_utf8(read_len16_bytes(data, &mut pos)?).ok()?;
+    let identity_generation = u32::from_be_bytes([
+        *data.get(pos)?,
+        *data.get(pos + 1)?,
+        *data.get(pos + 2)?,
+        *data.get(pos + 3)?,
+    ]);
+    pos += 4;
+
+    if pos + ED25519_PK_LEN > data.len() {
+        return None;
+    }
+    pos += ED25519_PK_LEN;
+
+    let ml_dsa_65_public_key = read_len16_bytes(data, &mut pos)?;
+    if ml_dsa_65_public_key.len() != ML_DSA_65_PK_LEN {
+        return None;
+    }
+
+    let _signature = read_len32_bytes(data, &mut pos)?;
+
+    if pos != data.len() {
+        return None;
+    }
+
+    Some((sharing_id, identity_generation))
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +132,13 @@ pub async fn put_identity(
         return Err(AppError::PayloadTooLarge("identity_bundle too large"));
     }
 
+    let (bundle_sharing_id, identity_generation) = parse_identity_bundle_metadata(&bundle).ok_or(
+        AppError::BadRequest("Invalid identity_bundle canonical format"),
+    )?;
+    if bundle_sharing_id != req.sharing_id {
+        return Err(AppError::BadRequest("identity_bundle sharing_id mismatch"));
+    }
+
     let db = state.db.clone();
     let sync_id = auth.sync_id.clone();
     let sharing_id = req.sharing_id;
@@ -75,8 +151,7 @@ pub async fn put_identity(
                 return Err(rusqlite::Error::QueryReturnedNoRows); // sentinel
             }
             let now = db::now_secs();
-            db::upsert_sharing_identity(conn, &sharing_id, &bundle, now)?;
-            Ok(true)
+            db::upsert_sharing_identity(conn, &sharing_id, &bundle, identity_generation, now)
         })
     })
     .await
@@ -86,6 +161,13 @@ pub async fn put_identity(
             AppError::Conflict("sharing_id/sync_id mapping conflict")
         } else {
             AppError::Internal(e.to_string())
+        }
+    })
+    .and_then(|stored| {
+        if stored {
+            Ok(())
+        } else {
+            Err(AppError::Conflict("identity_generation rollback"))
         }
     })?;
 
@@ -218,11 +300,7 @@ pub async fn get_bundle(
     let now = db::now_secs();
     let max_age = state.config.prekey_serve_max_age_secs;
     if created_at < now - max_age {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "recipient_prekey_stale"})),
-        )
-            .into_response());
+        return Err(AppError::NotFound);
     }
 
     let b64 = base64::engine::general_purpose::STANDARD;

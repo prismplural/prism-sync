@@ -195,7 +195,7 @@ async fn test_pairing_create_and_join() {
     let store_a = memory_secure_store();
     let service_a = PairingService::new(relay_a, store_a.clone());
 
-    let (credentials, invite) = service_a
+    let (credentials, response) = service_a
         .create_sync_group(
             "shared-password",
             "wss://relay.example.com",
@@ -225,21 +225,21 @@ async fn test_pairing_create_and_join() {
     );
     assert!(!credentials.salt.is_empty(), "salt must not be empty");
 
-    // Invite must reference the same sync_id.
+    // Pairing response must reference the same sync_id.
     assert_eq!(
-        invite.response().sync_id,
+        response.sync_id,
         credentials.sync_id,
-        "invite sync_id must match credentials sync_id"
+        "pairing response sync_id must match credentials sync_id"
     );
     assert_eq!(
-        invite.response().relay_url,
+        response.relay_url,
         "wss://relay.example.com",
-        "invite relay_url must match"
+        "pairing response relay_url must match"
     );
     assert_eq!(
-        invite.response().admission_context(),
+        response.admission_context(),
         "first_device",
-        "initial invite should be a first-device snapshot"
+        "initial pairing response should be a first-device snapshot"
     );
 
     // Device A credentials must be persisted to the secure store.
@@ -259,7 +259,7 @@ async fn test_pairing_create_and_join() {
     let service_b = PairingService::new(relay_b, store_b.clone());
 
     let (key_hierarchy_b, snapshot) = service_b
-        .join_sync_group(invite.response(), "shared-password")
+        .join_sync_group(&response, "shared-password")
         .await
         .expect("join_sync_group with correct password should succeed");
 
@@ -309,7 +309,7 @@ async fn test_pairing_create_and_join() {
     let service_c = PairingService::new(relay_c, store_c);
 
     let bad_join = service_c
-        .join_sync_group(invite.response(), "wrong-password")
+        .join_sync_group(&response, "wrong-password")
         .await;
     assert!(
         bad_join.is_err(),

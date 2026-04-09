@@ -116,7 +116,8 @@ impl ServerRelay {
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
             b"http_request",
             &signing_data,
-        );
+        )
+        .expect("hardcoded http request context should be <= 255 bytes");
         let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
             ed25519_sig: self.request_signing_key.sign(&m_prime).to_bytes().to_vec(),
             ml_dsa_65_sig: self.request_ml_dsa_signing_key.sign(&m_prime),
@@ -182,9 +183,29 @@ impl ServerRelay {
                     message: format!("HTTP {status}: {body}"),
                 }
             }
-            403 => RelayError::Auth {
-                message: format!("HTTP {status}: {body}"),
-            },
+            403 => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                    if json.get("error").and_then(|v| v.as_str()) == Some("upgrade_required") {
+                        let min_signature_version = json
+                            .get("min_signature_version")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| u8::try_from(v).ok())
+                            .unwrap_or(3);
+                        let message = json
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+                        return RelayError::UpgradeRequired {
+                            min_signature_version,
+                            message,
+                        };
+                    }
+                }
+                RelayError::Auth {
+                    message: format!("HTTP {status}: {body}"),
+                }
+            }
             408 | 504 => RelayError::Timeout {
                 message: format!("HTTP {status}: {body}"),
             },
@@ -802,5 +823,21 @@ mod tests {
         let err = ServerRelay::classify_error(401, r#"{"error":"something_else"}"#);
 
         assert!(matches!(err, RelayError::Auth { .. }));
+    }
+
+    #[test]
+    fn classify_error_parses_upgrade_required_response() {
+        let err = ServerRelay::classify_error(
+            403,
+            r#"{"error":"upgrade_required","min_signature_version":3,"message":"update"}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::UpgradeRequired {
+                min_signature_version: 3,
+                ref message,
+            } if message == "update"
+        ));
     }
 }

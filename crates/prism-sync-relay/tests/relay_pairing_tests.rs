@@ -321,6 +321,80 @@ async fn test_pairing_invalid_base64_returns_400() {
 }
 
 #[tokio::test]
+async fn test_pairing_rate_limiting_ignores_spoofed_forwarded_headers() {
+    let config = Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 10_000,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
+        snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: true,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
+        pairing_session_ttl_secs: 300,
+        pairing_session_rate_limit: 1,
+        pairing_session_max_payload_bytes: 65536,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 100,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
+    };
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let bootstrap = base64::engine::general_purpose::STANDARD.encode(b"bootstrap");
+
+    let resp = client
+        .post(format!("{url}/v1/pairing"))
+        .header("x-forwarded-for", "203.0.113.10")
+        .json(&serde_json::json!({ "joiner_bootstrap": bootstrap }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let resp = client
+        .post(format!("{url}/v1/pairing"))
+        .header("x-forwarded-for", "198.51.100.77")
+        .json(&serde_json::json!({ "joiner_bootstrap": bootstrap }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        429,
+        "spoofed forwarded headers must not bypass pairing rate limits"
+    );
+}
+
+#[tokio::test]
 async fn test_pairing_payload_too_large_returns_413() {
     let config = Config {
         port: 0,

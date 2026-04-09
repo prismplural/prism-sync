@@ -22,9 +22,11 @@ use crate::relay::traits::{
 };
 use crate::relay::SyncRelay;
 use crate::secure_store::SecureStore;
-use prism_sync_crypto::{mnemonic, DeviceSecret, DeviceSigningKey, KeyHierarchy};
+use prism_sync_crypto::{mnemonic, DeviceSecret, KeyHierarchy};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
+
+const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
 
 /// Orchestrates sync group creation and joining.
 ///
@@ -44,12 +46,45 @@ impl PairingService {
         }
     }
 
+    fn ratchet_min_signature_version(&self, observed: Option<u8>) -> Result<()> {
+        let Some(observed) = observed else {
+            return Ok(());
+        };
+
+        let current = self
+            .secure_store
+            .get(MIN_SIGNATURE_VERSION_FLOOR_KEY)?
+            .map(|bytes| {
+                let value = String::from_utf8(bytes).map_err(|e| {
+                    CoreError::Crypto(prism_sync_crypto::CryptoError::Serialization(format!(
+                        "invalid UTF-8 in {MIN_SIGNATURE_VERSION_FLOOR_KEY}: {e}"
+                    )))
+                })?;
+                value.parse::<u8>().map_err(|e| {
+                    CoreError::Crypto(prism_sync_crypto::CryptoError::Serialization(format!(
+                        "invalid integer in {MIN_SIGNATURE_VERSION_FLOOR_KEY}: {e}"
+                    )))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+
+        if observed > current {
+            self.secure_store.set(
+                MIN_SIGNATURE_VERSION_FLOOR_KEY,
+                observed.to_string().as_bytes(),
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Create a new sync group (first device).
     ///
     /// 1. Generates a BIP39 mnemonic (or uses `mnemonic_override`).
     /// 2. Initializes a `KeyHierarchy` with `password + mnemonic`.
     /// 3. Generates a unique `sync_id`.
-    /// 4. Builds `SyncGroupCredentials` and an `Invite`.
+    /// 4. Builds `SyncGroupCredentials` and the first-device pairing response.
     /// 5. Generates a device identity and registers with the relay.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_sync_group(
@@ -61,7 +96,7 @@ impl PairingService {
         nonce_response_override: Option<RegistrationNonceResponse>,
         first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
         registration_token: Option<String>,
-    ) -> Result<(SyncGroupCredentials, Invite)> {
+    ) -> Result<(SyncGroupCredentials, PairingResponse)> {
         // 1. Generate or accept mnemonic
         let mnemonic_str = mnemonic_override.unwrap_or_else(mnemonic::generate);
         let secret_key = mnemonic::to_bytes(&mnemonic_str).map_err(CoreError::Crypto)?;
@@ -120,7 +155,8 @@ impl PairingService {
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
             b"invitation",
             &signing_data,
-        );
+        )
+        .expect("hardcoded invitation context should be <= 255 bytes");
         let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
             ed25519_sig: signing_key.sign(&m_prime),
             ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
@@ -141,7 +177,7 @@ impl PairingService {
         }]);
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
-        // 8. Build PairingResponse for the Invite
+        // 8. Build the first-device pairing response.
         let response = PairingResponse {
             relay_url: relay_url.to_string(),
             sync_id: sync_id.clone(),
@@ -169,6 +205,7 @@ impl PairingService {
                 .await
                 .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?,
         };
+        self.ratchet_min_signature_version(nonce_response.min_signature_version)?;
         let pow_solution = solve_registration_pow(&sync_id, &device_id, &nonce_response)?;
         let nonce = nonce_response.nonce;
 
@@ -200,6 +237,7 @@ impl PairingService {
             .register_device(register_req)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
+        self.ratchet_min_signature_version(register_response.min_signature_version)?;
 
         // 11. Persist credentials and device identity to secure store
         self.secure_store.set(
@@ -219,7 +257,7 @@ impl PairingService {
         self.secure_store.set("device_id", device_id.as_bytes())?;
         self.secure_store.set("epoch", b"0")?;
 
-        Ok((credentials, Invite::new(response)))
+        Ok((credentials, response))
     }
 
     /// Join an existing sync group (second+ device).
@@ -251,61 +289,40 @@ impl PairingService {
             .clone()
             .try_into()
             .map_err(|_| CoreError::Engine("invalid inviter public key length".into()))?;
-
-        let has_inviter_pq = !response.inviter_ml_dsa_65_pk.is_empty();
+        if response.inviter_ml_dsa_65_pk.is_empty() {
+            return Err(CoreError::Engine(
+                "pairing response missing inviter ML-DSA public key".into(),
+            ));
+        }
 
         let sig_bytes = prism_sync_crypto::hex::decode(&response.signed_invitation)
             .map_err(CoreError::Crypto)?;
-
-        if has_inviter_pq {
-            // V3 hybrid invitation verification
-            let signing_data = build_invitation_signing_data_v2(
-                &response.sync_id,
-                &response.relay_url,
-                &response.wrapped_dek,
-                &response.salt,
-                &response.inviter_device_id,
-                &inviter_pk,
-                &response.inviter_ml_dsa_65_pk,
-                response.joiner_device_id.as_deref(),
-                response.current_epoch,
-                &response.epoch_key,
-            );
-            verify_hybrid_invitation(
-                &signing_data,
-                &sig_bytes,
-                &inviter_pk,
-                &response.inviter_ml_dsa_65_pk,
-            )?;
-        } else {
-            // V1 Ed25519-only invitation verification (backward compat)
-            let signing_data = build_invitation_signing_data(
-                &response.sync_id,
-                &response.relay_url,
-                &response.wrapped_dek,
-                &response.salt,
-                &response.inviter_device_id,
-                &inviter_pk,
-                response.joiner_device_id.as_deref(),
-                response.current_epoch,
-                &response.epoch_key,
-            );
-            DeviceSigningKey::verify(&inviter_pk, &signing_data, &sig_bytes)
-                .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?;
-        }
+        let signing_data = build_invitation_signing_data_v2(
+            &response.sync_id,
+            &response.relay_url,
+            &response.wrapped_dek,
+            &response.salt,
+            &response.inviter_device_id,
+            &inviter_pk,
+            &response.inviter_ml_dsa_65_pk,
+            response.joiner_device_id.as_deref(),
+            response.current_epoch,
+            &response.epoch_key,
+        );
+        verify_hybrid_invitation(
+            &signing_data,
+            &sig_bytes,
+            &inviter_pk,
+            &response.inviter_ml_dsa_65_pk,
+        )?;
 
         // 1b. Verify and decode the signed registry snapshot
-        let registry_snapshot = if has_inviter_pq {
-            SignedRegistrySnapshot::verify_and_decode_hybrid(
-                &response.signed_keyring,
-                &inviter_pk,
-                &response.inviter_ml_dsa_65_pk,
-            )
-            .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
-        } else {
-            SignedRegistrySnapshot::verify_and_decode(&response.signed_keyring, &inviter_pk)
-                .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
-        };
+        let registry_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &response.signed_keyring,
+            &inviter_pk,
+            &response.inviter_ml_dsa_65_pk,
+        )
+        .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?;
 
         // 2. Unlock key hierarchy
         let secret_key = mnemonic::to_bytes(&response.mnemonic).map_err(CoreError::Crypto)?;
@@ -338,6 +355,7 @@ impl PairingService {
             .get_registration_nonce()
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
+        self.ratchet_min_signature_version(nonce_response.min_signature_version)?;
         let pow_solution = solve_registration_pow(&response.sync_id, &device_id, &nonce_response)?;
         let nonce = nonce_response.nonce;
 
@@ -377,6 +395,7 @@ impl PairingService {
             })
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
+        self.ratchet_min_signature_version(join_register_response.min_signature_version)?;
 
         // 6. Persist credentials to secure store (with rollback marker)
         self.secure_store
@@ -474,18 +493,17 @@ impl PairingService {
             .clone()
             .try_into()
             .map_err(|_| CoreError::Engine("invalid inviter public key length".into()))?;
-        let has_inviter_pq = !bundle.inviter_ml_dsa_65_pk.is_empty();
-        let registry_snapshot = if has_inviter_pq {
-            SignedRegistrySnapshot::verify_and_decode_hybrid(
-                &bundle.signed_keyring,
-                &inviter_pk,
-                &bundle.inviter_ml_dsa_65_pk,
-            )
-            .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
-        } else {
-            SignedRegistrySnapshot::verify_and_decode(&bundle.signed_keyring, &inviter_pk)
-                .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?
-        };
+        if bundle.inviter_ml_dsa_65_pk.is_empty() {
+            return Err(CoreError::Engine(
+                "credential bundle missing inviter ML-DSA public key".into(),
+            ));
+        }
+        let registry_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &bundle.signed_keyring,
+            &inviter_pk,
+            &bundle.inviter_ml_dsa_65_pk,
+        )
+        .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?;
 
         let secret_key = mnemonic::to_bytes(&bundle.mnemonic).map_err(CoreError::Crypto)?;
         let mut key_hierarchy = KeyHierarchy::new();
@@ -514,6 +532,7 @@ impl PairingService {
             .get_registration_nonce()
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
+        self.ratchet_min_signature_version(nonce_response.min_signature_version)?;
         let pow_solution = solve_registration_pow(&sync_id, &device_id, &nonce_response)?;
         let nonce = nonce_response.nonce;
 
@@ -553,6 +572,7 @@ impl PairingService {
             })
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
+        self.ratchet_min_signature_version(register_response.min_signature_version)?;
 
         self.secure_store
             .set("setup_rollback_marker", b"in_progress")?;
@@ -719,7 +739,8 @@ impl PairingService {
         let m_prime_approval = prism_sync_crypto::pq::build_hybrid_message_representative(
             b"registry_approval",
             &approval_data,
-        );
+        )
+        .expect("hardcoded registry approval context should be <= 255 bytes");
         let hybrid_approval = prism_sync_crypto::pq::HybridSignature {
             ed25519_sig: signing_key.sign(&m_prime_approval),
             ml_dsa_65_sig: pq_signing_key.sign(&m_prime_approval),
@@ -964,7 +985,8 @@ fn build_hybrid_challenge_signature(
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
         b"device_challenge",
         &challenge_data,
-    );
+    )
+    .expect("hardcoded device challenge context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: signing_key.sign(&m_prime),
         ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
@@ -1157,6 +1179,7 @@ mod tests {
             Ok(RegistrationNonceResponse {
                 nonce: uuid::Uuid::new_v4().to_string(),
                 pow_challenge: None,
+                min_signature_version: None,
             })
         }
         async fn register_device(
@@ -1165,6 +1188,7 @@ mod tests {
         ) -> std::result::Result<RegisterResponse, RelayError> {
             Ok(RegisterResponse {
                 device_session_token: "mock-session-token".to_string(),
+                min_signature_version: None,
             })
         }
         async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> {
@@ -1271,6 +1295,7 @@ mod tests {
             Ok(RegistrationNonceResponse {
                 nonce: "bootstrap-nonce".to_string(),
                 pow_challenge: None,
+                min_signature_version: None,
             })
         }
         async fn register_device(
@@ -1291,6 +1316,7 @@ mod tests {
             });
             Ok(RegisterResponse {
                 device_session_token: "mock-session-token".to_string(),
+                min_signature_version: None,
             })
         }
         async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> {
@@ -1635,7 +1661,7 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(relay, store.clone());
 
-        let (creds, invite) = service
+        let (creds, response) = service
             .create_sync_group(
                 "test-password",
                 "wss://relay.example.com",
@@ -1654,9 +1680,9 @@ mod tests {
         assert!(!creds.wrapped_dek.is_empty());
         assert!(!creds.salt.is_empty());
 
-        // Invite should reference same sync_id
-        assert_eq!(invite.response().sync_id, creds.sync_id);
-        assert_eq!(invite.response().relay_url, "wss://relay.example.com");
+        // Response should reference same sync_id
+        assert_eq!(response.sync_id, creds.sync_id);
+        assert_eq!(response.relay_url, "wss://relay.example.com");
 
         // Credentials should be persisted
         let stored_id = store.get("sync_id").unwrap().unwrap();
@@ -1669,7 +1695,7 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(relay, store.clone());
 
-        let (_creds, _invite) = service
+        let (_creds, _response) = service
             .create_sync_group(
                 "test-password",
                 "wss://relay.example.com",
@@ -1700,7 +1726,7 @@ mod tests {
         let service = PairingService::new(relay, store.clone());
 
         // Create a sync group first to get valid credentials
-        let (_creds, invite) = service
+        let (_creds, response) = service
             .create_sync_group(
                 "my-password",
                 "wss://relay.example.com",
@@ -1713,12 +1739,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Now join using the invite's response
+        // Now join using the pairing response
         let join_store = Arc::new(MemStore::default());
         let join_service = PairingService::new(Arc::new(MockRelay), join_store.clone());
 
         let (kh, snapshot) = join_service
-            .join_sync_group(invite.response(), "my-password")
+            .join_sync_group(&response, "my-password")
             .await
             .unwrap();
 
@@ -1736,7 +1762,7 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(relay, store);
 
-        let (_creds, invite) = service
+        let (_creds, response) = service
             .create_sync_group(
                 "correct-password",
                 "wss://relay.example.com",
@@ -1752,9 +1778,7 @@ mod tests {
         let join_store = Arc::new(MemStore::default());
         let join_service = PairingService::new(Arc::new(MockRelay), join_store);
 
-        let result = join_service
-            .join_sync_group(invite.response(), "wrong-password")
-            .await;
+        let result = join_service.join_sync_group(&response, "wrong-password").await;
         assert!(result.is_err());
     }
 
@@ -1822,7 +1846,7 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(relay, store);
 
-        let (_creds, invite) = service
+        let (_creds, resp) = service
             .create_sync_group(
                 "test-pw",
                 "wss://relay.example.com",
@@ -1834,8 +1858,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-        let resp = invite.response();
 
         // The signed_invitation should be non-empty (hex-encoded V3 hybrid signature)
         assert!(!resp.signed_invitation.is_empty());
@@ -1911,7 +1933,7 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(relay, store);
 
-        let (_creds, invite) = service
+        let (_creds, response) = service
             .create_sync_group(
                 "test-pw",
                 "wss://relay.example.com",
@@ -1925,7 +1947,7 @@ mod tests {
             .unwrap();
 
         // Tamper with the sync_id in the response
-        let mut tampered = invite.response().clone();
+        let mut tampered = response.clone();
         tampered.sync_id = "tampered-sync-id".into();
 
         let join_store = Arc::new(MemStore::default());
@@ -1948,7 +1970,7 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(relay, store);
 
-        let (_creds, invite) = service
+        let (_creds, response) = service
             .create_sync_group(
                 "test-pw",
                 "wss://relay.example.com",
@@ -1962,7 +1984,7 @@ mod tests {
             .unwrap();
 
         // Replace the inviter's public key with a different key
-        let mut tampered = invite.response().clone();
+        let mut tampered = response.clone();
         let fake_secret = DeviceSecret::generate();
         let fake_key = fake_secret.ed25519_keypair("fake").unwrap();
         tampered.inviter_ed25519_pk = fake_key.public_key_bytes().to_vec();
@@ -1989,6 +2011,7 @@ mod tests {
                 algorithm: "sha256_leading_zero_bits".to_string(),
                 difficulty_bits: 8,
             }),
+            min_signature_version: None,
         };
 
         let solution = solve_registration_pow("sync-id", "device-id", &nonce_response)
@@ -2012,6 +2035,7 @@ mod tests {
                 algorithm: "argon2id".to_string(),
                 difficulty_bits: 8,
             }),
+            min_signature_version: None,
         };
 
         let err = solve_registration_pow("sync-id", "device-id", &nonce_response).unwrap_err();
@@ -2038,6 +2062,7 @@ mod tests {
                 Ok(RegistrationNonceResponse {
                     nonce: "test-nonce-12345".to_string(),
                     pow_challenge: None,
+                    min_signature_version: None,
                 })
             }
             async fn register_device(
@@ -2047,6 +2072,7 @@ mod tests {
                 *self.captured_req.lock().unwrap() = Some(req);
                 Ok(RegisterResponse {
                     device_session_token: "mock-token".to_string(),
+                    min_signature_version: None,
                 })
             }
             async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
@@ -2168,6 +2194,7 @@ mod tests {
                 Ok(RegistrationNonceResponse {
                     nonce: "join-nonce".to_string(),
                     pow_challenge: None,
+                    min_signature_version: None,
                 })
             }
             async fn register_device(
@@ -2177,6 +2204,7 @@ mod tests {
                 *self.captured_req.lock().unwrap() = Some(req);
                 Ok(RegisterResponse {
                     device_session_token: "mock-token".to_string(),
+                    min_signature_version: None,
                 })
             }
             async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
@@ -2254,11 +2282,15 @@ mod tests {
         let inviter_device_id = "inviter-001".to_string();
         let inviter_signing_key = inviter_secret.ed25519_keypair(&inviter_device_id).unwrap();
         let inviter_exchange_key = inviter_secret.x25519_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_signing_key = inviter_secret.ml_dsa_65_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_kem_key = inviter_secret.ml_kem_768_keypair(&inviter_device_id).unwrap();
 
         let joiner_secret = DeviceSecret::generate();
         let joiner_device_id = "joiner-001".to_string();
         let joiner_signing_key = joiner_secret.ed25519_keypair(&joiner_device_id).unwrap();
         let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
 
         let snapshot = SignedRegistrySnapshot::new(vec![
             RegistrySnapshotEntry {
@@ -2266,8 +2298,8 @@ mod tests {
                 device_id: inviter_device_id.clone(),
                 ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -2275,19 +2307,26 @@ mod tests {
                 device_id: joiner_device_id.clone(),
                 ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
+                ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
             },
         ]);
-        let signed_keyring = snapshot.sign(&inviter_signing_key);
-        let approval_signature = hex::encode(inviter_signing_key.sign(
-            &build_registry_approval_signing_data(
-                "sync-approved",
-                &inviter_device_id,
-                &signed_keyring,
-            ),
-        ));
+        let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);
+        let approval_data =
+            build_registry_approval_signing_data_v2("sync-approved", &inviter_device_id, &signed_keyring);
+        let approval_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"registry_approval",
+            &approval_data,
+        )
+        .unwrap();
+        let hybrid_approval = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: inviter_signing_key.sign(&approval_m_prime),
+            ml_dsa_65_sig: inviter_pq_signing_key.sign(&approval_m_prime),
+        };
+        let mut approval_wire = vec![0x03u8];
+        approval_wire.extend_from_slice(&hybrid_approval.to_bytes());
+        let approval_signature = hex::encode(&approval_wire);
 
         let mnemonic = mnemonic::generate();
         let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
@@ -2295,17 +2334,29 @@ mod tests {
         let (wrapped_dek, salt) = key_hierarchy
             .initialize("test-password", &secret_key)
             .unwrap();
-        let signing_data = build_invitation_signing_data(
+        let signing_data = build_invitation_signing_data_v2(
             "sync-approved",
             "wss://relay.example.com",
             &wrapped_dek,
             &salt,
             &inviter_device_id,
             &inviter_signing_key.public_key_bytes(),
+            &inviter_pq_signing_key.public_key_bytes(),
             Some(&joiner_device_id),
             0,
             &[],
         );
+        let invitation_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"invitation",
+            &signing_data,
+        )
+        .unwrap();
+        let invitation_sig = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: inviter_signing_key.sign(&invitation_m_prime),
+            ml_dsa_65_sig: inviter_pq_signing_key.sign(&invitation_m_prime),
+        };
+        let mut invitation_wire = vec![0x03u8];
+        invitation_wire.extend_from_slice(&invitation_sig.to_bytes());
 
         let response = PairingResponse {
             relay_url: "wss://relay.example.com".into(),
@@ -2313,11 +2364,11 @@ mod tests {
             mnemonic,
             wrapped_dek,
             salt,
-            signed_invitation: hex::encode(inviter_signing_key.sign(&signing_data)),
+            signed_invitation: hex::encode(&invitation_wire),
             signed_keyring: signed_keyring.clone(),
             inviter_device_id: inviter_device_id.clone(),
             inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
-            inviter_ml_dsa_65_pk: Vec::new(),
+            inviter_ml_dsa_65_pk: inviter_pq_signing_key.public_key_bytes(),
             joiner_device_id: Some(joiner_device_id.clone()),
             current_epoch: 0,
             epoch_key: vec![],
@@ -2373,11 +2424,15 @@ mod tests {
         let inviter_device_id = "inviter-001".to_string();
         let inviter_signing_key = inviter_secret.ed25519_keypair(&inviter_device_id).unwrap();
         let inviter_exchange_key = inviter_secret.x25519_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_signing_key = inviter_secret.ml_dsa_65_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_kem_key = inviter_secret.ml_kem_768_keypair(&inviter_device_id).unwrap();
 
         let joiner_device_id = "joiner-001".to_string();
         let joiner_secret = DeviceSecret::generate();
         let joiner_signing_key = joiner_secret.ed25519_keypair(&joiner_device_id).unwrap();
         let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
 
         let snapshot = SignedRegistrySnapshot::new(vec![
             RegistrySnapshotEntry {
@@ -2385,8 +2440,8 @@ mod tests {
                 device_id: inviter_device_id.clone(),
                 ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
             },
             RegistrySnapshotEntry {
@@ -2394,19 +2449,26 @@ mod tests {
                 device_id: joiner_device_id.clone(),
                 ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
                 x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
+                ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
             },
         ]);
-        let signed_keyring = snapshot.sign(&inviter_signing_key);
-        let approval_signature = hex::encode(inviter_signing_key.sign(
-            &build_registry_approval_signing_data(
-                "sync-approved",
-                &inviter_device_id,
-                &signed_keyring,
-            ),
-        ));
+        let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);
+        let approval_data =
+            build_registry_approval_signing_data_v2("sync-approved", &inviter_device_id, &signed_keyring);
+        let approval_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"registry_approval",
+            &approval_data,
+        )
+        .unwrap();
+        let hybrid_approval = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: inviter_signing_key.sign(&approval_m_prime),
+            ml_dsa_65_sig: inviter_pq_signing_key.sign(&approval_m_prime),
+        };
+        let mut approval_wire = vec![0x03u8];
+        approval_wire.extend_from_slice(&hybrid_approval.to_bytes());
+        let approval_signature = hex::encode(&approval_wire);
 
         let mnemonic = mnemonic::generate();
         let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
@@ -2414,17 +2476,29 @@ mod tests {
         let (wrapped_dek, salt) = key_hierarchy
             .initialize("test-password", &secret_key)
             .unwrap();
-        let signing_data = build_invitation_signing_data(
+        let signing_data = build_invitation_signing_data_v2(
             "sync-approved",
             "wss://relay.example.com",
             &wrapped_dek,
             &salt,
             &inviter_device_id,
             &inviter_signing_key.public_key_bytes(),
+            &inviter_pq_signing_key.public_key_bytes(),
             Some(&joiner_device_id),
             0,
             &[],
         );
+        let invitation_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            b"invitation",
+            &signing_data,
+        )
+        .unwrap();
+        let invitation_sig = prism_sync_crypto::pq::HybridSignature {
+            ed25519_sig: inviter_signing_key.sign(&invitation_m_prime),
+            ml_dsa_65_sig: inviter_pq_signing_key.sign(&invitation_m_prime),
+        };
+        let mut invitation_wire = vec![0x03u8];
+        invitation_wire.extend_from_slice(&invitation_sig.to_bytes());
 
         let response = PairingResponse {
             relay_url: "wss://relay.example.com".into(),
@@ -2432,11 +2506,11 @@ mod tests {
             mnemonic,
             wrapped_dek,
             salt,
-            signed_invitation: hex::encode(inviter_signing_key.sign(&signing_data)),
+            signed_invitation: hex::encode(&invitation_wire),
             signed_keyring,
             inviter_device_id,
             inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
-            inviter_ml_dsa_65_pk: Vec::new(),
+            inviter_ml_dsa_65_pk: inviter_pq_signing_key.public_key_bytes(),
             joiner_device_id: Some(joiner_device_id),
             current_epoch: 0,
             epoch_key: vec![],

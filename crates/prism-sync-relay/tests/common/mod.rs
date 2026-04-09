@@ -158,7 +158,8 @@ pub fn sign_hybrid_challenge(
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
         b"device_challenge",
         &data,
-    );
+    )
+    .expect("hardcoded device challenge context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -218,7 +219,8 @@ pub fn apply_signed_headers_hybrid(
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
         b"http_request",
         &signing_data,
-    );
+    )
+    .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -509,7 +511,8 @@ pub fn build_signed_registry_snapshot_hybrid(
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
         b"registry_snapshot",
         &signing_data,
-    );
+    )
+    .expect("hardcoded registry snapshot context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -569,7 +572,8 @@ pub fn build_registry_approval_hybrid(
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
         b"registry_approval",
         &approval_data,
-    );
+    )
+    .expect("hardcoded registry approval context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: approver_ed25519_key
             .sign(&m_prime)

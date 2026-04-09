@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,6 +102,12 @@ fn generate_session_token() -> String {
 fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn hash_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
     hex::encode(hasher.finalize())
 }
 
@@ -411,9 +417,20 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         -- Sharing identity bundles (post-quantum sharing bootstrap)
         CREATE TABLE IF NOT EXISTS sharing_identity_bundles (
-            sharing_id       TEXT PRIMARY KEY,
-            identity_bundle  BLOB NOT NULL,
-            updated_at       INTEGER NOT NULL
+            sharing_id            TEXT PRIMARY KEY,
+            identity_bundle       BLOB NOT NULL,
+            identity_generation   INTEGER NOT NULL DEFAULT 0,
+            updated_at            INTEGER NOT NULL
+        );
+
+        -- Persistent relay-side high-water marks for sharing identity generations.
+        -- These survive identity deletion so disable/re-enable cannot roll back
+        -- generation for a stable sharing_id.
+        CREATE TABLE IF NOT EXISTS sharing_identity_generation_floors (
+            sharing_id               TEXT PRIMARY KEY,
+            max_identity_generation  INTEGER NOT NULL DEFAULT 0,
+            identity_bundle_hash     TEXT,
+            updated_at               INTEGER NOT NULL
         );
 
         -- Sharing signed prekeys
@@ -468,6 +485,8 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_snapshots_ephemeral(conn)?;
     migrate_devices_remote_wipe(conn)?;
     migrate_devices_pq_columns(conn)?;
+    migrate_sharing_identity_generation(conn)?;
+    migrate_sharing_identity_generation_floors(conn)?;
     migrate_sync_groups_password_version(conn)?;
 
     Ok(())
@@ -565,6 +584,31 @@ fn sync_group_has_column(conn: &Connection, column: &str) -> Result<bool, rusqli
     Ok(false)
 }
 
+fn sharing_identity_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(sharing_identity_bundles)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sharing_identity_generation_floor_has_column(
+    conn: &Connection,
+    column: &str,
+) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(sharing_identity_generation_floors)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Add password_version column to an existing `sync_groups` table.
 /// Safe to call repeatedly — checks for column existence first.
 fn migrate_sync_groups_password_version(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -574,6 +618,109 @@ fn migrate_sync_groups_password_version(conn: &Connection) -> Result<(), rusqlit
             "ALTER TABLE sync_groups ADD COLUMN password_version INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    Ok(())
+}
+
+fn migrate_sharing_identity_generation(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_identity_generation = sharing_identity_has_column(conn, "identity_generation")?;
+    if !has_identity_generation {
+        conn.execute_batch(
+            "ALTER TABLE sharing_identity_bundles
+             ADD COLUMN identity_generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_sharing_identity_generation_floors(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sharing_identity_generation_floors (
+             sharing_id               TEXT PRIMARY KEY,
+             max_identity_generation  INTEGER NOT NULL DEFAULT 0,
+             identity_bundle_hash     TEXT,
+             updated_at               INTEGER NOT NULL
+         );",
+    )?;
+
+    let has_bundle_hash =
+        sharing_identity_generation_floor_has_column(conn, "identity_bundle_hash")?;
+    if !has_bundle_hash {
+        conn.execute_batch(
+            "ALTER TABLE sharing_identity_generation_floors
+             ADD COLUMN identity_bundle_hash TEXT;",
+        )?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO sharing_identity_generation_floors
+             (sharing_id, max_identity_generation, identity_bundle_hash, updated_at)
+         SELECT sharing_id, identity_generation, NULL, updated_at
+           FROM sharing_identity_bundles",
+        [],
+    )?;
+
+    conn.execute(
+        "UPDATE sharing_identity_generation_floors
+            SET max_identity_generation = (
+                    SELECT MAX(
+                        sharing_identity_generation_floors.max_identity_generation,
+                        sib.identity_generation
+                    )
+                    FROM sharing_identity_bundles sib
+                    WHERE sib.sharing_id = sharing_identity_generation_floors.sharing_id
+                ),
+                updated_at = MAX(
+                    sharing_identity_generation_floors.updated_at,
+                    COALESCE(
+                        (
+                            SELECT MAX(sib.updated_at)
+                            FROM sharing_identity_bundles sib
+                            WHERE sib.sharing_id = sharing_identity_generation_floors.sharing_id
+                        ),
+                        sharing_identity_generation_floors.updated_at
+                    )
+                )
+          WHERE EXISTS (
+                SELECT 1
+                FROM sharing_identity_bundles sib
+                WHERE sib.sharing_id = sharing_identity_generation_floors.sharing_id
+          )",
+        [],
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT sharing_id, identity_bundle, identity_generation, updated_at
+         FROM sharing_identity_bundles",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, u32>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (sharing_id, identity_bundle, identity_generation, updated_at) = row?;
+        conn.execute(
+            "UPDATE sharing_identity_generation_floors
+                SET identity_bundle_hash = CASE
+                        WHEN max_identity_generation < ?2 THEN ?3
+                        WHEN max_identity_generation = ?2 AND identity_bundle_hash IS NULL THEN ?3
+                        ELSE identity_bundle_hash
+                    END,
+                    updated_at = MAX(updated_at, ?4)
+              WHERE sharing_id = ?1",
+            params![
+                sharing_id,
+                identity_generation,
+                hash_bytes(&identity_bundle),
+                updated_at
+            ],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1977,17 +2124,82 @@ pub fn upsert_sharing_identity(
     conn: &Connection,
     sharing_id: &str,
     bundle: &[u8],
+    identity_generation: u32,
     now: i64,
-) -> Result<(), rusqlite::Error> {
-    conn.execute(
-        "INSERT INTO sharing_identity_bundles (sharing_id, identity_bundle, updated_at)
-         VALUES (?1, ?2, ?3)
+) -> Result<bool, rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    let bundle_hash = hash_bytes(bundle);
+
+    let floor: Option<(u32, Option<String>)> = tx
+        .query_row(
+            "SELECT max_identity_generation, identity_bundle_hash
+               FROM sharing_identity_generation_floors
+              WHERE sharing_id = ?1",
+            params![sharing_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    if floor
+        .as_ref()
+        .is_some_and(|(current_generation, _)| identity_generation < *current_generation)
+    {
+        tx.rollback()?;
+        return Ok(false);
+    }
+
+    if floor.as_ref().is_some_and(|(current_generation, current_hash)| {
+        identity_generation == *current_generation
+            && current_hash
+                .as_deref()
+                .is_some_and(|hash| hash != bundle_hash.as_str())
+    }) {
+        tx.rollback()?;
+        return Ok(false);
+    }
+
+    tx.execute(
+        "INSERT INTO sharing_identity_generation_floors
+             (sharing_id, max_identity_generation, identity_bundle_hash, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(sharing_id) DO UPDATE SET
+             max_identity_generation =
+                 MAX(
+                     sharing_identity_generation_floors.max_identity_generation,
+                     excluded.max_identity_generation
+                 ),
+             identity_bundle_hash = CASE
+                 WHEN excluded.max_identity_generation
+                      > sharing_identity_generation_floors.max_identity_generation
+                 THEN excluded.identity_bundle_hash
+                 WHEN excluded.max_identity_generation
+                      = sharing_identity_generation_floors.max_identity_generation
+                 THEN COALESCE(
+                      sharing_identity_generation_floors.identity_bundle_hash,
+                      excluded.identity_bundle_hash
+                 )
+                 ELSE sharing_identity_generation_floors.identity_bundle_hash
+             END,
+             updated_at = MAX(
+                 sharing_identity_generation_floors.updated_at,
+                 excluded.updated_at
+             )",
+        params![sharing_id, identity_generation, bundle_hash, now],
+    )?;
+
+    tx.execute(
+        "INSERT INTO sharing_identity_bundles
+            (sharing_id, identity_bundle, identity_generation, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(sharing_id) DO UPDATE SET
             identity_bundle = excluded.identity_bundle,
+            identity_generation = excluded.identity_generation,
             updated_at = excluded.updated_at",
-        params![sharing_id, bundle, now],
+        params![sharing_id, bundle, identity_generation, now],
     )?;
-    Ok(())
+
+    tx.commit()?;
+    Ok(true)
 }
 
 pub fn get_sharing_identity(
@@ -2194,7 +2406,8 @@ pub fn fetch_and_consume_pending_sharing_inits(
              FROM sharing_init_payloads
              WHERE recipient_id = ?1
                AND consumed_at IS NULL
-               AND expires_at > ?2",
+               AND expires_at > ?2
+             ORDER BY created_at ASC, init_id ASC",
         )?;
         let rows = stmt
             .query_map(params![recipient_id, now], |row| {
@@ -2210,14 +2423,22 @@ pub fn fetch_and_consume_pending_sharing_inits(
     };
 
     if !results.is_empty() {
-        tx.execute(
+        let placeholders = std::iter::repeat_n("?", results.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
             "UPDATE sharing_init_payloads
-             SET consumed_at = ?1
-             WHERE recipient_id = ?2
-               AND consumed_at IS NULL
-               AND expires_at > ?1",
-            params![now, recipient_id],
-        )?;
+             SET consumed_at = ?
+             WHERE init_id IN ({placeholders})"
+        );
+
+        let mut params: Vec<&dyn ToSql> = Vec::with_capacity(results.len() + 1);
+        params.push(&now);
+        for pending in &results {
+            params.push(&pending.init_id);
+        }
+
+        tx.execute(&sql, params_from_iter(params))?;
     }
 
     tx.commit()?;
