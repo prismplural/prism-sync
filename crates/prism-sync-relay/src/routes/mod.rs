@@ -29,6 +29,9 @@ pub struct AuthIdentity {
     pub device_id: String,
     pub signing_public_key: Vec<u8>,
     pub ml_dsa_65_public_key: Vec<u8>,
+    /// Previous ML-DSA key accepted during a 30-day grace period after rotation.
+    /// `None` if no grace key exists or the grace period has expired.
+    pub prev_ml_dsa_65_public_key: Option<Vec<u8>>,
 }
 
 pub(crate) fn verify_signed_request(
@@ -94,12 +97,24 @@ pub(crate) fn verify_signed_request(
         timestamp,
         nonce,
     );
-    if !auth::verify_hybrid_request_signature(
+    let verified = auth::verify_hybrid_request_signature(
         &auth_identity.signing_public_key,
         &auth_identity.ml_dsa_65_public_key,
         &signing_data,
         &signature,
-    ) {
+    ) || auth_identity
+        .prev_ml_dsa_65_public_key
+        .as_ref()
+        .is_some_and(|prev_pk| {
+            auth::verify_hybrid_request_signature(
+                &auth_identity.signing_public_key,
+                prev_pk,
+                &signing_data,
+                &signature,
+            )
+        });
+
+    if !verified {
         return Err(AppError::Unauthorized);
     }
 
@@ -248,11 +263,22 @@ async fn auth_middleware(
                             .unwrap_or(false);
                         return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
                     }
+                    let prev_ml_dsa_65_public_key =
+                        if !device.prev_ml_dsa_65_public_key.is_empty()
+                            && device
+                                .prev_ml_dsa_65_expires_at
+                                .is_some_and(|exp| exp > db::now_secs())
+                        {
+                            Some(device.prev_ml_dsa_65_public_key)
+                        } else {
+                            None
+                        };
                     return Ok(AuthResult::Ok(AuthIdentity {
                         sync_id,
                         device_id,
                         signing_public_key: device.signing_public_key,
                         ml_dsa_65_public_key: device.ml_dsa_65_public_key,
+                        prev_ml_dsa_65_public_key,
                     }));
                 }
 
