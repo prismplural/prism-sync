@@ -6,6 +6,7 @@
 
 use crate::error::{CoreError, Result};
 use crate::storage::{DeviceRecord, SyncStorage};
+use prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof;
 
 /// Stateless helper for device registry operations.
 ///
@@ -110,9 +111,19 @@ impl DeviceRegistryManager {
         let merged = match existing {
             None => device.clone(),
             Some(existing) if !Self::keys_match(&existing, device) => {
-                return Err(CoreError::DeviceKeyChanged {
-                    device_id: device.device_id.clone(),
-                });
+                // Check if this is an ML-DSA rotation (only ML-DSA key differs, generation increased)
+                if device.ml_dsa_key_generation > existing.ml_dsa_key_generation
+                    && device.ed25519_public_key == existing.ed25519_public_key
+                    && device.x25519_public_key == existing.x25519_public_key
+                    && device.ml_kem_768_public_key == existing.ml_kem_768_public_key
+                {
+                    // Accept ML-DSA rotation from relay (trusted source, generation monotonically increasing)
+                    return Self::write_device_record(storage, device);
+                } else {
+                    return Err(CoreError::DeviceKeyChanged {
+                        device_id: device.device_id.clone(),
+                    });
+                }
             }
             Some(existing) if existing.status == "revoked" && device.status != "revoked" => {
                 return Ok(());
@@ -174,6 +185,57 @@ impl DeviceRegistryManager {
 
         let mut tx = storage.begin_tx()?;
         tx.upsert_device_record(&revoked)?;
+        tx.commit()
+    }
+
+    /// Accept an ML-DSA key rotation for a known device.
+    ///
+    /// Verifies the continuity proof, then updates the local device record
+    /// with the new ML-DSA key and generation.
+    pub fn accept_ml_dsa_rotation(
+        storage: &dyn SyncStorage,
+        sync_id: &str,
+        device_id: &str,
+        new_ml_dsa_pk: &[u8],
+        new_generation: u32,
+        proof: &MlDsaContinuityProof,
+    ) -> Result<()> {
+        let existing = storage
+            .get_device_record(sync_id, device_id)?
+            .ok_or_else(|| CoreError::Storage(format!("device {device_id} not in registry")))?;
+
+        if existing.status == "revoked" {
+            return Err(CoreError::Storage(format!(
+                "device {device_id} has been revoked"
+            )));
+        }
+
+        if new_generation <= existing.ml_dsa_key_generation {
+            return Err(CoreError::DeviceKeyChanged {
+                device_id: device_id.to_string(),
+            });
+        }
+
+        // Verify the continuity proof against the stored keys
+        let ed25519_pk: [u8; 32] = existing
+            .ed25519_public_key
+            .clone()
+            .try_into()
+            .map_err(|_| CoreError::Storage("invalid ed25519 pk length in registry".into()))?;
+
+        proof
+            .verify(&ed25519_pk, &existing.ml_dsa_65_public_key)
+            .map_err(|e| CoreError::Storage(format!("continuity proof verification failed: {e}")))?;
+
+        // Update the device record with the new ML-DSA key
+        let updated = DeviceRecord {
+            ml_dsa_65_public_key: new_ml_dsa_pk.to_vec(),
+            ml_dsa_key_generation: new_generation,
+            ..existing
+        };
+
+        let mut tx = storage.begin_tx()?;
+        tx.upsert_device_record(&updated)?;
         tx.commit()
     }
 
@@ -358,5 +420,241 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.status, "revoked");
+    }
+
+    #[test]
+    fn accept_ml_dsa_rotation_with_valid_proof() {
+        let storage = make_storage();
+        let secret = prism_sync_crypto::DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let device_id = "dev-rotate";
+
+        // Create initial device with gen 0 keys
+        let ed25519 = secret.ed25519_keypair(device_id).unwrap();
+        let ml_dsa_0 = secret.ml_dsa_65_keypair_v(device_id, 0).unwrap();
+
+        let device = DeviceRecord {
+            sync_id: "sync-1".into(),
+            device_id: device_id.into(),
+            ed25519_public_key: ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: ml_dsa_0.public_key_bytes(),
+            ml_kem_768_public_key: vec![0u8; 1184],
+            status: "active".into(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
+
+        // Create rotation proof
+        let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof::create(
+            &secret, device_id, 0, 1,
+        )
+        .unwrap();
+        let ml_dsa_1 = secret.ml_dsa_65_keypair_v(device_id, 1).unwrap();
+
+        // Accept the rotation
+        DeviceRegistryManager::accept_ml_dsa_rotation(
+            &storage,
+            "sync-1",
+            device_id,
+            &ml_dsa_1.public_key_bytes(),
+            1,
+            &proof,
+        )
+        .unwrap();
+
+        // Verify the new key is stored
+        let stored = storage
+            .get_device_record("sync-1", device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.ml_dsa_key_generation, 1);
+        assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_1.public_key_bytes());
+    }
+
+    #[test]
+    fn accept_ml_dsa_rotation_rejects_invalid_proof() {
+        let storage = make_storage();
+        let secret = prism_sync_crypto::DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let device_id = "dev-rotate-bad";
+
+        let ed25519 = secret.ed25519_keypair(device_id).unwrap();
+        let ml_dsa_0 = secret.ml_dsa_65_keypair_v(device_id, 0).unwrap();
+
+        let device = DeviceRecord {
+            sync_id: "sync-1".into(),
+            device_id: device_id.into(),
+            ed25519_public_key: ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: ml_dsa_0.public_key_bytes(),
+            ml_kem_768_public_key: vec![0u8; 1184],
+            status: "active".into(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
+
+        // Create a valid proof but tamper with old_signs_new
+        let mut proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof::create(
+            &secret, device_id, 0, 1,
+        )
+        .unwrap();
+        proof.old_signs_new[10] ^= 0xFF;
+        let ml_dsa_1 = secret.ml_dsa_65_keypair_v(device_id, 1).unwrap();
+
+        let result = DeviceRegistryManager::accept_ml_dsa_rotation(
+            &storage,
+            "sync-1",
+            device_id,
+            &ml_dsa_1.public_key_bytes(),
+            1,
+            &proof,
+        );
+        assert!(result.is_err(), "tampered proof should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("continuity proof verification failed"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn accept_ml_dsa_rotation_rejects_generation_rollback() {
+        let storage = make_storage();
+        let secret = prism_sync_crypto::DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let device_id = "dev-rotate-rollback";
+
+        let ed25519 = secret.ed25519_keypair(device_id).unwrap();
+        let ml_dsa_0 = secret.ml_dsa_65_keypair_v(device_id, 0).unwrap();
+        let ml_dsa_1 = secret.ml_dsa_65_keypair_v(device_id, 1).unwrap();
+
+        // Pin device at generation 1
+        let device = DeviceRecord {
+            sync_id: "sync-1".into(),
+            device_id: device_id.into(),
+            ed25519_public_key: ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: ml_dsa_1.public_key_bytes(),
+            ml_kem_768_public_key: vec![0u8; 1184],
+            status: "active".into(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 1,
+        };
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
+
+        // Try to rotate back to generation 0 (should fail)
+        let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof::create(
+            &secret, device_id, 1, 2,
+        )
+        .unwrap();
+
+        // Even with a valid proof for 1->2, try to pass generation 0
+        let result = DeviceRegistryManager::accept_ml_dsa_rotation(
+            &storage,
+            "sync-1",
+            device_id,
+            &ml_dsa_0.public_key_bytes(),
+            0,
+            &proof,
+        );
+        assert!(
+            matches!(result, Err(CoreError::DeviceKeyChanged { .. })),
+            "generation rollback should be rejected"
+        );
+
+        // Also try the same generation
+        let result = DeviceRegistryManager::accept_ml_dsa_rotation(
+            &storage,
+            "sync-1",
+            device_id,
+            &ml_dsa_1.public_key_bytes(),
+            1,
+            &proof,
+        );
+        assert!(
+            matches!(result, Err(CoreError::DeviceKeyChanged { .. })),
+            "same generation should be rejected"
+        );
+    }
+
+    #[test]
+    fn merge_relay_device_accepts_ml_dsa_rotation() {
+        let storage = make_storage();
+        let secret = prism_sync_crypto::DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let device_id = "dev-merge-rotate";
+
+        let ed25519 = secret.ed25519_keypair(device_id).unwrap();
+        let ml_dsa_0 = secret.ml_dsa_65_keypair_v(device_id, 0).unwrap();
+        let ml_dsa_1 = secret.ml_dsa_65_keypair_v(device_id, 1).unwrap();
+
+        let device = DeviceRecord {
+            sync_id: "sync-1".into(),
+            device_id: device_id.into(),
+            ed25519_public_key: ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: ml_dsa_0.public_key_bytes(),
+            ml_kem_768_public_key: vec![0u8; 1184],
+            status: "active".into(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
+
+        // Relay sends updated device with new ML-DSA key and higher generation
+        let rotated = DeviceRecord {
+            ml_dsa_65_public_key: ml_dsa_1.public_key_bytes(),
+            ml_dsa_key_generation: 1,
+            ..device.clone()
+        };
+        DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &rotated).unwrap();
+
+        let stored = storage
+            .get_device_record("sync-1", device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.ml_dsa_key_generation, 1);
+        assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_1.public_key_bytes());
+    }
+
+    #[test]
+    fn merge_relay_device_still_rejects_ed25519_change() {
+        let storage = make_storage();
+        let secret = prism_sync_crypto::DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let device_id = "dev-merge-ed-change";
+
+        let ed25519 = secret.ed25519_keypair(device_id).unwrap();
+        let ml_dsa_0 = secret.ml_dsa_65_keypair_v(device_id, 0).unwrap();
+        let ml_dsa_1 = secret.ml_dsa_65_keypair_v(device_id, 1).unwrap();
+
+        let device = DeviceRecord {
+            sync_id: "sync-1".into(),
+            device_id: device_id.into(),
+            ed25519_public_key: ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: ml_dsa_0.public_key_bytes(),
+            ml_kem_768_public_key: vec![0u8; 1184],
+            status: "active".into(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
+
+        // Change both Ed25519 key AND ML-DSA key — should still be rejected
+        let changed = DeviceRecord {
+            ed25519_public_key: vec![99u8; 32],
+            ml_dsa_65_public_key: ml_dsa_1.public_key_bytes(),
+            ml_dsa_key_generation: 1,
+            ..device.clone()
+        };
+        let result = DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &changed);
+        assert!(
+            matches!(result, Err(CoreError::DeviceKeyChanged { .. })),
+            "Ed25519 key change should still be rejected even with higher ML-DSA generation"
+        );
     }
 }
