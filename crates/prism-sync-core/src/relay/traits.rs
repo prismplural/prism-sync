@@ -387,6 +387,12 @@ pub enum SyncNotification {
     ConnectionStateChanged { connected: bool },
 }
 
+/// Response from ML-DSA key rotation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RotateMlDsaResponse {
+    pub ml_dsa_key_generation: u32,
+}
+
 /// Transport layer for communicating with the relay server.
 ///
 /// Ships with `ServerRelay` (HTTP + WebSocket). Consumers can mock
@@ -483,6 +489,19 @@ pub trait SyncRelay: Send + Sync {
 
     /// Stream of real-time notifications from the relay.
     fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>>;
+
+    /// Rotate this device's ML-DSA key on the relay.
+    ///
+    /// Sends the new public key, the target generation number, and a
+    /// continuity proof (cross-signatures between old and new keys) so the
+    /// relay can verify ownership continuity before accepting the rotation.
+    async fn rotate_ml_dsa(
+        &self,
+        device_id: &str,
+        new_ml_dsa_pk: &[u8],
+        new_generation: u32,
+        proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+    ) -> std::result::Result<RotateMlDsaResponse, RelayError>;
 
     /// Dispose of all resources.
     async fn dispose(&self) -> std::result::Result<(), RelayError>;

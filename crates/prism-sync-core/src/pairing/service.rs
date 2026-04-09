@@ -1262,6 +1262,15 @@ mod tests {
         fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
             unimplemented!()
         }
+        async fn rotate_ml_dsa(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+            unimplemented!()
+        }
         async fn dispose(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
@@ -1390,6 +1399,15 @@ mod tests {
             unimplemented!()
         }
         fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+            unimplemented!()
+        }
+        async fn rotate_ml_dsa(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
             unimplemented!()
         }
         async fn dispose(&self) -> std::result::Result<(), RelayError> {
@@ -2148,6 +2166,15 @@ mod tests {
             fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
                 unimplemented!()
             }
+            async fn rotate_ml_dsa(
+                &self,
+                _: &str,
+                _: &[u8],
+                _: u32,
+                _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+                unimplemented!()
+            }
             async fn dispose(&self) -> std::result::Result<(), RelayError> {
                 unimplemented!()
             }
@@ -2278,6 +2305,15 @@ mod tests {
                 unimplemented!()
             }
             fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+                unimplemented!()
+            }
+            async fn rotate_ml_dsa(
+                &self,
+                _: &str,
+                _: &[u8],
+                _: u32,
+                _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
                 unimplemented!()
             }
             async fn dispose(&self) -> std::result::Result<(), RelayError> {

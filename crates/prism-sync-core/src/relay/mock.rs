@@ -9,8 +9,8 @@ use tokio::sync::broadcast;
 
 use super::traits::{
     DeviceInfo, OutgoingBatch, PullResponse, ReceivedBatch, RegisterRequest, RegisterResponse,
-    RegistrationNonceResponse, RelayError, SignedBatchEnvelope, SnapshotResponse, SyncNotification,
-    SyncRelay,
+    RegistrationNonceResponse, RelayError, RotateMlDsaResponse, SignedBatchEnvelope,
+    SnapshotResponse, SyncNotification, SyncRelay,
 };
 
 /// In-memory mock implementation of [`SyncRelay`] for testing.
@@ -38,6 +38,8 @@ struct MockRelayState {
     ack_calls: Vec<i64>,
     /// If set, `ack()` will return this error.
     ack_error: Option<String>,
+    /// Tracks the current ML-DSA key generation per device.
+    ml_dsa_generations: HashMap<String, u32>,
 }
 
 /// Full stored batch — keeps the original `SignedBatchEnvelope` so that
@@ -63,6 +65,7 @@ impl MockRelay {
                 min_acked_seq: None,
                 ack_calls: Vec::new(),
                 ack_error: None,
+                ml_dsa_generations: HashMap::new(),
             }),
             notification_tx,
         }
@@ -293,6 +296,50 @@ impl SyncRelay for MockRelay {
         )
     }
 
+    async fn rotate_ml_dsa(
+        &self,
+        device_id: &str,
+        new_ml_dsa_pk: &[u8],
+        new_generation: u32,
+        _proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+    ) -> Result<RotateMlDsaResponse, RelayError> {
+        let mut state = self.state.lock().unwrap();
+
+        // Check the device exists.
+        let device_idx = state
+            .devices
+            .iter()
+            .position(|d| d.device_id == device_id)
+            .ok_or_else(|| RelayError::Protocol {
+                message: format!("device not found: {device_id}"),
+            })?;
+
+        // Check that the new generation is strictly greater than the current one.
+        let current_gen = state
+            .ml_dsa_generations
+            .get(device_id)
+            .copied()
+            .unwrap_or(state.devices[device_idx].ml_dsa_key_generation);
+        if new_generation <= current_gen {
+            return Err(RelayError::Protocol {
+                message: format!(
+                    "ML-DSA key generation must increase: current={current_gen}, requested={new_generation}"
+                ),
+            });
+        }
+
+        // Update the device's ML-DSA public key and generation.
+        state.devices[device_idx].ml_dsa_65_public_key = new_ml_dsa_pk.to_vec();
+        state.devices[device_idx].ml_dsa_key_generation = new_generation;
+        state
+            .ml_dsa_generations
+            .insert(device_id.to_string(), new_generation);
+
+        Ok(RotateMlDsaResponse {
+            ml_dsa_key_generation: new_generation,
+        })
+    }
+
     async fn dispose(&self) -> Result<(), RelayError> {
         Ok(())
     }
@@ -501,5 +548,112 @@ mod tests {
         let devices = relay.list_devices().await.unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_id, "d2");
+    }
+
+    fn make_continuity_proof() -> prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof {
+        // Dummy proof — the mock relay does not verify signatures.
+        prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof {
+            device_id: "d1".to_string(),
+            old_generation: 0,
+            new_generation: 1,
+            new_ml_dsa_pk: vec![0x42; 1952],
+            old_signs_new: vec![0xAA; 64],
+            new_signs_old: vec![0xBB; 64],
+        }
+    }
+
+    fn make_device(id: &str) -> DeviceInfo {
+        DeviceInfo {
+            device_id: id.to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: vec![1; 32],
+            x25519_public_key: vec![2; 32],
+            ml_dsa_65_public_key: vec![3; 1952],
+            ml_kem_768_public_key: vec![4; 1184],
+            permission: None,
+            ml_dsa_key_generation: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_ml_dsa_accepts_valid_rotation() {
+        let relay = MockRelay::new();
+        relay.add_device(make_device("d1"));
+
+        let new_pk = vec![0x42; 1952];
+        let proof = make_continuity_proof();
+        let resp = relay
+            .rotate_ml_dsa("d1", &new_pk, 1, &proof)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.ml_dsa_key_generation, 1);
+
+        // Verify the public key and generation were updated in the device list.
+        let devices = relay.list_devices().await.unwrap();
+        assert_eq!(devices[0].ml_dsa_65_public_key, new_pk);
+        assert_eq!(devices[0].ml_dsa_key_generation, 1);
+
+        // A second rotation to generation 2 should also succeed.
+        let newer_pk = vec![0x43; 1952];
+        let resp2 = relay
+            .rotate_ml_dsa("d1", &newer_pk, 2, &proof)
+            .await
+            .unwrap();
+        assert_eq!(resp2.ml_dsa_key_generation, 2);
+
+        let devices = relay.list_devices().await.unwrap();
+        assert_eq!(devices[0].ml_dsa_65_public_key, newer_pk);
+        assert_eq!(devices[0].ml_dsa_key_generation, 2);
+    }
+
+    #[tokio::test]
+    async fn rotate_ml_dsa_rejects_generation_rollback() {
+        let relay = MockRelay::new();
+        relay.add_device(make_device("d1"));
+
+        let proof = make_continuity_proof();
+
+        // First rotation to generation 2.
+        relay
+            .rotate_ml_dsa("d1", &vec![0x42; 1952], 2, &proof)
+            .await
+            .unwrap();
+
+        // Attempt to rotate to generation 1 (rollback) should fail.
+        let err = relay
+            .rotate_ml_dsa("d1", &vec![0x43; 1952], 1, &proof)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RelayError::Protocol { ref message } if message.contains("must increase")),
+            "expected protocol error about generation, got: {err:?}"
+        );
+
+        // Same generation (2) should also fail.
+        let err = relay
+            .rotate_ml_dsa("d1", &vec![0x44; 1952], 2, &proof)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RelayError::Protocol { ref message } if message.contains("must increase")),
+            "expected protocol error about generation, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_ml_dsa_rejects_unknown_device() {
+        let relay = MockRelay::new();
+        let proof = make_continuity_proof();
+
+        let err = relay
+            .rotate_ml_dsa("nonexistent", &vec![0x42; 1952], 1, &proof)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RelayError::Protocol { ref message } if message.contains("device not found")),
+            "expected protocol error about unknown device, got: {err:?}"
+        );
     }
 }
