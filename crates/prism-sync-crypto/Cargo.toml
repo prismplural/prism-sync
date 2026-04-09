@@ -26,6 +26,10 @@ hex = "0.4"
 hybrid-array = "0.2"
 
 # Post-quantum cryptography (RustCrypto ecosystem)
+# SECURITY: PQ crate pins verified 2026-04-08. All versions are latest available.
+# x-wing =0.1.0-rc.0, ml-kem 0.3.0-rc.2, ml-dsa 0.1.0-rc.8.
+# Do not update without running cross-language vector tests:
+#   cargo test -p prism-sync-crypto --test cross_language_vectors -- --ignored
 ml-kem = { version = "0.3.0-rc.2", features = ["zeroize"] }
 ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize", "rand_core"] }
 x-wing = { version = "=0.1.0-rc.0", features = ["zeroize"] }
