@@ -1782,6 +1782,7 @@ mod tests {
         assert_eq!(d1.x25519_public_key, vec![5, 6, 7, 8]);
         assert_eq!(d1.ml_dsa_65_public_key, vec![9u8; 1952]);
         assert_eq!(d1.ml_kem_768_public_key, vec![10u8; 1184]);
+        assert_eq!(d1.ml_dsa_key_generation, 0);
 
         // Verify applied_ops were imported
         assert!(dst.is_op_applied("applied-1").unwrap());
@@ -1863,6 +1864,39 @@ mod tests {
             "compressed {} >= raw json {}",
             blob.len(),
             json.len()
+        );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_nonzero_ml_dsa_generation() {
+        let src = make_storage();
+        populate_for_snapshot(&src);
+
+        // Update dev-1 to generation 5
+        let mut dev = src
+            .get_device_record("sync-1", "dev-1")
+            .unwrap()
+            .unwrap();
+        dev.ml_dsa_key_generation = 5;
+        let mut tx = src.begin_tx().unwrap();
+        tx.upsert_device_record(&dev).unwrap();
+        tx.commit().unwrap();
+
+        // Export and import
+        let blob = src.export_snapshot("sync-1").unwrap();
+        let dst = make_storage();
+        let mut tx = dst.begin_tx().unwrap();
+        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.commit().unwrap();
+
+        // Verify non-zero generation survived
+        let imported = dst
+            .get_device_record("sync-1", "dev-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            imported.ml_dsa_key_generation, 5,
+            "ml_dsa_key_generation should survive snapshot round-trip"
         );
     }
 }

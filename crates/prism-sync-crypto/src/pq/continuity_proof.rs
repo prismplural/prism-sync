@@ -315,4 +315,24 @@ mod tests {
             .verify(&ed25519.public_key_bytes(), &old_ml_dsa.public_key_bytes())
             .expect("generation gap proof should verify");
     }
+
+    #[test]
+    fn mismatched_device_id_fails() {
+        let secret = test_secret();
+        let mut proof = MlDsaContinuityProof::create(&secret, DEVICE_ID, 0, 1).unwrap();
+
+        // Change the device_id in the proof — signature should no longer verify
+        // because device_id is bound into the signed message.
+        proof.device_id = "wrong-device-id".to_string();
+
+        let ed25519 = secret.ed25519_keypair(DEVICE_ID).unwrap();
+        let old_ml_dsa = secret.ml_dsa_65_keypair_v(DEVICE_ID, 0).unwrap();
+
+        assert!(
+            proof
+                .verify(&ed25519.public_key_bytes(), &old_ml_dsa.public_key_bytes())
+                .is_err(),
+            "mismatched device_id should fail verification"
+        );
+    }
 }
