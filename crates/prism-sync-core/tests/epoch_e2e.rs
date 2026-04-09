@@ -121,6 +121,21 @@ impl SyncRelay for RekeyMockRelay {
     fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
         unimplemented!()
     }
+    async fn rotate_ml_dsa(
+        &self,
+        _: &str,
+        _: &[u8],
+        _: u32,
+        _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+    ) -> Result<RotateMlDsaResponse, RelayError> {
+        unimplemented!()
+    }
+    async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> Result<(), RelayError> {
+        unimplemented!()
+    }
+    async fn download_media(&self, _: &str) -> Result<Vec<u8>, RelayError> {
+        unimplemented!()
+    }
     async fn dispose(&self) -> Result<(), RelayError> {
         Ok(())
     }
@@ -151,6 +166,7 @@ async fn epoch_rotation_full_cycle() {
             x25519_public_key: xk_a.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
+            ml_dsa_key_generation: 0,
             permission: None,
         },
         DeviceInfo {
@@ -161,6 +177,7 @@ async fn epoch_rotation_full_cycle() {
             x25519_public_key: xk_b.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
+            ml_dsa_key_generation: 0,
             permission: None,
         },
         DeviceInfo {
@@ -171,6 +188,7 @@ async fn epoch_rotation_full_cycle() {
             x25519_public_key: xk_c.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
+            ml_dsa_key_generation: 0,
             permission: None,
         },
     ];
@@ -283,6 +301,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
             x25519_public_key: xk_a.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
+            ml_dsa_key_generation: 0,
             permission: None,
         },
         DeviceInfo {
@@ -293,6 +312,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
             x25519_public_key: xk_c.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
+            ml_dsa_key_generation: 0,
             permission: None,
         },
     ];

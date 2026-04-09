@@ -274,6 +274,26 @@ mod tests {
         fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
             unimplemented!()
         }
+        async fn rotate_ml_dsa(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn upload_media(
+            &self,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
+            unimplemented!()
+        }
         async fn dispose(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
@@ -344,6 +364,7 @@ mod tests {
                 ml_dsa_65_public_key: vec![],
                 ml_kem_768_public_key: vec![],
                 permission: None,
+                ml_dsa_key_generation: 0,
             },
             DeviceInfo {
                 device_id: "receiver".to_string(),
@@ -354,6 +375,7 @@ mod tests {
                 ml_dsa_65_public_key: vec![],
                 ml_kem_768_public_key: vec![],
                 permission: None,
+                ml_dsa_key_generation: 0,
             },
             DeviceInfo {
                 device_id: "revoked-dev".to_string(),
@@ -364,6 +386,7 @@ mod tests {
                 ml_dsa_65_public_key: vec![],
                 ml_kem_768_public_key: vec![],
                 permission: None,
+                ml_dsa_key_generation: 0,
             },
         ]
     }

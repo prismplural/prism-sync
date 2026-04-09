@@ -370,6 +370,7 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
         "epoch": info.epoch,
         "status": info.status,
         "permission": info.permission,
+        "ml_dsa_key_generation": info.ml_dsa_key_generation,
     })
 }
 
@@ -1458,6 +1459,48 @@ pub async fn reconnect_websocket(handle: &PrismSyncHandle) -> Result<(), String>
 pub async fn on_resume(handle: &PrismSyncHandle) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
     inner.on_resume().await.map_err(|e| e.to_string())
+}
+
+/// Upload an encrypted media blob to the relay.
+///
+/// Requires `configure_engine` to have been called after `initialize`/`unlock`.
+pub async fn upload_media(
+    handle: &PrismSyncHandle,
+    media_id: String,
+    content_hash: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let relay = handle
+        .relay
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| "Relay not configured".to_string())?;
+
+    match relay.upload_media(&media_id, &content_hash, data).await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format_handle_relay_error(handle, "upload_media", error).await),
+    }
+}
+
+/// Download an encrypted media blob from the relay.
+///
+/// Requires `configure_engine` to have been called after `initialize`/`unlock`.
+pub async fn download_media(
+    handle: &PrismSyncHandle,
+    media_id: String,
+) -> Result<Vec<u8>, String> {
+    let relay = handle
+        .relay
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| "Relay not configured".to_string())?;
+
+    match relay.download_media(&media_id).await {
+        Ok(data) => Ok(data),
+        Err(error) => Err(format_handle_relay_error(handle, "download_media", error).await),
+    }
 }
 
 /// Upload an ephemeral snapshot for device pairing.
@@ -3078,6 +3121,181 @@ async fn poll_pairing_slot(
         }
     }
     Err(format!("timeout waiting for pairing slot {slot:?}"))
+}
+
+// ── ML-DSA key rotation ──
+
+/// Rotate this device's ML-DSA-65 signing key.
+///
+/// Generates a new ML-DSA keypair at the next generation, creates a
+/// cross-signed continuity proof, submits it to the relay, and updates
+/// the local device registry.
+///
+/// Returns JSON: `{"ml_dsa_key_generation": N, "device_id": "..."}`
+pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, String> {
+    // 1. Read credentials and device state from the handle
+    let (storage, secure_store, relay_url, allow_insecure) = {
+        let inner = handle.inner.lock().await;
+        (
+            inner.storage().clone(),
+            inner.secure_store().clone(),
+            inner.relay_url().map(str::to_string),
+            handle.allow_insecure,
+        )
+    };
+
+    let sync_id = require_secure_string(secure_store.as_ref(), "sync_id")?;
+    let device_id = require_secure_string(secure_store.as_ref(), "device_id")?;
+    let session_token = require_secure_string(secure_store.as_ref(), "session_token")?;
+    let device_secret_bytes = secure_store
+        .get("device_secret")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "device_secret not found in secure store".to_string())?;
+    let device_secret = DeviceSecret::from_bytes(device_secret_bytes)
+        .map_err(|e| format!("invalid device_secret: {e}"))?;
+    let relay_url = decode_optional_utf8(secure_store.as_ref(), "relay_url")?
+        .or(relay_url)
+        .ok_or_else(|| "relay_url not configured".to_string())?;
+
+    // 2. Get current generation from local device registry
+    let sid = sync_id.clone();
+    let did = device_id.clone();
+    let current_record = tokio::task::spawn_blocking(move || storage.get_device_record(&sid, &did))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("device {device_id} not in local registry"))?;
+
+    let mut current_gen = current_record.ml_dsa_key_generation;
+
+    // 2b. Check relay's generation to handle crash recovery.
+    // If the relay is ahead of local (e.g., previous rotation succeeded on
+    // relay but client crashed before updating local registry), sync local
+    // state forward so we rotate from the relay's generation.
+    let relay = build_relay(
+        &relay_url,
+        &sync_id,
+        &device_id,
+        &session_token,
+        Some(device_secret.as_bytes().to_vec()),
+        allow_insecure,
+        None,
+    )?;
+
+    let relay_devices = relay.list_devices().await.unwrap_or_default();
+    if let Some(relay_self) = relay_devices.iter().find(|d| d.device_id == device_id) {
+        if relay_self.ml_dsa_key_generation > current_gen {
+            // Relay is ahead — re-derive the key at relay's generation and
+            // update local registry so our next rotation starts from there.
+            let relay_gen = relay_self.ml_dsa_key_generation;
+            let synced_ml_dsa = device_secret
+                .ml_dsa_65_keypair_v(&device_id, relay_gen)
+                .map_err(|e| format!("failed to derive ML-DSA key at relay gen {relay_gen}: {e}"))?;
+            let synced_pk = synced_ml_dsa.public_key_bytes();
+
+            let inner = handle.inner.lock().await;
+            let storage = inner.storage().clone();
+            let sid = sync_id.clone();
+            let did = device_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut record = storage
+                    .get_device_record(&sid, &did)?
+                    .ok_or_else(|| {
+                        prism_sync_core::error::CoreError::Storage(
+                            "device not in registry".into(),
+                        )
+                    })?;
+                record.ml_dsa_65_public_key = synced_pk;
+                record.ml_dsa_key_generation = relay_gen;
+                let mut tx = storage.begin_tx()?;
+                tx.upsert_device_record(&record)?;
+                tx.commit()
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+
+            current_gen = relay_gen;
+        }
+    }
+
+    let new_gen = current_gen + 1;
+
+    // 3. Create continuity proof (cross-signed by old and new ML-DSA keys)
+    let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof::create(
+        &device_secret,
+        &device_id,
+        current_gen,
+        new_gen,
+    )
+    .map_err(|e| format!("failed to create continuity proof: {e}"))?;
+
+    let new_ml_dsa = device_secret
+        .ml_dsa_65_keypair_v(&device_id, new_gen)
+        .map_err(|e| format!("failed to derive new ML-DSA key: {e}"))?;
+    let new_pk = new_ml_dsa.public_key_bytes();
+
+    // 4. Submit rotation to relay
+    let response = match relay
+        .rotate_ml_dsa(&device_id, &new_pk, new_gen, &proof)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            return Err(format_handle_relay_error(handle, "rotate_ml_dsa", error).await)
+        }
+    };
+
+    // 5. Update local device registry
+    let inner = handle.inner.lock().await;
+    let storage = inner.storage().clone();
+    let sid = sync_id.clone();
+    let did = device_id.clone();
+    let proof_clone = proof.clone();
+    let new_pk_clone = new_pk.clone();
+    tokio::task::spawn_blocking(move || {
+        DeviceRegistryManager::accept_ml_dsa_rotation(
+            storage.as_ref(),
+            &sid,
+            &did,
+            &new_pk_clone,
+            new_gen,
+            &proof_clone,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    // 6. Return result as JSON
+    let result = serde_json::json!({
+        "ml_dsa_key_generation": response.ml_dsa_key_generation,
+        "device_id": device_id,
+    });
+    Ok(result.to_string())
+}
+
+/// Get the current ML-DSA key generation for this device.
+///
+/// Returns the generation number (0 for initial key, increments on each rotation).
+pub async fn get_ml_dsa_key_generation(handle: &PrismSyncHandle) -> Result<u32, String> {
+    let (storage, secure_store) = {
+        let inner = handle.inner.lock().await;
+        (inner.storage().clone(), inner.secure_store().clone())
+    };
+
+    let sync_id = require_secure_string(secure_store.as_ref(), "sync_id")?;
+    let device_id = require_secure_string(secure_store.as_ref(), "device_id")?;
+
+    let record = tokio::task::spawn_blocking(move || {
+        storage.get_device_record(&sync_id, &device_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?
+    .ok_or("device not in registry")?;
+
+    Ok(record.ml_dsa_key_generation)
 }
 
 #[cfg(test)]
