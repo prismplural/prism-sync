@@ -3,6 +3,7 @@
 //! Provides hybrid signatures (Ed25519 + ML-DSA-65) and typed model types
 //! for the PQ bootstrap protocol.
 
+pub mod continuity_proof;
 pub mod hybrid_kem;
 pub mod models;
 pub use models::*;

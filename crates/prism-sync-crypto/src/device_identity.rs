@@ -55,8 +55,9 @@ impl DeviceSecret {
     }
 
     /// Derive a versioned ML-DSA-65 signing keypair for key rotation.
-    /// Generation 0 uses info `"prism_device_ml_dsa_65"` (backward-compatible).
-    /// Generation N>0 uses info `"prism_device_ml_dsa_65_v{N}"`.
+    ///
+    /// - Generation 0: info = `"prism_device_ml_dsa_65"` (backward-compatible)
+    /// - Generation N>0: info = `"prism_device_ml_dsa_65_v{N}"`
     pub fn ml_dsa_65_keypair_v(
         &self,
         device_id: &str,
@@ -166,6 +167,11 @@ pub struct DevicePqSigningKey {
 }
 
 impl DevicePqSigningKey {
+    /// Access the inner `ExpandedSigningKey` (e.g. for `HybridSignature::sign_v3`).
+    pub fn as_signing_key(&self) -> &ml_dsa::ExpandedSigningKey<MlDsa65> {
+        &self.signing_key
+    }
+
     /// Get the encoded verifying (public) key bytes (1952 bytes).
     pub fn public_key_bytes(&self) -> Vec<u8> {
         let vk = self.signing_key.verifying_key();
