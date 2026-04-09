@@ -914,10 +914,18 @@ pub async fn initialize(
     password: String,
     secret_key: Vec<u8>,
 ) -> Result<(), String> {
-    let mut inner = handle.inner.lock().await;
-    inner
-        .initialize(&password, &secret_key)
-        .map_err(|e| e.to_string())
+    // Argon2id (64 MiB, 3 rounds) is CPU-heavy. Run on a spawn_blocking thread
+    // so we don't stall the tokio worker. blocking_lock() acquires the tokio
+    // Mutex synchronously, which is safe inside spawn_blocking.
+    let inner = handle.inner.clone();
+    tokio::task::spawn_blocking(move || {
+        inner
+            .blocking_lock()
+            .initialize(&password, &secret_key)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task failed: {e}"))?
 }
 
 /// Unlock (subsequent launches).
@@ -926,10 +934,16 @@ pub async fn unlock(
     password: String,
     secret_key: Vec<u8>,
 ) -> Result<(), String> {
-    let mut inner = handle.inner.lock().await;
-    inner
-        .unlock(&password, &secret_key)
-        .map_err(|e| e.to_string())
+    // Same reasoning as initialize — Argon2id must not run on a tokio worker.
+    let inner = handle.inner.clone();
+    tokio::task::spawn_blocking(move || {
+        inner
+            .blocking_lock()
+            .unlock(&password, &secret_key)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task failed: {e}"))?
 }
 
 /// Restore the unlocked state directly from raw key material.
@@ -1170,20 +1184,26 @@ pub async fn change_password(
         .await?;
     }
 
-    let inner = handle.inner.lock().await;
-    let (new_wrapped_dek, new_salt) = inner
-        .key_hierarchy()
-        .change_password(&new_password, &secret_key)
-        .map_err(|e| format!("change_password failed: {e}"))?;
-
-    inner
-        .secure_store()
-        .set("wrapped_dek", &new_wrapped_dek)
-        .map_err(|e| format!("Failed to persist wrapped_dek: {e}"))?;
-    inner
-        .secure_store()
-        .set("dek_salt", &new_salt)
-        .map_err(|e| format!("Failed to persist dek_salt: {e}"))?;
+    // Argon2id (re-wrap DEK under new password) must not run on a tokio worker.
+    let inner_arc = handle.inner.clone();
+    tokio::task::spawn_blocking(move || {
+        let inner = inner_arc.blocking_lock();
+        let (new_wrapped_dek, new_salt) = inner
+            .key_hierarchy()
+            .change_password(&new_password, &secret_key)
+            .map_err(|e| format!("change_password failed: {e}"))?;
+        inner
+            .secure_store()
+            .set("wrapped_dek", &new_wrapped_dek)
+            .map_err(|e| format!("Failed to persist wrapped_dek: {e}"))?;
+        inner
+            .secure_store()
+            .set("dek_salt", &new_salt)
+            .map_err(|e| format!("Failed to persist dek_salt: {e}"))?;
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| format!("task failed: {e}"))??;
 
     Ok(next_identity_generation)
 }
