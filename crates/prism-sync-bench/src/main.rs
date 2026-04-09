@@ -98,6 +98,17 @@ async fn start_in_process_relay(reader_pool_size: usize) -> Result<String> {
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 5,
         pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 65536,
+        sharing_prekey_max_bytes: 65536,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 50,
+        sharing_init_max_pending: 10,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
     };
 
     let db = Database::open(
