@@ -82,6 +82,7 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// Upload helper that handles signed request headers.
 /// Returns the response (not consumed).
+#[allow(clippy::too_many_arguments)]
 async fn upload_media(
     client: &Client,
     url: &str,
@@ -108,6 +109,7 @@ async fn upload_media(
 }
 
 /// Upload helper that lets caller specify the hash (for mismatch tests).
+#[allow(clippy::too_many_arguments)]
 async fn upload_media_with_hash(
     client: &Client,
     url: &str,
