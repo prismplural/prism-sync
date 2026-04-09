@@ -3738,4 +3738,51 @@ mod tests {
         })
         .unwrap();
     }
+
+    #[test]
+    fn test_cleanup_expired_ml_dsa_grace_keys() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            let ml_dsa_pk = vec![0xAA; 1952];
+            let ml_kem_pk = vec![0xBB; 1184];
+            register_device_with_pq(
+                conn, "sg1", "dev1", &[1; 32], &[2; 32], &ml_dsa_pk, &ml_kem_pk, 0,
+            )?;
+
+            // Rotate the key so the old key lands in the grace slot.
+            let new_ml_dsa_pk = vec![0xCC; 1952];
+            let grace_expires_at = now_secs() + 3600; // 1 hour from now
+            let rotated = rotate_device_ml_dsa(conn, "sg1", "dev1", &new_ml_dsa_pk, 1, grace_expires_at)?;
+            assert!(rotated, "rotation should apply");
+
+            // Verify the grace key is present.
+            let device = get_device(conn, "sg1", "dev1")?.expect("device exists");
+            assert_eq!(device.prev_ml_dsa_65_public_key, ml_dsa_pk);
+            assert_eq!(device.prev_ml_dsa_65_expires_at, Some(grace_expires_at));
+
+            // Cleanup with "now" before the expiry — should NOT clear the grace key.
+            let cleaned = cleanup_expired_ml_dsa_grace_keys(conn, now_secs())?;
+            assert_eq!(cleaned, 0, "non-expired grace key should not be cleared");
+
+            let device = get_device(conn, "sg1", "dev1")?.expect("device exists");
+            assert_eq!(device.prev_ml_dsa_65_public_key, ml_dsa_pk, "grace key still present");
+            assert_eq!(device.prev_ml_dsa_65_expires_at, Some(grace_expires_at));
+
+            // Cleanup with a timestamp after the expiry — should clear the grace key.
+            let cleaned = cleanup_expired_ml_dsa_grace_keys(conn, grace_expires_at + 1)?;
+            assert_eq!(cleaned, 1, "expired grace key should be cleared");
+
+            let device = get_device(conn, "sg1", "dev1")?.expect("device exists");
+            assert!(device.prev_ml_dsa_65_public_key.is_empty(), "grace key should be empty");
+            assert_eq!(device.prev_ml_dsa_65_expires_at, None, "expiry should be NULL");
+
+            // The current key should be untouched.
+            assert_eq!(device.ml_dsa_65_public_key, new_ml_dsa_pk);
+            assert_eq!(device.ml_dsa_key_generation, 1);
+
+            Ok(())
+        })
+        .unwrap();
+    }
 }

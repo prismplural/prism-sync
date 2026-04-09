@@ -75,7 +75,11 @@ async fn run_cleanup(state: &AppState) {
             // 11. Delete expired or long-consumed sharing-init payloads.
             let expired_sharing_inits = crate::db::cleanup_expired_sharing_init_payloads(conn)?;
 
-            // 12. Reclaim freed pages (incremental auto_vacuum)
+            // 12. Clear expired ML-DSA grace keys (post-rotation old keys).
+            let expired_grace_keys =
+                crate::db::cleanup_expired_ml_dsa_grace_keys(conn, crate::db::now_secs())?;
+
+            // 13. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 = conn
                 .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -97,6 +101,7 @@ async fn run_cleanup(state: &AppState) {
                 revoked_tombstones,
                 stale_prekeys,
                 expired_sharing_inits,
+                expired_grace_keys,
                 pages_freed,
             ))
         })
@@ -117,6 +122,7 @@ async fn run_cleanup(state: &AppState) {
             revoked_tombstones,
             stale_prekeys,
             expired_sharing_inits,
+            expired_grace_keys,
             pages_freed,
         ))) => {
             state.metrics.last_cleanup_epoch_secs.store(
@@ -135,6 +141,7 @@ async fn run_cleanup(state: &AppState) {
                 || revoked_tombstones > 0
                 || stale_prekeys > 0
                 || expired_sharing_inits > 0
+                || expired_grace_keys > 0
                 || pages_freed > 0
             {
                 tracing::info!(
@@ -149,6 +156,7 @@ async fn run_cleanup(state: &AppState) {
                     revoked_tombstones,
                     stale_prekeys,
                     expired_sharing_inits,
+                    expired_grace_keys,
                     pages_freed,
                     "cleanup cycle complete"
                 );
