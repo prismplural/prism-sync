@@ -158,6 +158,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/sync/{sync_id}/devices/{device_id}/revoke",
             post(devices::post_atomic_revoke),
         )
+        .route(
+            "/v1/sync/{sync_id}/devices/{device_id}/rotate-ml-dsa",
+            post(devices::post_rotate_ml_dsa),
+        )
         .route("/v1/sync/{sync_id}/rekey", post(devices::post_rekey))
         .route(
             "/v1/sync/{sync_id}/rekey/{device_id}",
