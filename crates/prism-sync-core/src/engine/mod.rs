@@ -440,6 +440,7 @@ impl SyncEngine {
                         } else {
                             None
                         },
+                        ml_dsa_key_generation: dev.ml_dsa_key_generation,
                     }
                 })
                 .collect::<Vec<_>>();

@@ -228,6 +228,7 @@ pub fn register_device(
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
         permission: None,
+        ml_dsa_key_generation: 0,
     });
 
     let mut tx = storage.begin_tx().unwrap();
@@ -241,6 +242,7 @@ pub fn register_device(
         status: "active".to_string(),
         registered_at: chrono::Utc::now(),
         revoked_at: None,
+        ml_dsa_key_generation: 0,
     })
     .unwrap();
     tx.commit().unwrap();

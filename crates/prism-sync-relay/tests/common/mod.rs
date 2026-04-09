@@ -452,6 +452,7 @@ pub fn registry_snapshot_entry(
         x25519_public_key: x25519_public_key.to_vec(),
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
+        ml_dsa_key_generation: 0,
         status: status.to_string(),
     }
 }
@@ -470,6 +471,7 @@ pub fn registry_snapshot_entry_hybrid(
         x25519_public_key: keys.x25519_pk.to_vec(),
         ml_dsa_65_public_key: keys.ml_dsa_pk.clone(),
         ml_kem_768_public_key: keys.ml_kem_pk.clone(),
+        ml_dsa_key_generation: 0,
         status: status.to_string(),
     }
 }

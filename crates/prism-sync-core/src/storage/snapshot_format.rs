@@ -37,6 +37,8 @@ pub struct DeviceRegistryEntry {
     pub status: String,
     pub registered_at: String,
     pub revoked_at: Option<String>,
+    #[serde(default)]
+    pub ml_dsa_key_generation: u32,
 }
 
 /// Snapshot representation of an applied_ops row.

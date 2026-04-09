@@ -74,4 +74,5 @@ pub struct DeviceRecord {
     pub status: String, // "active" or "revoked"
     pub registered_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub ml_dsa_key_generation: u32,
 }

@@ -125,6 +125,7 @@ fn row_to_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecor
                 .ok()
                 .map(|d| d.with_timezone(&Utc))
         }),
+        ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
     })
 }
 
@@ -435,8 +436,8 @@ fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result
         "INSERT OR REPLACE INTO device_registry \
          (sync_id, device_id, ed25519_public_key, x25519_public_key, \
           ml_dsa_65_public_key, ml_kem_768_public_key, status, \
-          registered_at, revoked_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          registered_at, revoked_at, ml_dsa_key_generation) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             device.sync_id,
             device.device_id,
@@ -447,6 +448,7 @@ fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result
             device.status,
             device.registered_at.to_rfc3339(),
             device.revoked_at.map(|d| d.to_rfc3339()),
+            device.ml_dsa_key_generation as i32,
         ],
     )
     .map_err(CoreError::Sqlite)?;
@@ -569,6 +571,7 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 status: row.get("status")?,
                 registered_at: row.get("registered_at")?,
                 revoked_at: row.get("revoked_at")?,
+                ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
             })
         })
         .map_err(CoreError::Sqlite)?
@@ -685,8 +688,8 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
             "INSERT OR REPLACE INTO device_registry \
              (sync_id, device_id, ed25519_public_key, x25519_public_key, \
               ml_dsa_65_public_key, ml_kem_768_public_key, status, \
-              registered_at, revoked_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              registered_at, revoked_at, ml_dsa_key_generation) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 sync_id,
                 dr.device_id,
@@ -697,6 +700,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 dr.status,
                 dr.registered_at,
                 dr.revoked_at,
+                dr.ml_dsa_key_generation as i32,
             ],
         )
         .map_err(CoreError::Sqlite)?;
@@ -1131,6 +1135,7 @@ mod tests {
             status: "active".to_string(),
             registered_at: Utc::now(),
             revoked_at: None,
+            ml_dsa_key_generation: 0,
         }
     }
 

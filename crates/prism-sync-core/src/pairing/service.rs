@@ -174,6 +174,7 @@ impl PairingService {
             ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
             status: "active".into(),
+            ml_dsa_key_generation: 0,
         }]);
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
@@ -709,6 +710,7 @@ impl PairingService {
                 ml_dsa_65_public_key: device.ml_dsa_65_public_key,
                 ml_kem_768_public_key: device.ml_kem_768_public_key,
                 status: device.status,
+                ml_dsa_key_generation: device.ml_dsa_key_generation,
             })
             .collect();
         snapshot_entries.push(RegistrySnapshotEntry {
@@ -719,6 +721,7 @@ impl PairingService {
             ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
             status: "active".into(),
+            ml_dsa_key_generation: 0,
         });
         snapshot_entries.push(RegistrySnapshotEntry {
             sync_id: sync_id.clone(),
@@ -728,6 +731,7 @@ impl PairingService {
             ml_dsa_65_public_key: bootstrap_record.ml_dsa_65_public_key.clone(),
             ml_kem_768_public_key: bootstrap_record.ml_kem_768_ek().to_vec(),
             status: "active".into(),
+            ml_dsa_key_generation: 0,
         });
 
         let registry_snapshot = SignedRegistrySnapshot::new(snapshot_entries);
@@ -1313,6 +1317,7 @@ mod tests {
                 ml_dsa_65_public_key: req.ml_dsa_65_public_key,
                 ml_kem_768_public_key: req.ml_kem_768_public_key,
                 permission: None,
+                ml_dsa_key_generation: 0,
             });
             Ok(RegisterResponse {
                 device_session_token: "mock-session-token".to_string(),
@@ -1454,6 +1459,7 @@ mod tests {
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
             permission: None,
+            ml_dsa_key_generation: 0,
         }]));
 
         let initiator_store = Arc::new(MemStore::default());
@@ -1601,6 +1607,7 @@ mod tests {
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
             permission: None,
+            ml_dsa_key_generation: 0,
         }]));
 
         let initiator_store = Arc::new(MemStore::default());
@@ -2301,6 +2308,7 @@ mod tests {
                 ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "sync-approved".into(),
@@ -2310,6 +2318,7 @@ mod tests {
                 ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
         ]);
         let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);
@@ -2443,6 +2452,7 @@ mod tests {
                 ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "sync-approved".into(),
@@ -2452,6 +2462,7 @@ mod tests {
                 ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
         ]);
         let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);

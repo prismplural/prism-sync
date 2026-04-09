@@ -344,6 +344,7 @@ mod tests {
                 ml_dsa_65_public_key: vec![],
                 ml_kem_768_public_key: vec![],
                 permission: None,
+                ml_dsa_key_generation: 0,
             },
             DeviceInfo {
                 device_id: "receiver".to_string(),
@@ -354,6 +355,7 @@ mod tests {
                 ml_dsa_65_public_key: vec![],
                 ml_kem_768_public_key: vec![],
                 permission: None,
+                ml_dsa_key_generation: 0,
             },
             DeviceInfo {
                 device_id: "revoked-dev".to_string(),
@@ -364,6 +366,7 @@ mod tests {
                 ml_dsa_65_public_key: vec![],
                 ml_kem_768_public_key: vec![],
                 permission: None,
+                ml_dsa_key_generation: 0,
             },
         ]
     }

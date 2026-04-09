@@ -134,6 +134,7 @@ impl DeviceRegistryManager {
                 } else {
                     None
                 },
+                ml_dsa_key_generation: device.ml_dsa_key_generation,
             },
         };
 
@@ -203,6 +204,7 @@ mod tests {
             status: "active".into(),
             registered_at: Utc::now(),
             revoked_at: None,
+            ml_dsa_key_generation: 0,
         }
     }
 

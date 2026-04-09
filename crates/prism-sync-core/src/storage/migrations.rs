@@ -83,5 +83,10 @@ pub fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (sync_id, device_id)
             );
             ",
+    ),
+    M::up(
+        "-- V2: Add ml_dsa_key_generation to device_registry
+            ALTER TABLE device_registry ADD COLUMN ml_dsa_key_generation INTEGER NOT NULL DEFAULT 0;
+            ",
     )])
 }

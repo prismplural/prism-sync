@@ -270,6 +270,8 @@ pub struct DeviceInfo {
     #[serde(default, deserialize_with = "deserialize_base64_or_bytes")]
     pub ml_kem_768_public_key: Vec<u8>,
     pub permission: Option<String>,
+    #[serde(default)]
+    pub ml_dsa_key_generation: u32,
 }
 
 /// Serde module for `Vec<u8>` that serializes as base64 and deserializes

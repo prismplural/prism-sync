@@ -477,6 +477,7 @@ mod tests {
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
             permission: None,
+            ml_dsa_key_generation: 0,
         });
         relay.add_device(DeviceInfo {
             device_id: "d2".to_string(),
@@ -487,6 +488,7 @@ mod tests {
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
             permission: None,
+            ml_dsa_key_generation: 0,
         });
 
         let devices = relay.list_devices().await.unwrap();
