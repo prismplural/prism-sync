@@ -2,7 +2,7 @@ use axum::{
     body::Bytes,
     extract::{Extension, Path, State},
     http::HeaderMap,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use sha2::{Digest, Sha256};
@@ -115,7 +115,7 @@ pub async fn upload_media(
 
     tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
 
             // Check quota
             let current_usage = db::get_group_media_usage(&tx, &sid)?;
@@ -131,12 +131,17 @@ pub async fn upload_media(
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| {
-        if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+    .map_err(|e| match &e {
+        rusqlite::Error::QueryReturnedNoRows => {
             AppError::StorageFull("Media quota exceeded for sync group")
-        } else {
-            AppError::Internal(e.to_string())
         }
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                || f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            AppError::Conflict("Media with this ID already exists")
+        }
+        _ => AppError::Internal(e.to_string()),
     })?;
 
     // 10. Write to disk
@@ -154,12 +159,11 @@ pub async fn upload_media(
         .parent()
         .ok_or_else(|| AppError::Internal("Invalid media path".into()))?
         .to_path_buf();
-    let body_vec = body.to_vec();
     let file_path_clone = file_path.clone();
 
     let write_result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
         let named_temp = tempfile::NamedTempFile::new_in(&parent_dir)?;
-        std::io::Write::write_all(&mut named_temp.as_file().try_clone()?, &body_vec)?;
+        std::io::Write::write_all(&mut named_temp.as_file().try_clone()?, &body)?;
         named_temp.persist(&file_path_clone)?;
         Ok(())
     })
@@ -197,7 +201,7 @@ pub async fn download_media(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
     Path((path_sync_id, media_id)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     // 1. Validate path_sync_id == auth.sync_id
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
@@ -227,31 +231,26 @@ pub async fn download_media(
         _ => return Err(AppError::NotFound),
     };
 
-    // 4. Read file from disk
+    // 4. Stream file from disk
     let storage_path = state.config.media_storage_path.clone();
     let file_path = media_file_path(&storage_path, &metadata.sync_id, &metadata.media_id);
 
-    let data = tokio::fs::read(&file_path)
+    let file = tokio::fs::File::open(&file_path)
         .await
         .map_err(|_| AppError::NotFound)?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
 
     // 5. Increment metrics
     state.metrics.inc(&state.metrics.media_downloads);
 
-    // 6. Return bytes with appropriate headers
-    Ok((
-        [
-            (
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("no-store"),
-            ),
-            (
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/octet-stream"),
-            ),
-        ],
-        data,
-    ))
+    // 6. Return streaming body with appropriate headers
+    Ok(Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body)
+        .unwrap())
 }
 
 #[cfg(test)]

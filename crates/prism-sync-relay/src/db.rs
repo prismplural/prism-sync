@@ -2263,23 +2263,16 @@ pub fn cleanup_expired_media(
     retention_days: u64,
 ) -> Result<Vec<(String, String)>, rusqlite::Error> {
     let cutoff = now_secs() - (retention_days * 86400) as i64;
+    let now = now_secs();
     let mut stmt = conn.prepare(
-        "SELECT sync_id, media_id FROM media_metadata
-         WHERE deleted_at IS NULL AND created_at < ?1",
+        "UPDATE media_metadata SET deleted_at = ?1
+         WHERE deleted_at IS NULL AND created_at < ?2
+         RETURNING sync_id, media_id",
     )?;
     let pairs: Vec<(String, String)> = stmt
-        .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map(params![now, cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
         .collect();
-
-    let now = now_secs();
-    for (_, media_id) in &pairs {
-        conn.execute(
-            "UPDATE media_metadata SET deleted_at = ?1 WHERE media_id = ?2 AND deleted_at IS NULL",
-            params![now, media_id],
-        )?;
-    }
-
     Ok(pairs)
 }
 
