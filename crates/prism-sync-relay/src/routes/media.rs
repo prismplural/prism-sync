@@ -41,6 +41,9 @@ pub async fn upload_media(
     Extension(auth): Extension<AuthIdentity>,
     Path(path_sync_id): Path<String>,
     headers: HeaderMap,
+    // Note: Entire body buffered in memory (max `media_max_file_bytes`, default 10MB).
+    // Acceptable at current scale. For high-concurrency deployments, consider
+    // streaming to disk via axum::body::Body with incremental SHA-256.
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     // 1. Validate path_sync_id == auth.sync_id
@@ -113,7 +116,7 @@ pub async fn upload_media(
     let mid = media_id_owned.clone();
     let chash = content_hash_owned.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let inserted = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
 
@@ -121,20 +124,17 @@ pub async fn upload_media(
             let current_usage = db::get_group_media_usage(&tx, &sid)?;
             if current_usage + size_bytes > quota as i64 {
                 tx.rollback()?;
-                return Err(rusqlite::Error::QueryReturnedNoRows); // sentinel
+                return Ok(false); // quota exceeded
             }
 
             db::insert_media_metadata(&tx, &mid, &sid, &did, size_bytes, &chash, None)?;
             tx.commit()?;
-            Ok(())
+            Ok(true)
         })
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| match &e {
-        rusqlite::Error::QueryReturnedNoRows => {
-            AppError::StorageFull("Media quota exceeded for sync group")
-        }
         rusqlite::Error::SqliteFailure(f, _)
             if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
                 || f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
@@ -143,6 +143,10 @@ pub async fn upload_media(
         }
         _ => AppError::Internal(e.to_string()),
     })?;
+
+    if !inserted {
+        return Err(AppError::StorageFull("Media quota exceeded for sync group"));
+    }
 
     // 10. Write to disk
     let storage_path = state.config.media_storage_path.clone();
