@@ -47,15 +47,28 @@ impl DeviceSecret {
         Ok(DeviceSigningKey { signing_key })
     }
 
-    /// Derive ML-DSA-65 signing keypair.
+    /// Derive ML-DSA-65 signing keypair (generation 0).
     /// HKDF: ikm=device_secret, salt=device_id, info="prism_device_ml_dsa_65"
     /// Uses `ExpandedSigningKey` which implements `ZeroizeOnDrop`.
     pub fn ml_dsa_65_keypair(&self, device_id: &str) -> Result<DevicePqSigningKey> {
-        let seed = kdf::derive_subkey(
-            &self.secret,
-            device_id.as_bytes(),
-            b"prism_device_ml_dsa_65",
-        )?;
+        self.ml_dsa_65_keypair_v(device_id, 0)
+    }
+
+    /// Derive a versioned ML-DSA-65 signing keypair for key rotation.
+    /// Generation 0 uses info `"prism_device_ml_dsa_65"` (backward-compatible).
+    /// Generation N>0 uses info `"prism_device_ml_dsa_65_v{N}"`.
+    pub fn ml_dsa_65_keypair_v(
+        &self,
+        device_id: &str,
+        generation: u32,
+    ) -> Result<DevicePqSigningKey> {
+        let info: Vec<u8> = if generation == 0 {
+            b"prism_device_ml_dsa_65".to_vec()
+        } else {
+            format!("prism_device_ml_dsa_65_v{generation}")
+                .into_bytes()
+        };
+        let seed = kdf::derive_subkey(&self.secret, device_id.as_bytes(), &info)?;
         let mut seed_arr = ml_dsa::B32::try_from(seed.as_slice())
             .map_err(|_| CryptoError::KdfFailed("ML-DSA seed length mismatch".into()))?;
         let signing_key = ml_dsa::ExpandedSigningKey::<MlDsa65>::from_seed(&seed_arr);
@@ -358,5 +371,32 @@ mod tests {
         assert_zeroize_on_drop::<ml_dsa::ExpandedSigningKey<MlDsa65>>();
         assert_zeroize_on_drop::<ml_kem::DecapsulationKey<MlKem768>>();
         assert_zeroize_on_drop::<DeviceExchangeKey>();
+    }
+
+    #[test]
+    fn ml_dsa_65_keypair_v_generation_0_matches_original() {
+        let secret = DeviceSecret::generate();
+        let original = secret.ml_dsa_65_keypair("device_abc").unwrap();
+        let versioned = secret.ml_dsa_65_keypair_v("device_abc", 0).unwrap();
+        assert_eq!(original.public_key_bytes(), versioned.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_dsa_65_keypair_v_different_generations_differ() {
+        let secret = DeviceSecret::generate();
+        let gen0 = secret.ml_dsa_65_keypair_v("device_abc", 0).unwrap();
+        let gen1 = secret.ml_dsa_65_keypair_v("device_abc", 1).unwrap();
+        let gen2 = secret.ml_dsa_65_keypair_v("device_abc", 2).unwrap();
+        assert_ne!(gen0.public_key_bytes(), gen1.public_key_bytes());
+        assert_ne!(gen1.public_key_bytes(), gen2.public_key_bytes());
+        assert_ne!(gen0.public_key_bytes(), gen2.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_dsa_65_keypair_v_deterministic() {
+        let secret = DeviceSecret::generate();
+        let a = secret.ml_dsa_65_keypair_v("device_abc", 1).unwrap();
+        let b = secret.ml_dsa_65_keypair_v("device_abc", 1).unwrap();
+        assert_eq!(a.public_key_bytes(), b.public_key_bytes());
     }
 }
