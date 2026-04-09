@@ -149,6 +149,9 @@ impl SharingSender {
             .map_err(|e| CoreError::Engine(format!("CSPRNG failed: {e}")))?;
         let eph_dk = XWingKem::decapsulation_key_from_bytes(&eph_seed);
         let sender_ephemeral_ek = XWingKem::encapsulation_key_bytes(&eph_dk);
+        // Drop the ephemeral DK before the relay .await below — it's no longer
+        // needed and holding it across the await inflates the async state machine.
+        drop(eph_dk);
 
         // 7. Encapsulate to recipient's prekey xwing_ek
         let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
@@ -245,8 +248,6 @@ impl SharingSender {
             )
             .await
             .map_err(|e| CoreError::Engine(format!("failed to upload sharing init: {e}")))?;
-
-        // 16. Ephemeral dk seed is dropped (Zeroizing)
 
         Ok(SharingInitResult {
             pairwise_secret,

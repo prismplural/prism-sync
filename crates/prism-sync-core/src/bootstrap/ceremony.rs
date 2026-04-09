@@ -79,6 +79,15 @@ impl JoinerCeremony {
             ml_dsa_65_public_key: ml_dsa_65_kp.public_key_bytes(),
             xwing_ek: ek,
         };
+        // Drop large PQ types before the async relay call below. They are no
+        // longer needed and their presence in the async state machine across
+        // the .await would inflate the future size — ExpandedSigningKey<MlDsa65>
+        // alone is ~48 KB — causing stack overflow on platforms with limited
+        // tokio worker stacks (e.g. Android).
+        drop(ml_dsa_65_kp);
+        drop(dk);
+        drop(ed25519_kp);
+        drop(x25519_kp);
 
         // 5. Upload to relay
         let rendezvous_id = relay
@@ -327,6 +336,12 @@ impl InitiatorCeremony {
             ml_dsa_65_pk: ml_dsa_65_kp.public_key_bytes(),
             xwing_ek: local_xwing_ek,
         };
+        // Drop large PQ types before the async relay call below — same reason
+        // as JoinerCeremony::start: keep the future state machine small.
+        drop(ml_dsa_65_kp);
+        drop(local_xwing_dk);
+        drop(ed25519_kp);
+        drop(x25519_kp);
 
         // 5. Encapsulate to joiner's X-Wing ek
         let (kem_ciphertext, secret) =
