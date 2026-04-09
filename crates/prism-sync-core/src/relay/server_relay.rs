@@ -304,6 +304,8 @@ impl SyncRelay for ServerRelay {
             "device_id": req.device_id,
             "signing_public_key": hex::encode(&req.signing_public_key),
             "x25519_public_key": hex::encode(&req.x25519_public_key),
+            "ml_dsa_65_public_key": hex::encode(&req.ml_dsa_65_public_key),
+            "ml_kem_768_public_key": hex::encode(&req.ml_kem_768_public_key),
             "registration_challenge": hex::encode(&req.registration_challenge),
             "nonce": req.nonce,
             "pow_solution": req.pow_solution.as_ref().map(|solution| {
@@ -780,6 +782,50 @@ impl SyncRelay for ServerRelay {
             tokio_stream::wrappers::BroadcastStream::new(rx)
                 .filter_map(|r: Result<SyncNotification, _>| async move { r.ok() }),
         )
+    }
+
+    async fn rotate_ml_dsa(
+        &self,
+        device_id: &str,
+        new_ml_dsa_pk: &[u8],
+        new_generation: u32,
+        proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+    ) -> Result<RotateMlDsaResponse, RelayError> {
+        let path = self.canonical_path(&format!("/devices/{device_id}/rotate-ml-dsa"));
+        let url = format!("{}{}", self.base_url, path);
+        debug!("rotate_ml_dsa device_id={device_id} generation={new_generation}");
+
+        let body = serde_json::json!({
+            "new_ml_dsa_pk": BASE64.encode(new_ml_dsa_pk),
+            "ml_dsa_key_generation": new_generation,
+            "timestamp": proof.timestamp,
+            "old_signs_new": BASE64.encode(&proof.old_signs_new),
+            "new_signs_old": BASE64.encode(&proof.new_signs_old),
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode rotate-ml-dsa request: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        resp.json::<RotateMlDsaResponse>()
+            .await
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse rotate-ml-dsa response: {e}"),
+            })
     }
 
     async fn dispose(&self) -> Result<(), RelayError> {
