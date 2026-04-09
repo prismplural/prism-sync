@@ -20,6 +20,9 @@ pub struct DeviceRecord {
     pub epoch: i64,
     pub status: String,
     pub last_seen_at: i64,
+    pub ml_dsa_key_generation: i64,
+    pub prev_ml_dsa_65_public_key: Vec<u8>,
+    pub prev_ml_dsa_65_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,7 @@ pub struct DeviceListEntry {
     pub ml_kem_768_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
+    pub ml_dsa_key_generation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +279,9 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             last_seen_at        INTEGER NOT NULL,
             revoked_at          INTEGER,
             remote_wipe         INTEGER NOT NULL DEFAULT 0,
+            ml_dsa_key_generation INTEGER NOT NULL DEFAULT 0,
+            prev_ml_dsa_65_public_key BLOB NOT NULL DEFAULT X'',
+            prev_ml_dsa_65_expires_at INTEGER,
             PRIMARY KEY (sync_id, device_id),
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
@@ -488,6 +495,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_sharing_identity_generation(conn)?;
     migrate_sharing_identity_generation_floors(conn)?;
     migrate_sync_groups_password_version(conn)?;
+    migrate_devices_ml_dsa_rotation(conn)?;
 
     Ok(())
 }
@@ -627,6 +635,31 @@ fn migrate_sharing_identity_generation(conn: &Connection) -> Result<(), rusqlite
         conn.execute_batch(
             "ALTER TABLE sharing_identity_bundles
              ADD COLUMN identity_generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Add ML-DSA key rotation columns to an existing `devices` table.
+/// Safe to call repeatedly — checks for column existence first.
+fn migrate_devices_ml_dsa_rotation(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_gen = device_has_column(conn, "ml_dsa_key_generation")?;
+    let has_prev = device_has_column(conn, "prev_ml_dsa_65_public_key")?;
+    let has_expires = device_has_column(conn, "prev_ml_dsa_65_expires_at")?;
+
+    if !has_gen {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN ml_dsa_key_generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !has_prev {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN prev_ml_dsa_65_public_key BLOB NOT NULL DEFAULT X'';",
+        )?;
+    }
+    if !has_expires {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN prev_ml_dsa_65_expires_at INTEGER;",
         )?;
     }
     Ok(())
@@ -1086,7 +1119,9 @@ pub fn get_device(
     conn.query_row(
         "SELECT device_id, signing_public_key, x25519_public_key,
                 ml_dsa_65_public_key, ml_kem_768_public_key,
-                epoch, status, last_seen_at
+                epoch, status, last_seen_at,
+                ml_dsa_key_generation, prev_ml_dsa_65_public_key,
+                prev_ml_dsa_65_expires_at
          FROM devices
          WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
@@ -1100,6 +1135,9 @@ pub fn get_device(
                 epoch: row.get(5)?,
                 status: row.get(6)?,
                 last_seen_at: row.get(7)?,
+                ml_dsa_key_generation: row.get(8)?,
+                prev_ml_dsa_65_public_key: row.get(9)?,
+                prev_ml_dsa_65_expires_at: row.get(10)?,
             })
         },
     )
@@ -1113,7 +1151,7 @@ pub fn list_devices(
     let mut stmt = conn.prepare(
         "SELECT device_id, signing_public_key, x25519_public_key,
                 ml_dsa_65_public_key, ml_kem_768_public_key,
-                epoch, status
+                epoch, status, ml_dsa_key_generation
          FROM devices
          WHERE sync_id = ?1
          ORDER BY registered_at ASC",
@@ -1127,6 +1165,7 @@ pub fn list_devices(
             ml_kem_768_public_key: row.get(4)?,
             epoch: row.get(5)?,
             status: row.get(6)?,
+            ml_dsa_key_generation: row.get(7)?,
         })
     })?;
     rows.collect()
@@ -1219,6 +1258,40 @@ pub fn count_active_devices(conn: &Connection, sync_id: &str) -> Result<u64, rus
         params![sync_id],
         |row| row.get(0),
     )
+}
+
+/// Rotate a device's ML-DSA key, shifting the current key to the grace slot.
+pub fn rotate_device_ml_dsa(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    new_ml_dsa_pk: &[u8],
+    new_generation: i64,
+    grace_expires_at: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE devices SET
+            prev_ml_dsa_65_public_key = ml_dsa_65_public_key,
+            prev_ml_dsa_65_expires_at = ?1,
+            ml_dsa_65_public_key = ?2,
+            ml_dsa_key_generation = ?3
+         WHERE sync_id = ?4 AND device_id = ?5 AND ml_dsa_key_generation < ?3",
+        params![grace_expires_at, new_ml_dsa_pk, new_generation, sync_id, device_id],
+    )?;
+    Ok(())
+}
+
+/// Clean up expired ML-DSA grace keys.
+pub fn cleanup_expired_ml_dsa_grace_keys(
+    conn: &Connection,
+    now: i64,
+) -> Result<usize, rusqlite::Error> {
+    let count = conn.execute(
+        "UPDATE devices SET prev_ml_dsa_65_public_key = X'', prev_ml_dsa_65_expires_at = NULL
+         WHERE prev_ml_dsa_65_expires_at IS NOT NULL AND prev_ml_dsa_65_expires_at < ?1",
+        [now],
+    )?;
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------

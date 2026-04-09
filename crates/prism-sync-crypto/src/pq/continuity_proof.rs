@@ -77,7 +77,7 @@ impl MlDsaContinuityProof {
             b"ml_dsa_rotation",
             &ed25519.into_signing_key(),
             old_ml_dsa.as_signing_key(),
-        );
+        )?;
         let old_signs_new = hybrid_sig.to_bytes();
 
         // New signs old: ML-DSA only (proves possession of new key)
