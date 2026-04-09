@@ -179,10 +179,10 @@ async fn test_rollback_generation_returns_409() {
     // even before proof verification since generation <= current.
     let gen0_sk = keys.device_secret.ml_dsa_65_keypair_v(&device_id, 0).unwrap();
     let body = serde_json::to_vec(&serde_json::json!({
-        "new_ml_dsa_pk": b64().encode(&gen0_sk.public_key_bytes()),
+        "new_ml_dsa_pk": b64().encode(gen0_sk.public_key_bytes()),
         "ml_dsa_key_generation": 0,
-        "old_signs_new": b64().encode(&[0u8; 64]),
-        "new_signs_old": b64().encode(&[0u8; 64]),
+        "old_signs_new": b64().encode([0u8; 64]),
+        "new_signs_old": b64().encode([0u8; 64]),
     }))
     .unwrap();
 
@@ -291,7 +291,7 @@ async fn test_double_rotation_succeeds() {
         .expect("proof gen 1→2 should succeed");
     let gen2_sk = keys.device_secret.ml_dsa_65_keypair_v(&device_id, 2).unwrap();
     let body = serde_json::to_vec(&serde_json::json!({
-        "new_ml_dsa_pk": b64().encode(&gen2_sk.public_key_bytes()),
+        "new_ml_dsa_pk": b64().encode(gen2_sk.public_key_bytes()),
         "ml_dsa_key_generation": 2,
         "old_signs_new": b64().encode(&proof.old_signs_new),
         "new_signs_old": b64().encode(&proof.new_signs_old),
