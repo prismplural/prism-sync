@@ -370,6 +370,7 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
         "epoch": info.epoch,
         "status": info.status,
         "permission": info.permission,
+        "ml_dsa_key_generation": info.ml_dsa_key_generation,
     })
 }
 
