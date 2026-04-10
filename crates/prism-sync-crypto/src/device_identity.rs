@@ -3,7 +3,7 @@ use ml_dsa::MlDsa65;
 use ml_kem::MlKem768;
 use rand::{rngs::OsRng, RngCore};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{CryptoError, Result};
 use crate::kdf;
@@ -47,15 +47,29 @@ impl DeviceSecret {
         Ok(DeviceSigningKey { signing_key })
     }
 
-    /// Derive ML-DSA-65 signing keypair.
+    /// Derive ML-DSA-65 signing keypair (generation 0).
     /// HKDF: ikm=device_secret, salt=device_id, info="prism_device_ml_dsa_65"
     /// Uses `ExpandedSigningKey` which implements `ZeroizeOnDrop`.
     pub fn ml_dsa_65_keypair(&self, device_id: &str) -> Result<DevicePqSigningKey> {
-        let seed = kdf::derive_subkey(
-            &self.secret,
-            device_id.as_bytes(),
-            b"prism_device_ml_dsa_65",
-        )?;
+        self.ml_dsa_65_keypair_v(device_id, 0)
+    }
+
+    /// Derive a versioned ML-DSA-65 signing keypair for key rotation.
+    ///
+    /// - Generation 0: info = `"prism_device_ml_dsa_65"` (backward-compatible)
+    /// - Generation N>0: info = `"prism_device_ml_dsa_65_v{N}"`
+    pub fn ml_dsa_65_keypair_v(
+        &self,
+        device_id: &str,
+        generation: u32,
+    ) -> Result<DevicePqSigningKey> {
+        let info: Vec<u8> = if generation == 0 {
+            b"prism_device_ml_dsa_65".to_vec()
+        } else {
+            format!("prism_device_ml_dsa_65_v{generation}")
+                .into_bytes()
+        };
+        let seed = kdf::derive_subkey(&self.secret, device_id.as_bytes(), &info)?;
         let mut seed_arr = ml_dsa::B32::try_from(seed.as_slice())
             .map_err(|_| CryptoError::KdfFailed("ML-DSA seed length mismatch".into()))?;
         let signing_key = ml_dsa::ExpandedSigningKey::<MlDsa65>::from_seed(&seed_arr);
@@ -77,6 +91,20 @@ impl DeviceSecret {
         let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(core::mem::take(&mut seed));
         seed.zeroize();
         Ok(DevicePqKemKey {
+            decapsulation_key: dk,
+        })
+    }
+
+    /// Derive X-Wing hybrid KEM keypair (X25519 + ML-KEM-768).
+    /// HKDF: ikm=device_secret, salt=device_id, info="prism_device_xwing_rekey"
+    pub fn xwing_keypair(&self, device_id: &str) -> Result<DeviceXWingKey> {
+        let seed =
+            kdf::derive_subkey(&self.secret, device_id.as_bytes(), b"prism_device_xwing_rekey")?;
+        let mut seed_arr = [0u8; 32];
+        seed_arr.copy_from_slice(&seed);
+        let dk = crate::pq::hybrid_kem::XWingKem::decapsulation_key_from_bytes(&seed_arr);
+        seed_arr.zeroize();
+        Ok(DeviceXWingKey {
             decapsulation_key: dk,
         })
     }
@@ -153,6 +181,11 @@ pub struct DevicePqSigningKey {
 }
 
 impl DevicePqSigningKey {
+    /// Access the inner `ExpandedSigningKey` (e.g. for `HybridSignature::sign_v3`).
+    pub fn as_signing_key(&self) -> &ml_dsa::ExpandedSigningKey<MlDsa65> {
+        &self.signing_key
+    }
+
     /// Get the encoded verifying (public) key bytes (1952 bytes).
     pub fn public_key_bytes(&self) -> Vec<u8> {
         let vk = self.signing_key.verifying_key();
@@ -199,6 +232,25 @@ impl DevicePqKemKey {
             .encapsulation_key()
             .to_bytes()
             .to_vec()
+    }
+}
+
+/// X-Wing hybrid KEM key (X25519 + ML-KEM-768) for epoch rekey.
+pub struct DeviceXWingKey {
+    decapsulation_key: x_wing::DecapsulationKey,
+}
+
+impl DeviceXWingKey {
+    /// Get the encapsulation (public) key bytes (1216 bytes).
+    pub fn encapsulation_key_bytes(&self) -> Vec<u8> {
+        crate::pq::hybrid_kem::XWingKem::encapsulation_key_bytes(&self.decapsulation_key)
+    }
+
+    /// Decapsulate an X-Wing ciphertext, recovering the shared secret.
+    pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let ss =
+            crate::pq::hybrid_kem::XWingKem::decapsulate(&self.decapsulation_key, ciphertext)?;
+        Ok(Zeroizing::new(ss))
     }
 }
 
@@ -358,5 +410,88 @@ mod tests {
         assert_zeroize_on_drop::<ml_dsa::ExpandedSigningKey<MlDsa65>>();
         assert_zeroize_on_drop::<ml_kem::DecapsulationKey<MlKem768>>();
         assert_zeroize_on_drop::<DeviceExchangeKey>();
+    }
+
+    #[test]
+    fn ml_dsa_65_keypair_v_generation_0_matches_original() {
+        let secret = DeviceSecret::generate();
+        let original = secret.ml_dsa_65_keypair("device_abc").unwrap();
+        let versioned = secret.ml_dsa_65_keypair_v("device_abc", 0).unwrap();
+        assert_eq!(original.public_key_bytes(), versioned.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_dsa_65_keypair_v_different_generations_differ() {
+        let secret = DeviceSecret::generate();
+        let gen0 = secret.ml_dsa_65_keypair_v("device_abc", 0).unwrap();
+        let gen1 = secret.ml_dsa_65_keypair_v("device_abc", 1).unwrap();
+        let gen2 = secret.ml_dsa_65_keypair_v("device_abc", 2).unwrap();
+        assert_ne!(gen0.public_key_bytes(), gen1.public_key_bytes());
+        assert_ne!(gen1.public_key_bytes(), gen2.public_key_bytes());
+        assert_ne!(gen0.public_key_bytes(), gen2.public_key_bytes());
+    }
+
+    #[test]
+    fn ml_dsa_65_keypair_v_deterministic() {
+        let secret = DeviceSecret::generate();
+        let a = secret.ml_dsa_65_keypair_v("device_abc", 1).unwrap();
+        let b = secret.ml_dsa_65_keypair_v("device_abc", 1).unwrap();
+        assert_eq!(a.public_key_bytes(), b.public_key_bytes());
+    }
+
+    #[test]
+    fn xwing_keypair_deterministic() {
+        let secret = DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let kp1 = secret.xwing_keypair("device_abc").unwrap();
+        let kp2 = secret.xwing_keypair("device_abc").unwrap();
+        assert_eq!(kp1.encapsulation_key_bytes(), kp2.encapsulation_key_bytes());
+    }
+
+    #[test]
+    fn xwing_different_devices_different_keys() {
+        let secret = DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let kp1 = secret.xwing_keypair("device_a").unwrap();
+        let kp2 = secret.xwing_keypair("device_b").unwrap();
+        assert_ne!(kp1.encapsulation_key_bytes(), kp2.encapsulation_key_bytes());
+    }
+
+    #[test]
+    fn xwing_encapsulation_key_size() {
+        let secret = DeviceSecret::generate();
+        let kp = secret.xwing_keypair("test").unwrap();
+        assert_eq!(kp.encapsulation_key_bytes().len(), 1216);
+    }
+
+    #[test]
+    fn xwing_encap_decap_round_trip() {
+        use crate::pq::hybrid_kem::XWingKem;
+
+        let secret = DeviceSecret::generate();
+        let kp = secret.xwing_keypair("my_device").unwrap();
+        let ek_bytes = kp.encapsulation_key_bytes();
+        let ek = XWingKem::encapsulation_key_from_bytes(&ek_bytes).unwrap();
+        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+        let (ct, ss_enc) = XWingKem::encapsulate(&ek, &mut rng);
+        let ss_dec = kp.decapsulate(&ct).unwrap();
+        assert_eq!(ss_enc.as_slice(), ss_dec.as_slice());
+        assert_eq!(ss_enc.len(), 32);
+    }
+
+    #[test]
+    fn xwing_key_distinct_from_ml_kem() {
+        let secret = DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
+        let xwing_kp = secret.xwing_keypair("device_abc").unwrap();
+        let ml_kem_kp = secret.ml_kem_768_keypair("device_abc").unwrap();
+        let x25519_kp = secret.x25519_keypair("device_abc").unwrap();
+
+        let xwing_ek = xwing_kp.encapsulation_key_bytes();
+        let ml_kem_pk = ml_kem_kp.public_key_bytes();
+        let x25519_pk = x25519_kp.public_key_bytes();
+
+        // X-Wing EK is 1216 bytes (different size from ML-KEM 1184 and X25519 32)
+        assert_ne!(xwing_ek.len(), ml_kem_pk.len());
+        assert_ne!(xwing_ek.len(), x25519_pk.len());
+        // Also check content differs (in case of overlapping prefix)
+        assert_ne!(&xwing_ek[..ml_kem_pk.len()], ml_kem_pk.as_slice());
     }
 }
