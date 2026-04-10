@@ -139,6 +139,9 @@ impl SyncRelay for RekeyMockRelay {
     async fn dispose(&self) -> Result<(), RelayError> {
         Ok(())
     }
+    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
+        Ok(None)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════

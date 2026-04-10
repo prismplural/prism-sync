@@ -852,6 +852,9 @@ mod tests {
         async fn dispose(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
+        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
+            Ok(None)
+        }
     }
 
     fn make_sync() -> PrismSync {
