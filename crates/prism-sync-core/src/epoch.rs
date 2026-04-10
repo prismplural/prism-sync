@@ -84,9 +84,13 @@ impl EpochManager {
             .decapsulate(ciphertext)
             .map_err(CoreError::Crypto)?;
 
-        // 5. Derive unwrap key via HKDF
+        // 5. Derive unwrap key via HKDF — salt binds epoch + device_id to prevent
+        //    artifact replay across epochs or devices.
+        let mut salt = Vec::with_capacity(4 + device_id.len());
+        salt.extend_from_slice(&new_epoch.to_le_bytes());
+        salt.extend_from_slice(device_id.as_bytes());
         let unwrap_key =
-            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &[], b"prism_epoch_rekey_v2")
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                 .map_err(CoreError::Crypto)?;
 
         // 6. Decrypt epoch key
@@ -107,6 +111,7 @@ impl EpochManager {
     /// encapsulation uses only the recipient's X-Wing public key.
     pub async fn prepare_wrapped_keys(
         relay: &dyn SyncRelay,
+        new_epoch: u32,
         excluded_device_id: Option<&str>,
     ) -> Result<(Zeroizing<Vec<u8>>, HashMap<String, Vec<u8>>)> {
         // 1. Generate a random 32-byte epoch key
@@ -161,9 +166,12 @@ impl EpochManager {
                 );
             let shared_secret = Zeroizing::new(shared_secret_raw);
 
-            // Derive wrap key via HKDF
+            // Derive wrap key via HKDF — salt binds epoch + device_id
+            let mut salt = Vec::with_capacity(4 + device.device_id.len());
+            salt.extend_from_slice(&new_epoch.to_le_bytes());
+            salt.extend_from_slice(device.device_id.as_bytes());
             let wrap_key =
-                prism_sync_crypto::kdf::derive_subkey(&shared_secret, &[], b"prism_epoch_rekey_v2")
+                prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                     .map_err(CoreError::Crypto)?;
 
             // Encrypt epoch key for this device
@@ -191,7 +199,7 @@ impl EpochManager {
         new_epoch: u32,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let (epoch_key, wrapped_keys) =
-            Self::prepare_wrapped_keys(relay, None).await?;
+            Self::prepare_wrapped_keys(relay, new_epoch, None).await?;
 
         key_hierarchy.store_epoch_key(new_epoch, Zeroizing::new(epoch_key.to_vec()));
         relay
@@ -382,7 +390,12 @@ mod tests {
     }
 
     /// Build a v2 artifact: sender encapsulates a known epoch key for the receiver.
-    fn build_v2_artifact(receiver_xwing: &DeviceXWingKey, epoch_key: &[u8]) -> Vec<u8> {
+    fn build_v2_artifact(
+        receiver_xwing: &DeviceXWingKey,
+        epoch_key: &[u8],
+        epoch: u32,
+        device_id: &str,
+    ) -> Vec<u8> {
         use prism_sync_crypto::pq::hybrid_kem::XWingKem;
 
         let ek_bytes = receiver_xwing.encapsulation_key_bytes();
@@ -392,13 +405,16 @@ mod tests {
             XWingKem::encapsulate(&ek, &mut rng);
         let shared_secret = Zeroizing::new(shared_secret_raw);
 
+        let mut salt = Vec::with_capacity(4 + device_id.len());
+        salt.extend_from_slice(&epoch.to_le_bytes());
+        salt.extend_from_slice(device_id.as_bytes());
         let wrap_key =
-            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &[], b"prism_epoch_rekey_v2")
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                 .unwrap();
         let encrypted_epoch_key =
             prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
 
-        let mut artifact = Vec::new();
+        let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
         artifact.push(ARTIFACT_VERSION);
         artifact.extend_from_slice(&ciphertext);
         artifact.extend_from_slice(&encrypted_epoch_key);
@@ -459,9 +475,9 @@ mod tests {
         let receiver_secret = DeviceSecret::generate();
         let receiver_xwing = receiver_secret.xwing_keypair("receiver").unwrap();
 
-        // Sender builds v2 artifact for receiver
+        // Sender builds v2 artifact for receiver at epoch 5
         let epoch_key = vec![0xABu8; 32];
-        let artifact = build_v2_artifact(&receiver_xwing, &epoch_key);
+        let artifact = build_v2_artifact(&receiver_xwing, &epoch_key, 5, "receiver");
 
         let relay = MockRelay::new_with_artifact(Some(artifact));
         let mut kh = KeyHierarchy::new();
@@ -576,9 +592,12 @@ mod tests {
         let encrypted_epoch_key = &artifact[1 + XWING_CT_LEN..];
 
         let shared_secret = receiver_xwing.decapsulate(ciphertext).unwrap();
+        let mut salt = Vec::new();
+        salt.extend_from_slice(&2u32.to_le_bytes());
+        salt.extend_from_slice(b"receiver");
         let unwrap_key = prism_sync_crypto::kdf::derive_subkey(
             &shared_secret,
-            &[],
+            &salt,
             b"prism_epoch_rekey_v2",
         )
         .unwrap();
@@ -619,7 +638,7 @@ mod tests {
         let xwing_c = secret_c.xwing_keypair("device-c").unwrap();
 
         let epoch_key = vec![0xCDu8; 32];
-        let artifact = build_v2_artifact(&xwing_b, &epoch_key);
+        let artifact = build_v2_artifact(&xwing_b, &epoch_key, 5, "device-b");
 
         let relay = MockRelay::new_with_artifact(Some(artifact));
         let mut kh = KeyHierarchy::new();
@@ -665,7 +684,7 @@ mod tests {
         ];
         let relay = MockRelay::new_with_devices(devices);
 
-        let (_, wrapped_keys) = EpochManager::prepare_wrapped_keys(&relay, None)
+        let (_, wrapped_keys) = EpochManager::prepare_wrapped_keys(&relay, 1, None)
             .await
             .expect("should succeed despite one bad device");
 

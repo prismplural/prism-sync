@@ -557,6 +557,7 @@ impl PrismSync {
         //    atomic revoke+epoch-rotation request against the relay.
         let (epoch_key, wrapped_keys) = crate::epoch::EpochManager::prepare_wrapped_keys(
             relay.as_ref(),
+            new_epoch,
             Some(target_device_id),
         )
         .await?;

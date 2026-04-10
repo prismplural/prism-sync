@@ -213,7 +213,7 @@ async fn epoch_rotation_full_cycle() {
     // ── Step 1: Device A generates a new epoch key and performs atomic revoke ──
     // Device C is revoked (excluded) — X-Wing wraps for A and B only.
     let (epoch_key_a, wrapped_keys) =
-        EpochManager::prepare_wrapped_keys(&relay, Some("device-c"))
+        EpochManager::prepare_wrapped_keys(&relay, 1, Some("device-c"))
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
@@ -336,7 +336,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
 
     // Device A excludes device-c from wrapped keys
     let (_epoch_key, wrapped_keys) =
-        EpochManager::prepare_wrapped_keys(&relay, Some("device-c"))
+        EpochManager::prepare_wrapped_keys(&relay, 1, Some("device-c"))
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
