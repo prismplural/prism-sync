@@ -16,6 +16,7 @@ use prism_sync_core::bootstrap::{
 };
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::service::PairingService;
+use prism_sync_core::pairing::{RegistrySnapshotEntry, SignedRegistrySnapshot};
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
 use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
@@ -3325,9 +3326,63 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         .map_err(|e| format!("failed to derive new ML-DSA key: {e}"))?;
     let new_pk = new_ml_dsa.public_key_bytes();
 
+    // 3b. Build signed registry snapshot for the relay to store
+    //
+    // Sign with the OLD ML-DSA key — that's the key peers have pinned.
+    // Include the NEW ML-DSA key for the rotating device in the snapshot.
+    let signed_snapshot = {
+        let inner = handle.inner.lock().await;
+        let storage = inner.storage().clone();
+        let sid = sync_id.clone();
+        let did = device_id.clone();
+        let new_pk_for_snapshot = new_pk.clone();
+
+        let device_records = tokio::task::spawn_blocking(move || {
+            storage.list_device_records(&sid)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+        // Build snapshot entries with the rotating device's NEW key
+        let entries: Vec<RegistrySnapshotEntry> = device_records
+            .iter()
+            .map(|r| {
+                let (ml_dsa_pk, ml_dsa_gen) = if r.device_id == did {
+                    // Use the NEW key for the rotating device
+                    (new_pk_for_snapshot.clone(), new_gen as u32)
+                } else {
+                    (r.ml_dsa_65_public_key.clone(), r.ml_dsa_key_generation)
+                };
+                RegistrySnapshotEntry {
+                    sync_id: r.sync_id.clone(),
+                    device_id: r.device_id.clone(),
+                    ed25519_public_key: r.ed25519_public_key.clone(),
+                    x25519_public_key: r.x25519_public_key.clone(),
+                    ml_dsa_65_public_key: ml_dsa_pk,
+                    ml_kem_768_public_key: r.ml_kem_768_public_key.clone(),
+                    status: r.status.clone(),
+                    ml_dsa_key_generation: ml_dsa_gen,
+                }
+            })
+            .collect();
+
+        let snapshot = SignedRegistrySnapshot::new(entries);
+
+        // Sign with Ed25519 (unchanged) + OLD ML-DSA key (what peers have pinned)
+        let ed25519_key = device_secret
+            .ed25519_keypair(&device_id)
+            .map_err(|e| format!("failed to derive Ed25519 key for snapshot: {e}"))?;
+        let old_ml_dsa_key = device_secret
+            .ml_dsa_65_keypair_v(&device_id, current_gen)
+            .map_err(|e| format!("failed to derive old ML-DSA key for snapshot: {e}"))?;
+
+        snapshot.sign_hybrid(&ed25519_key, &old_ml_dsa_key)
+    };
+
     // 4. Submit rotation to relay
     let response = match relay
-        .rotate_ml_dsa(&device_id, &new_pk, new_gen, &proof, None)
+        .rotate_ml_dsa(&device_id, &new_pk, new_gen, &proof, Some(&signed_snapshot))
         .await
     {
         Ok(resp) => resp,
