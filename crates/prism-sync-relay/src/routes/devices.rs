@@ -8,11 +8,11 @@ use axum::{
     Json,
 };
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{auth, db, errors::AppError, state::AppState};
 
-use super::{verify_signed_request, AuthIdentity};
+use super::{register::sync_registry_state_with_current_devices, verify_signed_request, AuthIdentity};
 
 const MAX_WRAPPED_KEY_SIZE: usize = 1024;
 const THIRTY_DAYS_SECS: i64 = 30 * 24 * 3600;
@@ -63,6 +63,7 @@ pub async fn list_devices(
                 "ml_kem_768_public_key": b64.encode(&d.ml_kem_768_public_key),
                 "epoch": d.epoch,
                 "status": d.status,
+                "ml_dsa_key_generation": d.ml_dsa_key_generation,
             })
         })
         .collect();
@@ -620,4 +621,153 @@ pub async fn post_ack(
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// post_rotate_ml_dsa — POST /v1/sync/{sync_id}/devices/{device_id}/rotate-ml-dsa
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RotateMlDsaRequest {
+    pub new_ml_dsa_pk: String,
+    pub ml_dsa_key_generation: i64,
+    #[serde(default)]
+    pub timestamp: i64,
+    pub old_signs_new: String,
+    pub new_signs_old: String,
+}
+
+#[derive(Serialize)]
+pub struct RotateMlDsaResponse {
+    pub ml_dsa_key_generation: i64,
+}
+
+/// POST /v1/sync/{sync_id}/devices/{device_id}/rotate-ml-dsa
+///
+/// Rotates the device's ML-DSA-65 key with a cross-signed continuity proof.
+/// The request must be signed with the device's CURRENT key.
+pub async fn post_rotate_ml_dsa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(auth_identity): Extension<AuthIdentity>,
+    Path((path_sync_id, device_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<RotateMlDsaResponse>, AppError> {
+    if path_sync_id != auth_identity.sync_id {
+        return Err(AppError::Forbidden("sync_id mismatch"));
+    }
+
+    // The authenticated device must match the path device_id
+    if auth_identity.device_id != device_id {
+        return Err(AppError::Forbidden("device_id mismatch"));
+    }
+
+    let path = format!(
+        "/v1/sync/{}/devices/{}/rotate-ml-dsa",
+        auth_identity.sync_id, device_id
+    );
+    verify_signed_request(&state, &auth_identity, &headers, "POST", &path, &body)?;
+
+    let req: RotateMlDsaRequest =
+        serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
+
+    // Look up the current device to get its generation and ML-DSA public key
+    let db = state.db.clone();
+    let sid = auth_identity.sync_id.clone();
+    let did = device_id.clone();
+    let device = tokio::task::spawn_blocking(move || {
+        db.with_read_conn(|conn| db::get_device(conn, &sid, &did))
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or(AppError::NotFound)?;
+
+    let current_gen = device.ml_dsa_key_generation;
+    if req.ml_dsa_key_generation <= current_gen {
+        return Err(AppError::Conflict(
+            "generation must be greater than current",
+        ));
+    }
+
+    // Decode base64 fields
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let new_pk = b64
+        .decode(&req.new_ml_dsa_pk)
+        .map_err(|_| AppError::BadRequest("invalid base64 in new_ml_dsa_pk"))?;
+    let old_signs_new = b64
+        .decode(&req.old_signs_new)
+        .map_err(|_| AppError::BadRequest("invalid base64 in old_signs_new"))?;
+    let new_signs_old = b64
+        .decode(&req.new_signs_old)
+        .map_err(|_| AppError::BadRequest("invalid base64 in new_signs_old"))?;
+
+    // Build and verify the continuity proof
+    let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof {
+        device_id: device_id.clone(),
+        old_generation: u32::try_from(current_gen)
+            .map_err(|_| AppError::Internal("invalid generation in database".into()))?,
+        new_generation: u32::try_from(req.ml_dsa_key_generation)
+            .map_err(|_| AppError::BadRequest("ml_dsa_key_generation out of range"))?,
+        timestamp: req.timestamp,
+        new_ml_dsa_pk: new_pk.clone(),
+        old_signs_new,
+        new_signs_old,
+    };
+
+    let ed25519_pk: [u8; 32] = auth_identity
+        .signing_public_key
+        .try_into()
+        .map_err(|_| AppError::Internal("invalid ed25519 pk length".into()))?;
+
+    proof
+        .verify(&ed25519_pk, &device.ml_dsa_65_public_key)
+        .map_err(|e| {
+            tracing::warn!("ML-DSA continuity proof verification failed: {e}");
+            AppError::BadRequest("invalid continuity proof")
+        })?;
+
+    // Apply the rotation with a 30-day grace period for the old key
+    let grace_expires_at = db::now_secs() + THIRTY_DAYS_SECS;
+    let new_gen = req.ml_dsa_key_generation;
+    let db = state.db.clone();
+    let sid = auth_identity.sync_id.clone();
+    let did = device_id.clone();
+    let applied = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            Ok(do_rotate_ml_dsa(conn, &sid, &did, &new_pk, new_gen, grace_expires_at))
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))??;
+
+    if !applied {
+        return Err(AppError::Conflict(
+            "rotation was not applied (concurrent rotation?)",
+        ));
+    }
+
+    Ok(Json(RotateMlDsaResponse {
+        ml_dsa_key_generation: new_gen,
+    }))
+}
+
+fn do_rotate_ml_dsa(
+    conn: &rusqlite::Connection,
+    sync_id: &str,
+    device_id: &str,
+    new_pk: &[u8],
+    new_gen: i64,
+    grace_expires_at: i64,
+) -> Result<bool, AppError> {
+    let applied = db::rotate_device_ml_dsa(conn, sync_id, device_id, new_pk, new_gen, grace_expires_at)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if applied {
+        // Update registry state so clients can detect the key change
+        sync_registry_state_with_current_devices(conn, sync_id, None, None)?;
+    }
+
+    Ok(applied)
 }
