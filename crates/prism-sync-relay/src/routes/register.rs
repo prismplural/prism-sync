@@ -898,7 +898,7 @@ fn snapshot_entries_by_device(
     Ok(by_device)
 }
 
-fn current_registry_entries(
+pub(crate) fn current_registry_entries(
     conn: &rusqlite::Connection,
     sync_id: &str,
 ) -> Result<Vec<RegistrySnapshotEntry>, AppError> {
@@ -919,7 +919,7 @@ fn current_registry_entries(
         .collect()
 }
 
-fn sync_registry_state_with_current_devices(
+pub(crate) fn sync_registry_state_with_current_devices(
     conn: &rusqlite::Connection,
     sync_id: &str,
     artifact_kind: Option<&str>,
@@ -948,13 +948,13 @@ fn sync_registry_state_with_current_devices(
     Ok(())
 }
 
-fn canonical_registry_json(entries: &[RegistrySnapshotEntry]) -> Result<Vec<u8>, AppError> {
+pub(crate) fn canonical_registry_json(entries: &[RegistrySnapshotEntry]) -> Result<Vec<u8>, AppError> {
     let mut sorted = entries.to_vec();
     sorted.sort_by(|a, b| a.device_id.cmp(&b.device_id));
     serde_json::to_vec(&sorted).map_err(|e| AppError::Internal(e.to_string()))
 }
 
-fn hash_registry_json(json: &[u8]) -> String {
+pub(crate) fn hash_registry_json(json: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(json);
     hex::encode(hasher.finalize())
