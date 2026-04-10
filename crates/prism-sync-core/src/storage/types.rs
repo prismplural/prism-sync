@@ -11,6 +11,7 @@ pub struct SyncMetadata {
     pub last_successful_sync_at: Option<DateTime<Utc>>,
     pub registered_at: Option<DateTime<Utc>>,
     pub needs_rekey: bool,
+    pub last_imported_registry_version: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -74,4 +75,5 @@ pub struct DeviceRecord {
     pub status: String, // "active" or "revoked"
     pub registered_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub ml_dsa_key_generation: u32,
 }

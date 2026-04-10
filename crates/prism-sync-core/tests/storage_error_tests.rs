@@ -27,6 +27,7 @@ fn sample_metadata(sync_id: &str) -> SyncMetadata {
         last_successful_sync_at: None,
         registered_at: Some(Utc::now()),
         needs_rekey: false,
+        last_imported_registry_version: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -87,6 +88,7 @@ fn sample_device_record(device_id: &str) -> DeviceRecord {
         status: "active".to_string(),
         registered_at: Utc::now(),
         revoked_at: None,
+        ml_dsa_key_generation: 0,
     }
 }
 
@@ -689,6 +691,7 @@ fn clear_sync_state_does_not_affect_other_sync_ids() {
         status: "active".to_string(),
         registered_at: Utc::now(),
         revoked_at: None,
+        ml_dsa_key_generation: 0,
     })
     .unwrap();
     tx.commit().unwrap();

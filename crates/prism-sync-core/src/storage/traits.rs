@@ -93,6 +93,7 @@ pub trait SyncStorageTx {
     fn update_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()>;
     fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()>;
     fn update_current_epoch(&mut self, sync_id: &str, epoch: i32) -> Result<()>;
+    fn update_last_imported_registry_version(&mut self, sync_id: &str, version: i64) -> Result<()>;
 
     // ── Pending ops ──
     fn insert_pending_op(&mut self, op: &PendingOp) -> Result<()>;

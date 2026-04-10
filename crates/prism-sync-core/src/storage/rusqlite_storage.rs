@@ -22,6 +22,7 @@ fn row_to_sync_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncMetadat
         last_successful_sync_at: None, // filled below
         registered_at: None,           // filled below
         needs_rekey: row.get::<_, i32>("needs_rekey")? != 0,
+        last_imported_registry_version: row.get("last_imported_registry_version").ok(),
         created_at: Utc::now(), // filled below
         updated_at: Utc::now(), // filled below
     })
@@ -125,6 +126,8 @@ fn row_to_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecor
                 .ok()
                 .map(|d| d.with_timezone(&Utc))
         }),
+        // SQLite stores as INTEGER (i64); safe for practical generation counts
+        ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
     })
 }
 
@@ -289,8 +292,8 @@ fn exec_upsert_sync_metadata(conn: &Connection, meta: &SyncMetadata) -> Result<(
         "INSERT OR REPLACE INTO sync_metadata \
          (sync_id, local_device_id, current_epoch, last_pulled_server_seq, \
           last_pushed_at, last_successful_sync_at, registered_at, needs_rekey, \
-          created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          last_imported_registry_version, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             meta.sync_id,
             meta.local_device_id,
@@ -300,6 +303,7 @@ fn exec_upsert_sync_metadata(conn: &Connection, meta: &SyncMetadata) -> Result<(
             meta.last_successful_sync_at.map(|d| d.to_rfc3339()),
             meta.registered_at.map(|d| d.to_rfc3339()),
             meta.needs_rekey as i32,
+            meta.last_imported_registry_version,
             meta.created_at.to_rfc3339(),
             meta.updated_at.to_rfc3339(),
         ],
@@ -340,6 +344,19 @@ fn exec_update_current_epoch(conn: &Connection, sync_id: &str, epoch: i32) -> Re
     conn.execute(
         "UPDATE sync_metadata SET current_epoch = ?1, updated_at = ?2 WHERE sync_id = ?3",
         params![epoch, now, sync_id],
+    )
+    .map_err(CoreError::Sqlite)?;
+    Ok(())
+}
+
+fn exec_update_last_imported_registry_version(
+    conn: &Connection,
+    sync_id: &str,
+    version: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_metadata SET last_imported_registry_version = ?2, updated_at = ?3 WHERE sync_id = ?1",
+        params![sync_id, version, Utc::now().to_rfc3339()],
     )
     .map_err(CoreError::Sqlite)?;
     Ok(())
@@ -435,8 +452,8 @@ fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result
         "INSERT OR REPLACE INTO device_registry \
          (sync_id, device_id, ed25519_public_key, x25519_public_key, \
           ml_dsa_65_public_key, ml_kem_768_public_key, status, \
-          registered_at, revoked_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          registered_at, revoked_at, ml_dsa_key_generation) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             device.sync_id,
             device.device_id,
@@ -447,6 +464,7 @@ fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result
             device.status,
             device.registered_at.to_rfc3339(),
             device.revoked_at.map(|d| d.to_rfc3339()),
+            device.ml_dsa_key_generation as i32,
         ],
     )
     .map_err(CoreError::Sqlite)?;
@@ -569,6 +587,7 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 status: row.get("status")?,
                 registered_at: row.get("registered_at")?,
                 revoked_at: row.get("revoked_at")?,
+                ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
             })
         })
         .map_err(CoreError::Sqlite)?
@@ -685,8 +704,8 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
             "INSERT OR REPLACE INTO device_registry \
              (sync_id, device_id, ed25519_public_key, x25519_public_key, \
               ml_dsa_65_public_key, ml_kem_768_public_key, status, \
-              registered_at, revoked_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              registered_at, revoked_at, ml_dsa_key_generation) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 sync_id,
                 dr.device_id,
@@ -697,6 +716,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 dr.status,
                 dr.registered_at,
                 dr.revoked_at,
+                dr.ml_dsa_key_generation as i32,
             ],
         )
         .map_err(CoreError::Sqlite)?;
@@ -963,6 +983,10 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_update_current_epoch(&self.conn, sync_id, epoch)
     }
 
+    fn update_last_imported_registry_version(&mut self, sync_id: &str, version: i64) -> Result<()> {
+        exec_update_last_imported_registry_version(&self.conn, sync_id, version)
+    }
+
     // ── Pending ops ──
 
     fn insert_pending_op(&mut self, op: &PendingOp) -> Result<()> {
@@ -1071,6 +1095,7 @@ mod tests {
             last_successful_sync_at: None,
             registered_at: Some(now),
             needs_rekey: false,
+            last_imported_registry_version: None,
             created_at: now,
             updated_at: now,
         }
@@ -1131,6 +1156,7 @@ mod tests {
             status: "active".to_string(),
             registered_at: Utc::now(),
             revoked_at: None,
+            ml_dsa_key_generation: 0,
         }
     }
 
@@ -1776,6 +1802,7 @@ mod tests {
         assert_eq!(d1.x25519_public_key, vec![5, 6, 7, 8]);
         assert_eq!(d1.ml_dsa_65_public_key, vec![9u8; 1952]);
         assert_eq!(d1.ml_kem_768_public_key, vec![10u8; 1184]);
+        assert_eq!(d1.ml_dsa_key_generation, 0);
 
         // Verify applied_ops were imported
         assert!(dst.is_op_applied("applied-1").unwrap());
@@ -1857,6 +1884,39 @@ mod tests {
             "compressed {} >= raw json {}",
             blob.len(),
             json.len()
+        );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_nonzero_ml_dsa_generation() {
+        let src = make_storage();
+        populate_for_snapshot(&src);
+
+        // Update dev-1 to generation 5
+        let mut dev = src
+            .get_device_record("sync-1", "dev-1")
+            .unwrap()
+            .unwrap();
+        dev.ml_dsa_key_generation = 5;
+        let mut tx = src.begin_tx().unwrap();
+        tx.upsert_device_record(&dev).unwrap();
+        tx.commit().unwrap();
+
+        // Export and import
+        let blob = src.export_snapshot("sync-1").unwrap();
+        let dst = make_storage();
+        let mut tx = dst.begin_tx().unwrap();
+        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.commit().unwrap();
+
+        // Verify non-zero generation survived
+        let imported = dst
+            .get_device_record("sync-1", "dev-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            imported.ml_dsa_key_generation, 5,
+            "ml_dsa_key_generation should survive snapshot round-trip"
         );
     }
 }
