@@ -128,16 +128,25 @@ impl DeviceRegistryManager {
                     && device.x25519_public_key == existing.x25519_public_key
                     && device.ml_kem_768_public_key == existing.ml_kem_768_public_key
                 {
-                    // Accept ML-DSA rotation from relay device list without proof verification.
+                    // Reject unverified ML-DSA rotation from relay device list.
                     //
-                    // TRUST ASSUMPTION: The relay is trusted to propagate legitimate key
-                    // rotations. The relay verifies the continuity proof at rotation time
-                    // (POST /rotate-ml-dsa) — we accept the result here without re-verifying.
-                    // A compromised relay could inject a fake ML-DSA key via this path.
-                    // This matches the existing relay trust model for initial key distribution
-                    // during registration. To close this gap, the relay would need to
-                    // broadcast the continuity proof alongside device list updates.
-                    return Self::write_device_record(storage, device);
+                    // ML-DSA rotations must arrive through either:
+                    // 1. Verified signed registry import (verify_and_import_signed_registry)
+                    // 2. Explicit accept_ml_dsa_rotation with continuity proof
+                    //
+                    // The relay verifies the continuity proof at rotation time, but a
+                    // compromised relay could inject a fake ML-DSA key via list_devices.
+                    // Closing this gap forces all rotation trust through client-verifiable
+                    // artifacts.
+                    tracing::warn!(
+                        device_id = %device.device_id,
+                        local_gen = existing.ml_dsa_key_generation,
+                        relay_gen = device.ml_dsa_key_generation,
+                        "Rejecting unverified ML-DSA rotation from relay device list"
+                    );
+                    // Don't fail the entire merge — just skip this device's key update.
+                    // Other metadata (status, timestamps) from the existing record is kept.
+                    return Ok(());
                 } else {
                     return Err(CoreError::DeviceKeyChanged {
                         device_id: device.device_id.clone(),
@@ -733,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_relay_device_accepts_ml_dsa_rotation() {
+    fn merge_relay_device_rejects_unverified_ml_dsa_rotation() {
         let storage = make_storage();
         let secret = prism_sync_crypto::DeviceSecret::from_bytes(vec![42u8; 32]).unwrap();
         let device_id = "dev-merge-rotate";
@@ -756,7 +765,8 @@ mod tests {
         };
         DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
 
-        // Relay sends updated device with new ML-DSA key and higher generation
+        // Relay sends updated device with new ML-DSA key and higher generation —
+        // merge_relay_device should return Ok but NOT update the key.
         let rotated = DeviceRecord {
             ml_dsa_65_public_key: ml_dsa_1.public_key_bytes(),
             ml_dsa_key_generation: 1,
@@ -764,12 +774,13 @@ mod tests {
         };
         DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &rotated).unwrap();
 
+        // The stored record should still have the OLD key and generation
         let stored = storage
             .get_device_record("sync-1", device_id)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.ml_dsa_key_generation, 1);
-        assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_1.public_key_bytes());
+        assert_eq!(stored.ml_dsa_key_generation, 0, "generation should not be updated");
+        assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_0.public_key_bytes(), "ML-DSA key should not be updated");
     }
 
     #[test]
