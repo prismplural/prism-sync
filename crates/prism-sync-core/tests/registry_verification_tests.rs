@@ -981,3 +981,346 @@ async fn generation_mismatch_registry_still_stale_returns_local() {
         "should return generation 0 when registry doesn't have expected generation"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G4+G5 — Negative tests for registry trust hardening (G1, G2, G3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── G1: Revoked devices cannot sign registry ─────────────────────────────
+
+/// A device that is revoked in local storage must not be able to verify
+/// a registry snapshot it signed. `verify_and_import_signed_registry` skips
+/// revoked devices in the verification loop, so the signature cannot be matched.
+#[test]
+fn revoked_signer_rejected() {
+    let storage = RusqliteSyncStorage::in_memory().unwrap();
+
+    let device_a_id = "device-aaa-revoked";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    // Register device A as active initially
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+
+    // Build a signed blob using device A's keys (while still active)
+    let entries = vec![RegistrySnapshotEntry {
+        sync_id: SYNC_ID.to_string(),
+        device_id: device_a_id.to_string(),
+        ed25519_public_key: ed25519_a.public_key_bytes().to_vec(),
+        x25519_public_key: x25519_a.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+        x_wing_public_key: vec![],
+        status: "active".to_string(),
+        ml_dsa_key_generation: 0,
+    }];
+    let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
+
+    // Now revoke device A in local storage
+    DeviceRegistryManager::revoke_device(&storage, SYNC_ID, device_a_id)
+        .expect("revoke should succeed");
+
+    // Attempt to import the signed blob — must fail because device A is revoked
+    let result =
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob);
+
+    assert!(
+        result.is_err(),
+        "revoked signer should be rejected, but got Ok"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("could not be verified")
+            || err_msg.contains("signature could not be verified"),
+        "error should mention verification failure, got: {err_msg}"
+    );
+}
+
+/// A device that marks itself as revoked in the snapshot must be rejected,
+/// even if its local record is active and its signature is cryptographically valid.
+///
+/// This tests the self-consistency check (G1): the signer must appear as
+/// non-revoked in their own snapshot.
+#[test]
+fn signer_self_revoked_in_snapshot_rejected() {
+    let storage = RusqliteSyncStorage::in_memory().unwrap();
+
+    let device_a_id = "device-aaa-self-revoked";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    // Register device A as active in local storage (so the signature can be verified)
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+
+    // Build entries where device A appears with status "revoked" in the snapshot
+    let entries = vec![RegistrySnapshotEntry {
+        sync_id: SYNC_ID.to_string(),
+        device_id: device_a_id.to_string(),
+        ed25519_public_key: ed25519_a.public_key_bytes().to_vec(),
+        x25519_public_key: x25519_a.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+        x_wing_public_key: vec![],
+        // Self-contradictory: signing but claiming to be revoked
+        status: "revoked".to_string(),
+        ml_dsa_key_generation: 0,
+    }];
+    let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
+
+    let result =
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob);
+
+    assert!(
+        result.is_err(),
+        "self-revoked signer in snapshot should be rejected, but got Ok"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("revoked"),
+        "error should mention revoked status, got: {err_msg}"
+    );
+}
+
+/// The signer must be present in their own snapshot. If device A signs the blob
+/// but the snapshot only includes device B (omitting A), the import must fail.
+///
+/// This tests the signer-presence check (G1): omitting the signer from their
+/// own snapshot would allow a compromised or removed device to issue fake
+/// updates without appearing in the registry.
+#[test]
+fn signer_missing_from_own_snapshot_rejected() {
+    let storage = RusqliteSyncStorage::in_memory().unwrap();
+
+    let device_a_id = "device-aaa-missing";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let device_b_id = "device-bbb-only";
+    let device_secret_b = DeviceSecret::generate();
+    let ed25519_b = device_secret_b.ed25519_keypair(device_b_id).unwrap();
+    let x25519_b = device_secret_b.x25519_keypair(device_b_id).unwrap();
+    let ml_dsa_b = device_secret_b.ml_dsa_65_keypair(device_b_id).unwrap();
+    let ml_kem_b = device_secret_b.ml_kem_768_keypair(device_b_id).unwrap();
+
+    // Register device A as active so its keys are known for signature verification
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+
+    // Build entries that only include device B — device A (the signer) is absent
+    let entries = vec![RegistrySnapshotEntry {
+        sync_id: SYNC_ID.to_string(),
+        device_id: device_b_id.to_string(),
+        ed25519_public_key: ed25519_b.public_key_bytes().to_vec(),
+        x25519_public_key: x25519_b.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: ml_dsa_b.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+        x_wing_public_key: vec![],
+        status: "active".to_string(),
+        ml_dsa_key_generation: 0,
+    }];
+    // Sign with device A's keys (A is absent from the snapshot itself)
+    let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
+
+    let result =
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob);
+
+    assert!(
+        result.is_err(),
+        "snapshot missing the signer should be rejected, but got Ok"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("signer not present"),
+        "error should mention signer not present in snapshot, got: {err_msg}"
+    );
+}
+
+/// When no signed registry is available on the relay and a batch arrives from
+/// an unknown sender, the engine must skip that batch (fail-closed) rather
+/// than fall back to the unverified `list_devices` endpoint.
+///
+/// NOTE: This property is already verified by
+/// `registry_verification_fallback_when_no_artifact` (Test 5 above).
+/// That test sets up a MockRelay with no signed registry, adds the unknown
+/// device to `list_devices`, injects a batch from that device, and asserts
+/// that `merged == 0` (the batch is skipped). This directly covers the G2
+/// security property: fail-closed behavior when signed registry is unavailable.
+///
+/// The test below is kept as a named alias so the property is easy to find by
+/// the G2 label, but the actual assertion is in Test 5.
+#[test]
+fn malicious_device_list_injection_rejected() {
+    // See `registry_verification_fallback_when_no_artifact` above, which is
+    // the authoritative test for G2 fail-closed behavior.
+    //
+    // Key properties verified there:
+    // - MockRelay has no signed registry (`set_signed_registry` not called)
+    // - Unknown device is present in `list_devices` only
+    // - Engine skips the unknown sender's batch (merged == 0)
+    // - Data from unknown sender does not appear in entity store
+}
+
+// ── G3: registry_version bound into signed payload ────────────────────────
+
+/// Monotonicity check: a relay that replays an older signed registry version
+/// should be rejected. This test is ignored because the monotonicity check
+/// is not yet implemented in `verify_and_import_signed_registry` — G3 only
+/// added `registry_version` to the signed payload; enforcement comes later.
+///
+/// TODO: enable when monotonicity check is added to
+/// `DeviceRegistryManager::verify_and_import_signed_registry`.
+#[test]
+#[ignore = "monotonicity check not yet implemented (G3 payload only; enforcement pending)"]
+fn stale_registry_version_rejected() {
+    // When implemented, this test should:
+    // 1. Import a signed registry at version 5 (persisted as last_imported_version).
+    // 2. Attempt to import a signed blob at version 3 (older).
+    // 3. Assert: returns Err containing "stale" or "registry version".
+    //
+    // The version field (`registry_version`) is already included in the V3
+    // signed JSON payload (`build_signed_registry_blob` uses
+    // `SignedRegistrySnapshot::new(entries, version)` → `canonical_json_v3`).
+    // The enforcement guard in `verify_and_import_signed_registry` is the
+    // missing piece.
+    todo!("add monotonicity enforcement to verify_and_import_signed_registry first");
+}
+
+// ── G2: bootstrap fail-closed for unknown snapshot senders ───────────────
+
+/// When a snapshot on the relay was signed by a device that is not known
+/// locally (and no signed registry resolves it), bootstrap must fail rather
+/// than silently importing untrusted data.
+///
+/// This tests the fail-closed property (G2) applied to the pairing bootstrap
+/// path: unknown snapshot sender → resolve_sender_public_key fails →
+/// bootstrap_from_snapshot returns Err.
+#[tokio::test]
+async fn bootstrap_from_snapshot_fail_closed() {
+    use prism_sync_core::relay::traits::SyncRelay as _;
+
+    let key_hierarchy = init_key_hierarchy();
+
+    // Device A: the local device (will attempt bootstrap)
+    let device_a_id = "device-aaa-bootstrap";
+    let signing_key_a = make_signing_key();
+    let ml_dsa_a = make_ml_dsa_keypair();
+
+    // Device X: an unknown device that uploaded the snapshot but is not in
+    // local storage and no signed registry is available to resolve it.
+    let device_x_id = "device-xxx-unknown";
+    let signing_key_x = make_signing_key();
+
+    let relay = Arc::new(MockRelay::new());
+    // No signed registry set — relay.get_signed_registry() returns Ok(None).
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, device_a_id);
+
+    // Register device A locally (not device X — it remains unknown)
+    register_device(
+        &relay,
+        &storage,
+        device_a_id,
+        &signing_key_a.verifying_key(),
+    );
+
+    // Build a minimal snapshot envelope signed by device X.
+    // We use an empty plaintext — the bootstrap will fail before decryption.
+    let hlc = Hlc::now(device_x_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-1:title:{}:{}", hlc, device_x_id),
+        batch_id: Some("batch-x1".to_string()),
+        entity_id: "task-1".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Secret data from unknown device\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_x_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+
+    let snapshot_envelope = make_encrypted_batch(
+        &ops,
+        &key_hierarchy,
+        &signing_key_x,
+        &ml_dsa_a, // uses device A's ML-DSA key just to build a valid envelope shape
+        "batch-x1",
+        device_x_id,
+    );
+
+    // Upload the snapshot to MockRelay (signed by the unknown device X)
+    relay
+        .put_snapshot(
+            0,
+            1,
+            serde_json::to_vec(&snapshot_envelope).unwrap(),
+            None,
+            None,
+            device_x_id.to_string(),
+        )
+        .await
+        .unwrap();
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Bootstrap must fail because device X is unknown and no signed registry
+    // is available to resolve it (fail-closed behavior).
+    let result = engine
+        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "bootstrap from snapshot by unknown sender should fail (fail closed)"
+    );
+
+    // Verify the entity store remains empty — no data imported
+    let title = entity.get_field("task-1", "title");
+    assert_eq!(
+        title, None,
+        "data from unknown snapshot sender should not be imported"
+    );
+}
