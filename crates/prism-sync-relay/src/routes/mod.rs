@@ -3,6 +3,7 @@ pub mod media;
 pub mod metrics;
 pub mod pairing;
 pub mod register;
+pub mod registry;
 pub mod sharing;
 pub mod sync;
 pub mod ws;
@@ -181,6 +182,8 @@ pub fn router(state: AppState) -> Router {
             get(devices::get_rekey_artifact),
         )
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
+        // Registry routes
+        .merge(registry::routes())
         // Sharing routes (auth + signed)
         .route(
             "/v1/sharing/identity",
