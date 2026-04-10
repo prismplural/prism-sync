@@ -565,6 +565,7 @@ impl SyncService {
         &mut self,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
     ) -> Result<SyncResult> {
         let engine = self
@@ -582,7 +583,7 @@ impl SyncService {
 
         loop {
             match engine
-                .sync(sync_id, key_hierarchy, signing_key, device_id)
+                .sync(sync_id, key_hierarchy, signing_key, ml_dsa_signing_key, device_id)
                 .await
             {
                 Ok(result) => {
@@ -649,6 +650,7 @@ impl SyncService {
         &mut self,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
     ) -> Result<()> {
         if let Some(last) = self.last_sync_time {
@@ -656,7 +658,9 @@ impl SyncService {
                 return Ok(());
             }
         }
-        let _ = self.sync_now(key_hierarchy, signing_key, device_id).await?;
+        let _ = self
+            .sync_now(key_hierarchy, signing_key, ml_dsa_signing_key, device_id)
+            .await?;
         Ok(())
     }
 }

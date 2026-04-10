@@ -261,6 +261,7 @@ async fn registry_verification_verified_import_happy_path() {
             SYNC_ID,
             &key_hierarchy,
             &signing_key_a.into_signing_key(),
+            None,
             device_a_id,
         )
         .await
@@ -597,7 +598,7 @@ async fn registry_verification_fallback_when_no_artifact() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
 

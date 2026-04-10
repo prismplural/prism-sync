@@ -134,7 +134,7 @@ async fn push_and_create_snapshot(
 
     // Push all from device A
     let result = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
     assert!(
@@ -171,7 +171,7 @@ async fn push_and_create_snapshot(
 
     // Pull and merge (populates field_versions on device B)
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, None, device_b_id)
         .await
         .unwrap();
     assert!(
@@ -243,7 +243,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
     );
 
     let result = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
     assert!(result.error.is_none(), "push failed: {:?}", result.error);
@@ -278,7 +278,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
     );
 
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, None, device_b_id)
         .await
         .unwrap();
     assert!(result_b.error.is_none());
@@ -307,7 +307,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
     insert_pending_ops(&storage_a, &ops_2, "batch-2");
 
     let result_a2 = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
     assert!(result_a2.error.is_none());
@@ -376,7 +376,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
 
     // Incremental sync to get task-2 (pushed after snapshot)
     let result_c = engine_c
-        .sync(SYNC_ID, &key_hierarchy_c, &signing_key_c, device_c_id)
+        .sync(SYNC_ID, &key_hierarchy_c, &signing_key_c, None, device_c_id)
         .await
         .unwrap();
     assert!(
@@ -435,7 +435,7 @@ async fn test_bootstrap_without_snapshot_falls_back() {
     );
 
     engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
 
@@ -483,7 +483,7 @@ async fn test_bootstrap_without_snapshot_falls_back() {
 
     // Incremental sync picks up all data
     let result = engine_b
-        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id)
         .await
         .unwrap();
     assert!(
@@ -591,7 +591,7 @@ async fn test_pairing_works_without_snapshot() {
     );
 
     let result_a = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
     assert!(result_a.error.is_none());
@@ -635,7 +635,7 @@ async fn test_pairing_works_without_snapshot() {
 
     // Incremental sync picks up all data
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id)
         .await
         .unwrap();
     assert!(

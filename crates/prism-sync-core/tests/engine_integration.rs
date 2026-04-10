@@ -120,7 +120,7 @@ async fn test_push_and_pull_roundtrip() {
 
     // Push from device A
     let result_a = engine_a
-        .sync(SYNC_ID, &key_hierarchy_a, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy_a, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
     assert!(
@@ -173,7 +173,7 @@ async fn test_push_and_pull_roundtrip() {
     );
 
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id)
         .await
         .unwrap();
     assert!(
@@ -283,7 +283,7 @@ async fn test_conflict_resolution() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync error: {:?}", result.error);
@@ -376,7 +376,7 @@ async fn test_signature_verification() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
 
@@ -492,7 +492,7 @@ async fn test_payload_hash_verification() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
 
@@ -571,7 +571,7 @@ async fn test_sync_sends_ack_after_pull() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
@@ -653,7 +653,7 @@ async fn test_ack_failure_does_not_abort_sync() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
 
@@ -733,7 +733,7 @@ async fn test_sync_prunes_with_min_acked_seq() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
@@ -793,7 +793,7 @@ async fn test_prune_runs_on_empty_pull() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
@@ -857,7 +857,7 @@ async fn test_no_pruning_without_min_acked_seq() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);

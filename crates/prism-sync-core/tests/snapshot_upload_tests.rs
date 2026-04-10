@@ -132,7 +132,7 @@ async fn push_and_create_snapshot(
 
     // Push all from device A
     let result = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
         .await
         .unwrap();
     assert!(
@@ -169,7 +169,7 @@ async fn push_and_create_snapshot(
 
     // Pull and merge (populates field_versions on device B)
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, None, device_b_id)
         .await
         .unwrap();
     assert!(
@@ -241,7 +241,7 @@ async fn test_push_limit_without_snapshot() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
         .await
         .unwrap();
     assert!(result.error.is_none(), "push failed: {:?}", result.error);
@@ -253,7 +253,7 @@ async fn test_push_limit_without_snapshot() {
     insert_pending_ops(&storage, &more_ops, "batch-extra");
 
     let result2 = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
         .await
         .unwrap();
     assert!(result2.error.is_none());

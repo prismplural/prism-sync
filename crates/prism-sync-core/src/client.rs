@@ -382,7 +382,12 @@ impl PrismSync {
             CoreError::Engine("device_id not set — call configure_engine first".into())
         })?;
         self.sync_service
-            .sync_now(&self.key_hierarchy, signing_key, device_id)
+            .sync_now(
+                &self.key_hierarchy,
+                signing_key,
+                self.device_ml_dsa_signing_key.as_ref(),
+                device_id,
+            )
             .await
     }
 
@@ -401,7 +406,12 @@ impl PrismSync {
             CoreError::Engine("device_id not set — call configure_engine first".into())
         })?;
         self.sync_service
-            .catch_up_if_stale(&self.key_hierarchy, signing_key, device_id)
+            .catch_up_if_stale(
+                &self.key_hierarchy,
+                signing_key,
+                self.device_ml_dsa_signing_key.as_ref(),
+                device_id,
+            )
             .await
     }
 

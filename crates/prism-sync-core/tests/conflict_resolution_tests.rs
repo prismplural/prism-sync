@@ -498,7 +498,7 @@ async fn test_soft_delete_wins_with_later_hlc() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
 
@@ -911,7 +911,7 @@ async fn test_full_sync_concurrent_write_conflict() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
 
@@ -1012,7 +1012,7 @@ async fn test_full_sync_different_fields_no_conflict() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
         .await
         .unwrap();
 

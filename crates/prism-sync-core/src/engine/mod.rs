@@ -109,6 +109,7 @@ impl SyncEngine {
         sync_id: &str,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         signing_key: &ed25519_dalek::SigningKey,
+        _ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
     ) -> Result<SyncResult> {
         let start = Instant::now();
@@ -180,7 +181,7 @@ impl SyncEngine {
         // Phase 2: Push
         self.set_state(SyncState::Pushing);
         let push_result = self
-            .push_phase(sync_id, key_hierarchy, signing_key, device_id)
+            .push_phase(sync_id, key_hierarchy, signing_key, _ml_dsa_signing_key, device_id)
             .await;
         match push_result {
             Ok(pushed) => {
@@ -804,6 +805,7 @@ impl SyncEngine {
         sync_id: &str,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         signing_key: &ed25519_dalek::SigningKey,
+        _ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
     ) -> Result<u64> {
         // Get dirty batch IDs
