@@ -100,7 +100,9 @@ async fn push_and_create_snapshot(
 ) {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_a = make_signing_key();
+    let ml_dsa_key_a = make_ml_dsa_keypair();
     let signing_key_b = make_signing_key();
+    let ml_dsa_key_b = make_ml_dsa_keypair();
     let device_a_id = "device-aaa";
     let device_b_id = "device-bbb";
 
@@ -111,11 +113,12 @@ async fn push_and_create_snapshot(
     let entity_a: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_a, device_a_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_a,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
 
     // Insert all task ops for device A
@@ -134,7 +137,7 @@ async fn push_and_create_snapshot(
 
     // Push all from device A
     let result = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
     assert!(
@@ -148,17 +151,19 @@ async fn push_and_create_snapshot(
     let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_b, device_b_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_b_id,
         &signing_key_b.verifying_key(),
+        &ml_dsa_key_b.public_key_bytes(),
     );
 
     let engine_b = SyncEngine::new(
@@ -171,7 +176,7 @@ async fn push_and_create_snapshot(
 
     // Pull and merge (populates field_versions on device B)
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, None, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
     assert!(
@@ -189,6 +194,8 @@ async fn push_and_create_snapshot(
             0,
             device_b_id,
             &signing_key_b,
+            &ml_dsa_key_b,
+            0,
             Some(300),
             None,
         )
@@ -215,6 +222,7 @@ async fn push_and_create_snapshot(
 async fn test_snapshot_bootstrap_then_incremental() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_a = make_signing_key();
+    let ml_dsa_key_a = make_ml_dsa_keypair();
     let device_a_id = "device-aaa";
 
     let relay = Arc::new(MockRelay::new());
@@ -224,11 +232,12 @@ async fn test_snapshot_bootstrap_then_incremental() {
     let entity_a: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_a, device_a_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_a,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
 
     let ops_1 = make_task_ops(device_a_id, "task-1", "Buy groceries", false, "batch-1");
@@ -243,7 +252,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
     );
 
     let result = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "push failed: {:?}", result.error);
@@ -251,22 +260,25 @@ async fn test_snapshot_bootstrap_then_incremental() {
 
     // --- Device B: pull/merge to populate field_versions, then upload snapshot ---
     let signing_key_b = make_signing_key();
+    let ml_dsa_key_b = make_ml_dsa_keypair();
     let device_b_id = "device-bbb";
     let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
     let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_b, device_b_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_b_id,
         &signing_key_b.verifying_key(),
+        &ml_dsa_key_b.public_key_bytes(),
     );
 
     let engine_b = SyncEngine::new(
@@ -278,7 +290,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
     );
 
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, None, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
     assert!(result_b.error.is_none());
@@ -292,6 +304,8 @@ async fn test_snapshot_bootstrap_then_incremental() {
             0,
             device_b_id,
             &signing_key_b,
+            &ml_dsa_key_b,
+            0,
             Some(300),
             None,
         )
@@ -307,7 +321,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
     insert_pending_ops(&storage_a, &ops_2, "batch-2");
 
     let result_a2 = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
     assert!(result_a2.error.is_none());
@@ -376,7 +390,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
 
     // Incremental sync to get task-2 (pushed after snapshot)
     let result_c = engine_c
-        .sync(SYNC_ID, &key_hierarchy_c, &signing_key_c, None, device_c_id)
+        .sync(SYNC_ID, &key_hierarchy_c, &signing_key_c, None, device_c_id, 0)
         .await
         .unwrap();
     assert!(
@@ -408,6 +422,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
 async fn test_bootstrap_without_snapshot_falls_back() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_a = make_signing_key();
+    let ml_dsa_key_a = make_ml_dsa_keypair();
     let device_a_id = "device-aaa";
 
     let relay = Arc::new(MockRelay::new());
@@ -415,11 +430,12 @@ async fn test_bootstrap_without_snapshot_falls_back() {
     let entity_a: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_a, device_a_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_a,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
 
     // Device A pushes data (no snapshot uploaded)
@@ -435,30 +451,33 @@ async fn test_bootstrap_without_snapshot_falls_back() {
     );
 
     engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
 
     // --- Device B: try bootstrap (no snapshot available) ---
     let key_hierarchy_b = shared_key_hierarchy(&key_hierarchy);
     let signing_key_b = make_signing_key();
+    let ml_dsa_key_b = make_ml_dsa_keypair();
     let device_b_id = "device-bbb";
 
     let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
     let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_b, device_b_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_b_id,
         &signing_key_b.verifying_key(),
+        &ml_dsa_key_b.public_key_bytes(),
     );
 
     let engine_b = SyncEngine::new(
@@ -483,7 +502,7 @@ async fn test_bootstrap_without_snapshot_falls_back() {
 
     // Incremental sync picks up all data
     let result = engine_b
-        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
     assert!(
@@ -559,7 +578,9 @@ async fn test_bootstrap_wrong_epoch_key() {
 async fn test_pairing_works_without_snapshot() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_a = make_signing_key();
+    let ml_dsa_key_a = make_ml_dsa_keypair();
     let signing_key_b = make_signing_key();
+    let ml_dsa_key_b = make_ml_dsa_keypair();
     let device_a_id = "device-aaa";
     let device_b_id = "device-bbb";
 
@@ -570,11 +591,12 @@ async fn test_pairing_works_without_snapshot() {
     let entity_a: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_a, device_a_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_a,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
 
     let ops_1 = make_task_ops(device_a_id, "task-1", "First task", false, "batch-1");
@@ -591,7 +613,7 @@ async fn test_pairing_works_without_snapshot() {
     );
 
     let result_a = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
     assert!(result_a.error.is_none());
@@ -605,17 +627,19 @@ async fn test_pairing_works_without_snapshot() {
     let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_b, device_b_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_b_id,
         &signing_key_b.verifying_key(),
+        &ml_dsa_key_b.public_key_bytes(),
     );
 
     let engine_b = SyncEngine::new(
@@ -635,7 +659,7 @@ async fn test_pairing_works_without_snapshot() {
 
     // Incremental sync picks up all data
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
     assert!(
@@ -827,13 +851,16 @@ async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
         serde_json::from_slice(&snapshot.data).expect("deserialize envelope");
 
     let wrong_payload_hash = batch_signature::compute_payload_hash(b"not the snapshot bytes");
+    let ml_dsa_key_b = make_ml_dsa_keypair();
     let tampered_envelope = batch_signature::sign_batch(
         &sk_b,
+        &ml_dsa_key_b,
         &envelope.sync_id,
         envelope.epoch,
         &envelope.batch_id,
         &envelope.batch_kind,
         &envelope.sender_device_id,
+        0,
         &wrong_payload_hash,
         envelope.nonce,
         envelope.ciphertext.clone(),

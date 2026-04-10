@@ -30,6 +30,7 @@ fn make_encrypted_batch(
     ops: &[CrdtChange],
     key_hierarchy: &prism_sync_crypto::KeyHierarchy,
     signing_key: &SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     batch_id: &str,
     sender_device_id: &str,
 ) -> SignedBatchEnvelope {
@@ -42,11 +43,13 @@ fn make_encrypted_batch(
 
     batch_signature::sign_batch(
         signing_key,
+        ml_dsa_signing_key,
         SYNC_ID,
         0,
         batch_id,
         "ops",
         sender_device_id,
+        0,
         &payload_hash,
         nonce,
         ciphertext,
@@ -63,6 +66,7 @@ async fn test_push_and_pull_roundtrip() {
     // --- Device A: create ops and push ---
     let key_hierarchy_a = init_key_hierarchy();
     let signing_key_a = make_signing_key();
+    let ml_dsa_key_a = make_ml_dsa_keypair();
     let device_a_id = "device-aaa";
 
     let relay = Arc::new(MockRelay::new());
@@ -70,11 +74,12 @@ async fn test_push_and_pull_roundtrip() {
     let entity_a: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_a, device_a_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_a,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
 
     // Create ops for device A
@@ -120,7 +125,7 @@ async fn test_push_and_pull_roundtrip() {
 
     // Push from device A
     let result_a = engine_a
-        .sync(SYNC_ID, &key_hierarchy_a, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy_a, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
     assert!(
@@ -151,11 +156,12 @@ async fn test_push_and_pull_roundtrip() {
 
     setup_sync_metadata(&storage_b, device_b_id);
     // Device B must know device A's public key for signature verification
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
     register_device(
         &relay,
@@ -173,7 +179,7 @@ async fn test_push_and_pull_roundtrip() {
     );
 
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id, 0)
         .await
         .unwrap();
     assert!(
@@ -201,6 +207,7 @@ async fn test_conflict_resolution() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -216,11 +223,12 @@ async fn test_conflict_resolution() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Local device wrote title="Local Title" at a recent HLC
@@ -269,6 +277,7 @@ async fn test_conflict_resolution() {
         &remote_ops,
         &key_hierarchy,
         &signing_key_remote,
+        &ml_dsa_key_remote,
         "batch-remote",
         remote_device,
     );
@@ -283,7 +292,7 @@ async fn test_conflict_resolution() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync error: {:?}", result.error);
@@ -318,7 +327,9 @@ async fn test_signature_verification() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let signing_key_attacker = make_signing_key(); // different key!
+    let ml_dsa_key_attacker = make_ml_dsa_keypair(); // different key!
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -334,11 +345,12 @@ async fn test_signature_verification() {
         &signing_key_local.verifying_key(),
     );
     // Register remote device with its REAL public key
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Create a batch signed with the ATTACKER's key (not the remote device's)
@@ -362,6 +374,7 @@ async fn test_signature_verification() {
         &ops,
         &key_hierarchy,
         &signing_key_attacker,
+        &ml_dsa_key_attacker,
         "batch-evil",
         remote_device,
     );
@@ -376,7 +389,7 @@ async fn test_signature_verification() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
 
@@ -403,6 +416,7 @@ async fn test_payload_hash_verification() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -417,11 +431,12 @@ async fn test_payload_hash_verification() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Build a valid batch first
@@ -470,11 +485,13 @@ async fn test_payload_hash_verification() {
     // Sign with the ORIGINAL payload_hash (mismatches the encrypted content)
     let envelope = batch_signature::sign_batch(
         &signing_key_remote,
+        &ml_dsa_key_remote,
         SYNC_ID,
         0,
         "batch-tampered",
         "ops",
         remote_device,
+        0,
         &payload_hash_original, // hash of original, but ciphertext is tampered
         nonce,
         ciphertext,
@@ -492,7 +509,7 @@ async fn test_payload_hash_verification() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
 
@@ -517,6 +534,7 @@ async fn test_sync_sends_ack_after_pull() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -531,11 +549,12 @@ async fn test_sync_sends_ack_after_pull() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Inject a batch from the remote device
@@ -557,6 +576,7 @@ async fn test_sync_sends_ack_after_pull() {
         &ops,
         &key_hierarchy,
         &signing_key_remote,
+        &ml_dsa_key_remote,
         "batch-1",
         remote_device,
     );
@@ -571,7 +591,7 @@ async fn test_sync_sends_ack_after_pull() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
@@ -597,6 +617,7 @@ async fn test_ack_failure_does_not_abort_sync() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -611,11 +632,12 @@ async fn test_ack_failure_does_not_abort_sync() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     let hlc = Hlc::now(remote_device, None);
@@ -636,6 +658,7 @@ async fn test_ack_failure_does_not_abort_sync() {
         &ops,
         &key_hierarchy,
         &signing_key_remote,
+        &ml_dsa_key_remote,
         "batch-1",
         remote_device,
     );
@@ -653,7 +676,7 @@ async fn test_ack_failure_does_not_abort_sync() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
 
@@ -676,6 +699,7 @@ async fn test_sync_prunes_with_min_acked_seq() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -690,11 +714,12 @@ async fn test_sync_prunes_with_min_acked_seq() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Inject and pull a batch first so applied_ops get populated
@@ -716,6 +741,7 @@ async fn test_sync_prunes_with_min_acked_seq() {
         &ops,
         &key_hierarchy,
         &signing_key_remote,
+        &ml_dsa_key_remote,
         "batch-1",
         remote_device,
     );
@@ -733,7 +759,7 @@ async fn test_sync_prunes_with_min_acked_seq() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
@@ -793,7 +819,7 @@ async fn test_prune_runs_on_empty_pull() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
@@ -857,7 +883,7 @@ async fn test_no_pruning_without_min_acked_seq() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);

@@ -109,8 +109,9 @@ impl SyncEngine {
         sync_id: &str,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         signing_key: &ed25519_dalek::SigningKey,
-        _ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
+        ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
+        ml_dsa_key_generation: u32,
     ) -> Result<SyncResult> {
         let start = Instant::now();
         let mut result = SyncResult::default();
@@ -181,7 +182,7 @@ impl SyncEngine {
         // Phase 2: Push
         self.set_state(SyncState::Pushing);
         let push_result = self
-            .push_phase(sync_id, key_hierarchy, signing_key, _ml_dsa_signing_key, device_id)
+            .push_phase(sync_id, key_hierarchy, signing_key, ml_dsa_signing_key, device_id, ml_dsa_key_generation)
             .await;
         match push_result {
             Ok(pushed) => {
@@ -307,9 +308,22 @@ impl SyncEngine {
                 }
             };
 
-            let sender_vk = ed25519_dalek::VerifyingKey::from_bytes(&sender_key_info.ed25519_pk)
-                .map_err(|e| CoreError::Engine(format!("invalid ed25519 public key: {e}")))?;
-            if let Err(e) = batch_signature::verify_batch_signature(envelope, &sender_vk) {
+            // If the sender's envelope declares a newer ML-DSA generation than
+            // we have locally, try to refresh from the relay before verifying.
+            let sender_key_info = if envelope.sender_ml_dsa_key_generation > sender_key_info.ml_dsa_key_generation {
+                match self.resolve_sender_keys_with_generation_hint(
+                    sync_id,
+                    &envelope.sender_device_id,
+                    Some(envelope.sender_ml_dsa_key_generation),
+                ).await {
+                    Ok(updated) => updated,
+                    Err(_) => sender_key_info, // Fall back to what we have
+                }
+            } else {
+                sender_key_info
+            };
+
+            if let Err(e) = batch_signature::verify_batch_signature(envelope, &sender_key_info.ed25519_pk, &sender_key_info.ml_dsa_65_pk) {
                 tracing::warn!(
                     "Skipping batch {} with invalid signature from {}: {e}",
                     envelope.batch_id,
@@ -909,8 +923,9 @@ impl SyncEngine {
         sync_id: &str,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         signing_key: &ed25519_dalek::SigningKey,
-        _ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
+        ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
+        ml_dsa_key_generation: u32,
     ) -> Result<u64> {
         // Get dirty batch IDs
         let storage = self.storage.clone();
@@ -975,13 +990,17 @@ impl SyncEngine {
                     .map_err(|e| CoreError::Engine(format!("Encrypt failed: {e}")))?;
 
             // Sign the batch
+            let ml_dsa_sk = ml_dsa_signing_key
+                .ok_or_else(|| CoreError::Engine("ML-DSA signing key required for hybrid batch signing".into()))?;
             let envelope = batch_signature::sign_batch(
                 signing_key,
+                ml_dsa_sk,
                 sync_id,
                 epoch,
                 batch_id,
                 "ops",
                 device_id,
+                ml_dsa_key_generation,
                 &payload_hash,
                 nonce,
                 ciphertext,
@@ -1031,6 +1050,8 @@ impl SyncEngine {
         epoch: i32,
         device_id: &str,
         signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+        ml_dsa_key_generation: u32,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
     ) -> Result<()> {
@@ -1065,11 +1086,13 @@ impl SyncEngine {
         let batch_id = format!("snapshot-{}", chrono::Utc::now().timestamp_millis());
         let envelope = crate::batch_signature::sign_batch(
             signing_key,
+            ml_dsa_signing_key,
             sync_id,
             epoch,
             &batch_id,
             "snapshot",
             device_id,
+            ml_dsa_key_generation,
             &payload_hash,
             nonce,
             ciphertext,
@@ -1128,10 +1151,22 @@ impl SyncEngine {
             .resolve_sender_public_key(sync_id, &envelope.sender_device_id)
             .await?;
 
-        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&sender_key_info.ed25519_pk)
-            .map_err(|e| CoreError::Engine(format!("invalid sender public key: {e}")))?;
+        // If the sender's envelope declares a newer ML-DSA generation than
+        // we have locally, try to refresh from the relay before verifying.
+        let sender_key_info = if envelope.sender_ml_dsa_key_generation > sender_key_info.ml_dsa_key_generation {
+            match self.resolve_sender_keys_with_generation_hint(
+                sync_id,
+                &envelope.sender_device_id,
+                Some(envelope.sender_ml_dsa_key_generation),
+            ).await {
+                Ok(updated) => updated,
+                Err(_) => sender_key_info, // Fall back to what we have
+            }
+        } else {
+            sender_key_info
+        };
 
-        crate::batch_signature::verify_batch_signature(&envelope, &verifying_key)?;
+        crate::batch_signature::verify_batch_signature(&envelope, &sender_key_info.ed25519_pk, &sender_key_info.ml_dsa_65_pk)?;
 
         // Verify relay-reported metadata matches the signed envelope
         if snapshot.epoch != envelope.epoch {

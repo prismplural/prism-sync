@@ -98,7 +98,9 @@ async fn push_and_create_snapshot(
 ) {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_a = make_signing_key();
+    let ml_dsa_key_a = make_ml_dsa_keypair();
     let signing_key_b = make_signing_key();
+    let ml_dsa_key_b = make_ml_dsa_keypair();
     let device_a_id = "device-aaa";
     let device_b_id = "device-bbb";
 
@@ -109,11 +111,12 @@ async fn push_and_create_snapshot(
     let entity_a: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_a, device_a_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_a,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
 
     // Insert all task ops for device A
@@ -132,7 +135,7 @@ async fn push_and_create_snapshot(
 
     // Push all from device A
     let result = engine_a
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
     assert!(
@@ -146,17 +149,19 @@ async fn push_and_create_snapshot(
     let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage_b, device_b_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_b,
         device_b_id,
         &signing_key_b.verifying_key(),
+        &ml_dsa_key_b.public_key_bytes(),
     );
 
     let engine_b = SyncEngine::new(
@@ -169,7 +174,7 @@ async fn push_and_create_snapshot(
 
     // Pull and merge (populates field_versions on device B)
     let result_b = engine_b
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, None, device_b_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
     assert!(
@@ -187,6 +192,8 @@ async fn push_and_create_snapshot(
             0,
             device_b_id,
             &signing_key_b,
+            &ml_dsa_key_b,
+            0,
             Some(300),
             None,
         )
@@ -211,6 +218,7 @@ async fn push_and_create_snapshot(
 async fn test_push_limit_without_snapshot() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
     let device_id = "device-aaa";
 
     let relay = Arc::new(MockRelay::new());
@@ -218,7 +226,7 @@ async fn test_push_limit_without_snapshot() {
     let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage, device_id);
-    register_device(&relay, &storage, device_id, &signing_key.verifying_key());
+    register_device_with_pq(&relay, &storage, device_id, &signing_key.verifying_key(), &ml_dsa_key.public_key_bytes());
 
     // Push 10 batches
     for i in 0..10 {
@@ -241,7 +249,7 @@ async fn test_push_limit_without_snapshot() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "push failed: {:?}", result.error);
@@ -253,7 +261,7 @@ async fn test_push_limit_without_snapshot() {
     insert_pending_ops(&storage, &more_ops, "batch-extra");
 
     let result2 = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
         .await
         .unwrap();
     assert!(result2.error.is_none());

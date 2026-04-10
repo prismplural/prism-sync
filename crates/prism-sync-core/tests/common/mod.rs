@@ -15,6 +15,7 @@ use prism_sync_core::secure_store::SecureStore;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{CrdtChange, SyncMetadata};
+use prism_sync_crypto::{DevicePqSigningKey, DeviceSecret};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MemorySecureStore — simple in-memory SecureStore for testing
@@ -182,6 +183,11 @@ pub fn make_signing_key() -> SigningKey {
     SigningKey::generate(&mut OsRng)
 }
 
+pub fn make_ml_dsa_keypair() -> DevicePqSigningKey {
+    let ds = DeviceSecret::generate();
+    ds.ml_dsa_65_keypair("test-device").unwrap()
+}
+
 pub fn init_key_hierarchy() -> prism_sync_crypto::KeyHierarchy {
     let mut kh = prism_sync_crypto::KeyHierarchy::new();
     kh.initialize("test-password", &[1u8; 16]).unwrap();
@@ -216,6 +222,17 @@ pub fn register_device(
     device_id: &str,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) {
+    register_device_with_pq(relay, storage, device_id, verifying_key, &[]);
+}
+
+/// Register a device with ML-DSA public key in both relay and storage.
+pub fn register_device_with_pq(
+    relay: &MockRelay,
+    storage: &RusqliteSyncStorage,
+    device_id: &str,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    ml_dsa_pk: &[u8],
+) {
     use prism_sync_core::storage::{DeviceRecord, SyncStorage};
 
     let pk_bytes = verifying_key.to_bytes().to_vec();
@@ -226,7 +243,7 @@ pub fn register_device(
         status: "active".to_string(),
         ed25519_public_key: pk_bytes.clone(),
         x25519_public_key: vec![0u8; 32],
-        ml_dsa_65_public_key: Vec::new(),
+        ml_dsa_65_public_key: ml_dsa_pk.to_vec(),
         ml_kem_768_public_key: Vec::new(),
         x_wing_public_key: Vec::new(),
         permission: None,
@@ -239,7 +256,7 @@ pub fn register_device(
         device_id: device_id.to_string(),
         ed25519_public_key: pk_bytes,
         x25519_public_key: vec![0u8; 32],
-        ml_dsa_65_public_key: Vec::new(),
+        ml_dsa_65_public_key: ml_dsa_pk.to_vec(),
         ml_kem_768_public_key: Vec::new(),
         x_wing_public_key: Vec::new(),
         status: "active".to_string(),

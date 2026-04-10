@@ -404,6 +404,7 @@ mod tests {
             signature: vec![0u8; 64],
             nonce: [0u8; 24],
             ciphertext: vec![1, 2, 3],
+            sender_ml_dsa_key_generation: 0,
         }
     }
 

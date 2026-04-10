@@ -33,6 +33,7 @@ fn make_encrypted_batch(
     ops: &[CrdtChange],
     key_hierarchy: &prism_sync_crypto::KeyHierarchy,
     signing_key: &ed25519_dalek::SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     batch_id: &str,
     sender_device_id: &str,
 ) -> SignedBatchEnvelope {
@@ -45,11 +46,13 @@ fn make_encrypted_batch(
 
     batch_signature::sign_batch(
         signing_key,
+        ml_dsa_signing_key,
         SYNC_ID,
         0,
         batch_id,
         "ops",
         sender_device_id,
+        0,
         &payload_hash,
         nonce,
         ciphertext,
@@ -233,10 +236,12 @@ async fn registry_verification_verified_import_happy_path() {
         server_seq: None,
     }];
 
+    let ml_dsa_key_b_for_signing = device_secret_b.ml_dsa_65_keypair(device_b_id).unwrap();
     let envelope = make_encrypted_batch(
         &ops,
         &key_hierarchy,
         &signing_key_b,
+        &ml_dsa_key_b_for_signing,
         "batch-b1",
         device_b_id,
     );
@@ -263,6 +268,7 @@ async fn registry_verification_verified_import_happy_path() {
             &signing_key_a.into_signing_key(),
             None,
             device_a_id,
+            0,
         )
         .await
         .unwrap();
@@ -516,6 +522,7 @@ async fn registry_verification_fallback_when_no_artifact() {
 
     let device_b_id = "device-remote";
     let signing_key_b = make_signing_key();
+    let ml_dsa_key_b = make_ml_dsa_keypair();
 
     let relay = Arc::new(MockRelay::new());
     // No signed registry set (default is None)
@@ -527,7 +534,7 @@ async fn registry_verification_fallback_when_no_artifact() {
         status: "active".to_string(),
         ed25519_public_key: signing_key_b.verifying_key().to_bytes().to_vec(),
         x25519_public_key: vec![0u8; 32],
-        ml_dsa_65_public_key: Vec::new(),
+        ml_dsa_65_public_key: ml_dsa_key_b.public_key_bytes(),
         ml_kem_768_public_key: Vec::new(),
         x_wing_public_key: Vec::new(),
         permission: None,
@@ -581,6 +588,7 @@ async fn registry_verification_fallback_when_no_artifact() {
         &ops,
         &key_hierarchy,
         &signing_key_b,
+        &ml_dsa_key_b,
         "batch-b1",
         device_b_id,
     );
@@ -598,7 +606,7 @@ async fn registry_verification_fallback_when_no_artifact() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id, 0)
         .await
         .unwrap();
 

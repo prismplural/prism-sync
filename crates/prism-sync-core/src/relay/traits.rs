@@ -220,7 +220,7 @@ pub struct OutgoingBatch {
 /// Signed and encrypted batch envelope.
 ///
 /// Contains all fields needed for verification and decryption.
-/// See spec section "Batch Sender Authentication (Ed25519 Signatures)".
+/// Protocol version 3 uses hybrid Ed25519 + ML-DSA-65 signatures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedBatchEnvelope {
     pub protocol_version: u16,
@@ -229,6 +229,9 @@ pub struct SignedBatchEnvelope {
     pub batch_id: String,
     pub batch_kind: String,
     pub sender_device_id: String,
+    /// ML-DSA key generation of the sender (bound into canonical signed data).
+    #[serde(default)]
+    pub sender_ml_dsa_key_generation: u32,
     #[serde(with = "base64_hash")]
     pub payload_hash: [u8; 32],
     #[serde(with = "base64_bytes")]

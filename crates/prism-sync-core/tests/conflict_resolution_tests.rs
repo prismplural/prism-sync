@@ -94,6 +94,7 @@ fn make_encrypted_batch(
     ops: &[CrdtChange],
     key_hierarchy: &prism_sync_crypto::KeyHierarchy,
     signing_key: &SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     batch_id: &str,
     sender_device_id: &str,
 ) -> prism_sync_core::relay::SignedBatchEnvelope {
@@ -106,11 +107,13 @@ fn make_encrypted_batch(
 
     batch_signature::sign_batch(
         signing_key,
+        ml_dsa_signing_key,
         SYNC_ID,
         0,
         batch_id,
         "ops",
         sender_device_id,
+        0,
         &payload_hash,
         nonce,
         ciphertext,
@@ -435,6 +438,7 @@ async fn test_soft_delete_wins_with_later_hlc() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -450,11 +454,12 @@ async fn test_soft_delete_wins_with_later_hlc() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Local has a field version for title at HLC 1000
@@ -484,6 +489,7 @@ async fn test_soft_delete_wins_with_later_hlc() {
         &[delete_op],
         &key_hierarchy,
         &signing_key_remote,
+        &ml_dsa_key_remote,
         "batch-del",
         remote_device,
     );
@@ -498,7 +504,7 @@ async fn test_soft_delete_wins_with_later_hlc() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
 
@@ -841,6 +847,7 @@ async fn test_full_sync_concurrent_write_conflict() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -856,11 +863,12 @@ async fn test_full_sync_concurrent_write_conflict() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Local device has title="Local" at HLC 1000
@@ -897,6 +905,7 @@ async fn test_full_sync_concurrent_write_conflict() {
         &remote_ops,
         &key_hierarchy,
         &signing_key_remote,
+        &ml_dsa_key_remote,
         "batch-remote",
         remote_device,
     );
@@ -911,7 +920,7 @@ async fn test_full_sync_concurrent_write_conflict() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
 
@@ -942,6 +951,7 @@ async fn test_full_sync_different_fields_no_conflict() {
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -957,11 +967,12 @@ async fn test_full_sync_different_fields_no_conflict() {
         local_device,
         &signing_key_local.verifying_key(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
     );
 
     // Local has title field
@@ -998,6 +1009,7 @@ async fn test_full_sync_different_fields_no_conflict() {
         &remote_ops,
         &key_hierarchy,
         &signing_key_remote,
+        &ml_dsa_key_remote,
         "batch-done",
         remote_device,
     );
@@ -1012,7 +1024,7 @@ async fn test_full_sync_different_fields_no_conflict() {
     );
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device)
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
 

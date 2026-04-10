@@ -494,12 +494,15 @@ impl SyncService {
     ///
     /// Delegates to [`SyncEngine::upload_pairing_snapshot`]. Requires
     /// the engine to be configured.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upload_pairing_snapshot(
         &self,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         epoch: i32,
         device_id: &str,
         signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+        ml_dsa_key_generation: u32,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
     ) -> Result<()> {
@@ -518,6 +521,8 @@ impl SyncService {
                 epoch,
                 device_id,
                 signing_key,
+                ml_dsa_signing_key,
+                ml_dsa_key_generation,
                 ttl_secs,
                 for_device_id,
             )
@@ -567,6 +572,7 @@ impl SyncService {
         signing_key: &ed25519_dalek::SigningKey,
         ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
+        ml_dsa_key_generation: u32,
     ) -> Result<SyncResult> {
         let engine = self
             .engine
@@ -583,7 +589,7 @@ impl SyncService {
 
         loop {
             match engine
-                .sync(sync_id, key_hierarchy, signing_key, ml_dsa_signing_key, device_id)
+                .sync(sync_id, key_hierarchy, signing_key, ml_dsa_signing_key, device_id, ml_dsa_key_generation)
                 .await
             {
                 Ok(result) => {
@@ -652,6 +658,7 @@ impl SyncService {
         signing_key: &ed25519_dalek::SigningKey,
         ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
+        ml_dsa_key_generation: u32,
     ) -> Result<()> {
         if let Some(last) = self.last_sync_time {
             if last.elapsed() < Duration::from_secs(5) {
@@ -659,7 +666,7 @@ impl SyncService {
             }
         }
         let _ = self
-            .sync_now(key_hierarchy, signing_key, ml_dsa_signing_key, device_id)
+            .sync_now(key_hierarchy, signing_key, ml_dsa_signing_key, device_id, ml_dsa_key_generation)
             .await?;
         Ok(())
     }
