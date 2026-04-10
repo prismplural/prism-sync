@@ -1,0 +1,4 @@
+# ML-DSA ExpandedSigningKey is ~200KB; tests that create multiple
+# keypairs overflow the default 2 MiB thread stack.
+[env]
+RUST_MIN_STACK = "8388608"
