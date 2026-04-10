@@ -56,10 +56,21 @@ async fn get_registry(
 
     let b64 = base64::engine::general_purpose::STANDARD;
 
+    // Return 404 when no registry state or no artifact exists, so the client
+    // can distinguish "no artifact" from "artifact present".
+    let Some(state) = registry_state else {
+        return Err(AppError::NotFound);
+    };
+    let Some(artifact) = artifact else {
+        return Err(AppError::NotFound);
+    };
+
+    // Field names must match SignedRegistryResponse on the client:
+    // { registry_version, artifact_blob (base64), artifact_kind }
     Ok(Json(serde_json::json!({
-        "registry_version": registry_state.as_ref().map(|s| s.registry_version).unwrap_or(0),
-        "registry_hash": registry_state.as_ref().map(|s| s.registry_hash.as_str()).unwrap_or(""),
-        "signed_registry_snapshot": artifact.map(|a| b64.encode(&a.artifact_blob)),
+        "registry_version": state.registry_version,
+        "artifact_blob": b64.encode(&artifact.artifact_blob),
+        "artifact_kind": artifact.artifact_kind,
     })))
 }
 
