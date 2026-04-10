@@ -1677,6 +1677,7 @@ pub async fn poll_event(handle: &PrismSyncHandle) -> Result<Option<String>, Stri
 /// (non-localhost HTTP), the URL check in `ServerRelay::new` is bypassed by
 /// temporarily rewriting the scheme — callers must opt in via the handle's
 /// `allow_insecure` flag.
+#[allow(clippy::too_many_arguments)]
 fn build_relay(
     relay_url: &str,
     sync_id: &str,

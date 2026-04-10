@@ -96,6 +96,8 @@ async fn push_and_create_snapshot(
     prism_sync_crypto::KeyHierarchy,
     SigningKey,
     SigningKey,
+    prism_sync_crypto::DevicePqSigningKey,
+    prism_sync_crypto::DevicePqSigningKey,
     Arc<RusqliteSyncStorage>,
 ) {
     let key_hierarchy = init_key_hierarchy();
@@ -207,6 +209,8 @@ async fn push_and_create_snapshot(
         key_hierarchy,
         signing_key_a,
         signing_key_b,
+        ml_dsa_key_a,
+        ml_dsa_key_b,
         storage_b,
     )
 }
@@ -335,24 +339,29 @@ async fn test_snapshot_bootstrap_then_incremental() {
     let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
     let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
+    let ml_dsa_key_c = make_ml_dsa_keypair();
+
     setup_sync_metadata(&storage_c, device_c_id);
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_c,
         device_a_id,
         &signing_key_a.verifying_key(),
+        &ml_dsa_key_a.public_key_bytes(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_c,
         device_b_id,
         &signing_key_b.verifying_key(),
+        &ml_dsa_key_b.public_key_bytes(),
     );
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_c,
         device_c_id,
         &signing_key_c.verifying_key(),
+        &ml_dsa_key_c.public_key_bytes(),
     );
 
     let engine_c = SyncEngine::new(
@@ -529,7 +538,7 @@ async fn test_bootstrap_without_snapshot_falls_back() {
 #[tokio::test]
 async fn test_bootstrap_wrong_epoch_key() {
     // Use the helper to create a snapshot with real data
-    let (relay, _key_hierarchy, _sk_a, _sk_b, _storage_b) =
+    let (relay, _key_hierarchy, _sk_a, _sk_b, _ml_a, _ml_b, _storage_b) =
         push_and_create_snapshot(vec![("task-1", "Secret task", false, "batch-1")]).await;
 
     // --- Device C: try bootstrap with a COMPLETELY DIFFERENT key hierarchy ---
@@ -694,7 +703,7 @@ async fn test_pairing_works_without_snapshot() {
 #[tokio::test]
 async fn test_bootstrap_emits_remote_changes() {
     // Create a snapshot containing 3 tasks
-    let (relay, key_hierarchy, _sk_a, _sk_b, _storage_b) = push_and_create_snapshot(vec![
+    let (relay, key_hierarchy, _sk_a, _sk_b, _ml_a, _ml_b, _storage_b) = push_and_create_snapshot(vec![
         ("task-1", "Alpha", false, "batch-1"),
         ("task-2", "Beta", true, "batch-2"),
         ("task-3", "Gamma", false, "batch-3"),
@@ -766,7 +775,7 @@ async fn test_bootstrap_emits_remote_changes() {
 /// stored data, then attempt bootstrap — should fail with a signature error.
 #[tokio::test]
 async fn test_bootstrap_rejects_tampered_signature() {
-    let (relay, key_hierarchy, _sk_a, _sk_b, _storage_b) =
+    let (relay, key_hierarchy, _sk_a, _sk_b, _ml_a, _ml_b, _storage_b) =
         push_and_create_snapshot(vec![("task-1", "Signed task", false, "batch-1")]).await;
 
     // Retrieve the snapshot from the relay and corrupt the signature
@@ -801,11 +810,12 @@ async fn test_bootstrap_rejects_tampered_signature() {
     setup_sync_metadata(&storage_c, "device-ccc");
 
     // Register Device B's key so signature lookup succeeds (but verification fails)
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_c,
         &snapshot.sender_device_id,
         &_sk_b.verifying_key(),
+        &_ml_b.public_key_bytes(),
     );
 
     let engine_c = SyncEngine::new(
@@ -843,7 +853,7 @@ async fn test_bootstrap_rejects_tampered_signature() {
 /// plaintext no longer matches the signed hash.
 #[tokio::test]
 async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
-    let (relay, key_hierarchy, _sk_a, sk_b, _storage_b) =
+    let (relay, key_hierarchy, _sk_a, sk_b, _ml_a, _ml_b, _storage_b) =
         push_and_create_snapshot(vec![("task-1", "Signed task", false, "batch-1")]).await;
 
     let snapshot = relay.get_snapshot().await.unwrap().unwrap();
@@ -851,10 +861,10 @@ async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
         serde_json::from_slice(&snapshot.data).expect("deserialize envelope");
 
     let wrong_payload_hash = batch_signature::compute_payload_hash(b"not the snapshot bytes");
-    let ml_dsa_key_b = make_ml_dsa_keypair();
+    let ml_dsa_key_b_new = make_ml_dsa_keypair();
     let tampered_envelope = batch_signature::sign_batch(
         &sk_b,
-        &ml_dsa_key_b,
+        &ml_dsa_key_b_new,
         &envelope.sync_id,
         envelope.epoch,
         &envelope.batch_id,
@@ -883,11 +893,12 @@ async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
     let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
     let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
     setup_sync_metadata(&storage_c, "device-ccc");
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_c,
         &snapshot.sender_device_id,
         &sk_b.verifying_key(),
+        &ml_dsa_key_b_new.public_key_bytes(),
     );
 
     let engine_c = SyncEngine::new(
@@ -922,7 +933,7 @@ async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
 /// bound to the original `server_seq_at`, so decryption should fail.
 #[tokio::test]
 async fn test_bootstrap_rejects_aad_mismatch() {
-    let (relay, key_hierarchy, _sk_a, _sk_b, _storage_b) =
+    let (relay, key_hierarchy, _sk_a, _sk_b, _ml_a, _ml_b, _storage_b) =
         push_and_create_snapshot(vec![("task-1", "AAD task", false, "batch-1")]).await;
 
     // Retrieve the snapshot and re-store it with a different server_seq_at
@@ -949,11 +960,12 @@ async fn test_bootstrap_rejects_aad_mismatch() {
     setup_sync_metadata(&storage_c, "device-ccc");
 
     // Register Device B's key so signature verification passes
-    register_device(
+    register_device_with_pq(
         &relay,
         &storage_c,
         &snapshot.sender_device_id,
         &_sk_b.verifying_key(),
+        &_ml_b.public_key_bytes(),
     );
 
     let engine_c = SyncEngine::new(
