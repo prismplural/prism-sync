@@ -139,6 +139,8 @@ struct RegisterRequest {
     ml_dsa_65_public_key: String,
     #[serde(default)]
     ml_kem_768_public_key: String,
+    #[serde(default)]
+    x_wing_public_key: String,
     registration_challenge: String,
     nonce: String,
     #[serde(default)]
@@ -182,6 +184,8 @@ pub(crate) struct RegistrySnapshotEntry {
     ml_dsa_65_public_key: Vec<u8>,
     #[serde(default)]
     ml_kem_768_public_key: Vec<u8>,
+    #[serde(default)]
+    x_wing_public_key: Vec<u8>,
     status: String,
     #[serde(default)]
     ml_dsa_key_generation: i64,
@@ -241,6 +245,16 @@ async fn register_device(
             return Err(AppError::BadRequest(
                 "ml_kem_768_public_key must be 1184 bytes",
             ));
+        }
+        decoded
+    };
+    let xwing_pk = if body.x_wing_public_key.is_empty() {
+        Vec::new()
+    } else {
+        let decoded = hex::decode(&body.x_wing_public_key)
+            .map_err(|_| AppError::BadRequest("Invalid x_wing_public_key hex"))?;
+        if decoded.len() != 1216 {
+            return Err(AppError::BadRequest("x_wing_public_key must be 1216 bytes"));
         }
         decoded
     };
@@ -309,6 +323,7 @@ async fn register_device(
                 &x25519_pk,
                 &ml_dsa_pk,
                 &ml_kem_pk,
+                &xwing_pk,
                 registry_approval,
                 pow_solution,
                 first_device_admission_proof,
@@ -380,6 +395,7 @@ fn do_register(
     x25519_pk: &[u8],
     ml_dsa_pk: &[u8],
     ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
     registry_approval: Option<RegistryApproval>,
     pow_solution: Option<PowSolution>,
     first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
@@ -471,7 +487,8 @@ fn do_register(
             // treat this as an existing group — require registry approval.
             let approval = registry_approval.as_ref().ok_or(AppError::Unauthorized)?;
             let artifact = verify_registry_approval(
-                &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, approval,
+                &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
+                approval,
             )?;
             registry_artifact_kind = Some("registry_approval");
             registry_artifact_blob = Some(artifact);
@@ -480,7 +497,8 @@ fn do_register(
         // Existing group: require registry approval.
         let approval = registry_approval.as_ref().ok_or(AppError::Unauthorized)?;
         let artifact = verify_registry_approval(
-            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, approval,
+            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
+            approval,
         )?;
         registry_artifact_kind = Some("registry_approval");
         registry_artifact_blob = Some(artifact);
@@ -497,6 +515,7 @@ fn do_register(
             || existing.x25519_public_key != x25519_pk
             || existing.ml_dsa_65_public_key != ml_dsa_pk
             || existing.ml_kem_768_public_key != ml_kem_pk
+            || existing.x_wing_public_key != xwing_pk
         {
             tracing::warn!(
                 sync_id = %&sync_id[..16],
@@ -505,6 +524,7 @@ fn do_register(
                 x25519_key_mismatch = existing.x25519_public_key != x25519_pk,
                 ml_dsa_key_mismatch = existing.ml_dsa_65_public_key != ml_dsa_pk,
                 ml_kem_key_mismatch = existing.ml_kem_768_public_key != ml_kem_pk,
+                xwing_key_mismatch = existing.x_wing_public_key != xwing_pk,
                 "Registration rejected: existing device keys do not match stored identity"
             );
             return Err(AppError::DeviceIdentityMismatch);
@@ -526,7 +546,8 @@ fn do_register(
             "New device registered"
         );
         db::register_device_with_pq(
-            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, epoch,
+            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
+            epoch,
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
         new_device_added = true;
@@ -693,6 +714,7 @@ fn verify_registry_approval(
     x25519_pk: &[u8],
     ml_dsa_pk: &[u8],
     ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
     approval: &RegistryApproval,
 ) -> Result<Vec<u8>, AppError> {
     let approver_ed25519_pk = hex::decode(&approval.approver_ed25519_pk)
@@ -759,6 +781,7 @@ fn verify_registry_approval(
         || approver.x25519_public_key != approver_entry.x25519_public_key
         || approver.ml_dsa_65_public_key != approver_ml_dsa_pk
         || approver.ml_kem_768_public_key != approver_entry.ml_kem_768_public_key
+        || approver.x_wing_public_key != approver_entry.x_wing_public_key
     {
         return Err(AppError::Unauthorized);
     }
@@ -771,6 +794,7 @@ fn verify_registry_approval(
         || approved_device.x25519_public_key != x25519_pk
         || approved_device.ml_dsa_65_public_key != ml_dsa_pk
         || approved_device.ml_kem_768_public_key != ml_kem_pk
+        || approved_device.x_wing_public_key != xwing_pk
     {
         return Err(AppError::DeviceIdentityMismatch);
     }
@@ -785,6 +809,7 @@ fn verify_registry_approval(
             || snapshot_entry.x25519_public_key != current.x25519_public_key
             || snapshot_entry.ml_dsa_65_public_key != current.ml_dsa_65_public_key
             || snapshot_entry.ml_kem_768_public_key != current.ml_kem_768_public_key
+            || snapshot_entry.x_wing_public_key != current.x_wing_public_key
             || snapshot_entry.status != current.status
         {
             return Err(AppError::Conflict("Stale registry approval"));
@@ -915,6 +940,7 @@ pub(crate) fn current_registry_entries(
                 x25519_public_key: device.x25519_public_key,
                 ml_dsa_65_public_key: device.ml_dsa_65_public_key,
                 ml_kem_768_public_key: device.ml_kem_768_public_key,
+                x_wing_public_key: device.x_wing_public_key,
                 status: normalize_registry_status(&device.status)?.to_string(),
                 ml_dsa_key_generation: device.ml_dsa_key_generation,
             })

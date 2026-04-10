@@ -14,7 +14,7 @@ use crate::{auth, db, errors::AppError, state::AppState};
 
 use super::{register::sync_registry_state_with_current_devices, verify_signed_request, AuthIdentity};
 
-const MAX_WRAPPED_KEY_SIZE: usize = 1024;
+const MAX_WRAPPED_KEY_SIZE: usize = 1536; // bumped from 1024 for hybrid X-Wing rekey artifacts (~1193 bytes)
 const THIRTY_DAYS_SECS: i64 = 30 * 24 * 3600;
 
 #[derive(Deserialize)]
@@ -61,6 +61,7 @@ pub async fn list_devices(
                 "x25519_public_key": b64.encode(&d.x25519_public_key),
                 "ml_dsa_65_public_key": b64.encode(&d.ml_dsa_65_public_key),
                 "ml_kem_768_public_key": b64.encode(&d.ml_kem_768_public_key),
+                "x_wing_public_key": b64.encode(&d.x_wing_public_key),
                 "epoch": d.epoch,
                 "status": d.status,
                 "ml_dsa_key_generation": d.ml_dsa_key_generation,

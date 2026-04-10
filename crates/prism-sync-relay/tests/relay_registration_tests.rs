@@ -2865,8 +2865,8 @@ async fn test_atomic_revoke_rejects_oversized_wrapped_key() {
     let (_target_token, _target_id_keys) = prepare_device(&db, &sync_id, &target_id).await;
 
     let b64 = base64::engine::general_purpose::STANDARD;
-    // 1025 bytes exceeds MAX_WRAPPED_KEY_SIZE (1024)
-    let oversized_key = vec![0xAB_u8; 1025];
+    // 1537 bytes exceeds MAX_WRAPPED_KEY_SIZE (1536)
+    let oversized_key = vec![0xAB_u8; 1537];
     let revoke_body = serde_json::json!({
         "new_epoch": 1,
         "remote_wipe": false,

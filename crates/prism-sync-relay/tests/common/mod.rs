@@ -439,6 +439,7 @@ pub async fn prepare_device(
                 &x25519_pk,
                 &ml_dsa_pk,
                 &ml_kem_pk,
+                &[],
                 0,
             )?;
             let token = db::create_session(conn, &sync_id, &device_id, 3600)?;
