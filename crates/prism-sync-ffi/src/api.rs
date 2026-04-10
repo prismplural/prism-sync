@@ -1161,7 +1161,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     *handle.relay.lock().unwrap() = Some(relay.clone());
 
     // Configure engine
-    inner.configure_engine(relay, sync_id, device_id, epoch);
+    inner.configure_engine(relay, sync_id, device_id, epoch, ml_dsa_key_generation);
 
     Ok(())
 }
@@ -3393,7 +3393,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     };
 
     // 5. Update local device registry
-    let inner = handle.inner.lock().await;
+    let mut inner = handle.inner.lock().await;
     let storage = inner.storage().clone();
     let sid = sync_id.clone();
     let did = device_id.clone();
@@ -3412,6 +3412,11 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
+
+    // After successful rotation, refresh the cached ML-DSA signing key in PrismSync
+    // so that subsequent hybrid batch signing uses the new key without requiring
+    // a full configure_engine call.
+    inner.refresh_ml_dsa_key(new_gen);
 
     // 6. Return result as JSON
     let result = serde_json::json!({

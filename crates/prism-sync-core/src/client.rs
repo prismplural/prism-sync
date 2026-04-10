@@ -149,6 +149,8 @@ impl PrismSyncBuilder {
             event_tx,
             op_emitter: None,
             device_signing_key: None,
+            device_ml_dsa_signing_key: None,
+            ml_dsa_key_generation: None,
             device_id: None,
             epoch: None,
         })
@@ -172,6 +174,8 @@ pub struct PrismSync {
     event_tx: broadcast::Sender<SyncEvent>,
     op_emitter: Option<OpEmitter>,
     device_signing_key: Option<ed25519_dalek::SigningKey>,
+    device_ml_dsa_signing_key: Option<prism_sync_crypto::DevicePqSigningKey>,
+    ml_dsa_key_generation: Option<u32>,
     device_id: Option<String>,
     epoch: Option<i32>,
 }
@@ -303,17 +307,20 @@ impl PrismSync {
     ///
     /// Call this after `initialize` or `unlock` and after obtaining a relay
     /// connection. The `node_id` is this device's unique identifier (12-char
-    /// hex), and `epoch` is the current sync epoch number.
+    /// hex), `epoch` is the current sync epoch number, and
+    /// `ml_dsa_key_generation` is the current ML-DSA key generation for this
+    /// device (0 for initial key, increments on each rotation).
     ///
     /// If a `DeviceSecret` is available (set by `initialize` or `unlock`),
-    /// the device's Ed25519 signing key is derived and stored for use by
-    /// `sync_now` and `on_resume`.
+    /// the device's Ed25519 and ML-DSA signing keys are derived and stored
+    /// for use by `sync_now`, `on_resume`, and hybrid batch signing.
     pub fn configure_engine(
         &mut self,
         relay: Arc<dyn SyncRelay>,
         sync_id: String,
         node_id: String,
         epoch: i32,
+        ml_dsa_key_generation: u32,
     ) {
         let engine = SyncEngine::new(
             self.storage.clone(),
@@ -329,10 +336,15 @@ impl PrismSync {
             None,
         ));
 
-        // Derive and store the device signing key if a DeviceSecret is available.
+        // Derive and store the device signing keys if a DeviceSecret is available.
         if let Some(ref device_secret) = self.device_secret {
             if let Ok(dsk) = device_secret.ed25519_keypair(&node_id) {
                 self.device_signing_key = Some(dsk.into_signing_key());
+            }
+            // Derive ML-DSA signing key at current generation
+            if let Ok(pq_sk) = device_secret.ml_dsa_65_keypair_v(&node_id, ml_dsa_key_generation) {
+                self.device_ml_dsa_signing_key = Some(pq_sk);
+                self.ml_dsa_key_generation = Some(ml_dsa_key_generation);
             }
         }
         self.device_id = Some(node_id);
@@ -681,6 +693,26 @@ impl PrismSync {
         self.epoch
     }
 
+    /// Access the ML-DSA signing key, if derived.
+    pub fn ml_dsa_signing_key(&self) -> Option<&prism_sync_crypto::DevicePqSigningKey> {
+        self.device_ml_dsa_signing_key.as_ref()
+    }
+
+    /// Access the ML-DSA key generation, if set.
+    pub fn ml_dsa_key_generation(&self) -> Option<u32> {
+        self.ml_dsa_key_generation
+    }
+
+    /// Re-derive the ML-DSA signing key after a local rotation.
+    pub fn refresh_ml_dsa_key(&mut self, new_generation: u32) {
+        if let (Some(ref device_secret), Some(ref device_id)) = (&self.device_secret, &self.device_id) {
+            if let Ok(pq_sk) = device_secret.ml_dsa_65_keypair_v(device_id, new_generation) {
+                self.device_ml_dsa_signing_key = Some(pq_sk);
+                self.ml_dsa_key_generation = Some(new_generation);
+            }
+        }
+    }
+
     /// Access the configured relay URL, if any.
     pub fn relay_url(&self) -> Option<&str> {
         self.relay_url.as_deref()
@@ -873,6 +905,7 @@ mod tests {
             "sync-1".to_string(),
             "a1b2c3d4e5f6".to_string(),
             1,
+            0, // ml_dsa_key_generation
         );
     }
 
