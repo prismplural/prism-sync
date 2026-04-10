@@ -538,16 +538,6 @@ impl PrismSync {
         remote_wipe: bool,
     ) -> Result<u32> {
         // Get required state
-        let device_id = self
-            .device_id()
-            .ok_or_else(|| CoreError::Engine("device_id not set".into()))?
-            .to_string();
-        let device_secret = self
-            .device_secret()
-            .ok_or_else(|| CoreError::Engine("device_secret not set".into()))?;
-        let exchange_key = device_secret
-            .x25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
         let sync_id = self
             .sync_service()
             .sync_id()
@@ -567,7 +557,6 @@ impl PrismSync {
         //    atomic revoke+epoch-rotation request against the relay.
         let (epoch_key, wrapped_keys) = crate::epoch::EpochManager::prepare_wrapped_keys(
             relay.as_ref(),
-            &exchange_key,
             Some(target_device_id),
         )
         .await?;

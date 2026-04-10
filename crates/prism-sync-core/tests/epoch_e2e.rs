@@ -1,8 +1,8 @@
 //! Epoch rotation end-to-end test (C12).
 //!
 //! Verifies the full cycle: Device A generates a new epoch key, posts it via
-//! atomic revoke, Device B recovers it via `handle_rotation`, and both
-//! can encrypt/decrypt with the same epoch key.
+//! atomic revoke using X-Wing KEM, Device B recovers it via `handle_rotation`,
+//! and both can encrypt/decrypt with the same epoch key.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -157,9 +157,10 @@ async fn epoch_rotation_full_cycle() {
     let secret_b = DeviceSecret::generate();
     let secret_c = DeviceSecret::generate();
 
-    let xk_a = secret_a.x25519_keypair("device-a").unwrap();
-    let xk_b = secret_b.x25519_keypair("device-b").unwrap();
-    let xk_c = secret_c.x25519_keypair("device-c").unwrap();
+    // Derive X-Wing keypairs for each device
+    let xwing_a = secret_a.xwing_keypair("device-a").unwrap();
+    let xwing_b = secret_b.xwing_keypair("device-b").unwrap();
+    let xwing_c = secret_c.xwing_keypair("device-c").unwrap();
 
     let devices = vec![
         DeviceInfo {
@@ -167,10 +168,10 @@ async fn epoch_rotation_full_cycle() {
             epoch: 0,
             status: "active".to_string(),
             ed25519_public_key: vec![],
-            x25519_public_key: xk_a.public_key_bytes().to_vec(),
+            x25519_public_key: vec![],
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_a.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
         },
@@ -179,10 +180,10 @@ async fn epoch_rotation_full_cycle() {
             epoch: 0,
             status: "active".to_string(),
             ed25519_public_key: vec![],
-            x25519_public_key: xk_b.public_key_bytes().to_vec(),
+            x25519_public_key: vec![],
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_b.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
         },
@@ -191,10 +192,10 @@ async fn epoch_rotation_full_cycle() {
             epoch: 0,
             status: "revoked".to_string(),
             ed25519_public_key: vec![],
-            x25519_public_key: xk_c.public_key_bytes().to_vec(),
+            x25519_public_key: vec![],
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_c.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
         },
@@ -210,8 +211,9 @@ async fn epoch_rotation_full_cycle() {
     kh_b.initialize("password", &[2u8; 16]).unwrap();
 
     // ── Step 1: Device A generates a new epoch key and performs atomic revoke ──
+    // Device C is revoked (excluded) — X-Wing wraps for A and B only.
     let (epoch_key_a, wrapped_keys) =
-        EpochManager::prepare_wrapped_keys(&relay, &xk_a, Some("device-c"))
+        EpochManager::prepare_wrapped_keys(&relay, Some("device-c"))
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
@@ -243,13 +245,13 @@ async fn epoch_rotation_full_cycle() {
     }
 
     // ── Step 2: Device B recovers the epoch key via handle_rotation ──
+    // With X-Wing KEM, B only needs its own DK — no sender identity needed.
     EpochManager::handle_rotation(
         &relay,
         &mut kh_b,
         1,
         "device-b",
-        &xk_b,
-        &xk_a.public_key_bytes(),
+        &xwing_b,
     )
     .await
     .expect("handle_rotation should succeed");
@@ -296,8 +298,8 @@ async fn revoked_device_cannot_recover_epoch_key() {
     let secret_a = DeviceSecret::generate();
     let secret_c = DeviceSecret::generate();
 
-    let xk_a = secret_a.x25519_keypair("device-a").unwrap();
-    let xk_c = secret_c.x25519_keypair("device-c").unwrap();
+    let xwing_a = secret_a.xwing_keypair("device-a").unwrap();
+    let xwing_c = secret_c.xwing_keypair("device-c").unwrap();
 
     let devices = vec![
         DeviceInfo {
@@ -305,22 +307,23 @@ async fn revoked_device_cannot_recover_epoch_key() {
             epoch: 0,
             status: "active".to_string(),
             ed25519_public_key: vec![],
-            x25519_public_key: xk_a.public_key_bytes().to_vec(),
+            x25519_public_key: vec![],
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_a.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
         },
         DeviceInfo {
             device_id: "device-c".to_string(),
             epoch: 0,
-            status: "active".to_string(), // still listed as active in device list
+            // listed as active in device list but will be excluded from wrapped keys
+            status: "active".to_string(),
             ed25519_public_key: vec![],
-            x25519_public_key: xk_c.public_key_bytes().to_vec(),
+            x25519_public_key: vec![],
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_c.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
         },
@@ -331,8 +334,9 @@ async fn revoked_device_cannot_recover_epoch_key() {
     let mut kh_a = KeyHierarchy::new();
     kh_a.initialize("password", &[1u8; 16]).unwrap();
 
+    // Device A excludes device-c from wrapped keys
     let (_epoch_key, wrapped_keys) =
-        EpochManager::prepare_wrapped_keys(&relay, &xk_a, Some("device-c"))
+        EpochManager::prepare_wrapped_keys(&relay, Some("device-c"))
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
@@ -340,7 +344,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
         .await
         .expect("atomic revoke should succeed");
 
-    // Device C tries to recover -- no artifact for it
+    // Device C tries to recover -- no artifact was posted for it
     let mut kh_c = KeyHierarchy::new();
     kh_c.initialize("password", &[3u8; 16]).unwrap();
 
@@ -349,8 +353,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
         &mut kh_c,
         1,
         "device-c",
-        &xk_c,
-        &xk_a.public_key_bytes(),
+        &xwing_c,
     )
     .await;
 

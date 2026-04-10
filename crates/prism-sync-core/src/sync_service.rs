@@ -199,10 +199,10 @@ pub fn spawn_notification_handler(
 
 /// Attempt to recover the epoch key for a new epoch after rotation.
 ///
-/// Lists active devices from the relay and tries each one's X25519 public
-/// key to unwrap the rekey artifact. On success, stores the epoch key in
-/// the key hierarchy, persists it to the secure store, and updates the
-/// current epoch in storage.
+/// Fetches the device's own X-Wing decapsulation key, then calls
+/// `handle_rotation` to fetch and decapsulate the rekey artifact from the
+/// relay. On success, stores the epoch key in the key hierarchy, persists it
+/// to the secure store, and updates the current epoch in storage.
 ///
 /// Logs warnings on failure but never panics or crashes — the device will
 /// be unable to sync at the new epoch until the key is recovered through
@@ -225,14 +225,15 @@ async fn recover_epoch_key(
         return;
     }
 
-    let exchange_key = match guard.device_secret() {
-        Some(ds) => match ds.x25519_keypair(my_device_id) {
-            Ok(xk) => xk,
+    // Derive own X-Wing decapsulation key — needed to unwrap the artifact
+    let xwing_key = match guard.device_secret() {
+        Some(ds) => match ds.xwing_keypair(my_device_id) {
+            Ok(k) => k,
             Err(e) => {
                 tracing::warn!(
                     epoch = new_epoch,
                     error = %e,
-                    "epoch recovery: failed to derive X25519 keypair"
+                    "epoch recovery: failed to derive X-Wing keypair"
                 );
                 return;
             }
@@ -246,21 +247,9 @@ async fn recover_epoch_key(
         }
     };
 
-    // Drop the lock before network I/O (list_devices). We'll re-acquire
-    // it for handle_rotation which mutates key_hierarchy.
+    // Drop the lock before network I/O. We'll re-acquire it for
+    // handle_rotation which mutates key_hierarchy.
     drop(guard);
-
-    let devices = match relay.list_devices().await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(
-                epoch = new_epoch,
-                error = %e,
-                "epoch recovery: failed to list devices"
-            );
-            return;
-        }
-    };
 
     // Re-acquire the lock for key_hierarchy mutation
     let mut guard = inner.lock().await;
@@ -270,55 +259,36 @@ async fn recover_epoch_key(
         return;
     }
 
-    let mut recovered = false;
-    for device in &devices {
-        if device.device_id == my_device_id || device.status != "active" {
-            continue;
+    // With X-Wing KEM the artifact is self-contained — no need to loop over
+    // active devices to find the sender. The receiver just decapsulates with
+    // its own DK.
+    let recovered = match EpochManager::handle_rotation(
+        relay.as_ref(),
+        guard.key_hierarchy_mut(),
+        new_epoch,
+        my_device_id,
+        &xwing_key,
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                epoch = new_epoch,
+                "epoch recovery: successfully recovered epoch key"
+            );
+            true
         }
-        if device.x25519_public_key.len() != 32 {
-            continue;
+        Err(e) => {
+            tracing::warn!(
+                epoch = new_epoch,
+                error = %e,
+                "epoch recovery: failed to recover epoch key"
+            );
+            false
         }
-        let sender_pk: [u8; 32] = match device.x25519_public_key.as_slice().try_into() {
-            Ok(pk) => pk,
-            Err(_) => continue,
-        };
-
-        match EpochManager::handle_rotation(
-            relay.as_ref(),
-            guard.key_hierarchy_mut(),
-            new_epoch,
-            my_device_id,
-            &exchange_key,
-            &sender_pk,
-        )
-        .await
-        {
-            Ok(()) => {
-                tracing::info!(
-                    epoch = new_epoch,
-                    sender = %device.device_id,
-                    "epoch recovery: successfully recovered epoch key"
-                );
-                recovered = true;
-                break;
-            }
-            Err(e) => {
-                tracing::debug!(
-                    epoch = new_epoch,
-                    sender = %device.device_id,
-                    error = %e,
-                    "epoch recovery: failed with this sender, trying next"
-                );
-                continue;
-            }
-        }
-    }
+    };
 
     if !recovered {
-        tracing::warn!(
-            epoch = new_epoch,
-            "epoch recovery: failed to recover epoch key from any active device"
-        );
         return;
     }
 

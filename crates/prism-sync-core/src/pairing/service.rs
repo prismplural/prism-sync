@@ -824,15 +824,11 @@ impl PairingService {
             joiner_bundle.device_id.as_bytes(),
         )?;
 
-        let joiner_exchange = device_secret
-            .x25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
         let next_epoch = current_epoch.saturating_add(1);
         let epoch_key = EpochManager::post_rekey(
             self.relay.as_ref(),
             &mut key_hierarchy,
             next_epoch,
-            &joiner_exchange,
         )
         .await?;
 
