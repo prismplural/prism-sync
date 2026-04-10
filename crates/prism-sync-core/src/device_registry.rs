@@ -942,4 +942,63 @@ mod tests {
         assert_eq!(stored.ml_dsa_key_generation, 1);
         assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_1.public_key_bytes());
     }
+
+    #[test]
+    fn future_registry_version_byte_rejected() {
+        let storage = make_storage();
+
+        // Build an artifact blob starting with version byte 0x04 (unknown future version)
+        let mut blob = Vec::new();
+        blob.push(0x04u8); // future version byte — not 0x03
+        blob.extend_from_slice(b"some payload that would never be parsed");
+
+        let result =
+            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob);
+        assert!(
+            result.is_err(),
+            "future registry version byte should be rejected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsupported registry artifact version"),
+            "error should mention unsupported version, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_registry_json_rejected() {
+        let storage = make_storage();
+
+        // Build a blob with valid version byte 0x03, followed by a plausible
+        // HybridSignature encoding (length-prefixed zeros), followed by invalid JSON.
+        //
+        // Format per verify_and_import_signed_registry:
+        //   [0x03] || le_u32(ed_len) || ed_bytes || le_u32(ml_len) || ml_bytes || json
+        //
+        // This will fail at signature verification (not JSON parsing), which is
+        // expected — the test verifies the function handles malformed input
+        // without panicking.
+        let mut blob = Vec::new();
+        blob.push(0x03u8); // version byte
+
+        // Fake Ed25519 signature part (64 zero bytes with LE length prefix)
+        let ed_len: u32 = 64;
+        blob.extend_from_slice(&ed_len.to_le_bytes());
+        blob.extend_from_slice(&[0u8; 64]);
+
+        // Fake ML-DSA signature part (100 zero bytes with LE length prefix)
+        let ml_len: u32 = 100;
+        blob.extend_from_slice(&ml_len.to_le_bytes());
+        blob.extend_from_slice(&[0u8; 100]);
+
+        // Invalid JSON payload
+        blob.extend_from_slice(b"not valid json {{{{");
+
+        let result =
+            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob);
+        assert!(
+            result.is_err(),
+            "blob with invalid content should be rejected without panic"
+        );
+    }
 }

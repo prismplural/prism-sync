@@ -449,6 +449,77 @@ mod tests {
     }
 
     #[test]
+    fn truncated_hybrid_signature_rejected() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let mut envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Truncate the hybrid signature to 8 bytes — far too short to be valid
+        envelope.signature = envelope.signature[..8].to_vec();
+
+        assert!(
+            verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err(),
+            "truncated signature should be rejected"
+        );
+    }
+
+    #[test]
+    fn garbage_hybrid_signature_rejected() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let mut envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Replace signature with random bytes of the same length
+        let sig_len = envelope.signature.len();
+        envelope.signature = (0..sig_len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(13)).collect();
+
+        assert!(
+            verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err(),
+            "garbage signature of correct length should be rejected"
+        );
+    }
+
+    #[test]
+    fn wrong_ml_dsa_pk_length_rejected() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Pass a 100-byte array instead of the correct 1952-byte ML-DSA public key
+        let wrong_ml_dsa_pk = vec![0u8; 100];
+
+        assert!(
+            verify_batch_signature(&envelope, &ed25519_pk, &wrong_ml_dsa_pk).is_err(),
+            "wrong ML-DSA public key length should be rejected"
+        );
+    }
+
+    #[test]
+    fn future_v4_batch_envelope_rejected() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let mut envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Change the protocol_version to 4 after signing.
+        // The verifier reconstructs canonical data using envelope.protocol_version,
+        // which now differs from the version (3) used when signing — so the
+        // canonical data will not match and signature verification must fail.
+        envelope.protocol_version = 4;
+
+        assert!(
+            verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err(),
+            "envelope with future protocol version should be rejected"
+        );
+    }
+
+    #[test]
     fn v2_signature_rejected_by_v3_verifier() {
         use ed25519_dalek::Signer;
 

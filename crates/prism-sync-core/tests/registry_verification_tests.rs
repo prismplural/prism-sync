@@ -1324,3 +1324,135 @@ async fn bootstrap_from_snapshot_fail_closed() {
         "data from unknown snapshot sender should not be imported"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G7: Integration — hybrid batch roundtrip with verified registry
+//
+// NOTE: The full round-trip integration test for G7 is already covered by
+// `registry_verification_verified_import_happy_path` (Test 1 above), which:
+//   1. Creates two devices (A and B) with ML-DSA keys
+//   2. Builds and signs a registry snapshot containing both devices
+//   3. Sets it on MockRelay
+//   4. Device A creates a SyncEngine and calls sync()
+//   5. The engine fetches the signed registry, verifies it, imports B's keys,
+//      verifies B's batch signature, and merges B's ops
+//   6. Asserts: merged > 0, B's data is present in the entity store, and
+//      B's device record is in local storage
+//
+// The test below explicitly documents the G7 property and verifies that
+// `resolve_sender_keys_with_generation_hint` resolves a newly imported device
+// after a signed registry import — covering the key resolution integration path.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn hybrid_batch_roundtrip_with_verified_registry() {
+    // Full round-trip is covered by `registry_verification_verified_import_happy_path`.
+    //
+    // This test additionally verifies that after a verified registry import,
+    // the local key resolver can find the newly imported device's keys —
+    // confirming the integration between verify_and_import_signed_registry
+    // and resolve_sender_keys_with_generation_hint.
+
+    let device_a_id = "device-aaa-g7";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let device_b_id = "device-bbb-g7";
+    let device_secret_b = DeviceSecret::generate();
+    let ed25519_b = device_secret_b.ed25519_keypair(device_b_id).unwrap();
+    let x25519_b = device_secret_b.x25519_keypair(device_b_id).unwrap();
+    let ml_dsa_b = device_secret_b.ml_dsa_65_keypair(device_b_id).unwrap();
+    let ml_kem_b = device_secret_b.ml_kem_768_keypair(device_b_id).unwrap();
+
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: device_a_id.to_string(),
+            ed25519_public_key: ed25519_a.public_key_bytes().to_vec(),
+            x25519_public_key: x25519_a.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: device_b_id.to_string(),
+            ed25519_public_key: ed25519_b.public_key_bytes().to_vec(),
+            x25519_public_key: x25519_b.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa_b.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        },
+    ];
+
+    let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
+
+    let relay = Arc::new(MockRelay::new());
+    relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: signed_blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, device_a_id);
+
+    // Register only device A locally — B is unknown until registry is imported
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // After the signed registry is imported, device B's keys should be resolvable.
+    // The engine fetches the signed registry lazily; we trigger it by calling
+    // resolve_sender_keys_with_generation_hint for device B.
+    let info = engine
+        .resolve_sender_keys_with_generation_hint(SYNC_ID, device_b_id, Some(0))
+        .await
+        .expect("device B should be resolved after verified registry import");
+
+    assert_eq!(
+        info.ed25519_pk,
+        ed25519_b.public_key_bytes(),
+        "Ed25519 public key for device B should match after registry import"
+    );
+    assert_eq!(
+        info.ml_dsa_65_pk,
+        ml_dsa_b.public_key_bytes(),
+        "ML-DSA public key for device B should match after registry import"
+    );
+    assert_eq!(
+        info.ml_dsa_key_generation, 0,
+        "ML-DSA generation for device B should be 0"
+    );
+
+    // Verify device B is now in local storage (imported from the signed registry)
+    let device_b_record = storage
+        .get_device_record(SYNC_ID, device_b_id)
+        .unwrap()
+        .expect("device B should be in local storage after verified import");
+    assert_eq!(device_b_record.status, "active");
+}
