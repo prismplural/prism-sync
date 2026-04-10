@@ -895,3 +895,69 @@ async fn test_no_pruning_without_min_acked_seq() {
         "op should not have been pruned"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 10: Push without ML-DSA key errors
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn push_without_ml_dsa_key_errors() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-local";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    // Insert pending ops so there is something to push
+    let hlc = Hlc::now(device_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:t1:title:{}:{}", hlc, device_id),
+        batch_id: Some("batch-nopq".to_string()),
+        entity_id: "t1".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Hello\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+    insert_pending_ops(&storage, &ops, "batch-nopq");
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Call sync with None for ml_dsa_signing_key — push should fail
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        result.error.is_some(),
+        "Expected an error when pushing without ML-DSA signing key"
+    );
+    let err_msg = result.error.unwrap();
+    assert!(
+        err_msg.contains("ML-DSA signing key required"),
+        "Error should mention ML-DSA signing key required, got: {err_msg}"
+    );
+}

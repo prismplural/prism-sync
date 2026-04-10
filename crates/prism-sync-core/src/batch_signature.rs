@@ -400,6 +400,55 @@ mod tests {
     }
 
     #[test]
+    fn tampered_generation_fails() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let mut envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Envelope was signed with generation 0; change it to 1 after signing.
+        // Verification should fail because generation is bound in the canonical data.
+        envelope.sender_ml_dsa_key_generation = 1;
+
+        assert!(verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err());
+    }
+
+    #[test]
+    fn hybrid_batch_tampered_ed25519_half_fails() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let mut envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Parse the hybrid signature, corrupt only the Ed25519 portion, re-serialize
+        let mut hybrid_sig = HybridSignature::from_bytes(&envelope.signature)
+            .expect("should parse hybrid signature");
+        hybrid_sig.ed25519_sig[0] ^= 0xFF;
+        envelope.signature = hybrid_sig.to_bytes();
+
+        assert!(verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err());
+    }
+
+    #[test]
+    fn hybrid_batch_tampered_ml_dsa_half_fails() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let mut envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Parse the hybrid signature, corrupt only the ML-DSA portion, re-serialize
+        let mut hybrid_sig = HybridSignature::from_bytes(&envelope.signature)
+            .expect("should parse hybrid signature");
+        hybrid_sig.ml_dsa_65_sig[0] ^= 0xFF;
+        envelope.signature = hybrid_sig.to_bytes();
+
+        assert!(verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err());
+    }
+
+    #[test]
     fn v2_signature_rejected_by_v3_verifier() {
         use ed25519_dalek::Signer;
 
