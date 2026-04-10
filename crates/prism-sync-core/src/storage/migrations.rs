@@ -93,5 +93,10 @@ pub fn migrations() -> Migrations<'static> {
         "-- V3: Track last imported registry version
             ALTER TABLE sync_metadata ADD COLUMN last_imported_registry_version INTEGER;
             ",
+    ),
+    M::up(
+        "-- V4: Add x_wing_public_key to device_registry
+            ALTER TABLE device_registry ADD COLUMN x_wing_public_key BLOB NOT NULL DEFAULT X'';
+            ",
     )])
 }

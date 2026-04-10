@@ -913,6 +913,7 @@ fn build_register_device_body(req: &RegisterRequest) -> serde_json::Value {
         "x25519_public_key": hex::encode(&req.x25519_public_key),
         "ml_dsa_65_public_key": hex::encode(&req.ml_dsa_65_public_key),
         "ml_kem_768_public_key": hex::encode(&req.ml_kem_768_public_key),
+        "x_wing_public_key": hex::encode(&req.x_wing_public_key),
         "registration_challenge": hex::encode(&req.registration_challenge),
         "nonce": &req.nonce,
         "pow_solution": req.pow_solution.as_ref().map(|solution| {
@@ -997,6 +998,7 @@ mod tests {
             x25519_public_key: vec![0x22; 32],
             ml_dsa_65_public_key: vec![0x33; 1952],
             ml_kem_768_public_key: vec![0x44; 1184],
+            x_wing_public_key: vec![],
             registration_challenge: vec![0x55; 64],
             nonce: "nonce".to_string(),
             pow_solution: None,

@@ -94,6 +94,7 @@ fn register_device_in_storage(
         x25519_public_key: x25519_pk.to_vec(),
         ml_dsa_65_public_key: ml_dsa_pk.to_vec(),
         ml_kem_768_public_key: ml_kem_pk.to_vec(),
+        x_wing_public_key: vec![],
         status: "active".to_string(),
         registered_at: chrono::Utc::now(),
         revoked_at: None,
@@ -140,6 +141,7 @@ async fn registry_verification_verified_import_happy_path() {
             x25519_public_key: x25519_a.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
             ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+            x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
         },
@@ -150,6 +152,7 @@ async fn registry_verification_verified_import_happy_path() {
             x25519_public_key: x25519_b.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: ml_dsa_b.public_key_bytes(),
             ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+            x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
         },
@@ -176,6 +179,7 @@ async fn registry_verification_verified_import_happy_path() {
         x25519_public_key: x25519_b.public_key_bytes().to_vec(),
         ml_dsa_65_public_key: ml_dsa_b.public_key_bytes(),
         ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+        x_wing_public_key: vec![],
         permission: None,
         ml_dsa_key_generation: 0,
     });
@@ -204,6 +208,7 @@ async fn registry_verification_verified_import_happy_path() {
         x25519_public_key: x25519_a.public_key_bytes().to_vec(),
         ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
         ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+        x_wing_public_key: vec![],
         permission: None,
         ml_dsa_key_generation: 0,
     });
@@ -302,6 +307,7 @@ fn registry_verification_unverified_merge_blocked() {
         x25519_public_key: vec![2u8; 32],
         ml_dsa_65_public_key: original_ml_dsa_pk.clone(),
         ml_kem_768_public_key: vec![4u8; 1184],
+        x_wing_public_key: vec![],
         status: "active".to_string(),
         registered_at: chrono::Utc::now(),
         revoked_at: None,
@@ -318,6 +324,7 @@ fn registry_verification_unverified_merge_blocked() {
         x25519_public_key: vec![2u8; 32],     // same
         ml_dsa_65_public_key: vec![0xBB; 1952], // DIFFERENT
         ml_kem_768_public_key: vec![4u8; 1184], // same
+        x_wing_public_key: vec![],
         status: "active".to_string(),
         registered_at: chrono::Utc::now(),
         revoked_at: None,
@@ -396,6 +403,7 @@ fn registry_verification_verified_import_preserves_generation() {
             x25519_public_key: x25519_a.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
             ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+            x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
         },
@@ -406,6 +414,7 @@ fn registry_verification_verified_import_preserves_generation() {
             x25519_public_key: x25519_b.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: ml_dsa_b_gen3.public_key_bytes(),
             ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+            x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 3,
         },
@@ -470,6 +479,7 @@ fn registry_verification_tampered_artifact_rejected() {
         x25519_public_key: x25519_a.public_key_bytes().to_vec(),
         ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
         ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+        x_wing_public_key: vec![],
         status: "active".to_string(),
         ml_dsa_key_generation: 0,
     }];
@@ -518,6 +528,7 @@ async fn registry_verification_fallback_when_no_artifact() {
         x25519_public_key: vec![0u8; 32],
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
+        x_wing_public_key: Vec::new(),
         permission: None,
         ml_dsa_key_generation: 0,
     });
@@ -531,6 +542,7 @@ async fn registry_verification_fallback_when_no_artifact() {
         x25519_public_key: vec![0u8; 32],
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
+        x_wing_public_key: Vec::new(),
         permission: None,
         ml_dsa_key_generation: 0,
     });

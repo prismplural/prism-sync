@@ -3361,6 +3361,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
                     x25519_public_key: r.x25519_public_key.clone(),
                     ml_dsa_65_public_key: ml_dsa_pk,
                     ml_kem_768_public_key: r.ml_kem_768_public_key.clone(),
+                    x_wing_public_key: r.x_wing_public_key.clone(),
                     status: r.status.clone(),
                     ml_dsa_key_generation: ml_dsa_gen,
                 }

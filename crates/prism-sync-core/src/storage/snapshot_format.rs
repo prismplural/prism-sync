@@ -34,9 +34,13 @@ pub struct DeviceRegistryEntry {
     pub x25519_public_key: String,     // hex-encoded
     pub ml_dsa_65_public_key: String,  // hex-encoded
     pub ml_kem_768_public_key: String, // hex-encoded
+    #[serde(default)]
+    pub x_wing_public_key: String, // hex-encoded
     pub status: String,
     pub registered_at: String,
     pub revoked_at: Option<String>,
+    #[serde(default)]
+    pub ml_dsa_key_generation: u32,
 }
 
 /// Snapshot representation of an applied_ops row.

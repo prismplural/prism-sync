@@ -228,6 +228,7 @@ pub fn register_device(
         x25519_public_key: vec![0u8; 32],
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
+        x_wing_public_key: Vec::new(),
         permission: None,
         ml_dsa_key_generation: 0,
     });
@@ -240,6 +241,7 @@ pub fn register_device(
         x25519_public_key: vec![0u8; 32],
         ml_dsa_65_public_key: Vec::new(),
         ml_kem_768_public_key: Vec::new(),
+        x_wing_public_key: Vec::new(),
         status: "active".to_string(),
         registered_at: chrono::Utc::now(),
         revoked_at: None,

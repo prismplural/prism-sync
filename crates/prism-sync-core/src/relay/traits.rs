@@ -148,6 +148,7 @@ pub struct RegisterRequest {
     pub x25519_public_key: Vec<u8>,
     pub ml_dsa_65_public_key: Vec<u8>,
     pub ml_kem_768_public_key: Vec<u8>,
+    pub x_wing_public_key: Vec<u8>,
     pub registration_challenge: Vec<u8>,
     pub nonce: String,
     pub pow_solution: Option<ProofOfWorkSolution>,
@@ -269,6 +270,8 @@ pub struct DeviceInfo {
     pub ml_dsa_65_public_key: Vec<u8>,
     #[serde(default, deserialize_with = "deserialize_base64_or_bytes")]
     pub ml_kem_768_public_key: Vec<u8>,
+    #[serde(default, deserialize_with = "deserialize_base64_or_bytes")]
+    pub x_wing_public_key: Vec<u8>,
     pub permission: Option<String>,
     #[serde(default)]
     pub ml_dsa_key_generation: u32,

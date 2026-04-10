@@ -357,7 +357,11 @@ pub struct RegistrySnapshotEntry {
     pub ml_dsa_65_public_key: Vec<u8>,
     #[serde(default)]
     pub ml_kem_768_public_key: Vec<u8>,
+    #[serde(default)]
+    pub x_wing_public_key: Vec<u8>,
     pub status: String,
+    #[serde(default)]
+    pub ml_dsa_key_generation: u32,
 }
 
 /// A signed, typed snapshot of the device registry.
@@ -540,9 +544,11 @@ impl SignedRegistrySnapshot {
                 x25519_public_key: e.x25519_public_key.clone(),
                 ml_dsa_65_public_key: e.ml_dsa_65_public_key.clone(),
                 ml_kem_768_public_key: e.ml_kem_768_public_key.clone(),
+                x_wing_public_key: e.x_wing_public_key.clone(),
                 status: e.status.clone(),
                 registered_at: chrono::Utc::now(),
                 revoked_at: None,
+                ml_dsa_key_generation: e.ml_dsa_key_generation,
             })
             .collect()
     }
@@ -630,7 +636,9 @@ mod tests {
             x25519_public_key: vec![0xBB; 32],
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
+            x_wing_public_key: Vec::new(),
             status: "active".into(),
+            ml_dsa_key_generation: 0,
         }]);
         let mut resp = sample_response();
         resp.inviter_device_id = "device-001".into();
@@ -649,7 +657,9 @@ mod tests {
                 x25519_public_key: vec![0xBB; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "sync-1".into(),
@@ -658,7 +668,9 @@ mod tests {
                 x25519_public_key: vec![0xDD; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
         ]);
         let mut resp = sample_response();
@@ -677,7 +689,9 @@ mod tests {
             x25519_public_key: vec![0xBB; 32],
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
+            x_wing_public_key: Vec::new(),
             status: "active".into(),
+            ml_dsa_key_generation: 0,
         }]);
         let mut resp = sample_response();
         resp.inviter_device_id = "device-001".into();
@@ -717,7 +731,9 @@ mod tests {
                 x25519_public_key: vec![2u8; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "sync-1".into(),
@@ -726,7 +742,9 @@ mod tests {
                 x25519_public_key: vec![4u8; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
         ])
     }
@@ -772,7 +790,9 @@ mod tests {
                 x25519_public_key: vec![2u8; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "s".into(),
@@ -781,7 +801,9 @@ mod tests {
                 x25519_public_key: vec![1u8; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
         ]);
         let snapshot_ba = SignedRegistrySnapshot::new(vec![
@@ -792,7 +814,9 @@ mod tests {
                 x25519_public_key: vec![1u8; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "s".into(),
@@ -801,7 +825,9 @@ mod tests {
                 x25519_public_key: vec![2u8; 32],
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
         ]);
         assert_eq!(snapshot_ab.canonical_json(), snapshot_ba.canonical_json());
@@ -884,7 +910,9 @@ mod tests {
             x25519_public_key: vec![2u8; 32],
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
+            x_wing_public_key: Vec::new(),
             status: "active".into(),
+            ml_dsa_key_generation: 0,
         };
         let json = serde_json::to_vec(&entry).unwrap();
         let decoded: RegistrySnapshotEntry = serde_json::from_slice(&json).unwrap();

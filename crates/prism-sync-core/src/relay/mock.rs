@@ -418,6 +418,7 @@ mod tests {
                 x25519_public_key: vec![],
                 ml_dsa_65_public_key: vec![],
                 ml_kem_768_public_key: vec![],
+                x_wing_public_key: vec![],
                 registration_challenge: vec![],
                 nonce: "nonce".to_string(),
                 pow_solution: None,
@@ -566,6 +567,7 @@ mod tests {
             x25519_public_key: vec![],
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
+            x_wing_public_key: vec![],
             permission: None,
             ml_dsa_key_generation: 0,
         });
@@ -577,6 +579,7 @@ mod tests {
             x25519_public_key: vec![],
             ml_dsa_65_public_key: vec![],
             ml_kem_768_public_key: vec![],
+            x_wing_public_key: vec![],
             permission: None,
             ml_dsa_key_generation: 0,
         });
@@ -615,6 +618,7 @@ mod tests {
             x25519_public_key: vec![2; 32],
             ml_dsa_65_public_key: vec![3; 1952],
             ml_kem_768_public_key: vec![4; 1184],
+            x_wing_public_key: vec![],
             permission: None,
             ml_dsa_key_generation: 0,
         }
