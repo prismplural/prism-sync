@@ -393,6 +393,26 @@ pub struct RotateMlDsaResponse {
     pub ml_dsa_key_generation: u32,
 }
 
+/// Response from fetching the latest signed registry artifact.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignedRegistryResponse {
+    pub registry_version: i64,
+    #[serde(with = "base64_bytes")]
+    pub artifact_blob: Vec<u8>,
+    pub artifact_kind: String,
+}
+
+/// Result of attempting to import a signed registry artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryImportResult {
+    /// Registry was fetched, verified, and imported successfully.
+    VerifiedRegistry,
+    /// Fell back to unverified relay device list.
+    UnverifiedFallback,
+    /// No registry artifact was available.
+    NoRegistry,
+}
+
 /// Transport layer for communicating with the relay server.
 ///
 /// Ships with `ServerRelay` (HTTP + WebSocket). Consumers can mock
@@ -516,6 +536,13 @@ pub trait SyncRelay: Send + Sync {
         &self,
         media_id: &str,
     ) -> std::result::Result<Vec<u8>, RelayError>;
+
+    /// Fetch the latest signed registry artifact for this sync group.
+    ///
+    /// Returns the signed snapshot blob that clients can verify independently
+    /// of the relay. Returns `Ok(None)` if no artifact exists (e.g., single-
+    /// device groups).
+    async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError>;
 
     /// Dispose of all resources.
     async fn dispose(&self) -> std::result::Result<(), RelayError>;
