@@ -135,6 +135,9 @@ impl PairingService {
         let pq_kem_key = device_secret
             .ml_kem_768_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let xwing_key = device_secret
+            .xwing_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
         // 5b. Pre-generate a device_id for the joining device (snapshot targeting)
         let joiner_device_id = crate::node_id::generate_node_id();
@@ -173,7 +176,7 @@ impl PairingService {
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_key.encapsulation_key_bytes(),
             status: "active".into(),
             ml_dsa_key_generation: 0,
         }]);
@@ -227,7 +230,7 @@ impl PairingService {
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_key.encapsulation_key_bytes(),
             registration_challenge: challenge_signature,
             nonce,
             pow_solution,
@@ -351,6 +354,9 @@ impl PairingService {
         let pq_kem_key = device_secret
             .ml_kem_768_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let xwing_key = device_secret
+            .xwing_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
         // 4. Fetch registration nonce and build V2 hybrid challenge (CRITICAL-2)
         let nonce_response = self
@@ -390,7 +396,7 @@ impl PairingService {
                 x25519_public_key: exchange_key.public_key_bytes().to_vec(),
                 ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-                x_wing_public_key: vec![],
+                x_wing_public_key: xwing_key.encapsulation_key_bytes(),
                 registration_challenge: challenge_signature,
                 nonce,
                 pow_solution,
@@ -529,6 +535,9 @@ impl PairingService {
         let pq_kem_key = device_secret
             .ml_kem_768_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let xwing_key = device_secret
+            .xwing_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
         let sync_id = bundle.sync_id.clone();
         let nonce_response = self
@@ -568,7 +577,7 @@ impl PairingService {
                 x25519_public_key: exchange_key.public_key_bytes().to_vec(),
                 ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-                x_wing_public_key: vec![],
+                x_wing_public_key: xwing_key.encapsulation_key_bytes(),
                 registration_challenge: challenge_signature,
                 nonce,
                 pow_solution,
@@ -669,6 +678,9 @@ impl PairingService {
         let pq_kem_key = device_secret
             .ml_kem_768_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
+        let xwing_key = device_secret
+            .xwing_keypair(&device_id)
+            .map_err(CoreError::Crypto)?;
 
         let mut key_hierarchy = KeyHierarchy::new();
         let sync_id = self.load_secure_string("sync_id")?;
@@ -733,7 +745,7 @@ impl PairingService {
             x25519_public_key: exchange_key.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-            x_wing_public_key: vec![],
+            x_wing_public_key: xwing_key.encapsulation_key_bytes(),
             status: "active".into(),
             ml_dsa_key_generation: current_ml_dsa_generation,
         });
@@ -2434,6 +2446,8 @@ mod tests {
         let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
         let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
         let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
+        let inviter_xwing_key = inviter_secret.xwing_keypair(&inviter_device_id).unwrap();
+        let joiner_xwing_key = joiner_secret.xwing_keypair(&joiner_device_id).unwrap();
 
         let snapshot = SignedRegistrySnapshot::new(vec![
             RegistrySnapshotEntry {
@@ -2443,7 +2457,7 @@ mod tests {
                 x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
                 ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: vec![],
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             },
@@ -2454,7 +2468,7 @@ mod tests {
                 x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
                 ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: vec![],
+                x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             },
@@ -2580,6 +2594,8 @@ mod tests {
         let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
         let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
         let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
+        let inviter_xwing_key = inviter_secret.xwing_keypair(&inviter_device_id).unwrap();
+        let joiner_xwing_key = joiner_secret.xwing_keypair(&joiner_device_id).unwrap();
 
         let snapshot = SignedRegistrySnapshot::new(vec![
             RegistrySnapshotEntry {
@@ -2589,7 +2605,7 @@ mod tests {
                 x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
                 ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: vec![],
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             },
@@ -2600,7 +2616,7 @@ mod tests {
                 x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
                 ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
                 ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: vec![],
+                x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             },
