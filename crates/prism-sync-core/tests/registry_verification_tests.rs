@@ -507,10 +507,13 @@ fn registry_verification_tampered_artifact_rejected() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test 5: Fallback to list_devices when no signed registry is available
+// Test 5: Fail closed when no signed registry is available
 //
-// When MockRelay returns None for get_signed_registry, the engine should
-// fall back to list_devices to resolve an unknown sender.
+// When MockRelay returns None for get_signed_registry and a batch arrives
+// from an unknown sender, the engine must skip that batch (fail closed)
+// rather than falling back to the unverified list_devices endpoint.
+// The sync should complete without error, but no data from the unknown
+// sender should be merged.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -527,7 +530,8 @@ async fn registry_verification_fallback_when_no_artifact() {
     let relay = Arc::new(MockRelay::new());
     // No signed registry set (default is None)
 
-    // Add device B to the relay's device list (for list_devices fallback)
+    // Add device B to the relay's device list — with fail-closed behavior,
+    // this must NOT be consulted for key resolution.
     relay.add_device(DeviceInfo {
         device_id: device_b_id.to_string(),
         epoch: 0,
@@ -566,7 +570,8 @@ async fn registry_verification_fallback_when_no_artifact() {
         &signing_key_a.verifying_key(),
     );
 
-    // DO NOT register device B locally — it should be resolved via list_devices
+    // DO NOT register device B locally and provide no signed registry.
+    // The engine must fail closed and skip device B's batch entirely.
 
     // Inject a batch from device B
     let hlc = Hlc::now(device_b_id, None);
@@ -610,19 +615,25 @@ async fn registry_verification_fallback_when_no_artifact() {
         .await
         .unwrap();
 
+    // Sync must succeed overall (fail closed = skip batch, not abort sync)
     assert!(
         result.error.is_none(),
-        "sync should succeed via list_devices fallback: {:?}",
+        "sync should complete even when unknown sender batch is skipped: {:?}",
         result.error
     );
     assert!(result.pulled > 0, "expected at least 1 batch pulled");
-    assert!(result.merged > 0, "expected ops merged via fallback path");
 
-    // Verify data arrived
+    // The unknown sender's batch must be SKIPPED — no ops merged
+    assert_eq!(
+        result.merged, 0,
+        "expected 0 ops merged from unknown sender (fail closed)"
+    );
+
+    // Verify that the injected data did NOT arrive
     let title = entity.get_field("task-1", "title");
     assert_eq!(
-        title,
-        Some(SyncValue::String("Fallback data".to_string()))
+        title, None,
+        "data from unknown sender should not be present (fail closed)"
     );
 }
 

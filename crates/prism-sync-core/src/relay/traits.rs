@@ -413,10 +413,6 @@ pub struct SignedRegistryResponse {
 pub enum RegistryImportResult {
     /// Registry was fetched, verified, and imported successfully.
     VerifiedRegistry,
-    /// Fell back to unverified relay device list.
-    UnverifiedFallback,
-    /// No registry artifact was available.
-    NoRegistry,
 }
 
 /// Transport layer for communicating with the relay server.

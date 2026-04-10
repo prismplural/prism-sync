@@ -552,6 +552,16 @@ async fn test_bootstrap_wrong_epoch_key() {
     let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
     setup_sync_metadata(&storage_c, "device-ccc");
 
+    // Register device B in device C's storage so the signature lookup
+    // succeeds (fail-closed) and the test reaches the decryption check.
+    register_device_with_pq(
+        &relay,
+        &storage_c,
+        "device-bbb",
+        &_sk_b.verifying_key(),
+        &_ml_b.public_key_bytes(),
+    );
+
     let engine_c = SyncEngine::new(
         storage_c.clone(),
         relay.clone(),
@@ -715,6 +725,16 @@ async fn test_bootstrap_emits_remote_changes() {
     let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
     let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
     setup_sync_metadata(&storage_c, "device-ccc");
+
+    // Register device B in device C's storage so the signature verification
+    // can proceed (fail-closed: no unverified fallback available).
+    register_device_with_pq(
+        &relay,
+        &storage_c,
+        "device-bbb",
+        &_sk_b.verifying_key(),
+        &_ml_b.public_key_bytes(),
+    );
 
     let engine_c = SyncEngine::new(
         storage_c.clone(),

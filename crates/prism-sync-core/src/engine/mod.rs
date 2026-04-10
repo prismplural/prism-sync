@@ -509,7 +509,7 @@ impl SyncEngine {
             )));
         }
 
-        // Unknown sender -- try signed registry first, then fall back to list_devices
+        // Unknown sender -- attempt signed registry; fail closed if unavailable
         tracing::info!(
             "Unknown sender device {}, attempting signed registry fetch",
             sender_device_id
@@ -526,71 +526,18 @@ impl SyncEngine {
             }
         }
 
-        // Stage 3: Fall back to unverified list_devices (existing behavior)
+        // Stage 3: Fail closed — no unverified fallback.
+        // If signed registry is unavailable, the batch from this unknown
+        // sender will be skipped. Legitimate devices become known through
+        // pairing (import_keyring) or signed registry artifacts.
         tracing::warn!(
-            "Falling back to unverified list_devices() for sender {}",
+            "No verified registry path for unknown sender {}; skipping batch (fail closed)",
             sender_device_id
         );
-        let devices = self
-            .relay
-            .list_devices()
-            .await
-            .map_err(CoreError::from_relay)?;
-
-        let storage = self.storage.clone();
-        let sid = sync_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let device_records = devices
-                .into_iter()
-                .map(|dev| {
-                    let observed_at = chrono::Utc::now();
-                    DeviceRecord {
-                        sync_id: sid.clone(),
-                        device_id: dev.device_id,
-                        ed25519_public_key: dev.ed25519_public_key,
-                        x25519_public_key: dev.x25519_public_key,
-                        ml_dsa_65_public_key: dev.ml_dsa_65_public_key,
-                        ml_kem_768_public_key: dev.ml_kem_768_public_key,
-                        x_wing_public_key: dev.x_wing_public_key,
-                        status: dev.status.clone(),
-                        registered_at: observed_at,
-                        revoked_at: if dev.status == "revoked" {
-                            Some(observed_at)
-                        } else {
-                            None
-                        },
-                        ml_dsa_key_generation: dev.ml_dsa_key_generation,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            DeviceRegistryManager::merge_relay_devices(&*storage, &sid, &device_records)
-        })
-        .await
-        .map_err(|e| CoreError::Storage(e.to_string()))??;
-
-        // Retry lookup after unverified refresh
-        let storage = self.storage.clone();
-        let sid = sync_id.to_string();
-        let sender_id = sender_device_id.to_string();
-        let record =
-            tokio::task::spawn_blocking(move || storage.get_device_record(&sid, &sender_id))
-                .await
-                .map_err(|e| CoreError::Storage(e.to_string()))??;
-
-        match record {
-            Some(ref r) if r.status == "active" => pk_from_record(r),
-            _ => {
-                tracing::warn!(
-                    "Still unknown sender {} after registry refresh, skipping",
-                    sender_device_id
-                );
-                Err(CoreError::Storage(format!(
-                    "Unknown device {} after registry refresh",
-                    sender_device_id
-                )))
-            }
-        }
+        Err(CoreError::Storage(format!(
+            "Unknown device {} and no verified registry available (fail closed)",
+            sender_device_id
+        )))
     }
 
     /// Fetch signed registry, verify, import, and re-lookup a specific device.

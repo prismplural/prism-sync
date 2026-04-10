@@ -85,7 +85,7 @@ fn make_task_ops(
 ///  - Device B pulls and merges them (populating field_versions).
 ///  - Device B uploads a snapshot.
 ///
-/// Returns (relay, key_hierarchy, device_a_signing_key, device_b_signing_key, device_b_storage).
+/// Returns (relay, key_hierarchy, device_a_signing_key, device_b_signing_key, device_b_ml_dsa_key, device_b_storage).
 /// The relay now has a snapshot and the pushed batches.
 async fn push_and_create_snapshot(
     task_ops: Vec<(&str, &str, bool, &str)>, // (task_id, title, done, batch_id)
@@ -94,6 +94,7 @@ async fn push_and_create_snapshot(
     prism_sync_crypto::KeyHierarchy,
     SigningKey,
     SigningKey,
+    prism_sync_crypto::DevicePqSigningKey,
     Arc<RusqliteSyncStorage>,
 ) {
     let key_hierarchy = init_key_hierarchy();
@@ -205,6 +206,7 @@ async fn push_and_create_snapshot(
         key_hierarchy,
         signing_key_a,
         signing_key_b,
+        ml_dsa_key_b,
         storage_b,
     )
 }
@@ -278,7 +280,7 @@ async fn test_push_limit_without_snapshot() {
 #[tokio::test]
 async fn test_snapshot_roundtrip_preserves_data() {
     // Use the helper to create a populated snapshot
-    let (relay, key_hierarchy, _sk_a, _sk_b, storage_b) = push_and_create_snapshot(vec![
+    let (relay, key_hierarchy, _sk_a, _sk_b, _ml_b, storage_b) = push_and_create_snapshot(vec![
         ("task-1", "First", false, "batch-1"),
         ("task-2", "Second", true, "batch-2"),
     ])
@@ -289,6 +291,16 @@ async fn test_snapshot_roundtrip_preserves_data() {
     let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
     let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
     setup_sync_metadata(&storage_c, "device-ccc");
+
+    // Register device B in device C's storage so the signature verification
+    // can proceed (fail-closed: no unverified list_devices fallback).
+    register_device_with_pq(
+        &relay,
+        &storage_c,
+        "device-bbb",
+        &_sk_b.verifying_key(),
+        &_ml_b.public_key_bytes(),
+    );
 
     let engine_c = SyncEngine::new(
         storage_c.clone(),
