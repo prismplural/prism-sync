@@ -173,7 +173,7 @@ struct RegistryApproval {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RegistrySnapshotEntry {
+pub(crate) struct RegistrySnapshotEntry {
     sync_id: String,
     device_id: String,
     ed25519_public_key: Vec<u8>,
