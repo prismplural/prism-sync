@@ -17,6 +17,7 @@ pub struct DeviceRecord {
     pub x25519_public_key: Vec<u8>,
     pub ml_dsa_65_public_key: Vec<u8>,
     pub ml_kem_768_public_key: Vec<u8>,
+    pub x_wing_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
     pub last_seen_at: i64,
@@ -32,6 +33,7 @@ pub struct DeviceListEntry {
     pub x25519_public_key: Vec<u8>,
     pub ml_dsa_65_public_key: Vec<u8>,
     pub ml_kem_768_public_key: Vec<u8>,
+    pub x_wing_public_key: Vec<u8>,
     pub epoch: i64,
     pub status: String,
     pub ml_dsa_key_generation: i64,
@@ -519,6 +521,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_snapshots_ephemeral(conn)?;
     migrate_devices_remote_wipe(conn)?;
     migrate_devices_pq_columns(conn)?;
+    migrate_devices_xwing_column(conn)?;
     migrate_sharing_identity_generation(conn)?;
     migrate_sharing_identity_generation_floors(conn)?;
     migrate_sync_groups_password_version(conn)?;
@@ -583,6 +586,16 @@ fn migrate_devices_pq_columns(conn: &Connection) -> Result<(), rusqlite::Error> 
         )?;
     }
 
+    Ok(())
+}
+
+fn migrate_devices_xwing_column(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_xwing = device_has_column(conn, "x_wing_public_key")?;
+    if !has_xwing {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN x_wing_public_key BLOB NOT NULL DEFAULT X'';",
+        )?;
+    }
     Ok(())
 }
 
@@ -1111,6 +1124,7 @@ pub fn register_device(
         x25519_pk,
         &[],
         &[],
+        &[],
         epoch,
     )
 }
@@ -1124,16 +1138,17 @@ pub fn register_device_with_pq(
     x25519_pk: &[u8],
     ml_dsa_pk: &[u8],
     ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
     epoch: i64,
 ) -> Result<(), rusqlite::Error> {
     let now = now_secs();
     conn.execute(
         "INSERT INTO devices (
             sync_id, device_id, signing_public_key, x25519_public_key,
-            ml_dsa_65_public_key, ml_kem_768_public_key,
+            ml_dsa_65_public_key, ml_kem_768_public_key, x_wing_public_key,
             epoch, status, registered_at, last_seen_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?8)",
-        params![sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, epoch, now],
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9)",
+        params![sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk, epoch, now],
     )?;
     Ok(())
 }
@@ -1145,7 +1160,7 @@ pub fn get_device(
 ) -> Result<Option<DeviceRecord>, rusqlite::Error> {
     conn.query_row(
         "SELECT device_id, signing_public_key, x25519_public_key,
-                ml_dsa_65_public_key, ml_kem_768_public_key,
+                ml_dsa_65_public_key, ml_kem_768_public_key, x_wing_public_key,
                 epoch, status, last_seen_at,
                 ml_dsa_key_generation, prev_ml_dsa_65_public_key,
                 prev_ml_dsa_65_expires_at
@@ -1159,12 +1174,13 @@ pub fn get_device(
                 x25519_public_key: row.get(2)?,
                 ml_dsa_65_public_key: row.get(3)?,
                 ml_kem_768_public_key: row.get(4)?,
-                epoch: row.get(5)?,
-                status: row.get(6)?,
-                last_seen_at: row.get(7)?,
-                ml_dsa_key_generation: row.get(8)?,
-                prev_ml_dsa_65_public_key: row.get(9)?,
-                prev_ml_dsa_65_expires_at: row.get(10)?,
+                x_wing_public_key: row.get(5)?,
+                epoch: row.get(6)?,
+                status: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                ml_dsa_key_generation: row.get(9)?,
+                prev_ml_dsa_65_public_key: row.get(10)?,
+                prev_ml_dsa_65_expires_at: row.get(11)?,
             })
         },
     )
@@ -1177,7 +1193,7 @@ pub fn list_devices(
 ) -> Result<Vec<DeviceListEntry>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT device_id, signing_public_key, x25519_public_key,
-                ml_dsa_65_public_key, ml_kem_768_public_key,
+                ml_dsa_65_public_key, ml_kem_768_public_key, x_wing_public_key,
                 epoch, status, ml_dsa_key_generation
          FROM devices
          WHERE sync_id = ?1
@@ -1190,9 +1206,10 @@ pub fn list_devices(
             x25519_public_key: row.get(2)?,
             ml_dsa_65_public_key: row.get(3)?,
             ml_kem_768_public_key: row.get(4)?,
-            epoch: row.get(5)?,
-            status: row.get(6)?,
-            ml_dsa_key_generation: row.get(7)?,
+            x_wing_public_key: row.get(5)?,
+            epoch: row.get(6)?,
+            status: row.get(7)?,
+            ml_dsa_key_generation: row.get(8)?,
         })
     })?;
     rows.collect()
@@ -3881,7 +3898,7 @@ mod tests {
             let ml_dsa_pk = vec![0xAA; 1952];
             let ml_kem_pk = vec![0xBB; 1184];
             register_device_with_pq(
-                conn, "sg1", "dev1", &[1; 32], &[2; 32], &ml_dsa_pk, &ml_kem_pk, 0,
+                conn, "sg1", "dev1", &[1; 32], &[2; 32], &ml_dsa_pk, &ml_kem_pk, &[], 0,
             )?;
 
             // Rotate the key so the old key lands in the grace slot.
