@@ -120,7 +120,7 @@ impl EpochManager {
             .map_err(|e| CoreError::Storage(format!("failed to list devices: {e}")))?;
 
         // 3. For each active surviving device, wrap the epoch key via X-Wing KEM
-        let mut wrapped_keys: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut wrapped_keys: HashMap<String, Vec<u8>> = HashMap::with_capacity(devices.len());
         for device in &devices {
             if device.status != "active" {
                 continue;
@@ -136,18 +136,21 @@ impl EpochManager {
                 continue;
             }
 
-            // Parse the recipient's encapsulation key
-            let ek = prism_sync_crypto::pq::hybrid_kem::XWingKem::encapsulation_key_from_bytes(
+            // Parse the recipient's encapsulation key — skip on failure so one
+            // corrupt device doesn't abort the entire rotation for everyone.
+            let ek = match prism_sync_crypto::pq::hybrid_kem::XWingKem::encapsulation_key_from_bytes(
                 &device.x_wing_public_key,
-            )
-            .map_err(|e| {
-                CoreError::Crypto(prism_sync_crypto::CryptoError::InvalidKeyMaterial(
-                    format!(
-                        "invalid x_wing_public_key for device {}: {e}",
-                        device.device_id
-                    ),
-                ))
-            })?;
+            ) {
+                Ok(ek) => ek,
+                Err(e) => {
+                    tracing::warn!(
+                        device_id = %device.device_id,
+                        error = %e,
+                        "prepare_wrapped_keys: skipping device with invalid x_wing_public_key"
+                    );
+                    continue;
+                }
+            };
 
             // Encapsulate: generate ciphertext + shared secret
             let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
@@ -582,6 +585,93 @@ mod tests {
         let decrypted =
             prism_sync_crypto::aead::xchacha_decrypt(&unwrap_key, encrypted_epoch_key).unwrap();
         assert_eq!(decrypted.len(), 32);
+
+        // Verify decrypted epoch key matches what was stored in the hierarchy
+        let stored_key = kh.epoch_key(2).unwrap();
+        assert_eq!(decrypted, stored_key, "decrypted key should match stored epoch key");
+    }
+
+    #[tokio::test]
+    async fn handle_rotation_rejects_corrupted_ciphertext() {
+        // Valid version byte, valid length, but zeroed ciphertext — decapsulation fails
+        let mut bad_artifact = vec![ARTIFACT_VERSION];
+        bad_artifact.extend_from_slice(&[0u8; XWING_CT_LEN]);
+        bad_artifact.extend_from_slice(&[0u8; 72]); // fake encrypted epoch key
+
+        let relay = MockRelay::new_with_artifact(Some(bad_artifact));
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let secret = DeviceSecret::generate();
+        let xwing = secret.xwing_keypair("dev-a").unwrap();
+
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing).await;
+        assert!(result.is_err(), "corrupted ciphertext should fail decapsulation");
+    }
+
+    #[tokio::test]
+    async fn handle_rotation_rejects_wrong_decapsulation_key() {
+        // Build artifact for device B, try to decapsulate with device C's key
+        let secret_b = DeviceSecret::generate();
+        let xwing_b = secret_b.xwing_keypair("device-b").unwrap();
+        let secret_c = DeviceSecret::generate();
+        let xwing_c = secret_c.xwing_keypair("device-c").unwrap();
+
+        let epoch_key = vec![0xCDu8; 32];
+        let artifact = build_v2_artifact(&xwing_b, &epoch_key);
+
+        let relay = MockRelay::new_with_artifact(Some(artifact));
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        // Device C tries to use device B's artifact
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "device-c", &xwing_c).await;
+        assert!(result.is_err(), "wrong DK should fail to recover epoch key");
+    }
+
+    #[tokio::test]
+    async fn prepare_wrapped_keys_skips_invalid_ek() {
+        // One device has valid X-Wing EK, another has garbage (non-empty, wrong length)
+        let valid_secret = DeviceSecret::generate();
+        let valid_xwing = valid_secret.xwing_keypair("valid-dev").unwrap();
+
+        let devices = vec![
+            DeviceInfo {
+                device_id: "valid-dev".to_string(),
+                epoch: 1,
+                status: "active".to_string(),
+                ed25519_public_key: vec![],
+                x25519_public_key: vec![],
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
+                x_wing_public_key: valid_xwing.encapsulation_key_bytes(),
+                permission: None,
+                ml_dsa_key_generation: 0,
+            },
+            DeviceInfo {
+                device_id: "bad-dev".to_string(),
+                epoch: 1,
+                status: "active".to_string(),
+                ed25519_public_key: vec![],
+                x25519_public_key: vec![],
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
+                x_wing_public_key: vec![0u8; 100], // wrong length
+                permission: None,
+                ml_dsa_key_generation: 0,
+            },
+        ];
+        let relay = MockRelay::new_with_devices(devices);
+
+        let (_, wrapped_keys) = EpochManager::prepare_wrapped_keys(&relay, None)
+            .await
+            .expect("should succeed despite one bad device");
+
+        // Valid device gets a key, bad device is skipped
+        assert!(wrapped_keys.contains_key("valid-dev"), "valid device should get wrapped key");
+        assert!(!wrapped_keys.contains_key("bad-dev"), "bad device should be skipped");
     }
 
     #[tokio::test]
