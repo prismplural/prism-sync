@@ -74,7 +74,7 @@ fn build_signed_registry_blob(
     let pq_signing_key = signer_device_secret
         .ml_dsa_65_keypair(signer_device_id)
         .unwrap();
-    let snapshot = SignedRegistrySnapshot::new(entries);
+    let snapshot = SignedRegistrySnapshot::new(entries, 1);
     snapshot.sign_hybrid(&signing_key, &pq_signing_key)
 }
 

@@ -3369,7 +3369,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             })
             .collect();
 
-        let snapshot = SignedRegistrySnapshot::new(entries);
+        let snapshot = SignedRegistrySnapshot::new(entries, new_gen as i64);
 
         // Sign with Ed25519 (unchanged) + OLD ML-DSA key (what peers have pinned)
         let ed25519_key = device_secret

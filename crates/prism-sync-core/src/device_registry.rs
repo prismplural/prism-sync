@@ -332,8 +332,8 @@ impl DeviceRegistryManager {
 
         // 3. Build signing data (same domain as relay's verification)
         let mut signing_data =
-            Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V2\x00".len() + json_bytes.len());
-        signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V2\x00");
+            Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V3\x00".len() + json_bytes.len());
+        signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V3\x00");
         signing_data.extend_from_slice(json_bytes);
 
         // 4. Try to verify against any locally known device's keys
@@ -387,8 +387,17 @@ impl DeviceRegistryManager {
             ml_dsa_key_generation: u32,
         }
 
-        let entries: Vec<RegistryEntry> = serde_json::from_slice(json_bytes)
+        // V3 format wraps entries in {"registry_version": N, "entries": [...]}
+        #[derive(serde::Deserialize)]
+        struct RegistryWrapper {
+            #[allow(dead_code)]
+            registry_version: i64,
+            entries: Vec<RegistryEntry>,
+        }
+
+        let wrapper: RegistryWrapper = serde_json::from_slice(json_bytes)
             .map_err(|e| CoreError::Engine(format!("invalid registry artifact JSON: {e}")))?;
+        let entries = wrapper.entries;
 
         // 5a. Require signer to appear and be non-revoked in their own snapshot.
         //     This catches self-contradictory snapshots and closes the revocation
