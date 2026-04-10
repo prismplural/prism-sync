@@ -714,13 +714,27 @@ impl PrismSync {
     }
 
     /// Re-derive the ML-DSA signing key after a local rotation.
-    pub fn refresh_ml_dsa_key(&mut self, new_generation: u32) {
-        if let (Some(ref device_secret), Some(ref device_id)) = (&self.device_secret, &self.device_id) {
-            if let Ok(pq_sk) = device_secret.ml_dsa_65_keypair_v(device_id, new_generation) {
-                self.device_ml_dsa_signing_key = Some(pq_sk);
-                self.ml_dsa_key_generation = Some(new_generation);
+    pub fn refresh_ml_dsa_key(&mut self, new_generation: u32) -> Result<()> {
+        // Enforce monotonicity: generation must increase
+        if let Some(current) = self.ml_dsa_key_generation {
+            if new_generation <= current {
+                return Err(CoreError::Engine(format!(
+                    "ML-DSA generation must increase: current={current}, requested={new_generation}"
+                )));
             }
         }
+        let device_secret = self.device_secret.as_ref().ok_or_else(|| {
+            CoreError::Engine("device_secret not set — call initialize first".into())
+        })?;
+        let device_id = self.device_id.as_ref().ok_or_else(|| {
+            CoreError::Engine("device_id not set — call configure_engine first".into())
+        })?;
+        let pq_sk = device_secret
+            .ml_dsa_65_keypair_v(device_id, new_generation)
+            .map_err(CoreError::Crypto)?;
+        self.device_ml_dsa_signing_key = Some(pq_sk);
+        self.ml_dsa_key_generation = Some(new_generation);
+        Ok(())
     }
 
     /// Access the configured relay URL, if any.
@@ -1034,7 +1048,7 @@ mod tests {
         );
 
         // Test refresh to generation 2
-        sync.refresh_ml_dsa_key(2);
+        sync.refresh_ml_dsa_key(2).unwrap();
         assert_eq!(
             sync.ml_dsa_key_generation(),
             Some(2),

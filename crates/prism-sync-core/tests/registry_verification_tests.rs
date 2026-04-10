@@ -802,3 +802,163 @@ async fn generation_mismatch_triggers_registry_fetch() {
         "ML-DSA public key should differ from generation-0 key"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 8: Generation mismatch — relay returns no registry (fallback to stale)
+//
+// When the relay fails to return a signed registry during a generation
+// mismatch, the resolver should fall back to the stale local key rather
+// than erroring — the caller's verification decides whether to accept.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn generation_mismatch_registry_fetch_fails_returns_stale_info() {
+    let device_id = "device-stale";
+    let device_secret = DeviceSecret::generate();
+    let ed25519_kp = device_secret.ed25519_keypair(device_id).unwrap();
+    let x25519_kp = device_secret.x25519_keypair(device_id).unwrap();
+    let ml_dsa_kp = device_secret.ml_dsa_65_keypair(device_id).unwrap();
+    let ml_kem_kp = device_secret.ml_kem_768_keypair(device_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, "other-device");
+
+    register_device_in_storage(
+        &storage,
+        device_id,
+        &ed25519_kp.public_key_bytes(),
+        &x25519_kp.public_key_bytes(),
+        &ml_dsa_kp.public_key_bytes(),
+        &ml_kem_kp.public_key_bytes(),
+        0,
+    );
+
+    // Mock relay returns None for signed registry (no artifact available)
+    let relay = Arc::new(MockRelay::new());
+    // Don't set any signed registry — relay returns Ok(None)
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Request gen 1 but relay has no registry — should fall back to local gen 0
+    let info = engine
+        .resolve_sender_keys_with_generation_hint(SYNC_ID, device_id, Some(1))
+        .await
+        .expect("should succeed with stale info when registry unavailable");
+
+    assert_eq!(
+        info.ml_dsa_key_generation, 0,
+        "should fall back to local generation 0 when registry fetch fails"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 9: Generation mismatch — registry fetched but still at old generation
+//
+// When the signed registry is fetched but still has the sender at the old
+// generation, the resolver should return the (unchanged) local key info.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn generation_mismatch_registry_still_stale_returns_local() {
+    let verifier_id = "device-verifier2";
+    let verifier_secret = DeviceSecret::generate();
+    let verifier_ed25519 = verifier_secret.ed25519_keypair(verifier_id).unwrap();
+    let verifier_x25519 = verifier_secret.x25519_keypair(verifier_id).unwrap();
+    let verifier_ml_dsa = verifier_secret.ml_dsa_65_keypair(verifier_id).unwrap();
+    let verifier_ml_kem = verifier_secret.ml_kem_768_keypair(verifier_id).unwrap();
+
+    let sender_id = "device-sender2";
+    let sender_secret = DeviceSecret::generate();
+    let sender_ed25519 = sender_secret.ed25519_keypair(sender_id).unwrap();
+    let sender_x25519 = sender_secret.x25519_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen0 = sender_secret.ml_dsa_65_keypair(sender_id).unwrap();
+    let sender_ml_kem = sender_secret.ml_kem_768_keypair(sender_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, verifier_id);
+
+    register_device_in_storage(
+        &storage,
+        verifier_id,
+        &verifier_ed25519.public_key_bytes(),
+        &verifier_x25519.public_key_bytes(),
+        &verifier_ml_dsa.public_key_bytes(),
+        &verifier_ml_kem.public_key_bytes(),
+        0,
+    );
+    register_device_in_storage(
+        &storage,
+        sender_id,
+        &sender_ed25519.public_key_bytes(),
+        &sender_x25519.public_key_bytes(),
+        &sender_ml_dsa_gen0.public_key_bytes(),
+        &sender_ml_kem.public_key_bytes(),
+        0,
+    );
+
+    // Build signed registry with sender STILL at generation 0
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: verifier_id.to_string(),
+            ed25519_public_key: verifier_ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: verifier_x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: verifier_ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: verifier_ml_kem.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: sender_id.to_string(),
+            ed25519_public_key: sender_ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: sender_x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: sender_ml_dsa_gen0.public_key_bytes(),
+            ml_kem_768_public_key: sender_ml_kem.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        },
+    ];
+
+    let signed_blob = build_signed_registry_blob(entries, &verifier_secret, verifier_id);
+
+    let relay = Arc::new(MockRelay::new());
+    relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: signed_blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Request gen 1 but registry only has gen 0
+    let info = engine
+        .resolve_sender_keys_with_generation_hint(SYNC_ID, sender_id, Some(1))
+        .await
+        .expect("should succeed with stale info when registry doesn't have expected gen");
+
+    assert_eq!(
+        info.ml_dsa_key_generation, 0,
+        "should return generation 0 when registry doesn't have expected generation"
+    );
+}

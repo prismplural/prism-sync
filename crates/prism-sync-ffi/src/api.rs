@@ -3416,7 +3416,8 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     // After successful rotation, refresh the cached ML-DSA signing key in PrismSync
     // so that subsequent hybrid batch signing uses the new key without requiring
     // a full configure_engine call.
-    inner.refresh_ml_dsa_key(new_gen);
+    inner.refresh_ml_dsa_key(new_gen)
+        .map_err(|e| format!("Failed to refresh ML-DSA signing key: {e}"))?;
 
     // 6. Return result as JSON
     let result = serde_json::json!({
