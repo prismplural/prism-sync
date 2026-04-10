@@ -174,7 +174,11 @@ impl DeviceRegistryManager {
                 } else {
                     None
                 },
-                ml_dsa_key_generation: device.ml_dsa_key_generation,
+                // Preserve the local generation counter; do not accept the relay's
+                // unverified value.  A malicious relay could inflate this field to
+                // poison the generation-hint check in resolve_sender_keys_with_generation_hint.
+                // Legitimate ML-DSA rotations arrive through verify_and_import_signed_registry.
+                ml_dsa_key_generation: existing.ml_dsa_key_generation,
             },
         };
 

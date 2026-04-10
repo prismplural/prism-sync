@@ -441,8 +441,6 @@ impl SyncEngine {
                         );
                         // Re-run Stage 2 (signed registry fetch) to try to get updated keys.
                         // If it succeeds and the generation is now sufficient, return the updated info.
-                        // If it fails, fall through and return what we have — the caller's
-                        // verification will decide whether to accept or skip.
                         if let Ok(updated) =
                             self.fetch_and_import_registry(sync_id, sender_device_id).await
                         {
@@ -450,6 +448,41 @@ impl SyncEngine {
                                 return Ok(updated);
                             }
                         }
+                        // Re-read the device record after the refresh attempt — the import may
+                        // have changed the device status (e.g., revoked it) even if the generation
+                        // did not reach the expected level.  Returning stale `info` here would
+                        // hand back an active key for a device that was just revoked.
+                        let storage = self.storage.clone();
+                        let sid = sync_id.to_string();
+                        let sender_id = sender_device_id.to_string();
+                        let refreshed_record = tokio::task::spawn_blocking(move || {
+                            storage.get_device_record(&sid, &sender_id)
+                        })
+                        .await
+                        .map_err(|e| CoreError::Storage(e.to_string()))??;
+
+                        return match refreshed_record {
+                            Some(ref r) if r.status == "active" => pk_from_record(r),
+                            Some(ref r) => {
+                                tracing::warn!(
+                                    "Device {} was revoked during registry refresh",
+                                    sender_device_id
+                                );
+                                Err(CoreError::Storage(format!(
+                                    "Device {} was revoked during registry refresh (status: {})",
+                                    sender_device_id, r.status
+                                )))
+                            }
+                            None => {
+                                // Device was removed during refresh; fall through to the
+                                // unknown-sender stages below by returning an error here so
+                                // the caller can skip or reject the batch.
+                                Err(CoreError::Storage(format!(
+                                    "Device {} disappeared during registry refresh",
+                                    sender_device_id
+                                )))
+                            }
+                        };
                     }
                 }
 
