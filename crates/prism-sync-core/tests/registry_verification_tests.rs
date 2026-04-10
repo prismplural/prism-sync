@@ -431,7 +431,7 @@ fn registry_verification_verified_import_preserves_generation() {
 
     // Import the signed registry
     let result = DeviceRegistryManager::verify_and_import_signed_registry(
-        &storage, SYNC_ID, &signed_blob,
+        &storage, SYNC_ID, &signed_blob, None,
     );
     assert!(
         result.is_ok(),
@@ -498,7 +498,7 @@ fn registry_verification_tampered_artifact_rejected() {
     signed_blob[last_idx] ^= 0xFF;
 
     let result = DeviceRegistryManager::verify_and_import_signed_registry(
-        &storage, SYNC_ID, &signed_blob,
+        &storage, SYNC_ID, &signed_blob, None,
     );
     assert!(
         result.is_err(),
@@ -1033,7 +1033,7 @@ fn revoked_signer_rejected() {
 
     // Attempt to import the signed blob — must fail because device A is revoked
     let result =
-        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob);
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob, None);
 
     assert!(
         result.is_err(),
@@ -1090,7 +1090,7 @@ fn signer_self_revoked_in_snapshot_rejected() {
     let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
 
     let result =
-        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob);
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob, None);
 
     assert!(
         result.is_err(),
@@ -1154,7 +1154,7 @@ fn signer_missing_from_own_snapshot_rejected() {
     let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
 
     let result =
-        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob);
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob, None);
 
     assert!(
         result.is_err(),
@@ -1195,26 +1195,74 @@ fn malicious_device_list_injection_rejected() {
 // ── G3: registry_version bound into signed payload ────────────────────────
 
 /// Monotonicity check: a relay that replays an older signed registry version
-/// should be rejected. This test is ignored because the monotonicity check
-/// is not yet implemented in `verify_and_import_signed_registry` — G3 only
-/// added `registry_version` to the signed payload; enforcement comes later.
-///
-/// TODO: enable when monotonicity check is added to
-/// `DeviceRegistryManager::verify_and_import_signed_registry`.
+/// should be rejected. Import at version 5, then attempt version 3 — must fail.
 #[test]
-#[ignore = "monotonicity check not yet implemented (G3 payload only; enforcement pending)"]
 fn stale_registry_version_rejected() {
-    // When implemented, this test should:
-    // 1. Import a signed registry at version 5 (persisted as last_imported_version).
-    // 2. Attempt to import a signed blob at version 3 (older).
-    // 3. Assert: returns Err containing "stale" or "registry version".
-    //
-    // The version field (`registry_version`) is already included in the V3
-    // signed JSON payload (`build_signed_registry_blob` uses
-    // `SignedRegistrySnapshot::new(entries, version)` → `canonical_json_v3`).
-    // The enforcement guard in `verify_and_import_signed_registry` is the
-    // missing piece.
-    todo!("add monotonicity enforcement to verify_and_import_signed_registry first");
+    let device_a_id = "device-a-stale";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_kp_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_kp_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_kp_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_kp_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let storage = RusqliteSyncStorage::in_memory().unwrap();
+    setup_sync_metadata(&storage, "other");
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_kp_a.public_key_bytes(),
+        &x25519_kp_a.public_key_bytes(),
+        &ml_dsa_kp_a.public_key_bytes(),
+        &ml_kem_kp_a.public_key_bytes(),
+        0,
+    );
+
+    let entries = vec![RegistrySnapshotEntry {
+        sync_id: SYNC_ID.into(),
+        device_id: device_a_id.into(),
+        ed25519_public_key: ed25519_kp_a.public_key_bytes().to_vec(),
+        x25519_public_key: x25519_kp_a.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: ml_dsa_kp_a.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_kp_a.public_key_bytes(),
+        x_wing_public_key: Vec::new(),
+        status: "active".into(),
+        ml_dsa_key_generation: 0,
+    }];
+
+    // Build a signed blob at version 5
+    let signing_key = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let pq_signing_key = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let snapshot_v5 = SignedRegistrySnapshot::new(entries.clone(), 5);
+    let blob_v5 = snapshot_v5.sign_hybrid(&signing_key, &pq_signing_key);
+
+    // Import version 5 — should succeed
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage, SYNC_ID, &blob_v5, None,
+    );
+    assert!(result.is_ok(), "version 5 import should succeed: {:?}", result.err());
+    assert_eq!(result.unwrap(), 5, "should return signed version 5");
+
+    // Build a signed blob at version 3 (stale replay)
+    let snapshot_v3 = SignedRegistrySnapshot::new(entries.clone(), 3);
+    let blob_v3 = snapshot_v3.sign_hybrid(&signing_key, &pq_signing_key);
+
+    // Import version 3 with last_imported=5 — must fail
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage, SYNC_ID, &blob_v3, Some(5),
+    );
+    assert!(result.is_err(), "stale version 3 should be rejected when 5 was already imported");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("stale"), "error should mention staleness: {err}");
+
+    // Build a signed blob at version 7 (newer) — should succeed
+    let snapshot_v7 = SignedRegistrySnapshot::new(entries, 7);
+    let blob_v7 = snapshot_v7.sign_hybrid(&signing_key, &pq_signing_key);
+
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage, SYNC_ID, &blob_v7, Some(5),
+    );
+    assert!(result.is_ok(), "newer version 7 should succeed: {:?}", result.err());
+    assert_eq!(result.unwrap(), 7, "should return signed version 7");
 }
 
 // ── G2: bootstrap fail-closed for unknown snapshot senders ───────────────

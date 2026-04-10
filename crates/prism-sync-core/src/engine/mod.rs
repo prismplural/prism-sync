@@ -552,31 +552,42 @@ impl SyncEngine {
     ) -> Result<SenderKeyInfo> {
         match self.relay.get_signed_registry().await {
             Ok(Some(response)) => {
+                // Read the last imported version for monotonicity check
+                let storage = self.storage.clone();
+                let sid = sync_id.to_string();
+                let last_version = tokio::task::spawn_blocking(move || {
+                    storage.get_sync_metadata(&sid)
+                })
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?
+                .ok()
+                .flatten()
+                .and_then(|m| m.last_imported_registry_version);
+
                 let storage = self.storage.clone();
                 let sid = sync_id.to_string();
                 let blob = response.artifact_blob.clone();
-                let version = response.registry_version;
 
                 let import_result = tokio::task::spawn_blocking(move || {
                     DeviceRegistryManager::verify_and_import_signed_registry(
-                        &*storage, &sid, &blob,
+                        &*storage, &sid, &blob, last_version,
                     )
                 })
                 .await
                 .map_err(|e| CoreError::Storage(e.to_string()))?;
 
                 match import_result {
-                    Ok(_result) => {
+                    Ok(signed_version) => {
                         tracing::info!(
-                            "Imported verified registry v{version} for device {}",
+                            "Imported verified registry v{signed_version} for device {}",
                             device_id
                         );
-                        // Store the imported version
+                        // Store the signed (verified) version — not the relay response version
                         let storage = self.storage.clone();
                         let sid = sync_id.to_string();
                         let _ = tokio::task::spawn_blocking(move || {
                             let mut tx = storage.begin_tx()?;
-                            tx.update_last_imported_registry_version(&sid, version)?;
+                            tx.update_last_imported_registry_version(&sid, signed_version)?;
                             tx.commit()
                         })
                         .await

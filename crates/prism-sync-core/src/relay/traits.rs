@@ -408,13 +408,6 @@ pub struct SignedRegistryResponse {
     pub artifact_kind: String,
 }
 
-/// Result of attempting to import a signed registry artifact.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegistryImportResult {
-    /// Registry was fetched, verified, and imported successfully.
-    VerifiedRegistry,
-}
-
 /// Transport layer for communicating with the relay server.
 ///
 /// Ships with `ServerRelay` (HTTP + WebSocket). Consumers can mock

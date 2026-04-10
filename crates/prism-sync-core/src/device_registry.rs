@@ -5,7 +5,6 @@
 //! key matches the pinned key, raising an error on mismatch (TOFU model).
 
 use crate::error::{CoreError, Result};
-use crate::relay::traits::RegistryImportResult;
 use crate::storage::{DeviceRecord, SyncStorage};
 use prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof;
 
@@ -282,12 +281,14 @@ impl DeviceRegistryManager {
     /// Parses the V3 hybrid-signed registry snapshot, verifies the signature
     /// against a locally known device's keys, and imports the device records.
     ///
-    /// Returns `VerifiedRegistry` on success, or an error if verification fails.
+    /// Returns the signed `registry_version` on success, or an error if
+    /// verification or the monotonicity check fails.
     pub fn verify_and_import_signed_registry(
         storage: &dyn SyncStorage,
         sync_id: &str,
         artifact_blob: &[u8],
-    ) -> Result<RegistryImportResult> {
+        last_imported_version: Option<i64>,
+    ) -> Result<i64> {
         use prism_sync_crypto::pq::HybridSignature;
 
         // 1. Check version byte
@@ -390,13 +391,23 @@ impl DeviceRegistryManager {
         // V3 format wraps entries in {"registry_version": N, "entries": [...]}
         #[derive(serde::Deserialize)]
         struct RegistryWrapper {
-            #[allow(dead_code)]
             registry_version: i64,
             entries: Vec<RegistryEntry>,
         }
 
         let wrapper: RegistryWrapper = serde_json::from_slice(json_bytes)
             .map_err(|e| CoreError::Engine(format!("invalid registry artifact JSON: {e}")))?;
+
+        // 4a. Monotonicity check — reject stale or replayed artifacts
+        if wrapper.registry_version <= last_imported_version.unwrap_or(-1) {
+            return Err(CoreError::Engine(format!(
+                "stale registry artifact: version {} <= last imported {}",
+                wrapper.registry_version,
+                last_imported_version.unwrap_or(-1)
+            )));
+        }
+
+        let signed_version = wrapper.registry_version;
         let entries = wrapper.entries;
 
         // 5a. Require signer to appear and be non-revoked in their own snapshot.
@@ -440,7 +451,7 @@ impl DeviceRegistryManager {
 
         Self::import_keyring(storage, sync_id, &device_records)?;
 
-        Ok(RegistryImportResult::VerifiedRegistry)
+        Ok(signed_version)
     }
 }
 
@@ -953,7 +964,7 @@ mod tests {
         blob.extend_from_slice(b"some payload that would never be parsed");
 
         let result =
-            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob);
+            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob, None);
         assert!(
             result.is_err(),
             "future registry version byte should be rejected"
@@ -995,7 +1006,7 @@ mod tests {
         blob.extend_from_slice(b"not valid json {{{{");
 
         let result =
-            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob);
+            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob, None);
         assert!(
             result.is_err(),
             "blob with invalid content should be rejected without panic"
