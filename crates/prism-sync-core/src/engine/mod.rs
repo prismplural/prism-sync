@@ -23,6 +23,16 @@ use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, SyncStorage};
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
 
+/// Key material resolved for a batch sender device.
+pub struct SenderKeyInfo {
+    /// Ed25519 public key (32 bytes).
+    pub ed25519_pk: [u8; 32],
+    /// ML-DSA-65 public key (may be empty for legacy devices).
+    pub ml_dsa_65_pk: Vec<u8>,
+    /// ML-DSA key generation (0 = initial, increases on rotation).
+    pub ml_dsa_key_generation: u32,
+}
+
 /// Result of the pull phase, bundling counts with relay-reported metadata.
 struct PullPhaseResult {
     pulled: u64,
@@ -271,11 +281,11 @@ impl SyncEngine {
             // Look up sender's Ed25519 public key from device registry.
             // If the sender device was deregistered (hard-deleted from relay),
             // its public key is gone — skip the batch and advance server_seq.
-            let sender_pk = match self
+            let sender_key_info = match self
                 .resolve_sender_public_key(sync_id, &envelope.sender_device_id)
                 .await
             {
-                Ok(pk) => pk,
+                Ok(ki) => ki,
                 Err(e) => {
                     tracing::warn!(
                         "Skipping batch from unresolvable sender {}: {e}",
@@ -296,7 +306,7 @@ impl SyncEngine {
                 }
             };
 
-            let sender_vk = ed25519_dalek::VerifyingKey::from_bytes(&sender_pk)
+            let sender_vk = ed25519_dalek::VerifyingKey::from_bytes(&sender_key_info.ed25519_pk)
                 .map_err(|e| CoreError::Engine(format!("invalid ed25519 public key: {e}")))?;
             if let Err(e) = batch_signature::verify_batch_signature(envelope, &sender_vk) {
                 tracing::warn!(
@@ -381,13 +391,13 @@ impl SyncEngine {
         })
     }
 
-    /// Resolve a sender's Ed25519 public key from the local device registry,
+    /// Resolve a sender's key material from the local device registry,
     /// refreshing from the relay if the sender is unknown.
     async fn resolve_sender_public_key(
         &self,
         sync_id: &str,
         sender_device_id: &str,
-    ) -> Result<[u8; 32]> {
+    ) -> Result<SenderKeyInfo> {
         // First try local lookup
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
@@ -1007,12 +1017,12 @@ impl SyncEngine {
                 CoreError::Serialization(format!("snapshot envelope deserialization failed: {e}"))
             })?;
 
-        // Look up the sender's public key and verify the batch signature
-        let sender_pk = self
+        // Look up the sender's key material and verify the batch signature
+        let sender_key_info = self
             .resolve_sender_public_key(sync_id, &envelope.sender_device_id)
             .await?;
 
-        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&sender_pk)
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&sender_key_info.ed25519_pk)
             .map_err(|e| CoreError::Engine(format!("invalid sender public key: {e}")))?;
 
         crate::batch_signature::verify_batch_signature(&envelope, &verifying_key)?;
@@ -1115,11 +1125,16 @@ impl SyncEngine {
     }
 }
 
-/// Extract a 32-byte Ed25519 public key from a DeviceRecord.
-fn pk_from_record(record: &DeviceRecord) -> Result<[u8; 32]> {
-    record
+/// Extract sender key material from a DeviceRecord.
+fn pk_from_record(record: &DeviceRecord) -> Result<SenderKeyInfo> {
+    let ed25519_pk: [u8; 32] = record
         .ed25519_public_key
         .clone()
         .try_into()
-        .map_err(|_| CoreError::Storage("invalid ed25519 key length".into()))
+        .map_err(|_| CoreError::Storage("invalid ed25519 key length".into()))?;
+    Ok(SenderKeyInfo {
+        ed25519_pk,
+        ml_dsa_65_pk: record.ml_dsa_65_public_key.clone(),
+        ml_dsa_key_generation: record.ml_dsa_key_generation,
+    })
 }
