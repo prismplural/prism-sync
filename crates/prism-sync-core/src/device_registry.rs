@@ -364,6 +364,8 @@ impl DeviceRegistryManager {
             #[serde(default)]
             ml_kem_768_public_key: Vec<u8>,
             status: String,
+            #[serde(default)]
+            ml_dsa_key_generation: u32,
         }
 
         let entries: Vec<RegistryEntry> = serde_json::from_slice(json_bytes)
@@ -384,7 +386,7 @@ impl DeviceRegistryManager {
                     status: e.status,
                     registered_at: now,
                     revoked_at: None,
-                    ml_dsa_key_generation: 0,
+                    ml_dsa_key_generation: e.ml_dsa_key_generation,
                 }
             })
             .collect();
