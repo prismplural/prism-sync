@@ -399,7 +399,23 @@ impl SyncEngine {
         sync_id: &str,
         sender_device_id: &str,
     ) -> Result<SenderKeyInfo> {
-        // First try local lookup
+        self.resolve_sender_keys_with_generation_hint(sync_id, sender_device_id, None)
+            .await
+    }
+
+    /// Resolve sender keys, optionally checking for ML-DSA generation freshness.
+    ///
+    /// If `expected_generation` is `Some(n)` and the locally stored generation
+    /// for this sender is less than `n`, triggers a signed registry fetch +
+    /// import before returning, so that hybrid verification can proceed with
+    /// the sender's current ML-DSA key.
+    pub(crate) async fn resolve_sender_keys_with_generation_hint(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+        expected_generation: Option<u32>,
+    ) -> Result<SenderKeyInfo> {
+        // Stage 1: local lookup
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         let sender_id = sender_device_id.to_string();
@@ -410,7 +426,34 @@ impl SyncEngine {
 
         if let Some(ref r) = record {
             if r.status == "active" {
-                return pk_from_record(r);
+                let info = pk_from_record(r)?;
+
+                // Generation-freshness check: if the caller expects a newer
+                // ML-DSA generation than we have locally, try a signed registry
+                // fetch to update the key before returning.
+                if let Some(expected) = expected_generation {
+                    if expected > info.ml_dsa_key_generation {
+                        tracing::info!(
+                            sender = %sender_device_id,
+                            local_gen = info.ml_dsa_key_generation,
+                            expected_gen = expected,
+                            "ML-DSA generation stale; fetching signed registry"
+                        );
+                        // Re-run Stage 2 (signed registry fetch) to try to get updated keys.
+                        // If it succeeds and the generation is now sufficient, return the updated info.
+                        // If it fails, fall through and return what we have — the caller's
+                        // verification will decide whether to accept or skip.
+                        if let Ok(updated) =
+                            self.fetch_and_import_registry(sync_id, sender_device_id).await
+                        {
+                            if updated.ml_dsa_key_generation >= expected {
+                                return Ok(updated);
+                            }
+                        }
+                    }
+                }
+
+                return Ok(info);
             }
             tracing::warn!("Skipping batch from revoked device {}", sender_device_id);
             return Err(CoreError::Storage(format!(
@@ -425,87 +468,22 @@ impl SyncEngine {
             sender_device_id
         );
 
-        // Step 1: Try to fetch and verify a signed registry artifact
-        let mut registry_resolved = false;
-        match self.relay.get_signed_registry().await {
-            Ok(Some(response)) => {
-                let storage = self.storage.clone();
-                let sid = sync_id.to_string();
-                let blob = response.artifact_blob.clone();
-                let version = response.registry_version;
-
-                let import_result = tokio::task::spawn_blocking(move || {
-                    DeviceRegistryManager::verify_and_import_signed_registry(
-                        &*storage, &sid, &blob,
-                    )
-                })
-                .await
-                .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-                match import_result {
-                    Ok(_result) => {
-                        tracing::info!(
-                            "Imported verified registry v{version} for sender {}",
-                            sender_device_id
-                        );
-                        // Store the imported version
-                        let storage = self.storage.clone();
-                        let sid = sync_id.to_string();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let mut tx = storage.begin_tx()?;
-                            tx.update_last_imported_registry_version(&sid, version)?;
-                            tx.commit()
-                        })
-                        .await
-                        .map_err(|e| CoreError::Storage(e.to_string()))?;
-
-                        // Retry local lookup after verified import
-                        let storage = self.storage.clone();
-                        let sid = sync_id.to_string();
-                        let sender_id = sender_device_id.to_string();
-                        let record = tokio::task::spawn_blocking(move || {
-                            storage.get_device_record(&sid, &sender_id)
-                        })
-                        .await
-                        .map_err(|e| CoreError::Storage(e.to_string()))??;
-
-                        if let Some(ref r) = record {
-                            if r.status == "active" {
-                                return pk_from_record(r);
-                            }
-                        }
-                        // Sender still not found after verified import — fall through
-                        registry_resolved = false;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Signed registry verification failed for sender {}: {e}",
-                            sender_device_id
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    "No signed registry artifact available for sender {}",
-                    sender_device_id
-                );
-            }
+        // Stage 2: Try to fetch and verify a signed registry artifact
+        match self.fetch_and_import_registry(sync_id, sender_device_id).await {
+            Ok(info) => return Ok(info),
             Err(e) => {
                 tracing::warn!(
-                    "Failed to fetch signed registry for sender {}: {e}",
+                    "Signed registry fetch/import failed for sender {}: {e}",
                     sender_device_id
                 );
             }
         }
 
-        // Step 2: Fall back to unverified list_devices (existing behavior)
-        if !registry_resolved {
-            tracing::warn!(
-                "Falling back to unverified list_devices() for sender {}",
-                sender_device_id
-            );
-        }
+        // Stage 3: Fall back to unverified list_devices (existing behavior)
+        tracing::warn!(
+            "Falling back to unverified list_devices() for sender {}",
+            sender_device_id
+        );
         let devices = self
             .relay
             .list_devices()
@@ -564,6 +542,99 @@ impl SyncEngine {
                     "Unknown device {} after registry refresh",
                     sender_device_id
                 )))
+            }
+        }
+    }
+
+    /// Fetch signed registry, verify, import, and re-lookup a specific device.
+    ///
+    /// Returns the resolved `SenderKeyInfo` for `device_id` after importing the
+    /// signed registry artifact. Errors if the registry fetch fails, verification
+    /// fails, or the device is still not found (or not active) after import.
+    async fn fetch_and_import_registry(
+        &self,
+        sync_id: &str,
+        device_id: &str,
+    ) -> Result<SenderKeyInfo> {
+        match self.relay.get_signed_registry().await {
+            Ok(Some(response)) => {
+                let storage = self.storage.clone();
+                let sid = sync_id.to_string();
+                let blob = response.artifact_blob.clone();
+                let version = response.registry_version;
+
+                let import_result = tokio::task::spawn_blocking(move || {
+                    DeviceRegistryManager::verify_and_import_signed_registry(
+                        &*storage, &sid, &blob,
+                    )
+                })
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+                match import_result {
+                    Ok(_result) => {
+                        tracing::info!(
+                            "Imported verified registry v{version} for device {}",
+                            device_id
+                        );
+                        // Store the imported version
+                        let storage = self.storage.clone();
+                        let sid = sync_id.to_string();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut tx = storage.begin_tx()?;
+                            tx.update_last_imported_registry_version(&sid, version)?;
+                            tx.commit()
+                        })
+                        .await
+                        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+                        // Retry local lookup after verified import
+                        let storage = self.storage.clone();
+                        let sid = sync_id.to_string();
+                        let dev_id = device_id.to_string();
+                        let record = tokio::task::spawn_blocking(move || {
+                            storage.get_device_record(&sid, &dev_id)
+                        })
+                        .await
+                        .map_err(|e| CoreError::Storage(e.to_string()))??;
+
+                        if let Some(ref r) = record {
+                            if r.status == "active" {
+                                return pk_from_record(r);
+                            }
+                        }
+                        // Device still not found after verified import
+                        Err(CoreError::Storage(format!(
+                            "Device {} not found in signed registry",
+                            device_id
+                        )))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Signed registry verification failed for device {}: {e}",
+                            device_id
+                        );
+                        Err(CoreError::Storage(format!(
+                            "Signed registry verification failed: {e}"
+                        )))
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "No signed registry artifact available for device {}",
+                    device_id
+                );
+                Err(CoreError::Storage(
+                    "No signed registry artifact available".to_string(),
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch signed registry for device {}: {e}",
+                    device_id
+                );
+                Err(CoreError::from_relay(e))
             }
         }
     }
