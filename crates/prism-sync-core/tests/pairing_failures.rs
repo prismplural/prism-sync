@@ -406,8 +406,9 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
         ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
         ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
+        ml_dsa_key_generation: 0,
         status: "active".into(),
-    }]);
+    }], 0);
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {
@@ -582,6 +583,7 @@ async fn join_from_approval_roundtrip() {
             x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
+            ml_dsa_key_generation: 0,
             status: "active".into(),
         },
         RegistrySnapshotEntry {
@@ -591,9 +593,10 @@ async fn join_from_approval_roundtrip() {
             x25519_public_key: exchange_key_b.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: pq_signing_key_b.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key_b.public_key_bytes(),
+            ml_dsa_key_generation: 0,
             status: "active".into(),
         },
-    ]);
+    ], 1);
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {

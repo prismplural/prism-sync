@@ -199,10 +199,19 @@ impl PairingResponse {
             &self.signed_keyring[ED25519_SIG_LEN..]
         };
 
-        let entries: Vec<RegistrySnapshotEntry> = match serde_json::from_slice(json_bytes) {
-            Ok(e) => e,
-            Err(_) => return "existing_group",
-        };
+        // Try V3 wrapper format first, then fall back to bare array (V1/V2 legacy).
+        #[derive(serde::Deserialize)]
+        struct V3Wrapper {
+            entries: Vec<RegistrySnapshotEntry>,
+        }
+        let entries: Vec<RegistrySnapshotEntry> =
+            if let Ok(w) = serde_json::from_slice::<V3Wrapper>(json_bytes) {
+                w.entries
+            } else if let Ok(e) = serde_json::from_slice::<Vec<RegistrySnapshotEntry>>(json_bytes) {
+                e
+            } else {
+                return "existing_group";
+            };
         if entries.len() == 1 && entries[0].device_id == self.inviter_device_id {
             "first_device"
         } else {
@@ -340,7 +349,9 @@ pub struct SyncGroupCredentials {
 
 /// Domain separation prefix for registry snapshot signatures.
 const REGISTRY_SNAPSHOT_DOMAIN: &[u8] = b"PRISM_SYNC_REGISTRY_V1\x00";
+#[allow(dead_code)]
 const REGISTRY_SNAPSHOT_DOMAIN_V2: &[u8] = b"PRISM_SYNC_REGISTRY_V2\x00";
+const REGISTRY_SNAPSHOT_DOMAIN_V3: &[u8] = b"PRISM_SYNC_REGISTRY_V3\x00";
 
 /// A single device entry inside a [`SignedRegistrySnapshot`].
 ///
@@ -358,6 +369,8 @@ pub struct RegistrySnapshotEntry {
     #[serde(default)]
     pub ml_kem_768_public_key: Vec<u8>,
     pub status: String,
+    #[serde(default)]
+    pub ml_dsa_key_generation: u32,
 }
 
 /// A signed, typed snapshot of the device registry.
@@ -371,12 +384,17 @@ pub struct RegistrySnapshotEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedRegistrySnapshot {
     pub entries: Vec<RegistrySnapshotEntry>,
+    /// Registry version bound into the V3 signed payload.
+    ///
+    /// For snapshots decoded from V1/V2 wire format, this defaults to `0`.
+    #[serde(default)]
+    pub registry_version: i64,
 }
 
 impl SignedRegistrySnapshot {
-    /// Build a snapshot from a list of device entries.
-    pub fn new(entries: Vec<RegistrySnapshotEntry>) -> Self {
-        Self { entries }
+    /// Build a snapshot from a list of device entries with a registry version.
+    pub fn new(entries: Vec<RegistrySnapshotEntry>, registry_version: i64) -> Self {
+        Self { entries, registry_version }
     }
 
     /// Canonical JSON encoding used for both signing and wire transport.
@@ -399,10 +417,41 @@ impl SignedRegistrySnapshot {
     }
 
     /// Build the Phase 5 hybrid signing payload: versioned domain + canonical JSON.
+    #[allow(dead_code)]
     fn signing_data_v2(&self) -> Vec<u8> {
         let json = self.canonical_json();
         let mut data = Vec::with_capacity(REGISTRY_SNAPSHOT_DOMAIN_V2.len() + json.len());
         data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V2);
+        data.extend_from_slice(&json);
+        data
+    }
+
+    /// Canonical JSON encoding for V3 wire format.
+    ///
+    /// Produces a wrapper object `{ "registry_version": i64, "entries": [...] }`
+    /// with entries sorted by `device_id` for deterministic output.
+    pub fn canonical_json_v3(&self) -> Vec<u8> {
+        let mut sorted = self.entries.clone();
+        sorted.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+
+        #[derive(serde::Serialize)]
+        struct Wrapper<'a> {
+            registry_version: i64,
+            entries: &'a [RegistrySnapshotEntry],
+        }
+
+        serde_json::to_vec(&Wrapper {
+            registry_version: self.registry_version,
+            entries: &sorted,
+        })
+        .unwrap_or_default()
+    }
+
+    /// Build the V3 signing payload: `PRISM_SYNC_REGISTRY_V3\x00 || canonical_json_v3()`.
+    fn signing_data_v3(&self) -> Vec<u8> {
+        let json = self.canonical_json_v3();
+        let mut data = Vec::with_capacity(REGISTRY_SNAPSHOT_DOMAIN_V3.len() + json.len());
+        data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V3);
         data.extend_from_slice(&json);
         data
     }
@@ -420,13 +469,17 @@ impl SignedRegistrySnapshot {
     /// Sign the snapshot with both Ed25519 and ML-DSA-65 using V3 labeled WNS.
     ///
     /// Returns the wire format:
-    /// `[0x03][HybridSignature::to_bytes()][canonical JSON]`.
+    /// `[0x03][HybridSignature::to_bytes()][canonical JSON V3]`.
+    ///
+    /// The signed payload uses the `PRISM_SYNC_REGISTRY_V3` domain and
+    /// a wrapper object `{ "registry_version": i64, "entries": [...] }` so
+    /// that the registry version is cryptographically bound to the snapshot.
     pub fn sign_hybrid(
         &self,
         signing_key: &prism_sync_crypto::DeviceSigningKey,
         pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     ) -> Vec<u8> {
-        let data = self.signing_data_v2();
+        let data = self.signing_data_v3();
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
             b"registry_snapshot",
             &data,
@@ -436,7 +489,7 @@ impl SignedRegistrySnapshot {
             ed25519_sig: signing_key.sign(&m_prime),
             ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
         };
-        let json = self.canonical_json();
+        let json = self.canonical_json_v3();
         let mut out = Vec::with_capacity(1 + hybrid_sig.to_bytes().len() + json.len());
         out.push(HYBRID_SIGNATURE_VERSION_V3);
         out.extend_from_slice(&hybrid_sig.to_bytes());
@@ -470,12 +523,14 @@ impl SignedRegistrySnapshot {
         let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
             .map_err(|e| format!("registry snapshot JSON invalid: {e}"))?;
 
-        Ok(Self { entries })
+        Ok(Self { entries, registry_version: 0 })
     }
 
     /// Verify and decode a hybrid-signed snapshot from its wire format.
     ///
-    /// Production decoding accepts only the Phase 6 V3 labeled-WNS wire format.
+    /// Production decoding accepts only the Phase 6 V3 labeled-WNS wire format
+    /// with the `PRISM_SYNC_REGISTRY_V3` signing domain and a wrapper JSON
+    /// object `{ "registry_version": i64, "entries": [...] }`.
     pub fn verify_and_decode_hybrid(
         signed_bytes: &[u8],
         expected_ed25519_pk: &[u8; 32],
@@ -510,8 +565,8 @@ impl SignedRegistrySnapshot {
         let json_bytes = &remaining[signature_len..];
 
         let mut signing_data =
-            Vec::with_capacity(REGISTRY_SNAPSHOT_DOMAIN_V2.len() + json_bytes.len());
-        signing_data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V2);
+            Vec::with_capacity(REGISTRY_SNAPSHOT_DOMAIN_V3.len() + json_bytes.len());
+        signing_data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V3);
         signing_data.extend_from_slice(json_bytes);
 
         signature
@@ -523,10 +578,19 @@ impl SignedRegistrySnapshot {
             )
             .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
 
-        let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            registry_version: i64,
+            entries: Vec<RegistrySnapshotEntry>,
+        }
+
+        let wrapper: Wrapper = serde_json::from_slice(json_bytes)
             .map_err(|e| format!("registry snapshot JSON invalid: {e}"))?;
 
-        Ok(Self { entries })
+        Ok(Self {
+            entries: wrapper.entries,
+            registry_version: wrapper.registry_version,
+        })
     }
 
     /// Convert snapshot entries to [`crate::storage::DeviceRecord`]s for import.
@@ -543,6 +607,7 @@ impl SignedRegistrySnapshot {
                 status: e.status.clone(),
                 registered_at: chrono::Utc::now(),
                 revoked_at: None,
+                ml_dsa_key_generation: e.ml_dsa_key_generation,
             })
             .collect()
     }
@@ -631,7 +696,8 @@ mod tests {
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
-        }]);
+            ml_dsa_key_generation: 0,
+        }], 0);
         let mut resp = sample_response();
         resp.inviter_device_id = "device-001".into();
         resp.signed_keyring = snapshot.sign(&key);
@@ -650,6 +716,7 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "sync-1".into(),
@@ -659,8 +726,9 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
-        ]);
+        ], 0);
         let mut resp = sample_response();
         resp.inviter_device_id = "device-001".into();
         resp.signed_keyring = snapshot.sign(&key);
@@ -678,7 +746,8 @@ mod tests {
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
-        }]);
+            ml_dsa_key_generation: 0,
+        }], 0);
         let mut resp = sample_response();
         resp.inviter_device_id = "device-001".into();
         resp.signed_keyring = snapshot.sign(&key);
@@ -718,6 +787,7 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "sync-1".into(),
@@ -727,8 +797,9 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
-        ])
+        ], 0)
     }
 
     #[test]
@@ -773,6 +844,7 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "s".into(),
@@ -782,8 +854,9 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
-        ]);
+        ], 0);
         let snapshot_ba = SignedRegistrySnapshot::new(vec![
             RegistrySnapshotEntry {
                 sync_id: "s".into(),
@@ -793,6 +866,7 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
             RegistrySnapshotEntry {
                 sync_id: "s".into(),
@@ -802,8 +876,9 @@ mod tests {
                 ml_dsa_65_public_key: Vec::new(),
                 ml_kem_768_public_key: Vec::new(),
                 status: "active".into(),
+                ml_dsa_key_generation: 0,
             },
-        ]);
+        ], 0);
         assert_eq!(snapshot_ab.canonical_json(), snapshot_ba.canonical_json());
     }
 
@@ -885,6 +960,7 @@ mod tests {
             ml_dsa_65_public_key: Vec::new(),
             ml_kem_768_public_key: Vec::new(),
             status: "active".into(),
+            ml_dsa_key_generation: 0,
         };
         let json = serde_json::to_vec(&entry).unwrap();
         let decoded: RegistrySnapshotEntry = serde_json::from_slice(&json).unwrap();

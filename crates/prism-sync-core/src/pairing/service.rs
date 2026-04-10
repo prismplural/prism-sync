@@ -166,6 +166,7 @@ impl PairingService {
         let signed_invitation_hex = hex::encode(&invitation_wire);
 
         // 7. Build signed registry snapshot (typed, verifiable device records)
+        // registry_version 0 is used for first-device bootstrap (no relay version yet).
         let registry_snapshot = SignedRegistrySnapshot::new(vec![RegistrySnapshotEntry {
             sync_id: sync_id.clone(),
             device_id: device_id.clone(),
@@ -175,7 +176,7 @@ impl PairingService {
             ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
             status: "active".into(),
             ml_dsa_key_generation: 0,
-        }]);
+        }], 0);
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
         // 8. Build the first-device pairing response.
@@ -734,7 +735,9 @@ impl PairingService {
             ml_dsa_key_generation: 0,
         });
 
-        let registry_snapshot = SignedRegistrySnapshot::new(snapshot_entries);
+        // registry_version 0 is a placeholder; relay-tracked versioning will be
+        // bound into the snapshot in a future protocol update.
+        let registry_snapshot = SignedRegistrySnapshot::new(snapshot_entries, 0);
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
         // V3 hybrid registry approval signature (labeled WNS)
@@ -2400,7 +2403,7 @@ mod tests {
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             },
-        ]);
+        ], 1);
         let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);
         let approval_data =
             build_registry_approval_signing_data_v2("sync-approved", &inviter_device_id, &signed_keyring);
@@ -2544,7 +2547,7 @@ mod tests {
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             },
-        ]);
+        ], 1);
         let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);
         let approval_data =
             build_registry_approval_signing_data_v2("sync-approved", &inviter_device_id, &signed_keyring);
