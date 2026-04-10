@@ -617,3 +617,188 @@ async fn registry_verification_fallback_when_no_artifact() {
         Some(SyncValue::String("Fallback data".to_string()))
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 6: SenderKeyInfo includes ML-DSA keys
+//
+// Verify that resolve_sender_keys_with_generation_hint returns the correct
+// ML-DSA public key and generation from the local device registry.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn sender_key_info_includes_ml_dsa_keys() {
+    let device_id = "device-aaa";
+    let device_secret = DeviceSecret::generate();
+    let ed25519_kp = device_secret.ed25519_keypair(device_id).unwrap();
+    let x25519_kp = device_secret.x25519_keypair(device_id).unwrap();
+    let ml_dsa_kp = device_secret.ml_dsa_65_keypair(device_id).unwrap();
+    let ml_kem_kp = device_secret.ml_kem_768_keypair(device_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, device_id);
+
+    // Insert device record with ML-DSA key at generation 0
+    register_device_in_storage(
+        &storage,
+        device_id,
+        &ed25519_kp.public_key_bytes(),
+        &x25519_kp.public_key_bytes(),
+        &ml_dsa_kp.public_key_bytes(),
+        &ml_kem_kp.public_key_bytes(),
+        0,
+    );
+
+    let relay = Arc::new(MockRelay::new());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let info = engine
+        .resolve_sender_keys_with_generation_hint(SYNC_ID, device_id, None)
+        .await
+        .expect("resolve_sender_keys_with_generation_hint should succeed");
+
+    assert_eq!(
+        info.ed25519_pk,
+        ed25519_kp.public_key_bytes(),
+        "Ed25519 public key should match"
+    );
+    assert_eq!(
+        info.ml_dsa_65_pk,
+        ml_dsa_kp.public_key_bytes(),
+        "ML-DSA-65 public key should match"
+    );
+    assert_eq!(
+        info.ml_dsa_key_generation, 0,
+        "ML-DSA key generation should be 0"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 7: Generation mismatch triggers registry fetch
+//
+// When the expected ML-DSA generation is higher than what is stored locally,
+// resolve_sender_keys_with_generation_hint should fetch the signed registry
+// and import the updated key.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn generation_mismatch_triggers_registry_fetch() {
+    // --- Verifier device ---
+    let verifier_id = "device-verifier";
+    let verifier_secret = DeviceSecret::generate();
+    let verifier_ed25519 = verifier_secret.ed25519_keypair(verifier_id).unwrap();
+    let verifier_x25519 = verifier_secret.x25519_keypair(verifier_id).unwrap();
+    let verifier_ml_dsa = verifier_secret.ml_dsa_65_keypair(verifier_id).unwrap();
+    let verifier_ml_kem = verifier_secret.ml_kem_768_keypair(verifier_id).unwrap();
+
+    // --- Sender device ---
+    let sender_id = "device-sender";
+    let sender_secret = DeviceSecret::generate();
+    let sender_ed25519 = sender_secret.ed25519_keypair(sender_id).unwrap();
+    let sender_x25519 = sender_secret.x25519_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen0 = sender_secret.ml_dsa_65_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen1 = sender_secret.ml_dsa_65_keypair_v(sender_id, 1).unwrap();
+    let sender_ml_kem = sender_secret.ml_kem_768_keypair(sender_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, verifier_id);
+
+    // Register verifier in local storage
+    register_device_in_storage(
+        &storage,
+        verifier_id,
+        &verifier_ed25519.public_key_bytes(),
+        &verifier_x25519.public_key_bytes(),
+        &verifier_ml_dsa.public_key_bytes(),
+        &verifier_ml_kem.public_key_bytes(),
+        0,
+    );
+
+    // Insert sender into verifier's local storage at generation 0
+    register_device_in_storage(
+        &storage,
+        sender_id,
+        &sender_ed25519.public_key_bytes(),
+        &sender_x25519.public_key_bytes(),
+        &sender_ml_dsa_gen0.public_key_bytes(),
+        &sender_ml_kem.public_key_bytes(),
+        0,
+    );
+
+    // Build a signed registry snapshot with sender at generation 1
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: verifier_id.to_string(),
+            ed25519_public_key: verifier_ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: verifier_x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: verifier_ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: verifier_ml_kem.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: sender_id.to_string(),
+            ed25519_public_key: sender_ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: sender_x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: sender_ml_dsa_gen1.public_key_bytes(),
+            ml_kem_768_public_key: sender_ml_kem.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 1,
+        },
+    ];
+
+    // Sign with verifier's keys (any known device can sign the registry)
+    let signed_blob = build_signed_registry_blob(entries, &verifier_secret, verifier_id);
+
+    let relay = Arc::new(MockRelay::new());
+    relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: signed_blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Request resolution with expected generation 1 (local has 0)
+    let info = engine
+        .resolve_sender_keys_with_generation_hint(SYNC_ID, sender_id, Some(1))
+        .await
+        .expect("resolve should succeed after registry fetch");
+
+    assert_eq!(
+        info.ml_dsa_key_generation, 1,
+        "ML-DSA generation should be updated to 1"
+    );
+    assert_eq!(
+        info.ml_dsa_65_pk,
+        sender_ml_dsa_gen1.public_key_bytes(),
+        "ML-DSA public key should be the generation-1 key"
+    );
+    // Verify it's NOT the generation-0 key
+    assert_ne!(
+        info.ml_dsa_65_pk,
+        sender_ml_dsa_gen0.public_key_bytes(),
+        "ML-DSA public key should differ from generation-0 key"
+    );
+}

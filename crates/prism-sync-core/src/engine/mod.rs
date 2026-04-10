@@ -409,7 +409,7 @@ impl SyncEngine {
     /// for this sender is less than `n`, triggers a signed registry fetch +
     /// import before returning, so that hybrid verification can proceed with
     /// the sender's current ML-DSA key.
-    pub(crate) async fn resolve_sender_keys_with_generation_hint(
+    pub async fn resolve_sender_keys_with_generation_hint(
         &self,
         sync_id: &str,
         sender_device_id: &str,

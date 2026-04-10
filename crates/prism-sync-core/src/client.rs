@@ -1005,4 +1005,40 @@ mod tests {
             "expected 'sync not configured' error"
         );
     }
+
+    #[test]
+    fn configure_engine_derives_ml_dsa_key() {
+        let mut sync = make_sync();
+
+        // Initialize with a password so a DeviceSecret is generated
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        // Configure engine with ML-DSA generation 1
+        sync.configure_engine(
+            Arc::new(NoopRelay),
+            "sync-1".to_string(),
+            "a1b2c3d4e5f6".to_string(),
+            1,
+            1, // ml_dsa_key_generation
+        );
+
+        // Verify ML-DSA signing key was derived
+        assert!(
+            sync.ml_dsa_signing_key().is_some(),
+            "ML-DSA signing key should be derived after configure_engine"
+        );
+        assert_eq!(
+            sync.ml_dsa_key_generation(),
+            Some(1),
+            "ML-DSA key generation should be 1"
+        );
+
+        // Test refresh to generation 2
+        sync.refresh_ml_dsa_key(2);
+        assert_eq!(
+            sync.ml_dsa_key_generation(),
+            Some(2),
+            "ML-DSA key generation should be updated to 2 after refresh"
+        );
+    }
 }
