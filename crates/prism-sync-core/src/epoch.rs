@@ -60,8 +60,7 @@ impl EpochManager {
                 format!(
                     "unsupported rekey artifact version: {}",
                     artifact.first().copied().unwrap_or(0)
-                )
-                .into(),
+                ),
             )));
         }
 
@@ -72,8 +71,7 @@ impl EpochManager {
                     "rekey artifact too short: {} bytes (minimum {})",
                     artifact.len(),
                     MIN_ARTIFACT_LEN
-                )
-                .into(),
+                ),
             )));
         }
 
@@ -147,8 +145,7 @@ impl EpochManager {
                     format!(
                         "invalid x_wing_public_key for device {}: {e}",
                         device.device_id
-                    )
-                    .into(),
+                    ),
                 ))
             })?;
 

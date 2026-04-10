@@ -2161,6 +2161,7 @@ async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
             x25519_public_key: original_x25519_pk.to_vec(),
             ml_dsa_65_public_key: test_keys.ml_dsa_pk.clone(),
             ml_kem_768_public_key: test_keys.ml_kem_pk.clone(),
+            x_wing_public_key: Vec::new(),
             ml_dsa_key_generation: 0,
             status: "active".into(),
         }],
