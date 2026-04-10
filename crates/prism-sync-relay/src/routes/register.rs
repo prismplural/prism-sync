@@ -183,6 +183,8 @@ struct RegistrySnapshotEntry {
     #[serde(default)]
     ml_kem_768_public_key: Vec<u8>,
     status: String,
+    #[serde(default)]
+    ml_dsa_key_generation: i64,
 }
 
 #[derive(Serialize)]
@@ -914,6 +916,7 @@ fn current_registry_entries(
                 ml_dsa_65_public_key: device.ml_dsa_65_public_key,
                 ml_kem_768_public_key: device.ml_kem_768_public_key,
                 status: normalize_registry_status(&device.status)?.to_string(),
+                ml_dsa_key_generation: device.ml_dsa_key_generation,
             })
         })
         .collect()
