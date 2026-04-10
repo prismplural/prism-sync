@@ -919,7 +919,7 @@ fn current_registry_entries(
         .collect()
 }
 
-fn sync_registry_state_with_current_devices(
+pub(crate) fn sync_registry_state_with_current_devices(
     conn: &rusqlite::Connection,
     sync_id: &str,
     artifact_kind: Option<&str>,
