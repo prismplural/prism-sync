@@ -881,8 +881,8 @@ fn verify_registry_snapshot_hybrid(
     let json_bytes = &remaining[signature_len..];
 
     let mut signing_data =
-        Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V2\x00".len() + json_bytes.len());
-    signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V2\x00");
+        Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V3\x00".len() + json_bytes.len());
+    signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V3\x00");
     signing_data.extend_from_slice(json_bytes);
 
     // Only V3 is accepted (V2 sunset)
@@ -898,9 +898,14 @@ fn verify_registry_snapshot_hybrid(
         )
         .map_err(|_| AppError::Unauthorized)?;
 
-    let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
+    // V3 wire format uses a wrapper object: { "registry_version": i64, "entries": [...] }
+    #[derive(serde::Deserialize)]
+    struct RegistryWrapper {
+        entries: Vec<RegistrySnapshotEntry>,
+    }
+    let wrapper: RegistryWrapper = serde_json::from_slice(json_bytes)
         .map_err(|_| AppError::BadRequest("Invalid signed_registry_snapshot JSON"))?;
-    Ok(entries)
+    Ok(wrapper.entries)
 }
 
 fn snapshot_entries_by_device(

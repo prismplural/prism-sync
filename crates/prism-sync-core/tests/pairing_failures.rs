@@ -409,7 +409,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         x_wing_public_key: Vec::new(),
         ml_dsa_key_generation: 0,
         status: "active".into(),
-    }]);
+    }], 0);
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {
@@ -599,7 +599,7 @@ async fn join_from_approval_roundtrip() {
             ml_dsa_key_generation: 0,
             status: "active".into(),
         },
-    ]);
+    ], 1);
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {

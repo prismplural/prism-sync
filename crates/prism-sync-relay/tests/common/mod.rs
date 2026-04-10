@@ -495,7 +495,7 @@ pub fn build_signed_registry_snapshot(
     entries: Vec<RegistrySnapshotEntry>,
     signing_key: &SigningKey,
 ) -> Vec<u8> {
-    let snapshot = SignedRegistrySnapshot::new(entries);
+    let snapshot = SignedRegistrySnapshot::new(entries, 0);
     let canonical_json = snapshot.canonical_json();
 
     let mut signing_data =
@@ -516,13 +516,23 @@ pub fn build_signed_registry_snapshot_hybrid(
     ed25519_key: &SigningKey,
     ml_dsa_key: &prism_sync_crypto::DevicePqSigningKey,
 ) -> Vec<u8> {
-    let snapshot = SignedRegistrySnapshot::new(entries);
-    let canonical_json = snapshot.canonical_json();
+    build_signed_registry_snapshot_hybrid_versioned(entries, ed25519_key, ml_dsa_key, 1)
+}
+
+/// Build a V3 hybrid signed registry snapshot with an explicit registry version.
+pub fn build_signed_registry_snapshot_hybrid_versioned(
+    entries: Vec<RegistrySnapshotEntry>,
+    ed25519_key: &SigningKey,
+    ml_dsa_key: &prism_sync_crypto::DevicePqSigningKey,
+    registry_version: i64,
+) -> Vec<u8> {
+    let snapshot = SignedRegistrySnapshot::new(entries, registry_version);
+    let canonical_json_v3 = snapshot.canonical_json_v3();
 
     let mut signing_data =
-        Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V2\x00".len() + canonical_json.len());
-    signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V2\x00");
-    signing_data.extend_from_slice(&canonical_json);
+        Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V3\x00".len() + canonical_json_v3.len());
+    signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V3\x00");
+    signing_data.extend_from_slice(&canonical_json_v3);
 
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
         b"registry_snapshot",
@@ -534,10 +544,10 @@ pub fn build_signed_registry_snapshot_hybrid(
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
     };
     let sig_bytes = hybrid_sig.to_bytes();
-    let mut wire = Vec::with_capacity(1 + sig_bytes.len() + canonical_json.len());
+    let mut wire = Vec::with_capacity(1 + sig_bytes.len() + canonical_json_v3.len());
     wire.push(0x03);
     wire.extend_from_slice(&sig_bytes);
-    wire.extend_from_slice(&canonical_json);
+    wire.extend_from_slice(&canonical_json_v3);
     wire
 }
 
