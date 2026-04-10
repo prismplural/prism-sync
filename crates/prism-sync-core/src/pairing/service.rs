@@ -662,9 +662,6 @@ impl PairingService {
         let exchange_key = device_secret
             .x25519_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
-        let pq_signing_key = device_secret
-            .ml_dsa_65_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
         let pq_kem_key = device_secret
             .ml_kem_768_keypair(&device_id)
             .map_err(CoreError::Crypto)?;
@@ -699,6 +696,17 @@ impl PairingService {
             .map_err(|e| CoreError::from_relay_with_context(Some("listing devices"), e))?;
         devices.retain(|device| device.status == "active");
 
+        let current_ml_dsa_generation = devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .map(|device| device.ml_dsa_key_generation)
+            .ok_or_else(|| {
+                CoreError::Engine("current device missing from active relay device list".into())
+            })?;
+        let pq_signing_key = device_secret
+            .ml_dsa_65_keypair_v(&device_id, current_ml_dsa_generation)
+            .map_err(CoreError::Crypto)?;
+
         let mut snapshot_entries: Vec<RegistrySnapshotEntry> = devices
             .into_iter()
             .filter(|device| device.device_id != device_id)
@@ -721,7 +729,7 @@ impl PairingService {
             ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
             ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
             status: "active".into(),
-            ml_dsa_key_generation: 0,
+            ml_dsa_key_generation: current_ml_dsa_generation,
         });
         snapshot_entries.push(RegistrySnapshotEntry {
             sync_id: sync_id.clone(),
@@ -1482,6 +1490,7 @@ mod tests {
 
         let device_secret = DeviceSecret::generate();
         let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
         let mnemonic = mnemonic::generate();
         let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
         let mut key_hierarchy = KeyHierarchy::new();
@@ -1489,6 +1498,9 @@ mod tests {
 
         let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
         let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key = device_secret
+            .ml_dsa_65_keypair_v(&device_id, current_generation)
+            .unwrap();
 
         let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
             device_id: device_id.clone(),
@@ -1496,10 +1508,10 @@ mod tests {
             status: "active".to_string(),
             ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
             x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
             ml_kem_768_public_key: Vec::new(),
             permission: None,
-            ml_dsa_key_generation: 0,
+            ml_dsa_key_generation: current_generation,
         }]));
 
         let initiator_store = Arc::new(MemStore::default());
@@ -1614,6 +1626,24 @@ mod tests {
             let (next_epoch, wrapped_keys) = state.rekey_posts.as_ref().unwrap();
             assert!(*next_epoch >= 1);
             assert!(!wrapped_keys.is_empty());
+
+            let approval = register_req
+                .registry_approval
+                .as_ref()
+                .expect("registry approval present");
+            let inviter_pk: [u8; 32] = inviter_signing_key.public_key_bytes();
+            let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+                &approval.signed_registry_snapshot,
+                &inviter_pk,
+                &inviter_pq_signing_key.public_key_bytes(),
+            )
+            .unwrap();
+            let current_entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.device_id == device_id)
+                .expect("current device entry should be present");
+            assert_eq!(current_entry.ml_dsa_key_generation, current_generation);
         }
 
         let err = mailbox

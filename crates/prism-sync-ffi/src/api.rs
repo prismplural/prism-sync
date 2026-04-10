@@ -23,7 +23,7 @@ use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::SyncRelay as _;
 use prism_sync_core::schema::{SyncSchema, SyncValue};
-use prism_sync_core::storage::RusqliteSyncStorage;
+use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
     background_runtime, spawn_notification_handler, DeviceRegistryManager,
@@ -653,6 +653,7 @@ fn build_sharing_relay(
     device_id: String,
     session_token: String,
     device_secret_bytes: Vec<u8>,
+    ml_dsa_key_generation: u32,
 ) -> Result<Arc<ServerSharingRelay>, String> {
     let device_secret = DeviceSecret::from_bytes(device_secret_bytes)
         .map_err(|e| format!("Invalid device secret: {e}"))?;
@@ -661,7 +662,7 @@ fn build_sharing_relay(
         .map_err(|e| format!("Failed to derive sharing signing key: {e}"))?
         .into_signing_key();
     let ml_dsa_signing_key = device_secret
-        .ml_dsa_65_keypair(&device_id)
+        .ml_dsa_65_keypair_v(&device_id, ml_dsa_key_generation)
         .map_err(|e| format!("Failed to derive sharing ML-DSA signing key: {e}"))?;
     let relay = ServerSharingRelay::new(
         relay_url,
@@ -677,6 +678,7 @@ fn build_sharing_relay(
 
 async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandleContext, String> {
     let (
+        storage,
         secure_store,
         fallback_relay_url,
         fallback_sync_id,
@@ -686,6 +688,7 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
     ) = {
         let inner = handle.inner.lock().await;
         (
+            inner.storage().clone(),
             inner.secure_store().clone(),
             inner.relay_url().map(str::to_string),
             inner.sync_service().sync_id().map(str::to_string),
@@ -714,6 +717,8 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
         .map_err(|e| e.to_string())?
         .or(fallback_secret)
         .ok_or_else(|| "device_secret not configured".to_string())?;
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage.clone(), sync_id.clone(), device_id.clone()).await?;
 
     Ok(SharingHandleContext {
         relay: build_sharing_relay(
@@ -722,11 +727,29 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
             device_id.clone(),
             session_token,
             device_secret_bytes,
+            ml_dsa_key_generation,
         )?,
         secure_store,
         dek,
         device_id,
     })
+}
+
+async fn load_device_ml_dsa_generation(
+    storage: Arc<dyn SyncStorage>,
+    sync_id: String,
+    device_id: String,
+) -> Result<u32, String> {
+    let lookup_device_id = device_id.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        storage.get_device_record(&sync_id, &lookup_device_id)
+    })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("device {device_id} not in local registry"))?;
+
+    Ok(record.ml_dsa_key_generation)
 }
 
 async fn enforce_handle_signature_version_floor(handle: &PrismSyncHandle) -> Result<(), String> {
@@ -1073,6 +1096,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .map(|b| String::from_utf8(b).unwrap_or_default())
         .unwrap_or_default();
+    let storage = inner.storage().clone();
 
     // Read authoritative epoch from sync_metadata (storage), falling back
     // to secure_store cache, then 0 for brand-new groups.
@@ -1110,6 +1134,8 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         .secure_store()
         .get("device_secret")
         .map_err(|e| e.to_string())?;
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
 
     // Construct relay
     let relay = build_relay(
@@ -1118,6 +1144,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         &device_id,
         &session_token,
         device_secret,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -1655,6 +1682,7 @@ fn build_relay(
     device_id: &str,
     session_token: &str,
     device_secret: Option<Vec<u8>>,
+    ml_dsa_key_generation: u32,
     allow_insecure: bool,
     registration_token: Option<String>,
 ) -> Result<Arc<ServerRelay>, String> {
@@ -1685,10 +1713,10 @@ fn build_relay(
         });
     let ml_dsa_signing_key = parsed_secret
         .as_ref()
-        .and_then(|secret| secret.ml_dsa_65_keypair(device_id).ok())
+        .and_then(|secret| secret.ml_dsa_65_keypair_v(device_id, ml_dsa_key_generation).ok())
         .unwrap_or_else(|| {
             DeviceSecret::generate()
-                .ml_dsa_65_keypair(device_id)
+                .ml_dsa_65_keypair_v(device_id, ml_dsa_key_generation)
                 .expect("ephemeral ML-DSA signing key")
         });
     let relay = ServerRelay::new(
@@ -1781,6 +1809,7 @@ pub async fn create_sync_group(
         &device_id,
         "", // no session token yet — registration will return one
         None,
+        0,
         handle.allow_insecure,
         pending.3.clone(),
     )?;
@@ -1901,19 +1930,25 @@ pub async fn list_devices(
     session_token: String,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
-    let device_secret = handle
-        .inner
-        .lock()
-        .await
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
+    let (storage, device_secret) = {
+        let inner = handle.inner.lock().await;
+        (
+            inner.storage().clone(),
+            inner
+                .secure_store()
+                .get("device_secret")
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
     let relay = build_relay(
         &handle.relay_url,
         &sync_id,
         &device_id,
         &session_token,
         device_secret,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -1939,19 +1974,25 @@ pub async fn revoke_device(
     target_device_id: String,
 ) -> Result<(), String> {
     enforce_handle_signature_version_floor(handle).await?;
-    let device_secret = handle
-        .inner
-        .lock()
-        .await
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
+    let (storage, device_secret) = {
+        let inner = handle.inner.lock().await;
+        (
+            inner.storage().clone(),
+            inner
+                .secure_store()
+                .get("device_secret")
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
     let relay = build_relay(
         &handle.relay_url,
         &sync_id,
         &device_id,
         &session_token,
         device_secret,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -1989,19 +2030,25 @@ pub async fn revoke_and_rekey(
     remote_wipe: bool,
 ) -> Result<u32, String> {
     enforce_handle_signature_version_floor(handle).await?;
-    let device_secret = handle
-        .inner
-        .lock()
-        .await
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
+    let (storage, device_secret) = {
+        let inner = handle.inner.lock().await;
+        (
+            inner.storage().clone(),
+            inner
+                .secure_store()
+                .get("device_secret")
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
     let relay = build_relay(
         &handle.relay_url,
         &sync_id,
         &device_id,
         &session_token,
         device_secret,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -2057,19 +2104,25 @@ pub async fn deregister_device(
     session_token: String,
 ) -> Result<(), String> {
     enforce_handle_signature_version_floor(handle).await?;
-    let device_secret = handle
-        .inner
-        .lock()
-        .await
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
+    let (storage, device_secret) = {
+        let inner = handle.inner.lock().await;
+        (
+            inner.storage().clone(),
+            inner
+                .secure_store()
+                .get("device_secret")
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
     let relay = build_relay(
         &handle.relay_url,
         &sync_id,
         &device_id,
         &session_token,
         device_secret,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -2090,19 +2143,25 @@ pub async fn delete_sync_group(
     session_token: String,
 ) -> Result<(), String> {
     enforce_handle_signature_version_floor(handle).await?;
-    let device_secret = handle
-        .inner
-        .lock()
-        .await
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
+    let (storage, device_secret) = {
+        let inner = handle.inner.lock().await;
+        (
+            inner.storage().clone(),
+            inner
+                .secure_store()
+                .get("device_secret")
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
     let relay = build_relay(
         &handle.relay_url,
         &sync_id,
         &device_id,
         &session_token,
         device_secret,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -2750,6 +2809,7 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
             "pending",
             "",
             None,
+            0,
             handle.allow_insecure,
             None,
         )?,
@@ -2871,6 +2931,7 @@ pub async fn complete_joiner_ceremony(
         "pending",
         "",
         None,
+        0,
         handle.allow_insecure,
         None,
     )?;
@@ -2988,6 +3049,7 @@ pub async fn start_initiator_ceremony(
     // Build a SyncRelay so PairingService can load the current device identity
     let inner = handle.inner.lock().await;
     let secure_store = inner.secure_store().clone();
+    let storage = inner.storage().clone();
     let device_id = inner
         .secure_store()
         .get("device_id")
@@ -3011,6 +3073,8 @@ pub async fn start_initiator_ceremony(
         .get("device_secret")
         .map_err(|e| e.to_string())?;
     drop(inner);
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
 
     let relay = build_relay(
         &handle.relay_url,
@@ -3018,6 +3082,7 @@ pub async fn start_initiator_ceremony(
         &device_id,
         &session_token,
         device_secret_bytes,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -3072,6 +3137,7 @@ pub async fn complete_initiator_ceremony(
     // Build a SyncRelay for the PairingService (needs device identity + relay access)
     let inner = handle.inner.lock().await;
     let secure_store = inner.secure_store().clone();
+    let storage = inner.storage().clone();
     let device_id = inner
         .secure_store()
         .get("device_id")
@@ -3095,6 +3161,8 @@ pub async fn complete_initiator_ceremony(
         .get("device_secret")
         .map_err(|e| e.to_string())?;
     drop(inner);
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
 
     let relay = build_relay(
         &handle.relay_url,
@@ -3102,6 +3170,7 @@ pub async fn complete_initiator_ceremony(
         &device_id,
         &session_token,
         device_secret_bytes,
+        ml_dsa_key_generation,
         handle.allow_insecure,
         None,
     )?;
@@ -3198,6 +3267,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         &device_id,
         &session_token,
         Some(device_secret.as_bytes().to_vec()),
+        current_gen,
         allow_insecure,
         None,
     )?;
@@ -3306,16 +3376,7 @@ pub async fn get_ml_dsa_key_generation(handle: &PrismSyncHandle) -> Result<u32, 
 
     let sync_id = require_secure_string(secure_store.as_ref(), "sync_id")?;
     let device_id = require_secure_string(secure_store.as_ref(), "device_id")?;
-
-    let record = tokio::task::spawn_blocking(move || {
-        storage.get_device_record(&sync_id, &device_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?
-    .ok_or("device not in registry")?;
-
-    Ok(record.ml_dsa_key_generation)
+    load_device_ml_dsa_generation(storage, sync_id, device_id).await
 }
 
 #[cfg(test)]

@@ -304,31 +304,7 @@ impl SyncRelay for ServerRelay {
     async fn register_device(&self, req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
         let url = format!("{}/register", self.base_path());
 
-        let body = serde_json::json!({
-            "device_id": req.device_id,
-            "signing_public_key": hex::encode(&req.signing_public_key),
-            "x25519_public_key": hex::encode(&req.x25519_public_key),
-            "ml_dsa_65_public_key": hex::encode(&req.ml_dsa_65_public_key),
-            "ml_kem_768_public_key": hex::encode(&req.ml_kem_768_public_key),
-            "registration_challenge": hex::encode(&req.registration_challenge),
-            "nonce": req.nonce,
-            "pow_solution": req.pow_solution.as_ref().map(|solution| {
-                serde_json::json!({
-                    "counter": solution.counter,
-                })
-            }),
-            "first_device_admission_proof": req.first_device_admission_proof.as_ref().map(|proof| {
-                serde_json::to_value(proof).expect("first-device admission proof serializes")
-            }),
-            "registry_approval": req.registry_approval.as_ref().map(|approval| {
-                serde_json::json!({
-                    "approver_device_id": approval.approver_device_id,
-                    "approver_ed25519_pk": approval.approver_ed25519_pk,
-                    "approval_signature": approval.approval_signature,
-                    "signed_registry_snapshot": approval.signed_registry_snapshot,
-                })
-            }),
-        });
+        let body = build_register_device_body(&req);
 
         let mut req = self
             .apply_auth(self.client.post(&url))
@@ -889,10 +865,39 @@ impl SyncRelay for ServerRelay {
     }
 }
 
+fn build_register_device_body(req: &RegisterRequest) -> serde_json::Value {
+    serde_json::json!({
+        "device_id": &req.device_id,
+        "signing_public_key": hex::encode(&req.signing_public_key),
+        "x25519_public_key": hex::encode(&req.x25519_public_key),
+        "ml_dsa_65_public_key": hex::encode(&req.ml_dsa_65_public_key),
+        "ml_kem_768_public_key": hex::encode(&req.ml_kem_768_public_key),
+        "registration_challenge": hex::encode(&req.registration_challenge),
+        "nonce": &req.nonce,
+        "pow_solution": req.pow_solution.as_ref().map(|solution| {
+            serde_json::json!({
+                "counter": solution.counter,
+            })
+        }),
+        "first_device_admission_proof": req.first_device_admission_proof.as_ref().map(|proof| {
+            serde_json::to_value(proof).expect("first-device admission proof serializes")
+        }),
+        "registry_approval": req.registry_approval.as_ref().map(|approval| {
+            serde_json::json!({
+                "approver_device_id": &approval.approver_device_id,
+                "approver_ed25519_pk": &approval.approver_ed25519_pk,
+                "approver_ml_dsa_65_pk": &approval.approver_ml_dsa_65_pk,
+                "approval_signature": &approval.approval_signature,
+                "signed_registry_snapshot": &approval.signed_registry_snapshot,
+            })
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::ServerRelay;
-    use crate::relay::traits::RelayError;
+    use crate::relay::traits::{RelayError, RegistryApproval, RegisterRequest};
 
     #[test]
     fn classify_error_keeps_device_revoked_response_structured() {
@@ -940,5 +945,47 @@ mod tests {
                 ref message,
             } if message == "update"
         ));
+    }
+
+    #[test]
+    fn register_device_body_includes_approver_ml_dsa_key() {
+        let expected_pk = "bb".repeat(1952);
+        let body = super::build_register_device_body(&RegisterRequest {
+            device_id: "device-1".to_string(),
+            signing_public_key: vec![0x11; 32],
+            x25519_public_key: vec![0x22; 32],
+            ml_dsa_65_public_key: vec![0x33; 1952],
+            ml_kem_768_public_key: vec![0x44; 1184],
+            registration_challenge: vec![0x55; 64],
+            nonce: "nonce".to_string(),
+            pow_solution: None,
+            first_device_admission_proof: None,
+            registry_approval: Some(RegistryApproval {
+                approver_device_id: "approver-1".to_string(),
+                approver_ed25519_pk: "aa".repeat(32),
+                approver_ml_dsa_65_pk: "bb".repeat(1952),
+                approval_signature: "cc".repeat(64),
+                signed_registry_snapshot: vec![0xdd; 4],
+            }),
+        });
+
+        let approval = body
+            .get("registry_approval")
+            .and_then(|value| value.as_object())
+            .expect("registry approval object");
+
+        assert_eq!(
+            approval
+                .get("approver_ml_dsa_65_pk")
+                .and_then(|value| value.as_str())
+                .map(|s| s.len()),
+            Some(expected_pk.len())
+        );
+        assert_eq!(
+            approval
+                .get("approver_ml_dsa_65_pk")
+                .and_then(|value| value.as_str()),
+            Some(expected_pk.as_str())
+        );
     }
 }
