@@ -182,7 +182,7 @@ pub fn router(state: AppState) -> Router {
             get(devices::get_rekey_artifact),
         )
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
-        // Registry routes
+        // Registry routes (auth + signed)
         .merge(registry::routes())
         // Sharing routes (auth + signed)
         .route(
