@@ -859,6 +859,45 @@ impl SyncRelay for ServerRelay {
         Ok(bytes.to_vec())
     }
 
+    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
+        let path = self.canonical_path("/registry");
+        let url = format!("{}{}", self.base_url, path);
+        debug!("get_signed_registry");
+
+        let resp = self
+            .apply_signed_auth(self.client.get(&url), "GET", &path, &[])
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let response: SignedRegistryResponse =
+            resp.json().await.map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse registry response: {e}"),
+            })?;
+
+        // Client-side size cap to protect against malicious relay
+        if response.artifact_blob.len() > 512 * 1024 {
+            return Err(RelayError::Protocol {
+                message: format!(
+                    "Registry artifact too large: {} bytes (max 524288)",
+                    response.artifact_blob.len()
+                ),
+            });
+        }
+
+        Ok(Some(response))
+    }
+
     async fn dispose(&self) -> Result<(), RelayError> {
         self.disconnect_websocket().await?;
         Ok(())

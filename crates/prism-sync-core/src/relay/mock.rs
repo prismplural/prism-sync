@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use super::traits::{
     DeviceInfo, OutgoingBatch, PullResponse, ReceivedBatch, RegisterRequest, RegisterResponse,
     RegistrationNonceResponse, RelayError, RotateMlDsaResponse, SignedBatchEnvelope,
-    SnapshotResponse, SyncNotification, SyncRelay,
+    SignedRegistryResponse, SnapshotResponse, SyncNotification, SyncRelay,
 };
 
 /// In-memory mock implementation of [`SyncRelay`] for testing.
@@ -42,6 +42,8 @@ struct MockRelayState {
     ml_dsa_generations: HashMap<String, u32>,
     /// In-memory media blob storage.
     media: HashMap<String, Vec<u8>>,
+    /// Signed registry artifact to return from get_signed_registry.
+    signed_registry: Option<SignedRegistryResponse>,
 }
 
 /// Full stored batch — keeps the original `SignedBatchEnvelope` so that
@@ -69,6 +71,7 @@ impl MockRelay {
                 ack_error: None,
                 ml_dsa_generations: HashMap::new(),
                 media: HashMap::new(),
+                signed_registry: None,
             }),
             notification_tx,
         }
@@ -148,6 +151,11 @@ impl MockRelay {
             }
             (snap, _) => snap.clone(),
         }
+    }
+
+    /// Set the signed registry artifact to return from get_signed_registry.
+    pub fn set_signed_registry(&self, resp: SignedRegistryResponse) {
+        self.state.lock().unwrap().signed_registry = Some(resp);
     }
 }
 
@@ -368,6 +376,10 @@ impl SyncRelay for MockRelay {
                 status_code: 404,
                 message: "Media not found".into(),
             })
+    }
+
+    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
+        Ok(self.state.lock().unwrap().signed_registry.clone())
     }
 
     async fn dispose(&self) -> Result<(), RelayError> {
