@@ -3327,7 +3327,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
 
     // 4. Submit rotation to relay
     let response = match relay
-        .rotate_ml_dsa(&device_id, &new_pk, new_gen, &proof)
+        .rotate_ml_dsa(&device_id, &new_pk, new_gen, &proof, None)
         .await
     {
         Ok(resp) => resp,

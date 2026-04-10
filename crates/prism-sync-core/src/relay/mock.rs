@@ -313,6 +313,7 @@ impl SyncRelay for MockRelay {
         new_ml_dsa_pk: &[u8],
         new_generation: u32,
         _proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        _signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<RotateMlDsaResponse, RelayError> {
         let mut state = self.state.lock().unwrap();
 
@@ -627,7 +628,7 @@ mod tests {
         let new_pk = vec![0x42; 1952];
         let proof = make_continuity_proof();
         let resp = relay
-            .rotate_ml_dsa("d1", &new_pk, 1, &proof)
+            .rotate_ml_dsa("d1", &new_pk, 1, &proof, None)
             .await
             .unwrap();
 
@@ -641,7 +642,7 @@ mod tests {
         // A second rotation to generation 2 should also succeed.
         let newer_pk = vec![0x43; 1952];
         let resp2 = relay
-            .rotate_ml_dsa("d1", &newer_pk, 2, &proof)
+            .rotate_ml_dsa("d1", &newer_pk, 2, &proof, None)
             .await
             .unwrap();
         assert_eq!(resp2.ml_dsa_key_generation, 2);
@@ -660,13 +661,13 @@ mod tests {
 
         // First rotation to generation 2.
         relay
-            .rotate_ml_dsa("d1", &vec![0x42; 1952], 2, &proof)
+            .rotate_ml_dsa("d1", &vec![0x42; 1952], 2, &proof, None)
             .await
             .unwrap();
 
         // Attempt to rotate to generation 1 (rollback) should fail.
         let err = relay
-            .rotate_ml_dsa("d1", &vec![0x43; 1952], 1, &proof)
+            .rotate_ml_dsa("d1", &vec![0x43; 1952], 1, &proof, None)
             .await
             .unwrap_err();
         assert!(
@@ -676,7 +677,7 @@ mod tests {
 
         // Same generation (2) should also fail.
         let err = relay
-            .rotate_ml_dsa("d1", &vec![0x44; 1952], 2, &proof)
+            .rotate_ml_dsa("d1", &vec![0x44; 1952], 2, &proof, None)
             .await
             .unwrap_err();
         assert!(
@@ -691,7 +692,7 @@ mod tests {
         let proof = make_continuity_proof();
 
         let err = relay
-            .rotate_ml_dsa("nonexistent", &vec![0x42; 1952], 1, &proof)
+            .rotate_ml_dsa("nonexistent", &vec![0x42; 1952], 1, &proof, None)
             .await
             .unwrap_err();
         assert!(

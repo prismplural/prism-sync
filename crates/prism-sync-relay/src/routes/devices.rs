@@ -635,6 +635,8 @@ pub struct RotateMlDsaRequest {
     pub timestamp: i64,
     pub old_signs_new: String,
     pub new_signs_old: String,
+    #[serde(default)]
+    pub signed_registry_snapshot: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -727,6 +729,11 @@ pub async fn post_rotate_ml_dsa(
             AppError::BadRequest("invalid continuity proof")
         })?;
 
+    // Decode optional signed registry snapshot
+    let signed_snapshot = req.signed_registry_snapshot.as_ref().and_then(|s| {
+        base64::engine::general_purpose::STANDARD.decode(s).ok()
+    });
+
     // Apply the rotation with a 30-day grace period for the old key
     let grace_expires_at = db::now_secs() + THIRTY_DAYS_SECS;
     let new_gen = req.ml_dsa_key_generation;
@@ -735,7 +742,7 @@ pub async fn post_rotate_ml_dsa(
     let did = device_id.clone();
     let applied = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            Ok(do_rotate_ml_dsa(conn, &sid, &did, &new_pk, new_gen, grace_expires_at))
+            Ok(do_rotate_ml_dsa(conn, &sid, &did, &new_pk, new_gen, grace_expires_at, signed_snapshot))
         })
     })
     .await
@@ -760,13 +767,18 @@ fn do_rotate_ml_dsa(
     new_pk: &[u8],
     new_gen: i64,
     grace_expires_at: i64,
+    signed_snapshot: Option<Vec<u8>>,
 ) -> Result<bool, AppError> {
     let applied = db::rotate_device_ml_dsa(conn, sync_id, device_id, new_pk, new_gen, grace_expires_at)
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if applied {
         // Update registry state so clients can detect the key change
-        sync_registry_state_with_current_devices(conn, sync_id, None, None)?;
+        let (kind, blob): (Option<&str>, Option<&[u8]>) = match signed_snapshot.as_deref() {
+            Some(blob) => (Some("signed_registry_snapshot"), Some(blob)),
+            None => (None, None),
+        };
+        sync_registry_state_with_current_devices(conn, sync_id, kind, blob)?;
     }
 
     Ok(applied)

@@ -521,6 +521,7 @@ pub trait SyncRelay: Send + Sync {
         new_ml_dsa_pk: &[u8],
         new_generation: u32,
         proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> std::result::Result<RotateMlDsaResponse, RelayError>;
 
     /// Upload an encrypted media blob to the relay.

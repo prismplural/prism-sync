@@ -1276,6 +1276,7 @@ mod tests {
             _: &[u8],
             _: u32,
             _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            _: Option<&[u8]>,
         ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
             unimplemented!()
         }
@@ -1429,6 +1430,7 @@ mod tests {
             _: &[u8],
             _: u32,
             _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            _: Option<&[u8]>,
         ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
             unimplemented!()
         }
@@ -2230,6 +2232,7 @@ mod tests {
                 _: &[u8],
                 _: u32,
                 _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+                _: Option<&[u8]>,
             ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
                 unimplemented!()
             }
@@ -2385,6 +2388,7 @@ mod tests {
                 _: &[u8],
                 _: u32,
                 _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+                _: Option<&[u8]>,
             ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
                 unimplemented!()
             }

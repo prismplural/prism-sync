@@ -770,6 +770,7 @@ impl SyncRelay for ServerRelay {
         new_ml_dsa_pk: &[u8],
         new_generation: u32,
         proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<RotateMlDsaResponse, RelayError> {
         let path = self.canonical_path(&format!("/devices/{device_id}/rotate-ml-dsa"));
         let url = format!("{}{}", self.base_url, path);
@@ -781,6 +782,7 @@ impl SyncRelay for ServerRelay {
             "timestamp": proof.timestamp,
             "old_signs_new": BASE64.encode(&proof.old_signs_new),
             "new_signs_old": BASE64.encode(&proof.new_signs_old),
+            "signed_registry_snapshot": signed_registry_snapshot.map(|s| BASE64.encode(s)),
         });
         let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
             message: format!("Failed to encode rotate-ml-dsa request: {e}"),
