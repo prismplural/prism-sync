@@ -9,6 +9,7 @@ pub mod pq;
 
 pub use device_identity::{
     DeviceExchangeKey, DevicePqKemKey, DevicePqSigningKey, DeviceSecret, DeviceSigningKey,
+    DeviceXWingKey,
 };
 pub use error::CryptoError;
 pub use key_hierarchy::KeyHierarchy;
