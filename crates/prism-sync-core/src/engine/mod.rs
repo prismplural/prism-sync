@@ -408,11 +408,93 @@ impl SyncEngine {
             )));
         }
 
-        // Unknown sender -- refresh device registry from relay and retry once
+        // Unknown sender -- try signed registry first, then fall back to list_devices
         tracing::info!(
-            "Unknown sender device {}, refreshing device registry",
+            "Unknown sender device {}, attempting signed registry fetch",
             sender_device_id
         );
+
+        // Step 1: Try to fetch and verify a signed registry artifact
+        let mut registry_resolved = false;
+        match self.relay.get_signed_registry().await {
+            Ok(Some(response)) => {
+                let storage = self.storage.clone();
+                let sid = sync_id.to_string();
+                let blob = response.artifact_blob.clone();
+                let version = response.registry_version;
+
+                let import_result = tokio::task::spawn_blocking(move || {
+                    DeviceRegistryManager::verify_and_import_signed_registry(
+                        &*storage, &sid, &blob,
+                    )
+                })
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+                match import_result {
+                    Ok(_result) => {
+                        tracing::info!(
+                            "Imported verified registry v{version} for sender {}",
+                            sender_device_id
+                        );
+                        // Store the imported version
+                        let storage = self.storage.clone();
+                        let sid = sync_id.to_string();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut tx = storage.begin_tx()?;
+                            tx.update_last_imported_registry_version(&sid, version)?;
+                            tx.commit()
+                        })
+                        .await
+                        .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+                        // Retry local lookup after verified import
+                        let storage = self.storage.clone();
+                        let sid = sync_id.to_string();
+                        let sender_id = sender_device_id.to_string();
+                        let record = tokio::task::spawn_blocking(move || {
+                            storage.get_device_record(&sid, &sender_id)
+                        })
+                        .await
+                        .map_err(|e| CoreError::Storage(e.to_string()))??;
+
+                        if let Some(ref r) = record {
+                            if r.status == "active" {
+                                return pk_from_record(r);
+                            }
+                        }
+                        // Sender still not found after verified import — fall through
+                        registry_resolved = false;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Signed registry verification failed for sender {}: {e}",
+                            sender_device_id
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "No signed registry artifact available for sender {}",
+                    sender_device_id
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch signed registry for sender {}: {e}",
+                    sender_device_id
+                );
+            }
+        }
+
+        // Step 2: Fall back to unverified list_devices (existing behavior)
+        if !registry_resolved {
+            tracing::warn!(
+                "Falling back to unverified list_devices() for sender {}",
+                sender_device_id
+            );
+        }
         let devices = self
             .relay
             .list_devices()
@@ -440,6 +522,7 @@ impl SyncEngine {
                         } else {
                             None
                         },
+                        ml_dsa_key_generation: dev.ml_dsa_key_generation,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -449,7 +532,7 @@ impl SyncEngine {
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))??;
 
-        // Retry lookup after refresh
+        // Retry lookup after unverified refresh
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         let sender_id = sender_device_id.to_string();
@@ -462,7 +545,7 @@ impl SyncEngine {
             Some(ref r) if r.status == "active" => pk_from_record(r),
             _ => {
                 tracing::warn!(
-                    "Still unknown sender {} after refresh, skipping",
+                    "Still unknown sender {} after registry refresh, skipping",
                     sender_device_id
                 );
                 Err(CoreError::Storage(format!(
