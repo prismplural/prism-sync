@@ -338,8 +338,11 @@ impl DeviceRegistryManager {
 
         // 4. Try to verify against any locally known device's keys
         let local_devices = storage.list_device_records(sync_id)?;
-        let mut verified = false;
+        let mut signer_device_id: Option<String> = None;
         for device in &local_devices {
+            if device.status == "revoked" {
+                continue; // skip revoked devices — they retain their keys but must not sign
+            }
             if device.ed25519_public_key.len() != 32 || device.ml_dsa_65_public_key.is_empty() {
                 continue;
             }
@@ -353,12 +356,12 @@ impl DeviceRegistryManager {
                 )
                 .is_ok()
             {
-                verified = true;
+                signer_device_id = Some(device.device_id.clone());
                 break;
             }
         }
 
-        if !verified {
+        if signer_device_id.is_none() {
             return Err(CoreError::Engine(
                 "registry artifact signature could not be verified against any known device"
                     .into(),
@@ -386,6 +389,24 @@ impl DeviceRegistryManager {
 
         let entries: Vec<RegistryEntry> = serde_json::from_slice(json_bytes)
             .map_err(|e| CoreError::Engine(format!("invalid registry artifact JSON: {e}")))?;
+
+        // 5a. Require signer to appear and be non-revoked in their own snapshot.
+        //     This catches self-contradictory snapshots and closes the revocation
+        //     window between when we skip the key above and what the payload says.
+        let signer_id = signer_device_id.unwrap(); // safe: checked above (is_none returned)
+        match entries.iter().find(|e| e.device_id == signer_id) {
+            None => {
+                return Err(CoreError::Engine(
+                    "registry signer not present in own snapshot".into(),
+                ));
+            }
+            Some(entry) if entry.status == "revoked" => {
+                return Err(CoreError::Engine(
+                    "registry signed by device that marks itself as revoked".into(),
+                ));
+            }
+            _ => {} // signer is present and not revoked — proceed
+        }
 
         let device_records: Vec<DeviceRecord> = entries
             .into_iter()
