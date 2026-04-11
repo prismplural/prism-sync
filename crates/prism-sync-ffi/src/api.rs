@@ -22,7 +22,7 @@ use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
-use prism_sync_core::relay::SyncRelay as _;
+use prism_sync_core::relay::SyncRelay;
 use prism_sync_core::schema::{SyncSchema, SyncValue};
 use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
@@ -1738,10 +1738,9 @@ fn build_relay(
 ///
 /// Returns JSON containing `sync_id` and `relay_url`.
 ///
-/// The relay is constructed internally from the handle's `relay_url`.
-/// A placeholder `sync_id` is used for the registration call because the
-/// real `sync_id` is generated inside `PairingService::create_sync_group`.
-/// The relay server must accept registration at any sync-group path.
+/// The relay is constructed via a builder closure after the sync_id is
+/// generated internally, ensuring the registration request uses the real
+/// sync_id in the URL path.
 pub async fn create_sync_group(
     handle: &PrismSyncHandle,
     password: String,
@@ -1796,30 +1795,20 @@ pub async fn create_sync_group(
         )
     };
 
-    // Generate the sync_id BEFORE constructing the relay, because
-    // ServerRelay requires a valid 64-char hex sync_id at construction
-    // and the relay validates it on every request.
+    // Generate the sync_id upfront so the pending state can reference it.
+    // The relay is built later via the relay_builder closure, after
+    // PairingService resolves sync_id + device_id internally.
     let sync_id = pending
         .0
         .clone()
         .unwrap_or_else(prism_sync_core::epoch::EpochManager::generate_sync_id);
-    let device_id = prism_sync_core::node_id::generate_node_id();
-
-    let relay = build_relay(
-        &relay_url,
-        &sync_id,
-        &device_id,
-        "", // no session token yet — registration will return one
-        None,
-        0,
-        handle.allow_insecure,
-        pending.3.clone(),
-    )?;
 
     let mut inner = handle.inner.lock().await;
     let secure_store = inner.secure_store().clone();
-    let pairing = PairingService::new(relay, secure_store.clone());
+    let pairing = PairingService::new(secure_store.clone());
 
+    let ffi_relay_url = relay_url.clone();
+    let ffi_allow_insecure = handle.allow_insecure;
     let create_result = pairing
         .create_sync_group(
             &password,
@@ -1829,6 +1818,20 @@ pub async fn create_sync_group(
             pending.1.clone(),
             pending.2.clone(),
             pending.3.clone(),
+            |sync_id, device_id, registration_token| {
+                build_relay(
+                    &ffi_relay_url,
+                    sync_id,
+                    device_id,
+                    "", // no session token yet — registration will return one
+                    None,
+                    0,
+                    ffi_allow_insecure,
+                    registration_token.map(str::to_string),
+                )
+                .map(|r| r as Arc<dyn SyncRelay>)
+                .map_err(prism_sync_core::CoreError::Engine)
+            },
         )
         .await;
 
@@ -2850,21 +2853,7 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
     let pairing_relay = build_pairing_relay(handle)?;
 
     let inner = handle.inner.lock().await;
-    let pairing = PairingService::new(
-        // PairingService needs a SyncRelay for registration, but start_bootstrap_pairing
-        // only uses the PairingRelay argument. Build a temporary relay for the service.
-        build_relay(
-            &handle.relay_url,
-            "pending",
-            "pending",
-            "",
-            None,
-            0,
-            handle.allow_insecure,
-            None,
-        )?,
-        inner.secure_store().clone(),
-    );
+    let pairing = PairingService::new(inner.secure_store().clone());
     drop(inner);
 
     let (ceremony, token) = match pairing
@@ -2974,26 +2963,36 @@ pub async fn complete_joiner_ceremony(
         .take()
         .ok_or_else(|| "no joiner ceremony in progress — call get_joiner_sas first".to_string())?;
 
-    // Build a SyncRelay for registration
-    let relay = build_relay(
-        &handle.relay_url,
-        "pending",
-        "pending",
-        "",
-        None,
-        0,
-        handle.allow_insecure,
-        None,
-    )?;
+    let relay_url = handle.relay_url.clone();
+    let allow_insecure = handle.allow_insecure;
 
     let inner = handle.inner.lock().await;
-    let pairing = PairingService::new(relay, inner.secure_store().clone());
+    let pairing = PairingService::new(inner.secure_store().clone());
     drop(inner);
 
     // complete_bootstrap_join handles: confirmation MAC, wait for credentials,
     // decrypt, register, persist, post joiner bundle
     let (key_hierarchy, registry_snapshot) = match pairing
-        .complete_bootstrap_join(&ceremony, &pairing_relay, &[], &password)
+        .complete_bootstrap_join(
+            &ceremony,
+            &pairing_relay,
+            &[],
+            &password,
+            |sync_id, device_id, registration_token| {
+                build_relay(
+                    &relay_url,
+                    sync_id,
+                    device_id,
+                    "", // no session token yet — registration will return one
+                    None,
+                    0,
+                    allow_insecure,
+                    registration_token.map(str::to_string),
+                )
+                .map(|r| r as Arc<dyn SyncRelay>)
+                .map_err(prism_sync_core::CoreError::Engine)
+            },
+        )
         .await
     {
         Ok(value) => value,
@@ -3096,48 +3095,11 @@ pub async fn start_initiator_ceremony(
 
     let pairing_relay = build_pairing_relay(handle)?;
 
-    // Build a SyncRelay so PairingService can load the current device identity
     let inner = handle.inner.lock().await;
     let secure_store = inner.secure_store().clone();
-    let storage = inner.storage().clone();
-    let device_id = inner
-        .secure_store()
-        .get("device_id")
-        .map_err(|e| e.to_string())?
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| "pending".to_string());
-    let sync_id = inner
-        .secure_store()
-        .get("sync_id")
-        .map_err(|e| e.to_string())?
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| "pending".to_string());
-    let session_token = inner
-        .secure_store()
-        .get("session_token")
-        .map_err(|e| e.to_string())?
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default();
-    let device_secret_bytes = inner
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
     drop(inner);
-    let ml_dsa_key_generation =
-        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
 
-    let relay = build_relay(
-        &handle.relay_url,
-        &sync_id,
-        &device_id,
-        &session_token,
-        device_secret_bytes,
-        ml_dsa_key_generation,
-        handle.allow_insecure,
-        None,
-    )?;
-
-    let pairing = PairingService::new(relay, secure_store);
+    let pairing = PairingService::new(secure_store);
     let (ceremony, sas) = match pairing.start_bootstrap_initiator(token, &pairing_relay).await {
         Ok(value) => value,
         Err(error) => {
@@ -3225,9 +3187,9 @@ pub async fn complete_initiator_ceremony(
         None,
     )?;
 
-    let pairing = PairingService::new(relay, secure_store);
+    let pairing = PairingService::new(secure_store);
     if let Err(error) = pairing
-        .complete_bootstrap_initiator(&ceremony, &pairing_relay, &password)
+        .complete_bootstrap_initiator(&ceremony, &pairing_relay, &password, relay.as_ref())
         .await
     {
         return Err(encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await);

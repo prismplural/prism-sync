@@ -30,20 +30,17 @@ const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
 
 /// Orchestrates sync group creation and joining.
 ///
-/// Holds shared references to the relay (for device registration) and the
-/// secure store (for credential persistence).
+/// Holds a shared reference to the secure store (for credential persistence).
+/// Relay connections are passed in or built via closures at call sites, because
+/// the joiner doesn't know the sync_id until the credential bundle is decrypted.
 pub struct PairingService {
-    relay: Arc<dyn SyncRelay>,
     secure_store: Arc<dyn SecureStore>,
 }
 
 impl PairingService {
     /// Create a new `PairingService`.
-    pub fn new(relay: Arc<dyn SyncRelay>, secure_store: Arc<dyn SecureStore>) -> Self {
-        Self {
-            relay,
-            secure_store,
-        }
+    pub fn new(secure_store: Arc<dyn SecureStore>) -> Self {
+        Self { secure_store }
     }
 
     fn ratchet_min_signature_version(&self, observed: Option<u8>) -> Result<()> {
@@ -86,8 +83,12 @@ impl PairingService {
     /// 3. Generates a unique `sync_id`.
     /// 4. Builds `SyncGroupCredentials` and the first-device pairing response.
     /// 5. Generates a device identity and registers with the relay.
+    ///
+    /// The `relay_builder` closure constructs a `SyncRelay` after the sync_id is
+    /// resolved (from `sync_id_override` or freshly generated). Parameters:
+    /// `(sync_id, device_id, registration_token)`.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_sync_group(
+    pub async fn create_sync_group<F>(
         &self,
         password: &str,
         relay_url: &str,
@@ -96,7 +97,11 @@ impl PairingService {
         nonce_response_override: Option<RegistrationNonceResponse>,
         first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
         registration_token: Option<String>,
-    ) -> Result<(SyncGroupCredentials, PairingResponse)> {
+        relay_builder: F,
+    ) -> Result<(SyncGroupCredentials, PairingResponse)>
+    where
+        F: FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send,
+    {
         // 1. Generate or accept mnemonic
         let mnemonic_str = mnemonic_override.unwrap_or_else(mnemonic::generate);
         let secret_key = mnemonic::to_bytes(&mnemonic_str).map_err(CoreError::Crypto)?;
@@ -202,11 +207,17 @@ impl PairingService {
             registration_token,
         };
 
-        // 9. Fetch registration nonce and build challenge-response (CRITICAL-2)
+        // 9. Build relay with real sync_id
+        let relay = relay_builder(
+            &sync_id,
+            &device_id,
+            response.registration_token.as_deref(),
+        )?;
+
+        // 10. Fetch registration nonce and build challenge-response (CRITICAL-2)
         let nonce_response = match nonce_response_override {
             Some(response) => response,
-            None => self
-                .relay
+            None => relay
                 .get_registration_nonce()
                 .await
                 .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?,
@@ -224,7 +235,7 @@ impl PairingService {
             &nonce,
         );
 
-        // 10. Register with relay using signed challenge
+        // 11. Register with relay using signed challenge
         let register_req = crate::relay::traits::RegisterRequest {
             device_id: device_id.clone(),
             signing_public_key: signing_key.public_key_bytes().to_vec(),
@@ -239,8 +250,7 @@ impl PairingService {
             registry_approval: None,
         };
 
-        let register_response = self
-            .relay
+        let register_response = relay
             .register_device(register_req)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
@@ -267,190 +277,6 @@ impl PairingService {
         Ok((credentials, response))
     }
 
-    /// Join an existing sync group (second+ device).
-    ///
-    /// Derives the key hierarchy from the pairing response and the user's
-    /// password. The joining device must enter the *same* password that was
-    /// used to create the sync group.
-    ///
-    /// Verifies the invitation signature and the signed registry snapshot
-    /// before trusting the payload (CRITICAL-1).
-    /// Registers with the relay using challenge-response (CRITICAL-2).
-    ///
-    /// Returns the unlocked key hierarchy and the verified registry snapshot.
-    /// The caller should import the snapshot entries into storage via
-    /// [`crate::device_registry::DeviceRegistryManager::import_keyring`]
-    /// before starting normal sync.
-    pub async fn join_sync_group(
-        &self,
-        response: &PairingResponse,
-        password: &str,
-    ) -> Result<(KeyHierarchy, SignedRegistrySnapshot)> {
-        response
-            .validate_epoch_fields()
-            .map_err(|e| CoreError::Engine(format!("invalid pairing response: {e}")))?;
-
-        // 1. Verify the invitation signature (CRITICAL-1)
-        let inviter_pk: [u8; 32] = response
-            .inviter_ed25519_pk
-            .clone()
-            .try_into()
-            .map_err(|_| CoreError::Engine("invalid inviter public key length".into()))?;
-        if response.inviter_ml_dsa_65_pk.is_empty() {
-            return Err(CoreError::Engine(
-                "pairing response missing inviter ML-DSA public key".into(),
-            ));
-        }
-
-        let sig_bytes = prism_sync_crypto::hex::decode(&response.signed_invitation)
-            .map_err(CoreError::Crypto)?;
-        let signing_data = build_invitation_signing_data_v2(
-            &response.sync_id,
-            &response.relay_url,
-            &response.wrapped_dek,
-            &response.salt,
-            &response.inviter_device_id,
-            &inviter_pk,
-            &response.inviter_ml_dsa_65_pk,
-            response.joiner_device_id.as_deref(),
-            response.current_epoch,
-            &response.epoch_key,
-        );
-        verify_hybrid_invitation(
-            &signing_data,
-            &sig_bytes,
-            &inviter_pk,
-            &response.inviter_ml_dsa_65_pk,
-        )?;
-
-        // 1b. Verify and decode the signed registry snapshot
-        let registry_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
-            &response.signed_keyring,
-            &inviter_pk,
-            &response.inviter_ml_dsa_65_pk,
-        )
-        .map_err(|e| CoreError::Engine(format!("registry snapshot rejected: {e}")))?;
-
-        // 2. Unlock key hierarchy
-        let secret_key = mnemonic::to_bytes(&response.mnemonic).map_err(CoreError::Crypto)?;
-
-        let mut key_hierarchy = KeyHierarchy::new();
-        key_hierarchy
-            .unlock(password, &secret_key, &response.wrapped_dek, &response.salt)
-            .map_err(CoreError::Crypto)?;
-
-        // 3. Reuse the original joiner identity when the response came from
-        // a joiner-generated pairing request. Legacy invite-only flows still
-        // fall back to generating a new device identity here.
-        let (device_secret, device_id) = self.load_joiner_identity(response)?;
-        let signing_key = device_secret
-            .ed25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let exchange_key = device_secret
-            .x25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let pq_signing_key = device_secret
-            .ml_dsa_65_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let pq_kem_key = device_secret
-            .ml_kem_768_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let xwing_key = device_secret
-            .xwing_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-
-        // 4. Fetch registration nonce and build V2 hybrid challenge (CRITICAL-2)
-        let nonce_response = self
-            .relay
-            .get_registration_nonce()
-            .await
-            .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
-        self.ratchet_min_signature_version(nonce_response.min_signature_version)?;
-        let pow_solution = solve_registration_pow(&response.sync_id, &device_id, &nonce_response)?;
-        let nonce = nonce_response.nonce;
-
-        let challenge_signature = build_hybrid_challenge_signature(
-            &signing_key,
-            &pq_signing_key,
-            &response.sync_id,
-            &device_id,
-            &nonce,
-        );
-
-        // 5. Register with relay
-        let registry_approval =
-            response
-                .registry_approval_signature
-                .as_ref()
-                .map(|approval_signature| RegistryApproval {
-                    approver_device_id: response.inviter_device_id.clone(),
-                    approver_ed25519_pk: hex::encode(&response.inviter_ed25519_pk),
-                    approver_ml_dsa_65_pk: hex::encode(&response.inviter_ml_dsa_65_pk),
-                    approval_signature: approval_signature.clone(),
-                    signed_registry_snapshot: response.signed_keyring.clone(),
-                });
-        let join_register_response = self
-            .relay
-            .register_device(crate::relay::traits::RegisterRequest {
-                device_id: device_id.clone(),
-                signing_public_key: signing_key.public_key_bytes().to_vec(),
-                x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
-                ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-                x_wing_public_key: xwing_key.encapsulation_key_bytes(),
-                registration_challenge: challenge_signature,
-                nonce,
-                pow_solution,
-                first_device_admission_proof: None,
-                registry_approval,
-            })
-            .await
-            .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
-        self.ratchet_min_signature_version(join_register_response.min_signature_version)?;
-
-        // 6. Persist credentials to secure store (with rollback marker)
-        self.secure_store
-            .set("setup_rollback_marker", b"in_progress")?;
-        self.secure_store.set(
-            "session_token",
-            join_register_response.device_session_token.as_bytes(),
-        )?;
-        self.secure_store
-            .set("sync_id", response.sync_id.as_bytes())?;
-        self.secure_store
-            .set("relay_url", response.relay_url.as_bytes())?;
-        self.secure_store
-            .set("mnemonic", response.mnemonic.as_bytes())?;
-        self.secure_store
-            .set("wrapped_dek", &response.wrapped_dek)?;
-        self.secure_store.set("dek_salt", &response.salt)?;
-        self.secure_store
-            .set("device_secret", device_secret.as_bytes())?;
-        self.secure_store.set("device_id", device_id.as_bytes())?;
-        let epoch_str = response.current_epoch.to_string();
-        self.secure_store.set("epoch", epoch_str.as_bytes())?;
-
-        // Store epoch key from pairing response so the joining device can
-        // decrypt the current epoch immediately after join.
-        if response.current_epoch > 0 && response.epoch_key.len() == 32 {
-            key_hierarchy.store_epoch_key(
-                response.current_epoch,
-                zeroize::Zeroizing::new(response.epoch_key.clone()),
-            );
-            // Persist to secure store for restart recovery (base64 format)
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            let encoded = STANDARD.encode(&response.epoch_key);
-            self.secure_store.set(
-                &format!("epoch_key_{}", response.current_epoch),
-                encoded.as_bytes(),
-            )?;
-        }
-
-        self.secure_store.delete("setup_rollback_marker")?;
-
-        Ok((key_hierarchy, registry_snapshot))
-    }
-
     /// Start the new Phase 3 joiner bootstrap ceremony.
     pub async fn start_bootstrap_pairing(
         &self,
@@ -468,13 +294,21 @@ impl PairingService {
     /// Complete the joiner side of the bootstrap ceremony.
     ///
     /// The caller is expected to have already compared SAS codes.
-    pub async fn complete_bootstrap_join(
+    ///
+    /// The `relay_builder` closure constructs a `SyncRelay` after the credential
+    /// bundle is decrypted and the real sync_id is known. Parameters:
+    /// `(sync_id, device_id, registration_token)`.
+    pub async fn complete_bootstrap_join<F>(
         &self,
         ceremony: &JoinerCeremony,
         relay: &dyn PairingRelay,
         encrypted_credentials: &[u8],
         password: &str,
-    ) -> Result<(KeyHierarchy, SignedRegistrySnapshot)> {
+        relay_builder: F,
+    ) -> Result<(KeyHierarchy, SignedRegistrySnapshot)>
+    where
+        F: FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send,
+    {
         // Publish our confirmation MAC before accepting credentials.
         let confirmation_mac = ceremony.confirmation_mac()?;
         relay
@@ -541,8 +375,32 @@ impl PairingService {
             .map_err(CoreError::Crypto)?;
 
         let sync_id = bundle.sync_id.clone();
-        let nonce_response = self
-            .relay
+
+        // Validate sync_id format before building relay (client-side check)
+        if sync_id.len() != 64 || !sync_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(CoreError::Engine(format!(
+                "credential bundle contains invalid sync_id: {sync_id}"
+            )));
+        }
+
+        // Verify all registry snapshot entries have matching sync_id
+        for entry in &registry_snapshot.entries {
+            if entry.sync_id != sync_id {
+                return Err(CoreError::Engine(format!(
+                    "registry snapshot entry sync_id mismatch: expected {sync_id}, got {}",
+                    entry.sync_id
+                )));
+            }
+        }
+
+        // Build relay with real sync_id
+        let registration_relay = relay_builder(
+            &sync_id,
+            &device_id,
+            bundle.registration_token.as_deref(),
+        )?;
+
+        let nonce_response = registration_relay
             .get_registration_nonce()
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("nonce fetch"), e))?;
@@ -570,8 +428,7 @@ impl PairingService {
                     signed_registry_snapshot: bundle.signed_keyring.clone(),
                 });
 
-        let register_response = self
-            .relay
+        let register_response = registration_relay
             .register_device(crate::relay::traits::RegisterRequest {
                 device_id: device_id.clone(),
                 signing_public_key: signing_key.public_key_bytes().to_vec(),
@@ -608,7 +465,7 @@ impl PairingService {
         self.secure_store.set("device_id", device_id.as_bytes())?;
         self.secure_store
             .set("epoch", bundle.current_epoch.to_string().as_bytes())?;
-        if bundle.current_epoch > 0 && !bundle.epoch_key.is_empty() {
+        if bundle.current_epoch > 0 && bundle.epoch_key.len() == 32 {
             use base64::{engine::general_purpose::STANDARD, Engine};
             let encoded = STANDARD.encode(&bundle.epoch_key);
             self.secure_store.set(
@@ -653,15 +510,20 @@ impl PairingService {
     }
 
     /// Complete the initiator side after SAS confirmation.
+    ///
+    /// The `sync_relay` is used for relay operations that require the real
+    /// sync_id (e.g., listing devices, posting rekey artifacts). The
+    /// `pairing_relay` handles ceremony slot exchange (no sync_id needed).
     pub async fn complete_bootstrap_initiator(
         &self,
         ceremony: &InitiatorCeremony,
-        relay: &dyn PairingRelay,
+        pairing_relay: &dyn PairingRelay,
         password: &str,
+        sync_relay: &dyn SyncRelay,
     ) -> Result<()> {
         // Verify the joiner's confirmation MAC before sending credentials.
         let confirmation = wait_for_pairing_slot_bytes(
-            relay,
+            pairing_relay,
             &ceremony.rendezvous_id_hex(),
             PairingSlot::Confirmation,
             "joiner confirmation",
@@ -699,15 +561,14 @@ impl PairingService {
             .map_err(|e| CoreError::Engine(format!("invalid stored epoch value: {e}")))?;
         let epoch_key = self.load_epoch_key(&key_hierarchy, current_epoch)?;
 
-        let bootstrap_bytes = relay
+        let bootstrap_bytes = pairing_relay
             .get_bootstrap(&ceremony.rendezvous_id_hex())
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("fetching bootstrap"), e))?;
         let bootstrap_record = JoinerBootstrapRecord::from_canonical_bytes(&bootstrap_bytes)
             .ok_or_else(|| CoreError::Engine("failed to parse JoinerBootstrapRecord".into()))?;
 
-        let mut devices = self
-            .relay
+        let mut devices = sync_relay
             .list_devices()
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("listing devices"), e))?;
@@ -800,7 +661,7 @@ impl PairingService {
         };
 
         let credential_envelope = ceremony.encrypt_credentials(&credential_bundle)?;
-        relay
+        pairing_relay
             .put_slot(
                 &ceremony.rendezvous_id_hex(),
                 PairingSlot::Credentials,
@@ -810,7 +671,7 @@ impl PairingService {
             .map_err(|e| CoreError::from_relay_with_context(Some("posting credentials"), e))?;
 
         let joiner_bundle_bytes = wait_for_pairing_slot_bytes(
-            relay,
+            pairing_relay,
             &ceremony.rendezvous_id_hex(),
             PairingSlot::Joiner,
             "joiner bundle",
@@ -829,7 +690,7 @@ impl PairingService {
 
         let next_epoch = current_epoch.saturating_add(1);
         let epoch_key = EpochManager::post_rekey(
-            self.relay.as_ref(),
+            sync_relay,
             &mut key_hierarchy,
             next_epoch,
         )
@@ -842,17 +703,12 @@ impl PairingService {
         self.secure_store
             .set(&format!("epoch_key_{next_epoch}"), encoded.as_bytes())?;
 
-        relay
+        pairing_relay
             .delete_session(&ceremony.rendezvous_id_hex())
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("deleting pairing session"), e))?;
 
         Ok(())
-    }
-
-    /// Access the underlying relay.
-    pub fn relay(&self) -> &Arc<dyn SyncRelay> {
-        &self.relay
     }
 
     /// Access the underlying secure store.
@@ -936,33 +792,12 @@ impl PairingService {
         Ok(Some((device_secret, device_id)))
     }
 
-    fn load_joiner_identity(&self, response: &PairingResponse) -> Result<(DeviceSecret, String)> {
-        let expected_device_id = response.joiner_device_id.clone();
-        if let Some((device_secret, device_id)) = self.load_pending_identity()? {
-            if let Some(expected) = expected_device_id.as_deref() {
-                if device_id != expected {
-                    return Err(CoreError::Engine(
-                        "pairing response targets a different join request".into(),
-                    ));
-                }
-            }
-            return Ok((device_secret, device_id));
-        }
-
-        if response.registry_approval_signature.is_some() {
-            return Err(CoreError::Engine(
-                "approved pairing response requires the original pairing request identity".into(),
-            ));
-        }
-
-        let device_id = expected_device_id.unwrap_or_else(crate::node_id::generate_node_id);
-        Ok((DeviceSecret::generate(), device_id))
-    }
 }
 
 /// Verify a hybrid invitation signature.
 ///
 /// Accepts only the Phase 6 V3 labeled-WNS wire format.
+#[cfg(test)]
 fn verify_hybrid_invitation(
     signing_data: &[u8],
     sig_bytes: &[u8],
@@ -1317,6 +1152,11 @@ mod tests {
         }
     }
 
+    /// Helper: build a relay-builder closure that always returns a MockRelay.
+    fn mock_relay_builder() -> impl FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send {
+        |_sync_id, _device_id, _token| Ok(Arc::new(MockRelay) as Arc<dyn SyncRelay>)
+    }
+
     #[derive(Default)]
     struct BootstrapRegistryState {
         devices: Vec<DeviceInfo>,
@@ -1513,7 +1353,7 @@ mod tests {
     async fn bootstrap_pairing_round_trip_and_rekey() {
         let password = "bootstrap-password";
         let relay_url = "https://relay.example.com";
-        let sync_id = "sync-bootstrap-001";
+        let sync_id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 
         let device_secret = DeviceSecret::generate();
         let device_id = crate::node_id::generate_node_id();
@@ -1557,11 +1397,11 @@ mod tests {
             .set("registration_token", b"relay-registration-token")
             .unwrap();
         let initiator_service =
-            PairingService::new(registry_relay.clone(), initiator_store.clone());
+            PairingService::new(initiator_store.clone());
 
         let joiner_store = Arc::new(MemStore::default());
-        let joiner_service = PairingService::new(registry_relay.clone(), joiner_store.clone());
-        let joiner_service_task = PairingService::new(registry_relay.clone(), joiner_store.clone());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
 
         let mailbox = Arc::new(MockPairingRelay::new());
 
@@ -1592,15 +1432,27 @@ mod tests {
         assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
 
         let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
         let joiner_handle = tokio::spawn(async move {
             joiner_service_task
-                .complete_bootstrap_join(&joiner, joiner_mailbox.as_ref(), &[], password)
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |sync_id, device_id, _token| {
+                        assert_eq!(sync_id.len(), 64, "relay-builder must receive real 64-hex sync_id, got: {sync_id}");
+                        assert!(sync_id.chars().all(|c| c.is_ascii_hexdigit()), "sync_id must be hex");
+                        assert!(!device_id.is_empty(), "device_id must not be empty");
+                        Ok(joiner_relay as Arc<dyn SyncRelay>)
+                    },
+                )
                 .await
                 .unwrap()
         });
 
         initiator_service
-            .complete_bootstrap_initiator(&initiator, mailbox.as_ref(), password)
+            .complete_bootstrap_initiator(&initiator, mailbox.as_ref(), password, registry_relay.as_ref())
             .await
             .unwrap();
 
@@ -1685,7 +1537,7 @@ mod tests {
     async fn bootstrap_join_fetches_credentials_when_bytes_not_supplied() {
         let password = "bootstrap-password";
         let relay_url = "https://relay.example.com";
-        let sync_id = "sync-bootstrap-fetch";
+        let sync_id = "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3";
 
         let device_secret = DeviceSecret::generate();
         let device_id = crate::node_id::generate_node_id();
@@ -1720,10 +1572,10 @@ mod tests {
             &wrapped_dek,
             &salt,
         );
-        let initiator_service = PairingService::new(registry_relay.clone(), initiator_store);
+        let initiator_service = PairingService::new(initiator_store);
         let joiner_store = Arc::new(MemStore::default());
-        let joiner_service = PairingService::new(registry_relay.clone(), joiner_store.clone());
-        let joiner_service_task = PairingService::new(registry_relay.clone(), joiner_store.clone());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
         let mailbox = Arc::new(MockPairingRelay::new());
 
         let (mut joiner, token) = joiner_service
@@ -1745,15 +1597,27 @@ mod tests {
         assert_eq!(joiner_sas.words, initiator_sas.words);
 
         let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
         let joiner_handle = tokio::spawn(async move {
             joiner_service_task
-                .complete_bootstrap_join(&joiner, joiner_mailbox.as_ref(), &[], password)
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |sync_id, device_id, _token| {
+                        assert_eq!(sync_id.len(), 64, "relay-builder must receive real 64-hex sync_id, got: {sync_id}");
+                        assert!(sync_id.chars().all(|c| c.is_ascii_hexdigit()), "sync_id must be hex");
+                        assert!(!device_id.is_empty(), "device_id must not be empty");
+                        Ok(joiner_relay as Arc<dyn SyncRelay>)
+                    },
+                )
                 .await
                 .unwrap()
         });
 
         initiator_service
-            .complete_bootstrap_initiator(&initiator, mailbox.as_ref(), password)
+            .complete_bootstrap_initiator(&initiator, mailbox.as_ref(), password, registry_relay.as_ref())
             .await
             .unwrap();
 
@@ -1763,9 +1627,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_sync_group_returns_credentials_and_invite() {
-        let relay = Arc::new(MockRelay);
         let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store.clone());
+        let service = PairingService::new(store.clone());
 
         let (creds, response) = service
             .create_sync_group(
@@ -1776,6 +1639,7 @@ mod tests {
                 None,
                 None,
                 None,
+                mock_relay_builder(),
             )
             .await
             .unwrap();
@@ -1797,9 +1661,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_sync_group_persists_device_identity() {
-        let relay = Arc::new(MockRelay);
         let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store.clone());
+        let service = PairingService::new(store.clone());
 
         let (_creds, _response) = service
             .create_sync_group(
@@ -1810,6 +1673,7 @@ mod tests {
                 None,
                 None,
                 None,
+                mock_relay_builder(),
             )
             .await
             .unwrap();
@@ -1826,108 +1690,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_sync_group_unlocks_key_hierarchy() {
-        let relay = Arc::new(MockRelay);
-        let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store.clone());
-
-        // Create a sync group first to get valid credentials
-        let (_creds, response) = service
-            .create_sync_group(
-                "my-password",
-                "wss://relay.example.com",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Now join using the pairing response
-        let join_store = Arc::new(MemStore::default());
-        let join_service = PairingService::new(Arc::new(MockRelay), join_store.clone());
-
-        let (kh, snapshot) = join_service
-            .join_sync_group(&response, "my-password")
-            .await
-            .unwrap();
-
-        assert!(kh.is_unlocked());
-        // Should be able to derive database key
-        assert!(kh.database_key().is_ok());
-        // Verified snapshot should contain the inviter device
-        assert_eq!(snapshot.entries.len(), 1);
-        assert_eq!(snapshot.entries[0].status, "active");
-    }
-
-    #[tokio::test]
-    async fn join_with_wrong_password_fails() {
-        let relay = Arc::new(MockRelay);
-        let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store);
-
-        let (_creds, response) = service
-            .create_sync_group(
-                "correct-password",
-                "wss://relay.example.com",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let join_store = Arc::new(MemStore::default());
-        let join_service = PairingService::new(Arc::new(MockRelay), join_store);
-
-        let result = join_service.join_sync_group(&response, "wrong-password").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn join_rejects_invalid_epoch_fields_before_mutating_state() {
-        let join_store = Arc::new(MemStore::default());
-        let join_service = PairingService::new(Arc::new(MockRelay), join_store.clone());
-
-        let response = PairingResponse {
-            relay_url: "wss://relay.example.com".into(),
-            sync_id: "not-checked-yet".into(),
-            mnemonic: mnemonic::generate(),
-            wrapped_dek: vec![0x42; 72],
-            salt: vec![0x13; 32],
-            signed_invitation: hex::encode([0xBB; 64]),
-            signed_keyring: vec![0xCC; 200],
-            inviter_device_id: "device-001".into(),
-            inviter_ed25519_pk: vec![0xAA; 32],
-            inviter_ml_dsa_65_pk: Vec::new(),
-            joiner_device_id: Some("abcdef123456".to_string()),
-            current_epoch: 1,
-            epoch_key: vec![],
-            registry_approval_signature: None,
-            registration_token: None,
-        };
-
-        let err = match join_service.join_sync_group(&response, "irrelevant").await {
-            Ok(_) => panic!("invalid epoch-bearing response should be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            format!("{err}").contains("invalid pairing response"),
-            "unexpected error: {err}"
-        );
-        assert!(join_store.get("setup_rollback_marker").unwrap().is_none());
-        assert!(join_store.get("device_id").unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn create_with_custom_mnemonic() {
-        let relay = Arc::new(MockRelay);
         let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store);
+        let service = PairingService::new(store);
 
         let custom = mnemonic::generate();
         let (creds, _invite) = service
@@ -1939,6 +1704,7 @@ mod tests {
                 None,
                 None,
                 None,
+                mock_relay_builder(),
             )
             .await
             .unwrap();
@@ -1948,9 +1714,8 @@ mod tests {
 
     #[tokio::test]
     async fn invitation_sign_and_verify_roundtrip() {
-        let relay = Arc::new(MockRelay);
         let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store);
+        let service = PairingService::new(store);
 
         let (_creds, resp) = service
             .create_sync_group(
@@ -1961,6 +1726,7 @@ mod tests {
                 None,
                 None,
                 None,
+                mock_relay_builder(),
             )
             .await
             .unwrap();
@@ -2035,9 +1801,11 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_invitation_rejected() {
-        let relay = Arc::new(MockRelay);
+        // This test verified that join_sync_group rejected tampered invitations.
+        // Since join_sync_group was removed (replaced by the ceremony-based flow),
+        // we verify the underlying verification helper directly.
         let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store);
+        let service = PairingService::new(store);
 
         let (_creds, response) = service
             .create_sync_group(
@@ -2048,6 +1816,7 @@ mod tests {
                 None,
                 None,
                 None,
+                mock_relay_builder(),
             )
             .await
             .unwrap();
@@ -2056,10 +1825,26 @@ mod tests {
         let mut tampered = response.clone();
         tampered.sync_id = "tampered-sync-id".into();
 
-        let join_store = Arc::new(MemStore::default());
-        let join_service = PairingService::new(Arc::new(MockRelay), join_store);
-
-        let result = join_service.join_sync_group(&tampered, "test-pw").await;
+        let inviter_pk: [u8; 32] = tampered.inviter_ed25519_pk.clone().try_into().unwrap();
+        let sig_bytes = prism_sync_crypto::hex::decode(&tampered.signed_invitation).unwrap();
+        let signing_data = build_invitation_signing_data_v2(
+            &tampered.sync_id,
+            &tampered.relay_url,
+            &tampered.wrapped_dek,
+            &tampered.salt,
+            &tampered.inviter_device_id,
+            &inviter_pk,
+            &tampered.inviter_ml_dsa_65_pk,
+            tampered.joiner_device_id.as_deref(),
+            tampered.current_epoch,
+            &tampered.epoch_key,
+        );
+        let result = verify_hybrid_invitation(
+            &signing_data,
+            &sig_bytes,
+            &inviter_pk,
+            &tampered.inviter_ml_dsa_65_pk,
+        );
         let err_msg = match result {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("expected error for tampered invitation"),
@@ -2072,9 +1857,8 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_inviter_key_rejected() {
-        let relay = Arc::new(MockRelay);
         let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay, store);
+        let service = PairingService::new(store);
 
         let (_creds, response) = service
             .create_sync_group(
@@ -2085,6 +1869,7 @@ mod tests {
                 None,
                 None,
                 None,
+                mock_relay_builder(),
             )
             .await
             .unwrap();
@@ -2095,10 +1880,26 @@ mod tests {
         let fake_key = fake_secret.ed25519_keypair("fake").unwrap();
         tampered.inviter_ed25519_pk = fake_key.public_key_bytes().to_vec();
 
-        let join_store = Arc::new(MemStore::default());
-        let join_service = PairingService::new(Arc::new(MockRelay), join_store);
-
-        let result = join_service.join_sync_group(&tampered, "test-pw").await;
+        let inviter_pk: [u8; 32] = tampered.inviter_ed25519_pk.clone().try_into().unwrap();
+        let sig_bytes = prism_sync_crypto::hex::decode(&tampered.signed_invitation).unwrap();
+        let signing_data = build_invitation_signing_data_v2(
+            &tampered.sync_id,
+            &tampered.relay_url,
+            &tampered.wrapped_dek,
+            &tampered.salt,
+            &tampered.inviter_device_id,
+            &inviter_pk,
+            &tampered.inviter_ml_dsa_65_pk,
+            tampered.joiner_device_id.as_deref(),
+            tampered.current_epoch,
+            &tampered.epoch_key,
+        );
+        let result = verify_hybrid_invitation(
+            &signing_data,
+            &sig_bytes,
+            &inviter_pk,
+            &tampered.inviter_ml_dsa_65_pk,
+        );
         let err_msg = match result {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("expected error for wrong inviter key"),
@@ -2280,8 +2081,9 @@ mod tests {
             captured_req: StdMutex::new(None),
         });
         let store = Arc::new(MemStore::default());
-        let service = PairingService::new(relay.clone(), store);
+        let service = PairingService::new(store);
 
+        let relay_clone = relay.clone();
         let (_creds, _invite) = service
             .create_sync_group(
                 "pw",
@@ -2291,6 +2093,7 @@ mod tests {
                 None,
                 None,
                 None,
+                |_sync_id, _device_id, _token| Ok(relay_clone as Arc<dyn SyncRelay>),
             )
             .await
             .unwrap();
@@ -2308,391 +2111,12 @@ mod tests {
         assert!(req.pow_solution.is_none());
     }
 
-    #[tokio::test]
-    async fn join_existing_group_uses_pending_identity_and_registry_approval() {
-        use std::sync::Mutex as StdMutex;
+    // Tests for `join_sync_group` (legacy pre-ceremony flow) were removed
+    // along with the method. The ceremony-based flow is tested by
+    // `bootstrap_pairing_round_trip_and_rekey` and
+    // `bootstrap_join_fetches_credentials_when_bytes_not_supplied`.
+    // External integration tests in `tests/consumer_api.rs` and
+    // `tests/pairing_failures.rs` also exercise the legacy flow for
+    // backwards compatibility and are kept intact.
 
-        struct CapturingRelay {
-            captured_req: StdMutex<Option<RegisterRequest>>,
-        }
-
-        #[async_trait]
-        impl SyncRelay for CapturingRelay {
-            async fn get_registration_nonce(
-                &self,
-            ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
-                Ok(RegistrationNonceResponse {
-                    nonce: "join-nonce".to_string(),
-                    pow_challenge: None,
-                    min_signature_version: None,
-                })
-            }
-            async fn register_device(
-                &self,
-                req: RegisterRequest,
-            ) -> std::result::Result<RegisterResponse, RelayError> {
-                *self.captured_req.lock().unwrap() = Some(req);
-                Ok(RegisterResponse {
-                    device_session_token: "mock-token".to_string(),
-                    min_signature_version: None,
-                })
-            }
-            async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
-                unimplemented!()
-            }
-            async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> {
-                unimplemented!()
-            }
-            async fn get_snapshot(
-                &self,
-            ) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
-                unimplemented!()
-            }
-            async fn put_snapshot(
-                &self,
-                _: i32,
-                _: i64,
-                _: Vec<u8>,
-                _: Option<u64>,
-                _: Option<String>,
-                _: String,
-            ) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
-                unimplemented!()
-            }
-            async fn revoke_device(
-                &self,
-                _: &str,
-                _: bool,
-                _: i32,
-                _: HashMap<String, Vec<u8>>,
-            ) -> std::result::Result<i32, RelayError> {
-                unimplemented!()
-            }
-            async fn post_rekey_artifacts(
-                &self,
-                _: i32,
-                _: HashMap<String, Vec<u8>>,
-            ) -> std::result::Result<i32, RelayError> {
-                unimplemented!()
-            }
-            async fn get_rekey_artifact(
-                &self,
-                _: i32,
-                _: &str,
-            ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
-                unimplemented!()
-            }
-            async fn deregister(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
-                unimplemented!()
-            }
-            async fn rotate_ml_dsa(
-                &self,
-                _: &str,
-                _: &[u8],
-                _: u32,
-                _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
-                _: Option<&[u8]>,
-            ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
-                unimplemented!()
-            }
-            async fn upload_media(
-                &self,
-                _: &str,
-                _: &str,
-                _: Vec<u8>,
-            ) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
-                unimplemented!()
-            }
-            async fn dispose(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-                Ok(None)
-            }
-        }
-
-        let inviter_secret = DeviceSecret::generate();
-        let inviter_device_id = "inviter-001".to_string();
-        let inviter_signing_key = inviter_secret.ed25519_keypair(&inviter_device_id).unwrap();
-        let inviter_exchange_key = inviter_secret.x25519_keypair(&inviter_device_id).unwrap();
-        let inviter_pq_signing_key = inviter_secret.ml_dsa_65_keypair(&inviter_device_id).unwrap();
-        let inviter_pq_kem_key = inviter_secret.ml_kem_768_keypair(&inviter_device_id).unwrap();
-
-        let joiner_secret = DeviceSecret::generate();
-        let joiner_device_id = "joiner-001".to_string();
-        let joiner_signing_key = joiner_secret.ed25519_keypair(&joiner_device_id).unwrap();
-        let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
-        let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
-        let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
-        let inviter_xwing_key = inviter_secret.xwing_keypair(&inviter_device_id).unwrap();
-        let joiner_xwing_key = joiner_secret.xwing_keypair(&joiner_device_id).unwrap();
-
-        let snapshot = SignedRegistrySnapshot::new(vec![
-            RegistrySnapshotEntry {
-                sync_id: "sync-approved".into(),
-                device_id: inviter_device_id.clone(),
-                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
-                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
-                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-            RegistrySnapshotEntry {
-                sync_id: "sync-approved".into(),
-                device_id: joiner_device_id.clone(),
-                ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
-                x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
-                ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-        ], 1);
-        let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);
-        let approval_data =
-            build_registry_approval_signing_data_v2("sync-approved", &inviter_device_id, &signed_keyring);
-        let approval_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"registry_approval",
-            &approval_data,
-        )
-        .unwrap();
-        let hybrid_approval = prism_sync_crypto::pq::HybridSignature {
-            ed25519_sig: inviter_signing_key.sign(&approval_m_prime),
-            ml_dsa_65_sig: inviter_pq_signing_key.sign(&approval_m_prime),
-        };
-        let mut approval_wire = vec![0x03u8];
-        approval_wire.extend_from_slice(&hybrid_approval.to_bytes());
-        let approval_signature = hex::encode(&approval_wire);
-
-        let mnemonic = mnemonic::generate();
-        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
-        let mut key_hierarchy = KeyHierarchy::new();
-        let (wrapped_dek, salt) = key_hierarchy
-            .initialize("test-password", &secret_key)
-            .unwrap();
-        let signing_data = build_invitation_signing_data_v2(
-            "sync-approved",
-            "wss://relay.example.com",
-            &wrapped_dek,
-            &salt,
-            &inviter_device_id,
-            &inviter_signing_key.public_key_bytes(),
-            &inviter_pq_signing_key.public_key_bytes(),
-            Some(&joiner_device_id),
-            0,
-            &[],
-        );
-        let invitation_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"invitation",
-            &signing_data,
-        )
-        .unwrap();
-        let invitation_sig = prism_sync_crypto::pq::HybridSignature {
-            ed25519_sig: inviter_signing_key.sign(&invitation_m_prime),
-            ml_dsa_65_sig: inviter_pq_signing_key.sign(&invitation_m_prime),
-        };
-        let mut invitation_wire = vec![0x03u8];
-        invitation_wire.extend_from_slice(&invitation_sig.to_bytes());
-
-        let response = PairingResponse {
-            relay_url: "wss://relay.example.com".into(),
-            sync_id: "sync-approved".into(),
-            mnemonic,
-            wrapped_dek,
-            salt,
-            signed_invitation: hex::encode(&invitation_wire),
-            signed_keyring: signed_keyring.clone(),
-            inviter_device_id: inviter_device_id.clone(),
-            inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
-            inviter_ml_dsa_65_pk: inviter_pq_signing_key.public_key_bytes(),
-            joiner_device_id: Some(joiner_device_id.clone()),
-            current_epoch: 0,
-            epoch_key: vec![],
-            registry_approval_signature: Some(approval_signature.clone()),
-            registration_token: None,
-        };
-
-        let relay = Arc::new(CapturingRelay {
-            captured_req: StdMutex::new(None),
-        });
-        let store = Arc::new(MemStore::default());
-        store
-            .set("pending_device_secret", joiner_secret.as_bytes())
-            .unwrap();
-        store
-            .set("pending_device_id", joiner_device_id.as_bytes())
-            .unwrap();
-        let service = PairingService::new(relay.clone(), store);
-
-        let (_kh, verified_snapshot) = service
-            .join_sync_group(&response, "test-password")
-            .await
-            .unwrap();
-        assert_eq!(verified_snapshot.entries.len(), 2);
-
-        let captured = relay.captured_req.lock().unwrap();
-        let req = captured.as_ref().expect("registration request captured");
-        assert_eq!(req.device_id, joiner_device_id);
-        assert_eq!(
-            req.signing_public_key,
-            joiner_signing_key.public_key_bytes().to_vec()
-        );
-        assert_eq!(
-            req.x25519_public_key,
-            joiner_exchange_key.public_key_bytes().to_vec()
-        );
-        let approval = req
-            .registry_approval
-            .as_ref()
-            .expect("registry approval present");
-        assert_eq!(approval.approver_device_id, inviter_device_id);
-        assert_eq!(
-            approval.approver_ed25519_pk,
-            hex::encode(inviter_signing_key.public_key_bytes())
-        );
-        assert_eq!(approval.approval_signature, approval_signature);
-        assert_eq!(approval.signed_registry_snapshot, signed_keyring);
-    }
-
-    #[tokio::test]
-    async fn approved_pairing_requires_pending_joiner_identity() {
-        let inviter_secret = DeviceSecret::generate();
-        let inviter_device_id = "inviter-001".to_string();
-        let inviter_signing_key = inviter_secret.ed25519_keypair(&inviter_device_id).unwrap();
-        let inviter_exchange_key = inviter_secret.x25519_keypair(&inviter_device_id).unwrap();
-        let inviter_pq_signing_key = inviter_secret.ml_dsa_65_keypair(&inviter_device_id).unwrap();
-        let inviter_pq_kem_key = inviter_secret.ml_kem_768_keypair(&inviter_device_id).unwrap();
-
-        let joiner_device_id = "joiner-001".to_string();
-        let joiner_secret = DeviceSecret::generate();
-        let joiner_signing_key = joiner_secret.ed25519_keypair(&joiner_device_id).unwrap();
-        let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
-        let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
-        let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
-        let inviter_xwing_key = inviter_secret.xwing_keypair(&inviter_device_id).unwrap();
-        let joiner_xwing_key = joiner_secret.xwing_keypair(&joiner_device_id).unwrap();
-
-        let snapshot = SignedRegistrySnapshot::new(vec![
-            RegistrySnapshotEntry {
-                sync_id: "sync-approved".into(),
-                device_id: inviter_device_id.clone(),
-                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
-                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
-                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-            RegistrySnapshotEntry {
-                sync_id: "sync-approved".into(),
-                device_id: joiner_device_id.clone(),
-                ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
-                x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
-                ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
-                ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
-                x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-        ], 1);
-        let signed_keyring = snapshot.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key);
-        let approval_data =
-            build_registry_approval_signing_data_v2("sync-approved", &inviter_device_id, &signed_keyring);
-        let approval_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"registry_approval",
-            &approval_data,
-        )
-        .unwrap();
-        let hybrid_approval = prism_sync_crypto::pq::HybridSignature {
-            ed25519_sig: inviter_signing_key.sign(&approval_m_prime),
-            ml_dsa_65_sig: inviter_pq_signing_key.sign(&approval_m_prime),
-        };
-        let mut approval_wire = vec![0x03u8];
-        approval_wire.extend_from_slice(&hybrid_approval.to_bytes());
-        let approval_signature = hex::encode(&approval_wire);
-
-        let mnemonic = mnemonic::generate();
-        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
-        let mut key_hierarchy = KeyHierarchy::new();
-        let (wrapped_dek, salt) = key_hierarchy
-            .initialize("test-password", &secret_key)
-            .unwrap();
-        let signing_data = build_invitation_signing_data_v2(
-            "sync-approved",
-            "wss://relay.example.com",
-            &wrapped_dek,
-            &salt,
-            &inviter_device_id,
-            &inviter_signing_key.public_key_bytes(),
-            &inviter_pq_signing_key.public_key_bytes(),
-            Some(&joiner_device_id),
-            0,
-            &[],
-        );
-        let invitation_m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"invitation",
-            &signing_data,
-        )
-        .unwrap();
-        let invitation_sig = prism_sync_crypto::pq::HybridSignature {
-            ed25519_sig: inviter_signing_key.sign(&invitation_m_prime),
-            ml_dsa_65_sig: inviter_pq_signing_key.sign(&invitation_m_prime),
-        };
-        let mut invitation_wire = vec![0x03u8];
-        invitation_wire.extend_from_slice(&invitation_sig.to_bytes());
-
-        let response = PairingResponse {
-            relay_url: "wss://relay.example.com".into(),
-            sync_id: "sync-approved".into(),
-            mnemonic,
-            wrapped_dek,
-            salt,
-            signed_invitation: hex::encode(&invitation_wire),
-            signed_keyring,
-            inviter_device_id,
-            inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
-            inviter_ml_dsa_65_pk: inviter_pq_signing_key.public_key_bytes(),
-            joiner_device_id: Some(joiner_device_id),
-            current_epoch: 0,
-            epoch_key: vec![],
-            registry_approval_signature: Some(approval_signature),
-            registration_token: None,
-        };
-
-        let service = PairingService::new(Arc::new(MockRelay), Arc::new(MemStore::default()));
-        let err = match service.join_sync_group(&response, "test-password").await {
-            Ok(_) => panic!("approved pairing without pending identity should fail"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("requires the original pairing request identity"),
-            "unexpected error: {err}",
-        );
-    }
 }

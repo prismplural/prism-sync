@@ -19,144 +19,21 @@ use prism_sync_core::pairing::models::{
     SignedRegistrySnapshot,
 };
 use prism_sync_core::pairing::service::{cleanup_failed_setup, PairingService};
-use prism_sync_core::relay::MockRelay;
+use prism_sync_core::relay::{MockRelay, SyncRelay};
 use prism_sync_core::secure_store::SecureStore;
 use prism_sync_crypto::DeviceSecret;
 use prism_sync_crypto::pq::HybridSignature;
 
 use common::MemorySecureStore;
 
-// ── Helpers ──
-
-async fn create_invite(password: &str) -> (PairingResponse, Arc<MemorySecureStore>) {
-    let relay = Arc::new(MockRelay::new());
-    let store = Arc::new(MemorySecureStore::new());
-    let service = PairingService::new(relay, store.clone());
-
-    let (_creds, response) = service
-        .create_sync_group(
-            password,
-            "wss://relay.example.com",
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("create_sync_group should succeed");
-
-    (response, store)
-}
-
 // ══════════════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Modifying a field in PairingResponse after signing must cause join to
-/// reject the invitation with a signature error.
-#[tokio::test]
-async fn join_with_tampered_invitation_fails() {
-    let (mut response, _) = create_invite("test-password").await;
-
-    // Tamper: change the sync_id after the invitation was signed
-    response.sync_id = "tampered-sync-id-value".into();
-
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store);
-
-    let result = join_service
-        .join_sync_group(&response, "test-password")
-        .await;
-
-    let msg = match result {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("join with tampered invitation should fail"),
-    };
-    assert!(
-        msg.contains("signature invalid"),
-        "expected signature error, got: {msg}"
-    );
-}
-
-/// Modifying the wrapped_dek (payload field) after signing must also be
-/// detected by signature verification.
-#[tokio::test]
-async fn join_with_tampered_wrapped_dek_fails() {
-    let (mut response, _) = create_invite("test-password").await;
-
-    // Tamper: flip a byte in the wrapped DEK
-    if let Some(byte) = response.wrapped_dek.first_mut() {
-        *byte ^= 0xFF;
-    }
-
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store);
-
-    let result = join_service
-        .join_sync_group(&response, "test-password")
-        .await;
-
-    let msg = match result {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("join with tampered wrapped_dek should fail"),
-    };
-    assert!(
-        msg.contains("signature invalid"),
-        "expected signature error, got: {msg}"
-    );
-}
-
-/// Replacing the inviter's public key with a different device's key must
-/// cause signature verification to fail.
-#[tokio::test]
-async fn join_with_wrong_inviter_key_fails() {
-    let (mut response, _) = create_invite("test-password").await;
-
-    // Replace the inviter's public key with a different key
-    let fake_secret = DeviceSecret::generate();
-    let fake_key = fake_secret.ed25519_keypair("fake").unwrap();
-    response.inviter_ed25519_pk = fake_key.public_key_bytes().to_vec();
-
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store);
-
-    let result = join_service
-        .join_sync_group(&response, "test-password")
-        .await;
-
-    let msg = match result {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("join with wrong inviter key should fail"),
-    };
-    assert!(
-        msg.contains("signature invalid"),
-        "expected signature error, got: {msg}"
-    );
-}
-
-/// Joining with a different password than was used to create the group must
-/// fail (Argon2id will derive a different MEK, unwrapping the DEK fails).
-#[tokio::test]
-async fn join_with_wrong_password_fails() {
-    let (response, _) = create_invite("correct-password").await;
-
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store);
-
-    let result = join_service
-        .join_sync_group(&response, "wrong-password")
-        .await;
-
-    assert!(
-        result.is_err(),
-        "join with wrong password should return Err"
-    );
-}
+// Note: Tests for tampered invitations, wrong password, and wrong inviter key
+// that previously used the removed `join_sync_group` method are now covered by
+// unit tests in `pairing/service.rs` (tampered_invitation_rejected,
+// wrong_inviter_key_rejected) and by the bootstrap ceremony round-trip tests.
 
 /// When `setup_rollback_marker` is present in the secure store (simulating a
 /// crash mid-setup), `cleanup_failed_setup` must remove all partial state.
@@ -208,115 +85,22 @@ async fn cleanup_no_marker_is_noop() {
     assert!(store.get("unrelated_key").unwrap().is_some());
 }
 
-/// After a successful join, the verified registry snapshot can be imported
-/// into the device registry for TOFU key pinning.
-#[tokio::test]
-async fn join_imports_verified_registry_snapshot() {
-    use prism_sync_core::device_registry::DeviceRegistryManager;
-    use prism_sync_core::storage::RusqliteSyncStorage;
-
-    let (response, _) = create_invite("my-password").await;
-
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store);
-
-    let (_kh, snapshot) = join_service
-        .join_sync_group(&response, "my-password")
-        .await
-        .expect("join should succeed");
-
-    // Snapshot should contain exactly the inviter device
-    assert_eq!(snapshot.entries.len(), 1);
-    assert_eq!(snapshot.entries[0].status, "active");
-    assert_eq!(snapshot.entries[0].ed25519_public_key.len(), 32);
-    assert_eq!(snapshot.entries[0].x25519_public_key.len(), 32);
-
-    // Import into a real storage backend
-    let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
-    let records = snapshot.to_device_records();
-    DeviceRegistryManager::import_keyring(&storage, &response.sync_id, &records)
-        .expect("import should succeed");
-
-    // Verify the imported device can be found
-    DeviceRegistryManager::verify_device_key(
-        &storage,
-        &response.sync_id,
-        &records[0].device_id,
-        &records[0].ed25519_public_key,
-    )
-    .expect("imported device should verify");
-}
-
-/// A tampered signed_keyring (registry snapshot) should be rejected during join.
-#[tokio::test]
-async fn join_rejects_tampered_registry_snapshot() {
-    let (mut response, _) = create_invite("test-password").await;
-
-    // Tamper: flip a byte in the registry snapshot JSON (after the 64-byte sig)
-    if response.signed_keyring.len() > 65 {
-        response.signed_keyring[65] ^= 0xFF;
-    }
-
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store);
-
-    let result = join_service
-        .join_sync_group(&response, "test-password")
-        .await;
-
-    let msg = match result {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("join with tampered registry snapshot should fail"),
-    };
-    assert!(
-        msg.contains("registry snapshot rejected"),
-        "expected registry snapshot error, got: {msg}"
-    );
-}
-
-/// After a successful join, the rollback marker must not be present.
-#[tokio::test]
-async fn successful_join_has_no_rollback_marker() {
-    let (response, _) = create_invite("my-password").await;
-
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store.clone());
-
-    let (kh, _snapshot) = join_service
-        .join_sync_group(&response, "my-password")
-        .await
-        .expect("join should succeed");
-
-    assert!(kh.is_unlocked());
-
-    // Rollback marker must be gone
-    assert!(
-        join_store.get("setup_rollback_marker").unwrap().is_none(),
-        "rollback marker should be removed after successful join"
-    );
-
-    // But credentials should be persisted
-    assert!(join_store.get("sync_id").unwrap().is_some());
-    assert!(join_store.get("device_id").unwrap().is_some());
-    assert!(join_store.get("device_secret").unwrap().is_some());
-    assert!(join_store.get("relay_url").unwrap().is_some());
-}
+// Tests for join_imports_verified_registry_snapshot, join_rejects_tampered_registry_snapshot,
+// and successful_join_has_no_rollback_marker were removed along with the `join_sync_group`
+// method. The ceremony-based flow (`complete_bootstrap_join`) is tested in the service module's
+// bootstrap_pairing_round_trip_and_rekey test.
 
 // ══════════════════════════════════════════════════════════════════════════
 // Pairing happy-path roundtrip tests (Agent A security plan)
 // ══════════════════════════════════════════════════════════════════════════
 
 /// Manually construct an approve flow (as approve_pairing_request does in
-/// the FFI layer) and verify the resulting PairingResponse can be joined.
+/// the FFI layer) and verify the resulting PairingResponse has valid signatures.
 #[tokio::test]
 async fn approve_flow_produces_verifiable_pairing_response() {
     // Device A: create sync group
-    let relay_a = Arc::new(MockRelay::new());
     let store_a = Arc::new(MemorySecureStore::new());
-    let service_a = PairingService::new(relay_a, store_a.clone());
+    let service_a = PairingService::new(store_a.clone());
 
     let password = "test-password";
     let (_creds, _invite) = service_a
@@ -328,6 +112,9 @@ async fn approve_flow_produces_verifiable_pairing_response() {
             None,
             None,
             None,
+            |_sync_id, _device_id, _token| {
+                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
+            },
         )
         .await
         .expect("create_sync_group should succeed");
@@ -470,19 +257,9 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(snapshot.entries[0].device_id, device_id_a);
 
-    // Verify: Device B can join using this response
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store);
-
-    let (kh, joined_snapshot) = join_service
-        .join_sync_group(&response, password)
-        .await
-        .expect("join should succeed with approved response");
-
-    assert!(kh.is_unlocked(), "key hierarchy should be unlocked");
-    assert_eq!(joined_snapshot.entries.len(), 1);
-    assert_eq!(joined_snapshot.entries[0].device_id, device_id_a);
+    // Note: The legacy join_sync_group method was removed. The approve flow's
+    // invitation and registry snapshot signatures are verified above. The
+    // ceremony-based join flow is tested by bootstrap_pairing_round_trip_and_rekey.
 }
 
 /// Full roundtrip: Device A creates group, Device B generates request,
@@ -493,12 +270,22 @@ async fn join_from_approval_roundtrip() {
     let password = "roundtrip-password";
 
     // ── Device A: create sync group ──
-    let relay_a = Arc::new(MockRelay::new());
     let store_a = Arc::new(MemorySecureStore::new());
-    let service_a = PairingService::new(relay_a, store_a.clone());
+    let service_a = PairingService::new(store_a.clone());
 
     let (_creds, _invite) = service_a
-        .create_sync_group(password, "wss://relay.test", None, None, None, None, None)
+        .create_sync_group(
+            password,
+            "wss://relay.test",
+            None,
+            None,
+            None,
+            None,
+            None,
+            |_sync_id, _device_id, _token| {
+                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
+            },
+        )
         .await
         .expect("create_sync_group");
 
@@ -625,73 +412,26 @@ async fn join_from_approval_roundtrip() {
         "full membership snapshot should be treated as existing-group admission"
     );
 
-    // ── Device B: join using the approved response ──
-    let join_relay = Arc::new(MockRelay::new());
-    let join_store = Arc::new(MemorySecureStore::new());
-    let join_service = PairingService::new(join_relay, join_store.clone());
-
-    let (kh, snapshot) = join_service
-        .join_sync_group(&response, password)
-        .await
-        .expect("join should succeed");
-
-    assert!(kh.is_unlocked());
+    // Verify the signed registry snapshot directly (join_sync_group was removed)
+    let verified_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+        &response.signed_keyring,
+        &signing_key_a.public_key_bytes(),
+        &pq_signing_key_a.public_key_bytes(),
+    )
+    .expect("registry snapshot should verify");
 
     // Registry snapshot must contain both the approver and joiner.
-    assert_eq!(snapshot.entries.len(), 2);
-    assert!(snapshot.entries.iter().any(|e| e.device_id == device_id_a));
-    assert!(snapshot.entries.iter().any(|e| e.device_id == device_id_b));
-    let approver_entry = snapshot
-        .entries
-        .iter()
-        .find(|e| e.device_id == device_id_a)
-        .expect("approver entry should be present");
-    assert_eq!(approver_entry.status, "active");
-    assert_eq!(approver_entry.ed25519_public_key.len(), 32);
-    assert_eq!(approver_entry.x25519_public_key.len(), 32);
-
-    // Verify the snapshot can be imported into storage
-    let storage =
-        prism_sync_core::storage::RusqliteSyncStorage::in_memory().expect("in-memory storage");
-    let records = snapshot.to_device_records();
-    prism_sync_core::device_registry::DeviceRegistryManager::import_keyring(
-        &storage, &sync_id, &records,
-    )
-    .expect("import should succeed");
-
-    // Verify imported keys match the approved registry snapshot.
-    prism_sync_core::device_registry::DeviceRegistryManager::verify_device_key(
-        &storage,
-        &sync_id,
-        &device_id_a,
-        &signing_key_a.public_key_bytes(),
-    )
-    .expect("imported approver should verify");
-    prism_sync_core::device_registry::DeviceRegistryManager::verify_device_key(
-        &storage,
-        &sync_id,
-        device_id_b,
-        &signing_key_b.public_key_bytes(),
-    )
-    .expect("imported joiner should verify");
-
-    // Verify Device B's credentials were persisted
-    assert!(join_store.get("sync_id").unwrap().is_some());
-    assert!(join_store.get("device_id").unwrap().is_some());
-    assert!(join_store.get("device_secret").unwrap().is_some());
-    assert!(
-        join_store.get("setup_rollback_marker").unwrap().is_none(),
-        "rollback marker should be cleared after successful join"
-    );
+    assert_eq!(verified_snapshot.entries.len(), 2);
+    assert!(verified_snapshot.entries.iter().any(|e| e.device_id == device_id_a));
+    assert!(verified_snapshot.entries.iter().any(|e| e.device_id == device_id_b));
 }
 
 /// Creating a sync group with a registration_token propagates it into the
 /// PairingResponse so paired devices can use token-gated relays.
 #[tokio::test]
 async fn create_sync_group_with_registration_token() {
-    let relay = Arc::new(MockRelay::new());
     let store = Arc::new(MemorySecureStore::new());
-    let service = PairingService::new(relay, store.clone());
+    let service = PairingService::new(store.clone());
 
     let (_creds, response) = service
         .create_sync_group(
@@ -702,6 +442,9 @@ async fn create_sync_group_with_registration_token() {
             None,
             None,
             Some("test-token".into()),
+            |_sync_id, _device_id, _token| {
+                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
+            },
         )
         .await
         .expect("create_sync_group with registration_token should succeed");

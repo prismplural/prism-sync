@@ -9,7 +9,7 @@ mod common;
 use std::sync::Arc;
 
 use prism_sync_core::pairing::service::PairingService;
-use prism_sync_core::relay::MockRelay;
+use prism_sync_core::relay::{MockRelay, SyncRelay};
 use prism_sync_core::schema::{SyncSchema, SyncType};
 use prism_sync_core::secure_store::SecureStore;
 use prism_sync_core::storage::RusqliteSyncStorage;
@@ -186,14 +186,18 @@ fn test_initialize_and_unlock() {
 // Pairing integration tests
 // ══════════════════════════════════════════════════════════════════════════
 
-/// `PairingService::create_sync_group` followed by `join_sync_group` with the
-/// same password must produce an unlocked `KeyHierarchy` with the same DEK.
+/// `PairingService::create_sync_group` with a relay_builder closure must
+/// produce valid credentials, a first-device snapshot, and persist state.
+///
+/// Note: the legacy `join_sync_group` method has been removed in favour of
+/// the relay-based ceremony flow (`complete_bootstrap_join`). Join-side
+/// integration is covered by the bootstrap pairing round-trip tests in
+/// `pairing/service.rs`.
 #[tokio::test]
-async fn test_pairing_create_and_join() {
+async fn test_pairing_create_sync_group() {
     // Device A creates the sync group.
-    let relay_a = Arc::new(MockRelay::new());
     let store_a = memory_secure_store();
-    let service_a = PairingService::new(relay_a, store_a.clone());
+    let service_a = PairingService::new(store_a.clone());
 
     let (credentials, response) = service_a
         .create_sync_group(
@@ -204,6 +208,9 @@ async fn test_pairing_create_and_join() {
             None,
             None,
             None,
+            |_sync_id, _device_id, _token| {
+                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
+            },
         )
         .await
         .expect("create_sync_group should succeed");
@@ -251,68 +258,5 @@ async fn test_pairing_create_and_join() {
         String::from_utf8(stored_sync_id).unwrap(),
         credentials.sync_id,
         "stored sync_id must match"
-    );
-
-    // Device B joins using the invite's PairingResponse and the same password.
-    let relay_b = Arc::new(MockRelay::new());
-    let store_b = memory_secure_store();
-    let service_b = PairingService::new(relay_b, store_b.clone());
-
-    let (key_hierarchy_b, snapshot) = service_b
-        .join_sync_group(&response, "shared-password")
-        .await
-        .expect("join_sync_group with correct password should succeed");
-
-    // The joined key hierarchy must be unlocked and usable.
-    assert!(
-        key_hierarchy_b.is_unlocked(),
-        "joined key hierarchy should be unlocked"
-    );
-    let db_key_b = key_hierarchy_b
-        .database_key()
-        .expect("database_key should succeed on joined device");
-    assert!(
-        !db_key_b.is_empty(),
-        "database key on Device B must not be empty"
-    );
-
-    let imported_snapshot = snapshot.to_device_records();
-    let registry = RusqliteSyncStorage::in_memory().expect("in-memory registry storage");
-    prism_sync_core::device_registry::DeviceRegistryManager::import_keyring(
-        &registry,
-        &credentials.sync_id,
-        &imported_snapshot,
-    )
-    .expect("joined snapshot should import cleanly");
-    prism_sync_core::device_registry::DeviceRegistryManager::verify_device_key(
-        &registry,
-        &credentials.sync_id,
-        &imported_snapshot[0].device_id,
-        &imported_snapshot[0].ed25519_public_key,
-    )
-    .expect("imported registry entry should verify");
-
-    // Device B credentials must be persisted too.
-    let stored_b_sync_id = store_b
-        .get("sync_id")
-        .expect("get sync_id from store_b should not fail")
-        .expect("sync_id should be stored on Device B");
-    assert_eq!(
-        String::from_utf8(stored_b_sync_id).unwrap(),
-        credentials.sync_id,
-        "Device B stored sync_id must match Device A's sync_id"
-    );
-
-    // Wrong password must be rejected.
-    let relay_c = Arc::new(MockRelay::new());
-    let store_c = memory_secure_store();
-    let service_c = PairingService::new(relay_c, store_c);
-
-    let bad_join = service_c
-        .join_sync_group(&response, "wrong-password")
-        .await;
-    assert!(
-        bad_join.is_err(),
-        "join_sync_group with wrong password should return Err"
     );
 }
