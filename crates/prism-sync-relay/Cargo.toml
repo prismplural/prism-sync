@@ -47,3 +47,4 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = "0.24"
 prism-sync-core = { path = "../prism-sync-core" }
 rcgen = "0.13"
+async-trait = "0.1"
