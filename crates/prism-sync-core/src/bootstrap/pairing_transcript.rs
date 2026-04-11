@@ -104,6 +104,8 @@ mod tests {
             x25519_public_key: [0x66; 32],
             ml_dsa_65_public_key: vec![0x77; ML_DSA_65_PK_LEN],
             xwing_ek: vec![0x88; XWING_EK_LEN],
+            permanent_ml_kem_768_public_key: vec![],
+            permanent_xwing_public_key: vec![],
         }
     }
 
@@ -293,6 +295,8 @@ mod tests {
             x25519_public_key: init.x25519_pk,
             ml_dsa_65_public_key: init.ml_dsa_65_pk.clone(),
             xwing_ek: init.xwing_ek.clone(),
+            permanent_ml_kem_768_public_key: vec![],
+            permanent_xwing_public_key: vec![],
         };
         let h2 = build_hash(
             &rid,

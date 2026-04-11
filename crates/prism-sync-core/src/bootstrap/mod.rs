@@ -53,12 +53,15 @@ pub use transcript::BootstrapTranscript;
 pub enum BootstrapVersion {
     /// PQ hybrid bootstrap, initial version
     V1 = 1,
+    /// PQ hybrid bootstrap with permanent identity keys in bootstrap record
+    V2 = 2,
 }
 
 impl BootstrapVersion {
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             1 => Some(Self::V1),
+            2 => Some(Self::V2),
             _ => None,
         }
     }

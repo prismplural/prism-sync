@@ -23,6 +23,8 @@ const CONFIRMATION_MAC_LEN: usize = 32;
 
 // ── JoinerBootstrapRecord ───────────────────────────────────────────────────
 
+const ML_KEM_768_PK_LEN: usize = 1184;
+
 /// The joiner's public key bundle, broadcast during the bootstrap ceremony.
 #[derive(Debug, Clone)]
 pub struct JoinerBootstrapRecord {
@@ -31,15 +33,25 @@ pub struct JoinerBootstrapRecord {
     pub ed25519_public_key: [u8; 32],
     pub x25519_public_key: [u8; 32],
     pub ml_dsa_65_public_key: Vec<u8>,
-    /// Atomic X-Wing encapsulation key (1216 bytes).
+    /// Ephemeral X-Wing encapsulation key (1216 bytes) for the KEM handshake.
     pub xwing_ek: Vec<u8>,
+    /// Permanent ML-KEM-768 encapsulation key derived from DeviceSecret (V2+).
+    pub permanent_ml_kem_768_public_key: Vec<u8>,
+    /// Permanent X-Wing encapsulation key derived from DeviceSecret (V2+).
+    pub permanent_xwing_public_key: Vec<u8>,
 }
 
 impl JoinerBootstrapRecord {
-    /// Deterministic binary encoding:
+    /// Deterministic binary encoding (V1):
     /// ```text
     /// [1B version][2B device_id_len BE][device_id][32B ed25519_pk][32B x25519_pk]
     /// [2B ml_dsa_65_pk_len BE][ml_dsa_65_pk][2B xwing_ek_len BE][xwing_ek]
+    /// ```
+    ///
+    /// V2 appends permanent identity keys after the V1 fields:
+    /// ```text
+    /// ... [2B permanent_ml_kem_768_pk_len BE][permanent_ml_kem_768_pk]
+    ///     [2B permanent_xwing_pk_len BE][permanent_xwing_pk]
     /// ```
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
@@ -50,7 +62,14 @@ impl JoinerBootstrapRecord {
                 + 2
                 + self.ml_dsa_65_public_key.len()
                 + 2
-                + self.xwing_ek.len(),
+                + self.xwing_ek.len()
+                + if self.version == BootstrapVersion::V2 {
+                    2 + self.permanent_ml_kem_768_public_key.len()
+                        + 2
+                        + self.permanent_xwing_public_key.len()
+                } else {
+                    0
+                },
         );
         buf.push(self.version.as_byte());
         write_len16(&mut buf, self.device_id.as_bytes());
@@ -58,6 +77,10 @@ impl JoinerBootstrapRecord {
         buf.extend_from_slice(&self.x25519_public_key);
         write_len16(&mut buf, &self.ml_dsa_65_public_key);
         write_len16(&mut buf, &self.xwing_ek);
+        if self.version == BootstrapVersion::V2 {
+            write_len16(&mut buf, &self.permanent_ml_kem_768_public_key);
+            write_len16(&mut buf, &self.permanent_xwing_public_key);
+        }
         buf
     }
 
@@ -83,6 +106,21 @@ impl JoinerBootstrapRecord {
             return None;
         }
 
+        let (permanent_ml_kem_768_public_key, permanent_xwing_public_key) =
+            if version == BootstrapVersion::V2 {
+                let perm_ml_kem = read_len16_bytes(data, &mut pos)?;
+                if perm_ml_kem.len() != ML_KEM_768_PK_LEN {
+                    return None;
+                }
+                let perm_xwing = read_len16_bytes(data, &mut pos)?;
+                if perm_xwing.len() != XWING_EK_LEN {
+                    return None;
+                }
+                (perm_ml_kem, perm_xwing)
+            } else {
+                (vec![], vec![])
+            };
+
         // Reject trailing bytes
         if pos != data.len() {
             return None;
@@ -95,10 +133,13 @@ impl JoinerBootstrapRecord {
             x25519_public_key,
             ml_dsa_65_public_key,
             xwing_ek,
+            permanent_ml_kem_768_public_key,
+            permanent_xwing_public_key,
         })
     }
 
-    /// The ML-KEM-768 encapsulation key (first 1184 bytes of the X-Wing ek).
+    /// The ML-KEM-768 encapsulation key (first 1184 bytes of the ephemeral X-Wing ek).
+    /// Used only for the KEM handshake during the pairing ceremony itself.
     pub fn ml_kem_768_ek(&self) -> &[u8] {
         self.xwing_ek.get(..ML_KEM_768_EK_LEN).unwrap_or(&[])
     }
@@ -415,6 +456,8 @@ mod tests {
             x25519_public_key: [0xBB; 32],
             ml_dsa_65_public_key: vec![0xCC; ML_DSA_65_PK_LEN],
             xwing_ek: vec![0xDD; XWING_EK_LEN],
+            permanent_ml_kem_768_public_key: vec![],
+            permanent_xwing_public_key: vec![],
         }
     }
 
@@ -622,6 +665,8 @@ mod tests {
             x25519_public_key: [0x66; 32],
             ml_dsa_65_public_key: vec![0x77; ML_DSA_65_PK_LEN],
             xwing_ek: vec![0x88; 16],
+            permanent_ml_kem_768_public_key: vec![],
+            permanent_xwing_public_key: vec![],
         };
         assert!(short_record.ml_kem_768_ek().is_empty());
 

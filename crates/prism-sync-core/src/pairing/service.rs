@@ -611,14 +611,28 @@ impl PairingService {
             status: "active".into(),
             ml_dsa_key_generation: current_ml_dsa_generation,
         });
+        // Require V2 bootstrap records which carry the joiner's permanent
+        // identity keys (ML-KEM-768 and X-Wing derived from DeviceSecret).
+        // The ephemeral xwing_ek in the bootstrap record is for the KEM
+        // handshake only — using it as the registry identity key causes a
+        // device_identity_mismatch when the joiner registers with its
+        // permanent keys.
+        if bootstrap_record.permanent_ml_kem_768_public_key.is_empty()
+            || bootstrap_record.permanent_xwing_public_key.is_empty()
+        {
+            return Err(CoreError::Engine(
+                "bootstrap record missing permanent identity keys (V2 required for pairing)"
+                    .into(),
+            ));
+        }
         snapshot_entries.push(RegistrySnapshotEntry {
             sync_id: sync_id.clone(),
             device_id: bootstrap_record.device_id.clone(),
             ed25519_public_key: bootstrap_record.ed25519_public_key.to_vec(),
             x25519_public_key: bootstrap_record.x25519_public_key.to_vec(),
             ml_dsa_65_public_key: bootstrap_record.ml_dsa_65_public_key.clone(),
-            ml_kem_768_public_key: bootstrap_record.ml_kem_768_ek().to_vec(),
-            x_wing_public_key: bootstrap_record.xwing_ek.clone(),
+            ml_kem_768_public_key: bootstrap_record.permanent_ml_kem_768_public_key.clone(),
+            x_wing_public_key: bootstrap_record.permanent_xwing_public_key.clone(),
             status: "active".into(),
             ml_dsa_key_generation: 0,
         });

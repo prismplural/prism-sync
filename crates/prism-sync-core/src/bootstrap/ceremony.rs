@@ -62,22 +62,27 @@ impl JoinerCeremony {
         let ed25519_kp = device_secret.ed25519_keypair(&device_id)?;
         let x25519_kp = device_secret.x25519_keypair(&device_id)?;
         let ml_dsa_65_kp = device_secret.ml_dsa_65_keypair(&device_id)?;
+        // Permanent identity keys for the registry snapshot (V2).
+        let permanent_ml_kem_kp = device_secret.ml_kem_768_keypair(&device_id)?;
+        let permanent_xwing_kp = device_secret.xwing_keypair(&device_id)?;
 
-        // 3. Generate ephemeral X-Wing keypair
+        // 3. Generate ephemeral X-Wing keypair for the KEM handshake
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut())
             .map_err(|e| CoreError::Engine(format!("CSPRNG failed: {e}")))?;
         let dk = XWingKem::decapsulation_key_from_bytes(&seed);
         let ek = XWingKem::encapsulation_key_bytes(&dk);
 
-        // 4. Build bootstrap record
+        // 4. Build bootstrap record (V2 includes permanent identity keys)
         let record = JoinerBootstrapRecord {
-            version: BootstrapVersion::V1,
+            version: BootstrapVersion::V2,
             device_id: device_id.clone(),
             ed25519_public_key: ed25519_kp.public_key_bytes(),
             x25519_public_key: x25519_kp.public_key_bytes(),
             ml_dsa_65_public_key: ml_dsa_65_kp.public_key_bytes(),
             xwing_ek: ek,
+            permanent_ml_kem_768_public_key: permanent_ml_kem_kp.public_key_bytes().to_vec(),
+            permanent_xwing_public_key: permanent_xwing_kp.encapsulation_key_bytes(),
         };
         // Drop large PQ types before the async relay call below. They are no
         // longer needed and their presence in the async state machine across
@@ -85,6 +90,8 @@ impl JoinerCeremony {
         // alone is ~48 KB — causing stack overflow on platforms with limited
         // tokio worker stacks (e.g. Android).
         drop(ml_dsa_65_kp);
+        drop(permanent_ml_kem_kp);
+        drop(permanent_xwing_kp);
         drop(dk);
         drop(ed25519_kp);
         drop(x25519_kp);
