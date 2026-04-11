@@ -2017,7 +2017,7 @@ pub async fn revoke_device(
 /// This is the correct way to revoke a device — it:
 /// 1. Revokes the device on the relay (bumps epoch)
 /// 2. Generates a new epoch key
-/// 3. Wraps the key for each remaining device via X25519 DH
+/// 3. Wraps the key for each remaining device via X-Wing hybrid key exchange (X25519 + ML-KEM-768)
 /// 4. Posts wrapped keys to the relay
 /// 5. Persists the new epoch key locally
 /// 6. Updates local epoch metadata

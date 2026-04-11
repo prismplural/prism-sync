@@ -1,8 +1,11 @@
 //! Device registry management — key pinning and change detection.
 //!
-//! When a device is first seen during pairing or pull, its Ed25519 public key
-//! is "pinned" in local storage. Subsequent operations verify that the claimed
-//! key matches the pinned key, raising an error on mismatch (TOFU model).
+//! When a device is first seen during pairing or pull, its hybrid identity
+//! keys are "pinned" in local storage. Each device record includes its full
+//! hybrid identity: Ed25519 (classical signing), ML-DSA-65 (post-quantum
+//! signing), X25519 (classical key exchange), and ML-KEM-768 (post-quantum
+//! key exchange). Subsequent operations verify that the claimed keys match
+//! the pinned keys, raising an error on mismatch (TOFU model).
 
 use crate::error::{CoreError, Result};
 use crate::storage::{DeviceRecord, SyncStorage};
