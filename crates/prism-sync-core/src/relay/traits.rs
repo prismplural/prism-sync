@@ -100,12 +100,12 @@ pub enum RelayErrorKind {
 pub struct RegistryApproval {
     /// Device ID of the approving (existing) device.
     pub approver_device_id: String,
-    /// Ed25519 public key of the approver (32 bytes, hex-encoded).
+    /// Ed25519 public key of the approver (classical component of hybrid identity) (32 bytes, hex-encoded).
     pub approver_ed25519_pk: String,
     /// ML-DSA-65 public key of the approver (1952 bytes, hex-encoded).
     #[serde(default)]
     pub approver_ml_dsa_65_pk: String,
-    /// Ed25519 signature over the canonical approval data (hex-encoded).
+    /// Hybrid signature (Ed25519 + ML-DSA-65) over the canonical approval data (hex-encoded).
     pub approval_signature: String,
     /// The signed registry snapshot (wire format: [sig || json]).
     /// Allows the relay to verify group membership without seeing plaintext.
@@ -201,7 +201,7 @@ pub struct PullResponse {
 /// A batch received from the relay, including the full signed envelope.
 ///
 /// IMPORTANT: The relay passes through the complete SignedBatchEnvelope
-/// so that clients can verify the sender's Ed25519 signature before
+/// so that clients can verify the sender's hybrid signature (Ed25519 + ML-DSA-65) before
 /// decrypting. The relay does NOT verify signatures (zero-knowledge).
 #[derive(Debug, Clone)]
 pub struct ReceivedBatch {
@@ -246,7 +246,7 @@ pub struct SignedBatchEnvelope {
 ///
 /// The `data` field contains the full serialized `SignedBatchEnvelope`
 /// (with `batch_kind = "snapshot"`) so that the receiver can verify the
-/// sender's Ed25519 signature before decrypting the snapshot content.
+/// sender's hybrid signature (Ed25519 + ML-DSA-65) before decrypting the snapshot content.
 #[derive(Debug, Clone)]
 pub struct SnapshotResponse {
     pub epoch: i32,
@@ -420,7 +420,7 @@ pub trait SyncRelay: Send + Sync {
     ///
     /// The nonce is cryptographically random, short-lived (60s), and consumed
     /// after a single use. The client signs `sync_id || device_id || nonce`
-    /// with its Ed25519 key as a challenge-response for registration.
+    /// with its hybrid Ed25519 + ML-DSA-65 key as a challenge-response for registration.
     async fn get_registration_nonce(
         &self,
     ) -> std::result::Result<RegistrationNonceResponse, RelayError>;

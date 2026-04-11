@@ -73,7 +73,8 @@ pub struct PairingResponse {
 
     /// Hex-encoded Ed25519 signature over the canonical invitation signing
     /// data produced by [`build_invitation_signing_data`]. 128 hex chars
-    /// representing a 64-byte signature.
+    /// representing a 64-byte signature. V1 format (legacy). Current V3 uses
+    /// hybrid Ed25519 + ML-DSA-65 signatures.
     pub signed_invitation: String,
 
     /// [`SignedRegistrySnapshot`] in its wire format:
@@ -381,8 +382,9 @@ pub struct RegistrySnapshotEntry {
 /// [`PairingResponse::signed_keyring`]. The joining device verifies the
 /// signature before importing the entries into its local registry.
 ///
-/// Wire format: `[64-byte Ed25519 signature || canonical JSON]`
-/// The signature covers `PRISM_SYNC_REGISTRY_V1\x00 || canonical JSON`.
+/// Wire format (V1/V2, legacy): `[64-byte Ed25519 signature || canonical JSON]`
+/// covering `PRISM_SYNC_REGISTRY_V1\x00 || canonical JSON`. V3 uses a hybrid
+/// Ed25519 + ML-DSA-65 signature bound into the V3 signed payload format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedRegistrySnapshot {
     pub entries: Vec<RegistrySnapshotEntry>,

@@ -280,7 +280,7 @@ impl SyncEngine {
             }
 
             // STEP 1: Verify batch signature BEFORE decrypting.
-            // Look up sender's Ed25519 public key from device registry.
+            // Look up sender's hybrid (Ed25519 + ML-DSA-65) public key from device registry.
             // If the sender device was deregistered (hard-deleted from relay),
             // its public key is gone — skip the batch and advance server_seq.
             let sender_key_info = match self
