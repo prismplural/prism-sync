@@ -7,7 +7,7 @@ Plug-and-play encrypted CRDT sync library in Rust with cross-platform FFI bindin
 - **Language:** Rust 2021 edition
 - **Framework:** Axum (relay server), tokio (async runtime)
 - **Database:** SQLite via rusqlite (bundled)
-- **Crypto:** RustCrypto (chacha20poly1305, argon2, hkdf, ed25519-dalek, x25519-dalek)
+- **Crypto:** RustCrypto (chacha20poly1305, argon2, hkdf, ed25519-dalek, x25519-dalek), pqcrypto (ml-dsa-65, ml-kem-768)
 - **FFI:** flutter_rust_bridge v2.11.1 for Dart/Flutter bindings
 - **Dart:** Flutter packages for mobile integration
 
@@ -31,7 +31,7 @@ prism-sync/
 ## Build Commands
 ```bash
 cargo build --workspace                    # Build all crates
-cargo test --workspace                     # Run all tests (~309)
+cargo test --workspace                     # Run all tests (~775)
 cargo clippy --workspace --all-targets -- -D warnings  # Lint
 cargo fmt --all                            # Format
 just test                                  # Shorthand via justfile
@@ -57,7 +57,7 @@ prism-sync-relay   (standalone, no dependency on other crates)
 - `SyncStorageTx` for transactional writes, `SyncStorage` for reads + `begin_tx()`
 - `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` for SQLite transactions
 - All relay paths use `/v2/sync/{sync_id}/...`
-- Batch signatures use Ed25519 over deterministic binary canonical format (not JSON)
+- Batch signatures use hybrid Ed25519 + ML-DSA-65 over deterministic binary canonical format (protocol V3)
 - Pull phase skips unverifiable batches (unknown/deleted sender, bad signature) instead of aborting
 - SyncEngine uses `Arc<dyn SyncStorage>` and `Arc<dyn SyncRelay>` (trait objects, not generics)
 - FFI functions use only primitive types (no trait objects across FFI boundary)
@@ -67,7 +67,7 @@ prism-sync-relay   (standalone, no dependency on other crates)
 - Device identity uses per-device CSPRNG, never derived from shared DEK
 
 ## Testing
-- 369 tests across 4 crates
+- 775+ tests across 4 crates
 - Cross-language crypto vectors verified against Dart/libsodium
 - E2E relay tests start server in-process with in-memory SQLite
 - Mock relay for engine tests without HTTP
