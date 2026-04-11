@@ -48,3 +48,5 @@ tokio-tungstenite = "0.24"
 prism-sync-core = { path = "../prism-sync-core" }
 rcgen = "0.13"
 async-trait = "0.1"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+zeroize = "1"

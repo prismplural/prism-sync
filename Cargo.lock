@@ -2443,6 +2443,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "futures",
+ "getrandom 0.4.2",
  "hex",
  "num-traits",
  "prism-sync-core",
@@ -2468,6 +2469,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
