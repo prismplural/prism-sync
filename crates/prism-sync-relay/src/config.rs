@@ -190,7 +190,7 @@ impl Config {
             pairing_session_rate_limit: parse_env("PAIRING_SESSION_RATE_LIMIT", 5),
             pairing_session_max_payload_bytes: parse_env(
                 "PAIRING_SESSION_MAX_PAYLOAD_BYTES",
-                32768,
+                262144, // 256 KB — PQ credential bundles with ML-DSA/ML-KEM/X-Wing keys
             ),
             sharing_init_ttl_secs: parse_env("SHARING_INIT_TTL_SECS", 604800),
             sharing_init_max_payload_bytes: parse_env("SHARING_INIT_MAX_PAYLOAD_BYTES", 65536),
