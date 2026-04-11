@@ -99,6 +99,14 @@ impl SyncEngine {
         self.state_rx.clone()
     }
 
+    /// Borrow the relay trait object used for sync operations.
+    ///
+    /// Exposed so higher layers (PrismSync) can perform out-of-band relay
+    /// work such as epoch-key catch-up recovery before a sync cycle runs.
+    pub fn relay(&self) -> &Arc<dyn SyncRelay> {
+        &self.relay
+    }
+
     /// Execute a full sync cycle: pull -> merge -> push.
     ///
     /// `key_hierarchy` provides epoch keys by epoch number (not just "current epoch").

@@ -373,6 +373,17 @@ impl PrismSync {
     /// `unlock`). Returns the [`SyncResult`](crate::engine::SyncResult) on
     /// success.
     pub async fn sync_now(&mut self) -> Result<crate::engine::SyncResult> {
+        // Best-effort: recover any epoch keys we might be missing before we
+        // attempt a pull. Joiners that registered moments after the
+        // initiator's post_rekey (or any device that was offline when an
+        // epoch rotation happened) would otherwise hit
+        // "Missing epoch key for epoch N" as soon as pull_phase encountered
+        // a batch at the rotated epoch, with no in-pull recovery path.
+        // Ignoring the return value is intentional — the method already
+        // logs and swallows transient relay/crypto failures so a bad
+        // network doesn't block the actual sync.
+        let _ = self.catch_up_epoch_keys().await;
+
         let signing_key = self.device_signing_key.as_ref().ok_or_else(|| {
             CoreError::Engine(
                 "sync not configured — call configure_engine after initialize/unlock".into(),
@@ -390,6 +401,158 @@ impl PrismSync {
                 self.ml_dsa_key_generation.unwrap_or(0),
             )
             .await
+    }
+
+    /// Recover any epoch keys we might be missing from the relay.
+    ///
+    /// Iterates forward from the current runtime epoch and asks the relay
+    /// for the per-device wrapped rekey artifact for each subsequent epoch.
+    /// When an artifact is available, the X-Wing KEM is run against the
+    /// device's own decapsulation key to unwrap the epoch key, which is
+    /// then stored in the live key hierarchy and persisted to the secure
+    /// store. When a fetch returns `None`, the loop stops — that's the
+    /// relay's signal that no further rotations are waiting.
+    ///
+    /// This covers the "missed EpochRotated notification" case. The normal
+    /// recovery path in sync_service::spawn_notification_handler only fires
+    /// for live WebSocket events, so a device that was offline when the
+    /// rotation happened (or a joiner whose WebSocket hadn't connected yet
+    /// when the initiator's post_rekey fired) would otherwise stay stuck
+    /// at the pre-rotation epoch and fail the next pull with
+    /// `CoreError::Engine("Missing epoch key for epoch N")`.
+    ///
+    /// Best-effort: logs and returns `Ok(())` on any relay, crypto, or
+    /// storage failure. Sync still proceeds and the normal error surface
+    /// reports the underlying problem if recovery didn't fix it.
+    async fn catch_up_epoch_keys(&mut self) -> Result<()> {
+        let relay = match self.sync_service.relay() {
+            Some(r) => r.clone(),
+            None => return Ok(()),
+        };
+        let device_id = match self.device_id.as_deref() {
+            Some(d) => d.to_string(),
+            None => return Ok(()),
+        };
+        let sync_id = match self.sync_service.sync_id() {
+            Some(s) => s.to_string(),
+            None => return Ok(()),
+        };
+        let xwing_key = match self.device_secret.as_ref() {
+            Some(ds) => match ds.xwing_keypair(&device_id) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "catch_up_epoch_keys: failed to derive X-Wing keypair"
+                    );
+                    return Ok(());
+                }
+            },
+            None => return Ok(()),
+        };
+
+        let start_epoch = self.epoch.unwrap_or(0) as u32;
+        let mut target = start_epoch.saturating_add(1);
+        let mut highest_available: u32 = start_epoch;
+        let mut relay_attempts = 0u32;
+
+        // Bound the skip scan (devices with many cached epochs) and the
+        // relay fetches independently so a misbehaving relay can't hang us
+        // and a large key_hierarchy doesn't eat our relay budget.
+        for _ in 0..4096 {
+            if relay_attempts >= 32 {
+                break;
+            }
+
+            if self.key_hierarchy.has_epoch_key(target) {
+                highest_available = target;
+                target = target.saturating_add(1);
+                continue;
+            }
+
+            relay_attempts += 1;
+            match relay.get_rekey_artifact(target as i32, &device_id).await {
+                Ok(Some(_)) => {
+                    match crate::epoch::EpochManager::handle_rotation(
+                        relay.as_ref(),
+                        &mut self.key_hierarchy,
+                        target,
+                        &device_id,
+                        &xwing_key,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                epoch = target,
+                                "catch_up_epoch_keys: recovered epoch key"
+                            );
+                            if let Ok(key) = self.key_hierarchy.epoch_key(target) {
+                                if let Err(e) = self
+                                    .secure_store
+                                    .set(&format!("epoch_key_{target}"), key)
+                                {
+                                    tracing::warn!(
+                                        epoch = target,
+                                        error = %e,
+                                        "catch_up_epoch_keys: failed to persist epoch key"
+                                    );
+                                }
+                            }
+                            highest_available = target;
+                            target = target.saturating_add(1);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                epoch = target,
+                                error = %e,
+                                "catch_up_epoch_keys: handle_rotation failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break, // no more artifacts — we're caught up
+                Err(e) => {
+                    tracing::warn!(
+                        epoch = target,
+                        error = %e,
+                        "catch_up_epoch_keys: relay fetch failed"
+                    );
+                    break;
+                }
+            }
+        }
+
+        if (highest_available as i32) > self.epoch.unwrap_or(0) {
+            let storage = self.storage.clone();
+            let sid = sync_id;
+            let ne = highest_available as i32;
+            let update_result = tokio::task::spawn_blocking(move || {
+                let mut tx = storage.begin_tx()?;
+                tx.update_current_epoch(&sid, ne)?;
+                tx.commit()
+            })
+            .await;
+            match update_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "catch_up_epoch_keys: sync_metadata update failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "catch_up_epoch_keys: join error on sync_metadata update"
+                    );
+                }
+            }
+            self.advance_epoch(highest_available as i32);
+        }
+
+        Ok(())
     }
 
     /// App lifecycle hook: catch up sync if stale (>5 s since last sync).

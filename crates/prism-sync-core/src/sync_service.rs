@@ -421,6 +421,14 @@ impl SyncService {
         self.sync_id = Some(sync_id);
     }
 
+    /// Borrow the configured relay, if any.
+    ///
+    /// Exposed so `PrismSync` can perform epoch-key catch-up recovery
+    /// without having to reconstruct a relay client.
+    pub fn relay(&self) -> Option<&Arc<dyn crate::relay::traits::SyncRelay>> {
+        self.engine.as_ref().map(|e| e.relay())
+    }
+
     /// Update the auto-sync configuration, spawning or stopping the
     /// debounce background task as needed.
     ///
