@@ -9,7 +9,8 @@ Standalone cryptographic primitives for prism-sync. This crate has zero sync awa
 | `aead` | XChaCha20-Poly1305 (sync data) + XSalsa20-Poly1305 (DEK wrapping) |
 | `kdf` | Argon2id (password -> MEK) + HKDF-SHA256 (subkey derivation) |
 | `key_hierarchy` | Full key lifecycle: initialize, unlock, lock, change password, epoch keys |
-| `device_identity` | Per-device Ed25519 (signing) + X25519 (key exchange) from CSPRNG |
+| `device_identity` | Per-device Ed25519 (signing) + X25519 (key exchange) + ML-DSA-65 (PQ signing) + ML-KEM-768 (PQ KEM) + X-Wing (hybrid rekey) from CSPRNG |
+| `pq` | Post-quantum primitives: ML-DSA-65 signatures, ML-KEM-768 KEM, X-Wing hybrid KEM, HybridSignature |
 | `mnemonic` | BIP39 12-word mnemonic generation, validation, byte conversion |
 | `hex` | Hex encoding/decoding utilities |
 | `error` | `CryptoError` type with variants for each failure mode |
@@ -49,7 +50,7 @@ Changing the password only re-wraps the DEK under a new MEK. The DEK itself does
 ### Epoch keys
 
 - Epoch 0 is deterministically derived from the DEK via HKDF.
-- Higher epochs (1, 2, ...) are generated via X25519 DH during epoch rotation (handled by `prism-sync-core`) and stored via `KeyHierarchy::store_epoch_key()`.
+- Higher epochs (1, 2, ...) are generated via X-Wing hybrid key exchange (X25519 + ML-KEM-768) during epoch rotation (handled by `prism-sync-core`) and stored via `KeyHierarchy::store_epoch_key()`.
 - `KeyHierarchy::epoch_key(n)` retrieves any cached epoch key.
 - `export_epoch_keys()` / `import_epoch_keys()` support persistence of runtime key state.
 
@@ -68,9 +69,19 @@ DeviceSigningKey::verify(&pubkey, message, &signature)?;
 // X25519 key exchange (for pairing, epoch key wrapping)
 let exchange = device_secret.x25519_keypair("device_abc")?;
 let shared_secret = exchange.diffie_hellman(&peer_public_key);
+
+// ML-DSA-65 PQ signing key (generation-versioned)
+let ml_dsa_signing = device_secret.ml_dsa_65_keypair("device_abc", 0)?;
+// Generation N>0 uses info string "prism_device_ml_dsa_65_v{N}"
+
+// ML-KEM-768 PQ key exchange
+let ml_kem = device_secret.ml_kem_768_keypair("device_abc")?;
+
+// X-Wing hybrid KEM (for epoch rekey)
+let xwing = device_secret.xwing_keypair("device_abc")?;
 ```
 
-Both keypairs are derived deterministically from `HKDF(ikm=device_secret, salt=device_id, info=purpose)`, so they are stable across app restarts as long as the device secret is persisted.
+All five keypairs (Ed25519, X25519, ML-DSA-65, ML-KEM-768, X-Wing) are derived deterministically from `HKDF(ikm=device_secret, salt=device_id, info=purpose)`, so they are stable across app restarts as long as the device secret is persisted. ML-DSA-65 uses generation-versioned info strings (`prism_device_ml_dsa_65_v{N}` for generation N>0) to support key rotation.
 
 ## AEAD Primitives
 
