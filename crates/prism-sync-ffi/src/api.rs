@@ -3195,8 +3195,85 @@ pub async fn complete_initiator_ceremony(
         return Err(encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await);
     }
 
-    // Drain the store so Dart can pick up any updated values
-    // (epoch keys, registration token, etc.)
+    // Align the live client with the post-rekey epoch. complete_bootstrap_initiator
+    // calls EpochManager::post_rekey which writes `epoch` and `epoch_key_{new}`
+    // to secure_store, but the pairing service does not own the PrismSync
+    // client, so self.epoch, the op_emitter, sync_metadata.current_epoch, and
+    // key_hierarchy stay at the pre-rekey value. Leaving them stale breaks the
+    // next pairing attempt: upload_pairing_snapshot reads self.epoch (old) while
+    // complete_bootstrap_initiator reads secure_store.epoch (new) for the
+    // credential bundle, so the joiner receives the new epoch key but the
+    // snapshot is encrypted with the old one, and bootstrap_from_snapshot fails.
+    // Mirror what commit_epoch_rotation does: load the new epoch key into the
+    // live key hierarchy, update sync_metadata, and advance the runtime epoch.
+    {
+        let mut inner = handle.inner.lock().await;
+        let secure_store = inner.secure_store().clone();
+
+        let new_epoch_str = secure_store
+            .get("epoch")
+            .map_err(|e| format!("read epoch after pairing: {e}"))?
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or_else(|| "epoch missing from secure store after pairing".to_string())?;
+        let new_epoch: u32 = new_epoch_str
+            .parse()
+            .map_err(|e| format!("invalid epoch in secure store: {e}"))?;
+
+        let current_client_epoch = inner.epoch().unwrap_or(0);
+        if (new_epoch as i32) > current_client_epoch {
+            // Load the rekey epoch key from secure_store into the live key
+            // hierarchy. The pairing service base64-encodes it (see
+            // pairing/service.rs post_rekey path); fall back to raw bytes to
+            // match the tolerant decode in restore_runtime_keys.
+            let key_name = format!("epoch_key_{new_epoch}");
+            if let Some(stored_bytes) = secure_store
+                .get(&key_name)
+                .map_err(|e| format!("read {key_name}: {e}"))?
+            {
+                let key_bytes = if let Ok(decoded) = BASE64.decode(&stored_bytes) {
+                    if decoded.len() == 32 {
+                        decoded
+                    } else {
+                        stored_bytes
+                    }
+                } else {
+                    stored_bytes
+                };
+                if key_bytes.len() != 32 {
+                    return Err(format!(
+                        "{key_name} has wrong length ({}, expected 32)",
+                        key_bytes.len()
+                    ));
+                }
+                inner
+                    .key_hierarchy_mut()
+                    .store_epoch_key(new_epoch, zeroize::Zeroizing::new(key_bytes));
+            } else {
+                return Err(format!(
+                    "{key_name} missing from secure store after post_rekey"
+                ));
+            }
+
+            // Update sync_metadata.current_epoch so configure_engine on the
+            // next launch reads the same epoch we're advancing to. Without
+            // this, restart drops self.epoch back to the pre-rekey value
+            // (configure_engine prefers sync_metadata over secure_store).
+            let storage = inner.storage().clone();
+            let sid_for_meta = sync_id.clone();
+            let ne = new_epoch as i32;
+            tokio::task::spawn_blocking(move || {
+                let mut tx = storage.begin_tx()?;
+                tx.update_current_epoch(&sid_for_meta, ne)?;
+                tx.commit()
+            })
+            .await
+            .map_err(|e| format!("join sync_metadata update task: {e}"))?
+            .map_err(|e| format!("update sync_metadata.current_epoch: {e}"))?;
+
+            inner.advance_epoch(new_epoch as i32);
+        }
+    }
+
     Ok("ok".to_string())
 }
 
