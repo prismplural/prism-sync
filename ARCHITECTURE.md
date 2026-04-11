@@ -40,7 +40,7 @@ OpEmitter  ──>  pending_ops table (SyncStorage)
     |            SyncEngine.push_phase()
     |                    |
     |              encrypt (XChaCha20-Poly1305 with epoch key)
-    |              sign (Ed25519 over binary canonical format)
+    |              sign (hybrid Ed25519 + ML-DSA-65, protocol V3)
     |                    |
     |                    v
     |              Relay server (stores encrypted blob)
@@ -50,7 +50,7 @@ OpEmitter  ──>  pending_ops table (SyncStorage)
     v                    v
 Other device:    SyncEngine.pull_phase()
                          |
-                   verify Ed25519 signature
+                   verify hybrid signature (Ed25519 + ML-DSA-65)
                    decrypt (XChaCha20-Poly1305)
                    verify payload hash (SHA-256)
                    decode CrdtChange ops
@@ -92,13 +92,22 @@ DeviceSecret (32 bytes, per-device CSPRNG -- NOT derived from DEK)
     |       └── Ed25519 signing keypair (batch signatures, registration, SAS)
     |
     |── HKDF("prism_device_x25519", salt=device_id)
-            └── X25519 key exchange keypair (pairing, epoch key wrapping)
+    |       └── X25519 key exchange keypair (pairing, epoch key wrapping)
+    |
+    |── HKDF("prism_device_ml_dsa_65", salt=device_id)
+    |       └── ML-DSA-65 PQ signing keypair (generation-versioned: _v{N} suffix for N>0)
+    |
+    |── HKDF("prism_device_ml_kem_768", salt=device_id)
+    |       └── ML-KEM-768 PQ key exchange
+    |
+    |── HKDF("prism_device_xwing_rekey", salt=device_id)
+            └── X-Wing hybrid KEM for epoch rekey (X25519 + ML-KEM-768)
 ```
 
 Key design decisions:
 - **Password change = re-wrap only.** The DEK never changes, so no data re-encryption is needed. Only the MEK-wrapped DEK envelope is regenerated.
 - **Device identity is independent of shared secrets.** Per-device CSPRNG prevents key compromise on one device from exposing another device's signing/exchange keys.
-- **Epoch keys enable forward secrecy after revocation.** When a device is revoked, a new epoch key is generated via X25519 DH and distributed to remaining devices.
+- **Epoch keys enable forward secrecy after revocation.** When a device is revoked, a new epoch key is generated via X-Wing hybrid key exchange (X25519 + ML-KEM-768) and distributed to remaining devices.
 
 ## CRDT Merge Algorithm
 
@@ -136,9 +145,9 @@ The merge engine implements field-level Last-Write-Wins (LWW) with deterministic
 - Session tokens (per-device, issued via challenge-response)
 
 ### Integrity guarantees
-- **Ed25519 batch signatures:** Every pushed batch is signed with the sender's device signing key. Verified BEFORE decryption on pull.
+- **Hybrid batch signatures:** Every pushed batch is signed with hybrid Ed25519 + ML-DSA-65 (protocol V3). Both signatures must verify. Verified BEFORE decryption on pull.
 - **SHA-256 payload hash:** The plaintext content is hashed and included in the signed envelope. Verified AFTER decryption to detect payload tampering.
-- **Challenge-response registration:** Devices prove possession of Ed25519 private key during relay registration.
+- **Hybrid challenge-response registration:** Devices prove possession of Ed25519 and ML-DSA-65 private keys during relay registration.
 
 ## Sync Cycle
 
@@ -150,8 +159,8 @@ A full sync cycle (`SyncEngine::sync`) executes two phases:
 2. relay.pull_changes(since_seq) -> batches
 3. For each batch:
    a. Skip own batches (still advance server_seq)
-   b. Look up sender's Ed25519 public key from device registry
-   c. Verify batch signature (Ed25519 over binary canonical format)
+   b. Look up sender's Ed25519 and ML-DSA-65 public keys from device registry
+   c. Verify hybrid signature (Ed25519 + ML-DSA-65, before decryption)
    d. Decrypt with epoch key from THIS batch's epoch (not "current epoch")
    e. Verify payload hash (SHA-256 of plaintext == envelope.payload_hash)
    f. Decode CrdtChange ops from JSON
@@ -173,7 +182,7 @@ A full sync cycle (`SyncEngine::sync`) executes two phases:
    b. Encode ops to JSON
    c. Encrypt with current epoch key (XChaCha20-Poly1305 + AAD)
    d. Compute SHA-256 payload hash of plaintext
-   e. Build SignedBatchEnvelope with signature (Ed25519)
+   e. Build SignedBatchEnvelope with hybrid signatures (Ed25519 + ML-DSA-65)
    f. relay.push_changes(envelope)
    g. On success: delete pending_ops for this batch in a transaction
    h. Update last_pushed_server_seq
