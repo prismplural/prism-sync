@@ -44,7 +44,7 @@ The sync engine and everything it needs:
 - **Sync engine:** Pull → verify signature → decrypt → verify payload hash → merge → ack → prune → push. Ack reports processed seq to relay (fire-and-forget). Prune cleans up acknowledged `applied_ops`, `field_versions`, and tombstoned entities.
 - **Batch signatures:** Hybrid Ed25519 + ML-DSA-65 over deterministic binary canonical format (protocol V3). Verified before decryption.
 - **Relay client:** HTTP (reqwest) + WebSocket (tokio-tungstenite) with `/v2/` protocol, per-device session tokens, message-based WebSocket auth, auto-reconnect with exponential backoff.
-- **Pairing:** Ed25519-signed invitations, challenge-response relay registration, SAS verification protocol, signed keyring exchange.
+- **Pairing:** Hybrid-signed invitations (Ed25519 + ML-DSA-65), hybrid challenge-response relay registration, SAS verification protocol, signed keyring exchange.
 - **Epoch rotation:** X-Wing hybrid key exchange (X25519 + ML-KEM-768) for epoch key wrapping/unwrapping after device revocation.
 - **Consumer API:** `PrismSync::builder()` with fluent configuration, `record_create/update/delete` for mutations, `events()` stream, auto-sync debounce.
 
@@ -100,7 +100,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Testing
 
-775+ tests across 3 crates covering:
+920+ tests across 4 crates covering:
 
 - Crypto primitives (AEAD roundtrip, KDF determinism, key hierarchy lifecycle, device identity)
 - CRDT correctness (HLC merge, LWW comparison, tombstone protection, schema validation)

@@ -85,37 +85,46 @@ The compact binary encoding (`to_compact_bytes` / `from_compact_bytes`) and the 
 
 Wire format embedded in `PairingResponse.signed_keyring`.
 
-### Wire Format
+### Wire Format (V3)
 
 ```
+[0x03: version byte]
 [HybridSignature bytes (Ed25519 + ML-DSA-65)]
-[variable: canonical JSON]
+[variable: canonical JSON V3]
 ```
 
-Signature covers: `PRISM_SYNC_REGISTRY_V1\x00` || canonical JSON.
+Signature covers: `PRISM_SYNC_REGISTRY_V3\x00` || canonical JSON V3, with HybridSignature context `b"registry_snapshot"`.
 
-### Canonical JSON
+### Canonical JSON (V3)
 
-Entries sorted by `device_id`, then serialized as a JSON array:
+V3 wraps entries in a versioned envelope. Entries sorted by `device_id`:
 
 ```json
-[
-  {
-    "sync_id": "string",
-    "device_id": "string",
-    "ed25519_public_key": [/* 32 bytes */],
-    "x25519_public_key": [/* 32 bytes */],
-    "status": "active" | "revoked"
-  }
-]
+{
+  "registry_version": 1,
+  "entries": [
+    {
+      "sync_id": "string",
+      "device_id": "string",
+      "ed25519_public_key": [/* 32 bytes */],
+      "x25519_public_key": [/* 32 bytes */],
+      "ml_dsa_65_public_key": [/* ML-DSA-65 public key bytes */],
+      "ml_kem_768_public_key": [/* ML-KEM-768 public key bytes */],
+      "x_wing_public_key": [/* X-Wing encapsulation key bytes */],
+      "ml_dsa_key_generation": 0,
+      "status": "active" | "revoked"
+    }
+  ]
+}
 ```
 
 ### Verification
 
 The joiner must:
-1. Split at HybridSignature boundary → signature + JSON
-2. Rebuild signing data: `PRISM_SYNC_REGISTRY_V1\x00` || JSON
-3. Verify hybrid signature (Ed25519 + ML-DSA-65) against inviter keys
+1. Parse version byte (must be `0x03`)
+2. Split at HybridSignature boundary → signature + JSON
+3. Rebuild signing data: `PRISM_SYNC_REGISTRY_V3\x00` || JSON
+4. Verify hybrid signature (Ed25519 + ML-DSA-65, context `b"registry_snapshot"`) against inviter keys
 4. Deserialize entries and import via `DeviceRegistryManager::import_keyring`
 
 ---

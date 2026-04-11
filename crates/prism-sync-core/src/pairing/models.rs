@@ -77,11 +77,11 @@ pub struct PairingResponse {
     /// hybrid Ed25519 + ML-DSA-65 signatures.
     pub signed_invitation: String,
 
-    /// [`SignedRegistrySnapshot`] in its wire format:
-    /// `[64-byte Ed25519 signature || canonical JSON of RegistrySnapshotEntry[]]`.
-    ///
-    /// The signature covers `PRISM_SYNC_REGISTRY_V1\x00 || canonical JSON`.
-    /// Use [`SignedRegistrySnapshot::verify_and_decode`] to validate and
+    /// [`SignedRegistrySnapshot`] in its wire format. V1 legacy format was
+    /// `[64-byte Ed25519 signature || canonical JSON]`. Current V3 format is
+    /// `[0x03 || HybridSignature || canonical JSON V3]` with domain
+    /// `PRISM_SYNC_REGISTRY_V3\x00` and hybrid Ed25519 + ML-DSA-65 signatures.
+    /// Use [`SignedRegistrySnapshot::verify_and_decode_hybrid`] to validate and
     /// deserialize.
     pub signed_keyring: Vec<u8>,
 

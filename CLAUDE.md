@@ -31,7 +31,7 @@ prism-sync/
 ## Build Commands
 ```bash
 cargo build --workspace                    # Build all crates
-cargo test --workspace                     # Run all tests (~775)
+cargo test --workspace                     # Run all tests (~920)
 cargo clippy --workspace --all-targets -- -D warnings  # Lint
 cargo fmt --all                            # Format
 just test                                  # Shorthand via justfile
@@ -67,7 +67,7 @@ prism-sync-relay   (standalone, no dependency on other crates)
 - Device identity uses per-device CSPRNG, never derived from shared DEK
 
 ## Testing
-- 775+ tests across 4 crates
+- 920+ tests across 4 crates
 - Cross-language crypto vectors verified against Dart/libsodium
 - E2E relay tests start server in-process with in-memory SQLite
 - Mock relay for engine tests without HTTP
