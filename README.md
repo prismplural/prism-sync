@@ -30,7 +30,7 @@ Standalone cryptographic primitives with no sync awareness:
 - **AEAD:** XChaCha20-Poly1305 (sync data) + XSalsa20-Poly1305 (DEK wrapping)
 - **KDF:** Argon2id (password → MEK) + HKDF-SHA256 (subkey derivation)
 - **Key hierarchy:** Password + BIP39 secret key → MEK → wraps DEK → derives epoch keys, database key, group invite secret
-- **Device identity:** Per-device Ed25519 (signing) + X25519 (key exchange) from local CSPRNG — not derived from shared secrets
+- **Device identity:** Per-device Ed25519 (signing) + X25519 (key exchange) + ML-DSA-65 (PQ signing) + ML-KEM-768 (PQ key exchange) + X-Wing (hybrid rekey) from local CSPRNG — not derived from shared secrets
 - **BIP39:** 12-word mnemonic generation, validation, byte conversion
 - All sensitive buffers use `Zeroizing<Vec<u8>>` for automatic cleanup on drop
 
@@ -42,10 +42,10 @@ The sync engine and everything it needs:
 - **CRDT:** Field-level Last-Write-Wins with 3-level tiebreaker (HLC → device_id → op_id), tombstone protection, bulk reset
 - **Storage:** Object-safe `SyncStorage` + `SyncStorageTx` traits with `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` transaction pattern. Ships with `RusqliteSyncStorage` (SQLite with WAL).
 - **Sync engine:** Pull → verify signature → decrypt → verify payload hash → merge → ack → prune → push. Ack reports processed seq to relay (fire-and-forget). Prune cleans up acknowledged `applied_ops`, `field_versions`, and tombstoned entities.
-- **Batch signatures:** Ed25519 over deterministic binary canonical format. Verified before decryption.
+- **Batch signatures:** Hybrid Ed25519 + ML-DSA-65 over deterministic binary canonical format (protocol V3). Verified before decryption.
 - **Relay client:** HTTP (reqwest) + WebSocket (tokio-tungstenite) with `/v2/` protocol, per-device session tokens, message-based WebSocket auth, auto-reconnect with exponential backoff.
 - **Pairing:** Ed25519-signed invitations, challenge-response relay registration, SAS verification protocol, signed keyring exchange.
-- **Epoch rotation:** X25519 DH key exchange for epoch key wrapping/unwrapping after device revocation.
+- **Epoch rotation:** X-Wing hybrid key exchange (X25519 + ML-KEM-768) for epoch key wrapping/unwrapping after device revocation.
 - **Consumer API:** `PrismSync::builder()` with fluent configuration, `record_create/update/delete` for mutations, `events()` stream, auto-sync debounce.
 
 ## Quick start
@@ -100,7 +100,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Testing
 
-319 tests across 3 crates covering:
+775+ tests across 3 crates covering:
 
 - Crypto primitives (AEAD roundtrip, KDF determinism, key hierarchy lifecycle, device identity)
 - CRDT correctness (HLC merge, LWW comparison, tombstone protection, schema validation)
@@ -126,7 +126,8 @@ cargo test -p prism-sync-crypto --test cross_language_vectors -- --ignored
 
 - **Encryption:** XChaCha20-Poly1305 with 24-byte random nonces (AEAD)
 - **Key derivation:** Argon2id (64 MiB, 3 iterations) + HKDF-SHA256
-- **Signatures:** Ed25519 batch signatures with deterministic binary canonical format
+- **Signatures:** Hybrid Ed25519 + ML-DSA-65 batch signatures with deterministic binary canonical format (protocol V3)
+- **Post-quantum:** Hybrid device identity (Ed25519 + ML-DSA-65 + X25519 + ML-KEM-768), X-Wing hybrid rekey, signed registry trust model
 - **Device identity:** Per-device CSPRNG keys, never derived from shared DEK
 - **Transport:** HTTPS/WSS required (enforced at both builder and relay constructor)
 - **Memory:** All key material in `Zeroizing<Vec<u8>>` — auto-zeroed on drop
