@@ -1887,6 +1887,54 @@ pub async fn create_sync_group(
         .restore_runtime_keys(&dek, &device_secret_bytes)
         .map_err(|e| e.to_string())?;
 
+    // Insert the device's own record into the local registry so that
+    // configureEngine (which calls load_device_ml_dsa_generation) can
+    // find it. The joiner path does this via import_keyring, but the
+    // first-device (initiator) path was missing it.
+    let device_id = inner
+        .secure_store()
+        .get("device_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or("device_id not found after create_sync_group")?;
+    let device_secret = DeviceSecret::from_bytes(device_secret_bytes.clone())
+        .map_err(|e| format!("invalid device_secret: {e}"))?;
+    let signing_key = device_secret
+        .ed25519_keypair(&device_id)
+        .map_err(|e| format!("ed25519 derive failed: {e}"))?;
+    let exchange_key = device_secret
+        .x25519_keypair(&device_id)
+        .map_err(|e| format!("x25519 derive failed: {e}"))?;
+    let pq_signing_key = device_secret
+        .ml_dsa_65_keypair(&device_id)
+        .map_err(|e| format!("ml_dsa derive failed: {e}"))?;
+    let pq_kem_key = device_secret
+        .ml_kem_768_keypair(&device_id)
+        .map_err(|e| format!("ml_kem derive failed: {e}"))?;
+    let xwing_key = device_secret
+        .xwing_keypair(&device_id)
+        .map_err(|e| format!("xwing derive failed: {e}"))?;
+
+    let self_record = prism_sync_core::storage::types::DeviceRecord {
+        sync_id: response.sync_id.clone(),
+        device_id: device_id.clone(),
+        ed25519_public_key: signing_key.public_key_bytes().to_vec(),
+        x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+        ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
+        x_wing_public_key: xwing_key.encapsulation_key_bytes(),
+        status: "active".to_string(),
+        registered_at: chrono::Utc::now(),
+        revoked_at: None,
+        ml_dsa_key_generation: 0,
+    };
+    DeviceRegistryManager::import_keyring(
+        inner.storage().as_ref(),
+        &response.sync_id,
+        &[self_record],
+    )
+    .map_err(|e| format!("failed to seed local device registry: {e}"))?;
+
     let result = serde_json::json!({
         "sync_id": response.sync_id,
         "relay_url": response.relay_url,

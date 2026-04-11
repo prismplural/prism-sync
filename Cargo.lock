@@ -2477,6 +2477,7 @@ name = "prism_sync_ffi"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "flutter_rust_bridge",
  "prism-sync-core",
  "prism-sync-crypto",
