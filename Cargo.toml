@@ -12,3 +12,24 @@ members = [
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/user/prism-sync"
+
+# ── Build profiles ────────────────────────────────────────────────────────────
+# Dev: optimise for fast incremental compilation while keeping the app usable.
+# codegen-units=256 maximises parallelism; incremental=true skips unchanged code.
+# opt-level=1 avoids unoptimised crypto (Argon2id/XChaCha20 are 5-10× slower
+# at level 0); the crypto crate gets level 2 to keep unlock times reasonable.
+[profile.dev]
+opt-level = 1
+debug = true
+incremental = true
+codegen-units = 256
+
+[profile.dev.package.prism-sync-crypto]
+opt-level = 2
+
+# Release: maximise performance and binary size.
+# lto="thin" gives significant size reduction with faster link time than "fat".
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
