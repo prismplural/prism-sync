@@ -732,7 +732,7 @@ impl SyncRelay for ServerRelay {
             "[prism_relay] connect_websocket url={}",
             redact_url(&ws_url)
         );
-        debug!("connect_websocket url={ws_url}");
+        debug!("connect_websocket url={}", redact_url(&ws_url));
 
         let ws = WebSocketClient::new(
             ws_url,
