@@ -17,13 +17,13 @@ The sync engine and everything it needs: CRDT primitives, storage, relay client,
 | `op_emitter` | `OpEmitter` generates pending ops from consumer mutations |
 | `relay` | `SyncRelay` trait, `ServerRelay` (HTTP+WS), `MockRelay` |
 | `pairing` | `PairingService`: create/join sync groups, SAS verification |
-| `epoch` | `EpochManager`: X25519 DH key rotation after device revocation |
+| `epoch` | `EpochManager`: X-Wing hybrid key rotation (X25519 + ML-KEM-768) after device revocation |
 | `device_registry` | `DeviceRegistryManager`: track devices and public keys |
 | `sync_service` | `SyncService`: auto-sync debounce, lifecycle hooks |
 | `events` | `SyncEvent` enum, broadcast channel, `ChangeSet` |
 | `runtime` | `background_runtime()` for spawning the tokio runtime |
 | `runtime_keys` | Persist/restore key material across app restarts |
-| `batch_signature` | Ed25519 sign/verify over deterministic binary canonical format |
+| `batch_signature` | Hybrid Ed25519 + ML-DSA-65 sign/verify over deterministic binary canonical format (protocol V3) |
 | `sync_aad` | Build AAD strings for AEAD encryption |
 | `syncable_entity` | `SyncableEntity` trait for consumer data table writes |
 | `secure_store` | `SecureStore` trait for platform Keychain/Keystore |
@@ -155,7 +155,7 @@ pub struct SyncEngine {
 2. `relay.pull_changes(since_seq)` -- paginated batch fetch
 3. For each batch:
    - Skip own batches (advance seq only)
-   - Verify Ed25519 signature (before decryption)
+   - Verify hybrid signature (Ed25519 + ML-DSA-65, before decryption)
    - Decrypt with epoch key from the batch's epoch
    - Verify SHA-256 payload hash
    - Decode `CrdtChange` ops
@@ -168,7 +168,7 @@ pub struct SyncEngine {
 2. For each batch:
    - Load ops, encode to JSON
    - Encrypt with current epoch key + AAD
-   - Sign with device Ed25519 key
+   - Sign with hybrid Ed25519 + ML-DSA-65 keys
    - `relay.push_changes(envelope)`
    - On success: delete pending ops, advance seq
 
@@ -229,7 +229,7 @@ After a mutation, the service waits for `debounce` duration of quiet time before
 When a device is revoked, `EpochManager` handles key rotation:
 
 1. Owner generates new epoch key
-2. Wraps epoch key for each remaining device using X25519 DH
+2. Wraps epoch key for each remaining device using X-Wing hybrid key exchange (X25519 + ML-KEM-768)
 3. Posts wrapped artifacts to relay via `POST /v2/sync/{sync_id}/rekey`
 4. Each device fetches and unwraps its artifact
 5. Future batches use the new epoch key
