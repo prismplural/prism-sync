@@ -8,7 +8,7 @@ Plug-and-play encrypted CRDT sync library in Rust with cross-platform FFI bindin
 - **Framework:** Axum (relay server), tokio (async runtime)
 - **Database:** SQLite via rusqlite (bundled)
 - **Crypto:** RustCrypto (chacha20poly1305, argon2, hkdf, ed25519-dalek, x25519-dalek), pqcrypto (ml-dsa-65, ml-kem-768)
-- **FFI:** flutter_rust_bridge v2.11.1 for Dart/Flutter bindings
+- **FFI:** flutter_rust_bridge v2.12.0 for Dart/Flutter bindings
 - **Dart:** Flutter packages for mobile integration
 
 ## Project Structure

@@ -8,7 +8,7 @@ Dart bindings for the [prism-sync](../../) encrypted CRDT sync library. Generate
 - Key lifecycle: `initialize`, `unlock`, `lock`, `generateSecretKey`, `changePassword`
 - Mutation recording: `recordCreate`, `recordUpdate`, `recordDelete`
 - Sync control: `syncNow`, `onResume`, `setAutoSync`, `status`, `pollEvent`
-- Pairing: `createSyncGroup`, `joinFromQr`, `joinFromUrl`, `joinFromResponseJson`
+- Pairing: `createSyncGroup`, `startJoinerCeremony`, `getJoinerSas`, `completeJoinerCeremony`, `startInitiatorCeremony`, `completeInitiatorCeremony`
 - Device management: `listDevices`, `revokeDevice`
 - `MemorySecureStore` for testing
 
@@ -69,29 +69,35 @@ final event = await pollEvent(handle: handle);
 
 ## Pairing (Multi-Device Setup)
 
+Pairing uses a relay-based ceremony with SAS (Short Authentication String) verification:
+
 ```dart
-// Device A: Create sync group
+// Device A (existing): Create sync group
 final inviteJson = await createSyncGroup(
   handle: handle,
   password: 'shared_password',
   relayUrl: 'https://relay.example.com',
 );
-// inviteJson contains: qr_payload, words, url, sync_id, relay_url
 
-// Device B: Join from QR code
-await joinFromQr(
-  handle: handle,
-  qrBytes: qrPayloadBytes,
-  password: 'shared_password',
-);
+// Device B (joiner): Start pairing ceremony
+final tokenJson = await startJoinerCeremony(handle: handle);
+// tokenJson contains: token_bytes, token_url, device_id
+// Display the token_url as a QR code or share it
 
-// Or join from deep link URL
-await joinFromUrl(
-  handle: handle,
-  url: 'prism://join?...',
-  password: 'shared_password',
-);
+// Device B: Wait for initiator, get SAS codes
+final sasJson = await getJoinerSas(handle: handle);
+// sasJson contains: joiner_code, initiator_code — display for user verification
+
+// Device A (initiator): Start ceremony with the token
+final initResult = await startInitiatorCeremony(handle: handle, ...);
+// Both devices display SAS codes for user to compare
+
+// After user confirms SAS codes match:
+await completeJoinerCeremony(handle: handle, password: 'shared_password');
+await completeInitiatorCeremony(handle: handle);
 ```
+
+> **Note:** The previous compact QR/URL pairing APIs (`joinFromQr`, `joinFromUrl`, `joinFromResponseJson`) have been removed in favor of this relay-based ceremony.
 
 ## Generated Bindings
 
@@ -113,7 +119,7 @@ The `prism_sync_flutter` package provides the platform-specific setup and a real
 
 ## Dependencies
 
-- `flutter_rust_bridge: 2.11.1` -- FFI bridge runtime
+- `flutter_rust_bridge: 2.12.0` -- FFI bridge runtime
 - `meta: ^1.11.0` -- Dart annotations
 
 ## Related Packages
