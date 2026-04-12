@@ -139,7 +139,7 @@ The merge engine implements field-level Last-Write-Wins (LWW) with deterministic
 
 ### What the relay server sees (metadata)
 - Sync group membership (which device IDs belong to a group)
-- Device public keys (Ed25519 + X25519)
+- Device public keys (Ed25519, X25519, ML-DSA-65, ML-KEM-768, X-Wing)
 - Epoch numbers and batch sequence numbers
 - Batch sizes and timing patterns
 - Session tokens (per-device, issued via challenge-response)
