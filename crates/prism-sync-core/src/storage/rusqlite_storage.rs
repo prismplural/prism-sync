@@ -925,6 +925,14 @@ impl SyncStorage for RusqliteSyncStorage {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_export_snapshot(&conn, sync_id)
     }
+
+    fn rekey(&self, new_key: &[u8; 32]) -> Result<()> {
+        let hex = new_key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let conn = self.conn.lock().map_err(|_| CoreError::Storage("lock poisoned".into()))?;
+        conn.execute_batch(&format!("PRAGMA rekey = \"x'{hex}'\";\n"))
+            .map_err(|e| CoreError::Storage(format!("PRAGMA rekey failed: {e}")))?;
+        Ok(())
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1926,5 +1934,34 @@ mod tests {
             imported.ml_dsa_key_generation, 5,
             "ml_dsa_key_generation should survive snapshot round-trip"
         );
+    }
+
+    #[test]
+    fn rekey_changes_encryption_key() {
+        // Use a unique temp file path
+        let path = std::env::temp_dir().join(format!(
+            "prism_rekey_test_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Create an encrypted database with key [1u8; 32]
+        let conn1 = Connection::open(&path).unwrap();
+        let storage = RusqliteSyncStorage::new_encrypted(conn1, &[1u8; 32]).unwrap();
+
+        // Rekey to [2u8; 32]
+        let new_key = [2u8; 32];
+        storage.rekey(&new_key).unwrap();
+        drop(storage);
+
+        // Open with new key — should succeed
+        let conn2 = Connection::open(&path).unwrap();
+        let storage2 = RusqliteSyncStorage::new_encrypted(conn2, &[2u8; 32]);
+        assert!(storage2.is_ok(), "opening with new key should succeed");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -66,6 +66,10 @@ pub trait SyncStorage: Send + Sync {
     /// Export all sync state as a snapshot blob (JSON, then zstd-compressed).
     /// Contains field_versions, device_registry, applied_ops, and sync_metadata.
     fn export_snapshot(&self, sync_id: &str) -> Result<Vec<u8>>;
+
+    /// Re-encrypt the underlying storage with a new 32-byte key.
+    /// No-op for in-memory impls.
+    fn rekey(&self, new_key: &[u8; 32]) -> Result<()>;
 }
 
 /// Transactional operations on sync storage — obtained from `SyncStorage::begin_tx()`.
