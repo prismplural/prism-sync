@@ -66,6 +66,15 @@ pub fn derive_database_key(dek: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     derive_subkey(dek, &[], b"prism_database_key")
 }
 
+/// Derive the local storage key from DEK and device secret.
+///
+/// Used to tie the device's local database encryption key to both the
+/// sync group identity (via DEK) and the device identity (via DeviceSecret).
+/// IKM = DEK, salt = DeviceSecret bytes, info = "prism_local_storage_key".
+pub fn derive_local_storage_key(dek: &[u8], device_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    derive_subkey(dek, device_secret, b"prism_local_storage_key")
+}
+
 /// Derive an arbitrary-length subkey using HKDF-SHA256.
 pub fn derive_subkey_long(
     ikm: &[u8],

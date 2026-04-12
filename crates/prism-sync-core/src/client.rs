@@ -301,6 +301,28 @@ impl PrismSync {
         self.key_hierarchy.database_key().map_err(CoreError::Crypto)
     }
 
+    /// Derive the local storage key (HKDF(DEK, DeviceSecret)).
+    ///
+    /// Ties the consumer's local database to both the sync group identity and
+    /// device identity. Returns an error if locked or DeviceSecret is absent.
+    pub fn local_storage_key(&self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let device_secret = self.device_secret.as_ref().ok_or_else(|| {
+            CoreError::Engine(
+                "device_secret not set — call initialize or restore_runtime_keys first".into(),
+            )
+        })?;
+        self.key_hierarchy
+            .local_storage_key(device_secret.as_bytes())
+            .map_err(CoreError::Crypto)
+    }
+
+    /// Rotate the sync storage database key using PRAGMA rekey.
+    ///
+    /// Delegates to `SyncStorage::rekey()`. Default no-op for in-memory storage.
+    pub fn rekey_storage(&self, new_key: &[u8]) -> Result<()> {
+        self.storage.rekey(new_key)
+    }
+
     // ── Sync engine ──
 
     /// Configure the sync engine with a relay, enabling sync operations.

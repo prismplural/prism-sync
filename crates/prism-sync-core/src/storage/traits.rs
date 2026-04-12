@@ -66,6 +66,15 @@ pub trait SyncStorage: Send + Sync {
     /// Export all sync state as a snapshot blob (JSON, then zstd-compressed).
     /// Contains field_versions, device_registry, applied_ops, and sync_metadata.
     fn export_snapshot(&self, sync_id: &str) -> Result<Vec<u8>>;
+
+    /// Rotate the database encryption key using PRAGMA rekey.
+    ///
+    /// The new key must be 32 bytes. The connection must already be
+    /// authenticated (i.e., the initial PRAGMA key has been applied).
+    /// Default implementation is a no-op (for in-memory / test storage).
+    fn rekey(&self, _new_key: &[u8]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Transactional operations on sync storage — obtained from `SyncStorage::begin_tx()`.

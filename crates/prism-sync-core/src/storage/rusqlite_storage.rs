@@ -925,6 +925,13 @@ impl SyncStorage for RusqliteSyncStorage {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_export_snapshot(&conn, sync_id)
     }
+
+    fn rekey(&self, new_key: &[u8]) -> Result<()> {
+        let hex_key = hex::encode(new_key);
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute_batch(&format!("PRAGMA rekey = \"x'{hex_key}'\""))
+            .map_err(|e| CoreError::Storage(format!("PRAGMA rekey failed: {e}")))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════

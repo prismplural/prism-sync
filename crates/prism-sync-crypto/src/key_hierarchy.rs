@@ -197,6 +197,19 @@ impl KeyHierarchy {
         kdf::derive_database_key(&self.dek)
     }
 
+    /// Derive the local storage key from DEK and device secret.
+    ///
+    /// Ties the device's local database encryption key to both the sync group
+    /// identity (via DEK) and the device identity (via DeviceSecret). Returns
+    /// an error if the hierarchy is locked or if no DeviceSecret is set.
+    pub fn local_storage_key(
+        &self,
+        device_secret_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        self.require_unlocked()?;
+        kdf::derive_local_storage_key(&self.dek, device_secret_bytes)
+    }
+
     /// Lock: zero all key material.
     pub fn lock(&mut self) {
         self.dek = Zeroizing::new(Vec::new());

@@ -99,6 +99,28 @@ Future<String> generateSecretKey() =>
 Future<Uint8List> databaseKey({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiDatabaseKey(handle: handle);
 
+/// Derive the local storage key: HKDF-SHA256(IKM=DEK, salt=DeviceSecret,
+/// info="prism_local_storage_key"). Use this as the consumer SQLite PRAGMA key
+/// so the local database is tied to both the sync group (DEK) and the device
+/// (DeviceSecret), preventing cross-device key reuse.
+///
+/// Requires the key hierarchy to be unlocked and a DeviceSecret to be set.
+Future<Uint8List> localStorageKey({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiLocalStorageKey(handle: handle);
+
+/// Rotate the Rust-side sync database encryption key using PRAGMA rekey.
+///
+/// Call this after `local_storage_key()` to keep the Rust sync SQLite and
+/// the consumer Drift SQLite on the same derived key. Acquires an exclusive
+/// lock on the sync storage for the duration of the rekey operation.
+///
+/// The `new_key` must be exactly 32 bytes. This delegates to
+/// `SyncStorage::rekey()` — a no-op for in-memory / test storage.
+Future<void> rekeyDb({
+  required PrismSyncHandle handle,
+  required List<int> newKey,
+}) => RustLib.instance.api.crateApiRekeyDb(handle: handle, newKey: newKey);
+
 /// Configure the sync engine after initialize/unlock.
 ///
 /// Reads `sync_id`, `device_id`, and `session_token` from SecureStore,

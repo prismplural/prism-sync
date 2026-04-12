@@ -42,6 +42,9 @@ pub struct PrismSyncHandle {
     inner: Arc<Mutex<PrismSync>>,
     relay_url: String,
     allow_insecure: bool,
+    /// Path to the Rust-side sync SQLite database. Stored for diagnostic use.
+    #[allow(dead_code)]
+    db_path: String,
     /// The active relay after `configure_engine` is called. Stored here so
     /// `set_auto_sync` can connect the WebSocket notification handler.
     relay: std::sync::Mutex<Option<Arc<ServerRelay>>>,
@@ -940,6 +943,7 @@ pub fn create_prism_sync(
         inner: Arc::new(Mutex::new(prism_sync)),
         relay_url,
         allow_insecure,
+        db_path,
         relay: std::sync::Mutex::new(None),
         driver_handle: std::sync::Mutex::new(None),
         notification_handle: std::sync::Mutex::new(None),
@@ -1081,6 +1085,47 @@ pub async fn database_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
         .database_key()
         .map(|k| k.to_vec())
         .map_err(|e| e.to_string())
+}
+
+/// Derive the local storage key: HKDF-SHA256(IKM=DEK, salt=DeviceSecret,
+/// info="prism_local_storage_key"). Use this as the consumer SQLite PRAGMA key
+/// so the local database is tied to both the sync group (DEK) and the device
+/// (DeviceSecret), preventing cross-device key reuse.
+///
+/// Requires the key hierarchy to be unlocked and a DeviceSecret to be set.
+pub async fn local_storage_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
+    let inner = handle.inner.lock().await;
+    inner
+        .local_storage_key()
+        .map(|k| k.to_vec())
+        .map_err(|e| e.to_string())
+}
+
+/// Rotate the Rust-side sync database encryption key using PRAGMA rekey.
+///
+/// Call this after `local_storage_key()` to keep the Rust sync SQLite and
+/// the consumer Drift SQLite on the same derived key. Acquires an exclusive
+/// lock on the sync storage for the duration of the rekey operation.
+///
+/// The `new_key` must be exactly 32 bytes. This delegates to
+/// `SyncStorage::rekey()` — a no-op for in-memory / test storage.
+pub async fn rekey_db(handle: &PrismSyncHandle, new_key: Vec<u8>) -> Result<(), String> {
+    if new_key.len() != 32 {
+        return Err(format!(
+            "rekey_db: new_key must be 32 bytes, got {}",
+            new_key.len()
+        ));
+    }
+    let inner = handle.inner.clone();
+    // Spawn blocking so the rusqlite mutex lock + PRAGMA rekey don't stall tokio workers.
+    tokio::task::spawn_blocking(move || {
+        inner
+            .blocking_lock()
+            .rekey_storage(&new_key)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("rekey_db: task failed: {e}"))?
 }
 
 // ── Engine configuration ──
