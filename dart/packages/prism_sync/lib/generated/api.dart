@@ -99,6 +99,18 @@ Future<String> generateSecretKey() =>
 Future<Uint8List> databaseKey({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiDatabaseKey(handle: handle);
 
+/// Derive local storage key (HKDF from DEK + DeviceSecret).
+/// Requires initialize() or restore_runtime_keys() to have been called.
+Future<Uint8List> localStorageKey({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiLocalStorageKey(handle: handle);
+
+/// Re-encrypt the Rust sync SQLite database with a new 32-byte key.
+/// Takes Vec<u8> from Dart; validates to exactly 32 bytes.
+Future<void> rekeyDb({
+  required PrismSyncHandle handle,
+  required List<int> newKey,
+}) => RustLib.instance.api.crateApiRekeyDb(handle: handle, newKey: newKey);
+
 /// Configure the sync engine after initialize/unlock.
 ///
 /// Reads `sync_id`, `device_id`, and `session_token` from SecureStore,
