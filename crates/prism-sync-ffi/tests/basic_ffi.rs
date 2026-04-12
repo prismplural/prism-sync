@@ -378,3 +378,196 @@ async fn drain_secure_store_includes_epoch_keys() {
         "epoch_key_1 should be present in drained secure-store entries"
     );
 }
+
+/// The rewritten `drain_secure_store` uses `SecureStore::snapshot()` to
+/// export every entry in the `MemorySecureStore` — including dynamic keys
+/// that were never in the old `known_keys` allow-list. This test seeds a
+/// mix of static and dynamic keys (epoch_key_5, epoch_key_7, runtime
+/// keys) and asserts all of them round-trip through drain.
+#[tokio::test]
+async fn drain_exports_all_memorysecurestore_entries() {
+    use base64::Engine;
+
+    let handle = make_handle();
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    let entries = serde_json::json!({
+        "wrapped_dek": b64(&[0x01; 16]),
+        "device_id": b64(b"dev-42"),
+        // Dynamic keys that would have been dropped by the old allow-list:
+        "epoch_key_5": b64(&[0xAA; 32]),
+        "epoch_key_7": b64(&[0xBB; 32]),
+        "runtime_keys_abc": b64(&[0xCC; 64]),
+        "unknown_future_key": b64(b"forward compat"),
+    });
+
+    api::seed_secure_store(&handle, entries.to_string())
+        .await
+        .expect("seed");
+
+    let drained = api::drain_secure_store(&handle).await.expect("drain");
+    let json: serde_json::Value = serde_json::from_str(&drained).unwrap();
+
+    for expected in [
+        "wrapped_dek",
+        "device_id",
+        "epoch_key_5",
+        "epoch_key_7",
+        "runtime_keys_abc",
+        "unknown_future_key",
+    ] {
+        assert!(
+            json.get(expected).is_some(),
+            "drain must export `{expected}` via snapshot(): got {json}"
+        );
+    }
+}
+
+/// Seed a set of entries, drain, assert the drained JSON round-trips
+/// identically after a second seed.
+#[tokio::test]
+async fn seed_then_drain_round_trip() {
+    use base64::Engine;
+
+    let handle = make_handle();
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    let seeded = serde_json::json!({
+        "sync_id": b64(b"sync-abc"),
+        "epoch_key_3": b64(&[0x42; 32]),
+        "runtime_keys_xyz": b64(b"runtime-payload"),
+    });
+    api::seed_secure_store(&handle, seeded.to_string())
+        .await
+        .expect("first seed");
+
+    let drained1 = api::drain_secure_store(&handle).await.expect("drain");
+    let map1: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&drained1).unwrap();
+
+    // Seed a new handle with the drained output and drain again. The two
+    // drained maps must be identical.
+    let handle2 = make_handle();
+    api::seed_secure_store(&handle2, drained1.clone())
+        .await
+        .expect("reseed");
+    let drained2 = api::drain_secure_store(&handle2).await.expect("drain2");
+    let map2: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&drained2).unwrap();
+
+    assert_eq!(map1, map2, "drain output must be stable across reseed");
+    // And every originally-seeded entry must have survived.
+    for key in ["sync_id", "epoch_key_3", "runtime_keys_xyz"] {
+        assert!(map1.get(key).is_some(), "missing `{key}` after round-trip");
+    }
+}
+
+/// Cross-restart test (Test F.2 from the robustness plan, Appendix B.8):
+/// simulate an app restart by creating `handle1`, seeding credentials +
+/// a fabricated `epoch_key_1`, draining, disposing, then creating a
+/// fresh `handle2` with a new in-memory DB, seeding from the drained
+/// JSON, and verifying the `epoch_key_1` survives byte-for-byte.
+///
+/// Asserts all three Appendix B.8 invariants:
+/// 1. `epoch_key_1` is present in the drained map.
+/// 2. Every static credential key we seeded (13-entry allow-list subset)
+///    is present in the drained map.
+/// 3. After a cross-handle reseed + drain, `epoch_key_1` round-trips
+///    byte-for-byte.
+#[tokio::test]
+async fn cold_start_recovers_epoch_key_via_drain_seed_round_trip() {
+    use base64::Engine;
+
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let epoch_key_bytes = [0xAB_u8; 32];
+
+    // Minimal paired-device credentials. These match the static allow-list
+    // keys in both `_secureStoreKeys` (Dart) and `known_keys` in
+    // `drain_secure_store` (Rust fallback path).
+    let static_keys: &[(&str, Vec<u8>)] = &[
+        ("wrapped_dek", vec![0x11; 48]),
+        ("dek_salt", vec![0x22; 16]),
+        ("device_secret", vec![0x33; 32]),
+        ("device_id", b"dev-cold-start".to_vec()),
+        ("sync_id", b"sync-cold-start".to_vec()),
+        ("session_token", b"token-abc".to_vec()),
+        ("epoch", b"0".to_vec()),
+        ("relay_url", b"https://relay.example.com".to_vec()),
+        ("mnemonic", b"abandon abandon abandon".to_vec()),
+        ("setup_rollback_marker", b"0".to_vec()),
+        ("sharing_prekey_store", b"{}".to_vec()),
+        ("sharing_id_cache", b"cache".to_vec()),
+        ("min_signature_version_floor", b"3".to_vec()),
+    ];
+
+    // --- Session 1: seed, drain, drop ---
+    let handle1 = make_handle();
+    let mut seed_obj = serde_json::Map::new();
+    for (k, v) in static_keys {
+        seed_obj.insert((*k).to_string(), serde_json::Value::String(b64(v)));
+    }
+    // The critical dynamic key:
+    seed_obj.insert(
+        "epoch_key_1".to_string(),
+        serde_json::Value::String(b64(&epoch_key_bytes)),
+    );
+    let seeded = serde_json::Value::Object(seed_obj).to_string();
+    api::seed_secure_store(&handle1, seeded)
+        .await
+        .expect("session1 seed");
+
+    let drained1 = api::drain_secure_store(&handle1)
+        .await
+        .expect("session1 drain");
+    let map1: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&drained1).unwrap();
+
+    // Invariant 1: epoch_key_1 is in the drained map.
+    assert!(
+        map1.get("epoch_key_1").is_some(),
+        "session1 drain must export epoch_key_1"
+    );
+    // Invariant 2: every static key we seeded is in the drained map.
+    for (k, _) in static_keys {
+        assert!(
+            map1.contains_key(*k),
+            "session1 drain missing static key `{k}`: {map1:?}"
+        );
+    }
+
+    // Simulate app termination: drop session1 handle.
+    drop(handle1);
+
+    // --- Session 2: new in-memory DB, seed from drained, drain again ---
+    let handle2 = make_handle();
+    api::seed_secure_store(&handle2, drained1)
+        .await
+        .expect("session2 seed from drained");
+    let drained2 = api::drain_secure_store(&handle2)
+        .await
+        .expect("session2 drain");
+    let map2: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&drained2).unwrap();
+
+    // Invariant 3: the epoch key survived the simulated restart byte-for-byte.
+    let round_tripped = map2
+        .get("epoch_key_1")
+        .and_then(|v| v.as_str())
+        .expect("epoch_key_1 missing from session2 drain");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(round_tripped)
+        .expect("valid base64");
+    assert_eq!(
+        decoded,
+        epoch_key_bytes.to_vec(),
+        "epoch_key_1 must round-trip byte-for-byte across drain/seed cycles"
+    );
+
+    // Static keys also round-trip.
+    for (k, _) in static_keys {
+        assert!(
+            map2.contains_key(*k),
+            "session2 drain missing static key `{k}` after reseed"
+        );
+    }
+}

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
-use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope};
+use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope, SyncRelay};
 use prism_sync_core::schema::SyncValue;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
@@ -959,5 +959,221 @@ async fn push_without_ml_dsa_key_errors() {
     assert!(
         err_msg.contains("ML-DSA signing key required"),
         "Error should mention ML-DSA signing key required, got: {err_msg}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Push at current-epoch semantics (Bucket 3 of sync-robustness plan)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: seed epoch 1 key into a KeyHierarchy derived from epoch 0.
+fn seed_epoch_1_key(kh: &mut prism_sync_crypto::KeyHierarchy) {
+    // 32 deterministic bytes — the actual key value doesn't matter for
+    // these tests; only that the hierarchy has something at epoch 1.
+    kh.store_epoch_key(1, zeroize::Zeroizing::new(vec![0xCDu8; 32]));
+}
+
+/// Helper: overwrite `current_epoch` in `sync_metadata`.
+fn set_metadata_current_epoch(storage: &RusqliteSyncStorage, device_id: &str, epoch: i32) {
+    use prism_sync_core::storage::SyncStorage;
+    let mut tx = storage.begin_tx().unwrap();
+    tx.upsert_sync_metadata(&prism_sync_core::SyncMetadata {
+        sync_id: SYNC_ID.to_string(),
+        local_device_id: device_id.to_string(),
+        current_epoch: epoch,
+        last_pulled_server_seq: 0,
+        last_pushed_at: None,
+        last_successful_sync_at: None,
+        registered_at: Some(chrono::Utc::now()),
+        needs_rekey: false,
+        last_imported_registry_version: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    })
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+fn make_op(device_id: &str, batch_id: &str, epoch: i32, suffix: &str) -> CrdtChange {
+    let hlc = Hlc::now(device_id, None);
+    CrdtChange {
+        op_id: format!("tasks:task-{suffix}:title:{hlc}:{device_id}"),
+        batch_id: Some(batch_id.to_string()),
+        entity_id: format!("task-{suffix}"),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"hello\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_id.to_string(),
+        epoch,
+        server_seq: None,
+    }
+}
+
+/// If the group rotates from epoch 0 -> 1 while ops are still pending at
+/// epoch 0, the push must re-tag the envelope to the current epoch (1)
+/// so the relay's `envelope.epoch == group.current_epoch` check succeeds.
+#[tokio::test]
+async fn push_uses_current_epoch_not_stored_op_epoch() {
+    let mut key_hierarchy = init_key_hierarchy();
+    seed_epoch_1_key(&mut key_hierarchy);
+
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-push-curr";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    // Pending op was created at epoch 0.
+    let ops = vec![make_op(device_id, "batch-push-curr", 0, "1")];
+    insert_pending_ops(&storage, &ops, "batch-push-curr");
+
+    // Group has since rotated to epoch 1.
+    set_metadata_current_epoch(&storage, device_id, 1);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        result.error.is_none(),
+        "push should succeed at re-tagged epoch: {:?}",
+        result.error
+    );
+    assert_eq!(result.pushed, 1, "expected 1 batch pushed");
+    assert_eq!(relay.batch_count(), 1, "relay should have 1 envelope");
+
+    // The relay stores StoredBatch with envelope.epoch — we can't poke
+    // into the private state, but pull_changes returns the envelopes.
+    let pulled = relay.pull_changes(0).await.unwrap();
+    assert_eq!(pulled.batches.len(), 1);
+    assert_eq!(
+        pulled.batches[0].envelope.epoch, 1,
+        "envelope must be re-tagged to current_epoch (1)"
+    );
+}
+
+/// Degenerate case: metadata claims current_epoch = N but the KeyHierarchy
+/// has no key at N. Push must fail with a clear error, NOT silently fall
+/// back to an older epoch key.
+#[tokio::test]
+async fn push_still_fails_when_current_epoch_key_missing() {
+    let key_hierarchy = init_key_hierarchy(); // only epoch 0 available
+
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-push-missing-key";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    let ops = vec![make_op(device_id, "batch-missing-key", 0, "1")];
+    insert_pending_ops(&storage, &ops, "batch-missing-key");
+    set_metadata_current_epoch(&storage, device_id, 2); // no key for epoch 2
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        result.error.is_some(),
+        "push must fail when current_epoch key is missing"
+    );
+    let err = result.error.unwrap();
+    assert!(
+        err.contains("Missing epoch key for push epoch 2"),
+        "error must name the missing epoch: {err}"
+    );
+}
+
+/// If the stored op epoch is somehow *higher* than sync_metadata
+/// current_epoch (shouldn't happen in practice), the defensive `.max`
+/// keeps the push at the higher value so it doesn't regress to a stale
+/// epoch. Exercises the `current_epoch.max(ops[0].epoch)` branch.
+#[tokio::test]
+async fn push_honors_max_of_current_and_op_epoch() {
+    let mut key_hierarchy = init_key_hierarchy();
+    seed_epoch_1_key(&mut key_hierarchy);
+
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-push-max";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    // Op claims epoch 1 (unexpected but possible after a recovered rekey);
+    // sync_metadata still shows 0. Push must use epoch 1.
+    let ops = vec![make_op(device_id, "batch-max", 1, "1")];
+    insert_pending_ops(&storage, &ops, "batch-max");
+    set_metadata_current_epoch(&storage, device_id, 0);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+    assert!(result.error.is_none(), "push must succeed: {:?}", result.error);
+
+    let pulled = relay.pull_changes(0).await.unwrap();
+    assert_eq!(pulled.batches.len(), 1);
+    assert_eq!(
+        pulled.batches[0].envelope.epoch, 1,
+        "envelope must be at max(current=0, op=1) = 1"
     );
 }

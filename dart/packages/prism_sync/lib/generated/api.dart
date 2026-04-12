@@ -8,7 +8,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 // These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `json_value_to_sync_value`, `load_device_ml_dsa_generation`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `SharingHandleContext`, `SharingPendingResultJson`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
 /// Build and configure a PrismSync instance.
 ///
@@ -319,10 +319,9 @@ Future<String?> pollEvent({required PrismSyncHandle handle}) =>
 ///
 /// Returns JSON containing `sync_id` and `relay_url`.
 ///
-/// The relay is constructed internally from the handle's `relay_url`.
-/// A placeholder `sync_id` is used for the registration call because the
-/// real `sync_id` is generated inside `PairingService::create_sync_group`.
-/// The relay server must accept registration at any sync-group path.
+/// The relay is constructed via a builder closure after the sync_id is
+/// generated internally, ensuring the registration request uses the real
+/// sync_id in the URL path.
 Future<String> createSyncGroup({
   required PrismSyncHandle handle,
   required String password,
@@ -487,6 +486,16 @@ Future<void> seedSecureStore({
 /// Returns a JSON object: `{"key": "base64value", ...}`
 /// Call this after state-changing operations (initialize, change_password,
 /// create_sync_group, join_*).
+///
+/// **Fast path:** if the underlying store supports enumeration (i.e.
+/// `SecureStore::snapshot()` returns `Some`, which `MemorySecureStore`
+/// does), every entry is exported verbatim. This covers dynamic keys
+/// such as `epoch_key_*` and `runtime_keys_*` without allow-list
+/// maintenance.
+///
+/// **Fallback:** if enumeration is unavailable (keychain-backed impls),
+/// drain falls back to the historical fixed `known_keys` list plus
+/// `epoch_key_1..=current_epoch`.
 Future<String> drainSecureStore({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiDrainSecureStore(handle: handle);
 

@@ -197,6 +197,14 @@ fn sync_status_to_json(status: &prism_sync_core::client::SyncStatus) -> serde_js
 }
 
 fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_json::Value {
+    // `error_kind` uses the same pascal-case Debug format as
+    // `SyncEvent::Error.kind` (see below) so Dart can parse both the same way.
+    // Do not switch to kebab-case serde; the existing FFI convention is
+    // `format!("{k:?}")` and both surfaces must stay consistent.
+    //
+    // `error_code` and `remote_wipe` are forwarded verbatim so the Dart
+    // `SyncStatusNotifier` can trigger credential cleanup when the engine
+    // wraps a `device_revoked` response into an `Ok(result)` branch.
     serde_json::json!({
         "pulled": result.pulled,
         "merged": result.merged,
@@ -204,6 +212,9 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
         "pruned": result.pruned,
         "duration_ms": result.duration.as_millis() as u64,
         "error": result.error,
+        "error_kind": result.error_kind.as_ref().map(|k| format!("{k:?}")),
+        "error_code": result.error_code,
+        "remote_wipe": result.remote_wipe,
     })
 }
 
@@ -820,6 +831,14 @@ impl prism_sync_core::secure_store::SecureStore for MemorySecureStore {
         self.data.lock().unwrap().clear();
         Ok(())
     }
+
+    /// Override the default `None` impl so `drain_secure_store` can
+    /// enumerate every entry (including dynamic `epoch_key_*` and
+    /// `runtime_keys_*` keys) via the trait object. Reuses the existing
+    /// inherent `snapshot()` method above.
+    fn snapshot(&self) -> prism_sync_core::Result<Option<HashMap<String, Vec<u8>>>> {
+        Ok(Some(MemorySecureStore::snapshot(self)))
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1341,6 +1360,23 @@ pub async fn set_auto_sync(
         // It feeds the same mpsc channel as the debounce + notification tasks.
         let backoff_tx = notification_trigger_tx.clone();
 
+        // Auto-sync driver: outer tier of the two-tier retry architecture.
+        //
+        // The inner tier lives in `SyncService::sync_now` (prism-sync-core):
+        // 3 tight `INNER_RETRY_DELAY` (2s) retries inside a single sync
+        // cycle, scoped to transient transport hiccups (pull timeouts,
+        // TLS resets, backgrounded tokio timers firing overdue). The inner
+        // loop converts exhausted retries into `Err(synthetic_core_error)`.
+        //
+        // This outer loop receives that `Err` and runs exponential backoff
+        // across sync *cycles* (`30s -> 60s -> 120s -> 240s -> 300s`, with
+        // a ~10-minute cumulative cap). On success we reset; on final
+        // exhaustion we emit a terminal `SyncEvent::Error` and clear the
+        // backoff so a manual trigger starts fresh.
+        //
+        // Do not collapse the two tiers: the inner loop avoids escalating
+        // one-off hiccups to multi-minute user-visible delays; the outer
+        // loop prevents busy-looping during sustained outages.
         let driver = background_runtime().spawn(async move {
             use prism_sync_core::sync_service::SyncTrigger;
 
@@ -2269,6 +2305,16 @@ pub async fn seed_secure_store(
 /// Returns a JSON object: `{"key": "base64value", ...}`
 /// Call this after state-changing operations (initialize, change_password,
 /// create_sync_group, join_*).
+///
+/// **Fast path:** if the underlying store supports enumeration (i.e.
+/// `SecureStore::snapshot()` returns `Some`, which `MemorySecureStore`
+/// does), every entry is exported verbatim. This covers dynamic keys
+/// such as `epoch_key_*` and `runtime_keys_*` without allow-list
+/// maintenance.
+///
+/// **Fallback:** if enumeration is unavailable (keychain-backed impls),
+/// drain falls back to the historical fixed `known_keys` list plus
+/// `epoch_key_1..=current_epoch`.
 pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, String> {
     let (store, storage, sync_id, cached_epoch) = {
         let inner = handle.inner.lock().await;
@@ -2288,6 +2334,20 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         )
     };
 
+    // Fast path: snapshot the entire store.
+    if let Some(map) = store.snapshot().map_err(|e| e.to_string())? {
+        use base64::Engine;
+        let mut entries = serde_json::Map::with_capacity(map.len());
+        for (key, value) in map {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
+            entries.insert(key, serde_json::Value::String(b64));
+        }
+        return Ok(serde_json::Value::Object(entries).to_string());
+    }
+
+    // Fallback path: keychain-backed store without enumeration. Use the
+    // historical allow-list plus a bounded `epoch_key_*` scan so existing
+    // consumers keep working with no behavior change.
     let current_epoch = if let Some(sync_id) = sync_id {
         let meta_epoch = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sync_id))
             .await

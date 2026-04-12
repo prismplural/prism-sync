@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::events::EntityChange;
+use crate::events::{EntityChange, SyncErrorKind};
 
 /// The current state of the sync engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +34,26 @@ pub struct SyncResult {
     pub duration: Duration,
     /// Error encountered, if any.
     pub error: Option<String>,
+    /// Structured classification of `error`, if populated.
+    ///
+    /// Populated alongside `error` by the engine's pull/push phases so both
+    /// the inner retry loop in `SyncService::sync_now` and the UI can
+    /// classify failures without string matching. `None` when `error` is
+    /// also `None`.
+    pub error_kind: Option<SyncErrorKind>,
+    /// Error code from a relay failure (e.g. "device_revoked",
+    /// "device_identity_mismatch"). Populated alongside `error` when the
+    /// failure originated from a `CoreError::Relay` with a `code`.
+    ///
+    /// Critical for credential-cleanup paths: `device_revoked` responses
+    /// arrive during pull/push but get wrapped back into `SyncResult`.
+    /// Without this field, the Dart side only sees the stringified error
+    /// and can't reliably trigger `_clearSyncCredentials`.
+    pub error_code: Option<String>,
+    /// Whether the relay also requested a remote wipe, copied from
+    /// `CoreError::Relay.remote_wipe`. Only meaningful when
+    /// `error_code == Some("device_revoked")`.
+    pub remote_wipe: Option<bool>,
     /// Entity changes with full field values from the pull phase.
     ///
     /// Populated when remote changes were merged. Each entry contains
@@ -51,6 +71,9 @@ impl Default for SyncResult {
             pruned: 0,
             duration: Duration::ZERO,
             error: None,
+            error_kind: None,
+            error_code: None,
+            remote_wipe: None,
             entity_changes: Vec::new(),
         }
     }

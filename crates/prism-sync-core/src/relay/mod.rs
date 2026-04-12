@@ -6,7 +6,7 @@ pub mod sharing_relay;
 pub mod traits;
 pub mod websocket;
 
-pub use mock::MockRelay;
+pub use mock::{InjectedPullError, MockRelay};
 pub use mock_sharing_relay::MockSharingRelay;
 pub use pairing_relay::{MockPairingRelay, PairingRelay, PairingSlot, ServerPairingRelay};
 pub use server_relay::ServerRelay;

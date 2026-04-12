@@ -61,7 +61,17 @@ impl ServerRelay {
         // NOTE: Do NOT set a global timeout on the Client — use per-request
         // timeouts instead, because snapshots need a longer deadline than
         // normal change pulls.
+        //
+        // The connect/pool/keepalive settings below are separate from the
+        // per-request deadline: they bound how long we'll wait for a TCP
+        // connect to start and how long idle sockets stay pooled. Without
+        // them, a slow or half-open TLS handshake can consume the full
+        // per-request budget before any data flows, and an iOS-backgrounded
+        // connection can return stale sockets after resume.
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 

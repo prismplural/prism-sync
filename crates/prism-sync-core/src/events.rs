@@ -104,6 +104,53 @@ pub enum SyncErrorKind {
     Timeout,
 }
 
+/// Classify a `CoreError` into a `SyncErrorKind` for structured reporting.
+///
+/// Called by `SyncEngine` when converting pull/push errors into a populated
+/// `SyncResult { error, error_kind }`, and by `SyncService::sync_now` when
+/// deciding whether to retry. Keeping the mapping here avoids duplication
+/// between the engine and the service.
+///
+/// **Retryability invariant:** only `Network`, `Server`, and `Timeout`
+/// kinds are treated as retryable by `sync_error_kind_retryable` in
+/// `sync_service.rs`. Local errors (`CoreError::Engine`,
+/// `CoreError::Storage`, `CoreError::Schema`, unknown table/field,
+/// serialization, etc.) must NOT map to `Network`: they are permanent
+/// local failures (missing epoch key, ML-DSA key not configured,
+/// corrupted pending op, schema mismatch) and retrying them burns 6
+/// seconds of user-visible latency for nothing. Map them to `Protocol`
+/// so the retry loop surfaces them immediately and the Dart
+/// event-driven drain does not treat them as transient.
+pub(crate) fn classify_core_error(e: &crate::error::CoreError) -> SyncErrorKind {
+    use crate::error::{CoreError, RelayErrorCategory};
+    match e {
+        CoreError::Relay { kind, .. } => match kind {
+            RelayErrorCategory::Network => SyncErrorKind::Network,
+            RelayErrorCategory::Auth => SyncErrorKind::Auth,
+            RelayErrorCategory::DeviceIdentityMismatch => SyncErrorKind::DeviceIdentityMismatch,
+            RelayErrorCategory::Server => SyncErrorKind::Server,
+            RelayErrorCategory::Protocol => SyncErrorKind::Protocol,
+            RelayErrorCategory::Other => SyncErrorKind::Network,
+        },
+        CoreError::DeviceKeyChanged { .. } => SyncErrorKind::KeyChanged,
+        CoreError::ClockDrift { .. } => SyncErrorKind::ClockSkew,
+        // Local/permanent failures — surface immediately, do not retry,
+        // do not drain. Storage busy-lock flakes are rare enough that
+        // the outer auto-sync driver will pick them up on the next
+        // cycle without us burning the inner retry budget.
+        CoreError::Engine(_) | CoreError::Storage(_) | CoreError::Sqlite(_) => {
+            SyncErrorKind::Protocol
+        }
+        CoreError::Schema(_)
+        | CoreError::Serialization(_)
+        | CoreError::Json(_)
+        | CoreError::HlcParse(_)
+        | CoreError::UnknownTable(_)
+        | CoreError::UnknownField { .. }
+        | CoreError::Crypto(_) => SyncErrorKind::Protocol,
+    }
+}
+
 /// Create a new broadcast channel for `SyncEvent`s.
 ///
 /// The channel capacity is 256 — enough to buffer a burst of events

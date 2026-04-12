@@ -33,6 +33,31 @@ pub struct SenderKeyInfo {
     pub ml_dsa_key_generation: u32,
 }
 
+/// Copy structured error metadata from a `CoreError` into `SyncResult`.
+///
+/// Populates `error`, `error_kind`, and — ONLY for `CoreError::Relay` —
+/// the `error_code` + `remote_wipe` fields so the propagation chain all
+/// the way out to Dart preserves `device_revoked` /
+/// `device_identity_mismatch` / `upgrade_required` markers.
+///
+/// **Invariant:** `error_code` / `remote_wipe` carry RELAY response
+/// metadata only. Local / engine errors (`DeviceKeyChanged`, `Engine`,
+/// `Storage`, etc.) must NOT populate these fields because Dart treats
+/// a non-null `error_code` as a relay response code for cleanup routing.
+/// `DeviceKeyChanged` is surfaced via `SyncErrorKind::KeyChanged`, not
+/// via `error_code`, and the UI keys off the `kind` for that path.
+fn populate_result_error(result: &mut SyncResult, e: &CoreError) {
+    result.error_kind = Some(crate::events::classify_core_error(e));
+    result.error = Some(e.to_string());
+    if let CoreError::Relay {
+        code, remote_wipe, ..
+    } = e
+    {
+        result.error_code = code.clone();
+        result.remote_wipe = *remote_wipe;
+    }
+}
+
 /// Result of the pull phase, bundling counts with relay-reported metadata.
 struct PullPhaseResult {
     pulled: u64,
@@ -147,7 +172,7 @@ impl SyncEngine {
                 }
             }
             Err(e) => {
-                result.error = Some(e.to_string());
+                populate_result_error(&mut result, &e);
                 result.duration = start.elapsed();
                 self.set_state(SyncState::Error {
                     message: e.to_string(),
@@ -197,7 +222,7 @@ impl SyncEngine {
                 result.pushed = pushed;
             }
             Err(e) => {
-                result.error = Some(e.to_string());
+                populate_result_error(&mut result, &e);
                 result.duration = start.elapsed();
                 self.set_state(SyncState::Error {
                     message: e.to_string(),
@@ -904,6 +929,24 @@ impl SyncEngine {
             return Ok(0);
         }
 
+        // Read the authoritative group epoch once at the top of the push
+        // phase. Epoch rotation serializes through `handle.inner.lock()`, so
+        // the group epoch cannot change mid-push; a per-batch read would be
+        // redundant I/O. We use this value instead of the op's stored epoch
+        // so that pending ops created before an epoch rotation are still
+        // pushed at the current epoch — the relay rejects envelopes whose
+        // epoch does not match `group.current_epoch`, and the envelope epoch
+        // is bound into signature + AAD. Merge semantics use HLC + device_id
+        // + op_id (not epoch), so re-tagging the envelope is safe.
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let current_epoch_i32: i32 =
+            tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))??
+                .map(|m| m.current_epoch)
+                .unwrap_or(0);
+
         let mut pushed_count = 0u64;
 
         for batch_id in &batch_ids {
@@ -918,7 +961,9 @@ impl SyncEngine {
                 continue;
             }
 
-            let epoch = ops[0].epoch;
+            // Defensive `.max` handles the degenerate case where sync_metadata
+            // is missing (first push) or somehow behind the stored op epoch.
+            let epoch = current_epoch_i32.max(ops[0].epoch);
 
             // Convert PendingOps to CrdtChanges for encoding
             let changes: Vec<CrdtChange> = ops
@@ -933,7 +978,9 @@ impl SyncEngine {
                     client_hlc: op.client_hlc.clone(),
                     is_delete: op.is_delete,
                     device_id: op.device_id.clone(),
-                    epoch: op.epoch,
+                    // Re-tag at the push-time epoch so the envelope and the
+                    // embedded change records agree. Storage is unchanged.
+                    epoch,
                     server_seq: None,
                 })
                 .collect();
@@ -1244,4 +1291,72 @@ fn pk_from_record(record: &DeviceRecord) -> Result<SenderKeyInfo> {
         ml_dsa_65_pk: record.ml_dsa_65_public_key.clone(),
         ml_dsa_key_generation: record.ml_dsa_key_generation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::RelayErrorCategory;
+
+    /// Relay errors with a `device_revoked` code must populate the
+    /// structured metadata on `SyncResult`.
+    #[test]
+    fn populate_result_error_copies_relay_code_and_remote_wipe() {
+        let mut result = SyncResult::default();
+        let err = CoreError::Relay {
+            message: "device revoked".into(),
+            kind: RelayErrorCategory::Auth,
+            status: Some(401),
+            code: Some("device_revoked".into()),
+            min_signature_version: None,
+            remote_wipe: Some(true),
+        };
+
+        populate_result_error(&mut result, &err);
+
+        assert_eq!(result.error.as_deref(), Some("relay error (Auth): device revoked"));
+        assert_eq!(result.error_code.as_deref(), Some("device_revoked"));
+        assert_eq!(result.remote_wipe, Some(true));
+    }
+
+    /// `DeviceKeyChanged` is a LOCAL engine error, not a relay response.
+    /// Regression guard for Fix 4 of the 2026-04-11 robustness plan:
+    /// `error_code` / `remote_wipe` must stay `None`. The key-changed
+    /// case is surfaced via `SyncErrorKind::KeyChanged` instead.
+    #[test]
+    fn populate_result_error_does_not_set_error_code_for_device_key_changed() {
+        let mut result = SyncResult::default();
+        let err = CoreError::DeviceKeyChanged {
+            device_id: "dev-a".into(),
+        };
+
+        populate_result_error(&mut result, &err);
+
+        assert!(
+            result.error_code.is_none(),
+            "DeviceKeyChanged must not leak a synthetic error_code: {:?}",
+            result.error_code
+        );
+        assert!(
+            result.remote_wipe.is_none(),
+            "DeviceKeyChanged has no remote_wipe: {:?}",
+            result.remote_wipe
+        );
+        assert_eq!(result.error_kind, Some(crate::events::SyncErrorKind::KeyChanged));
+    }
+
+    /// Local engine / storage errors must also leave the relay-scoped
+    /// fields at `None`.
+    #[test]
+    fn populate_result_error_does_not_set_error_code_for_local_errors() {
+        for err in [
+            CoreError::Engine("missing epoch key for push epoch 2".into()),
+            CoreError::Storage("tx aborted".into()),
+        ] {
+            let mut result = SyncResult::default();
+            populate_result_error(&mut result, &err);
+            assert!(result.error_code.is_none(), "{err:?}");
+            assert!(result.remote_wipe.is_none(), "{err:?}");
+        }
+    }
 }

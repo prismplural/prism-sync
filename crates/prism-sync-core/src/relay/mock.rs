@@ -38,12 +38,37 @@ struct MockRelayState {
     ack_calls: Vec<i64>,
     /// If set, `ack()` will return this error.
     ack_error: Option<String>,
+    /// Number of consecutive `pull_changes` calls that should return a
+    /// retryable network error before success. Decremented on each failure.
+    pull_failures_remaining: u32,
+    /// Optional override: when set, `pull_changes` returns this specific
+    /// error kind instead of a `Network` error. Used to test retry
+    /// classification on auth / server / protocol errors.
+    pull_failure_kind: Option<InjectedPullError>,
+    /// Total `pull_changes` call count (for test assertions).
+    pull_call_count: u32,
     /// Tracks the current ML-DSA key generation per device.
     ml_dsa_generations: HashMap<String, u32>,
     /// In-memory media blob storage.
     media: HashMap<String, Vec<u8>>,
     /// Signed registry artifact to return from get_signed_registry.
     signed_registry: Option<SignedRegistryResponse>,
+}
+
+/// How an injected `pull_changes` failure should present on the wire.
+///
+/// `Network` is the default for `fail_next_pulls`; the other variants are
+/// only used by retry-classification tests.
+#[derive(Clone, Copy, Debug)]
+pub enum InjectedPullError {
+    Network,
+    Auth,
+    Server,
+    /// Relay responded with `device_revoked` (optionally requesting a
+    /// remote wipe). Used to verify that the engine -> sync_service ->
+    /// FFI chain propagates the `code` / `remote_wipe` metadata all the
+    /// way out to Dart.
+    DeviceRevoked { remote_wipe: bool },
 }
 
 /// Full stored batch — keeps the original `SignedBatchEnvelope` so that
@@ -69,6 +94,9 @@ impl MockRelay {
                 min_acked_seq: None,
                 ack_calls: Vec::new(),
                 ack_error: None,
+                pull_failures_remaining: 0,
+                pull_failure_kind: None,
+                pull_call_count: 0,
                 ml_dsa_generations: HashMap::new(),
                 media: HashMap::new(),
                 signed_registry: None,
@@ -136,6 +164,27 @@ impl MockRelay {
         self.state.lock().unwrap().ack_error = Some(msg.to_string());
     }
 
+    /// Schedule the next `n` `pull_changes` calls to return a retryable
+    /// network error. Used by retry-loop tests in `sync_service`.
+    pub fn fail_next_pulls(&self, n: u32) {
+        let mut guard = self.state.lock().unwrap();
+        guard.pull_failures_remaining = n;
+        guard.pull_failure_kind = Some(InjectedPullError::Network);
+    }
+
+    /// Schedule the next `n` `pull_changes` calls to return a specific
+    /// kind of error. Used to exercise retry-classification logic.
+    pub fn fail_next_pulls_with(&self, n: u32, kind: InjectedPullError) {
+        let mut guard = self.state.lock().unwrap();
+        guard.pull_failures_remaining = n;
+        guard.pull_failure_kind = Some(kind);
+    }
+
+    /// Number of times `pull_changes` has been called.
+    pub fn pull_call_count(&self) -> u32 {
+        self.state.lock().unwrap().pull_call_count
+    }
+
     /// Returns the snapshot only if the caller's `device_id` is allowed to see it.
     ///
     /// Mirrors the server relay's `target_device_id` enforcement: if the snapshot
@@ -184,6 +233,31 @@ impl SyncRelay for MockRelay {
     }
 
     async fn pull_changes(&self, since: i64) -> Result<PullResponse, RelayError> {
+        {
+            let mut guard = self.state.lock().unwrap();
+            guard.pull_call_count += 1;
+            if guard.pull_failures_remaining > 0 {
+                guard.pull_failures_remaining -= 1;
+                let kind = guard
+                    .pull_failure_kind
+                    .unwrap_or(InjectedPullError::Network);
+                return Err(match kind {
+                    InjectedPullError::Network => RelayError::Network {
+                        message: "mock injected network error".into(),
+                    },
+                    InjectedPullError::Auth => RelayError::Auth {
+                        message: "mock injected auth error".into(),
+                    },
+                    InjectedPullError::Server => RelayError::Server {
+                        status_code: 503,
+                        message: "mock injected 503".into(),
+                    },
+                    InjectedPullError::DeviceRevoked { remote_wipe } => {
+                        RelayError::DeviceRevoked { remote_wipe }
+                    }
+                });
+            }
+        }
         let state = self.state.lock().unwrap();
         let batches: Vec<ReceivedBatch> = state
             .batches
