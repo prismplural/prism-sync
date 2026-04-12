@@ -301,6 +301,25 @@ impl PrismSync {
         self.key_hierarchy.database_key().map_err(CoreError::Crypto)
     }
 
+    /// Derive local storage key: HKDF(DEK, DeviceSecret, "prism_local_storage_v2").
+    ///
+    /// Requires the key hierarchy to be unlocked and a DeviceSecret to be loaded
+    /// (set by `initialize` or `unlock`).
+    pub fn local_storage_key(&self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let dek = self.key_hierarchy.dek().map_err(CoreError::Crypto)?;
+        let device_secret = self
+            .device_secret
+            .as_ref()
+            .ok_or_else(|| CoreError::Engine("device secret not loaded".into()))?;
+        prism_sync_crypto::kdf::derive_local_storage_key(dek, device_secret.as_bytes())
+            .map_err(CoreError::Crypto)
+    }
+
+    /// Re-encrypt the Rust sync SQLite with a new 32-byte key.
+    pub fn rekey_db(&self, new_key: &[u8; 32]) -> Result<()> {
+        self.storage.rekey(new_key)
+    }
+
     // ── Sync engine ──
 
     /// Configure the sync engine with a relay, enabling sync operations.
@@ -1223,6 +1242,53 @@ mod tests {
             sync.ml_dsa_key_generation(),
             Some(2),
             "ML-DSA key generation should be updated to 2 after refresh"
+        );
+    }
+
+    #[test]
+    fn local_storage_key_fails_without_device_secret() {
+        let mut sync = make_sync();
+        // Unlock the key hierarchy without setting a device secret by using restore_from_dek
+        sync.key_hierarchy_mut()
+            .restore_from_dek(&[0u8; 32])
+            .unwrap();
+        // device_secret is still None — local_storage_key should return an error about it
+        let result = sync.local_storage_key();
+        assert!(
+            result.is_err(),
+            "local_storage_key should fail without device secret"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("device secret"),
+            "error should mention device secret, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_storage_key_succeeds_after_initialize() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+        let result = sync.local_storage_key();
+        assert!(
+            result.is_ok(),
+            "local_storage_key should succeed after initialize: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().len(), 32);
+    }
+
+    #[test]
+    fn rekey_db_delegates_to_storage() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+        // In-memory storage — rekey is a no-op and should succeed
+        let new_key = [0xaau8; 32];
+        let result = sync.rekey_db(&new_key);
+        assert!(
+            result.is_ok(),
+            "rekey_db should succeed on in-memory storage: {:?}",
+            result.err()
         );
     }
 }
