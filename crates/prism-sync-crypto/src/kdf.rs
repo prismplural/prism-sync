@@ -66,6 +66,14 @@ pub fn derive_database_key(dek: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     derive_subkey(dek, &[], b"prism_database_key")
 }
 
+/// Derive local storage key from DEK + DeviceSecret.
+/// HKDF-SHA256(ikm=DEK, salt=DeviceSecret, info="prism_local_storage_v2")
+/// DeviceSecret as salt binds key to per-device PQ material (ML-KEM-768/ML-DSA-65 family).
+/// Two devices in the same sync group derive different local storage keys — correct since DBs are device-local.
+pub fn derive_local_storage_key(dek: &[u8], device_secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    derive_subkey(dek, device_secret, b"prism_local_storage_v2")
+}
+
 /// Derive an arbitrary-length subkey using HKDF-SHA256.
 pub fn derive_subkey_long(
     ikm: &[u8],
@@ -158,6 +166,32 @@ mod tests {
         let key1 = derive_subkey_long(&ikm, b"salt", b"info", 64).unwrap();
         let key2 = derive_subkey_long(&ikm, b"salt", b"info", 64).unwrap();
         assert_eq!(key1.len(), 64);
+        assert_eq!(*key1, *key2);
+    }
+
+    #[test]
+    fn derive_local_storage_key_is_32_bytes() {
+        let dek = vec![42u8; 32];
+        let device_secret = vec![7u8; 32];
+        let key = derive_local_storage_key(&dek, &device_secret).unwrap();
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn derive_local_storage_key_differs_from_database_key() {
+        let dek = vec![42u8; 32];
+        let device_secret = vec![7u8; 32];
+        let local_key = derive_local_storage_key(&dek, &device_secret).unwrap();
+        let db_key = derive_database_key(&dek).unwrap();
+        assert_ne!(*local_key, *db_key);
+    }
+
+    #[test]
+    fn derive_local_storage_key_deterministic() {
+        let dek = vec![42u8; 32];
+        let device_secret = vec![7u8; 32];
+        let key1 = derive_local_storage_key(&dek, &device_secret).unwrap();
+        let key2 = derive_local_storage_key(&dek, &device_secret).unwrap();
         assert_eq!(*key1, *key2);
     }
 }
