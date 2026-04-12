@@ -571,3 +571,77 @@ async fn cold_start_recovers_epoch_key_via_drain_seed_round_trip() {
         );
     }
 }
+
+// ── local_storage_key / rekey_db ──
+
+#[tokio::test]
+async fn local_storage_key_requires_unlock() {
+    let handle = make_handle();
+
+    let result = api::local_storage_key(&handle).await;
+    assert!(result.is_err(), "local_storage_key should fail when locked");
+}
+
+#[tokio::test]
+async fn local_storage_key_succeeds_after_initialize() {
+    let handle = make_handle();
+    let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
+    api::initialize(&handle, "pw".into(), secret_bytes)
+        .await
+        .unwrap();
+
+    let result = api::local_storage_key(&handle).await;
+    assert!(
+        result.is_ok(),
+        "local_storage_key should succeed after initialize: {:?}",
+        result.err()
+    );
+    let key = result.unwrap();
+    assert_eq!(key.len(), 32, "local_storage_key must be 32 bytes");
+}
+
+#[tokio::test]
+async fn local_storage_key_differs_from_database_key() {
+    let handle = make_handle();
+    let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
+    api::initialize(&handle, "pw".into(), secret_bytes)
+        .await
+        .unwrap();
+
+    let local_key = api::local_storage_key(&handle).await.unwrap();
+    let db_key = api::database_key(&handle).await.unwrap();
+    assert_ne!(local_key, db_key, "local_storage_key and database_key must differ");
+}
+
+#[tokio::test]
+async fn rekey_db_rejects_wrong_key_length() {
+    let handle = make_handle();
+    let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
+    api::initialize(&handle, "pw".into(), secret_bytes)
+        .await
+        .unwrap();
+
+    // 16 bytes — wrong length
+    let result = api::rekey_db(&handle, vec![0u8; 16]).await;
+    assert!(result.is_err(), "rekey_db should reject a 16-byte key");
+    assert!(
+        result.unwrap_err().contains("32 bytes"),
+        "error should mention 32 bytes"
+    );
+}
+
+#[tokio::test]
+async fn rekey_db_succeeds_with_32_byte_key() {
+    let handle = make_handle();
+    let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
+    api::initialize(&handle, "pw".into(), secret_bytes)
+        .await
+        .unwrap();
+
+    let result = api::rekey_db(&handle, vec![0xbbu8; 32]).await;
+    assert!(
+        result.is_ok(),
+        "rekey_db should succeed on in-memory storage: {:?}",
+        result.err()
+    );
+}

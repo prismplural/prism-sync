@@ -1083,6 +1083,26 @@ pub async fn database_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Derive local storage key (HKDF from DEK + DeviceSecret).
+/// Requires initialize() or restore_runtime_keys() to have been called.
+pub async fn local_storage_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
+    let inner = handle.inner.lock().await;
+    inner
+        .local_storage_key()
+        .map(|k| k.to_vec())
+        .map_err(|e| e.to_string())
+}
+
+/// Re-encrypt the Rust sync SQLite database with a new 32-byte key.
+/// Takes Vec<u8> from Dart; validates to exactly 32 bytes.
+pub async fn rekey_db(handle: &PrismSyncHandle, new_key: Vec<u8>) -> Result<(), String> {
+    let key: [u8; 32] = new_key
+        .try_into()
+        .map_err(|_| "rekey_db: key must be exactly 32 bytes".to_string())?;
+    let inner = handle.inner.lock().await;
+    inner.rekey_db(&key).map_err(|e| e.to_string())
+}
+
 // ── Engine configuration ──
 
 /// Configure the sync engine after initialize/unlock.
