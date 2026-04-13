@@ -1,61 +1,61 @@
 # prism-sync
 
-End-to-end encrypted CRDT sync library built in Rust. Add private, multi-device sync to any app with minimal integration effort.
+End-to-end encrypted CRDT sync library in Rust. Add private, multi-device sync to any app
+with field-level conflict resolution and zero-knowledge encryption — the relay server stores
+only encrypted blobs and never sees plaintext.
 
-## What it does
+## Highlights
 
-prism-sync provides field-level CRDT synchronization with zero-knowledge encryption. The relay server stores only encrypted blobs — it cannot read your data. Device identity, key management, pairing, epoch rotation, and conflict resolution are all handled by the library.
+- **Field-level CRDTs** — Last-Write-Wins with Hybrid Logical Clocks, not row-level overwrites
+- **Zero-knowledge relay** — the server sees encrypted blobs, device IDs, and timing; never content
+- **Post-quantum ready** — hybrid Ed25519 + ML-DSA-65 signatures, X-Wing (X25519 + ML-KEM-768) epoch rekey
+- **Self-contained** — crypto, storage, sync engine, relay server, and FFI bindings in one repo
+- **Flutter integration** — Dart bindings, Drift adapter, and Riverpod providers included
 
-**Privacy model:** Field-level data is encrypted with XChaCha20-Poly1305. The relay server sees sync group membership, device identifiers, epoch numbers, batch sizes, and timing patterns, but never plaintext content.
+## How It Works
+
+```
+Password + BIP39 mnemonic → Argon2id → MEK → wraps DEK
+  DEK → HKDF → epoch sync keys (XChaCha20-Poly1305)
+  DEK → HKDF → database encryption key
+  DeviceSecret (per-device CSPRNG) → HKDF → Ed25519 + X25519 + ML-DSA-65 + ML-KEM-768 + X-Wing
+
+Sync cycle: pull → verify signature → decrypt → merge → ack → prune → push
+```
+
+Each device has its own cryptographic identity derived from a local secret. Devices pair via
+a relay-mediated ceremony with SAS verification. When a device is revoked, epoch rotation
+uses X-Wing hybrid KEM to distribute fresh keys to surviving devices.
+
+Password changes re-wrap the DEK — no data re-encryption needed.
 
 ## Architecture
 
 ```
-prism-sync/
-├── crates/
-│   ├── prism-sync-crypto/     # Standalone crypto primitives (no sync awareness)
-│   ├── prism-sync-core/       # CRDT engine, storage, relay client, pairing, consumer API
-│   └── prism-sync-ffi/        # FFI layer for Flutter/Dart via flutter_rust_bridge
-└── dart/
-    └── packages/
-        ├── prism_sync/            # Dart bindings
-        ├── prism_sync_drift/      # Drift database adapter
-        └── prism_sync_flutter/    # Flutter secure storage + Riverpod providers
+crates/
+├── prism-sync-crypto/     # Standalone crypto primitives
+├── prism-sync-core/       # CRDT engine, storage, relay client, pairing
+├── prism-sync-ffi/        # FFI layer for Flutter/Dart
+└── prism-sync-relay/      # Self-hosted relay server (Axum + SQLite)
+
+dart/packages/
+├── prism_sync/            # Generated Dart bindings
+├── prism_sync_drift/      # Drift database adapter
+└── prism_sync_flutter/    # Flutter secure storage + Riverpod providers
 ```
 
-### prism-sync-crypto
+`prism-sync-crypto` is standalone with no sync awareness. `prism-sync-core` builds on it
+for the CRDT engine and sync protocol. `prism-sync-relay` is independently deployable with
+no dependency on the other crates.
 
-Standalone cryptographic primitives with no sync awareness:
-
-- **AEAD:** XChaCha20-Poly1305 (sync data) + XSalsa20-Poly1305 (DEK wrapping)
-- **KDF:** Argon2id (password → MEK) + HKDF-SHA256 (subkey derivation)
-- **Key hierarchy:** Password + BIP39 secret key → MEK → wraps DEK → derives epoch keys, database key, group invite secret
-- **Device identity:** Per-device Ed25519 (signing) + X25519 (key exchange) + ML-DSA-65 (PQ signing) + ML-KEM-768 (PQ key exchange) + X-Wing (hybrid rekey) from local CSPRNG — not derived from shared secrets
-- **BIP39:** 12-word mnemonic generation, validation, byte conversion
-- All sensitive buffers use `Zeroizing<Vec<u8>>` for automatic cleanup on drop
-
-### prism-sync-core
-
-The sync engine and everything it needs:
-
-- **HLC:** Hybrid Logical Clock with merge, comparison, and drift detection
-- **CRDT:** Field-level Last-Write-Wins with 3-level tiebreaker (HLC → device_id → op_id), tombstone protection, bulk reset
-- **Storage:** Object-safe `SyncStorage` + `SyncStorageTx` traits with `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` transaction pattern. Ships with `RusqliteSyncStorage` (SQLite with WAL).
-- **Sync engine:** Pull → verify signature → decrypt → verify payload hash → merge → ack → prune → push. Ack reports processed seq to relay (fire-and-forget). Prune cleans up acknowledged `applied_ops`, `field_versions`, and tombstoned entities.
-- **Batch signatures:** Hybrid Ed25519 + ML-DSA-65 over deterministic binary canonical format (protocol V3). Verified before decryption.
-- **Relay client:** HTTP (reqwest) + WebSocket (tokio-tungstenite) with `/v2/` protocol, per-device session tokens, message-based WebSocket auth, auto-reconnect with exponential backoff.
-- **Pairing:** Hybrid-signed invitations (Ed25519 + ML-DSA-65), hybrid challenge-response relay registration, SAS verification protocol, signed keyring exchange.
-- **Epoch rotation:** X-Wing hybrid key exchange (X25519 + ML-KEM-768) for epoch key wrapping/unwrapping after device revocation.
-- **Consumer API:** `PrismSync::builder()` with fluent configuration, `record_create/update/delete` for mutations, `events()` stream, auto-sync debounce.
-
-## Quick start
+## Quick Start
 
 ```rust
 use prism_sync_core::{PrismSync, SyncSchema, SyncType};
 use prism_sync_core::storage::RusqliteSyncStorage;
 use std::sync::Arc;
 
-// 1. Define your schema
+// Define your schema
 let schema = SyncSchema::builder()
     .entity("tasks", |e| {
         e.field("title", SyncType::String)
@@ -63,7 +63,7 @@ let schema = SyncSchema::builder()
     })
     .build();
 
-// 2. Build the sync client
+// Build the sync client
 let storage = Arc::new(RusqliteSyncStorage::in_memory()?);
 let client = PrismSync::builder()
     .schema(schema)
@@ -72,69 +72,61 @@ let client = PrismSync::builder()
     .relay_url("https://relay.example.com")
     .build()?;
 
-// 3. Initialize with password + secret key
+// Initialize with credentials
 client.initialize("my_password", &secret_key_bytes)?;
 
-// 4. Record mutations
+// Record mutations — these become CRDT ops
 client.record_create("tasks", &task_id, &fields)?;
 
-// 5. Sync
+// Sync with the relay
 let result = client.sync().await?;
 ```
 
 ## Building
 
 ```bash
-# Install Rust (if needed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Build all crates
 cargo build --workspace
-
-# Run all tests
 cargo test --workspace
-
-# Lint
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Testing
 
-920+ tests across 4 crates covering:
+920+ tests across all crates:
 
-- Crypto primitives (AEAD roundtrip, KDF determinism, key hierarchy lifecycle, device identity)
-- CRDT correctness (HLC merge, LWW comparison, tombstone protection, schema validation)
-- Storage (transaction commit/rollback, CRUD operations, migration, pruning)
-- Sync engine (push/pull roundtrip, conflict resolution, signature verification, payload hash tampering)
-- Pairing (create/join, signed invitations, tampered invite rejection, wrong password)
-- Epoch rotation (full cycle: revoke → rekey → unwrap → encrypt/decrypt)
-- Consumer API (builder validation, HTTPS enforcement, mutation recording)
+- Crypto: AEAD roundtrip, KDF determinism, key hierarchy, device identity, cross-language vectors
+- CRDT: HLC merge, LWW tiebreakers, tombstone protection, schema validation
+- Storage: transactions, CRUD, migration, pruning
+- Sync engine: push/pull roundtrip, conflict resolution, signature verification, payload tampering
+- Pairing: create/join ceremony, tampered invitation rejection, wrong-password handling
+- Epoch rotation: revoke → rekey → unwrap → encrypt/decrypt full cycle
+- Relay: authentication, quota enforcement, WebSocket notifications
 
 ```bash
-# Run everything
-cargo test --workspace
-
-# Run specific crate
-cargo test -p prism-sync-crypto
-cargo test -p prism-sync-core
-
-# Run cross-language vectors (requires Dart reference values)
-cargo test -p prism-sync-crypto --test cross_language_vectors -- --ignored
+cargo test --workspace                    # Everything
+cargo test -p prism-sync-crypto           # Crypto only
+cargo test -p prism-sync-core             # Engine + CRDT
+cargo test -p prism-sync-relay            # Relay server
 ```
 
 ## Security
 
-- **Encryption:** XChaCha20-Poly1305 with 24-byte random nonces (AEAD)
-- **Key derivation:** Argon2id (64 MiB, 3 iterations) + HKDF-SHA256
-- **Signatures:** Hybrid Ed25519 + ML-DSA-65 batch signatures with deterministic binary canonical format (protocol V3)
-- **Post-quantum:** Hybrid device identity (Ed25519 + ML-DSA-65 + X25519 + ML-KEM-768), X-Wing hybrid rekey, signed registry trust model
-- **Device identity:** Per-device CSPRNG keys, never derived from shared DEK
-- **Transport:** HTTPS/WSS required (enforced at both builder and relay constructor)
-- **Memory:** All key material in `Zeroizing<Vec<u8>>` — auto-zeroed on drop
-- **Transactions:** `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` with auto-rollback on drop
+| Layer | Primitive |
+|-------|-----------|
+| Encryption | XChaCha20-Poly1305 (24-byte random nonces) |
+| Key derivation | Argon2id (64 MiB, 3 iterations) + HKDF-SHA256 |
+| Signatures | Hybrid Ed25519 + ML-DSA-65 batch signatures |
+| Post-quantum KEM | X-Wing (X25519 + ML-KEM-768) for epoch rekey |
+| Device identity | Per-device CSPRNG keys (5 keypairs), never derived from shared secrets |
+| Transport | HTTPS/WSS required (enforced at builder and relay constructor) |
+| Memory | All key material in `Zeroizing<Vec<u8>>` — auto-zeroed on drop |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and threat model.
 
+## Contributing
+
+Contributions are welcome. Please open an issue first to discuss what you'd like to change.
+
 ## License
 
-MIT
+Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE).
