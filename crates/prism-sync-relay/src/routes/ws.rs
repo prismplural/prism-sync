@@ -131,30 +131,9 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
         );
     });
 
-    // Step 4: Process incoming messages (ack + ping/pong)
-    let state_recv = state.clone();
-    let sid_recv = sync_id.clone();
-    let did_recv = device_id.clone();
-    let stale_threshold = state.config.stale_device_secs as i64;
-
+    // Step 4: Process incoming messages (ping/pong only — ack is HTTP-only)
     while let Some(Ok(msg)) = ws_stream.next().await {
         match msg {
-            Message::Text(text) => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
-                    if json["type"] == "ack" {
-                        if let Some(server_seq) = json["server_seq"].as_i64() {
-                            handle_ws_ack(
-                                &state_recv,
-                                &sid_recv,
-                                &did_recv,
-                                server_seq,
-                                stale_threshold,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => break,
             _ => {}
@@ -230,44 +209,6 @@ async fn parse_and_validate_auth(state: &AppState, sync_id: &str, text: &str) ->
     }
 
     result
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket ACK handler
-// ---------------------------------------------------------------------------
-
-async fn handle_ws_ack(
-    state: &AppState,
-    sync_id: &str,
-    device_id: &str,
-    server_seq: i64,
-    stale_threshold: i64,
-) {
-    let db = state.db.clone();
-    let sid = sync_id.to_string();
-    let did = device_id.to_string();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            db::upsert_device_receipt(conn, &sid, &did, server_seq)?;
-            match db::get_safe_prune_seq(conn, &sid, stale_threshold)? {
-                Some(safe_seq) => db::prune_batches_before(conn, &sid, safe_seq),
-                None => Ok(0),
-            }
-        })
-    })
-    .await;
-
-    if let Ok(Ok(pruned)) = result {
-        if pruned > 0 {
-            tracing::debug!(
-                sync_id = %trunc(sync_id),
-                device_id = %trunc(device_id),
-                pruned,
-                "Pruned acked batches via WS ack"
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
