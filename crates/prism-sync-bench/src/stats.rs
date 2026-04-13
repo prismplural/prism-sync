@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum OpType {
+pub(crate) enum OpType {
     Register,
     Push,
     Pull,
@@ -30,13 +30,13 @@ struct OpStats {
     errors: AtomicU64,
 }
 
-pub struct Stats {
+pub(crate) struct Stats {
     start: Instant,
     ops: HashMap<OpType, OpStats>,
 }
 
 impl Stats {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut ops = HashMap::new();
         for op in [
             OpType::Register,
@@ -59,24 +59,24 @@ impl Stats {
         }
     }
 
-    pub fn record(&self, op: OpType, elapsed: Duration) {
+    pub(crate) fn record(&self, op: OpType, elapsed: Duration) {
         let micros = elapsed.as_micros() as u64;
         if let Some(s) = self.ops.get(&op) {
             let _ = s.histogram.lock().unwrap().record(micros);
         }
     }
 
-    pub fn record_error(&self, op: OpType) {
+    pub(crate) fn record_error(&self, op: OpType) {
         if let Some(s) = self.ops.get(&op) {
             s.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub fn elapsed(&self) -> Duration {
+    pub(crate) fn elapsed(&self) -> Duration {
         self.start.elapsed()
     }
 
-    pub fn print_progress(&self) {
+    pub(crate) fn print_progress(&self) {
         let elapsed = self.elapsed().as_secs();
         let mut parts = Vec::new();
         for op in [OpType::Push, OpType::Pull] {
@@ -107,7 +107,7 @@ impl Stats {
         }
     }
 
-    pub fn print_ws_progress(&self, connected: usize, target: usize) {
+    pub(crate) fn print_ws_progress(&self, connected: usize, target: usize) {
         let elapsed = self.elapsed().as_secs();
         let total_errors: u64 = self
             .ops
@@ -127,7 +127,7 @@ impl Stats {
         println!("[{elapsed}s] ws: {connected}/{target}{p99_str}  errors: {total_errors}");
     }
 
-    pub fn print_summary(&self, title: &str, extra: &str) {
+    pub(crate) fn print_summary(&self, title: &str, extra: &str) {
         println!("\n=== {title} Results ===");
         println!("Duration: {:.1}s", self.elapsed().as_secs_f64());
         if !extra.is_empty() {

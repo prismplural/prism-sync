@@ -288,11 +288,11 @@ pub(crate) mod base64_bytes {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{de, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         deserializer.deserialize_any(Base64OrBytesVisitor)
     }
 
@@ -333,11 +333,11 @@ pub(crate) mod base64_hash {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{de, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
         let bytes: Vec<u8> = super::base64_bytes::deserialize(deserializer)?;
         bytes
             .try_into()
@@ -351,11 +351,11 @@ pub(crate) mod base64_nonce {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{de, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &[u8; 24], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(bytes: &[u8; 24], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 24], D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 24], D::Error> {
         let bytes: Vec<u8> = super::base64_bytes::deserialize(deserializer)?;
         bytes
             .try_into()

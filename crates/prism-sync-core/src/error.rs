@@ -36,6 +36,8 @@ pub enum CoreError {
         code: Option<String>,
         min_signature_version: Option<u8>,
         remote_wipe: Option<bool>,
+        #[source]
+        source: Option<RelayError>,
     },
 
     #[error("device {device_id} key changed")]
@@ -123,7 +125,29 @@ impl CoreError {
             code,
             min_signature_version,
             remote_wipe,
+            source: Some(error),
         }
+    }
+
+    /// Whether this error is transient and the operation should be retried.
+    ///
+    /// Only relay-level `Network` and `Server` errors are retryable.
+    /// Auth failures, protocol errors, device revocations, and all local
+    /// errors (storage, crypto, schema) are permanent.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            CoreError::Relay {
+                kind: RelayErrorCategory::Network | RelayErrorCategory::Server,
+                ..
+            }
+        )
+    }
+}
+
+impl From<RelayError> for CoreError {
+    fn from(error: RelayError) -> Self {
+        Self::from_relay(error)
     }
 }
 

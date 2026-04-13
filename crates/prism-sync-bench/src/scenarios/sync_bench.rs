@@ -8,7 +8,7 @@ use crate::client::SimulatedClient;
 use crate::relay;
 use crate::stats::Stats;
 
-pub async fn run(
+pub(crate) async fn run(
     http: &Client,
     base_url: &str,
     num_clients: usize,

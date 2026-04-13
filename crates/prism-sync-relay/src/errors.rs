@@ -2,23 +2,36 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
-use std::fmt::{Display, Formatter};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("BadRequest({0})")]
     BadRequest(&'static str),
+    #[error("Unauthorized")]
     Unauthorized,
+    #[error("DeviceIdentityMismatch")]
     DeviceIdentityMismatch,
+    #[error("DeviceRevoked(remote_wipe={remote_wipe})")]
     DeviceRevoked { remote_wipe: bool },
+    #[error("FirstDeviceAdmissionRequired")]
     FirstDeviceAdmissionRequired,
+    #[error("FirstDeviceAdmissionInvalid")]
     FirstDeviceAdmissionInvalid,
+    #[error("UpgradeRequired(min_signature_version={min_signature_version})")]
     UpgradeRequired { min_signature_version: u8 },
+    #[error("Forbidden({0})")]
     Forbidden(&'static str),
+    #[error("NotFound")]
     NotFound,
+    #[error("Conflict({0})")]
     Conflict(&'static str),
+    #[error("PayloadTooLarge({0})")]
     PayloadTooLarge(&'static str),
+    #[error("TooManyRequests")]
     TooManyRequests,
+    #[error("StorageFull({0})")]
     StorageFull(&'static str),
+    #[error("Internal({0})")]
     Internal(String),
 }
 
@@ -121,35 +134,6 @@ struct ErrorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_wipe: Option<bool>,
 }
-
-impl Display for AppError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AppError::BadRequest(msg) => write!(f, "BadRequest({msg})"),
-            AppError::Unauthorized => write!(f, "Unauthorized"),
-            AppError::DeviceIdentityMismatch => write!(f, "DeviceIdentityMismatch"),
-            AppError::DeviceRevoked { remote_wipe } => {
-                write!(f, "DeviceRevoked(remote_wipe={remote_wipe})")
-            }
-            AppError::FirstDeviceAdmissionRequired => {
-                write!(f, "FirstDeviceAdmissionRequired")
-            }
-            AppError::FirstDeviceAdmissionInvalid => write!(f, "FirstDeviceAdmissionInvalid"),
-            AppError::UpgradeRequired {
-                min_signature_version,
-            } => write!(f, "UpgradeRequired(min_signature_version={min_signature_version})"),
-            AppError::Forbidden(msg) => write!(f, "Forbidden({msg})"),
-            AppError::NotFound => write!(f, "NotFound"),
-            AppError::Conflict(msg) => write!(f, "Conflict({msg})"),
-            AppError::PayloadTooLarge(msg) => write!(f, "PayloadTooLarge({msg})"),
-            AppError::TooManyRequests => write!(f, "TooManyRequests"),
-            AppError::StorageFull(msg) => write!(f, "StorageFull({msg})"),
-            AppError::Internal(msg) => write!(f, "Internal({msg})"),
-        }
-    }
-}
-
-impl std::error::Error for AppError {}
 
 impl From<rusqlite::Error> for AppError {
     fn from(e: rusqlite::Error) -> Self {

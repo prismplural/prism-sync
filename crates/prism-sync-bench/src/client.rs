@@ -8,17 +8,17 @@ use std::time::Instant;
 use crate::relay;
 use crate::stats::{OpType, Stats};
 
-pub struct SimulatedClient {
-    pub sync_id: String,
-    pub device_id: String,
-    pub signing_key: SigningKey,
-    pub token: Option<String>,
-    pub last_server_seq: i64,
-    pub epoch: i64,
+pub(crate) struct SimulatedClient {
+    pub(crate) sync_id: String,
+    pub(crate) device_id: String,
+    pub(crate) signing_key: SigningKey,
+    pub(crate) token: Option<String>,
+    pub(crate) last_server_seq: i64,
+    pub(crate) epoch: i64,
 }
 
 impl SimulatedClient {
-    pub fn new(sync_id: String) -> Self {
+    pub(crate) fn new(sync_id: String) -> Self {
         Self {
             sync_id,
             device_id: relay::generate_device_id(),
@@ -29,7 +29,7 @@ impl SimulatedClient {
         }
     }
 
-    pub async fn register(&mut self, http: &Client, base_url: &str, stats: &Stats) -> Result<()> {
+    pub(crate) async fn register(&mut self, http: &Client, base_url: &str, stats: &Stats) -> Result<()> {
         let start = Instant::now();
         match relay::register_device(
             http,
@@ -58,7 +58,7 @@ impl SimulatedClient {
             .ok_or_else(|| anyhow!("not registered"))
     }
 
-    pub async fn push(&self, http: &Client, base_url: &str, stats: &Stats) -> Result<i64> {
+    pub(crate) async fn push(&self, http: &Client, base_url: &str, stats: &Stats) -> Result<i64> {
         let token = self.token()?;
         let batch_id = uuid::Uuid::new_v4().to_string();
         let envelope =
@@ -86,7 +86,7 @@ impl SimulatedClient {
         Ok(server_seq)
     }
 
-    pub async fn pull(&mut self, http: &Client, base_url: &str, stats: &Stats) -> Result<i64> {
+    pub(crate) async fn pull(&mut self, http: &Client, base_url: &str, stats: &Stats) -> Result<i64> {
         let token = self.token()?;
 
         let start = Instant::now();
@@ -116,7 +116,7 @@ impl SimulatedClient {
         Ok(max_seq)
     }
 
-    pub async fn ack(
+    pub(crate) async fn ack(
         &self,
         http: &Client,
         base_url: &str,
@@ -143,7 +143,7 @@ impl SimulatedClient {
         Ok(())
     }
 
-    pub async fn ws_connect(
+    pub(crate) async fn ws_connect(
         &self,
         base_url: &str,
         stats: &Stats,

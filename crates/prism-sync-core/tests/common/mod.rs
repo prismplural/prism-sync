@@ -1,7 +1,7 @@
 //! Shared test fixtures for prism-sync-core integration tests.
 //!
 //! Not every test file uses every item, so we allow dead_code globally.
-#![allow(dead_code)]
+#![allow(dead_code, unreachable_pub)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;

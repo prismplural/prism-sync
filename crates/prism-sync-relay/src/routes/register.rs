@@ -859,7 +859,11 @@ fn verify_registry_snapshot_hybrid(
     if remaining.len() < 8 {
         return Err(AppError::BadRequest("signed_registry_snapshot too short"));
     }
-    let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap()) as usize;
+    let ed_len = u32::from_le_bytes(
+        remaining[0..4]
+            .try_into()
+            .expect("slice is exactly 4 bytes after length check"),
+    ) as usize;
     if remaining.len() < 4 + ed_len + 4 {
         return Err(AppError::BadRequest("signed_registry_snapshot truncated"));
     }
@@ -867,7 +871,7 @@ fn verify_registry_snapshot_hybrid(
     let ml_len = u32::from_le_bytes(
         remaining[ml_len_offset..ml_len_offset + 4]
             .try_into()
-            .unwrap(),
+            .expect("slice is exactly 4 bytes after length check"),
     ) as usize;
     let signature_len = ml_len_offset + 4 + ml_len;
     if remaining.len() <= signature_len {

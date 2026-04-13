@@ -10,22 +10,25 @@ name = "prism-sync-bench"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-futures = "0.3"
-tokio = { version = "1", features = ["full"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
-hex = "0.4"
-base64 = "0.22"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-hdrhistogram = "7"
-humantime = "2"
-anyhow = "1"
-prism-sync-relay = { path = "../prism-sync-relay" }
-axum = "0.8"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hdrhistogram = { workspace = true }
+humantime = { workspace = true }
+anyhow = { workspace = true }
+prism-sync-relay = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

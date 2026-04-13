@@ -3,8 +3,9 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
 /// Spawn the background cleanup task. Runs once immediately on startup,
-/// then repeats on the configured interval.
-pub fn spawn_cleanup_task(state: Arc<AppState>) {
+/// then repeats on the configured interval. Returns the [`JoinHandle`] so
+/// the caller can abort it during graceful shutdown.
+pub fn spawn_cleanup_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     let interval_secs = state.config.cleanup_interval_secs;
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(interval_secs));
@@ -13,7 +14,7 @@ pub fn spawn_cleanup_task(state: Arc<AppState>) {
             ticker.tick().await;
             run_cleanup(&state).await;
         }
-    });
+    })
 }
 
 async fn run_cleanup(state: &AppState) {

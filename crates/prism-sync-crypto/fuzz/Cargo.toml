@@ -1,0 +1,31 @@
+[package]
+name = "prism-sync-crypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prism-sync-crypto = { path = ".." }
+
+# Prevent this from interfering with workspace build
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decrypt_fuzz"
+path = "fuzz_targets/decrypt_fuzz.rs"
+doc = false
+
+[[bin]]
+name = "verify_ed25519_fuzz"
+path = "fuzz_targets/verify_ed25519_fuzz.rs"
+doc = false
+
+[[bin]]
+name = "secretbox_unwrap_fuzz"
+path = "fuzz_targets/secretbox_unwrap_fuzz.rs"
+doc = false

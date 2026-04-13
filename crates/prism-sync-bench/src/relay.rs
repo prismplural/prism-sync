@@ -6,21 +6,21 @@ use reqwest::Client;
 use serde_json::Value;
 
 /// Generate a valid 64-char hex sync ID (32 random bytes).
-pub fn generate_sync_id() -> String {
+pub(crate) fn generate_sync_id() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
 /// Generate a short device ID.
-pub fn generate_device_id() -> String {
+pub(crate) fn generate_device_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
 /// Build the canonical challenge bytes that the relay expects, then sign them.
-pub fn sign_challenge(
+pub(crate) fn sign_challenge(
     signing_key: &SigningKey,
     sync_id: &str,
     device_id: &str,
@@ -36,13 +36,13 @@ pub fn sign_challenge(
     sig.to_bytes().to_vec()
 }
 
-pub fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
+pub(crate) fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
     buf.extend_from_slice(data);
 }
 
 /// Full registration helper: fetches nonce, signs challenge, registers device.
-pub async fn register_device(
+pub(crate) async fn register_device(
     client: &Client,
     url: &str,
     sync_id: &str,
@@ -100,7 +100,7 @@ pub async fn register_device(
 }
 
 /// Build a minimal valid `SignedBatchEnvelope` JSON for testing.
-pub fn make_test_envelope(sync_id: &str, device_id: &str, batch_id: &str, epoch: i64) -> Value {
+pub(crate) fn make_test_envelope(sync_id: &str, device_id: &str, batch_id: &str, epoch: i64) -> Value {
     let payload_hash = vec![0u8; 32];
     let signature = vec![0u8; 64];
     let nonce = vec![0u8; 24];

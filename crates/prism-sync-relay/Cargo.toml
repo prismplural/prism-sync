@@ -13,40 +13,44 @@ path = "src/main.rs"
 test-helpers = []
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
-tokio = { version = "1", features = ["full"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = { version = "0.4", default-features = true }
-uuid = { version = "1", features = ["v4"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-futures = "0.3"
-base64 = "0.22"
-hex = "0.4"
-sha2 = "0.10"
-rand = "0.8"
-thiserror = "2"
-reqwest = { version = "0.12", default-features = false }
-x509-parser = { version = "0.16", features = ["verify"] }
-simple_asn1 = "0.6"
-num-traits = "0.2"
-serde_cbor = "0.11"
-subtle = "2"
-tempfile = "3"
-tokio-util = { version = "0.7", features = ["io"] }
-prism-sync-crypto = { path = "../prism-sync-crypto" }
+axum = { workspace = true, features = ["ws"] }
+axum-extra = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tower = { workspace = true }
+tower-http = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+x509-parser = { workspace = true }
+simple_asn1 = { workspace = true }
+num-traits = { workspace = true }
+serde_cbor = { workspace = true }
+subtle = { workspace = true }
+tempfile = { workspace = true }
+tokio-util = { workspace = true }
+prism-sync-crypto = { workspace = true }
+
+[lints]
+workspace = true
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json"] }
-tokio-tungstenite = "0.24"
-prism-sync-core = { path = "../prism-sync-core" }
-rcgen = "0.13"
-async-trait = "0.1"
-getrandom = { version = "0.4", features = ["sys_rng"] }
-zeroize = "1"
+reqwest = { workspace = true, features = ["json"] }
+tokio-tungstenite = { workspace = true }
+prism-sync-core = { workspace = true }
+rcgen = { workspace = true }
+async-trait = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }

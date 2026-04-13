@@ -1,3 +1,3 @@
-pub mod mixed;
-pub mod sync_bench;
-pub mod ws_ramp;
+pub(crate) mod mixed;
+pub(crate) mod sync_bench;
+pub(crate) mod ws_ramp;

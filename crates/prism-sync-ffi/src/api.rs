@@ -1398,7 +1398,7 @@ pub async fn set_auto_sync(
         // one-off hiccups to multi-minute user-visible delays; the outer
         // loop prevents busy-looping during sustained outages.
         let driver = background_runtime().spawn(async move {
-            use prism_sync_core::sync_service::SyncTrigger;
+            use prism_sync_core::sync_service::{SyncTrigger, jittered_delay};
 
             let mut backoff_secs: u64 = 0;
             let mut backoff_attempt: u32 = 0;
@@ -1420,7 +1420,19 @@ pub async fn set_auto_sync(
                         backoff_attempt = 0;
                         cumulative_backoff_secs = 0;
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        // Non-retryable errors (auth failures, protocol errors,
+                        // device revocations) should surface immediately without
+                        // scheduling a backoff retry. The inner loop already
+                        // emitted SyncCompleted + Error events; don't delay them
+                        // behind a 30-second backoff wall.
+                        if !e.is_retryable() {
+                            backoff_secs = 0;
+                            backoff_attempt = 0;
+                            cumulative_backoff_secs = 0;
+                            continue;
+                        }
+
                         backoff_secs = if backoff_secs == 0 {
                             30
                         } else {
@@ -1457,9 +1469,11 @@ pub async fn set_auto_sync(
 
                         if let Some(ref tx) = backoff_tx {
                             let tx = tx.clone();
-                            let delay = backoff_secs;
+                            let delay = jittered_delay(
+                                std::time::Duration::from_secs(backoff_secs),
+                            );
                             let task = tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                                tokio::time::sleep(delay).await;
                                 let _ = tx.send(SyncTrigger::ManualSync).await;
                             });
                             if let Ok(mut guard) = backoff_abort.lock() {

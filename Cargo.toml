@@ -12,6 +12,104 @@ members = [
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/user/prism-sync"
+rust-version = "1.75"
+
+# ── Workspace dependencies ───────────────────────────────────────────────────
+[workspace.dependencies]
+# Internal crates
+prism-sync-crypto = { path = "crates/prism-sync-crypto" }
+prism-sync-core = { path = "crates/prism-sync-core" }
+prism-sync-relay = { path = "crates/prism-sync-relay" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+chacha20poly1305 = "0.10"
+crypto_secretbox = "0.1"
+argon2 = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+bip39 = { version = "2", features = ["rand"] }
+ml-kem = { version = "0.3.0-rc.2", features = ["zeroize"] }
+ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize", "rand_core"] }
+x-wing = { version = "=0.1.0-rc.0", features = ["zeroize"] }
+subtle = "2"
+
+# Randomness
+rand = "0.8"
+rand_chacha = "0.3"
+rand_core = { version = "0.10", default-features = false }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Encoding
+hex = "0.4"
+base64 = "0.22"
+
+# Memory safety
+zeroize = { version = "1", features = ["derive"] }
+hybrid-array = "0.2"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-tungstenite = "0.24"
+async-trait = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+
+# HTTP / networking
+reqwest = { version = "0.12", default-features = false }
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "limit"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+
+# Database
+rusqlite = "0.31"
+rusqlite_migration = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# IDs
+uuid = { version = "1", features = ["v4"] }
+
+# FFI
+flutter_rust_bridge = "=2.12.0"
+
+# CLI / bench utilities
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+humantime = "2"
+
+# Relay-specific
+x509-parser = { version = "0.16", features = ["verify"] }
+simple_asn1 = "0.6"
+num-traits = "0.2"
+serde_cbor = "0.11"
+tempfile = "3"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+rcgen = "0.13"
+
+# Compression
+zstd = "0.13"
 
 # ── Build profiles ────────────────────────────────────────────────────────────
 # Dev: optimise for fast incremental compilation while keeping the app usable.
@@ -33,3 +131,13 @@ opt-level = 2
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# ── Workspace lints ──────────────────────────────────────────────────────────
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unsafe_code = "deny"

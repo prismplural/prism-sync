@@ -17,6 +17,8 @@ use futures_util::StreamExt;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 
+use rand::Rng;
+
 use crate::client::PrismSync;
 use crate::engine::{SyncEngine, SyncResult};
 use crate::epoch::EpochManager;
@@ -78,6 +80,16 @@ impl Default for AutoSyncConfig {
 /// failure, matching `AutoSyncConfig::max_retries` semantics.
 const INNER_RETRY_DELAY: Duration = Duration::from_secs(2);
 const INNER_RETRY_MAX: u32 = 3;
+
+/// Apply "full jitter" to a base delay: the actual delay is uniformly
+/// distributed between `base/2` and `base`. This prevents thundering-herd
+/// synchronisation when multiple devices retry after the same outage, while
+/// keeping the average delay close to the nominal value.
+pub fn jittered_delay(base: Duration) -> Duration {
+    let half_ms = base.as_millis() as u64 / 2;
+    let jitter_ms = rand::thread_rng().gen_range(0..=half_ms);
+    Duration::from_millis(half_ms + jitter_ms)
+}
 
 fn relay_error_retryable(kind: &RelayErrorCategory) -> bool {
     matches!(
@@ -675,7 +687,7 @@ impl SyncService {
                         let retryable = sync_error_kind_retryable(&err_kind);
                         attempts += 1;
                         if retryable && attempts <= INNER_RETRY_MAX {
-                            tokio::time::sleep(INNER_RETRY_DELAY).await;
+                            tokio::time::sleep(jittered_delay(INNER_RETRY_DELAY)).await;
                             last_result_with_error = Some(result);
                             continue;
                         }
@@ -695,6 +707,7 @@ impl SyncService {
                             code: result.error_code.clone(),
                             min_signature_version: None,
                             remote_wipe: result.remote_wipe,
+                            source: None,
                         };
                         return self.emit_final_failure(
                             result,
@@ -742,7 +755,7 @@ impl SyncService {
                             remote_wipe: stash_wipe,
                             ..SyncResult::default()
                         });
-                        tokio::time::sleep(INNER_RETRY_DELAY).await;
+                        tokio::time::sleep(jittered_delay(INNER_RETRY_DELAY)).await;
                         continue;
                     }
 
@@ -1131,6 +1144,7 @@ mod tests {
             code: Some("device_revoked".into()),
             min_signature_version: None,
             remote_wipe: Some(true),
+            source: None,
         };
 
         assert_eq!(
@@ -1237,6 +1251,7 @@ mod tests {
             code: Some("device_revoked".into()),
             min_signature_version: None,
             remote_wipe: Some(true),
+            source: None,
         };
         let _ = service.emit_final_failure(
             result,
@@ -1309,6 +1324,7 @@ mod tests {
             code: None,
             min_signature_version: None,
             remote_wipe: None,
+            source: None,
         };
         let _ = service.emit_final_failure(
             result,
@@ -1355,6 +1371,7 @@ mod tests {
             code: Some("device_revoked".into()),
             min_signature_version: None,
             remote_wipe: Some(true),
+            source: None,
         };
 
         let _ = service.emit_final_failure(

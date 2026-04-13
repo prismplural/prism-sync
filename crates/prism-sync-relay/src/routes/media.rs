@@ -254,7 +254,7 @@ pub async fn download_media(
         .header(axum::http::header::CACHE_CONTROL, "no-store")
         .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
         .body(body)
-        .unwrap())
+        .expect("response builder with valid constant headers"))
 }
 
 #[cfg(test)]

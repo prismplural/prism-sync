@@ -126,7 +126,7 @@ impl RateLimiter {
     /// Check whether a request for all `keys` is allowed, reserving a slot for
     /// each key atomically if so.
     pub fn check_many(&self, keys: &[&str], max_requests: u32, window_secs: u64) -> bool {
-        let mut map = self.windows.lock().unwrap();
+        let mut map = self.windows.lock().expect("rate limiter mutex poisoned");
         let now = Instant::now();
         let cutoff = now - std::time::Duration::from_secs(window_secs);
 
@@ -151,7 +151,9 @@ impl RateLimiter {
         }
 
         for key in candidates {
-            map.get_mut(&key).unwrap().push(now);
+            map.get_mut(&key)
+                .expect("key was just inserted above")
+                .push(now);
         }
         true
     }
@@ -159,7 +161,7 @@ impl RateLimiter {
     /// Remove entries that have no timestamps within the given window.
     /// Called periodically to prevent unbounded growth.
     pub fn prune_stale(&self, window_secs: u64) {
-        let mut map = self.windows.lock().unwrap();
+        let mut map = self.windows.lock().expect("rate limiter mutex poisoned");
         let cutoff = Instant::now() - std::time::Duration::from_secs(window_secs);
         map.retain(|_, timestamps| {
             timestamps.retain(|t| *t > cutoff);

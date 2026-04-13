@@ -7,14 +7,14 @@ use sha2::{Digest, Sha256};
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 
 /// Generate a secure session token (32 random bytes, hex encoded = 64 chars).
-pub fn generate_session_token() -> String {
+pub(crate) fn generate_session_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
 /// SHA-256 hash of a token string, returned as lowercase hex.
-pub fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     hex::encode(digest)
 }
@@ -24,7 +24,7 @@ pub fn hash_token(token: &str) -> String {
 /// XOR fold runs in constant time over the full length. The early length check
 /// does not leak information because both inputs are always 64-char hex-encoded
 /// SHA-256 hashes in practice.
-pub fn timing_safe_eq(a: &str, b: &str) -> bool {
+pub(crate) fn timing_safe_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
     if a.len() != b.len() {
@@ -76,7 +76,7 @@ pub fn verify_ed25519_challenge(
 ///
 /// Wire format for `versioned_signature`:
 /// `[0x03][HybridSignature::to_bytes()]`
-pub fn verify_hybrid_challenge(
+pub(crate) fn verify_hybrid_challenge(
     ed25519_public_key: &[u8],
     ml_dsa_public_key: &[u8],
     sync_id: &str,
@@ -111,7 +111,7 @@ pub fn verify_hybrid_challenge(
 }
 
 /// Validate that a sync ID is a 64-char hex string (32 bytes).
-pub fn is_valid_sync_id(sync_id: &str) -> bool {
+pub(crate) fn is_valid_sync_id(sync_id: &str) -> bool {
     sync_id.len() == 64 && sync_id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -122,7 +122,7 @@ pub fn is_valid_sync_id(sync_id: &str) -> bool {
 /// - <= 128 bytes
 /// - printable ASCII only (no control chars, no DEL)
 /// - no pipe `|` characters (used as AAD field separator)
-pub fn is_valid_device_id(device_id: &str) -> bool {
+pub(crate) fn is_valid_device_id(device_id: &str) -> bool {
     !device_id.is_empty()
         && device_id.len() <= 128
         && device_id
@@ -215,7 +215,7 @@ pub fn verify_request_signature(
 ///
 /// Wire format for `versioned_signature`:
 /// `[0x03][HybridSignature::to_bytes()]`
-pub fn verify_hybrid_request_signature(
+pub(crate) fn verify_hybrid_request_signature(
     ed25519_public_key: &[u8],
     ml_dsa_public_key: &[u8],
     signing_data: &[u8],

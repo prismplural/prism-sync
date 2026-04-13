@@ -19,6 +19,9 @@ use axum::{
 };
 use base64::Engine;
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
@@ -219,14 +222,34 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         )
         .layer(cors)
+        // 10 MiB default body limit (snapshot + media routes override with higher limits)
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<axum::body::Body>| {
+                    let request_id = request
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
                     let path = request.uri().path();
-                    tracing::debug_span!("http", method = %request.method(), path)
+                    tracing::debug_span!(
+                        "http",
+                        method = %request.method(),
+                        path,
+                        request_id,
+                    )
                 })
                 .on_response(DefaultOnResponse::new().level(Level::DEBUG)),
         )
+        // 30s timeout for non-WebSocket requests (returns 408 on expiry).
+        // WebSocket upgrades complete before the timeout fires, so long-lived
+        // WS connections are unaffected.
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(30),
+        ))
         .with_state(state)
 }
 

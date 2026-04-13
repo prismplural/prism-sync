@@ -1310,6 +1310,7 @@ mod tests {
             code: Some("device_revoked".into()),
             min_signature_version: None,
             remote_wipe: Some(true),
+            source: None,
         };
 
         populate_result_error(&mut result, &err);

@@ -1,7 +1,7 @@
 //! Shared test harness for prism-sync-relay end-to-end tests.
 //!
 //! Not every test file uses every item, so we allow dead_code globally.
-#![allow(dead_code)]
+#![allow(dead_code, unreachable_pub)]
 
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};

@@ -10,17 +10,20 @@ name = "prism_sync_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-prism-sync-core = { path = "../prism-sync-core" }
-prism-sync-crypto = { path = "../prism-sync-crypto" }
-flutter_rust_bridge = "=2.12.0"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
-base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-zeroize = "1"
-chrono = "0.4"
+prism-sync-core = { workspace = true }
+prism-sync-crypto = { workspace = true }
+flutter_rust_bridge = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
+base64 = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+zeroize = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true }
