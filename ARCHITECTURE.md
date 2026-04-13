@@ -67,7 +67,7 @@ Other device:    SyncEngine.pull_phase()
 ## Key Hierarchy
 
 ```
-Password (user-provided) + SecretKey (BIP39 12-word mnemonic, 128-bit entropy)
+PIN (6-digit in Prism app; arbitrary string at library level) + SecretKey (BIP39 12-word mnemonic, 128-bit entropy)
     |
     v
 Argon2id (64 MiB, 3 iterations, parallelism=1)
@@ -80,11 +80,11 @@ MEK (Master Encryption Key, 32 bytes)
                                                 |── HKDF("epoch_sync\0", salt=epoch.to_be_bytes())
                                                 |       └── Epoch 0 sync key (for XChaCha20-Poly1305 payload encryption)
                                                 |
-                                                |── HKDF("prism_database_key")
-                                                |       └── Database encryption key (for consumer's encrypted SQLite)
+                                                |── HKDF(IKM=DEK, salt=DeviceSecret, info="prism_local_storage_v2")
+                                                |       └── Local storage key (SQLite DB encryption; device-specific)
                                                 |
                                                 |── HKDF("prism_group_invite")
-                                                        └── Group invitation secret (for pairing)
+                                                        └── Group invitation secret (reserved)
 
 DeviceSecret (32 bytes, per-device CSPRNG -- NOT derived from DEK)
     |
