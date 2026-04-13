@@ -1,0 +1,36 @@
+# Prism Relay Ingress
+#
+# Uncomment the annotations block for your ingress controller.
+# WebSocket support is required — the relay uses WebSocket for real-time sync.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prism-relay
+  annotations:
+    # --- nginx-ingress ---
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # nginx handles WebSocket upgrade automatically when these timeouts are set.
+
+    # --- traefik (uncomment if using traefik, remove nginx annotations) ---
+    # traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    # traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: nginx  # Change to "traefik" if using traefik
+  tls:
+    - hosts:
+        - sync.example.com  # Replace with your domain
+      secretName: prism-relay-tls  # Your TLS secret (cert-manager, etc.)
+  rules:
+    - host: sync.example.com  # Replace with your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prism-relay
+                port:
+                  number: 8080

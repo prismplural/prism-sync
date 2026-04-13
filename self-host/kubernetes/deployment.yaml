@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prism-relay
+  labels:
+    app: prism-relay
+spec:
+  serviceName: prism-relay
+  replicas: 1  # SQLite = single writer, do not scale horizontally
+  podManagementPolicy: OrderedReady  # Ensures old pod terminates before new one starts
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: prism-relay
+  template:
+    metadata:
+      labels:
+        app: prism-relay
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: relay
+          image: ghcr.io/prismplural/prism-relay:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: prism-relay-config
+            - secretRef:
+                name: prism-relay-secrets
+                optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: prism-relay-data

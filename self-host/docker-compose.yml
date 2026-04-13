@@ -1,0 +1,42 @@
+# Prism Relay — Self-Hosting Docker Compose
+#
+# Quick start:
+#   1. Copy .env.example to .env and configure
+#   2. docker compose up -d
+#   3. curl http://localhost:8080/health
+#
+# The relay listens on port 8080 (HTTP only). You need a reverse proxy
+# (Caddy, nginx, etc.) for TLS. See https://prismplural.com/docs/self-hosting/
+
+services:
+  relay:
+    image: ghcr.io/prismplural/prism-relay:latest
+    # To build from source instead, comment out 'image' and uncomment:
+    # build:
+    #   context: ../../sync
+    #   dockerfile: ../deploy/self-host/Dockerfile
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    volumes:
+      - relay-data:/data
+    env_file: .env
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8080}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  relay-data:

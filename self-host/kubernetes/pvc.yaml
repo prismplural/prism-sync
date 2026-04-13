@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prism-relay-data
+spec:
+  accessModes:
+    - ReadWriteOncePod  # Prevents multiple pods from mounting simultaneously (K8s 1.29+)
+  resources:
+    requests:
+      storage: 1Gi  # Plenty for typical use; adjust if needed

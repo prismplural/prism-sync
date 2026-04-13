@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prism-relay-config
+data:
+  PORT: "8080"
+  DB_PATH: "/data/relay.db"
+  RUST_LOG: "info"
+  # Private relay defaults — disable anti-abuse measures designed for public relays
+  FIRST_DEVICE_POW_DIFFICULTY_BITS: "0"
+  FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED: "false"
+  FIRST_DEVICE_APPLE_ATTESTATION_ENABLED: "false"
+  # Keep data for 1 year instead of 90 days (prevents auto-deletion on private relays)
+  SYNC_INACTIVE_TTL_SECS: "31536000"
+  REGISTRATION_ENABLED: "true"
