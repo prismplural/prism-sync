@@ -185,6 +185,9 @@ All environment variables with their defaults. Everything is production-ready ou
 | `MEDIA_MAX_FILE_BYTES` | `10485760` | Maximum size per upload (10 MB) |
 | `MEDIA_QUOTA_BYTES_PER_GROUP` | `1073741824` | Total media per sync group (1 GB) |
 | `MEDIA_RETENTION_DAYS` | `90` | Days before unreferenced media is cleaned up |
+| `MEDIA_UPLOAD_RATE_LIMIT` | `10` | Max uploads per sync group per rate window |
+| `MEDIA_UPLOAD_RATE_WINDOW_SECS` | `60` | Rate limit sliding window |
+| `MEDIA_ORPHAN_CLEANUP_SECS` | `86400` | Interval for cleaning up orphaned media files (24 hours) |
 
 ### Anti-Abuse
 
@@ -199,6 +202,7 @@ All environment variables with their defaults. Everything is production-ready ou
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `METRICS_TOKEN` | *(unset)* | Bearer token for `/metrics`. If unset, metrics are open |
+| `NODE_EXPORTER_URL` | *(unset)* | URL for node-exporter proxy at `/metrics/node` |
 
 ## Private Relay Tips
 
@@ -266,6 +270,7 @@ Key metrics:
 - `prism_connected_devices` — active WebSocket connections
 - `prism_stored_batches` — undelivered batches (should stay low)
 - `prism_db_size_bytes` — database size on disk
+- `prism_freelist_pages` — SQLite pages available for reuse after pruning and cleanup
 - `prism_last_cleanup_timestamp_seconds` — last cleanup cycle
 
 ## Connecting the App
