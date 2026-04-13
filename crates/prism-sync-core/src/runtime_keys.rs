@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{CoreError, Result};
 use crate::secure_store::SecureStore;
+use crate::storage::StorageError;
 
 const DEVICE_WRAP_KEY_STORAGE_KEY: &str = "device_wrap_key";
 const RUNTIME_KEYS_PREFIX: &str = "runtime_keys_";
@@ -44,7 +45,7 @@ impl SyncRuntimeKeys {
 
         // Encrypt under wrap key
         let encrypted = aead::xchacha_encrypt(&wrap_key, &json)
-            .map_err(|e| CoreError::Storage(format!("encrypt failed: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("encrypt failed: {e}"))))?;
 
         let storage_key = format!("{RUNTIME_KEYS_PREFIX}{sync_id}");
         secure_store.set(&storage_key, &encrypted)?;
@@ -73,7 +74,7 @@ impl SyncRuntimeKeys {
 
         let json = Zeroizing::new(
             aead::xchacha_decrypt(&wrap_key, &encrypted)
-                .map_err(|e| CoreError::Storage(format!("decrypt failed: {e}")))?,
+                .map_err(|e| CoreError::Storage(StorageError::Logic(format!("decrypt failed: {e}"))))?,
         );
 
         let payload: HashMap<String, String> =
@@ -84,10 +85,10 @@ impl SyncRuntimeKeys {
             if let Some(epoch_str) = key_str.strip_prefix("epoch_") {
                 let epoch: u32 = epoch_str
                     .parse()
-                    .map_err(|e| CoreError::Storage(format!("invalid epoch: {e}")))?;
+                    .map_err(|e| CoreError::Storage(StorageError::Logic(format!("invalid epoch: {e}"))))?;
                 let key_bytes = STANDARD
                     .decode(&value_b64)
-                    .map_err(|e| CoreError::Storage(format!("base64 decode: {e}")))?;
+                    .map_err(|e| CoreError::Storage(StorageError::Logic(format!("base64 decode: {e}"))))?;
                 keys.insert(epoch, Zeroizing::new(key_bytes));
             }
         }
