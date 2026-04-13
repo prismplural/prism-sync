@@ -100,7 +100,6 @@ impl SyncDebugLog {
         self.entries.lock().expect("debug log mutex poisoned").len()
     }
 
-    /// Returns true if empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

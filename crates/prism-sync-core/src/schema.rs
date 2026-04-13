@@ -29,7 +29,6 @@ pub enum SyncValue {
 }
 
 impl SyncValue {
-    /// Returns the SyncType of this value, or None for Null.
     pub fn sync_type(&self) -> Option<SyncType> {
         match self {
             SyncValue::Null => None,
@@ -41,7 +40,6 @@ impl SyncValue {
         }
     }
 
-    /// Returns true if this is Null.
     pub fn is_null(&self) -> bool {
         matches!(self, SyncValue::Null)
     }
@@ -181,7 +179,6 @@ impl SyncSchema {
         self.entities.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Returns true if the given table is registered.
     pub fn has_table(&self, table_name: &str) -> bool {
         self.entities.contains_key(table_name)
     }

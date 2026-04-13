@@ -87,7 +87,6 @@ impl CrdtChange {
         }
     }
 
-    /// Returns true if this is a bulk reset operation.
     pub fn is_bulk_reset(&self) -> bool {
         self.field_name == BULK_RESET_FIELD
     }
@@ -98,8 +97,6 @@ impl CrdtChange {
     /// 1. Compare HLC (timestamp, counter, node_id)
     /// 2. Compare device_id lexicographically
     /// 3. Compare op_id lexicographically
-    ///
-    /// Returns true if `self` wins over `other`.
     pub fn wins_over(&self, other: &CrdtChange) -> Result<bool> {
         let self_hlc = Hlc::from_string(&self.client_hlc)?;
         let other_hlc = Hlc::from_string(&other.client_hlc)?;

@@ -272,9 +272,8 @@ impl PrismSync {
         Ok(())
     }
 
-    /// Export the raw DEK bytes for keychain persistence.
-    ///
-    /// Returns the raw 32-byte DEK. Only works when unlocked.
+    /// Only available when unlocked (after `initialize` or `unlock`).
+    /// Cache in the platform keychain for `restore_runtime_keys` on relaunch.
     pub fn export_dek(&self) -> Result<Vec<u8>> {
         Ok(self.key_hierarchy.dek()?.to_vec())
     }

@@ -74,7 +74,6 @@ pub struct ChangeSet {
 }
 
 impl ChangeSet {
-    /// Returns true if there are no changes.
     pub fn is_empty(&self) -> bool {
         self.created.is_empty() && self.updated.is_empty() && self.deleted.is_empty()
     }

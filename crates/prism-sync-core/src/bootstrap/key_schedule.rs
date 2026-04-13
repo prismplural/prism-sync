@@ -21,8 +21,13 @@ use super::{BootstrapProfile, BootstrapRole, BootstrapVersion};
 // Info-string builder
 // ---------------------------------------------------------------------------
 
-/// Build the HKDF info field:
+/// Build the HKDF info field for domain-separated key derivation.
+///
 /// `"prism_bootstrap" || 0x00 || profile_byte || version_byte || 0x00 || purpose`
+///
+/// The profile byte (pairing=0x01, sharing=0x02) ensures sync-pairing and
+/// remote-sharing never produce the same keys even with identical secrets and
+/// transcripts — defense-in-depth against cross-protocol key reuse.
 fn build_info(profile: BootstrapProfile, version: BootstrapVersion, purpose: &[u8]) -> Vec<u8> {
     let mut info = Vec::with_capacity(15 + 1 + 1 + 1 + 1 + purpose.len());
     info.extend_from_slice(b"prism_bootstrap");

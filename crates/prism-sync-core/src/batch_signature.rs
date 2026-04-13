@@ -53,7 +53,7 @@ fn build_canonical_signed_data_v2(
 
 /// Build the canonical signed data for a V3 envelope.
 ///
-/// Binary format (deterministic, NOT JSON):
+/// Binary format (deterministic, NOT JSON — avoids cross-language serialization drift):
 /// ```text
 /// "PRISM_SYNC_BATCH_V3" || 0x00
 /// || be_u16(protocol_version)
@@ -67,6 +67,10 @@ fn build_canonical_signed_data_v2(
 /// ```
 ///
 /// Where `len_prefixed_utf8` = `be_u32(len) || utf8_bytes`.
+///
+/// V3 adds `sender_ml_dsa_key_generation` (vs V2) so the verifier checks the
+/// signature against the correct version of the sender's ML-DSA key, preventing
+/// a downgrade attack where a revoked key generation is replayed.
 #[allow(clippy::too_many_arguments)]
 pub fn build_canonical_signed_data(
     protocol_version: u16,

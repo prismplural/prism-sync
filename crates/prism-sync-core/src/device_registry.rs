@@ -52,8 +52,10 @@ impl DeviceRegistryManager {
                     && device.x25519_public_key == existing.x25519_public_key
                     && device.ml_kem_768_public_key == existing.ml_kem_768_public_key =>
             {
-                // Accept ML-DSA rotation during keyring import (e.g., signed registry
-                // snapshot from a trusted device that saw a peer rotation).
+                // ML-DSA key rotation: a peer device rotated its PQ signing key
+                // (which is allowed) without changing its permanent Ed25519/X25519/
+                // ML-KEM keys. We learn about this through the signed device registry
+                // gossip. Accept if generation strictly increases (prevents rollback).
                 Self::write_device_record(storage, device)
             }
             Some(_) => Err(CoreError::DeviceKeyChanged {

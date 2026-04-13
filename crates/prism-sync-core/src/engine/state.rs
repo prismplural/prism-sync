@@ -80,7 +80,6 @@ impl Default for SyncResult {
 }
 
 impl SyncResult {
-    /// Returns true if an error was encountered.
     pub fn has_error(&self) -> bool {
         self.error.is_some()
     }

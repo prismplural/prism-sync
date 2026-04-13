@@ -294,7 +294,6 @@ pub fn pow_solution_from_nonce_json(
 }
 
 /// Full V3 hybrid registration helper using `TestDeviceKeys`.
-/// Returns the session token.
 pub async fn register_device(
     client: &Client,
     url: &str,
@@ -332,7 +331,6 @@ impl TestDeviceKeys {
 }
 
 /// Full V2 hybrid registration helper.
-/// Returns the session token.
 pub async fn register_device_hybrid(
     client: &Client,
     url: &str,

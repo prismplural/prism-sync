@@ -1,11 +1,11 @@
 import 'types.dart';
 
-/// Dart client for the prism-sync encrypted CRDT sync engine.
+/// Dart client stub for the prism-sync encrypted CRDT sync engine.
 ///
-/// Placeholder implementation — will be backed by flutter_rust_bridge
-/// bindings that call into the Rust `prism-sync-ffi` crate.
+/// The real integration uses flutter_rust_bridge-generated bindings in
+/// `prism_sync/lib/generated/`. This stub exists for the package's public API
+/// surface and is not used at runtime.
 class PrismSyncClient {
-  // TODO: Wire to Rust FFI via flutter_rust_bridge
 
   /// Initialize the sync engine for first-time setup.
   ///

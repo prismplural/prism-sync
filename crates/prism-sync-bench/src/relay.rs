@@ -42,7 +42,6 @@ pub fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
 }
 
 /// Full registration helper: fetches nonce, signs challenge, registers device.
-/// Returns the session token.
 pub async fn register_device(
     client: &Client,
     url: &str,

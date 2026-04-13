@@ -2,12 +2,10 @@ import 'dart:typed_data';
 
 /// Abstract interface for secure key/value storage.
 ///
-/// Placeholder — the concrete implementation will use `flutter_secure_storage`
-/// once that dependency is added. Values are stored as raw bytes.
-///
-/// In the full implementation, this bridges to the Rust `SecureStore` trait
-/// via the FFI layer, storing wrapped keys in platform-native secure storage
-/// (Keychain on iOS/macOS, EncryptedSharedPreferences on Android).
+/// Concrete implementation in the app uses `flutter_secure_storage` to bridge
+/// platform-native secure storage (Keychain on iOS/macOS,
+/// EncryptedSharedPreferences on Android) to the Rust `SecureStore` trait
+/// via the FFI layer.
 abstract class SecureStore {
   /// Read a value by key. Returns null if the key does not exist.
   Future<Uint8List?> get(String key);
