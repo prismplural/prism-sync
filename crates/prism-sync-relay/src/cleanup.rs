@@ -301,7 +301,7 @@ fn cleanup_abandoned_brand_new_groups(
         .collect();
 
     for sync_id in &sync_ids {
-        crate::db::delete_sync_group(conn, sync_id)?;
+        let _ = crate::db::delete_sync_group(conn, sync_id)?;
     }
 
     Ok(sync_ids.len())

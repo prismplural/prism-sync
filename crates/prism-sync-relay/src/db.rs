@@ -1911,8 +1911,49 @@ pub fn delete_password_change_artifacts_before(
 // ---------------------------------------------------------------------------
 
 /// Delete a sync group and all associated data (cascading).
-pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlite::Error> {
+/// Returns the list of media_ids that were stored for this group (for disk cleanup).
+pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<Vec<String>, rusqlite::Error> {
     let tx = conn.unchecked_transaction()?;
+
+    // Collect media_ids before deleting rows so callers can clean up files on disk
+    let mut stmt = tx.prepare("SELECT media_id FROM media_metadata WHERE sync_id = ?1")?;
+    let media_ids: Vec<String> = stmt
+        .query_map(params![sync_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    // Clean up sharing tables via the sharing_id mapping
+    let sharing_id: Option<String> = tx
+        .query_row(
+            "SELECT sharing_id FROM sharing_id_mappings WHERE sync_id = ?1",
+            params![sync_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(ref sid) = sharing_id {
+        tx.execute(
+            "DELETE FROM sharing_signed_prekeys WHERE sharing_id = ?1",
+            params![sid],
+        )?;
+        tx.execute(
+            "DELETE FROM sharing_identity_bundles WHERE sharing_id = ?1",
+            params![sid],
+        )?;
+        tx.execute(
+            "DELETE FROM sharing_identity_generation_floors WHERE sharing_id = ?1",
+            params![sid],
+        )?;
+        tx.execute(
+            "DELETE FROM sharing_init_payloads WHERE recipient_id = ?1 OR sender_id = ?1",
+            params![sid],
+        )?;
+        tx.execute(
+            "DELETE FROM sharing_id_mappings WHERE sync_id = ?1",
+            params![sync_id],
+        )?;
+    }
 
     tx.execute(
         "DELETE FROM password_change_artifacts WHERE sync_id = ?1",
@@ -1967,7 +2008,7 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<(), rusqlit
     )?;
 
     tx.commit()?;
-    Ok(())
+    Ok(media_ids)
 }
 
 /// Mark devices as 'stale' if they haven't been seen within the threshold.
@@ -2041,7 +2082,7 @@ pub fn prune_stale_sync_groups(
         .collect();
 
     for sync_id in &stale_ids {
-        delete_sync_group(conn, sync_id)?;
+        let _ = delete_sync_group(conn, sync_id)?;
     }
 
     Ok(stale_ids.len())

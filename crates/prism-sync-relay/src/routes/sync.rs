@@ -463,20 +463,33 @@ pub async fn delete_account(
     let sid = sync_id.clone();
     let did = device_id;
 
-    let deleted = tokio::task::spawn_blocking(move || {
+    let media_storage_path = state.config.media_storage_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| Ok(do_delete_account(conn, &sid, &did)))
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
-    if deleted {
-        tracing::debug!(sync_id = %trunc(&sync_id), "Sync group deleted");
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::Forbidden(
+    match result {
+        Some(media_ids) => {
+            // Clean up media files from disk
+            for media_id in &media_ids {
+                let path = std::path::Path::new(&media_storage_path)
+                    .join(&sync_id)
+                    .join(media_id);
+                let _ = std::fs::remove_file(&path);
+            }
+            let dir = std::path::Path::new(&media_storage_path).join(&sync_id);
+            let _ = std::fs::remove_dir(&dir);
+
+            tracing::debug!(sync_id = %trunc(&sync_id), "Sync group deleted");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        None => Err(AppError::Forbidden(
             "Only the sole active admin can delete the sync group",
-        ))
+        )),
     }
 }
 
@@ -484,17 +497,18 @@ fn do_delete_account(
     conn: &rusqlite::Connection,
     sync_id: &str,
     device_id: &str,
-) -> Result<bool, AppError> {
+) -> Result<Option<Vec<String>>, AppError> {
     let devices = db::list_devices(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;
     let active: Vec<_> = devices
         .into_iter()
         .filter(|d| d.status == "active")
         .collect();
     if active.len() == 1 && active[0].device_id == device_id {
-        db::delete_sync_group(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;
-        Ok(true)
+        let media_ids =
+            db::delete_sync_group(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;
+        Ok(Some(media_ids))
     } else {
-        Ok(false)
+        Ok(None)
     }
 }
 
