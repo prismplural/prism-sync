@@ -22,7 +22,7 @@ use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
-use prism_sync_core::relay::SyncRelay;
+use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
 use prism_sync_core::schema::{SyncSchema, SyncValue};
 use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
@@ -802,7 +802,7 @@ impl MemorySecureStore {
 
     /// Return a copy of all stored entries (for draining back to Dart).
     pub fn snapshot(&self) -> HashMap<String, Vec<u8>> {
-        self.data.lock().unwrap().clone()
+        lock_or_recover(&self.data).clone()
     }
 }
 
@@ -814,21 +814,18 @@ impl Default for MemorySecureStore {
 
 impl prism_sync_core::secure_store::SecureStore for MemorySecureStore {
     fn get(&self, key: &str) -> prism_sync_core::Result<Option<Vec<u8>>> {
-        Ok(self.data.lock().unwrap().get(key).cloned())
+        Ok(lock_or_recover(&self.data).get(key).cloned())
     }
     fn set(&self, key: &str, value: &[u8]) -> prism_sync_core::Result<()> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_vec());
+        lock_or_recover(&self.data).insert(key.to_string(), value.to_vec());
         Ok(())
     }
     fn delete(&self, key: &str) -> prism_sync_core::Result<()> {
-        self.data.lock().unwrap().remove(key);
+        lock_or_recover(&self.data).remove(key);
         Ok(())
     }
     fn clear(&self) -> prism_sync_core::Result<()> {
-        self.data.lock().unwrap().clear();
+        lock_or_recover(&self.data).clear();
         Ok(())
     }
 
@@ -839,6 +836,15 @@ impl prism_sync_core::secure_store::SecureStore for MemorySecureStore {
     fn snapshot(&self) -> prism_sync_core::Result<Option<HashMap<String, Vec<u8>>>> {
         Ok(Some(MemorySecureStore::snapshot(self)))
     }
+}
+
+/// Lock a `std::sync::Mutex`, recovering from poisoning instead of panicking.
+/// This is critical for FFI safety — a panic across the Dart/Rust boundary is UB.
+fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        eprintln!("[prism_sync_ffi] mutex poisoned, recovering inner value");
+        poisoned.into_inner()
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1197,7 +1203,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     }
 
     // Store relay so set_auto_sync can wire up the notification handler.
-    *handle.relay.lock().unwrap() = Some(relay.clone());
+    *lock_or_recover(&handle.relay) = Some(relay.clone());
 
     // Configure engine
     inner.configure_engine(relay, sync_id, device_id, epoch, ml_dsa_key_generation);
@@ -1342,13 +1348,13 @@ pub async fn set_auto_sync(
     max_retries: u32,
 ) -> Result<(), String> {
     // Abort any existing driver / notification / backoff tasks before reconfiguring.
-    if let Some(h) = handle.driver_handle.lock().unwrap().take() {
+    if let Some(h) = lock_or_recover(&handle.driver_handle).take() {
         h.abort();
     }
-    if let Some(h) = handle.notification_handle.lock().unwrap().take() {
+    if let Some(h) = lock_or_recover(&handle.notification_handle).take() {
         h.abort();
     }
-    if let Some(h) = handle.backoff_handle.lock().unwrap().take() {
+    if let Some(h) = lock_or_recover(&handle.backoff_handle).take() {
         h.abort();
     }
 
@@ -1408,7 +1414,7 @@ pub async fn set_auto_sync(
             while trigger_rx.recv().await.is_some() {
                 // Cancel any pending backoff delay task
                 {
-                    let mut guard = backoff_abort.lock().unwrap();
+                    let mut guard = lock_or_recover(&backoff_abort);
                     if let Some(abort) = guard.take() {
                         abort.abort();
                     }
@@ -1484,13 +1490,13 @@ pub async fn set_auto_sync(
                 }
             }
         });
-        *handle.driver_handle.lock().unwrap() = Some(driver);
+        *lock_or_recover(&handle.driver_handle) = Some(driver);
 
         // Spawn notification handler if relay is connected, so WebSocket
         // new_data messages trigger auto-pull on this device. Pass the
         // PrismSync handle and relay so epoch rotation can be recovered
         // inline before triggering sync.
-        let relay = handle.relay.lock().unwrap().clone();
+        let relay = lock_or_recover(&handle.relay).clone();
         if let (Some(trigger_tx), Some(relay)) = (notification_trigger_tx, relay) {
             let notifications = relay.notifications();
             let inner_for_notif = Some(handle.inner.clone());
@@ -1504,7 +1510,7 @@ pub async fn set_auto_sync(
                 inner_for_notif,
                 relay_for_notif,
             );
-            *handle.notification_handle.lock().unwrap() = Some(notif);
+            *lock_or_recover(&handle.notification_handle) = Some(notif);
         }
     }
 
@@ -3475,7 +3481,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
                     .get_device_record(&sid, &did)?
                     .ok_or_else(|| {
                         prism_sync_core::error::CoreError::Storage(
-                            "device not in registry".into(),
+                            prism_sync_core::storage::StorageError::Logic("device not in registry".into()),
                         )
                     })?;
                 record.ml_dsa_65_public_key = synced_pk;
@@ -3838,5 +3844,20 @@ mod tests {
         assert_eq!(json["type"], "BackoffScheduled");
         assert_eq!(json["attempt"], 3);
         assert_eq!(json["delay_secs"], 120);
+    }
+
+    #[test]
+    fn lock_or_recover_handles_poisoned_mutex() {
+        let mutex = std::sync::Arc::new(std::sync::Mutex::new(42));
+        let m = mutex.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = m.lock().unwrap();
+            panic!("intentional poisoning");
+        })
+        .join();
+
+        assert!(mutex.is_poisoned());
+        let guard = lock_or_recover(&mutex);
+        assert_eq!(*guard, 42);
     }
 }
