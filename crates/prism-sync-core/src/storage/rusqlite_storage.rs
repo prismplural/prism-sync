@@ -8,6 +8,7 @@ use super::migrations;
 use super::snapshot_format::*;
 use super::traits::*;
 use super::types::*;
+use super::error::StorageError;
 use crate::error::{CoreError, Result};
 
 // ── Row-mapping helpers ──
@@ -144,7 +145,7 @@ fn query_sync_metadata(conn: &Connection, sync_id: &str) -> Result<Option<SyncMe
         },
     )
     .optional()
-    .map_err(CoreError::Sqlite)
+    .map_err(CoreError::from)
 }
 
 fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<String>> {
@@ -154,13 +155,13 @@ fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<Stri
              FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NULL \
              GROUP BY local_batch_id ORDER BY first_created ASC",
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let rows = stmt
         .query_map(params![sync_id], |row| row.get::<_, String>(0))
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let mut result = Vec::new();
     for r in rows {
-        result.push(r.map_err(CoreError::Sqlite)?);
+        result.push(r?);
     }
     Ok(result)
 }
@@ -171,13 +172,13 @@ fn query_batch_ops(conn: &Connection, batch_id: &str) -> Result<Vec<PendingOp>> 
             "SELECT * FROM pending_ops WHERE local_batch_id = ?1 \
              ORDER BY created_at ASC, client_hlc ASC",
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let rows = stmt
         .query_map(params![batch_id], row_to_pending_op)
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let mut result = Vec::new();
     for r in rows {
-        result.push(r.map_err(CoreError::Sqlite)?);
+        result.push(r?);
     }
     Ok(result)
 }
@@ -190,7 +191,7 @@ fn query_is_op_applied(conn: &Connection, op_id: &str) -> Result<bool> {
             |row| row.get(0),
         )
         .optional()
-        .map_err(CoreError::Sqlite)?;
+        ?;
     Ok(exists.is_some())
 }
 
@@ -208,7 +209,7 @@ fn query_field_version(
         row_to_field_version,
     )
     .optional()
-    .map_err(CoreError::Sqlite)
+    .map_err(CoreError::from)
 }
 
 fn query_device_record(
@@ -222,19 +223,19 @@ fn query_device_record(
         row_to_device_record,
     )
     .optional()
-    .map_err(CoreError::Sqlite)
+    .map_err(CoreError::from)
 }
 
 fn query_list_device_records(conn: &Connection, sync_id: &str) -> Result<Vec<DeviceRecord>> {
     let mut stmt = conn
         .prepare("SELECT * FROM device_registry WHERE sync_id = ?1")
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let rows = stmt
         .query_map(params![sync_id], row_to_device_record)
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let mut result = Vec::new();
     for r in rows {
-        result.push(r.map_err(CoreError::Sqlite)?);
+        result.push(r?);
     }
     Ok(result)
 }
@@ -250,7 +251,7 @@ fn query_count_prunable_applied_ops(
             params![sync_id, below_seq],
             |row| row.get(0),
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
     Ok(count as usize)
 }
 
@@ -273,15 +274,15 @@ fn query_list_prunable_tombstones(
                AND ao.server_seq < ?2 \
              LIMIT ?3",
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let rows = stmt
         .query_map(params![sync_id, below_seq, limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let mut result = Vec::new();
     for r in rows {
-        result.push(r.map_err(CoreError::Sqlite)?);
+        result.push(r?);
     }
     Ok(result)
 }
@@ -309,7 +310,7 @@ fn exec_upsert_sync_metadata(conn: &Connection, meta: &SyncMetadata) -> Result<(
             meta.updated_at.to_rfc3339(),
         ],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -322,7 +323,7 @@ fn exec_update_last_pulled_seq(conn: &Connection, sync_id: &str, seq: i64) -> Re
          ON CONFLICT(sync_id) DO UPDATE SET last_pulled_server_seq = ?2, updated_at = ?3",
         params![sync_id, seq, now],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -336,7 +337,7 @@ fn exec_update_last_successful_sync(conn: &Connection, sync_id: &str) -> Result<
          ON CONFLICT(sync_id) DO UPDATE SET last_successful_sync_at = ?2, updated_at = ?2",
         params![sync_id, now],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -346,7 +347,7 @@ fn exec_update_current_epoch(conn: &Connection, sync_id: &str, epoch: i32) -> Re
         "UPDATE sync_metadata SET current_epoch = ?1, updated_at = ?2 WHERE sync_id = ?3",
         params![epoch, now, sync_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -359,7 +360,7 @@ fn exec_update_last_imported_registry_version(
         "UPDATE sync_metadata SET last_imported_registry_version = ?2, updated_at = ?3 WHERE sync_id = ?1",
         params![sync_id, version, Utc::now().to_rfc3339()],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -385,7 +386,7 @@ fn exec_insert_pending_op(conn: &Connection, op: &PendingOp) -> Result<()> {
             op.pushed_at.map(|d| d.to_rfc3339()),
         ],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -394,7 +395,7 @@ fn exec_mark_batch_pushed(conn: &Connection, batch_id: &str) -> Result<()> {
         "UPDATE pending_ops SET pushed_at = ?1 WHERE local_batch_id = ?2",
         params![Utc::now().to_rfc3339(), batch_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -403,7 +404,7 @@ fn exec_delete_pushed_ops(conn: &Connection, sync_id: &str) -> Result<()> {
         "DELETE FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NOT NULL",
         params![sync_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -422,7 +423,7 @@ fn exec_insert_applied_op(conn: &Connection, op: &AppliedOp) -> Result<()> {
             op.applied_at.to_rfc3339(),
         ],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -444,7 +445,7 @@ fn exec_upsert_field_version(conn: &Connection, fv: &FieldVersion) -> Result<()>
             fv.updated_at.to_rfc3339(),
         ],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -469,7 +470,7 @@ fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result
             device.ml_dsa_key_generation as i32,
         ],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -478,7 +479,7 @@ fn exec_remove_device_record(conn: &Connection, sync_id: &str, device_id: &str) 
         "DELETE FROM device_registry WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -487,27 +488,27 @@ fn exec_clear_sync_state(conn: &Connection, sync_id: &str) -> Result<()> {
         "DELETE FROM pending_ops WHERE sync_id = ?1",
         params![sync_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     conn.execute(
         "DELETE FROM applied_ops WHERE sync_id = ?1",
         params![sync_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     conn.execute(
         "DELETE FROM field_versions WHERE sync_id = ?1",
         params![sync_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     conn.execute(
         "DELETE FROM device_registry WHERE sync_id = ?1",
         params![sync_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     conn.execute(
         "DELETE FROM sync_metadata WHERE sync_id = ?1",
         params![sync_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -528,7 +529,7 @@ fn exec_delete_applied_ops_below_seq(
              )",
             params![sync_id, below_seq, limit as i64],
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
     Ok(affected)
 }
 
@@ -542,7 +543,7 @@ fn exec_delete_field_versions_for_entity(
         "DELETE FROM field_versions WHERE sync_id = ?1 AND entity_table = ?2 AND entity_id = ?3",
         params![sync_id, table, entity_id],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
     Ok(())
 }
 
@@ -552,7 +553,7 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
     // 1. Query all field_versions for this sync_id
     let mut fv_stmt = conn
         .prepare("SELECT * FROM field_versions WHERE sync_id = ?1")
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let field_versions: Vec<FieldVersionEntry> = fv_stmt
         .query_map(params![sync_id], |row| {
             Ok(FieldVersionEntry {
@@ -566,14 +567,14 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 updated_at: row.get("updated_at")?,
             })
         })
-        .map_err(CoreError::Sqlite)?
+        ?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(CoreError::Sqlite)?;
+        ?;
 
     // 2. Query all device_registry rows for this sync_id
     let mut dr_stmt = conn
         .prepare("SELECT * FROM device_registry WHERE sync_id = ?1")
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let device_registry: Vec<DeviceRegistryEntry> = dr_stmt
         .query_map(params![sync_id], |row| {
             let ed25519: Vec<u8> = row.get("ed25519_public_key")?;
@@ -594,14 +595,14 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
             })
         })
-        .map_err(CoreError::Sqlite)?
+        ?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(CoreError::Sqlite)?;
+        ?;
 
     // 3. Query all applied_ops for this sync_id
     let mut ao_stmt = conn
         .prepare("SELECT * FROM applied_ops WHERE sync_id = ?1")
-        .map_err(CoreError::Sqlite)?;
+        ?;
     let applied_ops: Vec<AppliedOpEntry> = ao_stmt
         .query_map(params![sync_id], |row| {
             Ok(AppliedOpEntry {
@@ -614,9 +615,9 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 applied_at: row.get("applied_at")?,
             })
         })
-        .map_err(CoreError::Sqlite)?
+        ?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(CoreError::Sqlite)?;
+        ?;
 
     // 4. Query sync_metadata for this sync_id
     let meta = query_sync_metadata(conn, sync_id)?;
@@ -628,9 +629,9 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
             last_pulled_server_seq: m.last_pulled_server_seq,
         },
         None => {
-            return Err(CoreError::Storage(format!(
+            return Err(CoreError::Storage(StorageError::Logic(format!(
                 "No sync_metadata found for sync_id={sync_id}"
-            )));
+            ))));
         }
     };
 
@@ -646,7 +647,7 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
 
     // 6. Compress with zstd (level 3)
     let compressed = zstd::encode_all(json.as_slice(), 3)
-        .map_err(|e| CoreError::Storage(format!("zstd compression failed: {e}")))?;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("zstd compression failed: {e}"))))?;
 
     Ok(compressed)
 }
@@ -654,16 +655,16 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
 fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result<u64> {
     // 1. Decompress zstd
     let json = zstd::decode_all(data)
-        .map_err(|e| CoreError::Storage(format!("zstd decompression failed: {e}")))?;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("zstd decompression failed: {e}"))))?;
 
     // 2. Parse JSON
     let snapshot: SnapshotData = serde_json::from_slice(&json)?;
 
     if snapshot.version != SNAPSHOT_VERSION {
-        return Err(CoreError::Storage(format!(
+        return Err(CoreError::Storage(StorageError::Logic(format!(
             "Unsupported snapshot version: {} (expected {})",
             snapshot.version, SNAPSHOT_VERSION
-        )));
+        ))));
     }
 
     // Track unique entities for the return count
@@ -690,22 +691,22 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 fv.updated_at,
             ],
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
         entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
     }
 
     // 4. Insert device_registry (INSERT OR REPLACE)
     for dr in &snapshot.device_registry {
         let ed25519 = hex::decode(&dr.ed25519_public_key)
-            .map_err(|e| CoreError::Storage(format!("bad hex in ed25519_public_key: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in ed25519_public_key: {e}"))))?;
         let x25519 = hex::decode(&dr.x25519_public_key)
-            .map_err(|e| CoreError::Storage(format!("bad hex in x25519_public_key: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in x25519_public_key: {e}"))))?;
         let ml_dsa = hex::decode(&dr.ml_dsa_65_public_key)
-            .map_err(|e| CoreError::Storage(format!("bad hex in ml_dsa_65_public_key: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in ml_dsa_65_public_key: {e}"))))?;
         let ml_kem = hex::decode(&dr.ml_kem_768_public_key)
-            .map_err(|e| CoreError::Storage(format!("bad hex in ml_kem_768_public_key: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in ml_kem_768_public_key: {e}"))))?;
         let x_wing = hex::decode(&dr.x_wing_public_key)
-            .map_err(|e| CoreError::Storage(format!("bad hex in x_wing_public_key: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in x_wing_public_key: {e}"))))?;
         conn.execute(
             "INSERT OR REPLACE INTO device_registry \
              (sync_id, device_id, ed25519_public_key, x25519_public_key, \
@@ -726,7 +727,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 dr.ml_dsa_key_generation as i32,
             ],
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
     }
 
     // 5. Insert applied_ops (INSERT OR IGNORE — idempotent)
@@ -745,7 +746,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 ao.applied_at,
             ],
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
     }
 
     // 6. Update sync_metadata (last_pulled_server_seq, current_epoch)
@@ -765,7 +766,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
             now,
         ],
     )
-    .map_err(CoreError::Sqlite)?;
+    ?;
 
     // 7. Return count of unique entities
     Ok(entities.len() as u64)
@@ -798,12 +799,12 @@ impl RusqliteSyncStorage {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )
-        .map_err(CoreError::Sqlite)?;
+        ?;
 
         let mut conn = conn;
         migrations::migrations()
             .to_latest(&mut conn)
-            .map_err(|e| CoreError::Storage(format!("Migration failed: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("Migration failed: {e}"))))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -817,7 +818,7 @@ impl RusqliteSyncStorage {
     pub fn new_encrypted(conn: Connection, key: &[u8]) -> Result<Self> {
         let hex_key = hex::encode(key);
         conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
-            .map_err(|e| CoreError::Storage(format!("PRAGMA key failed: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("PRAGMA key failed: {e}"))))?;
 
         // Now proceed with normal setup
         Self::new(conn)
@@ -835,21 +836,21 @@ impl RusqliteSyncStorage {
         let hex_key = hex::encode(key);
         let escaped_path = new_path.display().to_string().replace('\'', "''");
         let conn = Connection::open(old_path)
-            .map_err(|e| CoreError::Storage(format!("open old DB: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("open old DB: {e}"))))?;
 
         conn.execute_batch(&format!(
             "ATTACH DATABASE '{escaped_path}' AS encrypted KEY \"x'{hex_key}'\";\n\
              SELECT sqlcipher_export('encrypted');\n\
              DETACH DATABASE encrypted;",
         ))
-        .map_err(|e| CoreError::Storage(format!("encryption migration failed: {e}")))?;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("encryption migration failed: {e}"))))?;
 
         Ok(())
     }
 
     /// Create an in-memory storage instance for testing.
     pub fn in_memory() -> Result<Self> {
-        Self::new(Connection::open_in_memory().map_err(CoreError::Sqlite)?)
+        Self::new(Connection::open_in_memory()?)
     }
 }
 
@@ -858,7 +859,7 @@ impl SyncStorage for RusqliteSyncStorage {
         let guard = self.conn.lock().expect("SyncStorage mutex poisoned");
         guard
             .execute_batch("BEGIN IMMEDIATE")
-            .map_err(CoreError::Sqlite)?;
+            ?;
         Ok(Box::new(RusqliteTx {
             conn: guard,
             committed: false,
@@ -928,9 +929,9 @@ impl SyncStorage for RusqliteSyncStorage {
 
     fn rekey(&self, new_key: &[u8; 32]) -> Result<()> {
         let hex = new_key.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let conn = self.conn.lock().map_err(|_| CoreError::Storage("lock poisoned".into()))?;
+        let conn = self.conn.lock().map_err(|_| CoreError::Storage(StorageError::Logic("lock poisoned".into())))?;
         conn.execute_batch(&format!("PRAGMA rekey = \"x'{hex}'\";\n"))
-            .map_err(|e| CoreError::Storage(format!("PRAGMA rekey failed: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("PRAGMA rekey failed: {e}"))))?;
         Ok(())
     }
 }
@@ -1073,7 +1074,7 @@ impl SyncStorageTx for RusqliteTx<'_> {
     fn commit(mut self: Box<Self>) -> Result<()> {
         self.conn
             .execute_batch("COMMIT")
-            .map_err(CoreError::Sqlite)?;
+            ?;
         self.committed = true;
         Ok(())
     }
@@ -1081,7 +1082,7 @@ impl SyncStorageTx for RusqliteTx<'_> {
     fn rollback(mut self: Box<Self>) -> Result<()> {
         self.conn
             .execute_batch("ROLLBACK")
-            .map_err(CoreError::Sqlite)?;
+            ?;
         self.committed = true; // prevent double-rollback in Drop
         Ok(())
     }

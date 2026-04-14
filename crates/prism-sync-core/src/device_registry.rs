@@ -8,7 +8,7 @@
 //! the pinned keys, raising an error on mismatch (TOFU model).
 
 use crate::error::{CoreError, Result};
-use crate::storage::{DeviceRecord, SyncStorage};
+use crate::storage::{DeviceRecord, StorageError, SyncStorage};
 use prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof;
 
 /// Stateless helper for device registry operations.
@@ -78,12 +78,12 @@ impl DeviceRegistryManager {
     ) -> Result<()> {
         let record = storage.get_device_record(sync_id, device_id)?;
         match record {
-            None => Err(CoreError::Storage(format!(
+            None => Err(CoreError::Storage(StorageError::Logic(format!(
                 "device {device_id} not in registry"
-            ))),
-            Some(r) if r.status == "revoked" => Err(CoreError::Storage(format!(
+            )))),
+            Some(r) if r.status == "revoked" => Err(CoreError::Storage(StorageError::Logic(format!(
                 "device {device_id} has been revoked"
-            ))),
+            )))),
             Some(r) if r.ed25519_public_key != claimed_ed25519_pk => {
                 Err(CoreError::DeviceKeyChanged {
                     device_id: device_id.to_string(),
@@ -212,7 +212,7 @@ impl DeviceRegistryManager {
     pub fn revoke_device(storage: &dyn SyncStorage, sync_id: &str, device_id: &str) -> Result<()> {
         let record = storage
             .get_device_record(sync_id, device_id)?
-            .ok_or_else(|| CoreError::Storage(format!("device {device_id} not in registry")))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic(format!("device {device_id} not in registry"))))?;
 
         let revoked = DeviceRecord {
             status: "revoked".into(),
@@ -239,12 +239,12 @@ impl DeviceRegistryManager {
     ) -> Result<()> {
         let existing = storage
             .get_device_record(sync_id, device_id)?
-            .ok_or_else(|| CoreError::Storage(format!("device {device_id} not in registry")))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic(format!("device {device_id} not in registry"))))?;
 
         if existing.status == "revoked" {
-            return Err(CoreError::Storage(format!(
+            return Err(CoreError::Storage(StorageError::Logic(format!(
                 "device {device_id} has been revoked"
-            )));
+            ))));
         }
 
         if new_generation <= existing.ml_dsa_key_generation {
@@ -258,11 +258,11 @@ impl DeviceRegistryManager {
             .ed25519_public_key
             .clone()
             .try_into()
-            .map_err(|_| CoreError::Storage("invalid ed25519 pk length in registry".into()))?;
+            .map_err(|_| CoreError::Storage(StorageError::Logic("invalid ed25519 pk length in registry".into())))?;
 
         proof
             .verify(&ed25519_pk, &existing.ml_dsa_65_public_key)
-            .map_err(|e| CoreError::Storage(format!("continuity proof verification failed: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("continuity proof verification failed: {e}"))))?;
 
         // Update the device record with the new ML-DSA key
         let updated = DeviceRecord {

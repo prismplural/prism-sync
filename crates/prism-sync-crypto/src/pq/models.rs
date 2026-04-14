@@ -136,7 +136,7 @@ impl SignedPrekey {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         let key_id = self.key_id.as_bytes();
         if key_id.len() > u32::MAX as usize {
-            return Err(CryptoError::Serialization(
+            return Err(CryptoError::InvalidInput(
                 "signed prekey key_id exceeds u32::MAX bytes".into(),
             ));
         }

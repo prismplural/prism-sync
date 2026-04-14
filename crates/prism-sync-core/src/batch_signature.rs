@@ -5,6 +5,7 @@ use prism_sync_crypto::DevicePqSigningKey;
 
 use crate::error::{CoreError, Result};
 use crate::relay::SignedBatchEnvelope;
+use crate::storage::StorageError;
 
 /// Magic bytes prefixing all canonical signed data.
 const MAGIC: &[u8] = b"PRISM_SYNC_BATCH_V3";
@@ -193,7 +194,7 @@ pub fn verify_batch_signature(
 
     hybrid_sig
         .verify_v3(&canonical, b"sync_batch", sender_ed25519_pk, sender_ml_dsa_pk)
-        .map_err(|e| CoreError::Storage(format!("Batch signature verification failed: {e}")))?;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("Batch signature verification failed: {e}"))))?;
 
     Ok(())
 }
@@ -204,9 +205,9 @@ pub fn verify_batch_signature(
 pub fn verify_payload_hash(envelope: &SignedBatchEnvelope, decrypted_bytes: &[u8]) -> Result<()> {
     let computed = compute_payload_hash(decrypted_bytes);
     if computed != envelope.payload_hash {
-        return Err(CoreError::Storage(
+        return Err(CoreError::Storage(StorageError::Logic(
             "Payload hash mismatch: decrypted data does not match signed hash".to_string(),
-        ));
+        )));
     }
     Ok(())
 }

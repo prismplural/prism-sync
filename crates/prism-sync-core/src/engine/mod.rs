@@ -14,6 +14,7 @@ use crate::batch_signature;
 use crate::crdt_change::CrdtChange;
 use crate::device_registry::DeviceRegistryManager;
 use crate::error::{CoreError, Result};
+use crate::storage::StorageError;
 use crate::events::EntityChange;
 use crate::hlc::Hlc;
 use crate::pruning::TombstonePruner;
@@ -137,6 +138,7 @@ impl SyncEngine {
     /// `key_hierarchy` provides epoch keys by epoch number (not just "current epoch").
     /// This is critical because pulled batches may span multiple epochs during
     /// epoch rotation -- each batch is decrypted with its own epoch's key.
+    #[tracing::instrument(skip(self, key_hierarchy, signing_key, ml_dsa_signing_key), fields(sync_id, device_id), err)]
     pub async fn sync(
         &self,
         sync_id: &str,
@@ -243,7 +245,7 @@ impl SyncEngine {
             tx.commit()
         })
         .await
-        .map_err(|e| CoreError::Storage(e.to_string()))??;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         Ok(result)
     }
@@ -253,6 +255,7 @@ impl SyncEngine {
     }
 
     /// Pull phase: fetch batches, verify signature, decrypt, verify payload hash, merge.
+    #[tracing::instrument(skip(self, key_hierarchy), fields(sync_id, device_id), err)]
     async fn pull_phase(
         &self,
         sync_id: &str,
@@ -264,7 +267,7 @@ impl SyncEngine {
         let sid = sync_id.to_string();
         let meta = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         let since_seq = meta.map(|m| m.last_pulled_server_seq).unwrap_or(0);
 
@@ -307,7 +310,7 @@ impl SyncEngine {
                     tx.commit()
                 })
                 .await
-                .map_err(|e| CoreError::Storage(e.to_string()))??;
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
                 total_pulled += 1;
                 continue;
             }
@@ -335,7 +338,7 @@ impl SyncEngine {
                         tx.commit()
                     })
                     .await
-                    .map_err(|e| CoreError::Storage(e.to_string()))??;
+                    .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
                     total_pulled += 1;
                     continue;
                 }
@@ -371,7 +374,7 @@ impl SyncEngine {
                     tx.commit()
                 })
                 .await
-                .map_err(|e| CoreError::Storage(e.to_string()))??;
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
                 total_pulled += 1;
                 continue;
             }
@@ -469,7 +472,7 @@ impl SyncEngine {
         let record =
             tokio::task::spawn_blocking(move || storage.get_device_record(&sid, &sender_id))
                 .await
-                .map_err(|e| CoreError::Storage(e.to_string()))??;
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         if let Some(ref r) = record {
             if r.status == "active" {
@@ -506,7 +509,7 @@ impl SyncEngine {
                             storage.get_device_record(&sid, &sender_id)
                         })
                         .await
-                        .map_err(|e| CoreError::Storage(e.to_string()))??;
+                        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
                         return match refreshed_record {
                             Some(ref r) if r.status == "active" => pk_from_record(r),
@@ -515,19 +518,19 @@ impl SyncEngine {
                                     "Device {} was revoked during registry refresh",
                                     sender_device_id
                                 );
-                                Err(CoreError::Storage(format!(
+                                Err(CoreError::Storage(StorageError::Logic(format!(
                                     "Device {} was revoked during registry refresh (status: {})",
                                     sender_device_id, r.status
-                                )))
+                                ))))
                             }
                             None => {
                                 // Device was removed during refresh; fall through to the
                                 // unknown-sender stages below by returning an error here so
                                 // the caller can skip or reject the batch.
-                                Err(CoreError::Storage(format!(
+                                Err(CoreError::Storage(StorageError::Logic(format!(
                                     "Device {} disappeared during registry refresh",
                                     sender_device_id
-                                )))
+                                ))))
                             }
                         };
                     }
@@ -536,10 +539,10 @@ impl SyncEngine {
                 return Ok(info);
             }
             tracing::warn!("Skipping batch from revoked device {}", sender_device_id);
-            return Err(CoreError::Storage(format!(
+            return Err(CoreError::Storage(StorageError::Logic(format!(
                 "Device {} is revoked",
                 sender_device_id
-            )));
+            ))));
         }
 
         // Unknown sender -- attempt signed registry; fail closed if unavailable
@@ -567,10 +570,10 @@ impl SyncEngine {
             "No verified registry path for unknown sender {}; skipping batch (fail closed)",
             sender_device_id
         );
-        Err(CoreError::Storage(format!(
+        Err(CoreError::Storage(StorageError::Logic(format!(
             "Unknown device {} and no verified registry available (fail closed)",
             sender_device_id
-        )))
+        ))))
     }
 
     /// Fetch signed registry, verify, import, and re-lookup a specific device.
@@ -592,7 +595,7 @@ impl SyncEngine {
                     storage.get_sync_metadata(&sid)
                 })
                 .await
-                .map_err(|e| CoreError::Storage(e.to_string()))?
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
                 .ok()
                 .flatten()
                 .and_then(|m| m.last_imported_registry_version);
@@ -607,7 +610,7 @@ impl SyncEngine {
                     )
                 })
                 .await
-                .map_err(|e| CoreError::Storage(e.to_string()))?;
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?;
 
                 match import_result {
                     Ok(signed_version) => {
@@ -624,7 +627,7 @@ impl SyncEngine {
                             tx.commit()
                         })
                         .await
-                        .map_err(|e| CoreError::Storage(e.to_string()))?;
+                        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?;
 
                         // Retry local lookup after verified import
                         let storage = self.storage.clone();
@@ -634,7 +637,7 @@ impl SyncEngine {
                             storage.get_device_record(&sid, &dev_id)
                         })
                         .await
-                        .map_err(|e| CoreError::Storage(e.to_string()))??;
+                        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
                         if let Some(ref r) = record {
                             if r.status == "active" {
@@ -642,19 +645,19 @@ impl SyncEngine {
                             }
                         }
                         // Device still not found after verified import
-                        Err(CoreError::Storage(format!(
+                        Err(CoreError::Storage(StorageError::Logic(format!(
                             "Device {} not found in signed registry",
                             device_id
-                        )))
+                        ))))
                     }
                     Err(e) => {
                         tracing::warn!(
                             "Signed registry verification failed for device {}: {e}",
                             device_id
                         );
-                        Err(CoreError::Storage(format!(
+                        Err(CoreError::Storage(StorageError::Logic(format!(
                             "Signed registry verification failed: {e}"
-                        )))
+                        ))))
                     }
                 }
             }
@@ -663,9 +666,9 @@ impl SyncEngine {
                     "No signed registry artifact available for device {}",
                     device_id
                 );
-                Err(CoreError::Storage(
+                Err(CoreError::Storage(StorageError::Logic(
                     "No signed registry artifact available".to_string(),
-                ))
+                )))
             }
             Err(e) => {
                 tracing::warn!(
@@ -687,6 +690,7 @@ impl SyncEngine {
     /// will be re-pulled and re-applied on next sync (idempotent via applied_ops check).
     /// If sync bookkeeping fails after entity writes succeed, replay is safe because
     /// the merge is idempotent and write_fields uses upsert semantics.
+    #[tracing::instrument(skip(self, ops), err)]
     async fn apply_remote_batch(
         &self,
         sync_id: &str,
@@ -741,7 +745,7 @@ impl SyncEngine {
             Ok::<_, CoreError>((checked, winning_ops))
         })
         .await
-        .map_err(|e| CoreError::Storage(e.to_string()))??;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         let merged_count = winning_ops.len() as u64;
 
@@ -895,7 +899,7 @@ impl SyncEngine {
                 tx.commit()
             })
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
         }
 
         Ok((merged_count, entity_changes))
@@ -909,6 +913,7 @@ impl SyncEngine {
     /// (sent via X-Batch-Id header). If the relay does not deduplicate,
     /// the merge engine handles duplicate batches gracefully via the
     /// `applied_ops` idempotency table.
+    #[tracing::instrument(skip(self, key_hierarchy, signing_key, ml_dsa_signing_key), fields(sync_id, device_id), err)]
     async fn push_phase(
         &self,
         sync_id: &str,
@@ -923,7 +928,7 @@ impl SyncEngine {
         let sid = sync_id.to_string();
         let batch_ids = tokio::task::spawn_blocking(move || storage.get_unpushed_batch_ids(&sid))
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         if batch_ids.is_empty() {
             return Ok(0);
@@ -943,7 +948,7 @@ impl SyncEngine {
         let current_epoch_i32: i32 =
             tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
                 .await
-                .map_err(|e| CoreError::Storage(e.to_string()))??
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??
                 .map(|m| m.current_epoch)
                 .unwrap_or(0);
 
@@ -955,7 +960,7 @@ impl SyncEngine {
             let bid = batch_id.clone();
             let ops = tokio::task::spawn_blocking(move || storage.load_batch_ops(&bid))
                 .await
-                .map_err(|e| CoreError::Storage(e.to_string()))??;
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
             if ops.is_empty() {
                 continue;
@@ -1041,7 +1046,7 @@ impl SyncEngine {
                 Ok::<_, CoreError>(())
             })
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
             pushed_count += 1;
         }
@@ -1073,7 +1078,7 @@ impl SyncEngine {
         let sid = sync_id.to_string();
         let snapshot_data = tokio::task::spawn_blocking(move || storage.export_snapshot(&sid))
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         // 2. Get last pulled seq as the snapshot point
         let storage = self.storage.clone();
@@ -1083,7 +1088,7 @@ impl SyncEngine {
             Ok::<_, CoreError>(meta.map(|m| m.last_pulled_server_seq).unwrap_or(0))
         })
         .await
-        .map_err(|e| CoreError::Storage(e.to_string()))??;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         // 3. Encrypt with epoch key + snapshot AAD (binds metadata to ciphertext)
         let epoch_key = key_hierarchy
@@ -1221,7 +1226,7 @@ impl SyncEngine {
             Ok::<_, CoreError>(count)
         })
         .await
-        .map_err(|e| CoreError::Storage(e.to_string()))??;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         // 4. Build EntityChange list from the snapshot data so the caller
         //    can emit RemoteChanges to Dart for consumer DB population.
@@ -1238,7 +1243,7 @@ impl SyncEngine {
     fn build_entity_changes_from_snapshot(compressed: &[u8]) -> Result<Vec<EntityChange>> {
         // Decompress zstd
         let json = zstd::decode_all(std::io::Cursor::new(compressed))
-            .map_err(|e| CoreError::Storage(format!("zstd decompress failed: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("zstd decompress failed: {e}"))))?;
 
         // Parse snapshot data
         let snapshot: crate::storage::SnapshotData = serde_json::from_slice(&json)?;
@@ -1285,7 +1290,7 @@ fn pk_from_record(record: &DeviceRecord) -> Result<SenderKeyInfo> {
         .ed25519_public_key
         .clone()
         .try_into()
-        .map_err(|_| CoreError::Storage("invalid ed25519 key length".into()))?;
+        .map_err(|_| CoreError::Storage(StorageError::Logic("invalid ed25519 key length".into())))?;
     Ok(SenderKeyInfo {
         ed25519_pk,
         ml_dsa_65_pk: record.ml_dsa_65_public_key.clone(),
@@ -1352,7 +1357,7 @@ mod tests {
     fn populate_result_error_does_not_set_error_code_for_local_errors() {
         for err in [
             CoreError::Engine("missing epoch key for push epoch 2".into()),
-            CoreError::Storage("tx aborted".into()),
+            CoreError::Storage(StorageError::Logic("tx aborted".into())),
         ] {
             let mut result = SyncResult::default();
             populate_result_error(&mut result, &err);

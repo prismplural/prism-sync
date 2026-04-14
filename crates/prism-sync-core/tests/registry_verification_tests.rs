@@ -1276,7 +1276,7 @@ fn stale_registry_version_rejected() {
 /// bootstrap_from_snapshot returns Err.
 #[tokio::test]
 async fn bootstrap_from_snapshot_fail_closed() {
-    use prism_sync_core::relay::traits::SyncRelay as _;
+    use prism_sync_core::relay::traits::{SnapshotExchange as _, SyncRelay as _};
 
     let key_hierarchy = init_key_hierarchy();
 

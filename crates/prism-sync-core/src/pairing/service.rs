@@ -53,14 +53,14 @@ impl PairingService {
             .get(MIN_SIGNATURE_VERSION_FLOOR_KEY)?
             .map(|bytes| {
                 let value = String::from_utf8(bytes).map_err(|e| {
-                    CoreError::Crypto(prism_sync_crypto::CryptoError::Serialization(format!(
+                    CoreError::Serialization(format!(
                         "invalid UTF-8 in {MIN_SIGNATURE_VERSION_FLOOR_KEY}: {e}"
-                    )))
+                    ))
                 })?;
                 value.parse::<u8>().map_err(|e| {
-                    CoreError::Crypto(prism_sync_crypto::CryptoError::Serialization(format!(
+                    CoreError::Serialization(format!(
                         "invalid integer in {MIN_SIGNATURE_VERSION_FLOOR_KEY}: {e}"
-                    )))
+                    ))
                 })
             })
             .transpose()?
@@ -1051,119 +1051,47 @@ mod tests {
     struct MockRelay;
 
     #[async_trait]
+    impl SyncTransport for MockRelay {
+        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> { unimplemented!() }
+        async fn push_changes(&self, _batch: OutgoingBatch) -> std::result::Result<i64, RelayError> { unimplemented!() }
+        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> { unimplemented!() }
+    }
+    #[async_trait]
+    impl DeviceRegistry for MockRelay {
+        async fn get_registration_nonce(&self) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+            Ok(RegistrationNonceResponse { nonce: uuid::Uuid::new_v4().to_string(), pow_challenge: None, min_signature_version: None })
+        }
+        async fn register_device(&self, _req: RegisterRequest) -> std::result::Result<RegisterResponse, RelayError> {
+            Ok(RegisterResponse { device_session_token: "mock-session-token".to_string(), min_signature_version: None })
+        }
+        async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> { unimplemented!() }
+        async fn revoke_device(&self, _: &str, _: bool, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
+        async fn deregister(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn rotate_ml_dsa(&self, _: &str, _: &[u8], _: u32, _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof, _: Option<&[u8]>) -> std::result::Result<RotateMlDsaResponse, RelayError> { unimplemented!() }
+        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> { Ok(None) }
+    }
+    #[async_trait]
+    impl EpochManagement for MockRelay {
+        async fn post_rekey_artifacts(&self, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
+        async fn get_rekey_artifact(&self, _: i32, _: &str) -> std::result::Result<Option<Vec<u8>>, RelayError> { unimplemented!() }
+    }
+    #[async_trait]
+    impl SnapshotExchange for MockRelay {
+        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> { unimplemented!() }
+        async fn put_snapshot(&self, _: i32, _: i64, _: Vec<u8>, _: Option<u64>, _: Option<String>, _: String) -> std::result::Result<(), RelayError> { unimplemented!() }
+    }
+    #[async_trait]
+    impl MediaRelay for MockRelay {
+        async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> { unimplemented!() }
+    }
+    #[async_trait]
     impl SyncRelay for MockRelay {
-        async fn get_registration_nonce(
-            &self,
-        ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
-            Ok(RegistrationNonceResponse {
-                nonce: uuid::Uuid::new_v4().to_string(),
-                pow_challenge: None,
-                min_signature_version: None,
-            })
-        }
-        async fn register_device(
-            &self,
-            _req: RegisterRequest,
-        ) -> std::result::Result<RegisterResponse, RelayError> {
-            Ok(RegisterResponse {
-                device_session_token: "mock-session-token".to_string(),
-                min_signature_version: None,
-            })
-        }
-        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> {
-            unimplemented!()
-        }
-        async fn push_changes(
-            &self,
-            _batch: OutgoingBatch,
-        ) -> std::result::Result<i64, RelayError> {
-            unimplemented!()
-        }
-        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
-            unimplemented!()
-        }
-        async fn put_snapshot(
-            &self,
-            _epoch: i32,
-            _seq: i64,
-            _data: Vec<u8>,
-            _ttl_secs: Option<u64>,
-            _for_device_id: Option<String>,
-            _sender_device_id: String,
-        ) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
-            unimplemented!()
-        }
-        async fn revoke_device(
-            &self,
-            _device_id: &str,
-            _remote_wipe: bool,
-            _new_epoch: i32,
-            _wrapped_keys: HashMap<String, Vec<u8>>,
-        ) -> std::result::Result<i32, RelayError> {
-            unimplemented!()
-        }
-        async fn post_rekey_artifacts(
-            &self,
-            _epoch: i32,
-            _keys: HashMap<String, Vec<u8>>,
-        ) -> std::result::Result<i32, RelayError> {
-            unimplemented!()
-        }
-        async fn get_rekey_artifact(
-            &self,
-            _epoch: i32,
-            _device_id: &str,
-        ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
-            unimplemented!()
-        }
-        async fn deregister(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
-            unimplemented!()
-        }
-        async fn rotate_ml_dsa(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: u32,
-            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
-            _: Option<&[u8]>,
-        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
-            unimplemented!()
-        }
-        async fn upload_media(
-            &self,
-            _: &str,
-            _: &str,
-            _: Vec<u8>,
-        ) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
-            unimplemented!()
-        }
-        async fn dispose(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-            Ok(None)
-        }
+        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> { unimplemented!() }
+        async fn dispose(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
     }
 
     /// Helper: build a relay-builder closure that always returns a MockRelay.
@@ -1196,134 +1124,60 @@ mod tests {
     }
 
     #[async_trait]
-    impl SyncRelay for BootstrapRegistryRelay {
-        async fn get_registration_nonce(
-            &self,
-        ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
-            Ok(RegistrationNonceResponse {
-                nonce: "bootstrap-nonce".to_string(),
-                pow_challenge: None,
-                min_signature_version: None,
-            })
+    impl SyncTransport for BootstrapRegistryRelay {
+        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> { unimplemented!() }
+        async fn push_changes(&self, _batch: OutgoingBatch) -> std::result::Result<i64, RelayError> { unimplemented!() }
+        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> { unimplemented!() }
+    }
+    #[async_trait]
+    impl DeviceRegistry for BootstrapRegistryRelay {
+        async fn get_registration_nonce(&self) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+            Ok(RegistrationNonceResponse { nonce: "bootstrap-nonce".to_string(), pow_challenge: None, min_signature_version: None })
         }
-        async fn register_device(
-            &self,
-            req: RegisterRequest,
-        ) -> std::result::Result<RegisterResponse, RelayError> {
+        async fn register_device(&self, req: RegisterRequest) -> std::result::Result<RegisterResponse, RelayError> {
             let mut state = self.state.lock().unwrap();
             state.register_requests.push(req.clone());
             state.devices.push(DeviceInfo {
-                device_id: req.device_id,
-                epoch: 0,
-                status: "active".to_string(),
-                ed25519_public_key: req.signing_public_key,
-                x25519_public_key: req.x25519_public_key,
-                ml_dsa_65_public_key: req.ml_dsa_65_public_key,
-                ml_kem_768_public_key: req.ml_kem_768_public_key,
-                x_wing_public_key: req.x_wing_public_key,
-                permission: None,
-                ml_dsa_key_generation: 0,
+                device_id: req.device_id, epoch: 0, status: "active".to_string(),
+                ed25519_public_key: req.signing_public_key, x25519_public_key: req.x25519_public_key,
+                ml_dsa_65_public_key: req.ml_dsa_65_public_key, ml_kem_768_public_key: req.ml_kem_768_public_key,
+                x_wing_public_key: req.x_wing_public_key, permission: None, ml_dsa_key_generation: 0,
             });
-            Ok(RegisterResponse {
-                device_session_token: "mock-session-token".to_string(),
-                min_signature_version: None,
-            })
-        }
-        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> {
-            unimplemented!()
-        }
-        async fn push_changes(
-            &self,
-            _batch: OutgoingBatch,
-        ) -> std::result::Result<i64, RelayError> {
-            unimplemented!()
-        }
-        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
-            unimplemented!()
-        }
-        async fn put_snapshot(
-            &self,
-            _epoch: i32,
-            _seq: i64,
-            _data: Vec<u8>,
-            _ttl_secs: Option<u64>,
-            _for_device_id: Option<String>,
-            _sender_device_id: String,
-        ) -> std::result::Result<(), RelayError> {
-            unimplemented!()
+            Ok(RegisterResponse { device_session_token: "mock-session-token".to_string(), min_signature_version: None })
         }
         async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
             Ok(self.state.lock().unwrap().devices.clone())
         }
-        async fn revoke_device(
-            &self,
-            _device_id: &str,
-            _remote_wipe: bool,
-            _new_epoch: i32,
-            _wrapped_keys: HashMap<String, Vec<u8>>,
-        ) -> std::result::Result<i32, RelayError> {
-            unimplemented!()
-        }
-        async fn post_rekey_artifacts(
-            &self,
-            epoch: i32,
-            keys: HashMap<String, Vec<u8>>,
-        ) -> std::result::Result<i32, RelayError> {
+        async fn revoke_device(&self, _: &str, _: bool, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
+        async fn deregister(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn rotate_ml_dsa(&self, _: &str, _: &[u8], _: u32, _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof, _: Option<&[u8]>) -> std::result::Result<RotateMlDsaResponse, RelayError> { unimplemented!() }
+        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> { Ok(None) }
+    }
+    #[async_trait]
+    impl EpochManagement for BootstrapRegistryRelay {
+        async fn post_rekey_artifacts(&self, epoch: i32, keys: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> {
             self.state.lock().unwrap().rekey_posts = Some((epoch, keys));
             Ok(epoch)
         }
-        async fn get_rekey_artifact(
-            &self,
-            _epoch: i32,
-            _device_id: &str,
-        ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
-            Ok(None)
-        }
-        async fn deregister(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
-            unimplemented!()
-        }
-        async fn rotate_ml_dsa(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: u32,
-            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
-            _: Option<&[u8]>,
-        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
-            unimplemented!()
-        }
-        async fn upload_media(
-            &self,
-            _: &str,
-            _: &str,
-            _: Vec<u8>,
-        ) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
-            unimplemented!()
-        }
-        async fn dispose(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-            Ok(None)
-        }
+        async fn get_rekey_artifact(&self, _: i32, _: &str) -> std::result::Result<Option<Vec<u8>>, RelayError> { Ok(None) }
+    }
+    #[async_trait]
+    impl SnapshotExchange for BootstrapRegistryRelay {
+        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> { unimplemented!() }
+        async fn put_snapshot(&self, _: i32, _: i64, _: Vec<u8>, _: Option<u64>, _: Option<String>, _: String) -> std::result::Result<(), RelayError> { unimplemented!() }
+    }
+    #[async_trait]
+    impl MediaRelay for BootstrapRegistryRelay {
+        async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> { unimplemented!() }
+    }
+    #[async_trait]
+    impl SyncRelay for BootstrapRegistryRelay {
+        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> { unimplemented!() }
+        async fn dispose(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1976,119 +1830,48 @@ mod tests {
         }
 
         #[async_trait]
-        impl SyncRelay for CapturingRelay {
-            async fn get_registration_nonce(
-                &self,
-            ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
-                Ok(RegistrationNonceResponse {
-                    nonce: "test-nonce-12345".to_string(),
-                    pow_challenge: None,
-                    min_signature_version: None,
-                })
+        impl SyncTransport for CapturingRelay {
+            async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> { unimplemented!() }
+            async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> { unimplemented!() }
+            async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> { unimplemented!() }
+        }
+        #[async_trait]
+        impl DeviceRegistry for CapturingRelay {
+            async fn get_registration_nonce(&self) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+                Ok(RegistrationNonceResponse { nonce: "test-nonce-12345".to_string(), pow_challenge: None, min_signature_version: None })
             }
-            async fn register_device(
-                &self,
-                req: RegisterRequest,
-            ) -> std::result::Result<RegisterResponse, RelayError> {
+            async fn register_device(&self, req: RegisterRequest) -> std::result::Result<RegisterResponse, RelayError> {
                 *self.captured_req.lock().unwrap() = Some(req);
-                Ok(RegisterResponse {
-                    device_session_token: "mock-token".to_string(),
-                    min_signature_version: None,
-                })
+                Ok(RegisterResponse { device_session_token: "mock-token".to_string(), min_signature_version: None })
             }
-            async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
-                unimplemented!()
-            }
-            async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> {
-                unimplemented!()
-            }
-            async fn get_snapshot(
-                &self,
-            ) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
-                unimplemented!()
-            }
-            async fn put_snapshot(
-                &self,
-                _: i32,
-                _: i64,
-                _: Vec<u8>,
-                _: Option<u64>,
-                _: Option<String>,
-                _: String,
-            ) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
-                unimplemented!()
-            }
-            async fn revoke_device(
-                &self,
-                _: &str,
-                _: bool,
-                _: i32,
-                _: HashMap<String, Vec<u8>>,
-            ) -> std::result::Result<i32, RelayError> {
-                unimplemented!()
-            }
-            async fn post_rekey_artifacts(
-                &self,
-                _: i32,
-                _: HashMap<String, Vec<u8>>,
-            ) -> std::result::Result<i32, RelayError> {
-                unimplemented!()
-            }
-            async fn get_rekey_artifact(
-                &self,
-                _: i32,
-                _: &str,
-            ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
-                unimplemented!()
-            }
-            async fn deregister(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
-                unimplemented!()
-            }
-            async fn rotate_ml_dsa(
-                &self,
-                _: &str,
-                _: &[u8],
-                _: u32,
-                _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
-                _: Option<&[u8]>,
-            ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
-                unimplemented!()
-            }
-            async fn upload_media(
-                &self,
-                _: &str,
-                _: &str,
-                _: Vec<u8>,
-            ) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
-                unimplemented!()
-            }
-            async fn dispose(&self) -> std::result::Result<(), RelayError> {
-                unimplemented!()
-            }
-            async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-                Ok(None)
-            }
+            async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> { unimplemented!() }
+            async fn revoke_device(&self, _: &str, _: bool, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
+            async fn deregister(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+            async fn rotate_ml_dsa(&self, _: &str, _: &[u8], _: u32, _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof, _: Option<&[u8]>) -> std::result::Result<RotateMlDsaResponse, RelayError> { unimplemented!() }
+            async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> { Ok(None) }
+        }
+        #[async_trait]
+        impl EpochManagement for CapturingRelay {
+            async fn post_rekey_artifacts(&self, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
+            async fn get_rekey_artifact(&self, _: i32, _: &str) -> std::result::Result<Option<Vec<u8>>, RelayError> { unimplemented!() }
+        }
+        #[async_trait]
+        impl SnapshotExchange for CapturingRelay {
+            async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> { unimplemented!() }
+            async fn put_snapshot(&self, _: i32, _: i64, _: Vec<u8>, _: Option<u64>, _: Option<String>, _: String) -> std::result::Result<(), RelayError> { unimplemented!() }
+        }
+        #[async_trait]
+        impl MediaRelay for CapturingRelay {
+            async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> std::result::Result<(), RelayError> { unimplemented!() }
+            async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> { unimplemented!() }
+        }
+        #[async_trait]
+        impl SyncRelay for CapturingRelay {
+            async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+            async fn connect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+            async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+            fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> { unimplemented!() }
+            async fn dispose(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
         }
 
         let relay = Arc::new(CapturingRelay {

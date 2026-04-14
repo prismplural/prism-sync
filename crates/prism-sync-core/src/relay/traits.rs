@@ -408,14 +408,27 @@ pub struct SignedRegistryResponse {
     pub artifact_kind: String,
 }
 
-/// Transport layer for communicating with the relay server.
-///
-/// Ships with `ServerRelay` (HTTP + WebSocket). Consumers can mock
-/// or replace for testing or alternative transports.
-///
-/// Ported from Dart `lib/core/sync/sync_relay.dart`.
+// ── Sub-traits ──
+//
+// The `SyncRelay` supertrait composes these focused sub-traits so that
+// consumers can depend on only the slice of relay functionality they need.
+
+/// Core sync data transport: pull, push, and acknowledge batches.
 #[async_trait]
-pub trait SyncRelay: Send + Sync {
+pub trait SyncTransport: Send + Sync {
+    /// Pull encrypted batches since a given server sequence number.
+    async fn pull_changes(&self, since: i64) -> std::result::Result<PullResponse, RelayError>;
+
+    /// Push an encrypted batch. Returns the server-assigned sequence number.
+    async fn push_changes(&self, batch: OutgoingBatch) -> std::result::Result<i64, RelayError>;
+
+    /// Acknowledge receipt of server_seq (allows relay to prune).
+    async fn ack(&self, server_seq: i64) -> std::result::Result<(), RelayError>;
+}
+
+/// Device lifecycle: registration, listing, revocation, deregistration, and key rotation.
+#[async_trait]
+pub trait DeviceRegistry: Send + Sync {
     /// Fetch a single-use registration nonce from the relay.
     ///
     /// The nonce is cryptographically random, short-lived (60s), and consumed
@@ -432,12 +445,69 @@ pub trait SyncRelay: Send + Sync {
         req: RegisterRequest,
     ) -> std::result::Result<RegisterResponse, RelayError>;
 
-    /// Pull encrypted batches since a given server sequence number.
-    async fn pull_changes(&self, since: i64) -> std::result::Result<PullResponse, RelayError>;
+    /// List all devices in this sync group.
+    async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError>;
 
-    /// Push an encrypted batch. Returns the server-assigned sequence number.
-    async fn push_changes(&self, batch: OutgoingBatch) -> std::result::Result<i64, RelayError>;
+    /// Atomically revoke a device and rotate to `new_epoch`.
+    ///
+    /// `wrapped_keys` must contain wrapped epoch-key artifacts for all
+    /// surviving devices.
+    async fn revoke_device(
+        &self,
+        device_id: &str,
+        remote_wipe: bool,
+        new_epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> std::result::Result<i32, RelayError>;
 
+    /// Self-deregister this device from the sync group.
+    async fn deregister(&self) -> std::result::Result<(), RelayError>;
+
+    /// Rotate this device's ML-DSA key on the relay.
+    ///
+    /// Sends the new public key, the target generation number, and a
+    /// continuity proof (cross-signatures between old and new keys) so the
+    /// relay can verify ownership continuity before accepting the rotation.
+    async fn rotate_ml_dsa(
+        &self,
+        device_id: &str,
+        new_ml_dsa_pk: &[u8],
+        new_generation: u32,
+        proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        signed_registry_snapshot: Option<&[u8]>,
+    ) -> std::result::Result<RotateMlDsaResponse, RelayError>;
+
+    /// Fetch the latest signed registry artifact for this sync group.
+    ///
+    /// Returns the signed snapshot blob that clients can verify independently
+    /// of the relay. Returns `Ok(None)` if no artifact exists (e.g., single-
+    /// device groups).
+    async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError>;
+}
+
+/// Epoch key rotation: posting and retrieving per-device wrapped epoch keys.
+#[async_trait]
+pub trait EpochManagement: Send + Sync {
+    /// Standalone non-revoking epoch rotation.
+    ///
+    /// Posts per-device wrapped epoch-key artifacts for `epoch`.
+    async fn post_rekey_artifacts(
+        &self,
+        epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> std::result::Result<i32, RelayError>;
+
+    /// Fetch this device's wrapped epoch key for a given epoch.
+    async fn get_rekey_artifact(
+        &self,
+        epoch: i32,
+        device_id: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, RelayError>;
+}
+
+/// Snapshot exchange: uploading and downloading full-state snapshots for bootstrap.
+#[async_trait]
+pub trait SnapshotExchange: Send + Sync {
     /// Download full snapshot for first-sync bootstrap.
     async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError>;
 
@@ -455,70 +525,11 @@ pub trait SyncRelay: Send + Sync {
         for_device_id: Option<String>,
         sender_device_id: String,
     ) -> std::result::Result<(), RelayError>;
+}
 
-    /// List all devices in this sync group.
-    async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError>;
-
-    /// Atomically revoke a device and rotate to `new_epoch`.
-    ///
-    /// `wrapped_keys` must contain wrapped epoch-key artifacts for all
-    /// surviving devices.
-    async fn revoke_device(
-        &self,
-        device_id: &str,
-        remote_wipe: bool,
-        new_epoch: i32,
-        wrapped_keys: HashMap<String, Vec<u8>>,
-    ) -> std::result::Result<i32, RelayError>;
-
-    /// Standalone non-revoking epoch rotation.
-    ///
-    /// Posts per-device wrapped epoch-key artifacts for `epoch`.
-    async fn post_rekey_artifacts(
-        &self,
-        epoch: i32,
-        wrapped_keys: HashMap<String, Vec<u8>>,
-    ) -> std::result::Result<i32, RelayError>;
-
-    /// Fetch this device's wrapped epoch key for a given epoch.
-    async fn get_rekey_artifact(
-        &self,
-        epoch: i32,
-        device_id: &str,
-    ) -> std::result::Result<Option<Vec<u8>>, RelayError>;
-
-    /// Self-deregister this device from the sync group.
-    async fn deregister(&self) -> std::result::Result<(), RelayError>;
-
-    /// Delete the entire sync group and all data on the relay.
-    async fn delete_sync_group(&self) -> std::result::Result<(), RelayError>;
-
-    /// Acknowledge receipt of server_seq (allows relay to prune).
-    async fn ack(&self, server_seq: i64) -> std::result::Result<(), RelayError>;
-
-    /// Connect WebSocket for real-time notifications.
-    async fn connect_websocket(&self) -> std::result::Result<(), RelayError>;
-
-    /// Disconnect WebSocket.
-    async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError>;
-
-    /// Stream of real-time notifications from the relay.
-    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>>;
-
-    /// Rotate this device's ML-DSA key on the relay.
-    ///
-    /// Sends the new public key, the target generation number, and a
-    /// continuity proof (cross-signatures between old and new keys) so the
-    /// relay can verify ownership continuity before accepting the rotation.
-    async fn rotate_ml_dsa(
-        &self,
-        device_id: &str,
-        new_ml_dsa_pk: &[u8],
-        new_generation: u32,
-        proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
-        signed_registry_snapshot: Option<&[u8]>,
-    ) -> std::result::Result<RotateMlDsaResponse, RelayError>;
-
+/// Media upload and download.
+#[async_trait]
+pub trait MediaRelay: Send + Sync {
     /// Upload an encrypted media blob to the relay.
     async fn upload_media(
         &self,
@@ -532,13 +543,34 @@ pub trait SyncRelay: Send + Sync {
         &self,
         media_id: &str,
     ) -> std::result::Result<Vec<u8>, RelayError>;
+}
 
-    /// Fetch the latest signed registry artifact for this sync group.
-    ///
-    /// Returns the signed snapshot blob that clients can verify independently
-    /// of the relay. Returns `Ok(None)` if no artifact exists (e.g., single-
-    /// device groups).
-    async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError>;
+/// Transport layer for communicating with the relay server.
+///
+/// Composes all sub-traits ([`SyncTransport`], [`DeviceRegistry`],
+/// [`EpochManagement`], [`SnapshotExchange`], [`MediaRelay`]) plus
+/// WebSocket lifecycle and group management methods that don't fit
+/// a single sub-trait.
+///
+/// Ships with `ServerRelay` (HTTP + WebSocket). Consumers can mock
+/// or replace for testing or alternative transports.
+///
+/// Ported from Dart `lib/core/sync/sync_relay.dart`.
+#[async_trait]
+pub trait SyncRelay:
+    SyncTransport + DeviceRegistry + EpochManagement + SnapshotExchange + MediaRelay
+{
+    /// Delete the entire sync group and all data on the relay.
+    async fn delete_sync_group(&self) -> std::result::Result<(), RelayError>;
+
+    /// Connect WebSocket for real-time notifications.
+    async fn connect_websocket(&self) -> std::result::Result<(), RelayError>;
+
+    /// Disconnect WebSocket.
+    async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError>;
+
+    /// Stream of real-time notifications from the relay.
+    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>>;
 
     /// Dispose of all resources.
     async fn dispose(&self) -> std::result::Result<(), RelayError>;

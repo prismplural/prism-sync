@@ -20,7 +20,7 @@ use ed25519_dalek::SigningKey;
 
 use prism_sync_core::batch_signature;
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
-use prism_sync_core::relay::traits::{SignedBatchEnvelope, SyncRelay};
+use prism_sync_core::relay::traits::{SignedBatchEnvelope, SnapshotExchange, SyncRelay};
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;

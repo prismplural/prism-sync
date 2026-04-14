@@ -21,11 +21,11 @@ pub enum CryptoError {
     #[error("invalid mnemonic: {0}")]
     InvalidMnemonic(String),
 
-    #[error("hex decode error: {0}")]
-    HexDecode(String),
+    #[error("hex decode failed: {0}")]
+    HexDecode(#[from] hex::FromHexError),
 
-    #[error("serialization error: {0}")]
-    Serialization(String),
+    #[error("serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
 
     #[error("invalid input: {0}")]
     InvalidInput(String),

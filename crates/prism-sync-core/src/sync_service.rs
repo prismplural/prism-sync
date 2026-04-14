@@ -23,6 +23,7 @@ use crate::client::PrismSync;
 use crate::engine::{SyncEngine, SyncResult};
 use crate::epoch::EpochManager;
 use crate::error::{CoreError, RelayErrorCategory, Result};
+use crate::storage::StorageError;
 use crate::events::{ChangeSet, EntityChange, SyncError, SyncErrorKind, SyncEvent};
 use crate::relay::traits::SyncNotification;
 use crate::relay::SyncRelay;
@@ -264,6 +265,7 @@ pub fn spawn_notification_handler(
 /// Logs warnings on failure but never panics or crashes — the device will
 /// be unable to sync at the new epoch until the key is recovered through
 /// another mechanism (e.g. manual unlock or re-pairing).
+#[tracing::instrument(skip(inner, relay))]
 async fn recover_epoch_key(
     new_epoch: u32,
     my_device_id: &str,
@@ -574,11 +576,11 @@ impl SyncService {
         let engine = self
             .engine
             .as_ref()
-            .ok_or_else(|| CoreError::Storage("sync engine not configured".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync engine not configured".into())))?;
         let sync_id = self
             .sync_id
             .as_ref()
-            .ok_or_else(|| CoreError::Storage("sync_id not set".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync_id not set".into())))?;
         engine
             .upload_pairing_snapshot(
                 sync_id,
@@ -606,11 +608,11 @@ impl SyncService {
         let engine = self
             .engine
             .as_ref()
-            .ok_or_else(|| CoreError::Storage("sync engine not configured".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync engine not configured".into())))?;
         let sync_id = self
             .sync_id
             .as_ref()
-            .ok_or_else(|| CoreError::Storage("sync_id not set".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync_id not set".into())))?;
 
         let (count, entity_changes) = engine
             .bootstrap_from_snapshot(sync_id, key_hierarchy)
@@ -645,6 +647,7 @@ impl SyncService {
     /// etc.) without involving the outer auto-sync driver. Sustained
     /// outages escalate to the driver's exponential backoff via the
     /// returned `Err`.
+    #[tracing::instrument(skip(self, key_hierarchy, signing_key, ml_dsa_signing_key), err)]
     pub async fn sync_now(
         &mut self,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
@@ -656,11 +659,11 @@ impl SyncService {
         let engine = self
             .engine
             .as_ref()
-            .ok_or_else(|| CoreError::Storage("sync engine not configured".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync engine not configured".into())))?;
         let sync_id = self
             .sync_id
             .as_ref()
-            .ok_or_else(|| CoreError::Storage("sync_id not set".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync_id not set".into())))?;
 
         let _ = self.event_tx.send(SyncEvent::SyncStarted);
 
@@ -1174,7 +1177,7 @@ mod tests {
         let engine_err = CoreError::Engine("missing epoch key".into());
         assert_eq!(relay_error_details(&engine_err), (None, None));
 
-        let storage_err = CoreError::Storage("tx aborted".into());
+        let storage_err = CoreError::Storage(StorageError::Logic("tx aborted".into()));
         assert_eq!(relay_error_details(&storage_err), (None, None));
     }
 
@@ -1200,7 +1203,7 @@ mod tests {
             error: Some("simulated hard failure".into()),
             ..SyncResult::default()
         };
-        let err = CoreError::Storage("simulated hard failure".into());
+        let err = CoreError::Storage(StorageError::Logic("simulated hard failure".into()));
         let ret = service.emit_final_failure(
             result,
             SyncErrorKind::Protocol,

@@ -25,7 +25,7 @@ use crate::op_emitter::OpEmitter;
 use crate::relay::SyncRelay;
 use crate::schema::{SyncSchema, SyncValue};
 use crate::secure_store::SecureStore;
-use crate::storage::SyncStorage;
+use crate::storage::{StorageError, SyncStorage};
 use crate::sync_service::{AutoSyncConfig, SyncService};
 use crate::syncable_entity::SyncableEntity;
 use prism_sync_crypto::{mnemonic, DeviceSecret, KeyHierarchy};
@@ -118,18 +118,18 @@ impl PrismSyncBuilder {
             .ok_or_else(|| CoreError::Schema("schema is required".into()))?;
         let storage = self
             .storage
-            .ok_or_else(|| CoreError::Storage("storage is required".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("storage is required".into())))?;
         let secure_store = self
             .secure_store
-            .ok_or_else(|| CoreError::Storage("secure_store is required".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("secure_store is required".into())))?;
 
         // Validate relay URL transport security
         if let Some(ref url) = self.relay_url {
             if !self.allow_insecure && !url.starts_with("https://") && !url.starts_with("wss://") {
-                return Err(CoreError::Storage(
+                return Err(CoreError::Storage(StorageError::Logic(
                     "relay URL must use HTTPS/WSS (use allow_insecure_transport() for development)"
                         .into(),
-                ));
+                )));
             }
         }
 
@@ -233,11 +233,11 @@ impl PrismSync {
         let wrapped_dek = self
             .secure_store
             .get("wrapped_dek")?
-            .ok_or_else(|| CoreError::Storage("no wrapped DEK found".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("no wrapped DEK found".into())))?;
         let salt = self
             .secure_store
             .get("dek_salt")?
-            .ok_or_else(|| CoreError::Storage("no salt found".into()))?;
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("no salt found".into())))?;
 
         self.key_hierarchy
             .unlock(password, secret_key, &wrapped_dek, &salt)
@@ -759,7 +759,7 @@ impl PrismSync {
         let sid = sync_id.clone();
         let meta = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
         let current_epoch = meta.map(|m| m.current_epoch).unwrap_or(0);
         let new_epoch = (current_epoch + 1) as u32;
 
@@ -791,11 +791,11 @@ impl PrismSync {
             let encoded = STANDARD.encode(epoch_key);
             self.secure_store()
                 .set(&format!("epoch_key_{committed_epoch}"), encoded.as_bytes())
-                .map_err(|e| CoreError::Storage(format!("failed to persist epoch key: {e}")))?;
+                .map_err(|e| CoreError::Storage(StorageError::Logic(format!("failed to persist epoch key: {e}"))))?;
         }
         self.secure_store()
             .set("epoch", committed_epoch.to_string().as_bytes())
-            .map_err(|e| CoreError::Storage(format!("failed to persist epoch: {e}")))?;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("failed to persist epoch: {e}"))))?;
 
         // 4. Update local epoch in sync metadata
         let storage = self.storage().clone();
@@ -807,7 +807,7 @@ impl PrismSync {
             tx.commit()
         })
         .await
-        .map_err(|e| CoreError::Storage(e.to_string()))??;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         // 5. Advance runtime epoch so new mutations use the rotated epoch
         self.advance_epoch(committed_epoch as i32);
@@ -982,7 +982,20 @@ mod tests {
     struct NoopRelay;
 
     #[async_trait]
-    impl SyncRelay for NoopRelay {
+    impl SyncTransport for NoopRelay {
+        async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> {
+            unimplemented!()
+        }
+        async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl DeviceRegistry for NoopRelay {
         async fn get_registration_nonce(
             &self,
         ) -> std::result::Result<crate::relay::traits::RegistrationNonceResponse, RelayError>
@@ -999,26 +1012,6 @@ mod tests {
         ) -> std::result::Result<RegisterResponse, RelayError> {
             unimplemented!()
         }
-        async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
-            unimplemented!()
-        }
-        async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> {
-            unimplemented!()
-        }
-        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
-            unimplemented!()
-        }
-        async fn put_snapshot(
-            &self,
-            _: i32,
-            _: i64,
-            _: Vec<u8>,
-            _: Option<u64>,
-            _: Option<String>,
-            _: String,
-        ) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
         async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
             unimplemented!()
         }
@@ -1031,6 +1024,26 @@ mod tests {
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
+        async fn deregister(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn rotate_ml_dsa(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            _: Option<&[u8]>,
+        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl EpochManagement for NoopRelay {
         async fn post_rekey_artifacts(
             &self,
             _: i32,
@@ -1045,34 +1058,28 @@ mod tests {
         ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
             unimplemented!()
         }
-        async fn deregister(&self) -> std::result::Result<(), RelayError> {
+    }
+
+    #[async_trait]
+    impl SnapshotExchange for NoopRelay {
+        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
             unimplemented!()
         }
-        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
-            unimplemented!()
-        }
-        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
-            unimplemented!()
-        }
-        async fn rotate_ml_dsa(
+        async fn put_snapshot(
             &self,
-            _: &str,
-            _: &[u8],
-            _: u32,
-            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
-            _: Option<&[u8]>,
-        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+            _: i32,
+            _: i64,
+            _: Vec<u8>,
+            _: Option<u64>,
+            _: Option<String>,
+            _: String,
+        ) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
+    }
+
+    #[async_trait]
+    impl MediaRelay for NoopRelay {
         async fn upload_media(
             &self,
             _: &str,
@@ -1084,11 +1091,24 @@ mod tests {
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
             unimplemented!()
         }
-        async fn dispose(&self) -> std::result::Result<(), RelayError> {
+    }
+
+    #[async_trait]
+    impl SyncRelay for NoopRelay {
+        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
-        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-            Ok(None)
+        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+            unimplemented!()
+        }
+        async fn dispose(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
         }
     }
 

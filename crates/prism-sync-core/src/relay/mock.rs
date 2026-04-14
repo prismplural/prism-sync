@@ -8,9 +8,10 @@ use futures_util::Stream;
 use tokio::sync::broadcast;
 
 use super::traits::{
-    DeviceInfo, OutgoingBatch, PullResponse, ReceivedBatch, RegisterRequest, RegisterResponse,
-    RegistrationNonceResponse, RelayError, RotateMlDsaResponse, SignedBatchEnvelope,
-    SignedRegistryResponse, SnapshotResponse, SyncNotification, SyncRelay,
+    DeviceInfo, DeviceRegistry, EpochManagement, MediaRelay, OutgoingBatch, PullResponse,
+    ReceivedBatch, RegisterRequest, RegisterResponse, RegistrationNonceResponse, RelayError,
+    RotateMlDsaResponse, SignedBatchEnvelope, SignedRegistryResponse, SnapshotExchange,
+    SnapshotResponse, SyncNotification, SyncRelay, SyncTransport,
 };
 
 /// In-memory mock implementation of [`SyncRelay`] for testing.
@@ -215,23 +216,7 @@ impl Default for MockRelay {
 }
 
 #[async_trait]
-impl SyncRelay for MockRelay {
-    async fn get_registration_nonce(&self) -> Result<RegistrationNonceResponse, RelayError> {
-        Ok(RegistrationNonceResponse {
-            nonce: uuid::Uuid::new_v4().to_string(),
-            pow_challenge: None,
-            min_signature_version: None,
-        })
-    }
-
-    async fn register_device(&self, _req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
-        self.state.lock().unwrap().registered = true;
-        Ok(RegisterResponse {
-            device_session_token: "mock-session-token".to_string(),
-            min_signature_version: None,
-        })
-    }
-
+impl SyncTransport for MockRelay {
     async fn pull_changes(&self, since: i64) -> Result<PullResponse, RelayError> {
         {
             let mut guard = self.state.lock().unwrap();
@@ -290,28 +275,32 @@ impl SyncRelay for MockRelay {
         Ok(seq)
     }
 
-    async fn get_snapshot(&self) -> Result<Option<SnapshotResponse>, RelayError> {
-        Ok(self.state.lock().unwrap().snapshot.clone())
+    async fn ack(&self, server_seq: i64) -> Result<(), RelayError> {
+        let mut state = self.state.lock().unwrap();
+        state.ack_calls.push(server_seq);
+        if let Some(err_msg) = state.ack_error.take() {
+            return Err(RelayError::Network { message: err_msg });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DeviceRegistry for MockRelay {
+    async fn get_registration_nonce(&self) -> Result<RegistrationNonceResponse, RelayError> {
+        Ok(RegistrationNonceResponse {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            pow_challenge: None,
+            min_signature_version: None,
+        })
     }
 
-    async fn put_snapshot(
-        &self,
-        epoch: i32,
-        server_seq_at: i64,
-        data: Vec<u8>,
-        _ttl_secs: Option<u64>,
-        for_device_id: Option<String>,
-        sender_device_id: String,
-    ) -> Result<(), RelayError> {
-        let mut state = self.state.lock().unwrap();
-        state.snapshot = Some(SnapshotResponse {
-            epoch,
-            server_seq_at,
-            data,
-            sender_device_id,
-        });
-        state.snapshot_target_device_id = for_device_id;
-        Ok(())
+    async fn register_device(&self, _req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
+        self.state.lock().unwrap().registered = true;
+        Ok(RegisterResponse {
+            device_session_token: "mock-session-token".to_string(),
+            min_signature_version: None,
+        })
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
@@ -331,54 +320,8 @@ impl SyncRelay for MockRelay {
         Ok(epoch)
     }
 
-    async fn post_rekey_artifacts(
-        &self,
-        epoch: i32,
-        _wrapped_keys: HashMap<String, Vec<u8>>,
-    ) -> Result<i32, RelayError> {
-        Ok(epoch)
-    }
-
-    async fn get_rekey_artifact(
-        &self,
-        _epoch: i32,
-        _device_id: &str,
-    ) -> Result<Option<Vec<u8>>, RelayError> {
-        Ok(None)
-    }
-
     async fn deregister(&self) -> Result<(), RelayError> {
         Ok(())
-    }
-
-    async fn delete_sync_group(&self) -> Result<(), RelayError> {
-        Ok(())
-    }
-
-    async fn ack(&self, server_seq: i64) -> Result<(), RelayError> {
-        let mut state = self.state.lock().unwrap();
-        state.ack_calls.push(server_seq);
-        if let Some(err_msg) = state.ack_error.take() {
-            return Err(RelayError::Network { message: err_msg });
-        }
-        Ok(())
-    }
-
-    async fn connect_websocket(&self) -> Result<(), RelayError> {
-        Ok(())
-    }
-
-    async fn disconnect_websocket(&self) -> Result<(), RelayError> {
-        Ok(())
-    }
-
-    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
-        use futures_util::StreamExt;
-        let rx = self.notification_tx.subscribe();
-        Box::pin(
-            tokio_stream::wrappers::BroadcastStream::new(rx)
-                .filter_map(|r: Result<SyncNotification, _>| async move { r.ok() }),
-        )
     }
 
     async fn rotate_ml_dsa(
@@ -426,6 +369,59 @@ impl SyncRelay for MockRelay {
         })
     }
 
+    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
+        Ok(self.state.lock().unwrap().signed_registry.clone())
+    }
+}
+
+#[async_trait]
+impl EpochManagement for MockRelay {
+    async fn post_rekey_artifacts(
+        &self,
+        epoch: i32,
+        _wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> Result<i32, RelayError> {
+        Ok(epoch)
+    }
+
+    async fn get_rekey_artifact(
+        &self,
+        _epoch: i32,
+        _device_id: &str,
+    ) -> Result<Option<Vec<u8>>, RelayError> {
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl SnapshotExchange for MockRelay {
+    async fn get_snapshot(&self) -> Result<Option<SnapshotResponse>, RelayError> {
+        Ok(self.state.lock().unwrap().snapshot.clone())
+    }
+
+    async fn put_snapshot(
+        &self,
+        epoch: i32,
+        server_seq_at: i64,
+        data: Vec<u8>,
+        _ttl_secs: Option<u64>,
+        for_device_id: Option<String>,
+        sender_device_id: String,
+    ) -> Result<(), RelayError> {
+        let mut state = self.state.lock().unwrap();
+        state.snapshot = Some(SnapshotResponse {
+            epoch,
+            server_seq_at,
+            data,
+            sender_device_id,
+        });
+        state.snapshot_target_device_id = for_device_id;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MediaRelay for MockRelay {
     async fn upload_media(
         &self,
         media_id: &str,
@@ -452,9 +448,29 @@ impl SyncRelay for MockRelay {
                 message: "Media not found".into(),
             })
     }
+}
 
-    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
-        Ok(self.state.lock().unwrap().signed_registry.clone())
+#[async_trait]
+impl SyncRelay for MockRelay {
+    async fn delete_sync_group(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    async fn connect_websocket(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    async fn disconnect_websocket(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+        use futures_util::StreamExt;
+        let rx = self.notification_tx.subscribe();
+        Box::pin(
+            tokio_stream::wrappers::BroadcastStream::new(rx)
+                .filter_map(|r: Result<SyncNotification, _>| async move { r.ok() }),
+        )
     }
 
     async fn dispose(&self) -> Result<(), RelayError> {

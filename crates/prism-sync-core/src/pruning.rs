@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::error::{CoreError, Result};
-use crate::storage::SyncStorage;
+use crate::storage::{StorageError, SyncStorage};
 use crate::syncable_entity::SyncableEntity;
 
 /// Result of a single pruning pass.
@@ -48,7 +48,7 @@ impl TombstonePruner {
             storage_clone.list_prunable_tombstones(&sid, min_acked_seq, max_rows)
         })
         .await
-        .map_err(|e| CoreError::Storage(e.to_string()))??;
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         // Phase 1a: Hard-delete consumer entities (async, must be outside spawn_blocking)
         let mut deleted_tombstones: Vec<(String, String)> = Vec::new();
@@ -83,7 +83,7 @@ impl TombstonePruner {
                 tx.commit()
             })
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
             result.field_versions_pruned = count;
         }
 
@@ -100,7 +100,7 @@ impl TombstonePruner {
                 Ok::<_, crate::error::CoreError>(pruned)
             })
             .await
-            .map_err(|e| CoreError::Storage(e.to_string()))??;
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
             result.applied_ops_pruned = pruned;
         }
 

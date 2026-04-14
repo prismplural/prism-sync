@@ -1,4 +1,5 @@
 use crate::relay::traits::RelayError;
+use crate::storage::StorageError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,10 +15,7 @@ pub enum CoreError {
     },
 
     #[error("storage error: {0}")]
-    Storage(String),
-
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Storage(#[from] StorageError),
 
     #[error("schema error: {0}")]
     Schema(String),
@@ -148,6 +146,12 @@ impl CoreError {
 impl From<RelayError> for CoreError {
     fn from(error: RelayError) -> Self {
         Self::from_relay(error)
+    }
+}
+
+impl From<rusqlite::Error> for CoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(StorageError::Sqlite(error))
     }
 }
 

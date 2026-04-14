@@ -287,62 +287,7 @@ fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
 }
 
 #[async_trait]
-impl SyncRelay for ServerRelay {
-    async fn get_registration_nonce(&self) -> Result<RegistrationNonceResponse, RelayError> {
-        let url = format!("{}/register-nonce", self.base_path());
-        debug!("get_registration_nonce");
-
-        let mut req = self.client.get(&url).timeout(self.request_timeout);
-        if let Some(token) = &self.registration_token {
-            req = req.header("X-Registration-Token", token);
-        }
-        let resp = req.send().await.map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        resp.json::<RegistrationNonceResponse>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse nonce response: {e}"),
-            })
-    }
-
-    async fn register_device(&self, req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
-        let url = format!("{}/register", self.base_path());
-
-        let body = build_register_device_body(&req);
-
-        let mut req = self
-            .apply_auth(self.client.post(&url))
-            .json(&body)
-            .timeout(self.request_timeout);
-        if let Some(token) = &self.registration_token {
-            req = req.header("X-Registration-Token", token);
-        }
-        let resp = req.send().await.map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            if status == 409 {
-                return Err(RelayError::Protocol {
-                    message: format!("HTTP 409: {body_text}"),
-                });
-            }
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        resp.json::<RegisterResponse>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse register response: {e}"),
-            })
-    }
-
+impl SyncTransport for ServerRelay {
     async fn pull_changes(&self, since: i64) -> Result<PullResponse, RelayError> {
         let url = format!("{}/changes?since={since}", self.base_path());
         debug!("pull_changes since={since}");
@@ -432,6 +377,356 @@ impl SyncRelay for ServerRelay {
         Ok(json["server_seq"].as_i64().unwrap_or(0))
     }
 
+    async fn ack(&self, server_seq: i64) -> Result<(), RelayError> {
+        let url = format!("{}/ack", self.base_path());
+        let path = self.canonical_path("/ack");
+        debug!("ack server_seq={server_seq}");
+
+        let body_bytes = serde_json::to_vec(&serde_json::json!({ "server_seq": server_seq }))
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to serialize ack body: {e}"),
+            })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DeviceRegistry for ServerRelay {
+    async fn get_registration_nonce(&self) -> Result<RegistrationNonceResponse, RelayError> {
+        let url = format!("{}/register-nonce", self.base_path());
+        debug!("get_registration_nonce");
+
+        let mut req = self.client.get(&url).timeout(self.request_timeout);
+        if let Some(token) = &self.registration_token {
+            req = req.header("X-Registration-Token", token);
+        }
+        let resp = req.send().await.map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        resp.json::<RegistrationNonceResponse>()
+            .await
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse nonce response: {e}"),
+            })
+    }
+
+    async fn register_device(&self, req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
+        let url = format!("{}/register", self.base_path());
+
+        let body = build_register_device_body(&req);
+
+        let mut req = self
+            .apply_auth(self.client.post(&url))
+            .json(&body)
+            .timeout(self.request_timeout);
+        if let Some(token) = &self.registration_token {
+            req = req.header("X-Registration-Token", token);
+        }
+        let resp = req.send().await.map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            if status == 409 {
+                return Err(RelayError::Protocol {
+                    message: format!("HTTP 409: {body_text}"),
+                });
+            }
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        resp.json::<RegisterResponse>()
+            .await
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse register response: {e}"),
+            })
+    }
+
+    async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
+        let url = format!("{}/devices", self.base_path());
+        debug!("list_devices");
+
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        resp.json::<Vec<DeviceInfo>>()
+            .await
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse devices response: {e}"),
+            })
+    }
+
+    async fn revoke_device(
+        &self,
+        device_id: &str,
+        remote_wipe: bool,
+        new_epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> Result<i32, RelayError> {
+        let path = self.canonical_path(&format!("/devices/{device_id}/revoke"));
+        let url = format!("{}{}", self.base_url, path);
+        debug!("revoke_device_atomic {device_id} remote_wipe={remote_wipe} epoch={new_epoch}");
+
+        let encoded_keys: HashMap<String, String> = wrapped_keys
+            .into_iter()
+            .map(|(k, v)| (k, BASE64.encode(v)))
+            .collect();
+        let body = serde_json::json!({
+            "new_epoch": new_epoch,
+            "remote_wipe": remote_wipe,
+            "wrapped_keys": encoded_keys,
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode revoke request: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+        if status == 204 {
+            return Ok(new_epoch);
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse atomic revoke response: {e}"),
+        })?;
+        Ok(json["new_epoch"].as_i64().unwrap_or(new_epoch as i64) as i32)
+    }
+
+    async fn deregister(&self) -> Result<(), RelayError> {
+        let path = self.canonical_path(&format!("/devices/{}", self.device_id));
+        let url = format!("{}{}", self.base_url, path);
+        debug!("deregister device_id={}", self.device_id);
+
+        let resp = self
+            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        Ok(())
+    }
+
+    async fn rotate_ml_dsa(
+        &self,
+        device_id: &str,
+        new_ml_dsa_pk: &[u8],
+        new_generation: u32,
+        proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        signed_registry_snapshot: Option<&[u8]>,
+    ) -> Result<RotateMlDsaResponse, RelayError> {
+        let path = self.canonical_path(&format!("/devices/{device_id}/rotate-ml-dsa"));
+        let url = format!("{}{}", self.base_url, path);
+        debug!("rotate_ml_dsa device_id={device_id} generation={new_generation}");
+
+        let body = serde_json::json!({
+            "new_ml_dsa_pk": BASE64.encode(new_ml_dsa_pk),
+            "ml_dsa_key_generation": new_generation,
+            "timestamp": proof.timestamp,
+            "old_signs_new": BASE64.encode(&proof.old_signs_new),
+            "new_signs_old": BASE64.encode(&proof.new_signs_old),
+            "signed_registry_snapshot": signed_registry_snapshot.map(|s| BASE64.encode(s)),
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode rotate-ml-dsa request: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        resp.json::<RotateMlDsaResponse>()
+            .await
+            .map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse rotate-ml-dsa response: {e}"),
+            })
+    }
+
+    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
+        let path = self.canonical_path("/registry");
+        let url = format!("{}{}", self.base_url, path);
+        debug!("get_signed_registry");
+
+        let resp = self
+            .apply_signed_auth(self.client.get(&url), "GET", &path, &[])
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let response: SignedRegistryResponse =
+            resp.json().await.map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse registry response: {e}"),
+            })?;
+
+        // Client-side size cap to protect against malicious relay
+        if response.artifact_blob.len() > 512 * 1024 {
+            return Err(RelayError::Protocol {
+                message: format!(
+                    "Registry artifact too large: {} bytes (max 524288)",
+                    response.artifact_blob.len()
+                ),
+            });
+        }
+
+        Ok(Some(response))
+    }
+}
+
+#[async_trait]
+impl EpochManagement for ServerRelay {
+    async fn post_rekey_artifacts(
+        &self,
+        epoch: i32,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+    ) -> Result<i32, RelayError> {
+        let path = self.canonical_path("/rekey");
+        let url = format!("{}{}", self.base_url, path);
+        debug!("post_rekey_artifacts epoch={epoch}");
+
+        // Encode wrapped keys as base64.
+        let encoded_keys: HashMap<String, String> = wrapped_keys
+            .into_iter()
+            .map(|(k, v)| (k, BASE64.encode(v)))
+            .collect();
+
+        let body = serde_json::json!({
+            "epoch": epoch,
+            "wrapped_keys": encoded_keys,
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode rekey request: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse rekey response: {e}"),
+        })?;
+
+        Ok(json["new_epoch"].as_i64().unwrap_or(epoch as i64) as i32)
+    }
+
+    async fn get_rekey_artifact(
+        &self,
+        epoch: i32,
+        device_id: &str,
+    ) -> Result<Option<Vec<u8>>, RelayError> {
+        let url = format!("{}/rekey/{device_id}?epoch={epoch}", self.base_path());
+        debug!("get_rekey_artifact epoch={epoch} device={device_id}");
+
+        let resp = self
+            .apply_auth(self.client.get(&url))
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse rekey artifact: {e}"),
+        })?;
+
+        let wrapped_key = json["wrapped_key"]
+            .as_str()
+            .and_then(|s| BASE64.decode(s).ok());
+
+        Ok(wrapped_key)
+    }
+}
+
+#[async_trait]
+impl SnapshotExchange for ServerRelay {
     async fn get_snapshot(&self) -> Result<Option<SnapshotResponse>, RelayError> {
         let url = format!("{}/snapshot", self.base_path());
         debug!("get_snapshot");
@@ -513,313 +808,10 @@ impl SyncRelay for ServerRelay {
 
         Ok(())
     }
+}
 
-    async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
-        let url = format!("{}/devices", self.base_path());
-        debug!("list_devices");
-
-        let resp = self
-            .apply_auth(self.client.get(&url))
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        resp.json::<Vec<DeviceInfo>>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse devices response: {e}"),
-            })
-    }
-
-    async fn revoke_device(
-        &self,
-        device_id: &str,
-        remote_wipe: bool,
-        new_epoch: i32,
-        wrapped_keys: HashMap<String, Vec<u8>>,
-    ) -> Result<i32, RelayError> {
-        let path = self.canonical_path(&format!("/devices/{device_id}/revoke"));
-        let url = format!("{}{}", self.base_url, path);
-        debug!("revoke_device_atomic {device_id} remote_wipe={remote_wipe} epoch={new_epoch}");
-
-        let encoded_keys: HashMap<String, String> = wrapped_keys
-            .into_iter()
-            .map(|(k, v)| (k, BASE64.encode(v)))
-            .collect();
-        let body = serde_json::json!({
-            "new_epoch": new_epoch,
-            "remote_wipe": remote_wipe,
-            "wrapped_keys": encoded_keys,
-        });
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
-            message: format!("Failed to encode revoke request: {e}"),
-        })?;
-
-        let resp = self
-            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
-            .header("Content-Type", "application/json")
-            .body(body_bytes)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-        if status == 204 {
-            return Ok(new_epoch);
-        }
-
-        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse atomic revoke response: {e}"),
-        })?;
-        Ok(json["new_epoch"].as_i64().unwrap_or(new_epoch as i64) as i32)
-    }
-
-    async fn post_rekey_artifacts(
-        &self,
-        epoch: i32,
-        wrapped_keys: HashMap<String, Vec<u8>>,
-    ) -> Result<i32, RelayError> {
-        let path = self.canonical_path("/rekey");
-        let url = format!("{}{}", self.base_url, path);
-        debug!("post_rekey_artifacts epoch={epoch}");
-
-        // Encode wrapped keys as base64.
-        let encoded_keys: HashMap<String, String> = wrapped_keys
-            .into_iter()
-            .map(|(k, v)| (k, BASE64.encode(v)))
-            .collect();
-
-        let body = serde_json::json!({
-            "epoch": epoch,
-            "wrapped_keys": encoded_keys,
-        });
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
-            message: format!("Failed to encode rekey request: {e}"),
-        })?;
-
-        let resp = self
-            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
-            .header("Content-Type", "application/json")
-            .body(body_bytes)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse rekey response: {e}"),
-        })?;
-
-        Ok(json["new_epoch"].as_i64().unwrap_or(epoch as i64) as i32)
-    }
-
-    async fn get_rekey_artifact(
-        &self,
-        epoch: i32,
-        device_id: &str,
-    ) -> Result<Option<Vec<u8>>, RelayError> {
-        let url = format!("{}/rekey/{device_id}?epoch={epoch}", self.base_path());
-        debug!("get_rekey_artifact epoch={epoch} device={device_id}");
-
-        let resp = self
-            .apply_auth(self.client.get(&url))
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status == 404 {
-            return Ok(None);
-        }
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse rekey artifact: {e}"),
-        })?;
-
-        let wrapped_key = json["wrapped_key"]
-            .as_str()
-            .and_then(|s| BASE64.decode(s).ok());
-
-        Ok(wrapped_key)
-    }
-
-    async fn deregister(&self) -> Result<(), RelayError> {
-        let path = self.canonical_path(&format!("/devices/{}", self.device_id));
-        let url = format!("{}{}", self.base_url, path);
-        debug!("deregister device_id={}", self.device_id);
-
-        let resp = self
-            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        Ok(())
-    }
-
-    async fn delete_sync_group(&self) -> Result<(), RelayError> {
-        let path = self.canonical_path("");
-        let url = format!("{}{}", self.base_url, path);
-        debug!("delete_sync_group");
-
-        let resp = self
-            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        Ok(())
-    }
-
-    async fn ack(&self, server_seq: i64) -> Result<(), RelayError> {
-        let url = format!("{}/ack", self.base_path());
-        let path = self.canonical_path("/ack");
-        debug!("ack server_seq={server_seq}");
-
-        let body_bytes = serde_json::to_vec(&serde_json::json!({ "server_seq": server_seq }))
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to serialize ack body: {e}"),
-            })?;
-
-        let resp = self
-            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
-            .header("Content-Type", "application/json")
-            .body(body_bytes)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        Ok(())
-    }
-
-    async fn connect_websocket(&self) -> Result<(), RelayError> {
-        let ws_url = self.ws_url();
-        eprintln!(
-            "[prism_relay] connect_websocket url={}",
-            redact_url(&ws_url)
-        );
-        debug!("connect_websocket url={}", redact_url(&ws_url));
-
-        let ws = WebSocketClient::new(
-            ws_url,
-            self.device_id.clone(),
-            self.device_session_token.clone(),
-            self.notification_tx.clone(),
-        );
-        ws.connect().await;
-
-        *self.ws_client.lock().await = Some(ws);
-        Ok(())
-    }
-
-    async fn disconnect_websocket(&self) -> Result<(), RelayError> {
-        debug!("disconnect_websocket");
-        if let Some(ws) = self.ws_client.lock().await.as_ref() {
-            ws.disconnect().await;
-        }
-        *self.ws_client.lock().await = None;
-        Ok(())
-    }
-
-    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
-        let rx = self.notification_tx.subscribe();
-        use futures_util::StreamExt;
-        Box::pin(
-            tokio_stream::wrappers::BroadcastStream::new(rx)
-                .filter_map(|r: Result<SyncNotification, _>| async move { r.ok() }),
-        )
-    }
-
-    async fn rotate_ml_dsa(
-        &self,
-        device_id: &str,
-        new_ml_dsa_pk: &[u8],
-        new_generation: u32,
-        proof: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
-        signed_registry_snapshot: Option<&[u8]>,
-    ) -> Result<RotateMlDsaResponse, RelayError> {
-        let path = self.canonical_path(&format!("/devices/{device_id}/rotate-ml-dsa"));
-        let url = format!("{}{}", self.base_url, path);
-        debug!("rotate_ml_dsa device_id={device_id} generation={new_generation}");
-
-        let body = serde_json::json!({
-            "new_ml_dsa_pk": BASE64.encode(new_ml_dsa_pk),
-            "ml_dsa_key_generation": new_generation,
-            "timestamp": proof.timestamp,
-            "old_signs_new": BASE64.encode(&proof.old_signs_new),
-            "new_signs_old": BASE64.encode(&proof.new_signs_old),
-            "signed_registry_snapshot": signed_registry_snapshot.map(|s| BASE64.encode(s)),
-        });
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
-            message: format!("Failed to encode rotate-ml-dsa request: {e}"),
-        })?;
-
-        let resp = self
-            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
-            .header("Content-Type", "application/json")
-            .body(body_bytes)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(Self::classify_reqwest_error)?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
-        }
-
-        resp.json::<RotateMlDsaResponse>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse rotate-ml-dsa response: {e}"),
-            })
-    }
-
+#[async_trait]
+impl MediaRelay for ServerRelay {
     async fn upload_media(
         &self,
         media_id: &str,
@@ -870,44 +862,67 @@ impl SyncRelay for ServerRelay {
         let bytes = resp.bytes().await.map_err(Self::classify_reqwest_error)?;
         Ok(bytes.to_vec())
     }
+}
 
-    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
-        let path = self.canonical_path("/registry");
+#[async_trait]
+impl SyncRelay for ServerRelay {
+    async fn delete_sync_group(&self) -> Result<(), RelayError> {
+        let path = self.canonical_path("");
         let url = format!("{}{}", self.base_url, path);
-        debug!("get_signed_registry");
+        debug!("delete_sync_group");
 
         let resp = self
-            .apply_signed_auth(self.client.get(&url), "GET", &path, &[])
+            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
             .timeout(self.request_timeout)
             .send()
             .await
             .map_err(Self::classify_reqwest_error)?;
 
         let status = resp.status().as_u16();
-        if status == 404 {
-            return Ok(None);
-        }
         if status >= 400 {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let response: SignedRegistryResponse =
-            resp.json().await.map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse registry response: {e}"),
-            })?;
+        Ok(())
+    }
 
-        // Client-side size cap to protect against malicious relay
-        if response.artifact_blob.len() > 512 * 1024 {
-            return Err(RelayError::Protocol {
-                message: format!(
-                    "Registry artifact too large: {} bytes (max 524288)",
-                    response.artifact_blob.len()
-                ),
-            });
+    async fn connect_websocket(&self) -> Result<(), RelayError> {
+        let ws_url = self.ws_url();
+        eprintln!(
+            "[prism_relay] connect_websocket url={}",
+            redact_url(&ws_url)
+        );
+        debug!("connect_websocket url={}", redact_url(&ws_url));
+
+        let ws = WebSocketClient::new(
+            ws_url,
+            self.device_id.clone(),
+            self.device_session_token.clone(),
+            self.notification_tx.clone(),
+        );
+        ws.connect().await;
+
+        *self.ws_client.lock().await = Some(ws);
+        Ok(())
+    }
+
+    async fn disconnect_websocket(&self) -> Result<(), RelayError> {
+        debug!("disconnect_websocket");
+        if let Some(ws) = self.ws_client.lock().await.as_ref() {
+            ws.disconnect().await;
         }
+        *self.ws_client.lock().await = None;
+        Ok(())
+    }
 
-        Ok(Some(response))
+    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+        let rx = self.notification_tx.subscribe();
+        use futures_util::StreamExt;
+        Box::pin(
+            tokio_stream::wrappers::BroadcastStream::new(rx)
+                .filter_map(|r: Result<SyncNotification, _>| async move { r.ok() }),
+        )
     }
 
     async fn dispose(&self) -> Result<(), RelayError> {

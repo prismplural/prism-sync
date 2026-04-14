@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 use super::sharing_models::SignedPrekey;
 use crate::error::{CoreError, Result};
 use crate::secure_store::SecureStore;
+use crate::storage::StorageError;
 
 /// 7 days in seconds.
 const PREKEY_ROTATION_INTERVAL_SECS: i64 = 7 * 24 * 3600;
@@ -204,7 +205,7 @@ impl PrekeyStore {
         match secure_store.get(SHARING_PREKEY_STORE_KEY)? {
             Some(bytes) => {
                 let json = String::from_utf8(bytes).map_err(|e| {
-                    CoreError::Storage(format!("invalid UTF-8 in {SHARING_PREKEY_STORE_KEY}: {e}"))
+                    CoreError::Storage(StorageError::Logic(format!("invalid UTF-8 in {SHARING_PREKEY_STORE_KEY}: {e}")))
                 })?;
                 Self::from_json(&json)
             }
@@ -260,25 +261,25 @@ fn entry_to_serializable(entry: &PrekeyEntry) -> SerializablePrekeyEntry {
 fn serializable_to_entry(s: SerializablePrekeyEntry) -> Result<PrekeyEntry> {
     let prekey_id = s.prekey_id.clone();
     let seed_bytes = hex::decode(&s.xwing_dk_seed_hex).map_err(|e| {
-        CoreError::Storage(format!(
+        CoreError::Storage(StorageError::Logic(format!(
             "invalid xwing_dk_seed_hex for prekey {prekey_id}: {e}"
-        ))
+        )))
     })?;
     if seed_bytes.len() != XWING_DK_SEED_LEN {
-        return Err(CoreError::Storage(format!(
+        return Err(CoreError::Storage(StorageError::Logic(format!(
             "invalid xwing_dk_seed length for prekey {prekey_id}: expected {XWING_DK_SEED_LEN} bytes, got {}",
             seed_bytes.len()
-        )));
+        ))));
     }
 
     let xwing_ek = hex::decode(&s.xwing_ek_hex).map_err(|e| {
-        CoreError::Storage(format!("invalid xwing_ek_hex for prekey {prekey_id}: {e}"))
+        CoreError::Storage(StorageError::Logic(format!("invalid xwing_ek_hex for prekey {prekey_id}: {e}")))
     })?;
     if xwing_ek.len() != XWING_EK_LEN {
-        return Err(CoreError::Storage(format!(
+        return Err(CoreError::Storage(StorageError::Logic(format!(
             "invalid xwing_ek length for prekey {prekey_id}: expected {XWING_EK_LEN} bytes, got {}",
             xwing_ek.len()
-        )));
+        ))));
     }
 
     let mut seed = Zeroizing::new([0u8; XWING_DK_SEED_LEN]);

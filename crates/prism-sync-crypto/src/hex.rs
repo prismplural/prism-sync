@@ -1,4 +1,4 @@
-use crate::error::{CryptoError, Result};
+use crate::error::Result;
 
 /// Encode bytes to lowercase hex string.
 pub fn encode(bytes: &[u8]) -> String {
@@ -7,7 +7,7 @@ pub fn encode(bytes: &[u8]) -> String {
 
 /// Decode hex string to bytes.
 pub fn decode(hex_str: &str) -> Result<Vec<u8>> {
-    hex::decode(hex_str).map_err(|e| CryptoError::HexDecode(e.to_string()))
+    Ok(hex::decode(hex_str)?)
 }
 
 #[cfg(test)]
