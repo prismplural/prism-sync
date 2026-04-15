@@ -279,6 +279,29 @@ impl ServerRelay {
             .unwrap_or(&self.base_url);
         format!("{scheme}://{rest}/v1/sync/{}/ws", self.sync_id)
     }
+
+    pub async fn fetch_gif_service_config(&self) -> Result<GifServiceConfig, RelayError> {
+        let url = format!("{}/capabilities", self.base_path());
+        let response = self
+            .apply_auth(self.client.get(&url))
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse capability response: {e}"),
+        })?;
+        serde_json::from_value(json["gifs"].clone()).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse GIF capability payload: {e}"),
+        })
+    }
 }
 
 fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {

@@ -186,11 +186,19 @@ pub struct AppState {
     pub sharing_fetch_rate_limiter: RateLimiter,
     pub sharing_init_rate_limiter: RateLimiter,
     pub media_upload_rate_limiter: RateLimiter,
+    pub gif_request_rate_limiter: RateLimiter,
+    pub gif_http_client: reqwest::Client,
 }
 
 impl AppState {
     pub fn new(db: Database, config: Config) -> Self {
         let metrics = Arc::new(Metrics::default());
+        let gif_http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .build()
+            .expect("gif HTTP client should build");
 
         // Restore persisted counters so lifetime totals survive restarts.
         match db.with_read_conn(crate::db::load_counters) {
@@ -213,6 +221,8 @@ impl AppState {
             sharing_fetch_rate_limiter: RateLimiter::default(),
             sharing_init_rate_limiter: RateLimiter::default(),
             media_upload_rate_limiter: RateLimiter::default(),
+            gif_request_rate_limiter: RateLimiter::default(),
+            gif_http_client,
         }
     }
 

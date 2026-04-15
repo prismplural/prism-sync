@@ -541,6 +541,15 @@ mod tests {
             media_upload_rate_limit: 100,
             media_upload_rate_window_secs: 60,
             media_orphan_cleanup_secs: 86400,
+            gif_provider_mode: crate::config::GifProviderMode::Disabled,
+            gif_public_base_url: None,
+            gif_prism_base_url: None,
+            gif_api_base_url: "https://api.klipy.com".into(),
+            gif_api_key: None,
+            gif_http_timeout_secs: 15,
+            gif_request_rate_limit: 20,
+            gif_request_rate_window_secs: 60,
+            gif_query_max_len: 200,
         }
     }
 

@@ -7,3 +7,5 @@ pub mod db;
 pub(crate) mod errors;
 pub mod routes;
 pub mod state;
+
+pub use config::GifProviderMode;

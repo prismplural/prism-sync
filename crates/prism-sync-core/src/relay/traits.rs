@@ -280,6 +280,14 @@ pub struct DeviceInfo {
     pub ml_dsa_key_generation: u32,
 }
 
+/// Relay-advertised GIF service configuration for the current sync server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GifServiceConfig {
+    pub enabled: bool,
+    pub api_base_url: Option<String>,
+    pub media_proxy_enabled: bool,
+}
+
 /// Serde module for `Vec<u8>` that serializes as base64 and deserializes
 /// from either base64 strings or integer arrays (backward-compatible).
 ///

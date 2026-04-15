@@ -1,3 +1,21 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GifProviderMode {
+    Disabled,
+    PrismHosted,
+    SelfHosted,
+}
+
+impl GifProviderMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "disabled" => Some(Self::Disabled),
+            "prism_hosted" | "prism-hosted" => Some(Self::PrismHosted),
+            "self_hosted" | "self-hosted" => Some(Self::SelfHosted),
+            _ => None,
+        }
+    }
+}
+
 /// Application configuration, loaded from environment variables.
 #[derive(Clone)]
 pub struct Config {
@@ -106,6 +124,26 @@ pub struct Config {
     pub media_upload_rate_window_secs: u64,
     /// Interval in seconds for cleaning up orphaned media files.
     pub media_orphan_cleanup_secs: u64,
+    /// GIF provider mode for chat GIF search.
+    pub gif_provider_mode: GifProviderMode,
+    /// Public base URL that clients should use for GIF API calls when this relay
+    /// serves the proxy itself. Relative paths are allowed.
+    pub gif_public_base_url: Option<String>,
+    /// Prism-hosted GIF API base URL advertised to clients when this relay is in
+    /// prism-hosted mode. Relative paths are not allowed.
+    pub gif_prism_base_url: Option<String>,
+    /// Upstream Klipy API base URL used by self-hosted GIF proxy mode.
+    pub gif_api_base_url: String,
+    /// Klipy API key used by self-hosted GIF proxy mode.
+    pub gif_api_key: Option<String>,
+    /// Timeout in seconds for upstream GIF API requests.
+    pub gif_http_timeout_secs: u64,
+    /// Max GIF proxy requests per client IP within the GIF rate limit window.
+    pub gif_request_rate_limit: u32,
+    /// Sliding window in seconds for GIF proxy rate limiting.
+    pub gif_request_rate_window_secs: u64,
+    /// Maximum accepted search query length in bytes before truncation.
+    pub gif_query_max_len: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -122,6 +160,11 @@ impl std::fmt::Debug for Config {
                 "metrics_token",
                 &self.metrics_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("gif_provider_mode", &self.gif_provider_mode)
+            .field("gif_public_base_url", &self.gif_public_base_url)
+            .field("gif_prism_base_url", &self.gif_prism_base_url)
+            .field("gif_api_base_url", &self.gif_api_base_url)
+            .field("gif_api_key", &self.gif_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("reader_pool_size", &self.reader_pool_size)
             .finish_non_exhaustive()
     }
@@ -211,6 +254,27 @@ impl Config {
             media_upload_rate_limit: parse_env("MEDIA_UPLOAD_RATE_LIMIT", 10),
             media_upload_rate_window_secs: parse_env("MEDIA_UPLOAD_RATE_WINDOW_SECS", 60),
             media_orphan_cleanup_secs: parse_env("MEDIA_ORPHAN_CLEANUP_SECS", 86400),
+            gif_provider_mode: parse_gif_provider_mode_env(
+                "GIF_PROVIDER_MODE",
+                GifProviderMode::Disabled,
+            ),
+            gif_public_base_url: std::env::var("GIF_PUBLIC_BASE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            gif_prism_base_url: std::env::var("GIF_PRISM_BASE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            gif_api_base_url: std::env::var("GIF_API_BASE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "https://api.klipy.com".into()),
+            gif_api_key: std::env::var("GIF_API_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            gif_http_timeout_secs: parse_env("GIF_HTTP_TIMEOUT_SECS", 15),
+            gif_request_rate_limit: parse_env("GIF_REQUEST_RATE_LIMIT", 20),
+            gif_request_rate_window_secs: parse_env("GIF_REQUEST_RATE_WINDOW_SECS", 60),
+            gif_query_max_len: parse_env("GIF_QUERY_MAX_LEN", 200),
         }
     }
 
@@ -362,6 +426,14 @@ fn parse_json_vec_env(key: &str, default: Vec<String>) -> Vec<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or(default)
+}
+
+fn parse_gif_provider_mode_env(key: &str, default: GifProviderMode) -> GifProviderMode {
+    std::env::var(key)
+        .ok()
+        .as_deref()
+        .and_then(GifProviderMode::parse)
         .unwrap_or(default)
 }
 

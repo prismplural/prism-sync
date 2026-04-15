@@ -2091,6 +2091,65 @@ pub async fn list_devices(
     serde_json::to_string(&json).map_err(|e| format!("JSON serialization failed: {e}"))
 }
 
+/// Fetch the relay-advertised GIF service configuration for the current sync
+/// server. Returns JSON: `{"enabled": bool, "api_base_url": "...", "media_proxy_enabled": bool}`.
+pub async fn fetch_gif_service_config(handle: &PrismSyncHandle) -> Result<String, String> {
+    enforce_handle_signature_version_floor(handle).await?;
+    let (sync_id, device_id, session_token, relay_url, storage, device_secret) = {
+        let inner = handle.inner.lock().await;
+        let secure_store = inner.secure_store();
+        let sync_id = secure_store
+            .get("sync_id")
+            .map_err(|e| e.to_string())?
+            .map(|b| String::from_utf8(b).unwrap_or_default())
+            .ok_or("No sync_id found — pair first")?;
+        let device_id = secure_store
+            .get("device_id")
+            .map_err(|e| e.to_string())?
+            .map(|b| String::from_utf8(b).unwrap_or_default())
+            .ok_or("No device_id found — pair first")?;
+        let session_token = secure_store
+            .get("session_token")
+            .map_err(|e| e.to_string())?
+            .map(|b| String::from_utf8(b).unwrap_or_default())
+            .ok_or("No session token found — pair first")?;
+        let relay_url = secure_store
+            .get("relay_url")
+            .map_err(|e| e.to_string())?
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| handle.relay_url.clone());
+        (
+            sync_id,
+            device_id,
+            session_token,
+            relay_url,
+            inner.storage().clone(),
+            secure_store.get("device_secret").map_err(|e| e.to_string())?,
+        )
+    };
+
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
+    let relay = build_relay(
+        &relay_url,
+        &sync_id,
+        &device_id,
+        &session_token,
+        device_secret,
+        ml_dsa_key_generation,
+        handle.allow_insecure,
+        None,
+    )?;
+
+    let config = match relay.fetch_gif_service_config().await {
+        Ok(config) => config,
+        Err(error) => {
+            return Err(format_handle_relay_error(handle, "fetch_gif_service_config", error).await);
+        }
+    };
+    serde_json::to_string(&config).map_err(|e| format!("JSON serialization failed: {e}"))
+}
+
 /// Revoke a device (owner only).
 ///
 /// Takes primitive connection parameters instead of a relay trait object.

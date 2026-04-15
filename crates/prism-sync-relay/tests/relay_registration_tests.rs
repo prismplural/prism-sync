@@ -402,6 +402,15 @@ async fn test_registration_rejects_expired_nonce() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -535,6 +544,15 @@ async fn test_nonce_rate_limiting() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -690,6 +708,15 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -806,6 +833,15 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1011,6 +1047,15 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1126,6 +1171,15 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1386,6 +1440,15 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1802,6 +1865,15 @@ async fn test_nonce_rate_limiting_window_expiry() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -2960,6 +3032,15 @@ async fn test_revoke_rate_limiting() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -4043,6 +4124,15 @@ fn default_test_config() -> Config {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     }
 }
 

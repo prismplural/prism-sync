@@ -265,6 +265,15 @@ async fn test_pairing_expired_session_returns_404() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -388,6 +397,15 @@ async fn test_pairing_rate_limiting_ignores_spoofed_forwarded_headers() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
     let (url, _server, _db) = start_test_relay_with_config(config).await;
     let client = Client::new();
@@ -473,6 +491,15 @@ async fn test_pairing_payload_too_large_returns_413() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -547,6 +574,15 @@ async fn test_pairing_put_slot_payload_too_large() {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;

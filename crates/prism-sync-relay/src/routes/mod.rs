@@ -1,4 +1,5 @@
 pub mod devices;
+pub mod gifs;
 pub mod media;
 pub mod metrics;
 pub mod pairing;
@@ -185,6 +186,10 @@ pub fn router(state: AppState) -> Router {
             get(devices::get_rekey_artifact),
         )
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
+        .route(
+            "/v1/sync/{sync_id}/capabilities",
+            get(gifs::get_capabilities),
+        )
         // Registry routes (auth + signed)
         .merge(registry::routes())
         // Sharing routes (auth + signed)
@@ -206,6 +211,8 @@ pub fn router(state: AppState) -> Router {
         .merge(register::routes())
         .merge(pairing::routes())
         .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade))
+        .route("/v1/gifs/trending", get(gifs::get_trending))
+        .route("/v1/gifs/search", get(gifs::search_gifs))
         // Public sharing route (no auth, rate-limited by IP)
         .route("/v1/sharing/{sharing_id}/bundle", get(sharing::get_bundle));
 
