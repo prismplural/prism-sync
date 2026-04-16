@@ -2458,6 +2458,11 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         cached_epoch
     };
 
+    // The recovery phrase is deliberately not listed: the mnemonic is an
+    // offline backup credential and is not persisted to the secure store.
+    // The fast-path `snapshot()` above still exports anything present (so
+    // legacy entries from earlier builds drain once), but nothing will
+    // re-seed it afterwards.
     let known_keys = [
         "wrapped_dek",
         "dek_salt",
@@ -2467,7 +2472,6 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         "session_token",
         "epoch",
         "relay_url",
-        "mnemonic",
         "setup_rollback_marker",
         "registration_token",
         "sharing_prekey_store",
@@ -3287,10 +3291,17 @@ pub async fn start_initiator_ceremony(
 /// Waits for the joiner's confirmation MAC, verifies it, then sends
 /// encrypted credentials to the joiner. Returns `"ok"` on success.
 ///
+/// `mnemonic` is the inviter's 12-word BIP39 recovery phrase, typed by the
+/// user from their offline backup. The recovery phrase is never persisted in
+/// the secure store, so the caller must provide it here — it is needed to
+/// assemble the credential bundle shipped to the joiner so the joiner can
+/// derive the MEK and unlock the wrapped DEK.
+///
 /// Must be called after [`start_initiator_ceremony`] and user SAS verification.
 pub async fn complete_initiator_ceremony(
     handle: &PrismSyncHandle,
     password: String,
+    mnemonic: String,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
     let pairing_relay = build_pairing_relay(handle)?;
@@ -3348,7 +3359,13 @@ pub async fn complete_initiator_ceremony(
 
     let pairing = PairingService::new(secure_store);
     if let Err(error) = pairing
-        .complete_bootstrap_initiator(&ceremony, &pairing_relay, &password, relay.as_ref())
+        .complete_bootstrap_initiator(
+            &ceremony,
+            &pairing_relay,
+            &password,
+            &mnemonic,
+            relay.as_ref(),
+        )
         .await
     {
         return Err(encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await);

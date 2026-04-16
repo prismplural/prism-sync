@@ -103,7 +103,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     let service_a = PairingService::new(store_a.clone());
 
     let password = "test-password";
-    let (_creds, _invite) = service_a
+    let (creds, _invite) = service_a
         .create_sync_group(
             password,
             "wss://relay.example.com",
@@ -119,10 +119,12 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         .await
         .expect("create_sync_group should succeed");
 
-    // Read credentials back from store (as the FFI approve function does)
+    // Read credentials back from store (as the FFI approve function does).
+    // The recovery phrase is not persisted — take it from the returned
+    // credentials bundle, where it's surfaced once for the caller to display.
     let sync_id = String::from_utf8(store_a.get("sync_id").unwrap().unwrap()).unwrap();
     let relay_url = String::from_utf8(store_a.get("relay_url").unwrap().unwrap()).unwrap();
-    let mnemonic = String::from_utf8(store_a.get("mnemonic").unwrap().unwrap()).unwrap();
+    let mnemonic = creds.mnemonic.clone();
     let wrapped_dek = store_a.get("wrapped_dek").unwrap().unwrap();
     let salt = store_a.get("dek_salt").unwrap().unwrap();
     let device_id_a = String::from_utf8(store_a.get("device_id").unwrap().unwrap()).unwrap();
@@ -273,7 +275,7 @@ async fn join_from_approval_roundtrip() {
     let store_a = Arc::new(MemorySecureStore::new());
     let service_a = PairingService::new(store_a.clone());
 
-    let (_creds, _invite) = service_a
+    let (creds, _invite) = service_a
         .create_sync_group(
             password,
             "wss://relay.test",
@@ -291,7 +293,9 @@ async fn join_from_approval_roundtrip() {
 
     let sync_id = String::from_utf8(store_a.get("sync_id").unwrap().unwrap()).unwrap();
     let relay_url = String::from_utf8(store_a.get("relay_url").unwrap().unwrap()).unwrap();
-    let mnemonic = String::from_utf8(store_a.get("mnemonic").unwrap().unwrap()).unwrap();
+    // Recovery phrase is not persisted; read it from the credentials returned
+    // by create_sync_group.
+    let mnemonic = creds.mnemonic.clone();
     let wrapped_dek = store_a.get("wrapped_dek").unwrap().unwrap();
     let salt = store_a.get("dek_salt").unwrap().unwrap();
     let device_id_a = String::from_utf8(store_a.get("device_id").unwrap().unwrap()).unwrap();

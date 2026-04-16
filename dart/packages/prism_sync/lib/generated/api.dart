@@ -730,13 +730,21 @@ Future<String> startInitiatorCeremony({
 /// Waits for the joiner's confirmation MAC, verifies it, then sends
 /// encrypted credentials to the joiner. Returns `"ok"` on success.
 ///
+/// `mnemonic` is the inviter's 12-word BIP39 recovery phrase, typed by the
+/// user from their offline backup. The recovery phrase is never persisted in
+/// the secure store, so the caller must provide it here — it is needed to
+/// assemble the credential bundle shipped to the joiner so the joiner can
+/// derive the MEK and unlock the wrapped DEK.
+///
 /// Must be called after [`start_initiator_ceremony`] and user SAS verification.
 Future<String> completeInitiatorCeremony({
   required PrismSyncHandle handle,
   required String password,
+  required String mnemonic,
 }) => RustLib.instance.api.crateApiCompleteInitiatorCeremony(
   handle: handle,
   password: password,
+  mnemonic: mnemonic,
 );
 
 /// Rotate this device's ML-DSA-65 signing key.

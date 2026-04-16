@@ -392,6 +392,7 @@ fn wire__crate__api__complete_initiator_ceremony_impl(
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
             let api_password = <String>::sse_decode(&mut deserializer);
+            let api_mnemonic = <String>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, String>(
@@ -418,6 +419,7 @@ fn wire__crate__api__complete_initiator_ceremony_impl(
                         let output_ok = crate::api::complete_initiator_ceremony(
                             &*api_handle_guard,
                             api_password,
+                            api_mnemonic,
                         )
                         .await?;
                         Ok(output_ok)

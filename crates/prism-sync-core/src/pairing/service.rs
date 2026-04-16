@@ -264,8 +264,11 @@ impl PairingService {
         self.secure_store
             .set("sync_id", credentials.sync_id.as_bytes())?;
         self.secure_store.set("relay_url", relay_url.as_bytes())?;
-        self.secure_store
-            .set("mnemonic", credentials.mnemonic.as_bytes())?;
+        // Mnemonic is an offline backup credential — it is returned in
+        // `credentials.mnemonic` for the caller to display once during setup,
+        // but deliberately NOT persisted to the secure store. Change-PIN and
+        // device-pairing flows re-prompt the user to type it from their saved
+        // backup.
         self.secure_store
             .set("wrapped_dek", &credentials.wrapped_dek)?;
         self.secure_store.set("dek_salt", &credentials.salt)?;
@@ -456,8 +459,11 @@ impl PairingService {
             .set("sync_id", bundle.sync_id.as_bytes())?;
         self.secure_store
             .set("relay_url", bundle.relay_url.as_bytes())?;
-        self.secure_store
-            .set("mnemonic", bundle.mnemonic.as_bytes())?;
+        // Intentionally not persisting `bundle.mnemonic`: the recovery phrase
+        // is an offline backup credential. The joiner already has it in
+        // memory from the credential bundle and uses it transiently to
+        // unlock. Users will re-type it from their saved backup when needed
+        // (change-PIN, pair-new-device).
         self.secure_store.set("wrapped_dek", &bundle.wrapped_dek)?;
         self.secure_store.set("dek_salt", &bundle.salt)?;
         self.secure_store
@@ -514,11 +520,19 @@ impl PairingService {
     /// The `sync_relay` is used for relay operations that require the real
     /// sync_id (e.g., listing devices, posting rekey artifacts). The
     /// `pairing_relay` handles ceremony slot exchange (no sync_id needed).
+    ///
+    /// `mnemonic` is the inviter's BIP39 recovery phrase. It is required
+    /// because the recovery phrase is never persisted to the secure store —
+    /// the caller must obtain it from the user (typed from their offline
+    /// backup) and pass it through. The phrase is included in the encrypted
+    /// credential bundle shipped to the joiner so the joiner can Argon2-
+    /// unlock, and is zeroized once that bundle has been constructed.
     pub async fn complete_bootstrap_initiator(
         &self,
         ceremony: &InitiatorCeremony,
         pairing_relay: &dyn PairingRelay,
         password: &str,
+        mnemonic: &str,
         sync_relay: &dyn SyncRelay,
     ) -> Result<()> {
         // Verify the joiner's confirmation MAC before sending credentials.
@@ -548,8 +562,11 @@ impl PairingService {
         let mut key_hierarchy = KeyHierarchy::new();
         let sync_id = self.load_secure_string("sync_id")?;
         let relay_url = self.load_secure_string("relay_url")?;
-        let mnemonic = self.load_secure_string("mnemonic")?;
-        let secret_key = mnemonic::to_bytes(&mnemonic).map_err(CoreError::Crypto)?;
+        // `mnemonic` is supplied by the caller — the recovery phrase is never
+        // persisted to the secure store. Derive the secret key in-memory and
+        // rely on `secret_key`'s `Zeroizing<Vec<u8>>` wrapper to scrub the
+        // bytes when this function returns.
+        let secret_key = mnemonic::to_bytes(mnemonic).map_err(CoreError::Crypto)?;
         let wrapped_dek = self.load_secure_bytes("wrapped_dek")?;
         let salt = self.load_secure_bytes("dek_salt")?;
         key_hierarchy
@@ -661,7 +678,7 @@ impl PairingService {
         let credential_bundle = BootstrapCredentialBundle {
             sync_id: sync_id.clone(),
             relay_url: relay_url.clone(),
-            mnemonic: mnemonic.clone(),
+            mnemonic: mnemonic.to_string(),
             wrapped_dek: wrapped_dek.clone(),
             salt: salt.clone(),
             current_epoch,
@@ -1180,24 +1197,25 @@ mod tests {
         async fn dispose(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn seed_bootstrap_store(
         store: &MemStore,
         device_secret: &DeviceSecret,
         device_id: &str,
         sync_id: &str,
         relay_url: &str,
-        mnemonic_str: &str,
         wrapped_dek: &[u8],
         salt: &[u8],
     ) {
+        // Note: no mnemonic is written to the store — the recovery phrase is
+        // not a persisted credential. `complete_bootstrap_initiator` receives
+        // it as a parameter from the caller (who would have prompted the user
+        // to type it from their offline backup).
         store
             .set("device_secret", device_secret.as_bytes())
             .unwrap();
         store.set("device_id", device_id.as_bytes()).unwrap();
         store.set("sync_id", sync_id.as_bytes()).unwrap();
         store.set("relay_url", relay_url.as_bytes()).unwrap();
-        store.set("mnemonic", mnemonic_str.as_bytes()).unwrap();
         store.set("wrapped_dek", wrapped_dek).unwrap();
         store.set("dek_salt", salt).unwrap();
         store.set("epoch", b"0").unwrap();
@@ -1257,7 +1275,6 @@ mod tests {
             &device_id,
             sync_id,
             relay_url,
-            &mnemonic,
             &wrapped_dek,
             &salt,
         );
@@ -1320,7 +1337,13 @@ mod tests {
         });
 
         initiator_service
-            .complete_bootstrap_initiator(&initiator, mailbox.as_ref(), password, registry_relay.as_ref())
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+            )
             .await
             .unwrap();
 
@@ -1436,7 +1459,6 @@ mod tests {
             &device_id,
             sync_id,
             relay_url,
-            &mnemonic,
             &wrapped_dek,
             &salt,
         );
@@ -1485,7 +1507,13 @@ mod tests {
         });
 
         initiator_service
-            .complete_bootstrap_initiator(&initiator, mailbox.as_ref(), password, registry_relay.as_ref())
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+            )
             .await
             .unwrap();
 

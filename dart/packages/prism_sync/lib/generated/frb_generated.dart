@@ -108,6 +108,7 @@ abstract class RustLibApi extends BaseApi {
   Future<String> crateApiCompleteInitiatorCeremony({
     required PrismSyncHandle handle,
     required String password,
+    required String mnemonic,
   });
 
   Future<String> crateApiCompleteJoinerCeremony({
@@ -658,6 +659,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Future<String> crateApiCompleteInitiatorCeremony({
     required PrismSyncHandle handle,
     required String password,
+    required String mnemonic,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -668,6 +670,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_String(password, serializer);
+          sse_encode_String(mnemonic, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -680,7 +683,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiCompleteInitiatorCeremonyConstMeta,
-        argValues: [handle, password],
+        argValues: [handle, password, mnemonic],
         apiImpl: this,
       ),
     );
@@ -689,7 +692,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiCompleteInitiatorCeremonyConstMeta =>
       const TaskConstMeta(
         debugName: "complete_initiator_ceremony",
-        argNames: ["handle", "password"],
+        argNames: ["handle", "password", "mnemonic"],
       );
 
   @override
