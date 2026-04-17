@@ -19,6 +19,7 @@ use axum::{
     Router,
 };
 use base64::Engine;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
@@ -257,6 +258,8 @@ pub fn router(state: AppState) -> Router {
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(30),
         ))
+        // Cap concurrent in-flight requests to prevent connection exhaustion.
+        .layer(ConcurrencyLimitLayer::new(512))
         .with_state(state)
 }
 

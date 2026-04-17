@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use rand::Rng;
 use tokio::sync::broadcast;
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::redact_url;
 use super::traits::SyncNotification;
@@ -150,7 +151,7 @@ impl WebSocketClient {
                             .copied()
                             .or_else(|| panic_val.downcast_ref::<String>().map(String::as_str))
                             .unwrap_or("unknown panic");
-                        eprintln!("[prism_ws] PANIC in run_connection (attempt {attempt}): {msg}");
+                        error!("[prism_ws] PANIC in run_connection (attempt {attempt}): {msg}");
                     }
                     Ok(Ok(())) => {
                         // Clean disconnect or intentional close.
@@ -175,11 +176,13 @@ impl WebSocketClient {
                     break;
                 }
 
-                // Exponential backoff: min(2^attempt, MAX_RECONNECT_DELAY_SECS).
-                let delay_secs = (1u64 << attempt.min(5)).min(MAX_RECONNECT_DELAY_SECS);
-                info!("WebSocket reconnecting in {delay_secs}s (attempt {attempt})");
-                eprintln!("[prism_ws] Reconnecting in {delay_secs}s");
-                time::sleep(Duration::from_secs(delay_secs)).await;
+                // Exponential backoff with jitter: min(2^attempt, MAX_RECONNECT_DELAY_SECS) + rand(0..500ms).
+                // Jitter prevents thundering herd when many clients reconnect simultaneously.
+                let base_secs = (1u64 << attempt.min(5)).min(MAX_RECONNECT_DELAY_SECS);
+                let jitter_ms = rand::thread_rng().gen_range(0u64..500);
+                let delay = Duration::from_secs(base_secs) + Duration::from_millis(jitter_ms);
+                info!("WebSocket reconnecting in {base_secs}s +{jitter_ms}ms jitter (attempt {attempt})");
+                time::sleep(delay).await;
                 attempt = attempt.saturating_add(1);
             }
         });
