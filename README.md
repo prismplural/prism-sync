@@ -121,7 +121,15 @@ cargo test -p prism-sync-relay            # Relay server
 | Transport | HTTPS/WSS required (enforced at builder and relay constructor) |
 | Memory | All key material in `Zeroizing<Vec<u8>>` — auto-zeroed on drop |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and threat model.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and threat model,
+and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## Self-hosting a relay
+
+See [`self-host/SELF-HOSTING.md`](self-host/SELF-HOSTING.md) for Docker Compose
+and Kubernetes deployment guides. The relay stores only encrypted blobs, so
+running your own gives you full control over your data without requiring any
+cryptographic trust in the operator.
 
 ## Contributing
 
