@@ -824,30 +824,6 @@ impl RusqliteSyncStorage {
         Self::new(conn)
     }
 
-    /// Migrate an existing unencrypted database to an encrypted one.
-    ///
-    /// Uses SQLCipher's ATTACH + sqlcipher_export pattern to copy all data
-    /// from the plaintext source to a new encrypted database.
-    pub fn migrate_to_encrypted(
-        old_path: &std::path::Path,
-        new_path: &std::path::Path,
-        key: &[u8],
-    ) -> Result<()> {
-        let hex_key = hex::encode(key);
-        let escaped_path = new_path.display().to_string().replace('\'', "''");
-        let conn = Connection::open(old_path)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("open old DB: {e}"))))?;
-
-        conn.execute_batch(&format!(
-            "ATTACH DATABASE '{escaped_path}' AS encrypted KEY \"x'{hex_key}'\";\n\
-             SELECT sqlcipher_export('encrypted');\n\
-             DETACH DATABASE encrypted;",
-        ))
-        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("encryption migration failed: {e}"))))?;
-
-        Ok(())
-    }
-
     /// Create an in-memory storage instance for testing.
     pub fn in_memory() -> Result<Self> {
         Self::new(Connection::open_in_memory()?)

@@ -153,6 +153,49 @@ async fn create_handle_with_database_key_encrypts_file_db() {
     let _ = std::fs::remove_file(&db_path);
 }
 
+#[tokio::test]
+async fn create_handle_with_database_key_refuses_plaintext_file_db() {
+    let db_key = vec![0x42; 32];
+    let db_path = temp_db_path("prism-sync-ffi-plaintext");
+
+    let plain_conn = rusqlite::Connection::open(&db_path).expect("create plaintext DB");
+    plain_conn
+        .execute_batch("CREATE TABLE plaintext_marker (id INTEGER PRIMARY KEY);")
+        .expect("write plaintext DB");
+    drop(plain_conn);
+
+    let result = api::create_prism_sync(
+        "https://localhost:8080".into(),
+        db_path.to_string_lossy().into_owned(),
+        false,
+        String::new(),
+        Some(db_key),
+    );
+
+    assert!(
+        result.is_err(),
+        "existing plaintext DB should fail closed instead of being migrated"
+    );
+    let err = match result {
+        Ok(_) => unreachable!("asserted is_err above"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("refusing plaintext migration"),
+        "error should explain fail-closed behavior, got: {err}"
+    );
+    assert!(
+        !db_path.with_extension("db.bak").exists(),
+        "plaintext backup should not be created"
+    );
+    assert!(
+        !db_path.with_extension("db.enc").exists(),
+        "encrypted migration sidecar should not be created"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
 fn temp_db_path(prefix: &str) -> PathBuf {
     let unique = format!(
         "{prefix}-{}-{}.db",
