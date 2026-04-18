@@ -95,6 +95,7 @@
         "timing_mode": "Int",
         "notes_enabled": "Bool",
         "system_description": "String",
+        "system_tag": "String",
         "system_avatar_data": "Blob",
         "reminders_enabled": "Bool",
         "is_deleted": "Bool"
