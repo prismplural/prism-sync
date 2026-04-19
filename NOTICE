@@ -1,0 +1,45 @@
+prism-sync
+Copyright 2024-2026 Skylar Taylor-Barrick and prism-sync contributors
+
+This product is licensed under the MIT License OR the Apache License 2.0 at
+your option. See LICENSE-MIT and LICENSE-APACHE (or LICENSE) for the full
+license texts.
+
+This product includes software developed by third parties. Notable dependencies
+and their licenses:
+
+- RustCrypto project (chacha20poly1305, crypto_secretbox, argon2, hkdf,
+  ed25519-dalek, x25519-dalek, sha2, hmac)
+  MIT OR Apache-2.0
+  https://github.com/RustCrypto
+
+- PQClean / pqcrypto (ml-dsa-65, ml-kem-768)
+  MIT / CC0
+  https://github.com/rustpq/pqcrypto
+
+- tokio
+  MIT
+  https://github.com/tokio-rs/tokio
+
+- axum, tower, hyper
+  MIT
+  https://github.com/tokio-rs/axum
+
+- rusqlite and bundled SQLite
+  MIT (rusqlite), Public Domain (SQLite)
+  https://github.com/rusqlite/rusqlite
+
+- flutter_rust_bridge
+  MIT
+  https://github.com/fzyzcjy/flutter_rust_bridge
+
+- serde, serde_json
+  MIT OR Apache-2.0
+  https://github.com/serde-rs/serde
+
+- zeroize
+  MIT OR Apache-2.0
+  https://github.com/RustCrypto/utils
+
+Run `cargo tree` or `cargo deny list` from the workspace root for the complete
+transitive dependency list with license information.
