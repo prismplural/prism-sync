@@ -82,10 +82,9 @@ just test-crate prism-sync-core                 # Via justfile
 ```
 
 ## Deployment
-- Relay deploys via Docker to Hetzner CAX31 (ARM64, fsn1 Germany)
+- Relay deploys via Docker (self-hosted)
 - SQLite on LUKS-encrypted volume
 - Cloudflare Tunnel for ingress (no exposed ports)
-- `cd deploy && ./deploy.sh` — rsyncs source to server, builds natively (~30s)
 
 ## FFI Codegen
 After changing `crates/prism-sync-ffi/src/api.rs`:
