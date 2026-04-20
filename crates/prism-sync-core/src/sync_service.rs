@@ -351,10 +351,13 @@ async fn recover_epoch_key(
         return;
     }
 
-    // Persist the epoch key to the secure store
+    // Persist the epoch key to the secure store (base64-encoded, matching the
+    // bootstrap and rekey write paths so load_epoch_key can always decode once).
     if let Ok(epoch_key) = guard.key_hierarchy().epoch_key(new_epoch) {
+        use base64::{engine::general_purpose::STANDARD, Engine};
         let store_key = format!("epoch_key_{}", new_epoch);
-        if let Err(e) = guard.secure_store().set(&store_key, epoch_key) {
+        let encoded = STANDARD.encode(epoch_key);
+        if let Err(e) = guard.secure_store().set(&store_key, encoded.as_bytes()) {
             tracing::warn!(
                 epoch = new_epoch,
                 error = %e,

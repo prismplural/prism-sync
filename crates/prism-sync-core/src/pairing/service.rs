@@ -785,11 +785,24 @@ impl PairingService {
         }
 
         let key_name = format!("epoch_key_{epoch}");
-        if let Some(encoded) = self.secure_store.get(&key_name)? {
+        if let Some(stored) = self.secure_store.get(&key_name)? {
             use base64::{engine::general_purpose::STANDARD, Engine};
-            return STANDARD.decode(&encoded).map_err(|e| {
-                CoreError::Engine(format!("invalid encoded {key_name} in secure store: {e}"))
-            });
+            // Tolerant decode: sync_service.rs historically wrote raw bytes while
+            // the bootstrap/rekey paths write base64. Try base64 first; if the
+            // result is exactly 32 bytes it's the real key. Otherwise fall back to
+            // treating the stored bytes as raw key material.
+            if let Ok(decoded) = STANDARD.decode(&stored) {
+                if decoded.len() == 32 {
+                    return Ok(decoded);
+                }
+            }
+            if stored.len() == 32 {
+                return Ok(stored);
+            }
+            return Err(CoreError::Engine(format!(
+                "invalid {key_name} in secure store: expected 32-byte key, got {} bytes",
+                stored.len()
+            )));
         }
 
         Ok(key_hierarchy
