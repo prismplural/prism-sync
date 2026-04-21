@@ -272,11 +272,7 @@ async fn encode_handle_core_error(
     operation: &str,
     error: prism_sync_core::CoreError,
 ) -> String {
-    if let prism_sync_core::CoreError::Relay {
-        min_signature_version,
-        ..
-    } = &error
-    {
+    if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
         let _ = ratchet_handle_min_signature_version(handle, *min_signature_version).await;
     }
     encode_core_error(operation, error)
@@ -349,10 +345,7 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "epoch": info.epoch,
             "status": info.status,
         }),
-        SyncEvent::DeviceRevoked {
-            ref device_id,
-            remote_wipe,
-        } => serde_json::json!({
+        SyncEvent::DeviceRevoked { ref device_id, remote_wipe } => serde_json::json!({
             "type": "DeviceRevoked",
             "device_id": device_id,
             "remote_wipe": remote_wipe,
@@ -365,10 +358,7 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "type": "WebSocketStateChanged",
             "connected": connected,
         }),
-        SyncEvent::BackoffScheduled {
-            attempt,
-            delay_secs,
-        } => serde_json::json!({
+        SyncEvent::BackoffScheduled { attempt, delay_secs } => serde_json::json!({
             "type": "BackoffScheduled",
             "attempt": attempt,
             "delay_secs": delay_secs,
@@ -454,19 +444,14 @@ fn decode_binary_string(value: &str, field_name: &str) -> Result<Vec<u8>, String
             .map_err(|e| format!("Invalid hex in {field_name}: {e}"));
     }
 
-    BASE64
-        .decode(value)
-        .map_err(|e| format!("Invalid base64 in {field_name}: {e}"))
+    BASE64.decode(value).map_err(|e| format!("Invalid base64 in {field_name}: {e}"))
 }
 
 fn parse_sharing_id_bytes(sharing_id: &str) -> Result<[u8; SHARING_ID_LEN_BYTES], String> {
     let decoded = prism_sync_crypto::hex::decode(sharing_id)
         .map_err(|e| format!("sharing_id must be 32 hex chars (decode failed: {e})"))?;
     if decoded.len() != SHARING_ID_LEN_BYTES {
-        return Err(format!(
-            "sharing_id must be 32 hex chars (got {} bytes)",
-            decoded.len()
-        ));
+        return Err(format!("sharing_id must be 32 hex chars (got {} bytes)", decoded.len()));
     }
     let mut bytes = [0u8; SHARING_ID_LEN_BYTES];
     bytes.copy_from_slice(&decoded);
@@ -500,11 +485,7 @@ fn require_secure_string(store: &dyn PrismSecureStore, key: &str) -> Result<Stri
 
 fn decode_optional_u8(store: &dyn PrismSecureStore, key: &str) -> Result<Option<u8>, String> {
     decode_optional_utf8(store, key)?
-        .map(|value| {
-            value
-                .parse::<u8>()
-                .map_err(|e| format!("invalid integer in {key}: {e}"))
-        })
+        .map(|value| value.parse::<u8>().map_err(|e| format!("invalid integer in {key}: {e}")))
         .transpose()
 }
 
@@ -518,10 +499,7 @@ fn ratchet_min_signature_version(
     let current = decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)?.unwrap_or(0);
     if observed > current {
         store
-            .set(
-                MIN_SIGNATURE_VERSION_FLOOR_KEY,
-                observed.to_string().as_bytes(),
-            )
+            .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, observed.to_string().as_bytes())
             .map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -539,15 +517,11 @@ fn enforce_supported_signature_version_floor(store: &dyn PrismSecureStore) -> Re
 }
 
 fn cache_sharing_id(store: &dyn PrismSecureStore, sharing_id: &str) -> Result<(), String> {
-    store
-        .set(SHARING_ID_CACHE_KEY, sharing_id.as_bytes())
-        .map_err(|e| e.to_string())
+    store.set(SHARING_ID_CACHE_KEY, sharing_id.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn clear_sharing_id_cache(store: &dyn PrismSecureStore) -> Result<(), String> {
-    store
-        .delete(SHARING_ID_CACHE_KEY)
-        .map_err(|e| e.to_string())
+    store.delete(SHARING_ID_CACHE_KEY).map_err(|e| e.to_string())
 }
 
 fn validate_cached_sharing_id(
@@ -574,10 +548,7 @@ fn sharing_rotation_needed(store: &dyn PrismSecureStore, sharing_id: &str) -> Re
         return Ok(true);
     }
 
-    store
-        .get("sharing_prekey_store")
-        .map_err(|e| e.to_string())
-        .map(|value| value.is_some())
+    store.get("sharing_prekey_store").map_err(|e| e.to_string()).map(|value| value.is_some())
 }
 
 async fn republish_sharing_identity(
@@ -599,10 +570,8 @@ async fn republish_sharing_identity(
     )
     .map_err(|e| e.to_string())?;
 
-    if let Err(error) = context
-        .relay
-        .publish_identity(sharing_id, &recipient.identity().to_bytes())
-        .await
+    if let Err(error) =
+        context.relay.publish_identity(sharing_id, &recipient.identity().to_bytes()).await
     {
         return Err(format_handle_relay_error(handle, "publish_identity", error).await);
     }
@@ -646,10 +615,8 @@ fn parse_sharing_process_pending_inputs(
         .map_err(|e| format!("Invalid sharing_process_pending context JSON: {e}"))?;
     let mut pinned_identities = HashMap::with_capacity(parsed.pinned_identities.len());
     for (peer_id, encoded_identity) in parsed.pinned_identities {
-        pinned_identities.insert(
-            peer_id,
-            decode_binary_string(&encoded_identity, "pinned_identities")?,
-        );
+        pinned_identities
+            .insert(peer_id, decode_binary_string(&encoded_identity, "pinned_identities")?);
     }
 
     Ok(SharingProcessPendingInputs {
@@ -673,9 +640,10 @@ fn build_sharing_relay(
         .ed25519_keypair(&device_id)
         .map_err(|e| format!("Failed to derive sharing signing key: {e}"))?
         .into_signing_key();
-    let ml_dsa_signing_key = device_secret
-        .ml_dsa_65_keypair_v(&device_id, ml_dsa_key_generation)
-        .map_err(|e| format!("Failed to derive sharing ML-DSA signing key: {e}"))?;
+    let ml_dsa_signing_key =
+        device_secret
+            .ml_dsa_65_keypair_v(&device_id, ml_dsa_key_generation)
+            .map_err(|e| format!("Failed to derive sharing ML-DSA signing key: {e}"))?;
     let relay = ServerSharingRelay::new(
         relay_url,
         session_token,
@@ -705,9 +673,7 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
             inner.relay_url().map(str::to_string),
             inner.sync_service().sync_id().map(str::to_string),
             inner.device_id().map(str::to_string),
-            inner
-                .device_secret()
-                .map(|secret| secret.as_bytes().to_vec()),
+            inner.device_secret().map(|secret| secret.as_bytes().to_vec()),
             inner.export_dek().map_err(|e| e.to_string())?,
         )
     };
@@ -753,13 +719,12 @@ async fn load_device_ml_dsa_generation(
     device_id: String,
 ) -> Result<u32, String> {
     let lookup_device_id = device_id.clone();
-    let record = tokio::task::spawn_blocking(move || {
-        storage.get_device_record(&sync_id, &lookup_device_id)
-    })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("device {device_id} not in local registry"))?;
+    let record =
+        tokio::task::spawn_blocking(move || storage.get_device_record(&sync_id, &lookup_device_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("device {device_id} not in local registry"))?;
 
     Ok(record.ml_dsa_key_generation)
 }
@@ -795,9 +760,7 @@ pub struct MemorySecureStore {
 
 impl MemorySecureStore {
     pub fn new() -> Self {
-        Self {
-            data: std::sync::Mutex::new(HashMap::new()),
-        }
+        Self { data: std::sync::Mutex::new(HashMap::new()) }
     }
 
     /// Return a copy of all stored entries (for draining back to Dart).
@@ -902,10 +865,8 @@ pub fn create_prism_sync(
     }
     .map_err(|e| format!("Failed to create storage: {e}"))?;
 
-    let mut builder = PrismSync::builder()
-        .schema(schema)
-        .storage(Arc::new(storage))
-        .relay_url(&relay_url);
+    let mut builder =
+        PrismSync::builder().schema(schema).storage(Arc::new(storage)).relay_url(&relay_url);
 
     if allow_insecure {
         builder = builder.allow_insecure_transport();
@@ -943,10 +904,7 @@ pub async fn initialize(
     // Mutex synchronously, which is safe inside spawn_blocking.
     let inner = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
-        inner
-            .blocking_lock()
-            .initialize(&password, &secret_key)
-            .map_err(|e| e.to_string())
+        inner.blocking_lock().initialize(&password, &secret_key).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("task failed: {e}"))?
@@ -961,10 +919,7 @@ pub async fn unlock(
     // Same reasoning as initialize — Argon2id must not run on a tokio worker.
     let inner = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
-        inner
-            .blocking_lock()
-            .unlock(&password, &secret_key)
-            .map_err(|e| e.to_string())
+        inner.blocking_lock().unlock(&password, &secret_key).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("task failed: {e}"))?
@@ -984,9 +939,7 @@ pub async fn restore_runtime_keys(
     device_secret: Vec<u8>,
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    inner
-        .restore_runtime_keys(&dek, &device_secret)
-        .map_err(|e| e.to_string())?;
+    inner.restore_runtime_keys(&dek, &device_secret).map_err(|e| e.to_string())?;
 
     // Restore persisted epoch keys (epoch 1+, generated during rekey).
     // Epoch 0 is derived from the DEK by restore_from_dek, but higher epochs
@@ -1058,28 +1011,21 @@ pub fn generate_secret_key() -> Result<String, String> {
 /// Get database encryption key (for consumer's encrypted SQLite).
 pub async fn database_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
     let inner = handle.inner.lock().await;
-    inner
-        .database_key()
-        .map(|k| k.to_vec())
-        .map_err(|e| e.to_string())
+    inner.database_key().map(|k| k.to_vec()).map_err(|e| e.to_string())
 }
 
 /// Derive local storage key (HKDF from DEK + DeviceSecret).
 /// Requires initialize() or restore_runtime_keys() to have been called.
 pub async fn local_storage_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
     let inner = handle.inner.lock().await;
-    inner
-        .local_storage_key()
-        .map(|k| k.to_vec())
-        .map_err(|e| e.to_string())
+    inner.local_storage_key().map(|k| k.to_vec()).map_err(|e| e.to_string())
 }
 
 /// Re-encrypt the Rust sync SQLite database with a new 32-byte key.
 /// Takes Vec<u8> from Dart; validates to exactly 32 bytes.
 pub async fn rekey_db(handle: &PrismSyncHandle, new_key: Vec<u8>) -> Result<(), String> {
-    let key: [u8; 32] = new_key
-        .try_into()
-        .map_err(|_| "rekey_db: key must be exactly 32 bytes".to_string())?;
+    let key: [u8; 32] =
+        new_key.try_into().map_err(|_| "rekey_db: key must be exactly 32 bytes".to_string())?;
     let inner = handle.inner.lock().await;
     inner.rekey_db(&key).map_err(|e| e.to_string())
 }
@@ -1151,10 +1097,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_else(|| handle.relay_url.clone());
-    let device_secret = inner
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
+    let device_secret = inner.secure_store().get("device_secret").map_err(|e| e.to_string())?;
     let ml_dsa_key_generation =
         load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
 
@@ -1270,9 +1213,7 @@ pub async fn record_create(
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
     let fields = parse_fields_json(&fields_json)?;
-    inner
-        .record_create(&table, &entity_id, &fields)
-        .map_err(|e| e.to_string())
+    inner.record_create(&table, &entity_id, &fields).map_err(|e| e.to_string())
 }
 
 /// Record field updates on an existing entity.
@@ -1286,9 +1227,7 @@ pub async fn record_update(
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
     let fields = parse_fields_json(&changed_fields_json)?;
-    inner
-        .record_update(&table, &entity_id, &fields)
-        .map_err(|e| e.to_string())
+    inner.record_update(&table, &entity_id, &fields).map_err(|e| e.to_string())
 }
 
 /// Record entity deletion (soft delete / tombstone).
@@ -1298,9 +1237,7 @@ pub async fn record_delete(
     entity_id: String,
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    inner
-        .record_delete(&table, &entity_id)
-        .map_err(|e| e.to_string())
+    inner.record_delete(&table, &entity_id).map_err(|e| e.to_string())
 }
 
 // ── Sync control ──
@@ -1379,7 +1316,7 @@ pub async fn set_auto_sync(
         // one-off hiccups to multi-minute user-visible delays; the outer
         // loop prevents busy-looping during sustained outages.
         let driver = background_runtime().spawn(async move {
-            use prism_sync_core::sync_service::{SyncTrigger, jittered_delay};
+            use prism_sync_core::sync_service::{jittered_delay, SyncTrigger};
 
             let mut backoff_secs: u64 = 0;
             let mut backoff_attempt: u32 = 0;
@@ -1414,11 +1351,8 @@ pub async fn set_auto_sync(
                             continue;
                         }
 
-                        backoff_secs = if backoff_secs == 0 {
-                            30
-                        } else {
-                            (backoff_secs * 2).min(300)
-                        };
+                        backoff_secs =
+                            if backoff_secs == 0 { 30 } else { (backoff_secs * 2).min(300) };
                         backoff_attempt += 1;
                         cumulative_backoff_secs += backoff_secs;
 
@@ -1450,9 +1384,8 @@ pub async fn set_auto_sync(
 
                         if let Some(ref tx) = backoff_tx {
                             let tx = tx.clone();
-                            let delay = jittered_delay(
-                                std::time::Duration::from_secs(backoff_secs),
-                            );
+                            let delay =
+                                jittered_delay(std::time::Duration::from_secs(backoff_secs));
                             let task = tokio::spawn(async move {
                                 tokio::time::sleep(delay).await;
                                 let _ = tx.send(SyncTrigger::ManualSync).await;
@@ -1504,11 +1437,7 @@ pub async fn sync_now(handle: &PrismSyncHandle) -> Result<String, String> {
     let result = match inner.sync_now().await {
         Ok(result) => result,
         Err(error) => {
-            if let prism_sync_core::CoreError::Relay {
-                min_signature_version,
-                ..
-            } = &error
-            {
+            if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
                 let _ =
                     ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
             }
@@ -1585,10 +1514,7 @@ pub async fn upload_media(
 /// Download an encrypted media blob from the relay.
 ///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
-pub async fn download_media(
-    handle: &PrismSyncHandle,
-    media_id: String,
-) -> Result<Vec<u8>, String> {
+pub async fn download_media(handle: &PrismSyncHandle, media_id: String) -> Result<Vec<u8>, String> {
     let relay = handle
         .relay
         .lock()
@@ -1613,10 +1539,7 @@ pub async fn upload_pairing_snapshot(
     for_device_id: Option<String>,
 ) -> Result<(), String> {
     let inner = handle.inner.lock().await;
-    inner
-        .upload_pairing_snapshot(Some(ttl_secs), for_device_id)
-        .await
-        .map_err(|e| e.to_string())
+    inner.upload_pairing_snapshot(Some(ttl_secs), for_device_id).await.map_err(|e| e.to_string())
 }
 
 /// Download and apply a snapshot for initial device bootstrap.
@@ -1626,10 +1549,7 @@ pub async fn upload_pairing_snapshot(
 /// SyncEvent so Dart can populate its local database.
 pub async fn bootstrap_from_snapshot(handle: &PrismSyncHandle) -> Result<u64, String> {
     let mut inner = handle.inner.lock().await;
-    let (count, _changes) = inner
-        .bootstrap_from_snapshot()
-        .await
-        .map_err(|e| e.to_string())?;
+    let (count, _changes) = inner.bootstrap_from_snapshot().await.map_err(|e| e.to_string())?;
     Ok(count)
 }
 
@@ -1849,10 +1769,8 @@ pub async fn create_sync_group(
     // Generate the sync_id upfront so the pending state can reference it.
     // The relay is built later via the relay_builder closure, after
     // PairingService resolves sync_id + device_id internally.
-    let sync_id = pending
-        .0
-        .clone()
-        .unwrap_or_else(prism_sync_core::epoch::EpochManager::generate_sync_id);
+    let sync_id =
+        pending.0.clone().unwrap_or_else(prism_sync_core::epoch::EpochManager::generate_sync_id);
 
     let mut inner = handle.inner.lock().await;
     let secure_store = inner.secure_store().clone();
@@ -1900,11 +1818,7 @@ pub async fn create_sync_group(
     let (creds, response) = match create_result {
         Ok(value) => value,
         Err(error) => {
-            if let prism_sync_core::CoreError::Relay {
-                min_signature_version,
-                ..
-            } = &error
-            {
+            if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
                 let _ =
                     ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
             }
@@ -1927,9 +1841,7 @@ pub async fn create_sync_group(
     // the epoch key matches what's in the invite for other devices.
     let secret_key = prism_sync_crypto::mnemonic::to_bytes(&creds.mnemonic)
         .map_err(|e| format!("mnemonic conversion failed: {e}"))?;
-    inner
-        .unlock(&password, &secret_key)
-        .map_err(|e| format!("unlock after create failed: {e}"))?;
+    inner.unlock(&password, &secret_key).map_err(|e| format!("unlock after create failed: {e}"))?;
 
     let device_secret_bytes = inner
         .secure_store()
@@ -1937,9 +1849,7 @@ pub async fn create_sync_group(
         .map_err(|e| e.to_string())?
         .ok_or("device_secret not found after create_sync_group")?;
     let dek = inner.export_dek().map_err(|e| e.to_string())?;
-    inner
-        .restore_runtime_keys(&dek, &device_secret_bytes)
-        .map_err(|e| e.to_string())?;
+    inner.restore_runtime_keys(&dek, &device_secret_bytes).map_err(|e| e.to_string())?;
 
     // Insert the device's own record into the local registry so that
     // configureEngine (which calls load_device_ml_dsa_generation) can
@@ -1965,9 +1875,8 @@ pub async fn create_sync_group(
     let pq_kem_key = device_secret
         .ml_kem_768_keypair(&device_id)
         .map_err(|e| format!("ml_kem derive failed: {e}"))?;
-    let xwing_key = device_secret
-        .xwing_keypair(&device_id)
-        .map_err(|e| format!("xwing derive failed: {e}"))?;
+    let xwing_key =
+        device_secret.xwing_keypair(&device_id).map_err(|e| format!("xwing derive failed: {e}"))?;
 
     let self_record = prism_sync_core::storage::types::DeviceRecord {
         sync_id: response.sync_id.clone(),
@@ -2018,7 +1927,6 @@ pub async fn prepare_pending_device_identity(handle: &PrismSyncHandle) -> Result
     Ok(device_id)
 }
 
-
 // ── Device management ──
 
 /// List devices in the sync group. Returns JSON array.
@@ -2038,10 +1946,7 @@ pub async fn list_devices(
         let inner = handle.inner.lock().await;
         (
             inner.storage().clone(),
-            inner
-                .secure_store()
-                .get("device_secret")
-                .map_err(|e| e.to_string())?,
+            inner.secure_store().get("device_secret").map_err(|e| e.to_string())?,
         )
     };
     let ml_dsa_key_generation =
@@ -2141,10 +2046,7 @@ pub async fn revoke_device(
         let inner = handle.inner.lock().await;
         (
             inner.storage().clone(),
-            inner
-                .secure_store()
-                .get("device_secret")
-                .map_err(|e| e.to_string())?,
+            inner.secure_store().get("device_secret").map_err(|e| e.to_string())?,
         )
     };
     let ml_dsa_key_generation =
@@ -2197,10 +2099,7 @@ pub async fn revoke_and_rekey(
         let inner = handle.inner.lock().await;
         (
             inner.storage().clone(),
-            inner
-                .secure_store()
-                .get("device_secret")
-                .map_err(|e| e.to_string())?,
+            inner.secure_store().get("device_secret").map_err(|e| e.to_string())?,
         )
     };
     let ml_dsa_key_generation =
@@ -2271,10 +2170,7 @@ pub async fn deregister_device(
         let inner = handle.inner.lock().await;
         (
             inner.storage().clone(),
-            inner
-                .secure_store()
-                .get("device_secret")
-                .map_err(|e| e.to_string())?,
+            inner.secure_store().get("device_secret").map_err(|e| e.to_string())?,
         )
     };
     let ml_dsa_key_generation =
@@ -2310,10 +2206,7 @@ pub async fn delete_sync_group(
         let inner = handle.inner.lock().await;
         (
             inner.storage().clone(),
-            inner
-                .secure_store()
-                .get("device_secret")
-                .map_err(|e| e.to_string())?,
+            inner.secure_store().get("device_secret").map_err(|e| e.to_string())?,
         )
     };
     let ml_dsa_key_generation =
@@ -2510,10 +2403,8 @@ pub async fn sharing_enable(
     )
     .map_err(|e| e.to_string())?;
 
-    if let Err(error) = context
-        .relay
-        .publish_identity(&sharing_id, &recipient.identity().to_bytes())
-        .await
+    if let Err(error) =
+        context.relay.publish_identity(&sharing_id, &recipient.identity().to_bytes()).await
     {
         return Err(format_handle_relay_error(handle, "publish_identity", error).await);
     }
@@ -2792,10 +2683,7 @@ pub async fn sharing_process_pending(
             },
         };
 
-        if !seen_init_ids
-            .iter()
-            .any(|seen| seen == &pending_init.init_id)
-        {
+        if !seen_init_ids.iter().any(|seen| seen == &pending_init.init_id) {
             seen_init_ids.push(pending_init.init_id);
         }
         results.push(result);
@@ -2809,9 +2697,7 @@ pub fn sharing_fingerprint(identity_bundle_b64: String) -> Result<String, String
     let identity_bytes = decode_binary_string(&identity_bundle_b64, "identity_bundle")?;
     let identity = SharingIdentityBundle::from_bytes(&identity_bytes)
         .ok_or_else(|| "Invalid sharing identity bundle".to_string())?;
-    identity
-        .verify()
-        .map_err(|e| format!("Invalid sharing identity signature: {e}"))?;
+    identity.verify().map_err(|e| format!("Invalid sharing identity signature: {e}"))?;
 
     Ok(compute_sharing_fingerprint(
         &identity.sharing_id,
@@ -2891,13 +2777,9 @@ pub fn sharing_unwrap_keys(
 /// Used by the sharing/friend-invite system to exchange public keys.
 pub async fn get_identity_public_key(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
     let inner = handle.inner.lock().await;
-    let device_secret = inner
-        .device_secret()
-        .ok_or("Device secret not initialized")?;
+    let device_secret = inner.device_secret().ok_or("Device secret not initialized")?;
     let device_id = inner.device_id().ok_or("Device ID not configured")?;
-    let exchange_key = device_secret
-        .x25519_keypair(device_id)
-        .map_err(|e| e.to_string())?;
+    let exchange_key = device_secret.x25519_keypair(device_id).map_err(|e| e.to_string())?;
     Ok(exchange_key.public_key_bytes().to_vec())
 }
 
@@ -2908,19 +2790,12 @@ pub async fn perform_ecdh(
     peer_public_key: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     if peer_public_key.len() != 32 {
-        return Err(format!(
-            "peer public key must be 32 bytes, got {}",
-            peer_public_key.len()
-        ));
+        return Err(format!("peer public key must be 32 bytes, got {}", peer_public_key.len()));
     }
     let inner = handle.inner.lock().await;
-    let device_secret = inner
-        .device_secret()
-        .ok_or("Device secret not initialized")?;
+    let device_secret = inner.device_secret().ok_or("Device secret not initialized")?;
     let device_id = inner.device_id().ok_or("Device ID not configured")?;
-    let exchange_key = device_secret
-        .x25519_keypair(device_id)
-        .map_err(|e| e.to_string())?;
+    let exchange_key = device_secret.x25519_keypair(device_id).map_err(|e| e.to_string())?;
     let mut peer_arr = [0u8; 32];
     peer_arr.copy_from_slice(&peer_public_key);
     Ok(exchange_key.diffie_hellman(&peer_arr))
@@ -3000,9 +2875,7 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
     {
         Ok(value) => value,
         Err(error) => {
-            return Err(
-                encode_handle_core_error(handle, "start_bootstrap_pairing", error).await,
-            );
+            return Err(encode_handle_core_error(handle, "start_bootstrap_pairing", error).await);
         }
     };
 
@@ -3104,9 +2977,18 @@ pub async fn complete_joiner_ceremony(
     let relay_url = handle.relay_url.clone();
     let allow_insecure = handle.allow_insecure;
 
-    let inner = handle.inner.lock().await;
-    let pairing = PairingService::new(inner.secure_store().clone());
-    drop(inner);
+    let (pairing, fallback_registration_token) = {
+        let inner = handle.inner.lock().await;
+        let fallback_registration_token = inner
+            .secure_store()
+            .get("registration_token")
+            .map_err(|e| e.to_string())?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|e| format!("invalid registration token: {e}"))?
+            .filter(|token| !token.is_empty());
+        (PairingService::new(inner.secure_store().clone()), fallback_registration_token)
+    };
 
     // complete_bootstrap_join handles: confirmation MAC, wait for credentials,
     // decrypt, register, persist, post joiner bundle
@@ -3117,6 +2999,13 @@ pub async fn complete_joiner_ceremony(
             &[],
             &password,
             |sync_id, device_id, registration_token| {
+                // Fresh-install onboarding can seed a manual token locally
+                // before pairing starts. Use it when the inviter bundle does
+                // not already carry a relay registration token.
+                let registration_token = registration_token
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| fallback_registration_token.clone());
                 build_relay(
                     &relay_url,
                     sync_id,
@@ -3125,7 +3014,7 @@ pub async fn complete_joiner_ceremony(
                     None,
                     0,
                     allow_insecure,
-                    registration_token.map(str::to_string),
+                    registration_token,
                 )
                 .map(|r| r as Arc<dyn SyncRelay>)
                 .map_err(prism_sync_core::CoreError::Engine)
@@ -3135,9 +3024,7 @@ pub async fn complete_joiner_ceremony(
     {
         Ok(value) => value,
         Err(error) => {
-            return Err(
-                encode_handle_core_error(handle, "complete_bootstrap_join", error).await,
-            );
+            return Err(encode_handle_core_error(handle, "complete_bootstrap_join", error).await);
         }
     };
 
@@ -3165,9 +3052,7 @@ pub async fn complete_joiner_ceremony(
         .get("device_secret")
         .map_err(|e| e.to_string())?
         .ok_or("device_secret not found after join")?;
-    inner
-        .restore_runtime_keys(dek, &device_secret_bytes)
-        .map_err(|e| e.to_string())?;
+    inner.restore_runtime_keys(dek, &device_secret_bytes).map_err(|e| e.to_string())?;
 
     // Restore epoch keys into the live key hierarchy
     let epoch_val = inner
@@ -3241,9 +3126,7 @@ pub async fn start_initiator_ceremony(
     let (ceremony, sas) = match pairing.start_bootstrap_initiator(token, &pairing_relay).await {
         Ok(value) => value,
         Err(error) => {
-            return Err(
-                encode_handle_core_error(handle, "start_bootstrap_initiator", error).await,
-            );
+            return Err(encode_handle_core_error(handle, "start_bootstrap_initiator", error).await);
         }
     };
 
@@ -3313,10 +3196,8 @@ pub async fn complete_initiator_ceremony(
         .map_err(|e| e.to_string())?
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_default();
-    let device_secret_bytes = inner
-        .secure_store()
-        .get("device_secret")
-        .map_err(|e| e.to_string())?;
+    let device_secret_bytes =
+        inner.secure_store().get("device_secret").map_err(|e| e.to_string())?;
     drop(inner);
     let ml_dsa_key_generation =
         load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
@@ -3366,9 +3247,8 @@ pub async fn complete_initiator_ceremony(
             .map_err(|e| format!("read epoch after pairing: {e}"))?
             .and_then(|b| String::from_utf8(b).ok())
             .ok_or_else(|| "epoch missing from secure store after pairing".to_string())?;
-        let new_epoch: u32 = new_epoch_str
-            .parse()
-            .map_err(|e| format!("invalid epoch in secure store: {e}"))?;
+        let new_epoch: u32 =
+            new_epoch_str.parse().map_err(|e| format!("invalid epoch in secure store: {e}"))?;
 
         let current_client_epoch = inner.epoch().unwrap_or(0);
         if (new_epoch as i32) > current_client_epoch {
@@ -3377,9 +3257,8 @@ pub async fn complete_initiator_ceremony(
             // pairing/service.rs post_rekey path); fall back to raw bytes to
             // match the tolerant decode in restore_runtime_keys.
             let key_name = format!("epoch_key_{new_epoch}");
-            if let Some(stored_bytes) = secure_store
-                .get(&key_name)
-                .map_err(|e| format!("read {key_name}: {e}"))?
+            if let Some(stored_bytes) =
+                secure_store.get(&key_name).map_err(|e| format!("read {key_name}: {e}"))?
             {
                 let key_bytes = if let Ok(decoded) = BASE64.decode(&stored_bytes) {
                     if decoded.len() == 32 {
@@ -3400,9 +3279,7 @@ pub async fn complete_initiator_ceremony(
                     .key_hierarchy_mut()
                     .store_epoch_key(new_epoch, zeroize::Zeroizing::new(key_bytes));
             } else {
-                return Err(format!(
-                    "{key_name} missing from secure store after post_rekey"
-                ));
+                return Err(format!("{key_name} missing from secure store after post_rekey"));
             }
 
             // Update sync_metadata.current_epoch so configure_engine on the
@@ -3518,9 +3395,10 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             // Relay is ahead — re-derive the key at relay's generation and
             // update local registry so our next rotation starts from there.
             let relay_gen = relay_self.ml_dsa_key_generation;
-            let synced_ml_dsa = device_secret
-                .ml_dsa_65_keypair_v(&device_id, relay_gen)
-                .map_err(|e| format!("failed to derive ML-DSA key at relay gen {relay_gen}: {e}"))?;
+            let synced_ml_dsa =
+                device_secret.ml_dsa_65_keypair_v(&device_id, relay_gen).map_err(|e| {
+                    format!("failed to derive ML-DSA key at relay gen {relay_gen}: {e}")
+                })?;
             let synced_pk = synced_ml_dsa.public_key_bytes();
 
             let inner = handle.inner.lock().await;
@@ -3528,13 +3406,13 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             let sid = sync_id.clone();
             let did = device_id.clone();
             tokio::task::spawn_blocking(move || {
-                let mut record = storage
-                    .get_device_record(&sid, &did)?
-                    .ok_or_else(|| {
-                        prism_sync_core::error::CoreError::Storage(
-                            prism_sync_core::storage::StorageError::Logic("device not in registry".into()),
-                        )
-                    })?;
+                let mut record = storage.get_device_record(&sid, &did)?.ok_or_else(|| {
+                    prism_sync_core::error::CoreError::Storage(
+                        prism_sync_core::storage::StorageError::Logic(
+                            "device not in registry".into(),
+                        ),
+                    )
+                })?;
                 record.ml_dsa_65_public_key = synced_pk;
                 record.ml_dsa_key_generation = relay_gen;
                 let mut tx = storage.begin_tx()?;
@@ -3576,12 +3454,10 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         let did = device_id.clone();
         let new_pk_for_snapshot = new_pk.clone();
 
-        let device_records = tokio::task::spawn_blocking(move || {
-            storage.list_device_records(&sid)
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        let device_records = tokio::task::spawn_blocking(move || storage.list_device_records(&sid))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
 
         // Build snapshot entries with the rotating device's NEW key
         let entries: Vec<RegistrySnapshotEntry> = device_records
@@ -3626,9 +3502,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         .await
     {
         Ok(resp) => resp,
-        Err(error) => {
-            return Err(format_handle_relay_error(handle, "rotate_ml_dsa", error).await)
-        }
+        Err(error) => return Err(format_handle_relay_error(handle, "rotate_ml_dsa", error).await),
     };
 
     // 5. Update local device registry
@@ -3655,7 +3529,8 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     // After successful rotation, refresh the cached ML-DSA signing key in PrismSync
     // so that subsequent hybrid batch signing uses the new key without requiring
     // a full configure_engine call.
-    inner.refresh_ml_dsa_key(new_gen)
+    inner
+        .refresh_ml_dsa_key(new_gen)
         .map_err(|e| format!("Failed to refresh ML-DSA signing key: {e}"))?;
 
     // 6. Return result as JSON
@@ -3735,21 +3610,13 @@ mod tests {
 
         assert_eq!(
             BASE64
-                .decode(
-                    unwrapped_json["unwrapped_keys"]["read:members"]
-                        .as_str()
-                        .unwrap()
-                )
+                .decode(unwrapped_json["unwrapped_keys"]["read:members"].as_str().unwrap())
                 .unwrap(),
             vec![0x11; 32]
         );
         assert_eq!(
             BASE64
-                .decode(
-                    unwrapped_json["unwrapped_keys"]["read:fronting"]
-                        .as_str()
-                        .unwrap()
-                )
+                .decode(unwrapped_json["unwrapped_keys"]["read:fronting"].as_str().unwrap())
                 .unwrap(),
             vec![0x22; 32]
         );
@@ -3771,9 +3638,7 @@ mod tests {
     #[test]
     fn sharing_rotation_needed_requires_matching_cached_identity() {
         let store = MemorySecureStore::new();
-        store
-            .set(SHARING_ID_CACHE_KEY, b"feedfacefeedfacefeedfacefeedface")
-            .unwrap();
+        store.set(SHARING_ID_CACHE_KEY, b"feedfacefeedfacefeedfacefeedface").unwrap();
 
         let err = sharing_rotation_needed(&store, "deadbeefdeadbeefdeadbeefdeadbeef").unwrap_err();
         assert!(err.contains("bound to a different sharing_id"));
@@ -3783,9 +3648,7 @@ mod tests {
     fn sharing_rotation_needed_detects_cached_active_sharing() {
         let store = MemorySecureStore::new();
         let sharing_id = "feedfacefeedfacefeedfacefeedface";
-        store
-            .set(SHARING_ID_CACHE_KEY, sharing_id.as_bytes())
-            .unwrap();
+        store.set(SHARING_ID_CACHE_KEY, sharing_id.as_bytes()).unwrap();
 
         assert!(sharing_rotation_needed(&store, sharing_id).unwrap());
     }
@@ -3793,9 +3656,7 @@ mod tests {
     #[test]
     fn sharing_rotation_needed_detects_persisted_prekey_state_without_cache() {
         let store = MemorySecureStore::new();
-        store
-            .set("sharing_prekey_store", br#"{"current":null,"previous":[]}"#)
-            .unwrap();
+        store.set("sharing_prekey_store", br#"{"current":null,"previous":[]}"#).unwrap();
 
         assert!(sharing_rotation_needed(&store, "feedfacefeedfacefeedfacefeedface").unwrap());
     }
@@ -3813,11 +3674,7 @@ mod tests {
         let mut backoff_secs: u64 = 0;
         let expected = [30, 60, 120, 240, 300, 300];
         for &exp in &expected {
-            backoff_secs = if backoff_secs == 0 {
-                30
-            } else {
-                (backoff_secs * 2).min(300)
-            };
+            backoff_secs = if backoff_secs == 0 { 30 } else { (backoff_secs * 2).min(300) };
             assert_eq!(backoff_secs, exp);
         }
     }
@@ -3830,11 +3687,7 @@ mod tests {
 
         // Simulate two failures
         for _ in 0..2 {
-            backoff_secs = if backoff_secs == 0 {
-                30
-            } else {
-                (backoff_secs * 2).min(300)
-            };
+            backoff_secs = if backoff_secs == 0 { 30 } else { (backoff_secs * 2).min(300) };
             backoff_attempt += 1;
             cumulative_backoff_secs += backoff_secs;
         }
@@ -3851,11 +3704,7 @@ mod tests {
         assert_eq!(cumulative_backoff_secs, 0);
 
         // Next failure starts fresh at 30
-        backoff_secs = if backoff_secs == 0 {
-            30
-        } else {
-            (backoff_secs * 2).min(300)
-        };
+        backoff_secs = if backoff_secs == 0 { 30 } else { (backoff_secs * 2).min(300) };
         assert_eq!(backoff_secs, 30);
     }
 
@@ -3867,11 +3716,7 @@ mod tests {
         const MAX_CUMULATIVE_SECS: u64 = 600;
 
         loop {
-            backoff_secs = if backoff_secs == 0 {
-                30
-            } else {
-                (backoff_secs * 2).min(300)
-            };
+            backoff_secs = if backoff_secs == 0 { 30 } else { (backoff_secs * 2).min(300) };
             attempts += 1;
             cumulative_backoff_secs += backoff_secs;
 
@@ -3887,10 +3732,8 @@ mod tests {
 
     #[test]
     fn backoff_scheduled_event_json() {
-        let event = prism_sync_core::events::SyncEvent::BackoffScheduled {
-            attempt: 3,
-            delay_secs: 120,
-        };
+        let event =
+            prism_sync_core::events::SyncEvent::BackoffScheduled { attempt: 3, delay_secs: 120 };
         let json = sync_event_to_json(&event);
         assert_eq!(json["type"], "BackoffScheduled");
         assert_eq!(json["attempt"], 3);
