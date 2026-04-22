@@ -3410,11 +3410,14 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     // 2. Get current generation from local device registry
     let sid = sync_id.clone();
     let did = device_id.clone();
-    let current_record = tokio::task::spawn_blocking(move || storage.get_device_record(&sid, &did))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("device {device_id} not in local registry"))?;
+    let current_record = {
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || storage.get_device_record(&sid, &did))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("device {device_id} not in local registry"))?
+    };
 
     let mut current_gen = current_record.ml_dsa_key_generation;
 
@@ -3443,35 +3446,36 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
                 device_secret.ml_dsa_65_keypair_v(&device_id, relay_gen).map_err(|e| {
                     format!("failed to derive ML-DSA key at relay gen {relay_gen}: {e}")
                 })?;
-            let synced_pk = synced_ml_dsa.public_key_bytes();
-
-            let inner = handle.inner.lock().await;
-            let storage = inner.storage().clone();
-            let sid = sync_id.clone();
-            let did = device_id.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut record = storage.get_device_record(&sid, &did)?.ok_or_else(|| {
-                    prism_sync_core::error::CoreError::Storage(
-                        prism_sync_core::storage::StorageError::Logic(
-                            "device not in registry".into(),
-                        ),
-                    )
-                })?;
-                record.ml_dsa_65_public_key = synced_pk;
-                record.ml_dsa_key_generation = relay_gen;
-                let mut tx = storage.begin_tx()?;
-                tx.upsert_device_record(&record)?;
-                tx.commit()
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+            set_local_device_ml_dsa_state(
+                storage.clone(),
+                &sync_id,
+                &device_id,
+                synced_ml_dsa.public_key_bytes(),
+                relay_gen,
+            )
+            .await?;
 
             current_gen = relay_gen;
         }
     }
 
     let new_gen = current_gen + 1;
+    let last_imported_registry_version = {
+        let sid = sync_id.clone();
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .and_then(|meta| meta.last_imported_registry_version)
+    };
+    let relay_registry_version =
+        relay.get_signed_registry().await.ok().flatten().map(|response| response.registry_version);
+    let next_registry_version = next_registry_snapshot_version(
+        relay_registry_version,
+        last_imported_registry_version,
+        current_gen,
+    );
 
     // 3. Create continuity proof (cross-signed by old and new ML-DSA keys)
     let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof::create(
@@ -3527,7 +3531,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             })
             .collect();
 
-        let snapshot = SignedRegistrySnapshot::new(entries, new_gen as i64);
+        let snapshot = SignedRegistrySnapshot::new(entries, next_registry_version);
 
         // Sign with Ed25519 (unchanged) + OLD ML-DSA key (what peers have pinned)
         let ed25519_key = device_secret
@@ -3541,48 +3545,281 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     };
 
     // 4. Submit rotation to relay
-    let response = match relay
+    let final_generation = match relay
         .rotate_ml_dsa(&device_id, &new_pk, new_gen, &proof, Some(&signed_snapshot))
         .await
     {
-        Ok(resp) => resp,
-        Err(error) => return Err(format_handle_relay_error(handle, "rotate_ml_dsa", error).await),
+        Ok(response) => {
+            let storage = storage.clone();
+            let sid = sync_id.clone();
+            let did = device_id.clone();
+            let proof_clone = proof.clone();
+            let new_pk_clone = new_pk.clone();
+            tokio::task::spawn_blocking(move || {
+                DeviceRegistryManager::accept_ml_dsa_rotation(
+                    storage.as_ref(),
+                    &sid,
+                    &did,
+                    &new_pk_clone,
+                    new_gen,
+                    &proof_clone,
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            response.ml_dsa_key_generation
+        }
+        Err(error) => {
+            if error.is_retryable()
+                && reconcile_ml_dsa_rotation_commit(
+                    storage.clone(),
+                    relay.as_ref(),
+                    &sync_id,
+                    &device_id,
+                    new_gen,
+                    &new_pk,
+                )
+                .await
+            {
+                tracing::info!(
+                    device_id = %device_id,
+                    generation = new_gen,
+                    "rotate_ml_dsa_key: reconciled ambiguous relay failure after remote commit"
+                );
+                new_gen
+            } else {
+                return Err(format_handle_relay_error(handle, "rotate_ml_dsa", error).await);
+            }
+        }
     };
 
-    // 5. Update local device registry
+    // After successful rotation, refresh the cached ML-DSA signing key in PrismSync
+    // so that subsequent hybrid batch signing uses the new key without requiring
+    // a full configure_engine call.
     let mut inner = handle.inner.lock().await;
-    let storage = inner.storage().clone();
-    let sid = sync_id.clone();
-    let did = device_id.clone();
-    let proof_clone = proof.clone();
-    let new_pk_clone = new_pk.clone();
+    inner
+        .refresh_ml_dsa_key(final_generation)
+        .map_err(|e| format!("Failed to refresh ML-DSA signing key: {e}"))?;
+
+    // 6. Return result as JSON
+    let result = serde_json::json!({
+        "ml_dsa_key_generation": final_generation,
+        "device_id": device_id,
+    });
+    Ok(result.to_string())
+}
+
+async fn set_local_device_ml_dsa_state(
+    storage: Arc<dyn SyncStorage>,
+    sync_id: &str,
+    device_id: &str,
+    public_key: Vec<u8>,
+    generation: u32,
+) -> Result<(), String> {
+    let sid = sync_id.to_string();
+    let did = device_id.to_string();
     tokio::task::spawn_blocking(move || {
-        DeviceRegistryManager::accept_ml_dsa_rotation(
-            storage.as_ref(),
-            &sid,
-            &did,
-            &new_pk_clone,
-            new_gen,
-            &proof_clone,
-        )
+        let mut record = storage.get_device_record(&sid, &did)?.ok_or_else(|| {
+            prism_sync_core::error::CoreError::Storage(
+                prism_sync_core::storage::StorageError::Logic("device not in registry".into()),
+            )
+        })?;
+        record.ml_dsa_65_public_key = public_key;
+        record.ml_dsa_key_generation = generation;
+        let mut tx = storage.begin_tx()?;
+        tx.upsert_device_record(&record)?;
+        tx.commit()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+async fn import_signed_registry(
+    storage: Arc<dyn SyncStorage>,
+    sync_id: &str,
+    artifact_blob: Vec<u8>,
+) -> Result<i64, String> {
+    let sid = sync_id.to_string();
+    let last_imported_version = {
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .and_then(|meta| meta.last_imported_registry_version)
+    };
+
+    let sid = sync_id.to_string();
+    let signed_version = {
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            DeviceRegistryManager::verify_and_import_signed_registry(
+                storage.as_ref(),
+                &sid,
+                &artifact_blob,
+                last_imported_version,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+    };
+
+    let sid = sync_id.to_string();
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut tx = storage.begin_tx()?;
+        tx.update_last_imported_registry_version(&sid, signed_version)?;
+        tx.commit()
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
 
-    // After successful rotation, refresh the cached ML-DSA signing key in PrismSync
-    // so that subsequent hybrid batch signing uses the new key without requiring
-    // a full configure_engine call.
-    inner
-        .refresh_ml_dsa_key(new_gen)
-        .map_err(|e| format!("Failed to refresh ML-DSA signing key: {e}"))?;
+    Ok(signed_version)
+}
 
-    // 6. Return result as JSON
-    let result = serde_json::json!({
-        "ml_dsa_key_generation": response.ml_dsa_key_generation,
-        "device_id": device_id,
-    });
-    Ok(result.to_string())
+async fn reconcile_ml_dsa_rotation_commit(
+    storage: Arc<dyn SyncStorage>,
+    relay: &dyn SyncRelay,
+    sync_id: &str,
+    device_id: &str,
+    expected_new_gen: u32,
+    expected_new_pk: &[u8],
+) -> bool {
+    let relay_devices = match relay.list_devices().await {
+        Ok(devices) => devices,
+        Err(error) => {
+            tracing::warn!(
+                device_id = %device_id,
+                generation = expected_new_gen,
+                error = %error,
+                "rotate_ml_dsa_key: reconciliation failed to list relay devices"
+            );
+            return false;
+        }
+    };
+
+    let Some(relay_self) = relay_devices.iter().find(|device| device.device_id == device_id) else {
+        tracing::warn!(
+            device_id = %device_id,
+            generation = expected_new_gen,
+            "rotate_ml_dsa_key: reconciliation could not find local device on relay"
+        );
+        return false;
+    };
+
+    if relay_self.ml_dsa_key_generation != expected_new_gen {
+        tracing::info!(
+            device_id = %device_id,
+            expected_generation = expected_new_gen,
+            relay_generation = relay_self.ml_dsa_key_generation,
+            "rotate_ml_dsa_key: reconciliation did not prove relay advanced to target generation"
+        );
+        return false;
+    }
+
+    let signed_registry = match relay.get_signed_registry().await {
+        Ok(Some(response)) => response,
+        Ok(None) => {
+            tracing::info!(
+                device_id = %device_id,
+                generation = expected_new_gen,
+                "rotate_ml_dsa_key: reconciliation found no signed registry artifact"
+            );
+            return false;
+        }
+        Err(error) => {
+            tracing::warn!(
+                device_id = %device_id,
+                generation = expected_new_gen,
+                error = %error,
+                "rotate_ml_dsa_key: reconciliation failed to fetch signed registry"
+            );
+            return false;
+        }
+    };
+
+    if let Err(error) =
+        import_signed_registry(storage.clone(), sync_id, signed_registry.artifact_blob).await
+    {
+        tracing::warn!(
+            device_id = %device_id,
+            generation = expected_new_gen,
+            error = %error,
+            "rotate_ml_dsa_key: reconciliation failed to import signed registry"
+        );
+        return false;
+    }
+
+    let sid = sync_id.to_string();
+    let did = device_id.to_string();
+    match tokio::task::spawn_blocking(move || storage.get_device_record(&sid, &did)).await {
+        Ok(Ok(Some(record))) => {
+            if record.ml_dsa_key_generation == expected_new_gen
+                && record.ml_dsa_65_public_key == expected_new_pk
+            {
+                true
+            } else {
+                tracing::info!(
+                    device_id = %device_id,
+                    expected_generation = expected_new_gen,
+                    local_generation = record.ml_dsa_key_generation,
+                    "rotate_ml_dsa_key: reconciliation imported registry but local record did not match expected key state"
+                );
+                false
+            }
+        }
+        Ok(Ok(None)) => {
+            tracing::warn!(
+                device_id = %device_id,
+                generation = expected_new_gen,
+                "rotate_ml_dsa_key: reconciliation could not find local device after registry import"
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                device_id = %device_id,
+                generation = expected_new_gen,
+                error = %error,
+                "rotate_ml_dsa_key: reconciliation failed to load local device after registry import"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                device_id = %device_id,
+                generation = expected_new_gen,
+                error = %error,
+                "rotate_ml_dsa_key: reconciliation device lookup task failed"
+            );
+            false
+        }
+    }
+}
+
+fn next_registry_snapshot_version(
+    relay_registry_version: Option<i64>,
+    last_imported_registry_version: Option<i64>,
+    current_ml_dsa_generation: u32,
+) -> i64 {
+    // Registry version tracks global device-registry state, not this device's
+    // ML-DSA generation. Prefer the newest registry version we know about, and
+    // only use the local generation as a fallback monotonic floor when no
+    // signed registry artifact has been observed yet.
+    [
+        relay_registry_version,
+        last_imported_registry_version,
+        Some(i64::from(current_ml_dsa_generation)),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0)
+        + 1
 }
 
 /// Get the current ML-DSA key generation for this device.
@@ -3602,7 +3839,120 @@ pub async fn get_ml_dsa_key_generation(handle: &PrismSyncHandle) -> Result<u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use prism_sync_core::relay::{DeviceInfo, MockRelay, SignedRegistryResponse};
     use prism_sync_core::secure_store::SecureStore;
+    use prism_sync_core::storage::RusqliteSyncStorage;
+    use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
+    use std::sync::Arc;
+
+    fn make_device_record(
+        sync_id: &str,
+        device_id: &str,
+        secret: &DeviceSecret,
+        generation: u32,
+    ) -> DeviceRecord {
+        DeviceRecord {
+            sync_id: sync_id.to_string(),
+            device_id: device_id.to_string(),
+            ed25519_public_key: secret
+                .ed25519_keypair(device_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            x25519_public_key: secret
+                .x25519_keypair(device_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            ml_dsa_65_public_key: secret
+                .ml_dsa_65_keypair_v(device_id, generation)
+                .unwrap()
+                .public_key_bytes(),
+            ml_kem_768_public_key: secret.ml_kem_768_keypair(device_id).unwrap().public_key_bytes(),
+            x_wing_public_key: secret.xwing_keypair(device_id).unwrap().encapsulation_key_bytes(),
+            status: "active".to_string(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: generation,
+        }
+    }
+
+    fn make_device_info(
+        sync_id: &str,
+        device_id: &str,
+        secret: &DeviceSecret,
+        generation: u32,
+    ) -> DeviceInfo {
+        let record = make_device_record(sync_id, device_id, secret, generation);
+        DeviceInfo {
+            device_id: record.device_id,
+            epoch: 0,
+            status: record.status,
+            ed25519_public_key: record.ed25519_public_key,
+            x25519_public_key: record.x25519_public_key,
+            ml_dsa_65_public_key: record.ml_dsa_65_public_key,
+            ml_kem_768_public_key: record.ml_kem_768_public_key,
+            x_wing_public_key: record.x_wing_public_key,
+            permission: None,
+            ml_dsa_key_generation: record.ml_dsa_key_generation,
+        }
+    }
+
+    fn seed_rotation_storage(
+        storage: &RusqliteSyncStorage,
+        sync_id: &str,
+        device_id: &str,
+        record: &DeviceRecord,
+        last_imported_registry_version: Option<i64>,
+    ) {
+        let now = Utc::now();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&SyncMetadata {
+            sync_id: sync_id.to_string(),
+            local_device_id: device_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: 0,
+            last_pushed_at: None,
+            last_successful_sync_at: None,
+            registered_at: None,
+            needs_rekey: false,
+            last_imported_registry_version,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+        tx.upsert_device_record(record).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn make_signed_registry_artifact(
+        sync_id: &str,
+        device_id: &str,
+        device_secret: &DeviceSecret,
+        new_generation: u32,
+        registry_version: i64,
+    ) -> Vec<u8> {
+        let ed25519_key = device_secret.ed25519_keypair(device_id).unwrap();
+        let old_ml_dsa_key =
+            device_secret.ml_dsa_65_keypair_v(device_id, new_generation - 1).unwrap();
+        let new_record = make_device_record(sync_id, device_id, device_secret, new_generation);
+        SignedRegistrySnapshot::new(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device_id.to_string(),
+                ed25519_public_key: new_record.ed25519_public_key,
+                x25519_public_key: new_record.x25519_public_key,
+                ml_dsa_65_public_key: new_record.ml_dsa_65_public_key,
+                ml_kem_768_public_key: new_record.ml_kem_768_public_key,
+                x_wing_public_key: new_record.x_wing_public_key,
+                status: "active".to_string(),
+                ml_dsa_key_generation: new_generation,
+            }],
+            registry_version,
+        )
+        .sign_hybrid(&ed25519_key, &old_ml_dsa_key)
+    }
 
     #[test]
     fn decode_binary_string_accepts_hex_and_base64() {
@@ -3797,5 +4147,99 @@ mod tests {
         assert!(mutex.is_poisoned());
         let guard = lock_or_recover(&mutex);
         assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn next_registry_snapshot_version_prefers_relay_registry_state() {
+        assert_eq!(next_registry_snapshot_version(Some(10), Some(7), 1), 11);
+    }
+
+    #[test]
+    fn next_registry_snapshot_version_falls_back_to_local_metadata() {
+        assert_eq!(next_registry_snapshot_version(None, Some(4), 1), 5);
+    }
+
+    #[test]
+    fn next_registry_snapshot_version_uses_generation_only_as_floor() {
+        assert_eq!(next_registry_snapshot_version(None, None, 3), 4);
+    }
+
+    #[tokio::test]
+    async fn reconcile_ml_dsa_rotation_commit_imports_signed_registry() {
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let old_record = make_device_record(sync_id, device_id, &device_secret, 0);
+        let expected_new_pk =
+            device_secret.ml_dsa_65_keypair_v(device_id, 1).unwrap().public_key_bytes();
+        let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+        seed_rotation_storage(storage.as_ref(), sync_id, device_id, &old_record, Some(1));
+
+        let relay = MockRelay::new();
+        relay.add_device(make_device_info(sync_id, device_id, &device_secret, 1));
+        relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: 2,
+            artifact_blob: make_signed_registry_artifact(sync_id, device_id, &device_secret, 1, 2),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        assert!(
+            reconcile_ml_dsa_rotation_commit(
+                storage.clone(),
+                &relay,
+                sync_id,
+                device_id,
+                1,
+                &expected_new_pk,
+            )
+            .await
+        );
+
+        let record = storage.get_device_record(sync_id, device_id).unwrap().unwrap();
+        assert_eq!(record.ml_dsa_key_generation, 1);
+        assert_eq!(record.ml_dsa_65_public_key, expected_new_pk);
+        assert_eq!(
+            storage.get_sync_metadata(sync_id).unwrap().unwrap().last_imported_registry_version,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_ml_dsa_rotation_commit_refuses_unadvanced_relay_state() {
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let old_record = make_device_record(sync_id, device_id, &device_secret, 0);
+        let expected_new_pk =
+            device_secret.ml_dsa_65_keypair_v(device_id, 1).unwrap().public_key_bytes();
+        let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+        seed_rotation_storage(storage.as_ref(), sync_id, device_id, &old_record, Some(1));
+
+        let relay = MockRelay::new();
+        relay.add_device(make_device_info(sync_id, device_id, &device_secret, 0));
+        relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: 2,
+            artifact_blob: make_signed_registry_artifact(sync_id, device_id, &device_secret, 1, 2),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        assert!(
+            !reconcile_ml_dsa_rotation_commit(
+                storage.clone(),
+                &relay,
+                sync_id,
+                device_id,
+                1,
+                &expected_new_pk,
+            )
+            .await
+        );
+
+        let record = storage.get_device_record(sync_id, device_id).unwrap().unwrap();
+        assert_eq!(record.ml_dsa_key_generation, 0);
+        assert_eq!(
+            storage.get_sync_metadata(sync_id).unwrap().unwrap().last_imported_registry_version,
+            Some(1)
+        );
     }
 }

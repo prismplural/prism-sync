@@ -22,7 +22,9 @@ use crate::engine::{SyncConfig, SyncEngine};
 use crate::error::{CoreError, Result};
 use crate::events::{event_channel, SyncEvent};
 use crate::op_emitter::OpEmitter;
-use crate::recovery::{persist_epoch_cache, persist_epoch_key, KeyHierarchyRecoverer};
+use crate::recovery::{
+    commit_recovered_epoch_material, persist_epoch_cache, persist_epoch_key, KeyHierarchyRecoverer,
+};
 use crate::relay::SyncRelay;
 use crate::schema::{SyncSchema, SyncValue};
 use crate::secure_store::SecureStore;
@@ -836,6 +838,12 @@ impl PrismSync {
             .sync_id()
             .ok_or_else(|| CoreError::Engine("sync_id not set".into()))?
             .to_string();
+        let self_device_id = self
+            .device_id()
+            .ok_or_else(|| {
+                CoreError::Engine("device_id not set — call configure_engine first".into())
+            })?
+            .to_string();
 
         // 1. Get current epoch from local metadata
         let storage = self.storage().clone();
@@ -855,46 +863,146 @@ impl PrismSync {
         )
         .await?;
 
-        let committed_epoch = relay
+        let committed_epoch = match relay
             .revoke_device(target_device_id, remote_wipe, new_epoch as i32, wrapped_keys)
             .await
-            .map_err(CoreError::from_relay)? as u32;
+        {
+            Ok(epoch) => epoch as u32,
+            Err(relay_error) => {
+                let error = CoreError::from_relay(relay_error);
+                if !error.is_retryable() {
+                    return Err(error);
+                }
 
-        self.key_hierarchy_mut()
-            .store_epoch_key(committed_epoch, zeroize::Zeroizing::new(epoch_key.to_vec()));
+                if !self
+                    .reconcile_revoke_and_rekey_commit(
+                        relay.as_ref(),
+                        &self_device_id,
+                        target_device_id,
+                        new_epoch,
+                    )
+                    .await
+                {
+                    return Err(error);
+                }
 
-        // 3. Persist new epoch key to secure store
-        if let Ok(epoch_key) = self.key_hierarchy().epoch_key(committed_epoch) {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            let encoded = STANDARD.encode(epoch_key);
-            self.secure_store()
-                .set(&format!("epoch_key_{committed_epoch}"), encoded.as_bytes())
-                .map_err(|e| {
-                    CoreError::Storage(StorageError::Logic(format!(
-                        "failed to persist epoch key: {e}"
-                    )))
-                })?;
-        }
-        self.secure_store().set("epoch", committed_epoch.to_string().as_bytes()).map_err(|e| {
-            CoreError::Storage(StorageError::Logic(format!("failed to persist epoch: {e}")))
-        })?;
+                tracing::info!(
+                    device_id = %self_device_id,
+                    target_device_id = %target_device_id,
+                    epoch = new_epoch,
+                    "revoke_and_rekey: reconciled ambiguous relay failure after remote commit"
+                );
+                new_epoch
+            }
+        };
 
-        // 4. Update local epoch in sync metadata
-        let storage = self.storage().clone();
-        let sid = sync_id.clone();
-        let ne = committed_epoch as i32;
-        tokio::task::spawn_blocking(move || {
-            let mut tx = storage.begin_tx()?;
-            tx.update_current_epoch(&sid, ne)?;
-            tx.commit()
-        })
-        .await
-        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
-
-        // 5. Advance runtime epoch so new mutations use the rotated epoch
-        self.advance_epoch(committed_epoch as i32);
+        self.commit_local_epoch_rotation(&sync_id, committed_epoch, epoch_key.as_ref()).await?;
 
         Ok(committed_epoch)
+    }
+
+    async fn reconcile_revoke_and_rekey_commit(
+        &self,
+        relay: &dyn SyncRelay,
+        self_device_id: &str,
+        target_device_id: &str,
+        expected_epoch: u32,
+    ) -> bool {
+        let devices = match relay.list_devices().await {
+            Ok(devices) => devices,
+            Err(error) => {
+                tracing::warn!(
+                    device_id = %self_device_id,
+                    target_device_id = %target_device_id,
+                    epoch = expected_epoch,
+                    error = %error,
+                    "revoke_and_rekey: reconciliation failed to list devices"
+                );
+                return false;
+            }
+        };
+
+        let Some(self_device) = devices.iter().find(|device| device.device_id == self_device_id)
+        else {
+            tracing::warn!(
+                device_id = %self_device_id,
+                target_device_id = %target_device_id,
+                epoch = expected_epoch,
+                "revoke_and_rekey: reconciliation could not find local device in relay registry"
+            );
+            return false;
+        };
+
+        if self_device.status != "active" || self_device.epoch != expected_epoch as i32 {
+            tracing::info!(
+                device_id = %self_device_id,
+                target_device_id = %target_device_id,
+                epoch = expected_epoch,
+                relay_status = %self_device.status,
+                relay_epoch = self_device.epoch,
+                "revoke_and_rekey: reconciliation did not prove survivor advanced to new epoch"
+            );
+            return false;
+        }
+
+        let target_not_active = devices
+            .iter()
+            .find(|device| device.device_id == target_device_id)
+            .map(|device| device.status != "active")
+            .unwrap_or(true);
+        if !target_not_active {
+            tracing::info!(
+                device_id = %self_device_id,
+                target_device_id = %target_device_id,
+                epoch = expected_epoch,
+                "revoke_and_rekey: reconciliation did not prove target device was revoked"
+            );
+            return false;
+        }
+
+        match relay.get_rekey_artifact(expected_epoch as i32, self_device_id).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::info!(
+                    device_id = %self_device_id,
+                    target_device_id = %target_device_id,
+                    epoch = expected_epoch,
+                    "revoke_and_rekey: reconciliation found no local rekey artifact"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    device_id = %self_device_id,
+                    target_device_id = %target_device_id,
+                    epoch = expected_epoch,
+                    error = %error,
+                    "revoke_and_rekey: reconciliation failed to fetch local rekey artifact"
+                );
+                false
+            }
+        }
+    }
+
+    async fn commit_local_epoch_rotation(
+        &mut self,
+        sync_id: &str,
+        epoch: u32,
+        epoch_key: &[u8],
+    ) -> Result<()> {
+        commit_recovered_epoch_material(
+            self.storage().clone(),
+            self.secure_store().clone(),
+            sync_id,
+            epoch,
+            epoch_key,
+        )
+        .await?;
+
+        self.key_hierarchy_mut()
+            .store_epoch_key(epoch, zeroize::Zeroizing::new(epoch_key.to_vec()));
+        self.advance_epoch(epoch as i32);
+        Ok(())
     }
 
     fn apply_recovered_epoch_high_water(&mut self) {
@@ -1198,6 +1306,251 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum RevokeBehavior {
+        Success,
+        CommitThenTimeout,
+        TimeoutBeforeCommit,
+    }
+
+    struct RevokeTestRelayState {
+        devices: Vec<DeviceInfo>,
+        artifacts: HashMap<(i32, String), Vec<u8>>,
+        behavior: RevokeBehavior,
+        revoke_calls: u32,
+    }
+
+    struct RevokeTestRelay {
+        state: Mutex<RevokeTestRelayState>,
+    }
+
+    impl RevokeTestRelay {
+        fn new(devices: Vec<DeviceInfo>, behavior: RevokeBehavior) -> Self {
+            Self {
+                state: Mutex::new(RevokeTestRelayState {
+                    devices,
+                    artifacts: HashMap::new(),
+                    behavior,
+                    revoke_calls: 0,
+                }),
+            }
+        }
+
+        fn revoke_calls(&self) -> u32 {
+            self.state.lock().unwrap().revoke_calls
+        }
+
+        fn commit_revoke(
+            state: &mut RevokeTestRelayState,
+            target_device_id: &str,
+            new_epoch: i32,
+            wrapped_keys: HashMap<String, Vec<u8>>,
+        ) {
+            for device in &mut state.devices {
+                if device.device_id == target_device_id {
+                    device.status = "revoked".to_string();
+                    continue;
+                }
+                if device.status == "active" {
+                    device.epoch = new_epoch;
+                }
+            }
+
+            for (device_id, artifact) in wrapped_keys {
+                state.artifacts.insert((new_epoch, device_id), artifact);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SyncTransport for RevokeTestRelay {
+        async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> {
+            unimplemented!()
+        }
+        async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl DeviceRegistry for RevokeTestRelay {
+        async fn get_registration_nonce(
+            &self,
+        ) -> std::result::Result<crate::relay::traits::RegistrationNonceResponse, RelayError>
+        {
+            Ok(crate::relay::traits::RegistrationNonceResponse {
+                nonce: "nonce".to_string(),
+                pow_challenge: None,
+                min_signature_version: None,
+            })
+        }
+
+        async fn register_device(
+            &self,
+            _: RegisterRequest,
+        ) -> std::result::Result<RegisterResponse, RelayError> {
+            unimplemented!()
+        }
+
+        async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
+            Ok(self.state.lock().unwrap().devices.clone())
+        }
+
+        async fn revoke_device(
+            &self,
+            device_id: &str,
+            _: bool,
+            new_epoch: i32,
+            wrapped_keys: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
+            let mut state = self.state.lock().unwrap();
+            state.revoke_calls += 1;
+
+            match state.behavior {
+                RevokeBehavior::Success => {
+                    Self::commit_revoke(&mut state, device_id, new_epoch, wrapped_keys);
+                    Ok(new_epoch)
+                }
+                RevokeBehavior::CommitThenTimeout => {
+                    Self::commit_revoke(&mut state, device_id, new_epoch, wrapped_keys);
+                    Err(RelayError::Timeout { message: "response lost after commit".to_string() })
+                }
+                RevokeBehavior::TimeoutBeforeCommit => Err(RelayError::Timeout {
+                    message: "request timed out before commit".to_string(),
+                }),
+            }
+        }
+
+        async fn deregister(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+
+        async fn rotate_ml_dsa(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            _: Option<&[u8]>,
+        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+            unimplemented!()
+        }
+
+        async fn get_signed_registry(
+            &self,
+        ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl EpochManagement for RevokeTestRelay {
+        async fn post_rekey_artifacts(
+            &self,
+            _: i32,
+            _: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
+            unimplemented!()
+        }
+
+        async fn get_rekey_artifact(
+            &self,
+            epoch: i32,
+            device_id: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
+            Ok(self.state.lock().unwrap().artifacts.get(&(epoch, device_id.to_string())).cloned())
+        }
+    }
+
+    #[async_trait]
+    impl SnapshotExchange for RevokeTestRelay {
+        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
+            unimplemented!()
+        }
+
+        async fn put_snapshot(
+            &self,
+            _: i32,
+            _: i64,
+            _: Vec<u8>,
+            _: Option<u64>,
+            _: Option<String>,
+            _: String,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl MediaRelay for RevokeTestRelay {
+        async fn upload_media(
+            &self,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+
+        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl SyncRelay for RevokeTestRelay {
+        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+
+        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+
+        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+
+        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+            unimplemented!()
+        }
+
+        async fn dispose(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+    }
+
+    fn make_device_info(
+        device_id: &str,
+        secret: &DeviceSecret,
+        epoch: i32,
+        status: &str,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            device_id: device_id.to_string(),
+            epoch,
+            status: status.to_string(),
+            ed25519_public_key: secret
+                .ed25519_keypair(device_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            x25519_public_key: secret
+                .x25519_keypair(device_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            ml_dsa_65_public_key: secret.ml_dsa_65_keypair(device_id).unwrap().public_key_bytes(),
+            ml_kem_768_public_key: secret.ml_kem_768_keypair(device_id).unwrap().public_key_bytes(),
+            x_wing_public_key: secret.xwing_keypair(device_id).unwrap().encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        }
+    }
+
     fn make_sync() -> PrismSync {
         let schema = SyncSchema::builder()
             .entity("members", |e| {
@@ -1379,5 +1732,115 @@ mod tests {
         let new_key = [0xaau8; 32];
         let result = sync.rekey_db(&new_key);
         assert!(result.is_ok(), "rekey_db should succeed on in-memory storage: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_reconciles_ambiguous_failure_after_remote_commit() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, sync.device_secret().unwrap(), 0, "active"),
+                make_device_info(target_device_id, &target_secret, 0, "active"),
+            ],
+            RevokeBehavior::CommitThenTimeout,
+        ));
+
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
+
+        assert_eq!(committed_epoch, 1);
+        assert_eq!(relay.revoke_calls(), 1);
+        assert_eq!(sync.epoch(), Some(1));
+        assert!(sync.key_hierarchy().has_epoch_key(1));
+        assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 1);
+        assert_eq!(
+            String::from_utf8(sync.secure_store().get("epoch").unwrap().unwrap()).unwrap(),
+            "1"
+        );
+        assert!(sync.secure_store().get("epoch_key_1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_commits_local_state_on_immediate_success() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, sync.device_secret().unwrap(), 0, "active"),
+                make_device_info(target_device_id, &target_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
+
+        assert_eq!(committed_epoch, 1);
+        assert_eq!(relay.revoke_calls(), 1);
+        assert_eq!(sync.epoch(), Some(1));
+        assert!(sync.key_hierarchy().has_epoch_key(1));
+        assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 1);
+        assert!(sync.secure_store().get("epoch_key_1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_returns_original_error_when_ambiguous_failure_did_not_commit() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, sync.device_secret().unwrap(), 0, "active"),
+                make_device_info(target_device_id, &target_secret, 0, "active"),
+            ],
+            RevokeBehavior::TimeoutBeforeCommit,
+        ));
+
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
+
+        let error =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap_err();
+
+        assert!(error.is_retryable(), "timeout should remain classified as retryable");
+        assert_eq!(relay.revoke_calls(), 1);
+        assert_eq!(sync.epoch(), Some(0));
+        assert!(!sync.key_hierarchy().has_epoch_key(1));
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
+        assert!(sync.secure_store().get("epoch").unwrap().is_none());
+        assert!(sync.secure_store().get("epoch_key_1").unwrap().is_none());
     }
 }
