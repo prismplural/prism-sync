@@ -32,6 +32,42 @@ use prism_sync_core::{
 };
 use prism_sync_crypto::DeviceSecret;
 
+/// Initialize a `tracing` subscriber once per process, writing to stderr.
+///
+/// Opt-in via the `PRISM_SYNC_TRACE` env var (treated as an `EnvFilter`
+/// directive). In debug builds, defaults to `prism_sync_core=debug,
+/// prism_sync_ffi=debug` when the var is unset so developers see FFI logs
+/// by default. Release builds stay silent unless the env var is explicitly
+/// set. Calling this more than once is a no-op thanks to `Once`.
+///
+/// Diagnostic-only — do NOT ship production users into a tracing subscriber.
+fn install_trace_subscriber_once() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let directive = std::env::var("PRISM_SYNC_TRACE").ok();
+        let filter = match directive {
+            Some(d) if !d.is_empty() => d,
+            _ => {
+                if cfg!(debug_assertions) {
+                    "prism_sync_core=debug,prism_sync_ffi=debug".to_string()
+                } else {
+                    return; // release + no env var → stay silent
+                }
+            }
+        };
+        let env_filter = match tracing_subscriber::EnvFilter::try_new(&filter) {
+            Ok(f) => f,
+            Err(_) => tracing_subscriber::EnvFilter::new("prism_sync_core=info"),
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .try_init();
+    });
+}
+
 /// Opaque handle wrapping PrismSync for FFI.
 /// Uses tokio::sync::Mutex so async methods can hold the lock across .await.
 /// MUST be Send + Sync for flutter_rust_bridge.
@@ -834,6 +870,8 @@ pub fn create_prism_sync(
     schema_json: String,
     database_key: Option<Vec<u8>>,
 ) -> Result<PrismSyncHandle, String> {
+    install_trace_subscriber_once();
+
     let schema = if schema_json.is_empty() || schema_json == "{}" {
         SyncSchema::builder().build()
     } else {
