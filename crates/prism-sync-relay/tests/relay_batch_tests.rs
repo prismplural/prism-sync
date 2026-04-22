@@ -60,37 +60,17 @@ async fn test_push_pull_roundtrip() {
 
     // Device A pushes a batch
     let envelope = make_test_envelope(&sync_id, &device_a_id, "batch-001", 0);
-    let push_resp = push_signed(
-        &client,
-        &url,
-        &sync_id,
-        &device_a_id,
-        &token_a,
-        &keys_a,
-        &envelope,
-    )
-    .await;
-    assert!(
-        push_resp.status().is_success(),
-        "push failed: {}",
-        push_resp.status()
-    );
+    let push_resp =
+        push_signed(&client, &url, &sync_id, &device_a_id, &token_a, &keys_a, &envelope).await;
+    assert!(push_resp.status().is_success(), "push failed: {}", push_resp.status());
     let push_json: Value = push_resp.json().await.unwrap();
     let server_seq = push_json["server_seq"].as_i64().unwrap();
     assert!(server_seq > 0, "server_seq should be positive");
 
     // Device A pushes a second batch
     let envelope2 = make_test_envelope(&sync_id, &device_a_id, "batch-002", 0);
-    let push_resp2 = push_signed(
-        &client,
-        &url,
-        &sync_id,
-        &device_a_id,
-        &token_a,
-        &keys_a,
-        &envelope2,
-    )
-    .await;
+    let push_resp2 =
+        push_signed(&client, &url, &sync_id, &device_a_id, &token_a, &keys_a, &envelope2).await;
     assert!(push_resp2.status().is_success());
     let push_json2: Value = push_resp2.json().await.unwrap();
     let server_seq2 = push_json2["server_seq"].as_i64().unwrap();
@@ -108,21 +88,13 @@ async fn test_push_pull_roundtrip() {
     let pull_json: Value = pull_resp.json().await.unwrap();
     let batches = pull_json["batches"].as_array().unwrap();
     assert_eq!(batches.len(), 2, "should have 2 batches");
-    assert_eq!(
-        batches[0]["envelope"]["batch_id"].as_str().unwrap(),
-        "batch-001"
-    );
-    assert_eq!(
-        batches[1]["envelope"]["batch_id"].as_str().unwrap(),
-        "batch-002"
-    );
+    assert_eq!(batches[0]["envelope"]["batch_id"].as_str().unwrap(), "batch-001");
+    assert_eq!(batches[1]["envelope"]["batch_id"].as_str().unwrap(), "batch-002");
     assert_eq!(pull_json["max_server_seq"].as_i64().unwrap(), server_seq2);
 
     // Pull since first batch — should only get second
     let pull_resp2 = client
-        .get(format!(
-            "{url}/v1/sync/{sync_id}/changes?since={server_seq}"
-        ))
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since={server_seq}"))
         .header("Authorization", format!("Bearer {token_a}"))
         .header("X-Device-Id", &device_a_id)
         .send()
@@ -132,22 +104,11 @@ async fn test_push_pull_roundtrip() {
     let pull_json2: Value = pull_resp2.json().await.unwrap();
     let batches2 = pull_json2["batches"].as_array().unwrap();
     assert_eq!(batches2.len(), 1, "should only have 1 batch after first");
-    assert_eq!(
-        batches2[0]["envelope"]["batch_id"].as_str().unwrap(),
-        "batch-002"
-    );
+    assert_eq!(batches2[0]["envelope"]["batch_id"].as_str().unwrap(), "batch-002");
 
     // Duplicate push should return same server_seq (idempotent)
-    let push_resp_dup = push_signed(
-        &client,
-        &url,
-        &sync_id,
-        &device_a_id,
-        &token_a,
-        &keys_a,
-        &envelope,
-    )
-    .await;
+    let push_resp_dup =
+        push_signed(&client, &url, &sync_id, &device_a_id, &token_a, &keys_a, &envelope).await;
     assert!(push_resp_dup.status().is_success());
     let dup_json: Value = push_resp_dup.json().await.unwrap();
     assert_eq!(
@@ -173,16 +134,7 @@ async fn test_ack_triggers_pruning() {
     let mut last_seq = 0i64;
     for i in 0..5 {
         let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
-        let resp = push_signed(
-            &client,
-            &url,
-            &sync_id,
-            &device_id,
-            &token,
-            &keys,
-            &envelope,
-        )
-        .await;
+        let resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
         assert!(resp.status().is_success());
         let json: Value = resp.json().await.unwrap();
         last_seq = json["server_seq"].as_i64().unwrap();
@@ -246,10 +198,7 @@ async fn test_ack_triggers_pruning() {
     // Pruning deletes batches with id < safe_prune_seq.
     // safe_prune_seq = min(snapshot_seq_at, min_acked_seq) = min(last_seq, last_seq) = last_seq.
     // Batches with id < last_seq should be pruned; only the last batch (id == last_seq) remains.
-    assert!(
-        remaining <= 1,
-        "expected at most 1 batch after ack+prune, got {remaining}"
-    );
+    assert!(remaining <= 1, "expected at most 1 batch after ack+prune, got {remaining}");
 }
 
 // ───────────────────────────── Test 7: Epoch mismatch on push ───────────
@@ -266,21 +215,9 @@ async fn test_push_rejects_wrong_epoch() {
 
     // Try to push with epoch 5 (current is 0)
     let envelope = make_test_envelope(&sync_id, &device_id, "batch-wrong-epoch", 5);
-    let push_resp = push_signed(
-        &client,
-        &url,
-        &sync_id,
-        &device_id,
-        &token,
-        &keys,
-        &envelope,
-    )
-    .await;
-    assert_eq!(
-        push_resp.status(),
-        403,
-        "push with wrong epoch should be rejected"
-    );
+    let push_resp =
+        push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+    assert_eq!(push_resp.status(), 403, "push with wrong epoch should be rejected");
 }
 
 // ───────────────── Tests: unsigned mutation requests are rejected ──────────
@@ -305,11 +242,7 @@ async fn test_push_rejects_unsigned_request() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "push without signature headers should be rejected"
-    );
+    assert_eq!(resp.status(), 400, "push without signature headers should be rejected");
 }
 
 #[tokio::test]
@@ -331,11 +264,7 @@ async fn test_put_snapshot_rejects_unsigned_request() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "snapshot upload without signature headers should be rejected"
-    );
+    assert_eq!(resp.status(), 400, "snapshot upload without signature headers should be rejected");
 }
 
 #[tokio::test]
@@ -357,9 +286,5 @@ async fn test_ack_rejects_unsigned_request() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "ack without signature headers should be rejected"
-    );
+    assert_eq!(resp.status(), 400, "ack without signature headers should be rejected");
 }

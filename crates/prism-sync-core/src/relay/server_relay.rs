@@ -101,10 +101,7 @@ impl ServerRelay {
 
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.device_session_token),
-            )
+            .header("Authorization", format!("Bearer {}", self.device_session_token))
             .header("X-Device-Id", &self.device_id)
     }
 
@@ -172,10 +169,8 @@ impl ServerRelay {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
                     match json.get("error").and_then(|v| v.as_str()) {
                         Some("device_revoked") => {
-                            let remote_wipe = json
-                                .get("remote_wipe")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
+                            let remote_wipe =
+                                json.get("remote_wipe").and_then(|v| v.as_bool()).unwrap_or(false);
                             return RelayError::DeviceRevoked { remote_wipe };
                         }
                         Some("device_identity_mismatch") => {
@@ -189,9 +184,7 @@ impl ServerRelay {
                         _ => {}
                     }
                 }
-                RelayError::Auth {
-                    message: format!("HTTP {status}: {body}"),
-                }
+                RelayError::Auth { message: format!("HTTP {status}: {body}") }
             }
             403 => {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
@@ -206,19 +199,12 @@ impl ServerRelay {
                             .and_then(|v| v.as_str())
                             .map(str::to_owned)
                             .unwrap_or_else(|| format!("HTTP {status}: {body}"));
-                        return RelayError::UpgradeRequired {
-                            min_signature_version,
-                            message,
-                        };
+                        return RelayError::UpgradeRequired { min_signature_version, message };
                     }
                 }
-                RelayError::Auth {
-                    message: format!("HTTP {status}: {body}"),
-                }
+                RelayError::Auth { message: format!("HTTP {status}: {body}") }
             }
-            408 | 504 => RelayError::Timeout {
-                message: format!("HTTP {status}: {body}"),
-            },
+            408 | 504 => RelayError::Timeout { message: format!("HTTP {status}: {body}") },
             409 => RelayError::EpochRotation {
                 new_epoch: 0, // caller should parse from body
             },
@@ -226,32 +212,21 @@ impl ServerRelay {
                 status_code: status,
                 message: format!("Payload too large: {body}"),
             },
-            500..=599 => RelayError::Server {
-                status_code: status,
-                message: body.to_string(),
-            },
-            _ => RelayError::Protocol {
-                message: format!("Unexpected HTTP {status}: {body}"),
-            },
+            500..=599 => RelayError::Server { status_code: status, message: body.to_string() },
+            _ => RelayError::Protocol { message: format!("Unexpected HTTP {status}: {body}") },
         }
     }
 
     /// Classify a reqwest error into a RelayError.
     fn classify_reqwest_error(err: reqwest::Error) -> RelayError {
         if err.is_timeout() {
-            RelayError::Timeout {
-                message: err.to_string(),
-            }
+            RelayError::Timeout { message: err.to_string() }
         } else if err.is_connect() || err.is_request() {
-            RelayError::Network {
-                message: err.to_string(),
-            }
+            RelayError::Network { message: err.to_string() }
         } else if let Some(status) = err.status() {
             Self::classify_error(status.as_u16(), &err.to_string())
         } else {
-            RelayError::Network {
-                message: err.to_string(),
-            }
+            RelayError::Network { message: err.to_string() }
         }
     }
 
@@ -266,11 +241,7 @@ impl ServerRelay {
 
     /// Build the WebSocket URL from the base HTTP URL.
     fn ws_url(&self) -> String {
-        let scheme = if self.base_url.starts_with("https") {
-            "wss"
-        } else {
-            "ws"
-        };
+        let scheme = if self.base_url.starts_with("https") { "wss" } else { "ws" };
         // Strip the scheme from base_url to get host:port/path.
         let rest = self
             .base_url
@@ -348,24 +319,13 @@ impl SyncTransport for ServerRelay {
                 .map_err(|e| RelayError::Protocol {
                     message: format!("Failed to parse envelope: {e}"),
                 })?;
-            batches.push(ReceivedBatch {
-                server_seq,
-                received_at,
-                envelope,
-            });
+            batches.push(ReceivedBatch { server_seq, received_at, envelope });
         }
 
-        let password_version = json
-            .get("password_version")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
+        let password_version =
+            json.get("password_version").and_then(|v| v.as_i64()).map(|v| v as i32);
 
-        Ok(PullResponse {
-            batches,
-            max_server_seq,
-            min_acked_seq,
-            password_version,
-        })
+        Ok(PullResponse { batches, max_server_seq, min_acked_seq, password_version })
     }
 
     async fn push_changes(&self, batch: OutgoingBatch) -> Result<i64, RelayError> {
@@ -447,11 +407,9 @@ impl DeviceRegistry for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        resp.json::<RegistrationNonceResponse>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse nonce response: {e}"),
-            })
+        resp.json::<RegistrationNonceResponse>().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse nonce response: {e}"),
+        })
     }
 
     async fn register_device(&self, req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
@@ -459,10 +417,8 @@ impl DeviceRegistry for ServerRelay {
 
         let body = build_register_device_body(&req);
 
-        let mut req = self
-            .apply_auth(self.client.post(&url))
-            .json(&body)
-            .timeout(self.request_timeout);
+        let mut req =
+            self.apply_auth(self.client.post(&url)).json(&body).timeout(self.request_timeout);
         if let Some(token) = &self.registration_token {
             req = req.header("X-Registration-Token", token);
         }
@@ -472,18 +428,14 @@ impl DeviceRegistry for ServerRelay {
         if status >= 400 {
             let body_text = resp.text().await.unwrap_or_default();
             if status == 409 {
-                return Err(RelayError::Protocol {
-                    message: format!("HTTP 409: {body_text}"),
-                });
+                return Err(RelayError::Protocol { message: format!("HTTP 409: {body_text}") });
             }
             return Err(Self::classify_error(status, &body_text));
         }
 
-        resp.json::<RegisterResponse>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse register response: {e}"),
-            })
+        resp.json::<RegisterResponse>().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse register response: {e}"),
+        })
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
@@ -503,11 +455,9 @@ impl DeviceRegistry for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        resp.json::<Vec<DeviceInfo>>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse devices response: {e}"),
-            })
+        resp.json::<Vec<DeviceInfo>>().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse devices response: {e}"),
+        })
     }
 
     async fn revoke_device(
@@ -521,10 +471,8 @@ impl DeviceRegistry for ServerRelay {
         let url = format!("{}{}", self.base_url, path);
         debug!("revoke_device_atomic {device_id} remote_wipe={remote_wipe} epoch={new_epoch}");
 
-        let encoded_keys: HashMap<String, String> = wrapped_keys
-            .into_iter()
-            .map(|(k, v)| (k, BASE64.encode(v)))
-            .collect();
+        let encoded_keys: HashMap<String, String> =
+            wrapped_keys.into_iter().map(|(k, v)| (k, BASE64.encode(v))).collect();
         let body = serde_json::json!({
             "new_epoch": new_epoch,
             "remote_wipe": remote_wipe,
@@ -618,11 +566,9 @@ impl DeviceRegistry for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        resp.json::<RotateMlDsaResponse>()
-            .await
-            .map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse rotate-ml-dsa response: {e}"),
-            })
+        resp.json::<RotateMlDsaResponse>().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse rotate-ml-dsa response: {e}"),
+        })
     }
 
     async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
@@ -646,10 +592,9 @@ impl DeviceRegistry for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let response: SignedRegistryResponse =
-            resp.json().await.map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse registry response: {e}"),
-            })?;
+        let response: SignedRegistryResponse = resp.json().await.map_err(|e| {
+            RelayError::Protocol { message: format!("Failed to parse registry response: {e}") }
+        })?;
 
         // Client-side size cap to protect against malicious relay
         if response.artifact_blob.len() > 512 * 1024 {
@@ -677,10 +622,8 @@ impl EpochManagement for ServerRelay {
         debug!("post_rekey_artifacts epoch={epoch}");
 
         // Encode wrapped keys as base64.
-        let encoded_keys: HashMap<String, String> = wrapped_keys
-            .into_iter()
-            .map(|(k, v)| (k, BASE64.encode(v)))
-            .collect();
+        let encoded_keys: HashMap<String, String> =
+            wrapped_keys.into_iter().map(|(k, v)| (k, BASE64.encode(v))).collect();
 
         let body = serde_json::json!({
             "epoch": epoch,
@@ -740,9 +683,7 @@ impl EpochManagement for ServerRelay {
             message: format!("Failed to parse rekey artifact: {e}"),
         })?;
 
-        let wrapped_key = json["wrapped_key"]
-            .as_str()
-            .and_then(|s| BASE64.decode(s).ok());
+        let wrapped_key = json["wrapped_key"].as_str().and_then(|s| BASE64.decode(s).ok());
 
         Ok(wrapped_key)
     }
@@ -776,19 +717,11 @@ impl SnapshotExchange for ServerRelay {
 
         let epoch = json["epoch"].as_i64().unwrap_or(0) as i32;
         let server_seq_at = json["server_seq_at"].as_i64().unwrap_or(0);
-        let data = json["data"]
-            .as_str()
-            .and_then(|s| BASE64.decode(s).ok())
-            .unwrap_or_default();
+        let data = json["data"].as_str().and_then(|s| BASE64.decode(s).ok()).unwrap_or_default();
 
         let sender_device_id = json["sender_device_id"].as_str().unwrap_or("").to_string();
 
-        Ok(Some(SnapshotResponse {
-            epoch,
-            server_seq_at,
-            data,
-            sender_device_id,
-        }))
+        Ok(Some(SnapshotResponse { epoch, server_seq_at, data, sender_device_id }))
     }
 
     async fn put_snapshot(
@@ -912,10 +845,7 @@ impl SyncRelay for ServerRelay {
 
     async fn connect_websocket(&self) -> Result<(), RelayError> {
         let ws_url = self.ws_url();
-        eprintln!(
-            "[prism_relay] connect_websocket url={}",
-            redact_url(&ws_url)
-        );
+        eprintln!("[prism_relay] connect_websocket url={}", redact_url(&ws_url));
         debug!("connect_websocket url={}", redact_url(&ws_url));
 
         let ws = WebSocketClient::new(
@@ -987,17 +917,14 @@ fn build_register_device_body(req: &RegisterRequest) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::ServerRelay;
-    use crate::relay::traits::{RelayError, RegistryApproval, RegisterRequest};
+    use crate::relay::traits::{RegisterRequest, RegistryApproval, RelayError};
 
     #[test]
     fn classify_error_keeps_device_revoked_response_structured() {
         let err =
             ServerRelay::classify_error(401, r#"{"error":"device_revoked","remote_wipe":true}"#);
 
-        assert!(matches!(
-            err,
-            RelayError::DeviceRevoked { remote_wipe: true }
-        ));
+        assert!(matches!(err, RelayError::DeviceRevoked { remote_wipe: true }));
     }
 
     #[test]
@@ -1066,16 +993,11 @@ mod tests {
             .expect("registry approval object");
 
         assert_eq!(
-            approval
-                .get("approver_ml_dsa_65_pk")
-                .and_then(|value| value.as_str())
-                .map(|s| s.len()),
+            approval.get("approver_ml_dsa_65_pk").and_then(|value| value.as_str()).map(|s| s.len()),
             Some(expected_pk.len())
         );
         assert_eq!(
-            approval
-                .get("approver_ml_dsa_65_pk")
-                .and_then(|value| value.as_str()),
+            approval.get("approver_ml_dsa_65_pk").and_then(|value| value.as_str()),
             Some(expected_pk.as_str())
         );
     }

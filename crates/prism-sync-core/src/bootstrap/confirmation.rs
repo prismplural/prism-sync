@@ -245,18 +245,8 @@ mod tests {
     fn make_confirmation_pair(seed: u8) -> (ConfirmationCode, ConfirmationCode) {
         let (ks1, ks2, th) = test_key_schedule_pair(seed);
         (
-            ConfirmationCode::new(
-                BootstrapProfile::SyncPairing,
-                BootstrapVersion::V1,
-                &ks1,
-                th,
-            ),
-            ConfirmationCode::new(
-                BootstrapProfile::SyncPairing,
-                BootstrapVersion::V1,
-                &ks2,
-                th,
-            ),
+            ConfirmationCode::new(BootstrapProfile::SyncPairing, BootstrapVersion::V1, &ks1, th),
+            ConfirmationCode::new(BootstrapProfile::SyncPairing, BootstrapVersion::V1, &ks2, th),
         )
     }
 
@@ -281,10 +271,7 @@ mod tests {
         let words: Vec<&str> = words_str.split('-').collect();
         assert_eq!(words.len(), 3, "expected 3 words, got: {words_str}");
         for word in &words {
-            assert!(
-                SAS_WORDS.contains(word),
-                "word '{word}' not in SAS_WORDS list"
-            );
+            assert!(SAS_WORDS.contains(word), "word '{word}' not in SAS_WORDS list");
         }
     }
 
@@ -293,10 +280,7 @@ mod tests {
         let code = make_confirmation(7);
         let decimal = code.sas_decimal();
         assert_eq!(decimal.len(), 6, "expected 6 digits, got: {decimal}");
-        assert!(
-            decimal.chars().all(|c| c.is_ascii_digit()),
-            "expected all digits, got: {decimal}"
-        );
+        assert!(decimal.chars().all(|c| c.is_ascii_digit()), "expected all digits, got: {decimal}");
     }
 
     #[test]
@@ -333,8 +317,7 @@ mod tests {
     fn confirmation_mac_verify_succeeds() {
         let code = make_confirmation(7);
         let mac = code.confirmation_mac(BootstrapRole::Initiator);
-        code.verify_confirmation(&mac, BootstrapRole::Initiator)
-            .expect("valid MAC should verify");
+        code.verify_confirmation(&mac, BootstrapRole::Initiator).expect("valid MAC should verify");
     }
 
     #[test]
@@ -352,10 +335,7 @@ mod tests {
         let init_mac = code.confirmation_mac(BootstrapRole::Initiator);
         // Verify as responder — should fail
         let result = code.verify_confirmation(&init_mac, BootstrapRole::Responder);
-        assert!(
-            result.is_err(),
-            "initiator MAC verified as responder should fail"
-        );
+        assert!(result.is_err(), "initiator MAC verified as responder should fail");
     }
 
     // ── PublicFingerprint tests ──────────────────────────────────────────
@@ -405,23 +385,15 @@ mod tests {
         let hex = fp.hex();
         assert_eq!(hex.len(), 64, "hex should be 64 chars");
         assert!(
-            hex.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "hex should be lowercase hex: {hex}"
         );
     }
 
     #[test]
     fn sas_words_list_is_unique() {
-        let unique_count = SAS_WORDS
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        assert_eq!(
-            unique_count,
-            SAS_WORDS.len(),
-            "bootstrap SAS word list must be unique"
-        );
+        let unique_count =
+            SAS_WORDS.iter().copied().collect::<std::collections::BTreeSet<_>>().len();
+        assert_eq!(unique_count, SAS_WORDS.len(), "bootstrap SAS word list must be unique");
     }
 }

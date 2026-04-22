@@ -26,6 +26,11 @@ pub struct Metrics {
     pub media_uploads: AtomicU64,
     pub media_downloads: AtomicU64,
     pub media_bytes_uploaded: AtomicU64,
+    // Cached DB-state values refreshed after each cleanup cycle.
+    // Avoids live DB queries on every Prometheus scrape.
+    pub cached_stored_batches: AtomicU64,
+    pub cached_db_size_bytes: AtomicU64,
+    pub cached_freelist_pages: AtomicU64,
 }
 
 impl Metrics {
@@ -62,44 +67,17 @@ impl Metrics {
     /// Snapshot current counter values for flushing to SQLite.
     pub fn snapshot_counters(&self) -> Vec<(&'static str, u64)> {
         vec![
-            (
-                "changesets_pushed",
-                self.changesets_pushed.load(Ordering::Relaxed),
-            ),
-            (
-                "changesets_pulled",
-                self.changesets_pulled.load(Ordering::Relaxed),
-            ),
-            (
-                "changesets_pruned",
-                self.changesets_pruned.load(Ordering::Relaxed),
-            ),
-            (
-                "ws_notifications",
-                self.ws_notifications.load(Ordering::Relaxed),
-            ),
+            ("changesets_pushed", self.changesets_pushed.load(Ordering::Relaxed)),
+            ("changesets_pulled", self.changesets_pulled.load(Ordering::Relaxed)),
+            ("changesets_pruned", self.changesets_pruned.load(Ordering::Relaxed)),
+            ("ws_notifications", self.ws_notifications.load(Ordering::Relaxed)),
             ("auth_failures", self.auth_failures.load(Ordering::Relaxed)),
-            (
-                "snapshots_exchanged",
-                self.snapshots_exchanged.load(Ordering::Relaxed),
-            ),
+            ("snapshots_exchanged", self.snapshots_exchanged.load(Ordering::Relaxed)),
             ("registrations", self.registrations.load(Ordering::Relaxed)),
-            (
-                "vacuum_pages_freed",
-                self.vacuum_pages_freed.load(Ordering::Relaxed),
-            ),
-            (
-                "media_uploads",
-                self.media_uploads.load(Ordering::Relaxed),
-            ),
-            (
-                "media_downloads",
-                self.media_downloads.load(Ordering::Relaxed),
-            ),
-            (
-                "media_bytes_uploaded",
-                self.media_bytes_uploaded.load(Ordering::Relaxed),
-            ),
+            ("vacuum_pages_freed", self.vacuum_pages_freed.load(Ordering::Relaxed)),
+            ("media_uploads", self.media_uploads.load(Ordering::Relaxed)),
+            ("media_downloads", self.media_downloads.load(Ordering::Relaxed)),
+            ("media_bytes_uploaded", self.media_bytes_uploaded.load(Ordering::Relaxed)),
         ]
     }
 }
@@ -151,9 +129,7 @@ impl RateLimiter {
         }
 
         for key in candidates {
-            map.get_mut(&key)
-                .expect("key was just inserted above")
-                .push(now);
+            map.get_mut(&key).expect("key was just inserted above").push(now);
         }
         true
     }
@@ -206,6 +182,32 @@ impl AppState {
             Err(e) => tracing::warn!("failed to load persisted counters: {e}"),
         }
 
+        // Seed DB-state metric cache so the first scrape returns real values.
+        // Cleanup runs after one full interval (~1hr), not immediately, so
+        // without this the cached fields stay 0 until the first cleanup cycle.
+        match db.with_read_conn(|conn| {
+            let stored_batches: u64 =
+                conn.query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0)).unwrap_or(0);
+            let db_size_bytes: u64 = conn
+                .query_row(
+                    "SELECT page_count * page_size \
+                     FROM pragma_page_count(), pragma_page_size()",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let freelist_pages: u64 =
+                conn.query_row("PRAGMA freelist_count;", [], |r| r.get(0)).unwrap_or(0);
+            Ok::<(u64, u64, u64), rusqlite::Error>((stored_batches, db_size_bytes, freelist_pages))
+        }) {
+            Ok((sb, ds, fp)) => {
+                metrics.cached_stored_batches.store(sb, Ordering::Relaxed);
+                metrics.cached_db_size_bytes.store(ds, Ordering::Relaxed);
+                metrics.cached_freelist_pages.store(fp, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!("failed to seed metrics cache: {e}"),
+        }
+
         Self {
             db: Arc::new(db),
             config: Arc::new(config),
@@ -235,10 +237,7 @@ impl AppState {
                     continue;
                 }
                 if sender.send(message.to_string()).await.is_err() {
-                    tracing::debug!(
-                        "Failed to send to device {}, likely disconnected",
-                        device_id
-                    );
+                    tracing::debug!("Failed to send to device {}, likely disconnected", device_id);
                 }
             }
             self.metrics.inc(&self.metrics.ws_notifications);
@@ -251,10 +250,7 @@ impl AppState {
     pub async fn register_ws(&self, sync_id: &str, device_id: &str) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel(WS_CHANNEL_CAPACITY);
         let mut conns = self.ws_connections.write().await;
-        conns
-            .entry(sync_id.to_string())
-            .or_default()
-            .insert(device_id.to_string(), tx);
+        conns.entry(sync_id.to_string()).or_default().insert(device_id.to_string(), tx);
         rx
     }
 
@@ -351,10 +347,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // After window expiry, the next request should be allowed
-        assert!(
-            limiter.check("key", 2, 1),
-            "request after window expiry should be allowed"
-        );
+        assert!(limiter.check("key", 2, 1), "request after window expiry should be allowed");
     }
 
     #[test]

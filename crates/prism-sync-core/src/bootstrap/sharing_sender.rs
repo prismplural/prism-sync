@@ -73,12 +73,7 @@ impl SharingSender {
             &ml_dsa_sk,
         );
 
-        Ok(Self {
-            identity,
-            sharing_id: sharing_id.to_string(),
-            ed25519_sk,
-            ml_dsa_sk,
-        })
+        Ok(Self { identity, sharing_id: sharing_id.to_string(), ed25519_sk, ml_dsa_sk })
     }
 
     /// The sender's sharing identity bundle.
@@ -240,20 +235,11 @@ impl SharingSender {
         // 15. Serialize and upload
         let canonical_bytes = sharing_init.to_bytes();
         relay
-            .upload_sharing_init(
-                &init_id,
-                recipient_sharing_id,
-                &self.sharing_id,
-                &canonical_bytes,
-            )
+            .upload_sharing_init(&init_id, recipient_sharing_id, &self.sharing_id, &canonical_bytes)
             .await
             .map_err(|e| CoreError::Engine(format!("failed to upload sharing init: {e}")))?;
 
-        Ok(SharingInitResult {
-            pairwise_secret,
-            init_id,
-            recipient_identity,
-        })
+        Ok(SharingInitResult { pairwise_secret, init_id, recipient_identity })
     }
 }
 
@@ -314,10 +300,7 @@ mod tests {
             &ml_dsa_sk,
         );
 
-        relay
-            .publish_identity(&requested_sharing_id, &identity.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&requested_sharing_id, &identity.to_bytes()).await.unwrap();
         relay
             .publish_prekey(
                 &requested_sharing_id,

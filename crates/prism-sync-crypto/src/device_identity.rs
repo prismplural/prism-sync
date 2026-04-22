@@ -66,8 +66,7 @@ impl DeviceSecret {
         let info: Vec<u8> = if generation == 0 {
             b"prism_device_ml_dsa_65".to_vec()
         } else {
-            format!("prism_device_ml_dsa_65_v{generation}")
-                .into_bytes()
+            format!("prism_device_ml_dsa_65_v{generation}").into_bytes()
         };
         let seed = kdf::derive_subkey(&self.secret, device_id.as_bytes(), &info)?;
         let mut seed_arr = ml_dsa::B32::try_from(seed.as_slice())
@@ -90,9 +89,7 @@ impl DeviceSecret {
             .map_err(|_| CryptoError::KdfFailed("ML-KEM seed length mismatch".into()))?;
         let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(core::mem::take(&mut seed));
         seed.zeroize();
-        Ok(DevicePqKemKey {
-            decapsulation_key: dk,
-        })
+        Ok(DevicePqKemKey { decapsulation_key: dk })
     }
 
     /// Derive X-Wing hybrid KEM keypair (X25519 + ML-KEM-768).
@@ -104,9 +101,7 @@ impl DeviceSecret {
         seed_arr.copy_from_slice(&seed);
         let dk = crate::pq::hybrid_kem::XWingKem::decapsulation_key_from_bytes(&seed_arr);
         seed_arr.zeroize();
-        Ok(DeviceXWingKey {
-            decapsulation_key: dk,
-        })
+        Ok(DeviceXWingKey { decapsulation_key: dk })
     }
 
     /// Derive X25519 key exchange keypair.
@@ -118,10 +113,7 @@ impl DeviceSecret {
         let secret_key = StaticSecret::from(seed_arr);
         seed_arr.zeroize();
         let public_key = X25519PublicKey::from(&secret_key);
-        Ok(DeviceExchangeKey {
-            secret_key,
-            public_key,
-        })
+        Ok(DeviceExchangeKey { secret_key, public_key })
     }
 }
 
@@ -228,10 +220,7 @@ impl DevicePqKemKey {
     /// Get the encoded encapsulation (public) key bytes (1184 bytes).
     pub fn public_key_bytes(&self) -> Vec<u8> {
         use ml_kem::KeyExport;
-        self.decapsulation_key
-            .encapsulation_key()
-            .to_bytes()
-            .to_vec()
+        self.decapsulation_key.encapsulation_key().to_bytes().to_vec()
     }
 }
 
@@ -248,8 +237,7 @@ impl DeviceXWingKey {
 
     /// Decapsulate an X-Wing ciphertext, recovering the shared secret.
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let ss =
-            crate::pq::hybrid_kem::XWingKem::decapsulate(&self.decapsulation_key, ciphertext)?;
+        let ss = crate::pq::hybrid_kem::XWingKem::decapsulate(&self.decapsulation_key, ciphertext)?;
         Ok(Zeroizing::new(ss))
     }
 }

@@ -11,19 +11,12 @@ async fn main() -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    let json_mode = std::env::var("LOG_FORMAT")
-        .map(|v| v == "json")
-        .unwrap_or(false);
+    let json_mode = std::env::var("LOG_FORMAT").map(|v| v == "json").unwrap_or(false);
 
     if json_mode {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     // Log panics via tracing instead of the default stderr handler.
@@ -57,17 +50,13 @@ async fn main() -> anyhow::Result<()> {
     let cleanup_handle = cleanup::spawn_cleanup_task(Arc::new(state.clone()));
     let app = routes::router(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .context("failed to bind")?;
+    let listener =
+        tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.context("failed to bind")?;
     tracing::info!("prism-sync-relay listening on port {port}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("server error")?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
 
     tracing::info!("shutting down — aborting cleanup task");
     cleanup_handle.abort();

@@ -44,10 +44,7 @@ pub fn xchacha_encrypt_aead(key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid key: {e}")))?;
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let payload = chacha20poly1305::aead::Payload {
-        msg: plaintext,
-        aad,
-    };
+    let payload = chacha20poly1305::aead::Payload { msg: plaintext, aad };
     let ciphertext = cipher
         .encrypt(&nonce, payload)
         .map_err(|e| CryptoError::EncryptionFailed(format!("encryption failed: {e}")))?;
@@ -66,10 +63,7 @@ pub fn xchacha_decrypt_aead(key: &[u8], blob: &[u8], aad: &[u8]) -> Result<Vec<u
     let nonce = XNonce::from_slice(nonce_bytes);
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid key: {e}")))?;
-    let payload = chacha20poly1305::aead::Payload {
-        msg: ciphertext,
-        aad,
-    };
+    let payload = chacha20poly1305::aead::Payload { msg: ciphertext, aad };
     cipher
         .decrypt(nonce, payload)
         .map_err(|_| CryptoError::DecryptionFailed("decryption failed or AAD mismatch".into()))
@@ -84,10 +78,7 @@ pub fn xchacha_encrypt_for_sync(
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid key: {e}")))?;
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let payload = chacha20poly1305::aead::Payload {
-        msg: plaintext,
-        aad,
-    };
+    let payload = chacha20poly1305::aead::Payload { msg: plaintext, aad };
     let ciphertext = cipher
         .encrypt(&nonce, payload)
         .map_err(|e| CryptoError::EncryptionFailed(format!("encryption failed: {e}")))?;
@@ -106,10 +97,7 @@ pub fn xchacha_decrypt_from_sync(
     let nonce = XNonce::from_slice(nonce);
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid key: {e}")))?;
-    let payload = chacha20poly1305::aead::Payload {
-        msg: ciphertext,
-        aad,
-    };
+    let payload = chacha20poly1305::aead::Payload { msg: ciphertext, aad };
     cipher
         .decrypt(nonce, payload)
         .map_err(|_| CryptoError::DecryptionFailed("decryption failed or AAD mismatch".into()))
@@ -175,9 +163,7 @@ pub fn secretbox_wrap(mek: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 /// Unwrap DEK from `nonce || ciphertext+MAC` using XSalsa20-Poly1305.
 pub fn secretbox_unwrap(mek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>> {
     if wrapped.len() < XSALSA_NONCE_LEN + 16 {
-        return Err(CryptoError::DecryptionFailed(
-            "wrapped DEK too short".into(),
-        ));
+        return Err(CryptoError::DecryptionFailed("wrapped DEK too short".into()));
     }
     let (nonce_bytes, ciphertext) = wrapped.split_at(XSALSA_NONCE_LEN);
     let nonce = crypto_secretbox::Nonce::from_slice(nonce_bytes);

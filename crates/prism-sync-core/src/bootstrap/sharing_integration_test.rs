@@ -36,12 +36,7 @@ mod tests {
 
     type SenderResult = Result<(Vec<u8>, Zeroizing<Vec<u8>>, String), crate::error::CoreError>;
     type RecipientResult = Result<
-        (
-            Zeroizing<Vec<u8>>,
-            String,
-            Vec<String>,
-            SharingIdentityBundle,
-        ),
+        (Zeroizing<Vec<u8>>, String, Vec<String>, SharingIdentityBundle),
         crate::error::CoreError,
     >;
 
@@ -92,12 +87,7 @@ mod tests {
             &ml_dsa_sk,
         );
 
-        DerivedIdentity {
-            bundle,
-            ed25519_sk,
-            ml_dsa_sk,
-            sharing_id: sharing_id.to_string(),
-        }
+        DerivedIdentity { bundle, ed25519_sk, ml_dsa_sk, sharing_id: sharing_id.to_string() }
     }
 
     /// Generate a signed prekey for a given identity.
@@ -263,9 +253,7 @@ mod tests {
     ) -> RecipientResult {
         // Replay check
         if seen_init_ids.contains(&init_id.to_string()) {
-            return Err(crate::error::CoreError::Engine(
-                "Duplicate init_id (replay)".into(),
-            ));
+            return Err(crate::error::CoreError::Engine("Duplicate init_id (replay)".into()));
         }
 
         // Parse SharingInit
@@ -378,24 +366,15 @@ mod tests {
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
         // Recipient publishes identity + prekey
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey, dk_seed) = generate_signed_prekey(&recipient, "device-b", "prekey-1", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "prekey-1", &prekey.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "prekey-1", &prekey.to_bytes()).await.unwrap();
 
         // Sender fetches prekey bundle
-        let (identity_bytes, prekey_bytes) = relay
-            .fetch_prekey_bundle(&sid_b)
-            .await
-            .unwrap()
-            .expect("bundle should exist");
+        let (identity_bytes, prekey_bytes) =
+            relay.fetch_prekey_bundle(&sid_b).await.unwrap().expect("bundle should exist");
 
         // Sender initiates
         let (init_bytes, sender_pairwise, init_id) = sender_initiate(
@@ -408,10 +387,7 @@ mod tests {
         .unwrap();
 
         // Upload to relay
-        relay
-            .upload_sharing_init(&init_id, &sid_b, &sid_a, &init_bytes)
-            .await
-            .unwrap();
+        relay.upload_sharing_init(&init_id, &sid_b, &sid_a, &init_bytes).await.unwrap();
 
         // Recipient fetches and processes
         relay.set_sharing_id(&sid_b);
@@ -456,17 +432,11 @@ mod tests {
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
         // Recipient publishes identity + prekey (then goes "offline")
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey, dk_seed) = generate_signed_prekey(&recipient, "device-b", "pk-1", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes()).await.unwrap();
 
         // Sender fetches and initiates while recipient is offline
         let (identity_bytes, prekey_bytes) =
@@ -481,10 +451,7 @@ mod tests {
         )
         .unwrap();
 
-        relay
-            .upload_sharing_init(&init_id, &sid_b, &sid_a, &init_bytes)
-            .await
-            .unwrap();
+        relay.upload_sharing_init(&init_id, &sid_b, &sid_a, &init_bytes).await.unwrap();
 
         // Recipient comes "online" later and fetches
         relay.set_sharing_id(&sid_b);
@@ -524,17 +491,11 @@ mod tests {
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
         // Recipient publishes identity + prekey A
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey_a, dk_seed_a) = generate_signed_prekey(&recipient, "device-b", "pk-a", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-a", &prekey_a.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-a", &prekey_a.to_bytes()).await.unwrap();
 
         // Sender fetches prekey A
         let (identity_bytes, prekey_bytes) =
@@ -543,10 +504,7 @@ mod tests {
         // Recipient rotates to prekey B (prekey A enters grace period)
         let (_prekey_b, _dk_seed_b) =
             generate_signed_prekey(&recipient, "device-b", "pk-b", now + 1);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-b", &_prekey_b.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-b", &_prekey_b.to_bytes()).await.unwrap();
 
         // Sender initiates using prekey A (already fetched)
         let (init_bytes, sender_pairwise, init_id) = sender_initiate(
@@ -558,10 +516,7 @@ mod tests {
         )
         .unwrap();
 
-        relay
-            .upload_sharing_init(&init_id, &sid_b, &sid_a, &init_bytes)
-            .await
-            .unwrap();
+        relay.upload_sharing_init(&init_id, &sid_b, &sid_a, &init_bytes).await.unwrap();
 
         // Recipient processes using prekey A's DK seed (grace period active)
         relay.set_sharing_id(&sid_b);
@@ -597,10 +552,7 @@ mod tests {
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
         // Recipient publishes identity
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         // Create a prekey with created_at 31 days ago
         let now = chrono::Utc::now().timestamp();
@@ -649,17 +601,11 @@ mod tests {
         let ed25519_pk_offset = 1 + 2 + sid_len + 4;
         identity_bytes[ed25519_pk_offset] ^= 0xFF;
 
-        relay
-            .publish_identity(&sid_b, &identity_bytes)
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &identity_bytes).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey, _dk_seed) = generate_signed_prekey(&recipient, "device-b", "pk-1", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes()).await.unwrap();
 
         // Sender fetches
         let (fetched_identity, fetched_prekey) =
@@ -685,17 +631,11 @@ mod tests {
         let (sid_b, sid_b_bytes) = random_sharing_id();
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey, dk_seed) = generate_signed_prekey(&recipient, "device-b", "pk-1", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes()).await.unwrap();
 
         let (identity_bytes, prekey_bytes) =
             relay.fetch_prekey_bundle(&sid_b).await.unwrap().unwrap();
@@ -744,17 +684,11 @@ mod tests {
         let (sid_b, sid_b_bytes) = random_sharing_id();
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey, dk_seed) = generate_signed_prekey(&recipient, "device-b", "pk-1", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes()).await.unwrap();
 
         let (identity_bytes, prekey_bytes) =
             relay.fetch_prekey_bundle(&sid_b).await.unwrap().unwrap();
@@ -850,17 +784,11 @@ mod tests {
         let (sid_b, sid_b_bytes) = random_sharing_id();
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey, dk_seed) = generate_signed_prekey(&recipient, "device-b", "pk-1", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes()).await.unwrap();
 
         let (identity_bytes, prekey_bytes) =
             relay.fetch_prekey_bundle(&sid_b).await.unwrap().unwrap();
@@ -879,10 +807,7 @@ mod tests {
         // Sender C -> Recipient B (need fresh prekey since DK is per-session)
         // Re-publish prekey so sender C can fetch it
         let (prekey2, dk_seed2) = generate_signed_prekey(&recipient, "device-b", "pk-2", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-2", &prekey2.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-2", &prekey2.to_bytes()).await.unwrap();
 
         let (identity_bytes2, prekey_bytes2) =
             relay.fetch_prekey_bundle(&sid_b).await.unwrap().unwrap();
@@ -977,17 +902,11 @@ mod tests {
         let (sid_b, sid_b_bytes) = random_sharing_id();
         let recipient = derive_identity(&dek_b, &sid_b, &sid_b_bytes);
 
-        relay
-            .publish_identity(&sid_b, &recipient.bundle.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&sid_b, &recipient.bundle.to_bytes()).await.unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let (prekey, dk_seed) = generate_signed_prekey(&recipient, "device-b", "pk-1", now);
-        relay
-            .publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes())
-            .await
-            .unwrap();
+        relay.publish_prekey(&sid_b, "device-b", "pk-1", &prekey.to_bytes()).await.unwrap();
 
         let (identity_bytes, prekey_bytes) =
             relay.fetch_prekey_bundle(&sid_b).await.unwrap().unwrap();
@@ -1027,10 +946,7 @@ mod tests {
         // leading to different key schedule, so MAC verification fails)
         let result = recipient_process(&recipient, &dk_seed, &tampered_bytes, &init_id, &[], &[]);
 
-        assert!(
-            result.is_err(),
-            "Tampered kem_ciphertext should cause MAC verification failure"
-        );
+        assert!(result.is_err(), "Tampered kem_ciphertext should cause MAC verification failure");
     }
 
     // ── Additional relay-level test: duplicate init_id on relay ────────────
@@ -1039,14 +955,9 @@ mod tests {
     async fn relay_rejects_duplicate_init_id() {
         let relay = MockSharingRelay::new();
 
-        relay
-            .upload_sharing_init("init-dup", "bob", "alice", b"payload-1")
-            .await
-            .unwrap();
+        relay.upload_sharing_init("init-dup", "bob", "alice", b"payload-1").await.unwrap();
 
-        let result = relay
-            .upload_sharing_init("init-dup", "bob", "alice", b"payload-2")
-            .await;
+        let result = relay.upload_sharing_init("init-dup", "bob", "alice", b"payload-2").await;
 
         assert!(result.is_err(), "Relay should reject duplicate init_id");
     }

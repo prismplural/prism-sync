@@ -49,9 +49,7 @@ pub async fn get_capabilities(
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
 
-    Ok(Json(CapabilitiesResponse {
-        gifs: gif_capabilities(&state.config),
-    }))
+    Ok(Json(CapabilitiesResponse { gifs: gif_capabilities(&state.config) }))
 }
 
 pub async fn get_trending(
@@ -75,10 +73,7 @@ pub async fn search_gifs(
             .await;
     }
 
-    let bounded_query = trimmed
-        .chars()
-        .take(state.config.gif_query_max_len)
-        .collect::<String>();
+    let bounded_query = trimmed.chars().take(state.config.gif_query_max_len).collect::<String>();
     proxy_gif_request(
         &state,
         build_upstream_uri(&state.config, Some(bounded_query), query.per_page)?,
@@ -91,12 +86,7 @@ fn gif_capabilities(config: &Config) -> GifServiceCapabilities {
         GifProviderMode::Disabled => None,
         GifProviderMode::SelfHosted => {
             if config.gif_api_key.is_some() {
-                Some(
-                    config
-                        .gif_public_base_url
-                        .clone()
-                        .unwrap_or_else(|| "/v1/gifs".to_string()),
-                )
+                Some(config.gif_public_base_url.clone().unwrap_or_else(|| "/v1/gifs".to_string()))
             } else {
                 None
             }
@@ -112,7 +102,9 @@ fn gif_capabilities(config: &Config) -> GifServiceCapabilities {
 }
 
 fn enforce_gif_proxy_access(state: &AppState, peer_addr: SocketAddr) -> Result<(), AppError> {
-    if state.config.gif_provider_mode != GifProviderMode::SelfHosted || state.config.gif_api_key.is_none() {
+    if state.config.gif_provider_mode != GifProviderMode::SelfHosted
+        || state.config.gif_api_key.is_none()
+    {
         return Err(AppError::NotFound);
     }
 
@@ -133,18 +125,15 @@ fn build_upstream_uri(
     query: Option<String>,
     per_page: Option<u32>,
 ) -> Result<reqwest::Url, AppError> {
-    let api_key = config
-        .gif_api_key
-        .as_deref()
-        .ok_or(AppError::NotFound)?;
+    let api_key = config.gif_api_key.as_deref().ok_or(AppError::NotFound)?;
     let limit = per_page.unwrap_or(DEFAULT_GIF_LIMIT).clamp(1, MAX_GIF_LIMIT);
     let path = if query.is_some() {
         format!("{}/api/v1/{api_key}/gifs/search", config.gif_api_base_url)
     } else {
         format!("{}/api/v1/{api_key}/gifs/trending", config.gif_api_base_url)
     };
-    let mut url =
-        reqwest::Url::parse(&path).map_err(|_| AppError::Internal("invalid GIF API base URL".into()))?;
+    let mut url = reqwest::Url::parse(&path)
+        .map_err(|_| AppError::Internal("invalid GIF API base URL".into()))?;
     url.query_pairs_mut()
         .append_pair("per_page", &limit.to_string())
         .append_pair("page", "1")
@@ -192,14 +181,8 @@ async fn proxy_gif_request(
 
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )
-        .header(
-            axum::http::header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=60"),
-        )
+        .header(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .header(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=60"))
         .body(Body::from(body))
         .map_err(|e| AppError::Internal(e.to_string()))?)
 }
@@ -277,17 +260,8 @@ mod tests {
 
         assert_eq!(url.path(), "/api/v1/relay-secret/gifs/search");
         assert_eq!(url.query_pairs().find(|(k, _)| k == "q").unwrap().1, "cats");
-        assert_eq!(
-            url.query_pairs()
-                .find(|(k, _)| k == "per_page")
-                .unwrap()
-                .1,
-            "50"
-        );
-        assert_eq!(
-            url.query_pairs().find(|(k, _)| k == "page").unwrap().1,
-            "1"
-        );
+        assert_eq!(url.query_pairs().find(|(k, _)| k == "per_page").unwrap().1, "50");
+        assert_eq!(url.query_pairs().find(|(k, _)| k == "page").unwrap().1, "1");
     }
 
     #[test]
@@ -298,12 +272,6 @@ mod tests {
         let url = build_upstream_uri(&config, None, None).unwrap();
 
         assert_eq!(url.path(), "/api/v1/relay-secret/gifs/trending");
-        assert_eq!(
-            url.query_pairs()
-                .find(|(k, _)| k == "per_page")
-                .unwrap()
-                .1,
-            "30"
-        );
+        assert_eq!(url.query_pairs().find(|(k, _)| k == "per_page").unwrap().1, "30");
     }
 }

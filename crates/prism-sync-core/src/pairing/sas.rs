@@ -353,10 +353,7 @@ fn write_len_prefixed(hasher: &mut Sha256, data: &[u8]) {
 /// Each byte selects a word from the 256-word `SAS_WORDS` list, yielding
 /// 24 bits of entropy (~16.7 million combinations).
 pub fn sas_display_code(transcript_hash: &[u8; 32]) -> String {
-    let words: Vec<&str> = transcript_hash[..3]
-        .iter()
-        .map(|b| SAS_WORDS[*b as usize])
-        .collect();
+    let words: Vec<&str> = transcript_hash[..3].iter().map(|b| SAS_WORDS[*b as usize]).collect();
     words.join("-")
 }
 
@@ -381,11 +378,7 @@ impl SasVerification {
         initiator_ed25519_pk: [u8; 32],
         responder_ed25519_pk: [u8; 32],
     ) -> Self {
-        Self {
-            transcript_hash,
-            initiator_ed25519_pk,
-            responder_ed25519_pk,
-        }
+        Self { transcript_hash, initiator_ed25519_pk, responder_ed25519_pk }
     }
 
     /// The human-readable SAS display code (3 dash-separated words).
@@ -405,11 +398,7 @@ impl SasVerification {
     /// - `true`  → the signature was produced by the **initiator**
     /// - `false` → the signature was produced by the **responder**
     pub fn verify_confirmation(&self, signature: &[u8], is_initiator: bool) -> Result<()> {
-        let pk = if is_initiator {
-            &self.initiator_ed25519_pk
-        } else {
-            &self.responder_ed25519_pk
-        };
+        let pk = if is_initiator { &self.initiator_ed25519_pk } else { &self.responder_ed25519_pk };
         DeviceSigningKey::verify(pk, &self.transcript_hash, signature).map_err(CoreError::Crypto)
     }
 }
@@ -450,21 +439,18 @@ mod tests {
     #[test]
     fn transcript_is_deterministic() {
         let (sid, idev, rdev, ied, red, ix, rx, nonce, relay, ver) = test_params();
-        let h1 = compute_sas_transcript(
-            &sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver,
-        );
-        let h2 = compute_sas_transcript(
-            &sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver,
-        );
+        let h1 =
+            compute_sas_transcript(&sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver);
+        let h2 =
+            compute_sas_transcript(&sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn transcript_changes_with_different_input() {
         let (sid, idev, rdev, ied, red, ix, rx, nonce, relay, ver) = test_params();
-        let h1 = compute_sas_transcript(
-            &sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver,
-        );
+        let h1 =
+            compute_sas_transcript(&sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver);
         // Change sync_id
         let h2 = compute_sas_transcript(
             "different-sync",
@@ -489,27 +475,22 @@ mod tests {
     #[test]
     fn display_code_has_three_words() {
         let (sid, idev, rdev, ied, red, ix, rx, nonce, relay, ver) = test_params();
-        let hash = compute_sas_transcript(
-            &sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver,
-        );
+        let hash =
+            compute_sas_transcript(&sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver);
         let code = sas_display_code(&hash);
         let words: Vec<&str> = code.split('-').collect();
         assert_eq!(words.len(), 3, "display code should be 3 words: {code}");
         // Each word should be from the word list
         for word in &words {
-            assert!(
-                SAS_WORDS.contains(word),
-                "word '{word}' not in SAS_WORDS list"
-            );
+            assert!(SAS_WORDS.contains(word), "word '{word}' not in SAS_WORDS list");
         }
     }
 
     #[test]
     fn display_code_is_deterministic() {
         let (sid, idev, rdev, ied, red, ix, rx, nonce, relay, ver) = test_params();
-        let hash = compute_sas_transcript(
-            &sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver,
-        );
+        let hash =
+            compute_sas_transcript(&sid, &idev, &rdev, &ied, &red, &ix, &rx, &nonce, &relay, ver);
         let code1 = sas_display_code(&hash);
         let code2 = sas_display_code(&hash);
         assert_eq!(code1, code2);

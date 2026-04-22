@@ -154,13 +154,8 @@ struct RegisterRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FirstDeviceAdmissionProof {
-    AndroidKeyAttestation {
-        certificate_chain: Vec<String>,
-    },
-    AppleAppAttest {
-        key_id: String,
-        attestation_object: String,
-    },
+    AndroidKeyAttestation { certificate_chain: Vec<String> },
+    AppleAppAttest { key_id: String, attestation_object: String },
 }
 
 #[derive(Deserialize, Clone)]
@@ -230,9 +225,7 @@ async fn register_device(
         let decoded = hex::decode(&body.ml_dsa_65_public_key)
             .map_err(|_| AppError::BadRequest("Invalid ml_dsa_65_public_key hex"))?;
         if decoded.len() != 1952 {
-            return Err(AppError::BadRequest(
-                "ml_dsa_65_public_key must be 1952 bytes",
-            ));
+            return Err(AppError::BadRequest("ml_dsa_65_public_key must be 1952 bytes"));
         }
         decoded
     };
@@ -242,9 +235,7 @@ async fn register_device(
         let decoded = hex::decode(&body.ml_kem_768_public_key)
             .map_err(|_| AppError::BadRequest("Invalid ml_kem_768_public_key hex"))?;
         if decoded.len() != 1184 {
-            return Err(AppError::BadRequest(
-                "ml_kem_768_public_key must be 1184 bytes",
-            ));
+            return Err(AppError::BadRequest("ml_kem_768_public_key must be 1184 bytes"));
         }
         decoded
     };
@@ -368,10 +359,8 @@ fn check_registration_access(state: &AppState, headers: &HeaderMap) -> Result<()
         return Err(AppError::Forbidden("Registration is disabled"));
     }
     if let Some(expected_token) = &state.config.registration_token {
-        let provided = headers
-            .get("X-Registration-Token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let provided =
+            headers.get("X-Registration-Token").and_then(|v| v.to_str().ok()).unwrap_or("");
         use subtle::ConstantTimeEq;
         let expected_hash = Sha256::digest(expected_token.as_bytes());
         let provided_hash = Sha256::digest(provided.as_bytes());
@@ -410,9 +399,7 @@ fn do_register(
     first_device_group_rate_limit: u32,
     first_device_group_rate_window_secs: u64,
 ) -> Result<String, AppError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let tx = conn.unchecked_transaction().map_err(|e| AppError::Internal(e.to_string()))?;
     let mut created_new_group = false;
     let mut new_device_added = false;
     let mut registry_artifact_kind: Option<&str> = None;
@@ -546,8 +533,7 @@ fn do_register(
             "New device registered"
         );
         db::register_device_with_pq(
-            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
-            epoch,
+            &tx, sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk, epoch,
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
         new_device_added = true;
@@ -627,10 +613,7 @@ fn verify_first_device_admission_proof(
             );
             Ok(())
         }
-        FirstDeviceAdmissionProof::AppleAppAttest {
-            key_id,
-            attestation_object,
-        } => {
+        FirstDeviceAdmissionProof::AppleAppAttest { key_id, attestation_object } => {
             let verification = apple_attestation::verify_apple_app_attest(
                 sync_id,
                 device_id,
@@ -672,9 +655,7 @@ fn has_leading_zero_bits(hash: &[u8], difficulty_bits: u8) -> bool {
     }
 
     let mask = 0xFFu8 << (8 - remaining_bits);
-    hash.get(full_zero_bytes)
-        .map(|byte| byte & mask == 0)
-        .unwrap_or(false)
+    hash.get(full_zero_bytes).map(|byte| byte & mask == 0).unwrap_or(false)
 }
 
 fn client_ip_key(headers: &HeaderMap) -> Option<String> {
@@ -688,10 +669,7 @@ fn client_ip_key(headers: &HeaderMap) -> Option<String> {
     ] {
         if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
             let candidate = if header_name == "forwarded" {
-                value
-                    .split(';')
-                    .find_map(|part| part.trim().strip_prefix("for="))
-                    .unwrap_or(value)
+                value.split(';').find_map(|part| part.trim().strip_prefix("for=")).unwrap_or(value)
             } else {
                 value.split(',').next().unwrap_or(value)
             };
@@ -734,9 +712,7 @@ fn verify_registry_approval(
     // Only accept V3 hybrid approval signatures
     let version_byte = approval_signature_bytes.first().copied();
     if version_byte != Some(0x03) {
-        return Err(AppError::BadRequest(
-            "V3 hybrid approval signature required",
-        ));
+        return Err(AppError::BadRequest("V3 hybrid approval signature required"));
     }
 
     let sig_rest = &approval_signature_bytes[1..];
@@ -748,12 +724,7 @@ fn verify_registry_approval(
     write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
     write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
     hybrid_sig
-        .verify_v3(
-            &approval_data,
-            b"registry_approval",
-            &approver_pk_bytes,
-            &approver_ml_dsa_pk,
-        )
+        .verify_v3(&approval_data, b"registry_approval", &approver_pk_bytes, &approver_ml_dsa_pk)
         .map_err(|_| AppError::Unauthorized)?;
 
     let snapshot_entries = verify_registry_snapshot(
@@ -763,9 +734,8 @@ fn verify_registry_approval(
     )?;
     let snapshot_map = snapshot_entries_by_device(snapshot_entries, sync_id)?;
 
-    let approver_entry = snapshot_map
-        .get(&approval.approver_device_id)
-        .ok_or(AppError::Unauthorized)?;
+    let approver_entry =
+        snapshot_map.get(&approval.approver_device_id).ok_or(AppError::Unauthorized)?;
     if approver_entry.status != "active"
         || approver_entry.ed25519_public_key != approver_pk_bytes
         || approver_entry.ml_dsa_65_public_key != approver_ml_dsa_pk
@@ -799,7 +769,17 @@ fn verify_registry_approval(
         return Err(AppError::DeviceIdentityMismatch);
     }
 
-    let current_entries = current_registry_entries(conn, sync_id)?;
+    // Compare only against active devices. Revoked devices stay in the DB so
+    // historical ops from them still verify, but they are not members of the
+    // current sync group — the initiator builds its approval snapshot from
+    // active devices only (see pairing::service::build_registry_snapshot in
+    // prism-sync-core), so revoked rows here would never match and would
+    // deterministically 409 admission for any group that has ever revoked a
+    // device.
+    let current_entries: Vec<_> = current_registry_entries(conn, sync_id)?
+        .into_iter()
+        .filter(|entry| entry.status == "active")
+        .collect();
     let mut remaining = snapshot_map;
     for current in &current_entries {
         let Some(snapshot_entry) = remaining.remove(&current.device_id) else {
@@ -821,9 +801,7 @@ fn verify_registry_approval(
         1 if remaining.contains_key(device_id) => Ok(approval.signed_registry_snapshot.clone()),
         // Re-registration: device already in registry, all entries matched
         0 => Ok(approval.signed_registry_snapshot.clone()),
-        _ => Err(AppError::Conflict(
-            "Registry approval must add exactly one device",
-        )),
+        _ => Err(AppError::Conflict("Registry approval must add exactly one device")),
     }
 }
 
@@ -835,9 +813,7 @@ fn verify_registry_snapshot(
     // Only accept V3 hybrid format
     let first = signed_snapshot.first().copied();
     if first != Some(0x03) {
-        return Err(AppError::BadRequest(
-            "V3 hybrid signed registry snapshot required",
-        ));
+        return Err(AppError::BadRequest("V3 hybrid signed registry snapshot required"));
     }
 
     verify_registry_snapshot_hybrid(signed_snapshot, approver_ed25519_pk, approver_ml_dsa_pk)
@@ -860,9 +836,7 @@ fn verify_registry_snapshot_hybrid(
         return Err(AppError::BadRequest("signed_registry_snapshot too short"));
     }
     let ed_len = u32::from_le_bytes(
-        remaining[0..4]
-            .try_into()
-            .expect("slice is exactly 4 bytes after length check"),
+        remaining[0..4].try_into().expect("slice is exactly 4 bytes after length check"),
     ) as usize;
     if remaining.len() < 4 + ed_len + 4 {
         return Err(AppError::BadRequest("signed_registry_snapshot truncated"));
@@ -875,9 +849,7 @@ fn verify_registry_snapshot_hybrid(
     ) as usize;
     let signature_len = ml_len_offset + 4 + ml_len;
     if remaining.len() <= signature_len {
-        return Err(AppError::BadRequest(
-            "signed_registry_snapshot missing JSON payload",
-        ));
+        return Err(AppError::BadRequest("signed_registry_snapshot missing JSON payload"));
     }
 
     let signature = HybridSignature::from_bytes(&remaining[..signature_len])
@@ -894,12 +866,7 @@ fn verify_registry_snapshot_hybrid(
         return Err(AppError::Unauthorized);
     }
     signature
-        .verify_v3(
-            &signing_data,
-            b"registry_snapshot",
-            approver_ed25519_pk,
-            approver_ml_dsa_pk,
-        )
+        .verify_v3(&signing_data, b"registry_snapshot", approver_ed25519_pk, approver_ml_dsa_pk)
         .map_err(|_| AppError::Unauthorized)?;
 
     // V3 wire format uses a wrapper object: { "registry_version": i64, "entries": [...] }
@@ -926,9 +893,7 @@ fn snapshot_entries_by_device(
         }
         entry.status = normalize_registry_status(&entry.status)?.to_string();
         if by_device.insert(entry.device_id.clone(), entry).is_some() {
-            return Err(AppError::BadRequest(
-                "Duplicate device_id in registry snapshot",
-            ));
+            return Err(AppError::BadRequest("Duplicate device_id in registry snapshot"));
         }
     }
     Ok(by_device)
@@ -986,7 +951,9 @@ pub(crate) fn sync_registry_state_with_current_devices(
     Ok(())
 }
 
-pub(crate) fn canonical_registry_json(entries: &[RegistrySnapshotEntry]) -> Result<Vec<u8>, AppError> {
+pub(crate) fn canonical_registry_json(
+    entries: &[RegistrySnapshotEntry],
+) -> Result<Vec<u8>, AppError> {
     let mut sorted = entries.to_vec();
     sorted.sort_by(|a, b| a.device_id.cmp(&b.device_id));
     serde_json::to_vec(&sorted).map_err(|e| AppError::Internal(e.to_string()))

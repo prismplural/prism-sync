@@ -50,22 +50,13 @@ pub(crate) async fn run(
     for handle in reg_handles {
         registered_clients.push(handle.await?);
     }
-    let registered = registered_clients
-        .iter()
-        .filter(|c| c.token.is_some())
-        .count();
+    let registered = registered_clients.iter().filter(|c| c.token.is_some()).count();
     println!("Registered {registered}/{num_clients} devices");
 
     // Ramp WS connections
-    println!(
-        "Ramping {registered} WebSocket connections over {}s...",
-        ramp_duration.as_secs()
-    );
-    let ramp_interval = if registered > 0 {
-        ramp_duration / registered as u32
-    } else {
-        Duration::from_secs(1)
-    };
+    println!("Ramping {registered} WebSocket connections over {}s...", ramp_duration.as_secs());
+    let ramp_interval =
+        if registered > 0 { ramp_duration / registered as u32 } else { Duration::from_secs(1) };
 
     let mut ws_handles = Vec::new();
     for client in registered_clients {
@@ -114,10 +105,7 @@ pub(crate) async fn run(
     // Summary
     stats.print_summary(
         "WS Ramp",
-        &format!(
-            "Clients: {registered}\nPeak connected: {}",
-            connected.load(Ordering::Relaxed)
-        ),
+        &format!("Clients: {registered}\nPeak connected: {}", connected.load(Ordering::Relaxed)),
     );
 
     // Drop all WS connections (abort the tasks)

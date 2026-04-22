@@ -29,7 +29,12 @@ impl SimulatedClient {
         }
     }
 
-    pub(crate) async fn register(&mut self, http: &Client, base_url: &str, stats: &Stats) -> Result<()> {
+    pub(crate) async fn register(
+        &mut self,
+        http: &Client,
+        base_url: &str,
+        stats: &Stats,
+    ) -> Result<()> {
         let start = Instant::now();
         match relay::register_device(
             http,
@@ -53,9 +58,7 @@ impl SimulatedClient {
     }
 
     fn token(&self) -> Result<&str> {
-        self.token
-            .as_deref()
-            .ok_or_else(|| anyhow!("not registered"))
+        self.token.as_deref().ok_or_else(|| anyhow!("not registered"))
     }
 
     pub(crate) async fn push(&self, http: &Client, base_url: &str, stats: &Stats) -> Result<i64> {
@@ -86,7 +89,12 @@ impl SimulatedClient {
         Ok(server_seq)
     }
 
-    pub(crate) async fn pull(&mut self, http: &Client, base_url: &str, stats: &Stats) -> Result<i64> {
+    pub(crate) async fn pull(
+        &mut self,
+        http: &Client,
+        base_url: &str,
+        stats: &Stats,
+    ) -> Result<i64> {
         let token = self.token()?;
 
         let start = Instant::now();
@@ -106,9 +114,7 @@ impl SimulatedClient {
         }
 
         let body: Value = resp.json().await?;
-        let max_seq = body["max_server_seq"]
-            .as_i64()
-            .unwrap_or(self.last_server_seq);
+        let max_seq = body["max_server_seq"].as_i64().unwrap_or(self.last_server_seq);
         if max_seq > self.last_server_seq {
             self.last_server_seq = max_seq;
         }
@@ -153,9 +159,7 @@ impl SimulatedClient {
         >,
     > {
         let token = self.token()?;
-        let ws_url = base_url
-            .replacen("http://", "ws://", 1)
-            .replacen("https://", "wss://", 1);
+        let ws_url = base_url.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
         let url = format!("{ws_url}/v1/sync/{}/ws", self.sync_id);
 
         let start = Instant::now();

@@ -151,15 +151,9 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("db_path", &self.db_path)
             .field("port", &self.port)
-            .field(
-                "registration_token",
-                &self.registration_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
             .field("registration_enabled", &self.registration_enabled)
-            .field(
-                "metrics_token",
-                &self.metrics_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("metrics_token", &self.metrics_token.as_ref().map(|_| "[REDACTED]"))
             .field("gif_provider_mode", &self.gif_provider_mode)
             .field("gif_public_base_url", &self.gif_public_base_url)
             .field("gif_prism_base_url", &self.gif_prism_base_url)
@@ -180,9 +174,7 @@ impl Config {
             stale_device_secs: parse_env("STALE_DEVICE_SECS", 2_592_000),
             cleanup_interval_secs: parse_env("CLEANUP_INTERVAL_SECS", 3600),
             max_unpruned_batches: parse_env("MAX_UNPRUNED_BATCHES", 10_000),
-            metrics_token: std::env::var("METRICS_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|s| !s.is_empty()),
             session_expiry_secs: parse_env("SESSION_EXPIRY_SECS", 2_592_000),
             nonce_expiry_secs: parse_env("NONCE_EXPIRY_SECS", 60),
             first_device_pow_difficulty_bits: parse_env("FIRST_DEVICE_POW_DIFFICULTY_BITS", 18),
@@ -198,9 +190,7 @@ impl Config {
                 2_592_000,
             ),
             reader_pool_size: parse_env("READER_POOL_SIZE", 4),
-            node_exporter_url: std::env::var("NODE_EXPORTER_URL")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            node_exporter_url: std::env::var("NODE_EXPORTER_URL").ok().filter(|s| !s.is_empty()),
             first_device_apple_attestation_enabled: parse_bool_env(
                 "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED",
                 false,
@@ -225,9 +215,7 @@ impl Config {
                 "GRAPHENEOS_VERIFIED_BOOT_KEY_ALLOWLIST",
                 Vec::new(),
             ),
-            registration_token: std::env::var("REGISTRATION_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            registration_token: std::env::var("REGISTRATION_TOKEN").ok().filter(|s| !s.is_empty()),
             registration_enabled: parse_bool_env("REGISTRATION_ENABLED", true),
             pairing_session_ttl_secs: parse_env("PAIRING_SESSION_TTL_SECS", 300),
             pairing_session_rate_limit: parse_env("PAIRING_SESSION_RATE_LIMIT", 5),
@@ -268,9 +256,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "https://api.klipy.com".into()),
-            gif_api_key: std::env::var("GIF_API_KEY")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
+            gif_api_key: std::env::var("GIF_API_KEY").ok().filter(|s| !s.trim().is_empty()),
             gif_http_timeout_secs: parse_env("GIF_HTTP_TIMEOUT_SECS", 15),
             gif_request_rate_limit: parse_env("GIF_REQUEST_RATE_LIMIT", 20),
             gif_request_rate_window_secs: parse_env("GIF_REQUEST_RATE_WINDOW_SECS", 60),
@@ -310,10 +296,7 @@ impl Config {
 
     /// Brand-new groups get a much smaller unpruned batch budget until they age out.
     pub fn brand_new_group_max_unpruned_batches(&self) -> u64 {
-        let cap = parse_env(
-            "BRAND_NEW_GROUP_MAX_UNPRUNED_BATCHES",
-            self.max_unpruned_batches / 10,
-        );
+        let cap = parse_env("BRAND_NEW_GROUP_MAX_UNPRUNED_BATCHES", self.max_unpruned_batches / 10);
         cap.max(10).min(self.max_unpruned_batches.max(1))
     }
 
@@ -324,10 +307,7 @@ impl Config {
 
     /// Abandoned brand-new groups are eligible for cleanup after this long.
     pub fn abandoned_brand_new_group_ttl_secs(&self) -> u64 {
-        parse_env(
-            "ABANDONED_BRAND_NEW_GROUP_TTL_SECS",
-            self.sync_inactive_ttl_secs,
-        )
+        parse_env("ABANDONED_BRAND_NEW_GROUP_TTL_SECS", self.sync_inactive_ttl_secs)
     }
 
     /// Resolve the registration token using the priority chain:
@@ -350,9 +330,8 @@ impl Config {
         }
 
         // No env var — try the file next to the database.
-        let db_dir = std::path::Path::new(&self.db_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
+        let db_dir =
+            std::path::Path::new(&self.db_path).parent().unwrap_or(std::path::Path::new("."));
         let token_path = db_dir.join(".registration-token");
 
         if let Ok(contents) = std::fs::read_to_string(&token_path) {
@@ -404,10 +383,7 @@ impl Config {
 }
 
 fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn parse_bool_env(key: &str, default: bool) -> bool {
@@ -430,11 +406,7 @@ fn parse_json_vec_env(key: &str, default: Vec<String>) -> Vec<String> {
 }
 
 fn parse_gif_provider_mode_env(key: &str, default: GifProviderMode) -> GifProviderMode {
-    std::env::var(key)
-        .ok()
-        .as_deref()
-        .and_then(GifProviderMode::parse)
-        .unwrap_or(default)
+    std::env::var(key).ok().as_deref().and_then(GifProviderMode::parse).unwrap_or(default)
 }
 
 fn generate_random_token() -> String {

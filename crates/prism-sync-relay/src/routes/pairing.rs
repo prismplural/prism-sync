@@ -16,22 +16,13 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/pairing", axum::routing::post(create_session))
         .route("/v1/pairing/{rendezvous_id}/bootstrap", get(get_bootstrap))
-        .route(
-            "/v1/pairing/{rendezvous_id}/init",
-            put(put_init).get(get_init),
-        )
+        .route("/v1/pairing/{rendezvous_id}/init", put(put_init).get(get_init))
         .route(
             "/v1/pairing/{rendezvous_id}/confirmation",
             put(put_confirmation).get(get_confirmation),
         )
-        .route(
-            "/v1/pairing/{rendezvous_id}/credentials",
-            put(put_credentials).get(get_credentials),
-        )
-        .route(
-            "/v1/pairing/{rendezvous_id}/joiner",
-            put(put_joiner).get(get_joiner),
-        )
+        .route("/v1/pairing/{rendezvous_id}/credentials", put(put_credentials).get(get_credentials))
+        .route("/v1/pairing/{rendezvous_id}/joiner", put(put_joiner).get(get_joiner))
         .route("/v1/pairing/{rendezvous_id}", delete(delete_session))
 }
 
@@ -97,10 +88,7 @@ async fn create_session(
         "Pairing session created"
     );
 
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(CreateSessionResponse { rendezvous_id }),
-    ))
+    Ok((StatusCode::CREATED, axum::Json(CreateSessionResponse { rendezvous_id })))
 }
 
 // ---------------------------------------------------------------------------

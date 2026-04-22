@@ -69,7 +69,9 @@ pub enum InjectedPullError {
     /// remote wipe). Used to verify that the engine -> sync_service ->
     /// FFI chain propagates the `code` / `remote_wipe` metadata all the
     /// way out to Dart.
-    DeviceRevoked { remote_wipe: bool },
+    DeviceRevoked {
+        remote_wipe: bool,
+    },
 }
 
 /// Full stored batch — keeps the original `SignedBatchEnvelope` so that
@@ -113,11 +115,7 @@ impl MockRelay {
         let mut state = self.state.lock().unwrap();
         let seq = state.next_server_seq;
         state.next_server_seq += 1;
-        state.batches.push(StoredBatch {
-            server_seq: seq,
-            received_at: Utc::now(),
-            envelope,
-        });
+        state.batches.push(StoredBatch { server_seq: seq, received_at: Utc::now(), envelope });
         seq
     }
 
@@ -223,20 +221,17 @@ impl SyncTransport for MockRelay {
             guard.pull_call_count += 1;
             if guard.pull_failures_remaining > 0 {
                 guard.pull_failures_remaining -= 1;
-                let kind = guard
-                    .pull_failure_kind
-                    .unwrap_or(InjectedPullError::Network);
+                let kind = guard.pull_failure_kind.unwrap_or(InjectedPullError::Network);
                 return Err(match kind {
-                    InjectedPullError::Network => RelayError::Network {
-                        message: "mock injected network error".into(),
-                    },
-                    InjectedPullError::Auth => RelayError::Auth {
-                        message: "mock injected auth error".into(),
-                    },
-                    InjectedPullError::Server => RelayError::Server {
-                        status_code: 503,
-                        message: "mock injected 503".into(),
-                    },
+                    InjectedPullError::Network => {
+                        RelayError::Network { message: "mock injected network error".into() }
+                    }
+                    InjectedPullError::Auth => {
+                        RelayError::Auth { message: "mock injected auth error".into() }
+                    }
+                    InjectedPullError::Server => {
+                        RelayError::Server { status_code: 503, message: "mock injected 503".into() }
+                    }
                     InjectedPullError::DeviceRevoked { remote_wipe } => {
                         RelayError::DeviceRevoked { remote_wipe }
                     }
@@ -335,12 +330,9 @@ impl DeviceRegistry for MockRelay {
         let mut state = self.state.lock().unwrap();
 
         // Check the device exists.
-        let device_idx = state
-            .devices
-            .iter()
-            .position(|d| d.device_id == device_id)
-            .ok_or_else(|| RelayError::Protocol {
-                message: format!("device not found: {device_id}"),
+        let device_idx =
+            state.devices.iter().position(|d| d.device_id == device_id).ok_or_else(|| {
+                RelayError::Protocol { message: format!("device not found: {device_id}") }
             })?;
 
         // Check that the new generation is strictly greater than the current one.
@@ -360,13 +352,9 @@ impl DeviceRegistry for MockRelay {
         // Update the device's ML-DSA public key and generation.
         state.devices[device_idx].ml_dsa_65_public_key = new_ml_dsa_pk.to_vec();
         state.devices[device_idx].ml_dsa_key_generation = new_generation;
-        state
-            .ml_dsa_generations
-            .insert(device_id.to_string(), new_generation);
+        state.ml_dsa_generations.insert(device_id.to_string(), new_generation);
 
-        Ok(RotateMlDsaResponse {
-            ml_dsa_key_generation: new_generation,
-        })
+        Ok(RotateMlDsaResponse { ml_dsa_key_generation: new_generation })
     }
 
     async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
@@ -409,12 +397,7 @@ impl SnapshotExchange for MockRelay {
         sender_device_id: String,
     ) -> Result<(), RelayError> {
         let mut state = self.state.lock().unwrap();
-        state.snapshot = Some(SnapshotResponse {
-            epoch,
-            server_seq_at,
-            data,
-            sender_device_id,
-        });
+        state.snapshot = Some(SnapshotResponse { epoch, server_seq_at, data, sender_device_id });
         state.snapshot_target_device_id = for_device_id;
         Ok(())
     }
@@ -428,11 +411,7 @@ impl MediaRelay for MockRelay {
         _content_hash: &str,
         data: Vec<u8>,
     ) -> Result<(), RelayError> {
-        self.state
-            .lock()
-            .unwrap()
-            .media
-            .insert(media_id.to_string(), data);
+        self.state.lock().unwrap().media.insert(media_id.to_string(), data);
         Ok(())
     }
 
@@ -443,10 +422,7 @@ impl MediaRelay for MockRelay {
             .media
             .get(media_id)
             .cloned()
-            .ok_or(RelayError::Server {
-                status_code: 404,
-                message: "Media not found".into(),
-            })
+            .ok_or(RelayError::Server { status_code: 404, message: "Media not found".into() })
     }
 }
 
@@ -527,10 +503,7 @@ mod tests {
         let relay = MockRelay::new();
         let env = make_envelope("batch-1");
         let seq = relay
-            .push_changes(OutgoingBatch {
-                batch_id: "batch-1".to_string(),
-                envelope: env,
-            })
+            .push_changes(OutgoingBatch { batch_id: "batch-1".to_string(), envelope: env })
             .await
             .unwrap();
         assert_eq!(seq, 1);
@@ -569,10 +542,7 @@ mod tests {
     async fn snapshot_round_trip() {
         let relay = MockRelay::new();
         assert!(relay.get_snapshot().await.unwrap().is_none());
-        relay
-            .put_snapshot(1, 10, vec![9, 8, 7], None, None, "device-1".to_string())
-            .await
-            .unwrap();
+        relay.put_snapshot(1, 10, vec![9, 8, 7], None, None, "device-1".to_string()).await.unwrap();
         let snap = relay.get_snapshot().await.unwrap().unwrap();
         assert_eq!(snap.epoch, 1);
         assert_eq!(snap.server_seq_at, 10);
@@ -599,16 +569,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            relay.snapshot_target_device_id(),
-            Some("device-a".to_string())
-        );
+        assert_eq!(relay.snapshot_target_device_id(), Some("device-a".to_string()));
 
         // Replace with an untargeted snapshot.
-        relay
-            .put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string())
-            .await
-            .unwrap();
+        relay.put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string()).await.unwrap();
         assert_eq!(relay.snapshot_target_device_id(), None);
     }
 
@@ -639,10 +603,7 @@ mod tests {
         );
 
         // Untargeted snapshot is served to any device.
-        relay
-            .put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string())
-            .await
-            .unwrap();
+        relay.put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string()).await.unwrap();
         assert!(relay.get_snapshot_for_device("device-b").is_some());
         assert!(relay.get_snapshot_for_device("device-c").is_some());
     }
@@ -678,10 +639,7 @@ mod tests {
         let devices = relay.list_devices().await.unwrap();
         assert_eq!(devices.len(), 2);
 
-        relay
-            .revoke_device("d1", false, 2, HashMap::new())
-            .await
-            .unwrap();
+        relay.revoke_device("d1", false, 2, HashMap::new()).await.unwrap();
         let devices = relay.list_devices().await.unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_id, "d2");
@@ -722,10 +680,7 @@ mod tests {
 
         let new_pk = vec![0x42; 1952];
         let proof = make_continuity_proof();
-        let resp = relay
-            .rotate_ml_dsa("d1", &new_pk, 1, &proof, None)
-            .await
-            .unwrap();
+        let resp = relay.rotate_ml_dsa("d1", &new_pk, 1, &proof, None).await.unwrap();
 
         assert_eq!(resp.ml_dsa_key_generation, 1);
 
@@ -736,10 +691,7 @@ mod tests {
 
         // A second rotation to generation 2 should also succeed.
         let newer_pk = vec![0x43; 1952];
-        let resp2 = relay
-            .rotate_ml_dsa("d1", &newer_pk, 2, &proof, None)
-            .await
-            .unwrap();
+        let resp2 = relay.rotate_ml_dsa("d1", &newer_pk, 2, &proof, None).await.unwrap();
         assert_eq!(resp2.ml_dsa_key_generation, 2);
 
         let devices = relay.list_devices().await.unwrap();
@@ -755,26 +707,17 @@ mod tests {
         let proof = make_continuity_proof();
 
         // First rotation to generation 2.
-        relay
-            .rotate_ml_dsa("d1", &vec![0x42; 1952], 2, &proof, None)
-            .await
-            .unwrap();
+        relay.rotate_ml_dsa("d1", &vec![0x42; 1952], 2, &proof, None).await.unwrap();
 
         // Attempt to rotate to generation 1 (rollback) should fail.
-        let err = relay
-            .rotate_ml_dsa("d1", &vec![0x43; 1952], 1, &proof, None)
-            .await
-            .unwrap_err();
+        let err = relay.rotate_ml_dsa("d1", &vec![0x43; 1952], 1, &proof, None).await.unwrap_err();
         assert!(
             matches!(err, RelayError::Protocol { ref message } if message.contains("must increase")),
             "expected protocol error about generation, got: {err:?}"
         );
 
         // Same generation (2) should also fail.
-        let err = relay
-            .rotate_ml_dsa("d1", &vec![0x44; 1952], 2, &proof, None)
-            .await
-            .unwrap_err();
+        let err = relay.rotate_ml_dsa("d1", &vec![0x44; 1952], 2, &proof, None).await.unwrap_err();
         assert!(
             matches!(err, RelayError::Protocol { ref message } if message.contains("must increase")),
             "expected protocol error about generation, got: {err:?}"

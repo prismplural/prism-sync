@@ -95,9 +95,9 @@ impl EncryptedEnvelope {
     /// Decrypt and verify an envelope.
     pub fn open(key: &[u8], envelope: &[u8], context: &EnvelopeContext) -> Result<Vec<u8>> {
         if envelope.len() < HEADER_LEN {
-            return Err(CoreError::Crypto(
-                prism_sync_crypto::CryptoError::DecryptionFailed("envelope too short".into()),
-            ));
+            return Err(CoreError::Crypto(prism_sync_crypto::CryptoError::DecryptionFailed(
+                "envelope too short".into(),
+            )));
         }
 
         let version = BootstrapVersion::from_byte(envelope[0]).ok_or_else(|| {
@@ -107,28 +107,25 @@ impl EncryptedEnvelope {
             )))
         })?;
         if version != context.version {
-            return Err(CoreError::Crypto(
-                prism_sync_crypto::CryptoError::DecryptionFailed(format!(
+            return Err(CoreError::Crypto(prism_sync_crypto::CryptoError::DecryptionFailed(
+                format!(
                     "envelope version mismatch: wire={}, context={}",
                     version.as_byte(),
                     context.version.as_byte()
-                )),
-            ));
+                ),
+            )));
         }
 
         let nonce = &envelope[VERSION_LEN..VERSION_LEN + NONCE_LEN];
-        let len_bytes: [u8; 4] = envelope[VERSION_LEN + NONCE_LEN..HEADER_LEN]
-            .try_into()
-            .expect("4 bytes");
+        let len_bytes: [u8; 4] =
+            envelope[VERSION_LEN + NONCE_LEN..HEADER_LEN].try_into().expect("4 bytes");
         let ct_len = u32::from_be_bytes(len_bytes) as usize;
 
         let remaining = envelope.len() - HEADER_LEN;
         if remaining != ct_len {
-            return Err(CoreError::Crypto(
-                prism_sync_crypto::CryptoError::DecryptionFailed(format!(
-                    "ciphertext length mismatch: header says {ct_len}, got {remaining} bytes"
-                )),
-            ));
+            return Err(CoreError::Crypto(prism_sync_crypto::CryptoError::DecryptionFailed(
+                format!("ciphertext length mismatch: header says {ct_len}, got {remaining} bytes"),
+            )));
         }
 
         let ct_tag = &envelope[HEADER_LEN..];
@@ -146,9 +143,9 @@ impl EncryptedEnvelope {
     /// Read the version byte from an envelope without decrypting.
     pub fn version(envelope: &[u8]) -> Result<BootstrapVersion> {
         if envelope.is_empty() {
-            return Err(CoreError::Crypto(
-                prism_sync_crypto::CryptoError::DecryptionFailed("empty envelope".into()),
-            ));
+            return Err(CoreError::Crypto(prism_sync_crypto::CryptoError::DecryptionFailed(
+                "empty envelope".into(),
+            )));
         }
         BootstrapVersion::from_byte(envelope[0]).ok_or_else(|| {
             CoreError::Crypto(prism_sync_crypto::CryptoError::DecryptionFailed(format!(
@@ -228,10 +225,7 @@ mod tests {
         let ctx = test_context();
         let envelope = EncryptedEnvelope::seal(&key, b"secret", &ctx).unwrap();
 
-        let wrong_ctx = EnvelopeContext {
-            sender_role: BootstrapRole::Responder,
-            ..test_context()
-        };
+        let wrong_ctx = EnvelopeContext { sender_role: BootstrapRole::Responder, ..test_context() };
 
         assert!(EncryptedEnvelope::open(&key, &envelope, &wrong_ctx).is_err());
     }
@@ -242,10 +236,7 @@ mod tests {
         let ctx = test_context();
         let envelope = EncryptedEnvelope::seal(&key, b"secret", &ctx).unwrap();
 
-        let wrong_ctx = EnvelopeContext {
-            purpose: b"wrong_purpose",
-            ..test_context()
-        };
+        let wrong_ctx = EnvelopeContext { purpose: b"wrong_purpose", ..test_context() };
 
         assert!(EncryptedEnvelope::open(&key, &envelope, &wrong_ctx).is_err());
     }
@@ -256,10 +247,7 @@ mod tests {
         let ctx = test_context();
         let envelope = EncryptedEnvelope::seal(&key, b"secret", &ctx).unwrap();
 
-        let wrong_ctx = EnvelopeContext {
-            session_id: b"different-session",
-            ..test_context()
-        };
+        let wrong_ctx = EnvelopeContext { session_id: b"different-session", ..test_context() };
 
         assert!(EncryptedEnvelope::open(&key, &envelope, &wrong_ctx).is_err());
     }
@@ -271,10 +259,7 @@ mod tests {
         let envelope = EncryptedEnvelope::seal(&key, b"secret", &ctx).unwrap();
 
         let wrong_hash = [0xCD; 32];
-        let wrong_ctx = EnvelopeContext {
-            transcript_hash: &wrong_hash,
-            ..test_context()
-        };
+        let wrong_ctx = EnvelopeContext { transcript_hash: &wrong_hash, ..test_context() };
 
         assert!(EncryptedEnvelope::open(&key, &envelope, &wrong_ctx).is_err());
     }
@@ -285,10 +270,7 @@ mod tests {
         let ctx = test_context();
         let envelope = EncryptedEnvelope::seal(&key, b"data", &ctx).unwrap();
 
-        assert_eq!(
-            EncryptedEnvelope::version(&envelope).unwrap(),
-            BootstrapVersion::V1
-        );
+        assert_eq!(EncryptedEnvelope::version(&envelope).unwrap(), BootstrapVersion::V1);
     }
 
     #[test]

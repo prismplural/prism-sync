@@ -21,20 +21,12 @@ pub struct Hlc {
 impl Hlc {
     /// Create an HLC with explicit values.
     pub fn new(timestamp: i64, counter: u32, node_id: impl Into<String>) -> Self {
-        Self {
-            timestamp,
-            counter,
-            node_id: node_id.into(),
-        }
+        Self { timestamp, counter, node_id: node_id.into() }
     }
 
     /// Create a zero-valued HLC (used as initial state).
     pub fn zero(node_id: impl Into<String>) -> Self {
-        Self {
-            timestamp: 0,
-            counter: 0,
-            node_id: node_id.into(),
-        }
+        Self { timestamp: 0, counter: 0, node_id: node_id.into() }
     }
 
     /// Parse HLC from string format "timestamp:counter:nodeId".
@@ -43,11 +35,7 @@ impl Hlc {
     /// (matching Dart behavior).
     pub fn from_string(hlc_string: &str) -> Result<Self> {
         if hlc_string.is_empty() {
-            return Ok(Self {
-                timestamp: 0,
-                counter: 0,
-                node_id: String::new(),
-            });
+            return Ok(Self { timestamp: 0, counter: 0, node_id: String::new() });
         }
 
         let parts: Vec<&str> = hlc_string.split(':').collect();
@@ -65,11 +53,7 @@ impl Hlc {
             .map_err(|e| CoreError::HlcParse(format!("Invalid counter '{}': {e}", parts[1])))?;
         let node_id = parts[2].to_string();
 
-        Ok(Self {
-            timestamp,
-            counter,
-            node_id,
-        })
+        Ok(Self { timestamp, counter, node_id })
     }
 
     /// Get current wall-clock time in milliseconds since Unix epoch.
@@ -88,16 +72,10 @@ impl Hlc {
         let now = Self::now_ms();
 
         match last_known {
-            None => Self {
-                timestamp: now,
-                counter: 0,
-                node_id: node_id.to_string(),
-            },
-            Some(last) if now > last.timestamp => Self {
-                timestamp: now,
-                counter: 0,
-                node_id: node_id.to_string(),
-            },
+            None => Self { timestamp: now, counter: 0, node_id: node_id.to_string() },
+            Some(last) if now > last.timestamp => {
+                Self { timestamp: now, counter: 0, node_id: node_id.to_string() }
+            }
             Some(last) => Self {
                 timestamp: last.timestamp,
                 counter: last.counter + 1,
@@ -133,11 +111,7 @@ impl Hlc {
             0
         };
 
-        Self {
-            timestamp: max_ts,
-            counter: new_counter,
-            node_id: local_node_id.to_string(),
-        }
+        Self { timestamp: max_ts, counter: new_counter, node_id: local_node_id.to_string() }
     }
 
     /// Check if clock drift exceeds the given tolerance.
@@ -227,10 +201,7 @@ mod tests {
     #[test]
     fn now_creates_current_timestamp() {
         let hlc = Hlc::now("testnode", None);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
         // Should be within 100ms of now
         assert!((hlc.timestamp - now_ms).abs() < 100);
         assert_eq!(hlc.counter, 0);

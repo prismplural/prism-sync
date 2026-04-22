@@ -96,13 +96,13 @@ impl IntoResponse for AppError {
                 }),
             )
                 .into_response(),
-            AppError::UpgradeRequired {
-                min_signature_version,
-            } => (
+            AppError::UpgradeRequired { min_signature_version } => (
                 status,
                 Json(ErrorBody {
                     error: "upgrade_required",
-                    message: Some("This app version is too old. Please update to continue syncing."),
+                    message: Some(
+                        "This app version is too old. Please update to continue syncing.",
+                    ),
                     min_signature_version: Some(*min_signature_version),
                     remote_wipe: None,
                 }),

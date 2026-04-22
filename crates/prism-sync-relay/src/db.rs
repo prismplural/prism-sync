@@ -102,10 +102,7 @@ pub struct MediaRow {
 
 /// Current unix timestamp in seconds.
 pub fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 /// Generate a cryptographically random hex token (32 bytes = 64 hex chars).
@@ -157,11 +154,7 @@ impl Database {
             })
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
-        Ok(Self {
-            writer: Mutex::new(conn),
-            readers,
-            next_reader: AtomicUsize::new(0),
-        })
+        Ok(Self { writer: Mutex::new(conn), readers, next_reader: AtomicUsize::new(0) })
     }
 
     /// Open a database for testing, backed by a temp file so multiple
@@ -215,9 +208,7 @@ fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
     // silently ignored and incremental_vacuum becomes a no-op. A one-time full
     // VACUUM converts the file to INCREMENTAL mode so future cleanup cycles
     // can reclaim freelist pages incrementally.
-    let current_mode: i64 = conn
-        .query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))
-        .unwrap_or(0);
+    let current_mode: i64 = conn.query_row("PRAGMA auto_vacuum;", [], |r| r.get(0)).unwrap_or(0);
     if current_mode != 2 {
         // 0 = NONE, 1 = FULL, 2 = INCREMENTAL
         tracing::warn!(
@@ -698,9 +689,7 @@ fn migrate_devices_ml_dsa_rotation(conn: &Connection) -> Result<(), rusqlite::Er
         )?;
     }
     if !has_expires {
-        conn.execute_batch(
-            "ALTER TABLE devices ADD COLUMN prev_ml_dsa_65_expires_at INTEGER;",
-        )?;
+        conn.execute_batch("ALTER TABLE devices ADD COLUMN prev_ml_dsa_65_expires_at INTEGER;")?;
     }
     Ok(())
 }
@@ -785,12 +774,7 @@ fn migrate_sharing_identity_generation_floors(conn: &Connection) -> Result<(), r
                     END,
                     updated_at = MAX(updated_at, ?4)
               WHERE sharing_id = ?1",
-            params![
-                sharing_id,
-                identity_generation,
-                hash_bytes(&identity_bundle),
-                updated_at
-            ],
+            params![sharing_id, identity_generation, hash_bytes(&identity_bundle), updated_at],
         )?;
     }
 
@@ -884,14 +868,7 @@ pub fn store_registry_artifact(
             artifact_hash = excluded.artifact_hash,
             artifact_blob = excluded.artifact_blob,
             created_at = excluded.created_at",
-        params![
-            sync_id,
-            registry_version,
-            artifact_kind,
-            registry_hash,
-            artifact_blob,
-            now,
-        ],
+        params![sync_id, registry_version, artifact_kind, registry_hash, artifact_blob, now,],
     )?;
     Ok(())
 }
@@ -1116,17 +1093,7 @@ pub fn register_device(
     x25519_pk: &[u8],
     epoch: i64,
 ) -> Result<(), rusqlite::Error> {
-    register_device_with_pq(
-        conn,
-        sync_id,
-        device_id,
-        signing_pk,
-        x25519_pk,
-        &[],
-        &[],
-        &[],
-        epoch,
-    )
+    register_device_with_pq(conn, sync_id, device_id, signing_pk, x25519_pk, &[], &[], &[], epoch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1148,7 +1115,9 @@ pub fn register_device_with_pq(
             ml_dsa_65_public_key, ml_kem_768_public_key, x_wing_public_key,
             epoch, status, registered_at, last_seen_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9)",
-        params![sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk, epoch, now],
+        params![
+            sync_id, device_id, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk, epoch, now
+        ],
     )?;
     Ok(())
 }
@@ -1511,19 +1480,13 @@ pub fn consume_nonce(
 /// Remove all expired nonces. Returns the number removed.
 pub fn cleanup_expired_nonces(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
-    conn.execute(
-        "DELETE FROM registration_nonces WHERE expires_at <= ?1",
-        params![now],
-    )
+    conn.execute("DELETE FROM registration_nonces WHERE expires_at <= ?1", params![now])
 }
 
 /// Remove expired revoked-session markers.
 pub fn cleanup_expired_revoked_sessions(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
-    conn.execute(
-        "DELETE FROM revoked_device_sessions WHERE expires_at <= ?1",
-        params![now],
-    )
+    conn.execute("DELETE FROM revoked_device_sessions WHERE expires_at <= ?1", params![now])
 }
 
 // ---------------------------------------------------------------------------
@@ -1750,10 +1713,7 @@ pub fn prune_batches_before(
     sync_id: &str,
     before_seq: i64,
 ) -> Result<usize, rusqlite::Error> {
-    conn.execute(
-        "DELETE FROM batches WHERE sync_id = ?1 AND id < ?2",
-        params![sync_id, before_seq],
-    )
+    conn.execute("DELETE FROM batches WHERE sync_id = ?1 AND id < ?2", params![sync_id, before_seq])
 }
 
 // ---------------------------------------------------------------------------
@@ -1917,10 +1877,8 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<Vec<String>
 
     // Collect media_ids before deleting rows so callers can clean up files on disk
     let mut stmt = tx.prepare("SELECT media_id FROM media_metadata WHERE sync_id = ?1")?;
-    let media_ids: Vec<String> = stmt
-        .query_map(params![sync_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let media_ids: Vec<String> =
+        stmt.query_map(params![sync_id], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
     drop(stmt);
 
     // Clean up sharing tables via the sharing_id mapping
@@ -1933,14 +1891,8 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<Vec<String>
         .optional()?;
 
     if let Some(ref sid) = sharing_id {
-        tx.execute(
-            "DELETE FROM sharing_signed_prekeys WHERE sharing_id = ?1",
-            params![sid],
-        )?;
-        tx.execute(
-            "DELETE FROM sharing_identity_bundles WHERE sharing_id = ?1",
-            params![sid],
-        )?;
+        tx.execute("DELETE FROM sharing_signed_prekeys WHERE sharing_id = ?1", params![sid])?;
+        tx.execute("DELETE FROM sharing_identity_bundles WHERE sharing_id = ?1", params![sid])?;
         tx.execute(
             "DELETE FROM sharing_identity_generation_floors WHERE sharing_id = ?1",
             params![sid],
@@ -1949,63 +1901,24 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<Vec<String>
             "DELETE FROM sharing_init_payloads WHERE recipient_id = ?1 OR sender_id = ?1",
             params![sid],
         )?;
-        tx.execute(
-            "DELETE FROM sharing_id_mappings WHERE sync_id = ?1",
-            params![sync_id],
-        )?;
+        tx.execute("DELETE FROM sharing_id_mappings WHERE sync_id = ?1", params![sync_id])?;
     }
 
-    tx.execute(
-        "DELETE FROM password_change_artifacts WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM registry_state_artifacts WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM registry_states WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM rekey_artifacts WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM revocation_events WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM rekey_events WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM device_sessions WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM revoked_device_sessions WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM device_receipts WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
+    tx.execute("DELETE FROM password_change_artifacts WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM registry_state_artifacts WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM registry_states WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM rekey_artifacts WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM revocation_events WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM rekey_events WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM device_sessions WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM revoked_device_sessions WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM device_receipts WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM batches WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM snapshots WHERE sync_id = ?1", params![sync_id])?;
-    tx.execute(
-        "DELETE FROM media_metadata WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
-    tx.execute(
-        "DELETE FROM registration_nonces WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
+    tx.execute("DELETE FROM media_metadata WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM registration_nonces WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM devices WHERE sync_id = ?1", params![sync_id])?;
-    tx.execute(
-        "DELETE FROM sync_groups WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
+    tx.execute("DELETE FROM sync_groups WHERE sync_id = ?1", params![sync_id])?;
 
     tx.commit()?;
     Ok(media_ids)
@@ -2039,10 +1952,8 @@ pub fn auto_revoke_devices(
         "SELECT DISTINCT sync_id FROM devices
          WHERE status IN ('active', 'stale') AND last_seen_at < ?1",
     )?;
-    let sync_ids: Vec<String> = stmt
-        .query_map(params![cutoff], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let sync_ids: Vec<String> =
+        stmt.query_map(params![cutoff], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
 
     if !sync_ids.is_empty() {
         conn.execute(
@@ -2076,10 +1987,8 @@ pub fn prune_stale_sync_groups(
              WHERE d.sync_id = sg.sync_id AND d.last_seen_at >= ?1
          )",
     )?;
-    let stale_ids: Vec<String> = stmt
-        .query_map(params![cutoff], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let stale_ids: Vec<String> =
+        stmt.query_map(params![cutoff], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
 
     for sync_id in &stale_ids {
         let _ = delete_sync_group(conn, sync_id)?;
@@ -2093,21 +2002,13 @@ pub fn prune_stale_sync_groups(
 // ---------------------------------------------------------------------------
 
 /// Valid pairing slot column names.
-const PAIRING_SLOTS: &[&str] = &[
-    "pairing_init",
-    "joiner_confirmation",
-    "credential_bundle",
-    "joiner_bundle",
-];
+const PAIRING_SLOTS: &[&str] =
+    &["pairing_init", "joiner_confirmation", "credential_bundle", "joiner_bundle"];
 
 fn validate_pairing_slot(slot: &str) -> Result<&'static str, rusqlite::Error> {
-    PAIRING_SLOTS
-        .iter()
-        .find(|&&s| s == slot)
-        .copied()
-        .ok_or_else(|| {
-            rusqlite::Error::InvalidParameterName(format!("invalid pairing slot: {slot}"))
-        })
+    PAIRING_SLOTS.iter().find(|&&s| s == slot).copied().ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("invalid pairing slot: {slot}"))
+    })
 }
 
 /// Create a new pairing session with the given rendezvous ID and joiner bootstrap data.
@@ -2207,11 +2108,9 @@ pub fn get_pairing_slot(
     };
     // The column may be NULL (not yet set) — query_row returns the row,
     // and row.get::<_, Option<Vec<u8>>> handles the NULL -> None mapping.
-    conn.query_row(sql, params![rendezvous_id, now], |row| {
-        row.get::<_, Option<Vec<u8>>>(0)
-    })
-    .optional()
-    .map(|opt| opt.flatten())
+    conn.query_row(sql, params![rendezvous_id, now], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .optional()
+        .map(|opt| opt.flatten())
 }
 
 /// Delete a pairing session. Returns `true` if a row was deleted.
@@ -2219,20 +2118,16 @@ pub fn delete_pairing_session(
     conn: &Connection,
     rendezvous_id: &str,
 ) -> Result<bool, rusqlite::Error> {
-    let changed = conn.execute(
-        "DELETE FROM pairing_sessions WHERE rendezvous_id = ?1",
-        params![rendezvous_id],
-    )?;
+    let changed = conn
+        .execute("DELETE FROM pairing_sessions WHERE rendezvous_id = ?1", params![rendezvous_id])?;
     Ok(changed > 0)
 }
 
 /// Delete all expired pairing sessions. Returns the number of rows deleted.
 pub fn cleanup_expired_pairing_sessions(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
-    let deleted = conn.execute(
-        "DELETE FROM pairing_sessions WHERE expires_at <= ?1",
-        params![now],
-    )?;
+    let deleted =
+        conn.execute("DELETE FROM pairing_sessions WHERE expires_at <= ?1", params![now])?;
     Ok(deleted)
 }
 
@@ -2341,15 +2236,10 @@ pub fn delete_media_for_sync_group(
     sync_id: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare("SELECT media_id FROM media_metadata WHERE sync_id = ?1")?;
-    let media_ids: Vec<String> = stmt
-        .query_map(params![sync_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let media_ids: Vec<String> =
+        stmt.query_map(params![sync_id], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
 
-    conn.execute(
-        "DELETE FROM media_metadata WHERE sync_id = ?1",
-        params![sync_id],
-    )?;
+    conn.execute("DELETE FROM media_metadata WHERE sync_id = ?1", params![sync_id])?;
 
     Ok(media_ids)
 }
@@ -2361,9 +2251,7 @@ pub fn delete_media_for_sync_group(
 /// Load persisted counter values from SQLite. Returns a map of name → value.
 pub fn load_counters(conn: &Connection) -> Result<HashMap<String, u64>, rusqlite::Error> {
     let mut stmt = conn.prepare("SELECT name, value FROM counters")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-    })?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)))?;
     let mut map = HashMap::new();
     for row in rows {
         let (name, value) = row?;
@@ -2418,9 +2306,7 @@ pub fn upsert_sharing_identity(
 
     if floor.as_ref().is_some_and(|(current_generation, current_hash)| {
         identity_generation == *current_generation
-            && current_hash
-                .as_deref()
-                .is_some_and(|hash| hash != bundle_hash.as_str())
+            && current_hash.as_deref().is_some_and(|hash| hash != bundle_hash.as_str())
     }) {
         tx.rollback()?;
         return Ok(false);
@@ -2544,18 +2430,13 @@ pub fn cleanup_stale_sharing_prekeys(
     max_age_secs: i64,
 ) -> Result<usize, rusqlite::Error> {
     let cutoff = now_secs() - max_age_secs;
-    let deleted = conn.execute(
-        "DELETE FROM sharing_signed_prekeys WHERE created_at < ?1",
-        params![cutoff],
-    )?;
+    let deleted =
+        conn.execute("DELETE FROM sharing_signed_prekeys WHERE created_at < ?1", params![cutoff])?;
     Ok(deleted)
 }
 
 pub fn delete_sharing_prekeys(conn: &Connection, sharing_id: &str) -> Result<(), rusqlite::Error> {
-    conn.execute(
-        "DELETE FROM sharing_signed_prekeys WHERE sharing_id = ?1",
-        params![sharing_id],
-    )?;
+    conn.execute("DELETE FROM sharing_signed_prekeys WHERE sharing_id = ?1", params![sharing_id])?;
     Ok(())
 }
 
@@ -2691,9 +2572,7 @@ pub fn fetch_and_consume_pending_sharing_inits(
     };
 
     if !results.is_empty() {
-        let placeholders = std::iter::repeat_n("?", results.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = std::iter::repeat_n("?", results.len()).collect::<Vec<_>>().join(", ");
         let sql = format!(
             "UPDATE sharing_init_payloads
              SET consumed_at = ?
@@ -3041,16 +2920,7 @@ mod tests {
             assert_eq!(snap.uploaded_by_device_id, None);
 
             // Upsert replaces
-            upsert_snapshot(
-                conn,
-                "sg1",
-                2,
-                20,
-                b"snap_data_v2",
-                None,
-                Some("dev2"),
-                Some("dev1"),
-            )?;
+            upsert_snapshot(conn, "sg1", 2, 20, b"snap_data_v2", None, Some("dev2"), Some("dev1"))?;
             let snap = get_snapshot(conn, "sg1")?.unwrap();
             assert_eq!(snap.epoch, 2);
             assert_eq!(snap.server_seq_at, 20);
@@ -3455,18 +3325,11 @@ mod tests {
 
             // Second call with same sync_id is ignored and returns false
             let created_again = create_sync_group(conn, "sg1", 0)?;
-            assert!(
-                !created_again,
-                "second call should be ignored and return false"
-            );
+            assert!(!created_again, "second call should be ignored and return false");
 
             // Data remains consistent: epoch is still readable and unchanged
             let epoch = get_sync_group_epoch(conn, "sg1")?;
-            assert_eq!(
-                epoch,
-                Some(0),
-                "epoch should still be 0 after idempotent insert"
-            );
+            assert_eq!(epoch, Some(0), "epoch should still be 0 after idempotent insert");
 
             // A different sync_id still works
             let other = create_sync_group(conn, "sg2", 3)?;
@@ -3511,31 +3374,13 @@ mod tests {
 
             // Snapshot with expiry in the past is not returned by get_snapshot
             let past = now_secs() - 60;
-            upsert_snapshot(
-                conn,
-                "sg1",
-                1,
-                10,
-                b"expired",
-                Some(past),
-                None,
-                Some("dev1"),
-            )?;
+            upsert_snapshot(conn, "sg1", 1, 10, b"expired", Some(past), None, Some("dev1"))?;
             let snap = get_snapshot(conn, "sg1")?;
             assert!(snap.is_none(), "expired snapshot should not be returned");
 
             // Snapshot with expiry in the future is returned
             let future = now_secs() + 3600;
-            upsert_snapshot(
-                conn,
-                "sg1",
-                1,
-                10,
-                b"valid",
-                Some(future),
-                None,
-                Some("dev1"),
-            )?;
+            upsert_snapshot(conn, "sg1", 1, 10, b"valid", Some(future), None, Some("dev1"))?;
             let snap = get_snapshot(conn, "sg1")?.unwrap();
             assert_eq!(snap.data, b"valid");
             assert_eq!(snap.uploaded_by_device_id.as_deref(), Some("dev1"));
@@ -3754,41 +3599,17 @@ mod tests {
             let past = now_secs() - 3600;
 
             // sg_a: expires in 1 hour (valid)
-            upsert_snapshot(
-                conn,
-                "sg_a",
-                1,
-                5,
-                b"valid",
-                Some(future),
-                None,
-                Some("dev1"),
-            )?;
+            upsert_snapshot(conn, "sg_a", 1, 5, b"valid", Some(future), None, Some("dev1"))?;
             // sg_b: expired 1 hour ago
-            upsert_snapshot(
-                conn,
-                "sg_b",
-                1,
-                5,
-                b"expired",
-                Some(past),
-                None,
-                Some("dev2"),
-            )?;
+            upsert_snapshot(conn, "sg_b", 1, 5, b"expired", Some(past), None, Some("dev2"))?;
 
             let cleaned = cleanup_expired_snapshots(conn)?;
             assert_eq!(cleaned, 1, "only expired snapshot should be cleaned");
 
             // sg_a still exists
-            assert!(
-                get_snapshot(conn, "sg_a")?.is_some(),
-                "valid snapshot should exist"
-            );
+            assert!(get_snapshot(conn, "sg_a")?.is_some(), "valid snapshot should exist");
             // sg_b gone
-            assert!(
-                get_snapshot(conn, "sg_b")?.is_none(),
-                "expired snapshot should be gone"
-            );
+            assert!(get_snapshot(conn, "sg_b")?.is_none(), "expired snapshot should be gone");
 
             Ok(())
         })
@@ -3812,22 +3633,14 @@ mod tests {
 
             // min(50, 30) = 30
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(
-                safe,
-                Some(30),
-                "should be min of snapshot(50) and acked(30)"
-            );
+            assert_eq!(safe, Some(30), "should be min of snapshot(50) and acked(30)");
 
             // Device acked to seq=60
             upsert_device_receipt(conn, "sg1", "dev1", 60)?;
 
             // min(50, 60) = 50
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(
-                safe,
-                Some(50),
-                "should be min of snapshot(50) and acked(60)"
-            );
+            assert_eq!(safe, Some(50), "should be min of snapshot(50) and acked(60)");
 
             Ok(())
         })
@@ -3848,16 +3661,7 @@ mod tests {
             let future = now_secs() + 300;
 
             // Device A uploads snapshot
-            upsert_snapshot(
-                conn,
-                "sg1",
-                0,
-                10,
-                b"snap",
-                Some(future),
-                None,
-                Some("dev_a"),
-            )?;
+            upsert_snapshot(conn, "sg1", 0, 10, b"snap", Some(future), None, Some("dev_a"))?;
 
             // Device A downloads — check uploaded_by matches (no auto-delete)
             let snap = get_snapshot(conn, "sg1")?.unwrap();
@@ -3939,13 +3743,22 @@ mod tests {
             let ml_dsa_pk = vec![0xAA; 1952];
             let ml_kem_pk = vec![0xBB; 1184];
             register_device_with_pq(
-                conn, "sg1", "dev1", &[1; 32], &[2; 32], &ml_dsa_pk, &ml_kem_pk, &[], 0,
+                conn,
+                "sg1",
+                "dev1",
+                &[1; 32],
+                &[2; 32],
+                &ml_dsa_pk,
+                &ml_kem_pk,
+                &[],
+                0,
             )?;
 
             // Rotate the key so the old key lands in the grace slot.
             let new_ml_dsa_pk = vec![0xCC; 1952];
             let grace_expires_at = now_secs() + 3600; // 1 hour from now
-            let rotated = rotate_device_ml_dsa(conn, "sg1", "dev1", &new_ml_dsa_pk, 1, grace_expires_at)?;
+            let rotated =
+                rotate_device_ml_dsa(conn, "sg1", "dev1", &new_ml_dsa_pk, 1, grace_expires_at)?;
             assert!(rotated, "rotation should apply");
 
             // Verify the grace key is present.

@@ -156,10 +156,7 @@ mod tests {
         use ed25519_dalek::Signer;
         let msg = b"test message";
         let sig = ed_sk.sign(msg);
-        ed25519_dalek::VerifyingKey::from_bytes(&ed_pk)
-            .unwrap()
-            .verify_strict(msg, &sig)
-            .unwrap();
+        ed25519_dalek::VerifyingKey::from_bytes(&ed_pk).unwrap().verify_strict(msg, &sig).unwrap();
 
         use ml_dsa::signature::Signer as MlSigner;
         let ml_sig = ml_sk.sign(msg);

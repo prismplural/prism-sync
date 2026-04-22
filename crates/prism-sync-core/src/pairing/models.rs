@@ -21,8 +21,7 @@ pub struct PairingRequest {
     pub x25519_public_key: Vec<u8>,
 }
 
-impl PairingRequest {
-}
+impl PairingRequest {}
 
 /// Sent by the inviting device (Device A → Device B) in response to a
 /// [`PairingRequest`].
@@ -137,19 +136,13 @@ impl std::fmt::Debug for PairingResponse {
             .field("relay_url", &self.relay_url)
             .field("sync_id", &self.sync_id)
             .field("mnemonic", &"[REDACTED]")
-            .field(
-                "wrapped_dek",
-                &format!("[{} bytes]", self.wrapped_dek.len()),
-            )
+            .field("wrapped_dek", &format!("[{} bytes]", self.wrapped_dek.len()))
             .field("salt", &format!("[{} bytes]", self.salt.len()))
             .field("inviter_device_id", &self.inviter_device_id)
             .field("joiner_device_id", &self.joiner_device_id)
             .field("current_epoch", &self.current_epoch)
             .field("epoch_key", &format!("[{} bytes]", self.epoch_key.len()))
-            .field(
-                "registration_token",
-                &self.registration_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
             .finish_non_exhaustive()
     }
 }
@@ -175,17 +168,13 @@ impl PairingResponse {
             if remaining.len() < 8 {
                 return "existing_group";
             }
-            let ed_len = u32::from_le_bytes(
-                remaining[0..4].try_into().unwrap_or([0; 4]),
-            ) as usize;
+            let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap_or([0; 4])) as usize;
             if remaining.len() < 4 + ed_len + 4 {
                 return "existing_group";
             }
             let ml_len_offset = 4 + ed_len;
             let ml_len = u32::from_le_bytes(
-                remaining[ml_len_offset..ml_len_offset + 4]
-                    .try_into()
-                    .unwrap_or([0; 4]),
+                remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap_or([0; 4]),
             ) as usize;
             let signature_len = ml_len_offset + 4 + ml_len;
             if remaining.len() <= signature_len {
@@ -230,7 +219,6 @@ impl PairingResponse {
         }
         Ok(())
     }
-
 }
 
 /// Build the canonical bytes that get signed for an invitation.
@@ -444,11 +432,8 @@ impl SignedRegistrySnapshot {
             entries: &'a [RegistrySnapshotEntry],
         }
 
-        serde_json::to_vec(&Wrapper {
-            registry_version: self.registry_version,
-            entries: &sorted,
-        })
-        .unwrap_or_default()
+        serde_json::to_vec(&Wrapper { registry_version: self.registry_version, entries: &sorted })
+            .unwrap_or_default()
     }
 
     /// Build the V3 signing payload: `PRISM_SYNC_REGISTRY_V3\x00 || canonical_json_v3()`.
@@ -484,11 +469,9 @@ impl SignedRegistrySnapshot {
         pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     ) -> Vec<u8> {
         let data = self.signing_data_v3();
-        let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"registry_snapshot",
-            &data,
-        )
-        .expect("hardcoded registry snapshot context should be <= 255 bytes");
+        let m_prime =
+            prism_sync_crypto::pq::build_hybrid_message_representative(b"registry_snapshot", &data)
+                .expect("hardcoded registry snapshot context should be <= 255 bytes");
         let hybrid_sig = HybridSignature {
             ed25519_sig: signing_key.sign(&m_prime),
             ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
@@ -555,11 +538,9 @@ impl SignedRegistrySnapshot {
             return Err("registry snapshot signature invalid: hybrid signature truncated".into());
         }
         let ml_len_offset = 4 + ed_len;
-        let ml_len = u32::from_le_bytes(
-            remaining[ml_len_offset..ml_len_offset + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let ml_len =
+            u32::from_le_bytes(remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap())
+                as usize;
         let signature_len = ml_len_offset + 4 + ml_len;
         if remaining.len() <= signature_len {
             return Err("signed snapshot missing JSON payload".into());
@@ -574,12 +555,7 @@ impl SignedRegistrySnapshot {
         signing_data.extend_from_slice(json_bytes);
 
         signature
-            .verify_v3(
-                &signing_data,
-                b"registry_snapshot",
-                expected_ed25519_pk,
-                expected_ml_dsa_pk,
-            )
+            .verify_v3(&signing_data, b"registry_snapshot", expected_ed25519_pk, expected_ml_dsa_pk)
             .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
 
         #[derive(serde::Deserialize)]
@@ -591,10 +567,7 @@ impl SignedRegistrySnapshot {
         let wrapper: Wrapper = serde_json::from_slice(json_bytes)
             .map_err(|e| format!("registry snapshot JSON invalid: {e}"))?;
 
-        Ok(Self {
-            entries: wrapper.entries,
-            registry_version: wrapper.registry_version,
-        })
+        Ok(Self { entries: wrapper.entries, registry_version: wrapper.registry_version })
     }
 
     /// Convert snapshot entries to [`crate::storage::DeviceRecord`]s for import.
@@ -670,10 +643,7 @@ mod tests {
         assert_eq!(decoded.salt, resp.salt);
         assert_eq!(decoded.signed_invitation, resp.signed_invitation);
         assert_eq!(decoded.signed_keyring, resp.signed_keyring);
-        assert_eq!(
-            decoded.registry_approval_signature,
-            resp.registry_approval_signature
-        );
+        assert_eq!(decoded.registry_approval_signature, resp.registry_approval_signature);
     }
 
     #[test]
@@ -693,28 +663,8 @@ mod tests {
     #[test]
     fn admission_context_first_device() {
         let (key, _pk) = make_signing_key();
-        let snapshot = SignedRegistrySnapshot::new(vec![RegistrySnapshotEntry {
-            sync_id: "sync-1".into(),
-            device_id: "device-001".into(),
-            ed25519_public_key: vec![0xAA; 32],
-            x25519_public_key: vec![0xBB; 32],
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
-            x_wing_public_key: Vec::new(),
-            status: "active".into(),
-            ml_dsa_key_generation: 0,
-        }], 0);
-        let mut resp = sample_response();
-        resp.inviter_device_id = "device-001".into();
-        resp.signed_keyring = snapshot.sign(&key);
-        assert_eq!(resp.admission_context(), "first_device");
-    }
-
-    #[test]
-    fn admission_context_existing_group() {
-        let (key, _pk) = make_signing_key();
-        let snapshot = SignedRegistrySnapshot::new(vec![
-            RegistrySnapshotEntry {
+        let snapshot = SignedRegistrySnapshot::new(
+            vec![RegistrySnapshotEntry {
                 sync_id: "sync-1".into(),
                 device_id: "device-001".into(),
                 ed25519_public_key: vec![0xAA; 32],
@@ -724,19 +674,45 @@ mod tests {
                 x_wing_public_key: Vec::new(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
-            },
-            RegistrySnapshotEntry {
-                sync_id: "sync-1".into(),
-                device_id: "device-002".into(),
-                ed25519_public_key: vec![0xCC; 32],
-                x25519_public_key: vec![0xDD; 32],
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
-                x_wing_public_key: Vec::new(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-        ], 0);
+            }],
+            0,
+        );
+        let mut resp = sample_response();
+        resp.inviter_device_id = "device-001".into();
+        resp.signed_keyring = snapshot.sign(&key);
+        assert_eq!(resp.admission_context(), "first_device");
+    }
+
+    #[test]
+    fn admission_context_existing_group() {
+        let (key, _pk) = make_signing_key();
+        let snapshot = SignedRegistrySnapshot::new(
+            vec![
+                RegistrySnapshotEntry {
+                    sync_id: "sync-1".into(),
+                    device_id: "device-001".into(),
+                    ed25519_public_key: vec![0xAA; 32],
+                    x25519_public_key: vec![0xBB; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+                RegistrySnapshotEntry {
+                    sync_id: "sync-1".into(),
+                    device_id: "device-002".into(),
+                    ed25519_public_key: vec![0xCC; 32],
+                    x25519_public_key: vec![0xDD; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+            ],
+            0,
+        );
         let mut resp = sample_response();
         resp.inviter_device_id = "device-001".into();
         resp.signed_keyring = snapshot.sign(&key);
@@ -746,17 +722,20 @@ mod tests {
     #[test]
     fn admission_context_single_entry_different_inviter() {
         let (key, _pk) = make_signing_key();
-        let snapshot = SignedRegistrySnapshot::new(vec![RegistrySnapshotEntry {
-            sync_id: "sync-1".into(),
-            device_id: "device-999".into(),
-            ed25519_public_key: vec![0xAA; 32],
-            x25519_public_key: vec![0xBB; 32],
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
-            x_wing_public_key: Vec::new(),
-            status: "active".into(),
-            ml_dsa_key_generation: 0,
-        }], 0);
+        let snapshot = SignedRegistrySnapshot::new(
+            vec![RegistrySnapshotEntry {
+                sync_id: "sync-1".into(),
+                device_id: "device-999".into(),
+                ed25519_public_key: vec![0xAA; 32],
+                x25519_public_key: vec![0xBB; 32],
+                ml_dsa_65_public_key: Vec::new(),
+                ml_kem_768_public_key: Vec::new(),
+                x_wing_public_key: Vec::new(),
+                status: "active".into(),
+                ml_dsa_key_generation: 0,
+            }],
+            0,
+        );
         let mut resp = sample_response();
         resp.inviter_device_id = "device-001".into();
         resp.signed_keyring = snapshot.sign(&key);
@@ -787,30 +766,33 @@ mod tests {
     }
 
     fn sample_snapshot() -> SignedRegistrySnapshot {
-        SignedRegistrySnapshot::new(vec![
-            RegistrySnapshotEntry {
-                sync_id: "sync-1".into(),
-                device_id: "dev-a".into(),
-                ed25519_public_key: vec![1u8; 32],
-                x25519_public_key: vec![2u8; 32],
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
-                x_wing_public_key: Vec::new(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-            RegistrySnapshotEntry {
-                sync_id: "sync-1".into(),
-                device_id: "dev-b".into(),
-                ed25519_public_key: vec![3u8; 32],
-                x25519_public_key: vec![4u8; 32],
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
-                x_wing_public_key: Vec::new(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-        ], 0)
+        SignedRegistrySnapshot::new(
+            vec![
+                RegistrySnapshotEntry {
+                    sync_id: "sync-1".into(),
+                    device_id: "dev-a".into(),
+                    ed25519_public_key: vec![1u8; 32],
+                    x25519_public_key: vec![2u8; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+                RegistrySnapshotEntry {
+                    sync_id: "sync-1".into(),
+                    device_id: "dev-b".into(),
+                    ed25519_public_key: vec![3u8; 32],
+                    x25519_public_key: vec![4u8; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+            ],
+            0,
+        )
     }
 
     #[test]
@@ -846,54 +828,60 @@ mod tests {
     #[test]
     fn snapshot_canonical_json_is_deterministic() {
         // Order of entries should not matter — canonical form sorts by device_id
-        let snapshot_ab = SignedRegistrySnapshot::new(vec![
-            RegistrySnapshotEntry {
-                sync_id: "s".into(),
-                device_id: "b".into(),
-                ed25519_public_key: vec![2u8; 32],
-                x25519_public_key: vec![2u8; 32],
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
-                x_wing_public_key: Vec::new(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-            RegistrySnapshotEntry {
-                sync_id: "s".into(),
-                device_id: "a".into(),
-                ed25519_public_key: vec![1u8; 32],
-                x25519_public_key: vec![1u8; 32],
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
-                x_wing_public_key: Vec::new(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-        ], 0);
-        let snapshot_ba = SignedRegistrySnapshot::new(vec![
-            RegistrySnapshotEntry {
-                sync_id: "s".into(),
-                device_id: "a".into(),
-                ed25519_public_key: vec![1u8; 32],
-                x25519_public_key: vec![1u8; 32],
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
-                x_wing_public_key: Vec::new(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-            RegistrySnapshotEntry {
-                sync_id: "s".into(),
-                device_id: "b".into(),
-                ed25519_public_key: vec![2u8; 32],
-                x25519_public_key: vec![2u8; 32],
-                ml_dsa_65_public_key: Vec::new(),
-                ml_kem_768_public_key: Vec::new(),
-                x_wing_public_key: Vec::new(),
-                status: "active".into(),
-                ml_dsa_key_generation: 0,
-            },
-        ], 0);
+        let snapshot_ab = SignedRegistrySnapshot::new(
+            vec![
+                RegistrySnapshotEntry {
+                    sync_id: "s".into(),
+                    device_id: "b".into(),
+                    ed25519_public_key: vec![2u8; 32],
+                    x25519_public_key: vec![2u8; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+                RegistrySnapshotEntry {
+                    sync_id: "s".into(),
+                    device_id: "a".into(),
+                    ed25519_public_key: vec![1u8; 32],
+                    x25519_public_key: vec![1u8; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+            ],
+            0,
+        );
+        let snapshot_ba = SignedRegistrySnapshot::new(
+            vec![
+                RegistrySnapshotEntry {
+                    sync_id: "s".into(),
+                    device_id: "a".into(),
+                    ed25519_public_key: vec![1u8; 32],
+                    x25519_public_key: vec![1u8; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+                RegistrySnapshotEntry {
+                    sync_id: "s".into(),
+                    device_id: "b".into(),
+                    ed25519_public_key: vec![2u8; 32],
+                    x25519_public_key: vec![2u8; 32],
+                    ml_dsa_65_public_key: Vec::new(),
+                    ml_kem_768_public_key: Vec::new(),
+                    x_wing_public_key: Vec::new(),
+                    status: "active".into(),
+                    ml_dsa_key_generation: 0,
+                },
+            ],
+            0,
+        );
         assert_eq!(snapshot_ab.canonical_json(), snapshot_ba.canonical_json());
     }
 
@@ -905,10 +893,7 @@ mod tests {
         let signed = snapshot.sign(&key);
 
         let err = SignedRegistrySnapshot::verify_and_decode(&signed, &other_pk).unwrap_err();
-        assert!(
-            err.contains("signature invalid"),
-            "expected signature error, got: {err}"
-        );
+        assert!(err.contains("signature invalid"), "expected signature error, got: {err}");
     }
 
     #[test]
@@ -923,10 +908,7 @@ mod tests {
 
         let err = SignedRegistrySnapshot::verify_and_decode(&signed, &pk).unwrap_err();
         // Could fail as signature or JSON error depending on where the tamper lands
-        assert!(
-            err.contains("invalid"),
-            "expected error on tampered snapshot, got: {err}"
-        );
+        assert!(err.contains("invalid"), "expected error on tampered snapshot, got: {err}");
     }
 
     #[test]

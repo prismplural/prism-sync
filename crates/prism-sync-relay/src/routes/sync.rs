@@ -106,9 +106,7 @@ pub async fn push_changes(
         "server_seq": server_seq,
     })
     .to_string();
-    state
-        .notify_devices(&sync_id, Some(&device_id), &notification)
-        .await;
+    state.notify_devices(&sync_id, Some(&device_id), &notification).await;
 
     Ok(Json(serde_json::json!({ "server_seq": server_seq })))
 }
@@ -131,9 +129,7 @@ fn do_push(
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::NotFound)?;
     if device_epoch != current_epoch {
-        return Err(AppError::Forbidden(
-            "Epoch mismatch; perform epoch recovery first",
-        ));
+        return Err(AppError::Forbidden("Epoch mismatch; perform epoch recovery first"));
     }
 
     // Check max unpruned batches
@@ -276,9 +272,7 @@ pub async fn get_snapshot(
         Some(snap) => {
             if let Some(target_device_id) = snap.target_device_id.as_deref() {
                 if target_device_id != auth.device_id {
-                    return Err(AppError::Forbidden(
-                        "Snapshot is targeted at a different device",
-                    ));
+                    return Err(AppError::Forbidden("Snapshot is targeted at a different device"));
                 }
             }
 
@@ -347,9 +341,7 @@ pub async fn put_snapshot(
         .get("X-Server-Seq-At")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<i64>().ok())
-        .ok_or(AppError::BadRequest(
-            "Missing or invalid X-Server-Seq-At header",
-        ))?;
+        .ok_or(AppError::BadRequest("Missing or invalid X-Server-Seq-At header"))?;
 
     let ttl_secs = headers
         .get("X-Snapshot-TTL")
@@ -476,9 +468,7 @@ pub async fn delete_account(
         Some(media_ids) => {
             // Clean up media files from disk
             for media_id in &media_ids {
-                let path = std::path::Path::new(&media_storage_path)
-                    .join(&sync_id)
-                    .join(media_id);
+                let path = std::path::Path::new(&media_storage_path).join(&sync_id).join(media_id);
                 let _ = std::fs::remove_file(&path);
             }
             let dir = std::path::Path::new(&media_storage_path).join(&sync_id);
@@ -487,9 +477,7 @@ pub async fn delete_account(
             tracing::debug!(sync_id = %trunc(&sync_id), "Sync group deleted");
             Ok(StatusCode::NO_CONTENT)
         }
-        None => Err(AppError::Forbidden(
-            "Only the sole active admin can delete the sync group",
-        )),
+        None => Err(AppError::Forbidden("Only the sole active admin can delete the sync group")),
     }
 }
 
@@ -499,10 +487,7 @@ fn do_delete_account(
     device_id: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
     let devices = db::list_devices(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;
-    let active: Vec<_> = devices
-        .into_iter()
-        .filter(|d| d.status == "active")
-        .collect();
+    let active: Vec<_> = devices.into_iter().filter(|d| d.status == "active").collect();
     if active.len() == 1 && active[0].device_id == device_id {
         let media_ids =
             db::delete_sync_group(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;

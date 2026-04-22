@@ -8,10 +8,7 @@ mod scenarios;
 mod stats;
 
 #[derive(Parser)]
-#[command(
-    name = "prism-sync-bench",
-    about = "Load test tool for the Prism relay server"
-)]
+#[command(name = "prism-sync-bench", about = "Load test tool for the Prism relay server")]
 struct Cli {
     /// Relay URL. If omitted, starts an in-process relay.
     #[arg(long, global = true)]
@@ -175,11 +172,7 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::new();
 
     match cli.command {
-        Command::WsRamp {
-            clients,
-            ramp_duration,
-            hold_duration,
-        } => {
+        Command::WsRamp { clients, ramp_duration, hold_duration } => {
             scenarios::ws_ramp::run(
                 &http,
                 &base_url,
@@ -190,11 +183,7 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Command::SyncBench {
-            clients,
-            sync_interval,
-            duration,
-        } => {
+        Command::SyncBench { clients, sync_interval, duration } => {
             scenarios::sync_bench::run(
                 &http,
                 &base_url,
@@ -205,12 +194,7 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Command::Mixed {
-            ws_clients,
-            active_clients,
-            sync_interval,
-            duration,
-        } => {
+        Command::Mixed { ws_clients, active_clients, sync_interval, duration } => {
             scenarios::mixed::run(
                 &http,
                 &base_url,

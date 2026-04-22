@@ -100,8 +100,6 @@ pub struct SyncConfig {
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self {
-            max_clock_drift_ms: 60_000,
-        }
+        Self { max_clock_drift_ms: 60_000 }
     }
 }

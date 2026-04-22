@@ -27,9 +27,7 @@ pub struct MemorySecureStore {
 
 impl MemorySecureStore {
     pub fn new() -> Self {
-        Self {
-            data: Mutex::new(HashMap::new()),
-        }
+        Self { data: Mutex::new(HashMap::new()) }
     }
 }
 
@@ -39,10 +37,7 @@ impl SecureStore for MemorySecureStore {
     }
 
     fn set(&self, key: &str, value: &[u8]) -> prism_sync_core::Result<()> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_vec());
+        self.data.lock().unwrap().insert(key.to_string(), value.to_vec());
         Ok(())
     }
 
@@ -69,18 +64,11 @@ pub struct MockTaskEntity {
 
 impl MockTaskEntity {
     pub fn new() -> Self {
-        Self {
-            rows: Mutex::new(HashMap::new()),
-            deleted: Mutex::new(HashMap::new()),
-        }
+        Self { rows: Mutex::new(HashMap::new()), deleted: Mutex::new(HashMap::new()) }
     }
 
     pub fn get_field(&self, entity_id: &str, field: &str) -> Option<SyncValue> {
-        self.rows
-            .lock()
-            .unwrap()
-            .get(entity_id)
-            .and_then(|row| row.get(field).cloned())
+        self.rows.lock().unwrap().get(entity_id).and_then(|row| row.get(field).cloned())
     }
 }
 
@@ -94,14 +82,8 @@ impl SyncableEntity for MockTaskEntity {
         // Leak a static slice for the test lifetime — fine in tests.
         static FIELDS: std::sync::LazyLock<Vec<SyncFieldDef>> = std::sync::LazyLock::new(|| {
             vec![
-                SyncFieldDef {
-                    name: "title".to_string(),
-                    sync_type: SyncType::String,
-                },
-                SyncFieldDef {
-                    name: "done".to_string(),
-                    sync_type: SyncType::Bool,
-                },
+                SyncFieldDef { name: "title".to_string(), sync_type: SyncType::String },
+                SyncFieldDef { name: "done".to_string(), sync_type: SyncType::Bool },
             ]
         });
         &FIELDS
@@ -130,21 +112,12 @@ impl SyncableEntity for MockTaskEntity {
     }
 
     async fn soft_delete(&self, entity_id: &str, _hlc: &str) -> prism_sync_core::Result<()> {
-        self.deleted
-            .lock()
-            .unwrap()
-            .insert(entity_id.to_string(), true);
+        self.deleted.lock().unwrap().insert(entity_id.to_string(), true);
         Ok(())
     }
 
     async fn is_deleted(&self, entity_id: &str) -> prism_sync_core::Result<bool> {
-        Ok(self
-            .deleted
-            .lock()
-            .unwrap()
-            .get(entity_id)
-            .copied()
-            .unwrap_or(false))
+        Ok(self.deleted.lock().unwrap().get(entity_id).copied().unwrap_or(false))
     }
 
     async fn hard_delete(&self, entity_id: &str) -> prism_sync_core::Result<()> {
@@ -172,10 +145,7 @@ pub const SYNC_ID: &str = "test-sync-group";
 
 pub fn test_schema() -> SyncSchema {
     SyncSchema::builder()
-        .entity("tasks", |e| {
-            e.field("title", SyncType::String)
-                .field("done", SyncType::Bool)
-        })
+        .entity("tasks", |e| e.field("title", SyncType::String).field("done", SyncType::Bool))
         .build()
 }
 

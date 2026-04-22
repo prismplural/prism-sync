@@ -38,19 +38,11 @@ async fn put_snapshot_signed(
     for (k, v) in extra_headers {
         builder = builder.header(*k, *v);
     }
-    apply_signed_headers(
-        builder,
-        keys,
-        "PUT",
-        &path,
-        sync_id,
-        device_id,
-        &snapshot_data,
-    )
-    .body(snapshot_data)
-    .send()
-    .await
-    .unwrap()
+    apply_signed_headers(builder, keys, "PUT", &path, sync_id, device_id, &snapshot_data)
+        .body(snapshot_data)
+        .send()
+        .await
+        .unwrap()
 }
 
 // ───────────────────────────── Test 4: Snapshot ─────────────────────────
@@ -150,11 +142,7 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        download_resp.status(),
-        200,
-        "target device should be allowed"
-    );
+    assert_eq!(download_resp.status(), 200, "target device should be allowed");
     let json: serde_json::Value = download_resp.json().await.unwrap();
     let decoded_data = BASE64.decode(json["data"].as_str().unwrap()).unwrap();
     assert_eq!(decoded_data.as_slice(), b"targeted-snapshot");
@@ -166,11 +154,7 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        post_delete_resp.status(),
-        404,
-        "snapshot should auto-delete"
-    );
+    assert_eq!(post_delete_resp.status(), 404, "snapshot should auto-delete");
 }
 
 #[tokio::test]
@@ -216,9 +200,5 @@ async fn test_targeted_snapshot_expires() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        expired_resp.status(),
-        404,
-        "expired snapshot should be hidden"
-    );
+    assert_eq!(expired_resp.status(), 404, "expired snapshot should be hidden");
 }

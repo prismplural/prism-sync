@@ -131,9 +131,8 @@ impl ServerSharingRelay {
             ));
         }
 
-        let client = Client::builder()
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        let client =
+            Client::builder().build().map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
         Ok(Self {
             base_url,
@@ -212,9 +211,7 @@ impl ServerSharingRelay {
     /// Classify an HTTP status code into a RelayError.
     fn classify_error(status: u16, body: &str) -> RelayError {
         match status {
-            401 => RelayError::Auth {
-                message: format!("HTTP {status}: {body}"),
-            },
+            401 => RelayError::Auth { message: format!("HTTP {status}: {body}") },
             403 => {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
                     if json.get("error").and_then(|v| v.as_str()) == Some("upgrade_required") {
@@ -228,48 +225,28 @@ impl ServerSharingRelay {
                             .and_then(|v| v.as_str())
                             .map(str::to_owned)
                             .unwrap_or_else(|| format!("HTTP {status}: {body}"));
-                        return RelayError::UpgradeRequired {
-                            min_signature_version,
-                            message,
-                        };
+                        return RelayError::UpgradeRequired { min_signature_version, message };
                     }
                 }
-                RelayError::Auth {
-                    message: format!("HTTP {status}: {body}"),
-                }
+                RelayError::Auth { message: format!("HTTP {status}: {body}") }
             }
-            408 | 504 => RelayError::Timeout {
-                message: format!("HTTP {status}: {body}"),
-            },
-            409 => RelayError::Protocol {
-                message: format!("HTTP 409 Conflict: {body}"),
-            },
-            500..=599 => RelayError::Server {
-                status_code: status,
-                message: body.to_string(),
-            },
-            _ => RelayError::Protocol {
-                message: format!("Unexpected HTTP {status}: {body}"),
-            },
+            408 | 504 => RelayError::Timeout { message: format!("HTTP {status}: {body}") },
+            409 => RelayError::Protocol { message: format!("HTTP 409 Conflict: {body}") },
+            500..=599 => RelayError::Server { status_code: status, message: body.to_string() },
+            _ => RelayError::Protocol { message: format!("Unexpected HTTP {status}: {body}") },
         }
     }
 
     /// Classify a reqwest error into a RelayError.
     fn classify_reqwest_error(err: reqwest::Error) -> RelayError {
         if err.is_timeout() {
-            RelayError::Timeout {
-                message: err.to_string(),
-            }
+            RelayError::Timeout { message: err.to_string() }
         } else if err.is_connect() || err.is_request() {
-            RelayError::Network {
-                message: err.to_string(),
-            }
+            RelayError::Network { message: err.to_string() }
         } else if let Some(status) = err.status() {
             Self::classify_error(status.as_u16(), &err.to_string())
         } else {
-            RelayError::Network {
-                message: err.to_string(),
-            }
+            RelayError::Network { message: err.to_string() }
         }
     }
 }
@@ -289,9 +266,7 @@ fn validate_hex_id(field_name: &str, value: &str) -> Result<(), RelayError> {
     if value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err(RelayError::Protocol {
-            message: format!("Invalid {field_name} in relay response"),
-        })
+        Err(RelayError::Protocol { message: format!("Invalid {field_name} in relay response") })
     }
 }
 
@@ -611,13 +586,7 @@ mod tests {
     #[test]
     fn classify_error_500_is_server() {
         let err = ServerSharingRelay::classify_error(500, "internal error");
-        assert!(matches!(
-            err,
-            RelayError::Server {
-                status_code: 500,
-                ..
-            }
-        ));
+        assert!(matches!(err, RelayError::Server { status_code: 500, .. }));
     }
 
     #[tokio::test]

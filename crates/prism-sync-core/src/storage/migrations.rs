@@ -9,8 +9,9 @@ use rusqlite_migration::{Migrations, M};
 /// - field_versions
 /// - device_registry
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(
-        "-- V1: Initial sync engine tables
+    Migrations::new(vec![
+        M::up(
+            "-- V1: Initial sync engine tables
 
             CREATE TABLE IF NOT EXISTS sync_metadata (
                 sync_id TEXT PRIMARY KEY,
@@ -83,20 +84,21 @@ pub fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (sync_id, device_id)
             );
             ",
-    ),
-    M::up(
-        "-- V2: Add ml_dsa_key_generation to device_registry
+        ),
+        M::up(
+            "-- V2: Add ml_dsa_key_generation to device_registry
             ALTER TABLE device_registry ADD COLUMN ml_dsa_key_generation INTEGER NOT NULL DEFAULT 0;
             ",
-    ),
-    M::up(
-        "-- V3: Track last imported registry version
+        ),
+        M::up(
+            "-- V3: Track last imported registry version
             ALTER TABLE sync_metadata ADD COLUMN last_imported_registry_version INTEGER;
             ",
-    ),
-    M::up(
-        "-- V4: Add x_wing_public_key to device_registry
+        ),
+        M::up(
+            "-- V4: Add x_wing_public_key to device_registry
             ALTER TABLE device_registry ADD COLUMN x_wing_public_key BLOB NOT NULL DEFAULT X'';
             ",
-    )])
+        ),
+    ])
 }

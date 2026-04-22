@@ -32,13 +32,8 @@ fn bench_hybrid_sign_verify(c: &mut Criterion) {
 
     group.bench_function("sign_v3_hybrid", |b| {
         b.iter(|| {
-            HybridSignature::sign_v3(
-                &message,
-                context,
-                &ed25519_sk,
-                ml_dsa_sk.as_signing_key(),
-            )
-            .unwrap()
+            HybridSignature::sign_v3(&message, context, &ed25519_sk, ml_dsa_sk.as_signing_key())
+                .unwrap()
         })
     });
 
@@ -53,9 +48,7 @@ fn bench_hybrid_sign_verify(c: &mut Criterion) {
     });
 
     group.bench_function("verify_ed25519_only", |b| {
-        b.iter(|| {
-            DeviceSigningKey::verify(&ed25519_pk, &message, &ed25519_only_sig).unwrap()
-        })
+        b.iter(|| DeviceSigningKey::verify(&ed25519_pk, &message, &ed25519_only_sig).unwrap())
     });
 
     group.finish();

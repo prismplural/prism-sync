@@ -164,7 +164,9 @@ async fn upload_and_download_roundtrip() {
 
     // Upload a 1KB blob
     let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
-    let resp = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "test-media-001", &data).await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "test-media-001", &data)
+            .await;
     assert_eq!(resp.status(), 200, "upload should succeed");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["media_id"], "test-media-001");
@@ -319,7 +321,15 @@ async fn upload_rejects_content_hash_mismatch() {
     let wrong_hash = "a".repeat(64); // valid format but wrong hash
 
     let resp = upload_media_with_hash(
-        &client, &url, &token, &keys, &sync_id, &device_id, "test-media-001", data, &wrong_hash,
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        "test-media-001",
+        data,
+        &wrong_hash,
     )
     .await;
     assert_eq!(resp.status(), 400, "should reject content hash mismatch");
@@ -369,10 +379,7 @@ async fn upload_rejects_oversized_body() {
     // Axum's DefaultBodyLimit may return 413 (PayloadTooLarge) or the handler
     // returns 413 if the body somehow gets through. Either way, expect rejection.
     let status = resp.status().as_u16();
-    assert!(
-        status == 413 || status == 400,
-        "expected 413 or 400 for oversized body, got {status}"
-    );
+    assert!(status == 413 || status == 400, "expected 413 or 400 for oversized body, got {status}");
 }
 
 #[tokio::test]
@@ -394,18 +401,16 @@ async fn upload_rejects_when_quota_exceeded() {
 
     // First upload: 900 bytes — should succeed
     let data1 = vec![0x01u8; 900];
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "media-first", &data1,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "media-first", &data1)
+            .await;
     assert_eq!(resp.status(), 200, "first upload should succeed (within quota)");
 
     // Second upload: 200 bytes — should fail (900 + 200 > 1024)
     let data2 = vec![0x02u8; 200];
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "media-second", &data2,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "media-second", &data2)
+            .await;
     assert_eq!(resp.status(), 507, "second upload should fail with 507 StorageFull");
 }
 
@@ -464,7 +469,14 @@ async fn download_rejects_wrong_sync_id() {
     // Upload to group A
     let data = b"secret data for group A";
     let resp = upload_media(
-        &client, &url, &token_a, &keys_a, &sync_id_a, &device_id_a, "media-secret", data,
+        &client,
+        &url,
+        &token_a,
+        &keys_a,
+        &sync_id_a,
+        &device_id_a,
+        "media-secret",
+        data,
     )
     .await;
     assert_eq!(resp.status(), 200, "upload to group A should succeed");
@@ -476,11 +488,7 @@ async fn download_rejects_wrong_sync_id() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        404,
-        "download from wrong sync group should return 404"
-    );
+    assert_eq!(resp.status(), 404, "download from wrong sync group should return 404");
 }
 
 // ---------------------------------------------------------------------------
@@ -526,15 +534,13 @@ async fn download_returns_404_for_deleted_media() {
 
     // Upload a blob
     let data = b"soon to be deleted";
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "media-to-delete", data,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "media-to-delete", data)
+            .await;
     assert_eq!(resp.status(), 200, "upload should succeed");
 
     // Mark as deleted directly in DB
-    db.with_conn(|conn| db::mark_media_deleted(conn, "media-to-delete"))
-        .unwrap();
+    db.with_conn(|conn| db::mark_media_deleted(conn, "media-to-delete")).unwrap();
 
     // Try to download — should get 404
     let resp = client
@@ -543,11 +549,7 @@ async fn download_returns_404_for_deleted_media() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        404,
-        "download of deleted media should return 404"
-    );
+    assert_eq!(resp.status(), 404, "download of deleted media should return 404");
 }
 
 // ---------------------------------------------------------------------------
@@ -573,18 +575,16 @@ async fn upload_duplicate_media_id_returns_409() {
     let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
 
     let data = b"original upload";
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "dup-media-001", data,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "dup-media-001", data)
+            .await;
     assert_eq!(resp.status(), 200, "first upload should succeed");
 
     // Second upload with same media_id but different data
     let data2 = b"duplicate upload attempt";
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "dup-media-001", data2,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "dup-media-001", data2)
+            .await;
 
     let status = resp.status().as_u16();
     assert!(
@@ -617,25 +617,22 @@ async fn upload_rate_limited() {
 
     // Upload 1: should succeed
     let data1 = vec![0x01u8; 64];
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "rate-media-001", &data1,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "rate-media-001", &data1)
+            .await;
     assert_eq!(resp.status(), 200, "first upload should succeed");
 
     // Upload 2: should succeed (at the limit)
     let data2 = vec![0x02u8; 64];
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "rate-media-002", &data2,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "rate-media-002", &data2)
+            .await;
     assert_eq!(resp.status(), 200, "second upload should succeed");
 
     // Upload 3: should be rate limited
     let data3 = vec![0x03u8; 64];
-    let resp = upload_media(
-        &client, &url, &token, &keys, &sync_id, &device_id, "rate-media-003", &data3,
-    )
-    .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "rate-media-003", &data3)
+            .await;
     assert_eq!(resp.status(), 429, "third upload should be rate limited");
 }

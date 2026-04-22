@@ -139,11 +139,7 @@ async fn push_and_create_snapshot(
         .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_none(),
-        "Device A push failed: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "Device A push failed: {:?}", result.error);
 
     // --- Device B setup: pull and merge to populate field_versions ---
     let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
@@ -178,11 +174,7 @@ async fn push_and_create_snapshot(
         .sync(SYNC_ID, &key_hierarchy, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b.error.is_none(),
-        "Device B pull failed: {:?}",
-        result_b.error
-    );
+    assert!(result_b.error.is_none(), "Device B pull failed: {:?}", result_b.error);
     assert!(result_b.merged > 0, "Device B should have merged ops");
 
     // Device B uploads the snapshot
@@ -201,14 +193,7 @@ async fn push_and_create_snapshot(
         .await
         .unwrap();
 
-    (
-        relay,
-        key_hierarchy,
-        signing_key_a,
-        signing_key_b,
-        ml_dsa_key_b,
-        storage_b,
-    )
+    (relay, key_hierarchy, signing_key_a, signing_key_b, ml_dsa_key_b, storage_b)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -228,7 +213,13 @@ async fn test_push_limit_without_snapshot() {
     let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage, device_id);
-    register_device_with_pq(&relay, &storage, device_id, &signing_key.verifying_key(), &ml_dsa_key.public_key_bytes());
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
 
     // Push 10 batches
     for i in 0..10 {
@@ -310,10 +301,8 @@ async fn test_snapshot_roundtrip_preserves_data() {
         SyncConfig::default(),
     );
 
-    let (count, entity_changes) = engine_c
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
-        .await
-        .unwrap();
+    let (count, entity_changes) =
+        engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await.unwrap();
 
     assert_eq!(count, 2, "should restore 2 entities");
 
@@ -331,14 +320,8 @@ async fn test_snapshot_roundtrip_preserves_data() {
 
     assert_eq!(fv_b_1_title.winning_op_id, fv_c_1_title.winning_op_id);
     assert_eq!(fv_b_1_title.winning_hlc, fv_c_1_title.winning_hlc);
-    assert_eq!(
-        fv_b_1_title.winning_encoded_value,
-        fv_c_1_title.winning_encoded_value
-    );
-    assert_eq!(
-        fv_b_1_title.winning_device_id,
-        fv_c_1_title.winning_device_id
-    );
+    assert_eq!(fv_b_1_title.winning_encoded_value, fv_c_1_title.winning_encoded_value);
+    assert_eq!(fv_b_1_title.winning_device_id, fv_c_1_title.winning_device_id);
 
     // Check task-2 done
     let fv_b_2_done = storage_b
@@ -351,29 +334,18 @@ async fn test_snapshot_roundtrip_preserves_data() {
         .expect("imported field_version for task-2 done should exist");
 
     assert_eq!(fv_b_2_done.winning_op_id, fv_c_2_done.winning_op_id);
-    assert_eq!(
-        fv_b_2_done.winning_encoded_value,
-        fv_c_2_done.winning_encoded_value
-    );
+    assert_eq!(fv_b_2_done.winning_encoded_value, fv_c_2_done.winning_encoded_value);
 
     // Bootstrap must preserve the joining device's local identity, not the
     // source device identity embedded in the snapshot.
-    let imported_meta = storage_c
-        .get_sync_metadata(SYNC_ID)
-        .unwrap()
-        .expect("imported sync metadata should exist");
+    let imported_meta =
+        storage_c.get_sync_metadata(SYNC_ID).unwrap().expect("imported sync metadata should exist");
     assert_eq!(imported_meta.local_device_id, "device-ccc");
 
     // Verify entity_changes have correct data
-    let task_1 = entity_changes
-        .iter()
-        .find(|c| c.entity_id == "task-1")
-        .unwrap();
+    let task_1 = entity_changes.iter().find(|c| c.entity_id == "task-1").unwrap();
     assert_eq!(task_1.fields.get("title"), Some(&"\"First\"".to_string()));
 
-    let task_2 = entity_changes
-        .iter()
-        .find(|c| c.entity_id == "task-2")
-        .unwrap();
+    let task_2 = entity_changes.iter().find(|c| c.entity_id == "task-2").unwrap();
     assert_eq!(task_2.fields.get("done"), Some(&"true".to_string()));
 }

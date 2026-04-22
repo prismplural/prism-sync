@@ -24,18 +24,21 @@ struct RekeyMockRelay {
 
 impl RekeyMockRelay {
     fn new(devices: Vec<DeviceInfo>) -> Self {
-        Self {
-            devices,
-            artifacts: Mutex::new(HashMap::new()),
-        }
+        Self { devices, artifacts: Mutex::new(HashMap::new()) }
     }
 }
 
 #[async_trait]
 impl SyncTransport for RekeyMockRelay {
-    async fn pull_changes(&self, _: i64) -> Result<PullResponse, RelayError> { unimplemented!() }
-    async fn push_changes(&self, _: OutgoingBatch) -> Result<i64, RelayError> { unimplemented!() }
-    async fn ack(&self, _: i64) -> Result<(), RelayError> { unimplemented!() }
+    async fn pull_changes(&self, _: i64) -> Result<PullResponse, RelayError> {
+        unimplemented!()
+    }
+    async fn push_changes(&self, _: OutgoingBatch) -> Result<i64, RelayError> {
+        unimplemented!()
+    }
+    async fn ack(&self, _: i64) -> Result<(), RelayError> {
+        unimplemented!()
+    }
 }
 
 #[async_trait]
@@ -48,7 +51,10 @@ impl DeviceRegistry for RekeyMockRelay {
         })
     }
     async fn register_device(&self, _req: RegisterRequest) -> Result<RegisterResponse, RelayError> {
-        Ok(RegisterResponse { device_session_token: "mock".to_string(), min_signature_version: None })
+        Ok(RegisterResponse {
+            device_session_token: "mock".to_string(),
+            min_signature_version: None,
+        })
     }
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
         Ok(self.devices.clone())
@@ -66,9 +72,22 @@ impl DeviceRegistry for RekeyMockRelay {
         }
         Ok(epoch)
     }
-    async fn deregister(&self) -> Result<(), RelayError> { Ok(()) }
-    async fn rotate_ml_dsa(&self, _: &str, _: &[u8], _: u32, _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof, _: Option<&[u8]>) -> Result<RotateMlDsaResponse, RelayError> { unimplemented!() }
-    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> { Ok(None) }
+    async fn deregister(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+    async fn rotate_ml_dsa(
+        &self,
+        _: &str,
+        _: &[u8],
+        _: u32,
+        _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+        _: Option<&[u8]>,
+    ) -> Result<RotateMlDsaResponse, RelayError> {
+        unimplemented!()
+    }
+    async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -96,23 +115,49 @@ impl EpochManagement for RekeyMockRelay {
 
 #[async_trait]
 impl SnapshotExchange for RekeyMockRelay {
-    async fn get_snapshot(&self) -> Result<Option<SnapshotResponse>, RelayError> { unimplemented!() }
-    async fn put_snapshot(&self, _: i32, _: i64, _: Vec<u8>, _: Option<u64>, _: Option<String>, _: String) -> Result<(), RelayError> { unimplemented!() }
+    async fn get_snapshot(&self) -> Result<Option<SnapshotResponse>, RelayError> {
+        unimplemented!()
+    }
+    async fn put_snapshot(
+        &self,
+        _: i32,
+        _: i64,
+        _: Vec<u8>,
+        _: Option<u64>,
+        _: Option<String>,
+        _: String,
+    ) -> Result<(), RelayError> {
+        unimplemented!()
+    }
 }
 
 #[async_trait]
 impl MediaRelay for RekeyMockRelay {
-    async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> Result<(), RelayError> { unimplemented!() }
-    async fn download_media(&self, _: &str) -> Result<Vec<u8>, RelayError> { unimplemented!() }
+    async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> Result<(), RelayError> {
+        unimplemented!()
+    }
+    async fn download_media(&self, _: &str) -> Result<Vec<u8>, RelayError> {
+        unimplemented!()
+    }
 }
 
 #[async_trait]
 impl SyncRelay for RekeyMockRelay {
-    async fn delete_sync_group(&self) -> Result<(), RelayError> { unimplemented!() }
-    async fn connect_websocket(&self) -> Result<(), RelayError> { unimplemented!() }
-    async fn disconnect_websocket(&self) -> Result<(), RelayError> { unimplemented!() }
-    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> { unimplemented!() }
-    async fn dispose(&self) -> Result<(), RelayError> { Ok(()) }
+    async fn delete_sync_group(&self) -> Result<(), RelayError> {
+        unimplemented!()
+    }
+    async fn connect_websocket(&self) -> Result<(), RelayError> {
+        unimplemented!()
+    }
+    async fn disconnect_websocket(&self) -> Result<(), RelayError> {
+        unimplemented!()
+    }
+    fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+        unimplemented!()
+    }
+    async fn dispose(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -216,24 +261,15 @@ async fn epoch_rotation_full_cycle() {
 
     // ── Step 2: Device B recovers the epoch key via handle_rotation ──
     // With X-Wing KEM, B only needs its own DK — no sender identity needed.
-    EpochManager::handle_rotation(
-        &relay,
-        &mut kh_b,
-        1,
-        "device-b",
-        &xwing_b,
-    )
-    .await
-    .expect("handle_rotation should succeed");
+    EpochManager::handle_rotation(&relay, &mut kh_b, 1, "device-b", &xwing_b)
+        .await
+        .expect("handle_rotation should succeed");
 
     assert!(kh_b.has_epoch_key(1), "Device B should have epoch 1 key");
     let stored_b = kh_b.epoch_key(1).unwrap();
 
     // ── Step 3: Verify both have the SAME epoch key ──
-    assert_eq!(
-        stored_a, stored_b,
-        "Device A and B should have the same epoch 1 key"
-    );
+    assert_eq!(stored_a, stored_b, "Device A and B should have the same epoch 1 key");
 
     // ── Step 4: Verify encrypt/decrypt interop ──
     let plaintext = b"hello from device A at epoch 1";
@@ -243,10 +279,7 @@ async fn epoch_rotation_full_cycle() {
     let decrypted = aead::xchacha_decrypt(stored_b, &ciphertext)
         .expect("decryption with epoch key should succeed");
 
-    assert_eq!(
-        decrypted, plaintext,
-        "Device B should decrypt what Device A encrypted"
-    );
+    assert_eq!(decrypted, plaintext, "Device B should decrypt what Device A encrypted");
 
     // Also verify reverse direction
     let plaintext_b = b"reply from device B";
@@ -256,10 +289,7 @@ async fn epoch_rotation_full_cycle() {
     let decrypted_b =
         aead::xchacha_decrypt(stored_a, &ciphertext_b).expect("decryption by A should succeed");
 
-    assert_eq!(
-        decrypted_b, plaintext_b,
-        "Device A should decrypt what Device B encrypted"
-    );
+    assert_eq!(decrypted_b, plaintext_b, "Device A should decrypt what Device B encrypted");
 }
 
 /// Verify that a revoked device cannot recover the new epoch key (no artifact).
@@ -318,22 +348,9 @@ async fn revoked_device_cannot_recover_epoch_key() {
     let mut kh_c = KeyHierarchy::new();
     kh_c.initialize("password", &[3u8; 16]).unwrap();
 
-    let result = EpochManager::handle_rotation(
-        &relay,
-        &mut kh_c,
-        1,
-        "device-c",
-        &xwing_c,
-    )
-    .await;
+    let result = EpochManager::handle_rotation(&relay, &mut kh_c, 1, "device-c", &xwing_c).await;
 
-    assert!(
-        result.is_err(),
-        "revoked device should fail to recover epoch key"
-    );
+    assert!(result.is_err(), "revoked device should fail to recover epoch key");
     let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("no rekey artifact"),
-        "error should mention missing artifact, got: {msg}"
-    );
+    assert!(msg.contains("no rekey artifact"), "error should mention missing artifact, got: {msg}");
 }

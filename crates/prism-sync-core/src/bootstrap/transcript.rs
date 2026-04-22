@@ -205,10 +205,7 @@ mod tests {
             t.append_bytes(b"payload", b"same-data");
             t.finalize()
         };
-        assert_ne!(
-            build(BootstrapProfile::SyncPairing),
-            build(BootstrapProfile::RemoteSharing),
-        );
+        assert_ne!(build(BootstrapProfile::SyncPairing), build(BootstrapProfile::RemoteSharing),);
     }
 
     /// Initiator role ≠ Responder role with the same data.
@@ -219,10 +216,7 @@ mod tests {
             t.append_role_bytes(role, b"ek", b"key_data");
             t.finalize()
         };
-        assert_ne!(
-            build(BootstrapRole::Initiator),
-            build(BootstrapRole::Responder),
-        );
+        assert_ne!(build(BootstrapRole::Initiator), build(BootstrapRole::Responder),);
     }
 
     /// Different session IDs produce different hashes.
@@ -280,9 +274,6 @@ mod tests {
         hasher.update(b"session-pin");
         let fake_hash: [u8; 32] = hasher.finalize().into();
 
-        assert_ne!(
-            v1_hash, fake_hash,
-            "version byte must affect transcript hash"
-        );
+        assert_ne!(v1_hash, fake_hash, "version byte must affect transcript hash");
     }
 }

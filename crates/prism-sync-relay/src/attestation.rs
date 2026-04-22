@@ -91,13 +91,11 @@ pub(crate) fn verify_android_key_attestation(
     let extension_oid = Oid::from(ANDROID_KEY_ATTESTATION_EXTENSION_OID)
         .expect("android key attestation extension OID is valid");
 
-    let leaf = parsed
-        .first()
-        .ok_or_else(|| "android attestation chain is empty".to_string())?;
+    let leaf = parsed.first().ok_or_else(|| "android attestation chain is empty".to_string())?;
     for cert in parsed.iter().skip(1) {
         if cert.extensions().iter().any(|ext| ext.oid == extension_oid) {
             return Err(
-                "android attestation extension must only appear in the leaf certificate".into(),
+                "android attestation extension must only appear in the leaf certificate".into()
             );
         }
     }
@@ -127,14 +125,11 @@ pub(crate) fn verify_android_key_attestation(
     if !description.root_of_trust.device_locked {
         return Err("android attestation device is unlocked".into());
     }
-    let is_graphene = config
-        .grapheneos_verified_boot_key_allowlist
-        .iter()
-        .any(|entry| {
-            hex::decode(entry)
-                .map(|bytes| bytes == description.root_of_trust.verified_boot_key)
-                .unwrap_or(false)
-        });
+    let is_graphene = config.grapheneos_verified_boot_key_allowlist.iter().any(|entry| {
+        hex::decode(entry)
+            .map(|bytes| bytes == description.root_of_trust.verified_boot_key)
+            .unwrap_or(false)
+    });
 
     let admission_kind = match description.root_of_trust.verified_boot_state {
         VERIFIED_BOOT_STATE_VERIFIED => Some(FirstDeviceAdmissionKind::StockAndroid),
@@ -278,9 +273,7 @@ fn parse_tlv<'a>(input: &'a [u8], label: &str) -> Result<(DerTlv<'a>, &'a [u8]),
 
     let (class, constructed, tag, mut offset) = parse_identifier(input, label)?;
     let (length, length_len) = parse_length(
-        input
-            .get(offset..)
-            .ok_or_else(|| format!("invalid {label} DER: truncated length"))?,
+        input.get(offset..).ok_or_else(|| format!("invalid {label} DER: truncated length"))?,
         label,
     )?;
     offset += length_len;
@@ -291,21 +284,11 @@ fn parse_tlv<'a>(input: &'a [u8], label: &str) -> Result<(DerTlv<'a>, &'a [u8]),
         return Err(format!("invalid {label} DER: truncated value"));
     }
 
-    Ok((
-        DerTlv {
-            class,
-            constructed,
-            tag,
-            value: &input[offset..end],
-        },
-        &input[end..],
-    ))
+    Ok((DerTlv { class, constructed, tag, value: &input[offset..end] }, &input[end..]))
 }
 
 fn parse_identifier(input: &[u8], label: &str) -> Result<(DerClass, bool, u64, usize), String> {
-    let first = *input
-        .first()
-        .ok_or_else(|| format!("invalid {label} DER: missing identifier"))?;
+    let first = *input.first().ok_or_else(|| format!("invalid {label} DER: missing identifier"))?;
     let class = match first >> 6 {
         0 => DerClass::Universal,
         1 => DerClass::Application,
@@ -337,18 +320,14 @@ fn parse_identifier(input: &[u8], label: &str) -> Result<(DerClass, bool, u64, u
 }
 
 fn parse_length(input: &[u8], label: &str) -> Result<(usize, usize), String> {
-    let first = *input
-        .first()
-        .ok_or_else(|| format!("invalid {label} DER: missing length"))?;
+    let first = *input.first().ok_or_else(|| format!("invalid {label} DER: missing length"))?;
     if first & 0x80 == 0 {
         return Ok((first as usize, 1));
     }
 
     let length_len = (first & 0x7f) as usize;
     if length_len == 0 {
-        return Err(format!(
-            "invalid {label} DER: indefinite lengths are unsupported"
-        ));
+        return Err(format!("invalid {label} DER: indefinite lengths are unsupported"));
     }
     let bytes = input
         .get(1..1 + length_len)
@@ -407,9 +386,7 @@ fn read_octet_string(block: &DerTlv<'_>) -> Result<Vec<u8>, String> {
 
 fn read_octet_string_fixed<const N: usize>(block: &DerTlv<'_>) -> Result<[u8; N], String> {
     let bytes = read_octet_string(block)?;
-    bytes
-        .try_into()
-        .map_err(|_| "android attestation challenge has invalid length".into())
+    bytes.try_into().map_err(|_| "android attestation challenge has invalid length".into())
 }
 
 fn decode_base64_der(value: &str) -> Result<Vec<u8>, String> {
@@ -566,10 +543,7 @@ mod tests {
         assert_eq!(description.attestation_challenge, challenge);
         assert_eq!(description.root_of_trust.verified_boot_key, vec![0x42; 32]);
         assert!(description.root_of_trust.device_locked);
-        assert_eq!(
-            description.root_of_trust.verified_boot_state,
-            VERIFIED_BOOT_STATE_VERIFIED
-        );
+        assert_eq!(description.root_of_trust.verified_boot_state, VERIFIED_BOOT_STATE_VERIFIED);
     }
 
     #[test]
@@ -579,20 +553,16 @@ mod tests {
         let (root_cert, root_key) = make_test_root();
 
         let mut leaf_params = CertificateParams::new(vec!["leaf".into()]).unwrap();
-        leaf_params
-            .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                ANDROID_KEY_ATTESTATION_EXTENSION_OID,
-                build_attestation_extension(
-                    challenge,
-                    &verified_boot_key,
-                    VERIFIED_BOOT_STATE_SELF_SIGNED,
-                ),
-            ));
+        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
+            ANDROID_KEY_ATTESTATION_EXTENSION_OID,
+            build_attestation_extension(
+                challenge,
+                &verified_boot_key,
+                VERIFIED_BOOT_STATE_SELF_SIGNED,
+            ),
+        ));
         let leaf_key = KeyPair::generate().unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &root_cert, &root_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &root_cert, &root_key).unwrap();
 
         let result = verify_android_key_attestation(
             "sync",
@@ -610,16 +580,12 @@ mod tests {
     fn verify_android_key_attestation_rejects_challenge_mismatch() {
         let (root_cert, root_key) = make_test_root();
         let mut leaf_params = CertificateParams::new(vec!["leaf".into()]).unwrap();
-        leaf_params
-            .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                ANDROID_KEY_ATTESTATION_EXTENSION_OID,
-                build_attestation_extension([0x11; 32], &[0x22; 32], VERIFIED_BOOT_STATE_VERIFIED),
-            ));
+        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
+            ANDROID_KEY_ATTESTATION_EXTENSION_OID,
+            build_attestation_extension([0x11; 32], &[0x22; 32], VERIFIED_BOOT_STATE_VERIFIED),
+        ));
         let leaf_key = KeyPair::generate().unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &root_cert, &root_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &root_cert, &root_key).unwrap();
 
         let err = verify_android_key_attestation(
             "sync",
@@ -639,24 +605,20 @@ mod tests {
         let verified_boot_key = vec![0xBB; 32];
         let mut root_params = CertificateParams::new(vec!["Key Attestation CA".into()]).unwrap();
         root_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        root_params
-            .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                ANDROID_KEY_ATTESTATION_EXTENSION_OID,
-                build_attestation_extension(
-                    challenge,
-                    &verified_boot_key,
-                    VERIFIED_BOOT_STATE_VERIFIED,
-                ),
-            ));
+        root_params.custom_extensions.push(CustomExtension::from_oid_content(
+            ANDROID_KEY_ATTESTATION_EXTENSION_OID,
+            build_attestation_extension(
+                challenge,
+                &verified_boot_key,
+                VERIFIED_BOOT_STATE_VERIFIED,
+            ),
+        ));
         let root_key = KeyPair::generate().unwrap();
         let root_cert = root_params.self_signed(&root_key).unwrap();
 
         let leaf_params = CertificateParams::new(vec!["leaf".into()]).unwrap();
         let leaf_key = KeyPair::generate().unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &root_cert, &root_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &root_cert, &root_key).unwrap();
 
         let err = verify_android_key_attestation(
             "sync",

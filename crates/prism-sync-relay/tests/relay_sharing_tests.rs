@@ -184,11 +184,7 @@ async fn test_publish_identity_and_fetch_bundle() {
     assert_eq!(resp.status(), 204, "publish prekey should return 204");
 
     // 3. Fetch bundle (public route)
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["device_id"].as_str().unwrap(), device_id);
@@ -246,11 +242,7 @@ async fn test_sharing_id_conflict_different_sync_group() {
         b"bundle2",
     )
     .await;
-    assert_eq!(
-        resp.status(),
-        409,
-        "different sync group with same sharing_id should 409"
-    );
+    assert_eq!(resp.status(), 409, "different sync group with same sharing_id should 409");
 }
 
 #[tokio::test]
@@ -363,11 +355,7 @@ async fn test_identity_publish_rejects_generation_rollback() {
     .await;
     assert_eq!(resp.status(), 204);
 
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     let fetched_identity = base64::engine::general_purpose::STANDARD
@@ -508,11 +496,7 @@ async fn test_fetch_bundle_returns_most_recent_active_prekey() {
     .unwrap();
 
     // Fetch bundle should return the most recent prekey (device 2)
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["device_id"].as_str().unwrap(), device_id_2);
@@ -525,11 +509,7 @@ async fn test_fetch_nonexistent_sharing_id_returns_404() {
     let client = Client::new();
     let sharing_id = generate_sharing_id();
 
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -542,14 +522,8 @@ async fn test_sharing_init_upload_fetch_consume() {
     let sender_sync_id = generate_sync_id();
     let sender_device_id = generate_device_id();
     let sender_keys = TestDeviceKeys::generate(&sender_device_id);
-    let sender_token = register_device(
-        &client,
-        &url,
-        &sender_sync_id,
-        &sender_device_id,
-        &sender_keys,
-    )
-    .await;
+    let sender_token =
+        register_device(&client, &url, &sender_sync_id, &sender_device_id, &sender_keys).await;
     let sender_sharing_id = generate_sharing_id();
 
     // Bind sender's sharing_id
@@ -570,14 +544,9 @@ async fn test_sharing_init_upload_fetch_consume() {
     let recipient_sync_id = generate_sync_id();
     let recipient_device_id = generate_device_id();
     let recipient_keys = TestDeviceKeys::generate(&recipient_device_id);
-    let recipient_token = register_device(
-        &client,
-        &url,
-        &recipient_sync_id,
-        &recipient_device_id,
-        &recipient_keys,
-    )
-    .await;
+    let recipient_token =
+        register_device(&client, &url, &recipient_sync_id, &recipient_device_id, &recipient_keys)
+            .await;
     let recipient_sharing_id = generate_sharing_id();
 
     // Bind recipient's sharing_id
@@ -872,11 +841,7 @@ async fn test_max_pending_limit_enforced() {
         &body_bytes,
     );
     let resp = builder.send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        429,
-        "exceeding max_pending should return 429"
-    );
+    assert_eq!(resp.status(), 429, "exceeding max_pending should return 429");
 }
 
 #[tokio::test]
@@ -919,11 +884,7 @@ async fn test_delete_identity_removes_identity_and_prekeys() {
     assert_eq!(resp.status(), 204);
 
     // Verify bundle is available
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
     // Delete identity
@@ -943,11 +904,7 @@ async fn test_delete_identity_removes_identity_and_prekeys() {
     assert_eq!(resp.status(), 204);
 
     // Bundle should now be 404
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -1067,9 +1024,7 @@ async fn test_cleanup_removes_expired_and_consumed_sharing_inits() {
 
         // Verify remaining
         let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM sharing_init_payloads", [], |row| {
-                row.get(0)
-            })?;
+            conn.query_row("SELECT COUNT(*) FROM sharing_init_payloads", [], |row| row.get(0))?;
         assert_eq!(count, 2, "valid + recently consumed should remain");
 
         Ok(())
@@ -1446,15 +1401,10 @@ async fn test_revoked_device_prekey_not_returned() {
     // Revoke device_a
     let did_a2 = device_id_a.clone();
     let sid2 = sync_id.clone();
-    db.with_conn(move |conn| db::revoke_device(conn, &sid2, &did_a2, false))
-        .unwrap();
+    db.with_conn(move |conn| db::revoke_device(conn, &sid2, &did_a2, false)).unwrap();
 
     // Fetch bundle: should return device_b's prekey (device_a is revoked)
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["device_id"].as_str().unwrap(), device_id_b);
@@ -1463,20 +1413,11 @@ async fn test_revoked_device_prekey_not_returned() {
     // Now revoke device_b too
     let did_b2 = device_id_b.clone();
     let sid3 = sync_id.clone();
-    db.with_conn(move |conn| db::revoke_device(conn, &sid3, &did_b2, false))
-        .unwrap();
+    db.with_conn(move |conn| db::revoke_device(conn, &sid3, &did_b2, false)).unwrap();
 
     // Fetch bundle: should return 404 (all devices revoked)
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        404,
-        "bundle with all devices revoked should 404"
-    );
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
+    assert_eq!(resp.status(), 404, "bundle with all devices revoked should 404");
 }
 
 #[tokio::test]
@@ -1486,11 +1427,8 @@ async fn test_bundle_404_no_presence_probing() {
 
     // Scenario A: sharing_id doesn't exist at all
     let nonexistent_id = generate_sharing_id();
-    let resp_a = client
-        .get(format!("{url}/v1/sharing/{nonexistent_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp_a =
+        client.get(format!("{url}/v1/sharing/{nonexistent_id}/bundle")).send().await.unwrap();
     assert_eq!(resp_a.status(), 404, "nonexistent sharing_id should 404");
 
     // Scenario B: publish identity but NO prekeys
@@ -1514,11 +1452,7 @@ async fn test_bundle_404_no_presence_probing() {
     assert_eq!(resp.status(), 204);
 
     // Fetch bundle with identity but no prekeys
-    let resp_b = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp_b = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp_b.status(), 404, "identity without prekeys should 404");
 
     // Both scenarios must return the same status code (404) — no presence probing
@@ -1599,11 +1533,7 @@ async fn test_stale_prekey_not_served() {
 
     // Fetch bundle should return a generic 404 so callers cannot distinguish
     // stale prekeys from other "recipient unavailable" states.
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
     let body = resp.text().await.unwrap();
     assert_eq!(body, "Not Found");
@@ -1629,11 +1559,7 @@ async fn test_fresh_prekey_served_normally() {
     .unwrap();
 
     // Fetch bundle should succeed
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["device_id"].as_str().unwrap(), device_id);
@@ -1659,16 +1585,8 @@ async fn test_prekey_at_serve_boundary_still_served() {
     })
     .unwrap();
 
-    let resp = client
-        .get(format!("{url}/v1/sharing/{sharing_id}/bundle"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "prekey within serve limit should be served"
-    );
+    let resp = client.get(format!("{url}/v1/sharing/{sharing_id}/bundle")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "prekey within serve limit should be served");
 }
 
 #[tokio::test]

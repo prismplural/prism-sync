@@ -22,9 +22,7 @@ use common::MemorySecureStore;
 // ══════════════════════════════════════════════════════════════════════════
 
 fn minimal_schema() -> SyncSchema {
-    SyncSchema::builder()
-        .entity("items", |e| e.field("name", SyncType::String))
-        .build()
+    SyncSchema::builder().entity("items", |e| e.field("name", SyncType::String)).build()
 }
 
 fn in_memory_storage() -> Arc<RusqliteSyncStorage> {
@@ -45,17 +43,11 @@ fn test_builder_requires_schema() {
     let storage = in_memory_storage();
     let store = memory_secure_store();
 
-    let result = PrismSync::builder()
-        .storage(storage)
-        .secure_store(store)
-        .build();
+    let result = PrismSync::builder().storage(storage).secure_store(store).build();
 
     assert!(result.is_err(), "build() without schema should return Err");
     let msg = result.err().unwrap().to_string();
-    assert!(
-        msg.contains("schema"),
-        "error message should mention 'schema', got: {msg}"
-    );
+    assert!(msg.contains("schema"), "error message should mention 'schema', got: {msg}");
 }
 
 /// `PrismSync::builder().schema(...).build()` without storage must return an error.
@@ -63,17 +55,11 @@ fn test_builder_requires_schema() {
 fn test_builder_requires_storage() {
     let store = memory_secure_store();
 
-    let result = PrismSync::builder()
-        .schema(minimal_schema())
-        .secure_store(store)
-        .build();
+    let result = PrismSync::builder().schema(minimal_schema()).secure_store(store).build();
 
     assert!(result.is_err(), "build() without storage should return Err");
     let msg = result.err().unwrap().to_string();
-    assert!(
-        msg.contains("storage"),
-        "error message should mention 'storage', got: {msg}"
-    );
+    assert!(msg.contains("storage"), "error message should mention 'storage', got: {msg}");
 }
 
 /// Builder with an `http://` relay URL (without `allow_insecure_transport`) must
@@ -90,10 +76,7 @@ fn test_builder_rejects_http_url() {
         .relay_url("http://localhost:8080")
         .build();
 
-    assert!(
-        result.is_err(),
-        "build() with http:// URL should return Err"
-    );
+    assert!(result.is_err(), "build() with http:// URL should return Err");
     let msg = result.err().unwrap().to_string();
     assert!(
         msg.contains("HTTPS") || msg.contains("insecure") || msg.contains("https"),
@@ -131,10 +114,7 @@ fn test_builder_allows_insecure() {
         .allow_insecure_transport()
         .build();
 
-    assert!(
-        result.is_ok(),
-        "build() with http:// + allow_insecure_transport() should succeed"
-    );
+    assert!(result.is_ok(), "build() with http:// + allow_insecure_transport() should succeed");
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -163,8 +143,7 @@ fn test_initialize_and_unlock() {
     let secret_key_bytes = prism_sync_crypto::mnemonic::to_bytes(&secret_key_mnemonic)
         .expect("mnemonic to bytes should succeed");
 
-    sync.initialize("test-password-1", &secret_key_bytes)
-        .expect("initialize should succeed");
+    sync.initialize("test-password-1", &secret_key_bytes).expect("initialize should succeed");
 
     assert!(sync.is_unlocked(), "should be unlocked after initialize");
 
@@ -173,8 +152,7 @@ fn test_initialize_and_unlock() {
     assert!(!sync.is_unlocked(), "should be locked after lock()");
 
     // Unlock with same credentials should restore access.
-    sync.unlock("test-password-1", &secret_key_bytes)
-        .expect("unlock should succeed");
+    sync.unlock("test-password-1", &secret_key_bytes).expect("unlock should succeed");
     assert!(sync.is_unlocked(), "should be unlocked after unlock");
 
     // The database key should be derivable when unlocked.
@@ -208,39 +186,25 @@ async fn test_pairing_create_sync_group() {
             None,
             None,
             None,
-            |_sync_id, _device_id, _token| {
-                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
-            },
+            |_sync_id, _device_id, _token| Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>),
         )
         .await
         .expect("create_sync_group should succeed");
 
     // Basic credential sanity checks.
     assert!(!credentials.sync_id.is_empty(), "sync_id must not be empty");
-    assert_eq!(
-        credentials.sync_id.len(),
-        64,
-        "sync_id should be 32 bytes hex (64 chars)"
-    );
-    assert!(
-        !credentials.mnemonic.is_empty(),
-        "mnemonic must not be empty"
-    );
-    assert!(
-        !credentials.wrapped_dek.is_empty(),
-        "wrapped_dek must not be empty"
-    );
+    assert_eq!(credentials.sync_id.len(), 64, "sync_id should be 32 bytes hex (64 chars)");
+    assert!(!credentials.mnemonic.is_empty(), "mnemonic must not be empty");
+    assert!(!credentials.wrapped_dek.is_empty(), "wrapped_dek must not be empty");
     assert!(!credentials.salt.is_empty(), "salt must not be empty");
 
     // Pairing response must reference the same sync_id.
     assert_eq!(
-        response.sync_id,
-        credentials.sync_id,
+        response.sync_id, credentials.sync_id,
         "pairing response sync_id must match credentials sync_id"
     );
     assert_eq!(
-        response.relay_url,
-        "wss://relay.example.com",
+        response.relay_url, "wss://relay.example.com",
         "pairing response relay_url must match"
     );
     assert_eq!(

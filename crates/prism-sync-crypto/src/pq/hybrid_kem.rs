@@ -135,15 +135,13 @@ mod tests {
 
         fn try_next_u32(&mut self) -> core::result::Result<u32, Self::Error> {
             let mut buf = [0u8; 4];
-            self.try_fill_bytes(&mut buf)
-                .expect("fixed RNG cannot fail");
+            self.try_fill_bytes(&mut buf).expect("fixed RNG cannot fail");
             Ok(u32::from_le_bytes(buf))
         }
 
         fn try_next_u64(&mut self) -> core::result::Result<u64, Self::Error> {
             let mut buf = [0u8; 8];
-            self.try_fill_bytes(&mut buf)
-                .expect("fixed RNG cannot fail");
+            self.try_fill_bytes(&mut buf).expect("fixed RNG cannot fail");
             Ok(u64::from_le_bytes(buf))
         }
 

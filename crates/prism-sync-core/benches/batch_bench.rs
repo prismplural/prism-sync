@@ -66,9 +66,7 @@ fn bench_batch_sign_verify(c: &mut Criterion) {
     });
 
     group.bench_function("verify_batch_signature_v3_hybrid", |b| {
-        b.iter(|| {
-            verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).unwrap()
-        })
+        b.iter(|| verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).unwrap())
     });
 
     group.finish();

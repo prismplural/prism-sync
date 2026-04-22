@@ -18,10 +18,7 @@ use super::{verify_signed_request, AuthIdentity};
 // ---------------------------------------------------------------------------
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/v1/sync/{sync_id}/registry",
-        get(get_registry).put(put_registry),
-    )
+    Router::new().route("/v1/sync/{sync_id}/registry", get(get_registry).put(put_registry))
 }
 
 // ---------------------------------------------------------------------------
@@ -121,9 +118,7 @@ async fn put_registry(
 
     // Size cap: 512KB
     if artifact_blob.len() > 512 * 1024 {
-        return Err(AppError::BadRequest(
-            "signed_registry_snapshot too large (max 512KB)",
-        ));
+        return Err(AppError::BadRequest("signed_registry_snapshot too large (max 512KB)"));
     }
 
     let db = state.db.clone();
@@ -136,9 +131,7 @@ async fn put_registry(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
-    Ok(Json(PutRegistryResponse {
-        registry_version: version,
-    }))
+    Ok(Json(PutRegistryResponse { registry_version: version }))
 }
 
 fn do_put_registry(

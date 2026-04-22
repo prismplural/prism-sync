@@ -192,9 +192,13 @@ pub fn verify_batch_signature(
     let hybrid_sig = HybridSignature::from_bytes(&envelope.signature)
         .map_err(|e| CoreError::Serialization(format!("hybrid signature: {e}")))?;
 
-    hybrid_sig
-        .verify_v3(&canonical, b"sync_batch", sender_ed25519_pk, sender_ml_dsa_pk)
-        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("Batch signature verification failed: {e}"))))?;
+    hybrid_sig.verify_v3(&canonical, b"sync_batch", sender_ed25519_pk, sender_ml_dsa_pk).map_err(
+        |e| {
+            CoreError::Storage(StorageError::Logic(format!(
+                "Batch signature verification failed: {e}"
+            )))
+        },
+    )?;
 
     Ok(())
 }
@@ -275,8 +279,18 @@ mod tests {
         let wrong_ml_dsa_key = make_ml_dsa_keypair();
         let wrong_ml_dsa_pk = wrong_ml_dsa_key.public_key_bytes();
 
-        assert!(verify_batch_signature(&envelope, &wrong_ed25519_pk, &ml_dsa_key.public_key_bytes()).is_err());
-        assert!(verify_batch_signature(&envelope, &signing_key.verifying_key().to_bytes(), &wrong_ml_dsa_pk).is_err());
+        assert!(verify_batch_signature(
+            &envelope,
+            &wrong_ed25519_pk,
+            &ml_dsa_key.public_key_bytes()
+        )
+        .is_err());
+        assert!(verify_batch_signature(
+            &envelope,
+            &signing_key.verifying_key().to_bytes(),
+            &wrong_ml_dsa_pk
+        )
+        .is_err());
     }
 
     #[test]
@@ -374,8 +388,26 @@ mod tests {
     #[test]
     fn canonical_format_deterministic() {
         let payload_hash = [42u8; 32];
-        let data1 = build_canonical_signed_data(3, "sync-1", 0, "batch-1", "ops", "device-1", 0, &payload_hash);
-        let data2 = build_canonical_signed_data(3, "sync-1", 0, "batch-1", "ops", "device-1", 0, &payload_hash);
+        let data1 = build_canonical_signed_data(
+            3,
+            "sync-1",
+            0,
+            "batch-1",
+            "ops",
+            "device-1",
+            0,
+            &payload_hash,
+        );
+        let data2 = build_canonical_signed_data(
+            3,
+            "sync-1",
+            0,
+            "batch-1",
+            "ops",
+            "device-1",
+            0,
+            &payload_hash,
+        );
         assert_eq!(data1, data2);
     }
 
@@ -480,7 +512,8 @@ mod tests {
 
         // Replace signature with random bytes of the same length
         let sig_len = envelope.signature.len();
-        envelope.signature = (0..sig_len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(13)).collect();
+        envelope.signature =
+            (0..sig_len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(13)).collect();
 
         assert!(
             verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err(),
@@ -537,7 +570,13 @@ mod tests {
         let payload_hash = compute_payload_hash(plaintext);
 
         let v2_canonical = build_canonical_signed_data_v2(
-            2, "sync-group-1", 0, "batch-uuid-123", "ops", "device-abc", &payload_hash,
+            2,
+            "sync-group-1",
+            0,
+            "batch-uuid-123",
+            "ops",
+            "device-abc",
+            &payload_hash,
         );
 
         let ed25519_sig = signing_key.sign(&v2_canonical);

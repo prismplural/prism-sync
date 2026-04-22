@@ -66,16 +66,8 @@ pub fn build_sharing_transcript(
         b"ml_dsa_65_pk",
         &recipient_identity.ml_dsa_65_public_key,
     );
-    t.append_role_bytes(
-        BootstrapRole::Initiator,
-        b"ephemeral_ek",
-        sender_ephemeral_ek,
-    );
-    t.append_role_bytes(
-        BootstrapRole::Responder,
-        b"signed_prekey_ek",
-        recipient_prekey_ek,
-    );
+    t.append_role_bytes(BootstrapRole::Initiator, b"ephemeral_ek", sender_ephemeral_ek);
+    t.append_role_bytes(BootstrapRole::Responder, b"signed_prekey_ek", recipient_prekey_ek);
     t.append_bytes(b"kem_ciphertext", kem_ciphertext);
     t.append_bytes(b"target_prekey_id", target_prekey_id.as_bytes());
 
@@ -141,24 +133,8 @@ mod tests {
         let pk_ek = vec![0x88; XWING_EK_LEN];
         let ct = vec![0x99; KEM_CIPHERTEXT_LEN];
 
-        let h1 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
-        let h2 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
+        let h1 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
+        let h2 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
         assert_eq!(h1, h2);
     }
 
@@ -170,24 +146,8 @@ mod tests {
         let pk_ek = vec![0x88; XWING_EK_LEN];
         let ct = vec![0x99; KEM_CIPHERTEXT_LEN];
 
-        let h1 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
-        let h2 = build_hash(
-            "init-002",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
+        let h1 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
+        let h2 = build_hash("init-002", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
         assert_ne!(h1, h2);
     }
 
@@ -202,24 +162,8 @@ mod tests {
         let mut sender2 = sample_sender_identity();
         sender2.ed25519_public_key = [0xFF; 32];
 
-        let h1 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
-        let h2 = build_hash(
-            "init-001",
-            &sender2,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
+        let h1 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
+        let h2 = build_hash("init-001", &sender2, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
         assert_ne!(h1, h2);
     }
 
@@ -234,24 +178,8 @@ mod tests {
         let mut recipient2 = sample_recipient_identity();
         recipient2.ml_dsa_65_public_key = vec![0xEE; ML_DSA_65_PK_LEN];
 
-        let h1 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
-        let h2 = build_hash(
-            "init-001",
-            &sender,
-            &recipient2,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
+        let h1 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
+        let h2 = build_hash("init-001", &sender, &recipient2, &eph_ek, &pk_ek, &ct, "prekey-001");
         assert_ne!(h1, h2);
     }
 
@@ -319,24 +247,8 @@ mod tests {
         let pk_ek = vec![0x88; XWING_EK_LEN];
         let ct = vec![0x99; KEM_CIPHERTEXT_LEN];
 
-        let h1 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
-        let h2 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-002",
-        );
+        let h1 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
+        let h2 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-002");
         assert_ne!(h1, h2);
     }
 
@@ -373,25 +285,9 @@ mod tests {
         let pk_ek = vec![0x88; XWING_EK_LEN];
         let ct = vec![0x99; KEM_CIPHERTEXT_LEN];
 
-        let h1 = build_hash(
-            "init-001",
-            &sender,
-            &recipient,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
+        let h1 = build_hash("init-001", &sender, &recipient, &eph_ek, &pk_ek, &ct, "prekey-001");
         // Swap sender and recipient
-        let h2 = build_hash(
-            "init-001",
-            &recipient,
-            &sender,
-            &eph_ek,
-            &pk_ek,
-            &ct,
-            "prekey-001",
-        );
+        let h2 = build_hash("init-001", &recipient, &sender, &eph_ek, &pk_ek, &ct, "prekey-001");
         assert_ne!(h1, h2);
     }
 }

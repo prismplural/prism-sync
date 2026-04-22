@@ -150,8 +150,7 @@ impl SharingRecipient {
     ) -> Result<()> {
         if self.prekey_store.needs_rotation(now) {
             let signed_prekey =
-                self.prekey_store
-                    .rotate(&self.ed25519_sk, &self.ml_dsa_sk, device_id, now)?;
+                self.prekey_store.rotate(&self.ed25519_sk, &self.ml_dsa_sk, device_id, now)?;
 
             relay
                 .publish_prekey(
@@ -222,14 +221,9 @@ impl SharingRecipient {
             .map_err(|e| CoreError::Engine(format!("sender identity signature invalid: {e}")))?;
 
         // 4. Look up dk seed for target prekey
-        let dk_seed = self
-            .prekey_store
-            .get_dk_seed(&sharing_init.target_prekey_id)
-            .ok_or_else(|| {
-                CoreError::Engine(format!(
-                    "unknown prekey_id: {}",
-                    sharing_init.target_prekey_id
-                ))
+        let dk_seed =
+            self.prekey_store.get_dk_seed(&sharing_init.target_prekey_id).ok_or_else(|| {
+                CoreError::Engine(format!("unknown prekey_id: {}", sharing_init.target_prekey_id))
             })?;
 
         // Reconstruct the X-Wing decapsulation key from seed
@@ -240,10 +234,8 @@ impl SharingRecipient {
             DefaultBootstrapHandshake::decapsulate_from_peer(&dk, &sharing_init.kem_ciphertext)?;
 
         // 6. Get the prekey's ek for transcript building
-        let prekey_xwing_ek = self
-            .prekey_store
-            .get_ek(&sharing_init.target_prekey_id)
-            .ok_or_else(|| {
+        let prekey_xwing_ek =
+            self.prekey_store.get_ek(&sharing_init.target_prekey_id).ok_or_else(|| {
                 CoreError::Engine(format!(
                     "missing ek for prekey_id: {}",
                     sharing_init.target_prekey_id
@@ -361,10 +353,7 @@ mod tests {
         }
 
         fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-            self.data
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_vec());
+            self.data.lock().unwrap().insert(key.to_string(), value.to_vec());
             Ok(())
         }
 
@@ -400,16 +389,10 @@ mod tests {
                 .unwrap();
 
         // Publish identity to relay
-        relay
-            .publish_identity(&rid, &recipient.identity().to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&rid, &recipient.identity().to_bytes()).await.unwrap();
 
         // Rotate prekey and publish
-        recipient
-            .ensure_prekey_fresh(relay, "recipient-device-1", now)
-            .await
-            .unwrap();
+        recipient.ensure_prekey_fresh(relay, "recipient-device-1", now).await.unwrap();
 
         recipient
     }
@@ -435,10 +418,8 @@ mod tests {
 
         // Sender initiates
         let rid = recipient_sharing_id();
-        let result = sender
-            .initiate(&relay, &rid, "Alice", vec!["read:members".into()], now)
-            .await
-            .unwrap();
+        let result =
+            sender.initiate(&relay, &rid, "Alice", vec!["read:members".into()], now).await.unwrap();
 
         // Extract the sharing-init from the relay
         relay.set_sharing_id(&rid);
@@ -466,10 +447,7 @@ mod tests {
         let sender = make_sender();
 
         let rid = recipient_sharing_id();
-        let _result = sender
-            .initiate(&relay, &rid, "Alice", vec![], now)
-            .await
-            .unwrap();
+        let _result = sender.initiate(&relay, &rid, "Alice", vec![], now).await.unwrap();
 
         relay.set_sharing_id(&rid);
         let pending = relay.fetch_pending_inits().await.unwrap();
@@ -499,14 +477,8 @@ mod tests {
                 .unwrap();
 
         let old_time = now - (31 * 24 * 3600);
-        relay
-            .publish_identity(&rid, &recipient.identity().to_bytes())
-            .await
-            .unwrap();
-        recipient
-            .ensure_prekey_fresh(&relay, "device-1", old_time)
-            .await
-            .unwrap();
+        relay.publish_identity(&rid, &recipient.identity().to_bytes()).await.unwrap();
+        recipient.ensure_prekey_fresh(&relay, "device-1", old_time).await.unwrap();
 
         let sender = make_sender();
         let result = sender.initiate(&relay, &rid, "Alice", vec![], now).await;
@@ -524,10 +496,7 @@ mod tests {
         let sender = make_sender();
 
         let rid = recipient_sharing_id();
-        let _result = sender
-            .initiate(&relay, &rid, "Alice", vec![], now)
-            .await
-            .unwrap();
+        let _result = sender.initiate(&relay, &rid, "Alice", vec![], now).await.unwrap();
 
         relay.set_sharing_id(&rid);
         let pending = relay.fetch_pending_inits().await.unwrap();
@@ -535,10 +504,7 @@ mod tests {
         // Rotate the recipient's prekey via ensure_prekey_fresh (simulates rotation)
         // and then prune the old one to simulate the grace period having expired.
         // Use a time far enough in the future to trigger rotation (>7 days).
-        recipient
-            .ensure_prekey_fresh(&relay, "device-1", now + 8 * 24 * 3600)
-            .await
-            .unwrap();
+        recipient.ensure_prekey_fresh(&relay, "device-1", now + 8 * 24 * 3600).await.unwrap();
         // Force prune all previous (simulate expired grace period)
         recipient.prekey_store_mut().prune_expired(now + 1_000_000);
 
@@ -546,10 +512,7 @@ mod tests {
             recipient.process_sharing_init(&pending[0].payload, &pending[0].init_id, &[], &[]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown prekey_id"),
-            "expected unknown prekey_id error, got: {err}"
-        );
+        assert!(err.contains("unknown prekey_id"), "expected unknown prekey_id error, got: {err}");
     }
 
     #[tokio::test]
@@ -561,10 +524,7 @@ mod tests {
         let sender = make_sender();
 
         let rid = recipient_sharing_id();
-        let _result = sender
-            .initiate(&relay, &rid, "Alice", vec![], now)
-            .await
-            .unwrap();
+        let _result = sender.initiate(&relay, &rid, "Alice", vec![], now).await.unwrap();
 
         relay.set_sharing_id(&rid);
         let pending = relay.fetch_pending_inits().await.unwrap();
@@ -596,10 +556,7 @@ mod tests {
         let sid = sender_sharing_id();
 
         let rid = recipient_sharing_id();
-        let _result = sender
-            .initiate(&relay, &rid, "Alice", vec![], now)
-            .await
-            .unwrap();
+        let _result = sender.initiate(&relay, &rid, "Alice", vec![], now).await.unwrap();
 
         relay.set_sharing_id(&rid);
         let pending = relay.fetch_pending_inits().await.unwrap();
@@ -628,10 +585,7 @@ mod tests {
         let sender = make_sender();
 
         let rid = recipient_sharing_id();
-        let _result = sender
-            .initiate(&relay, &rid, "Alice", vec![], now)
-            .await
-            .unwrap();
+        let _result = sender.initiate(&relay, &rid, "Alice", vec![], now).await.unwrap();
 
         relay.set_sharing_id(&rid);
         let pending = relay.fetch_pending_inits().await.unwrap();
@@ -644,10 +598,7 @@ mod tests {
         let result = recipient.process_sharing_init(&tampered_bytes, &pending[0].init_id, &[], &[]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("confirmation MAC"),
-            "expected confirmation MAC error, got: {err}"
-        );
+        assert!(err.contains("confirmation MAC"), "expected confirmation MAC error, got: {err}");
     }
 
     #[tokio::test]
@@ -659,28 +610,21 @@ mod tests {
         let sender = make_sender();
 
         let rid = recipient_sharing_id();
-        let _result = sender
-            .initiate(&relay, &rid, "Alice", vec!["read:members".into()], now)
-            .await
-            .unwrap();
+        let _result =
+            sender.initiate(&relay, &rid, "Alice", vec!["read:members".into()], now).await.unwrap();
 
         relay.set_sharing_id(&rid);
         let pending = relay.fetch_pending_inits().await.unwrap();
         let mut sharing_init = SharingInit::from_bytes(&pending[0].payload).unwrap();
 
         let dk = XWingKem::decapsulation_key_from_bytes(
-            recipient
-                .prekey_store()
-                .get_dk_seed(&sharing_init.target_prekey_id)
-                .unwrap(),
+            recipient.prekey_store().get_dk_seed(&sharing_init.target_prekey_id).unwrap(),
         );
         let bootstrap_secret =
             DefaultBootstrapHandshake::decapsulate_from_peer(&dk, &sharing_init.kem_ciphertext)
                 .unwrap();
-        let prekey_xwing_ek = recipient
-            .prekey_store()
-            .get_ek(&sharing_init.target_prekey_id)
-            .unwrap();
+        let prekey_xwing_ek =
+            recipient.prekey_store().get_ek(&sharing_init.target_prekey_id).unwrap();
         let transcript_hash = build_sharing_transcript(
             &sharing_init.init_id,
             &sharing_init.sender_identity,
@@ -745,10 +689,7 @@ mod tests {
         let mut recipient =
             SharingRecipient::from_dek(&TEST_DEK_RECIPIENT, &rid, &recipient_sharing_id_bytes(), 0)
                 .unwrap();
-        relay
-            .publish_identity(&rid, &recipient.identity().to_bytes())
-            .await
-            .unwrap();
+        relay.publish_identity(&rid, &recipient.identity().to_bytes()).await.unwrap();
         recipient
             .ensure_prekey_fresh_and_persist(&relay, &secure_store, "recipient-device-1", now)
             .await
@@ -802,10 +743,7 @@ mod tests {
         // Sender 1
         let sender1 = make_sender();
         let rid = recipient_sharing_id();
-        let result1 = sender1
-            .initiate(&relay, &rid, "Alice", vec![], now)
-            .await
-            .unwrap();
+        let result1 = sender1.initiate(&relay, &rid, "Alice", vec![], now).await.unwrap();
 
         // Sender 2 (different DEK)
         let sid2 = "cc".repeat(16);
@@ -816,10 +754,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let result2 = sender2
-            .initiate(&relay, &rid, "Bob", vec![], now)
-            .await
-            .unwrap();
+        let result2 = sender2.initiate(&relay, &rid, "Bob", vec![], now).await.unwrap();
 
         // Different pairwise secrets
         assert_ne!(*result1.pairwise_secret, *result2.pairwise_secret);

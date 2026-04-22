@@ -142,11 +142,7 @@ async fn push_and_create_snapshot(
         .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_none(),
-        "Device A push failed: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "Device A push failed: {:?}", result.error);
 
     // --- Device B setup: pull and merge to populate field_versions ---
     let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
@@ -181,11 +177,7 @@ async fn push_and_create_snapshot(
         .sync(SYNC_ID, &key_hierarchy, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b.error.is_none(),
-        "Device B pull failed: {:?}",
-        result_b.error
-    );
+    assert!(result_b.error.is_none(), "Device B pull failed: {:?}", result_b.error);
     assert!(result_b.merged > 0, "Device B should have merged ops");
 
     // Device B uploads the snapshot
@@ -204,15 +196,7 @@ async fn push_and_create_snapshot(
         .await
         .unwrap();
 
-    (
-        relay,
-        key_hierarchy,
-        signing_key_a,
-        signing_key_b,
-        ml_dsa_key_a,
-        ml_dsa_key_b,
-        storage_b,
-    )
+    (relay, key_hierarchy, signing_key_a, signing_key_b, ml_dsa_key_a, ml_dsa_key_b, storage_b)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -373,52 +357,31 @@ async fn test_snapshot_bootstrap_then_incremental() {
     );
 
     // Bootstrap from snapshot — restores task-1 field_versions
-    let (count, entity_changes) = engine_c
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
-        .await
-        .unwrap();
+    let (count, entity_changes) =
+        engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await.unwrap();
 
     assert!(count > 0, "snapshot should contain at least 1 entity");
-    assert!(
-        !entity_changes.is_empty(),
-        "entity_changes should be non-empty"
-    );
+    assert!(!entity_changes.is_empty(), "entity_changes should be non-empty");
 
     // Verify task-1 is in the bootstrap entity_changes
     let task_1_change = entity_changes.iter().find(|c| c.entity_id == "task-1");
-    assert!(
-        task_1_change.is_some(),
-        "task-1 should be in snapshot entity_changes"
-    );
+    assert!(task_1_change.is_some(), "task-1 should be in snapshot entity_changes");
     let task_1 = task_1_change.unwrap();
     assert_eq!(task_1.table, "tasks");
-    assert_eq!(
-        task_1.fields.get("title"),
-        Some(&"\"Buy groceries\"".to_string())
-    );
+    assert_eq!(task_1.fields.get("title"), Some(&"\"Buy groceries\"".to_string()));
 
     // Incremental sync to get task-2 (pushed after snapshot)
     let result_c = engine_c
         .sync(SYNC_ID, &key_hierarchy_c, &signing_key_c, None, device_c_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_c.error.is_none(),
-        "incremental sync failed: {:?}",
-        result_c.error
-    );
+    assert!(result_c.error.is_none(), "incremental sync failed: {:?}", result_c.error);
     assert!(result_c.pulled > 0, "should pull post-snapshot batches");
     assert!(result_c.merged > 0, "should merge post-snapshot ops");
 
     // Verify task-2 arrived via incremental sync
-    let task_2_change = result_c
-        .entity_changes
-        .iter()
-        .find(|c| c.entity_id == "task-2");
-    assert!(
-        task_2_change.is_some(),
-        "task-2 should be in incremental changes"
-    );
+    let task_2_change = result_c.entity_changes.iter().find(|c| c.entity_id == "task-2");
+    assert!(task_2_change.is_some(), "task-2 should be in incremental changes");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -498,15 +461,10 @@ async fn test_bootstrap_without_snapshot_falls_back() {
     );
 
     // Bootstrap returns (0, []) when no snapshot exists
-    let (count, entity_changes) = engine_b
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_b)
-        .await
-        .unwrap();
+    let (count, entity_changes) =
+        engine_b.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_b).await.unwrap();
 
-    assert_eq!(
-        count, 0,
-        "bootstrap with no snapshot should return 0 entities"
-    );
+    assert_eq!(count, 0, "bootstrap with no snapshot should return 0 entities");
     assert!(entity_changes.is_empty(), "entity_changes should be empty");
 
     // Incremental sync picks up all data
@@ -514,18 +472,11 @@ async fn test_bootstrap_without_snapshot_falls_back() {
         .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_none(),
-        "incremental sync failed: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "incremental sync failed: {:?}", result.error);
     assert_eq!(result.pulled, 1, "should pull 1 batch incrementally");
     assert_eq!(result.merged, 2, "should merge 2 ops (title + done)");
 
-    let task = result
-        .entity_changes
-        .iter()
-        .find(|c| c.entity_id == "task-1");
+    let task = result.entity_changes.iter().find(|c| c.entity_id == "task-1");
     assert!(task.is_some(), "task-1 should be in entity_changes");
 }
 
@@ -543,9 +494,7 @@ async fn test_bootstrap_wrong_epoch_key() {
 
     // --- Device C: try bootstrap with a COMPLETELY DIFFERENT key hierarchy ---
     let mut wrong_kh = prism_sync_crypto::KeyHierarchy::new();
-    wrong_kh
-        .initialize("completely-wrong-password", &[99u8; 16])
-        .unwrap();
+    wrong_kh.initialize("completely-wrong-password", &[99u8; 16]).unwrap();
     // Do NOT copy epoch 0 key — the default epoch key will be different
 
     let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
@@ -573,10 +522,7 @@ async fn test_bootstrap_wrong_epoch_key() {
     // Bootstrap should fail because the epoch key doesn't match
     let result = engine_c.bootstrap_from_snapshot(SYNC_ID, &wrong_kh).await;
 
-    assert!(
-        result.is_err(),
-        "bootstrap with wrong epoch key should fail"
-    );
+    assert!(result.is_err(), "bootstrap with wrong epoch key should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("decrypt")
@@ -670,10 +616,7 @@ async fn test_pairing_works_without_snapshot() {
     );
 
     // Bootstrap returns nothing
-    let (count, _) = engine_b
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_b)
-        .await
-        .unwrap();
+    let (count, _) = engine_b.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_b).await.unwrap();
     assert_eq!(count, 0);
 
     // Incremental sync picks up all data
@@ -681,25 +624,12 @@ async fn test_pairing_works_without_snapshot() {
         .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b.error.is_none(),
-        "sync failed: {:?}",
-        result_b.error
-    );
+    assert!(result_b.error.is_none(), "sync failed: {:?}", result_b.error);
     assert_eq!(result_b.pulled, 2, "should pull both batches");
-    assert_eq!(
-        result_b.merged, 4,
-        "should merge 4 ops (2 tasks x 2 fields)"
-    );
+    assert_eq!(result_b.merged, 4, "should merge 4 ops (2 tasks x 2 fields)");
 
-    let has_task_1 = result_b
-        .entity_changes
-        .iter()
-        .any(|c| c.entity_id == "task-1");
-    let has_task_2 = result_b
-        .entity_changes
-        .iter()
-        .any(|c| c.entity_id == "task-2");
+    let has_task_1 = result_b.entity_changes.iter().any(|c| c.entity_id == "task-1");
+    let has_task_2 = result_b.entity_changes.iter().any(|c| c.entity_id == "task-2");
     assert!(has_task_1, "task-1 should be in entity_changes");
     assert!(has_task_2, "task-2 should be in entity_changes");
 }
@@ -713,12 +643,13 @@ async fn test_pairing_works_without_snapshot() {
 #[tokio::test]
 async fn test_bootstrap_emits_remote_changes() {
     // Create a snapshot containing 3 tasks
-    let (relay, key_hierarchy, _sk_a, _sk_b, _ml_a, _ml_b, _storage_b) = push_and_create_snapshot(vec![
-        ("task-1", "Alpha", false, "batch-1"),
-        ("task-2", "Beta", true, "batch-2"),
-        ("task-3", "Gamma", false, "batch-3"),
-    ])
-    .await;
+    let (relay, key_hierarchy, _sk_a, _sk_b, _ml_a, _ml_b, _storage_b) =
+        push_and_create_snapshot(vec![
+            ("task-1", "Alpha", false, "batch-1"),
+            ("task-2", "Beta", true, "batch-2"),
+            ("task-3", "Gamma", false, "batch-3"),
+        ])
+        .await;
 
     // --- Device C: bootstrap ---
     let key_hierarchy_c = shared_key_hierarchy(&key_hierarchy);
@@ -744,46 +675,28 @@ async fn test_bootstrap_emits_remote_changes() {
         SyncConfig::default(),
     );
 
-    let (count, entity_changes) = engine_c
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
-        .await
-        .unwrap();
+    let (count, entity_changes) =
+        engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await.unwrap();
 
     assert_eq!(count, 3, "snapshot should contain 3 entities");
-    assert_eq!(
-        entity_changes.len(),
-        3,
-        "should emit 3 EntityChange entries"
-    );
+    assert_eq!(entity_changes.len(), 3, "should emit 3 EntityChange entries");
 
     // Verify each entity has the correct fields
     for change in &entity_changes {
         assert_eq!(change.table, "tasks");
         assert!(!change.is_delete);
-        assert!(
-            change.fields.contains_key("title"),
-            "should have title field"
-        );
+        assert!(change.fields.contains_key("title"), "should have title field");
         assert!(change.fields.contains_key("done"), "should have done field");
     }
 
     // Verify specific values
-    let alpha = entity_changes
-        .iter()
-        .find(|c| c.entity_id == "task-1")
-        .unwrap();
+    let alpha = entity_changes.iter().find(|c| c.entity_id == "task-1").unwrap();
     assert_eq!(alpha.fields.get("title"), Some(&"\"Alpha\"".to_string()));
 
-    let beta = entity_changes
-        .iter()
-        .find(|c| c.entity_id == "task-2")
-        .unwrap();
+    let beta = entity_changes.iter().find(|c| c.entity_id == "task-2").unwrap();
     assert_eq!(beta.fields.get("title"), Some(&"\"Beta\"".to_string()));
 
-    let gamma = entity_changes
-        .iter()
-        .find(|c| c.entity_id == "task-3")
-        .unwrap();
+    let gamma = entity_changes.iter().find(|c| c.entity_id == "task-3").unwrap();
     assert_eq!(gamma.fields.get("title"), Some(&"\"Gamma\"".to_string()));
 }
 
@@ -846,14 +759,9 @@ async fn test_bootstrap_rejects_tampered_signature() {
         SyncConfig::default(),
     );
 
-    let result = engine_c
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
-        .await;
+    let result = engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await;
 
-    assert!(
-        result.is_err(),
-        "bootstrap with tampered signature should fail"
-    );
+    assert!(result.is_err(), "bootstrap with tampered signature should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("signature")
@@ -929,14 +837,9 @@ async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
         SyncConfig::default(),
     );
 
-    let result = engine_c
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
-        .await;
+    let result = engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await;
 
-    assert!(
-        result.is_err(),
-        "bootstrap with mismatched snapshot payload hash should fail"
-    );
+    assert!(result.is_err(), "bootstrap with mismatched snapshot payload hash should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("Payload hash mismatch"),
@@ -996,14 +899,9 @@ async fn test_bootstrap_rejects_aad_mismatch() {
         SyncConfig::default(),
     );
 
-    let result = engine_c
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c)
-        .await;
+    let result = engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await;
 
-    assert!(
-        result.is_err(),
-        "bootstrap with mismatched server_seq_at (AAD mismatch) should fail"
-    );
+    assert!(result.is_err(), "bootstrap with mismatched server_seq_at (AAD mismatch) should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("decrypt")

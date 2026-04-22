@@ -38,13 +38,7 @@ pub(crate) struct Stats {
 impl Stats {
     pub(crate) fn new() -> Self {
         let mut ops = HashMap::new();
-        for op in [
-            OpType::Register,
-            OpType::Push,
-            OpType::Pull,
-            OpType::Ack,
-            OpType::WsConnect,
-        ] {
+        for op in [OpType::Register, OpType::Push, OpType::Pull, OpType::Ack, OpType::WsConnect] {
             ops.insert(
                 op,
                 OpStats {
@@ -53,10 +47,7 @@ impl Stats {
                 },
             );
         }
-        Self {
-            start: Instant::now(),
-            ops,
-        }
+        Self { start: Instant::now(), ops }
     }
 
     pub(crate) fn record(&self, op: OpType, elapsed: Duration) {
@@ -95,11 +86,7 @@ impl Stats {
                 }
             }
         }
-        let total_errors: u64 = self
-            .ops
-            .values()
-            .map(|s| s.errors.load(Ordering::Relaxed))
-            .sum();
+        let total_errors: u64 = self.ops.values().map(|s| s.errors.load(Ordering::Relaxed)).sum();
         if parts.is_empty() {
             println!("[{elapsed}s] running...  errors: {total_errors}");
         } else {
@@ -109,19 +96,13 @@ impl Stats {
 
     pub(crate) fn print_ws_progress(&self, connected: usize, target: usize) {
         let elapsed = self.elapsed().as_secs();
-        let total_errors: u64 = self
-            .ops
-            .values()
-            .map(|s| s.errors.load(Ordering::Relaxed))
-            .sum();
+        let total_errors: u64 = self.ops.values().map(|s| s.errors.load(Ordering::Relaxed)).sum();
         let mut p99_str = String::new();
         if let Some(s) = self.ops.get(&OpType::WsConnect) {
             let h = s.histogram.lock().unwrap();
             if !h.is_empty() {
-                p99_str = format!(
-                    "  connect_p99={:.1}ms",
-                    h.value_at_quantile(0.99) as f64 / 1000.0
-                );
+                p99_str =
+                    format!("  connect_p99={:.1}ms", h.value_at_quantile(0.99) as f64 / 1000.0);
             }
         }
         println!("[{elapsed}s] ws: {connected}/{target}{p99_str}  errors: {total_errors}");
@@ -135,13 +116,7 @@ impl Stats {
         }
         println!();
 
-        for op in [
-            OpType::Register,
-            OpType::WsConnect,
-            OpType::Push,
-            OpType::Pull,
-            OpType::Ack,
-        ] {
+        for op in [OpType::Register, OpType::WsConnect, OpType::Push, OpType::Pull, OpType::Ack] {
             if let Some(s) = self.ops.get(&op) {
                 let h = s.histogram.lock().unwrap();
                 let count = h.len();
@@ -168,11 +143,7 @@ impl Stats {
             }
         }
 
-        let total_errors: u64 = self
-            .ops
-            .values()
-            .map(|s| s.errors.load(Ordering::Relaxed))
-            .sum();
+        let total_errors: u64 = self.ops.values().map(|s| s.errors.load(Ordering::Relaxed)).sum();
         println!("\nTotal errors: {total_errors}");
     }
 }

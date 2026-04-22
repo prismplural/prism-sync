@@ -96,17 +96,11 @@ pub(crate) fn verify_apple_app_attest(
         .verify_signature(None)
         .map_err(|e| format!("invalid apple attestation root signature: {e}"))?;
 
-    let leaf = parsed
-        .first()
-        .ok_or_else(|| "apple attestation chain is empty".to_string())?;
+    let leaf = parsed.first().ok_or_else(|| "apple attestation chain is empty".to_string())?;
     for cert in parsed.iter().skip(1) {
-        if cert
-            .extensions()
-            .iter()
-            .any(|ext| ext.oid == apple_extension_oid())
-        {
+        if cert.extensions().iter().any(|ext| ext.oid == apple_extension_oid()) {
             return Err(
-                "apple attestation extension must only appear in the leaf certificate".into(),
+                "apple attestation extension must only appear in the leaf certificate".into()
             );
         }
     }
@@ -184,11 +178,7 @@ fn parse_attestation_object(value: &Value) -> Result<ParsedAttestationObject, St
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(ParsedAttestationObject {
-        fmt,
-        auth_data,
-        certificate_chain,
-    })
+    Ok(ParsedAttestationObject { fmt, auth_data, certificate_chain })
 }
 
 fn apple_certificate_nonce(auth_data: &[u8], client_data_hash: &[u8; 32]) -> [u8; 32] {
@@ -216,9 +206,7 @@ fn match_allowed_app_id(
 }
 
 fn parse_rp_id_hash(auth_data: &[u8]) -> Result<&[u8], String> {
-    auth_data
-        .get(..32)
-        .ok_or_else(|| "apple authData truncated".to_string())
+    auth_data.get(..32).ok_or_else(|| "apple authData truncated".to_string())
 }
 
 fn parse_credential_id(auth_data: &[u8]) -> Result<Vec<u8>, String> {
@@ -295,9 +283,7 @@ fn parse_apple_certificate_nonce(input: &[u8]) -> Result<[u8; 32], String> {
         ASN1Block::OctetString(_, bytes) => bytes.clone(),
         _ => return Err("apple attestation extension nonce is not an octet string".into()),
     };
-    nonce
-        .try_into()
-        .map_err(|_| "apple attestation extension nonce has invalid length".into())
+    nonce.try_into().map_err(|_| "apple attestation extension nonce has invalid length".into())
 }
 
 fn decode_pem_certificate(pem: &str) -> Result<Vec<u8>, String> {
@@ -423,29 +409,19 @@ mod tests {
         let (root_cert, root_key) = make_test_root();
 
         let mut leaf_params = CertificateParams::new(vec!["leaf".into()]).unwrap();
-        leaf_params
-            .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                APPLE_APP_ATTESTATION_EXTENSION_OID,
-                {
-                    use simple_asn1::{to_der, ASN1Block};
-                    to_der(&ASN1Block::Sequence(
-                        0,
-                        vec![ASN1Block::OctetString(0, nonce.to_vec())],
-                    ))
+        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
+            APPLE_APP_ATTESTATION_EXTENSION_OID,
+            {
+                use simple_asn1::{to_der, ASN1Block};
+                to_der(&ASN1Block::Sequence(0, vec![ASN1Block::OctetString(0, nonce.to_vec())]))
                     .unwrap()
-                },
-            ));
+            },
+        ));
         let leaf_key = KeyPair::generate().unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &root_cert, &root_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &root_cert, &root_key).unwrap();
 
         let attestation_object = serde_cbor::to_vec(&serde_cbor::Value::Map(BTreeMap::from([
-            (
-                Value::Text("fmt".into()),
-                Value::Text(APPLE_APP_ATTESTATION_FMT.into()),
-            ),
+            (Value::Text("fmt".into()), Value::Text(APPLE_APP_ATTESTATION_FMT.into())),
             (Value::Text("authData".into()), Value::Bytes(auth_data)),
             (
                 Value::Text("attStmt".into()),

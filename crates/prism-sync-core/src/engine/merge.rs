@@ -101,13 +101,7 @@ impl MergeEngine {
 
             // Bulk reset is handled specially by the caller
             if op.is_bulk_reset() {
-                winners.insert(
-                    op.op_id.clone(),
-                    WinningOp {
-                        op: op.clone(),
-                        is_bulk_reset: true,
-                    },
-                );
+                winners.insert(op.op_id.clone(), WinningOp { op: op.clone(), is_bulk_reset: true });
                 continue;
             }
 
@@ -179,13 +173,7 @@ impl MergeEngine {
             }
 
             // Record this op as the new winner
-            winners.insert(
-                op.op_id.clone(),
-                WinningOp {
-                    op: op.clone(),
-                    is_bulk_reset: false,
-                },
-            );
+            winners.insert(op.op_id.clone(), WinningOp { op: op.clone(), is_bulk_reset: false });
             batch_winners.insert(field_key, op.clone());
         }
 

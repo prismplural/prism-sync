@@ -56,10 +56,7 @@ pub struct PrekeyStore {
 impl PrekeyStore {
     /// Create an empty prekey store.
     pub fn new() -> Self {
-        Self {
-            current: None,
-            previous: Vec::new(),
-        }
+        Self { current: None, previous: Vec::new() }
     }
 
     /// Get the decapsulation key seed for a prekey_id.
@@ -205,7 +202,9 @@ impl PrekeyStore {
         match secure_store.get(SHARING_PREKEY_STORE_KEY)? {
             Some(bytes) => {
                 let json = String::from_utf8(bytes).map_err(|e| {
-                    CoreError::Storage(StorageError::Logic(format!("invalid UTF-8 in {SHARING_PREKEY_STORE_KEY}: {e}")))
+                    CoreError::Storage(StorageError::Logic(format!(
+                        "invalid UTF-8 in {SHARING_PREKEY_STORE_KEY}: {e}"
+                    )))
                 })?;
                 Self::from_json(&json)
             }
@@ -273,7 +272,9 @@ fn serializable_to_entry(s: SerializablePrekeyEntry) -> Result<PrekeyEntry> {
     }
 
     let xwing_ek = hex::decode(&s.xwing_ek_hex).map_err(|e| {
-        CoreError::Storage(StorageError::Logic(format!("invalid xwing_ek_hex for prekey {prekey_id}: {e}")))
+        CoreError::Storage(StorageError::Logic(format!(
+            "invalid xwing_ek_hex for prekey {prekey_id}: {e}"
+        )))
     })?;
     if xwing_ek.len() != XWING_EK_LEN {
         return Err(CoreError::Storage(StorageError::Logic(format!(
@@ -324,10 +325,7 @@ mod tests {
         }
 
         fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-            self.data
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_vec());
+            self.data.lock().unwrap().insert(key.to_string(), value.to_vec());
             Ok(())
         }
 

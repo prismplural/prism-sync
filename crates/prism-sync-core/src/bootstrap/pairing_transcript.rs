@@ -25,52 +25,16 @@ pub fn build_sync_pairing_transcript(
 
     // Field order per Phase 3 plan section 3.2
     t.append_session_id(rendezvous_id);
-    t.append_role_bytes(
-        BootstrapRole::Initiator,
-        b"device_id",
-        initiator.device_id.as_bytes(),
-    );
-    t.append_role_bytes(
-        BootstrapRole::Responder,
-        b"device_id",
-        responder.device_id.as_bytes(),
-    );
-    t.append_role_fixed(
-        BootstrapRole::Initiator,
-        b"ed25519_pk",
-        &initiator.ed25519_pk,
-    );
-    t.append_role_fixed(
-        BootstrapRole::Responder,
-        b"ed25519_pk",
-        &responder.ed25519_public_key,
-    );
+    t.append_role_bytes(BootstrapRole::Initiator, b"device_id", initiator.device_id.as_bytes());
+    t.append_role_bytes(BootstrapRole::Responder, b"device_id", responder.device_id.as_bytes());
+    t.append_role_fixed(BootstrapRole::Initiator, b"ed25519_pk", &initiator.ed25519_pk);
+    t.append_role_fixed(BootstrapRole::Responder, b"ed25519_pk", &responder.ed25519_public_key);
     t.append_role_fixed(BootstrapRole::Initiator, b"x25519_pk", &initiator.x25519_pk);
-    t.append_role_fixed(
-        BootstrapRole::Responder,
-        b"x25519_pk",
-        &responder.x25519_public_key,
-    );
-    t.append_role_bytes(
-        BootstrapRole::Initiator,
-        b"ml_dsa_65_pk",
-        &initiator.ml_dsa_65_pk,
-    );
-    t.append_role_bytes(
-        BootstrapRole::Responder,
-        b"ml_dsa_65_pk",
-        &responder.ml_dsa_65_public_key,
-    );
-    t.append_role_bytes(
-        BootstrapRole::Initiator,
-        b"ml_kem_768_ek",
-        initiator.ml_kem_768_ek(),
-    );
-    t.append_role_bytes(
-        BootstrapRole::Responder,
-        b"ml_kem_768_ek",
-        responder.ml_kem_768_ek(),
-    );
+    t.append_role_fixed(BootstrapRole::Responder, b"x25519_pk", &responder.x25519_public_key);
+    t.append_role_bytes(BootstrapRole::Initiator, b"ml_dsa_65_pk", &initiator.ml_dsa_65_pk);
+    t.append_role_bytes(BootstrapRole::Responder, b"ml_dsa_65_pk", &responder.ml_dsa_65_public_key);
+    t.append_role_bytes(BootstrapRole::Initiator, b"ml_kem_768_ek", initiator.ml_kem_768_ek());
+    t.append_role_bytes(BootstrapRole::Responder, b"ml_kem_768_ek", responder.ml_kem_768_ek());
     t.append_bytes(b"kem_ciphertext", kem_ciphertext);
     t.append_bytes(b"relay_origin", relay_origin.as_bytes());
     t.append_fixed(b"bootstrap_commitment", commitment);
@@ -135,22 +99,8 @@ mod tests {
         let resp = sample_responder();
         let ct = vec![0x99; 1120];
 
-        let h1 = build_hash(
-            &rid,
-            &commit,
-            &init,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
-        let h2 = build_hash(
-            &rid,
-            &commit,
-            &init,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
+        let h1 = build_hash(&rid, &commit, &init, &resp, &ct, "https://relay.example.com");
+        let h2 = build_hash(&rid, &commit, &init, &resp, &ct, "https://relay.example.com");
         assert_eq!(h1, h2);
     }
 
@@ -161,22 +111,8 @@ mod tests {
         let resp = sample_responder();
         let ct = vec![0x99; 1120];
 
-        let h1 = build_hash(
-            &[0x01; 16],
-            &commit,
-            &init,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
-        let h2 = build_hash(
-            &[0x02; 16],
-            &commit,
-            &init,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
+        let h1 = build_hash(&[0x01; 16], &commit, &init, &resp, &ct, "https://relay.example.com");
+        let h2 = build_hash(&[0x02; 16], &commit, &init, &resp, &ct, "https://relay.example.com");
         assert_ne!(h1, h2);
     }
 
@@ -187,22 +123,8 @@ mod tests {
         let resp = sample_responder();
         let ct = vec![0x99; 1120];
 
-        let h1 = build_hash(
-            &rid,
-            &[0xAA; 32],
-            &init,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
-        let h2 = build_hash(
-            &rid,
-            &[0xBB; 32],
-            &init,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
+        let h1 = build_hash(&rid, &[0xAA; 32], &init, &resp, &ct, "https://relay.example.com");
+        let h2 = build_hash(&rid, &[0xBB; 32], &init, &resp, &ct, "https://relay.example.com");
         assert_ne!(h1, h2);
     }
 
@@ -217,22 +139,8 @@ mod tests {
         let mut init2 = sample_initiator();
         init2.ed25519_pk = [0xFF; 32]; // modify one key
 
-        let h1 = build_hash(
-            &rid,
-            &commit,
-            &init1,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
-        let h2 = build_hash(
-            &rid,
-            &commit,
-            &init2,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
+        let h1 = build_hash(&rid, &commit, &init1, &resp, &ct, "https://relay.example.com");
+        let h2 = build_hash(&rid, &commit, &init2, &resp, &ct, "https://relay.example.com");
         assert_ne!(h1, h2);
     }
 
@@ -243,22 +151,10 @@ mod tests {
         let init = sample_initiator();
         let resp = sample_responder();
 
-        let h1 = build_hash(
-            &rid,
-            &commit,
-            &init,
-            &resp,
-            &vec![0x99; 1120],
-            "https://relay.example.com",
-        );
-        let h2 = build_hash(
-            &rid,
-            &commit,
-            &init,
-            &resp,
-            &vec![0xFF; 1120],
-            "https://relay.example.com",
-        );
+        let h1 =
+            build_hash(&rid, &commit, &init, &resp, &vec![0x99; 1120], "https://relay.example.com");
+        let h2 =
+            build_hash(&rid, &commit, &init, &resp, &vec![0xFF; 1120], "https://relay.example.com");
         assert_ne!(h1, h2);
     }
 
@@ -271,14 +167,7 @@ mod tests {
         // Normal order
         let init = sample_initiator();
         let resp = sample_responder();
-        let h1 = build_hash(
-            &rid,
-            &commit,
-            &init,
-            &resp,
-            &ct,
-            "https://relay.example.com",
-        );
+        let h1 = build_hash(&rid, &commit, &init, &resp, &ct, "https://relay.example.com");
 
         // Swap: use responder's keys as initiator, initiator's as responder
         let swapped_init = PairingPublicKeys {

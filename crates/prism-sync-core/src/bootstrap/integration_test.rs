@@ -82,14 +82,8 @@ mod tests {
             initiator_ks.encryption_key(BootstrapRole::Responder),
             responder_ks.encryption_key(BootstrapRole::Responder),
         );
-        assert_eq!(
-            initiator_ks.confirmation_key(),
-            responder_ks.confirmation_key(),
-        );
-        assert_eq!(
-            initiator_ks.verification_key(),
-            responder_ks.verification_key(),
-        );
+        assert_eq!(initiator_ks.confirmation_key(), responder_ks.confirmation_key(),);
+        assert_eq!(initiator_ks.verification_key(), responder_ks.verification_key(),);
 
         // --- Both sides derive the same SAS ---
         let initiator_confirm =
@@ -98,10 +92,7 @@ mod tests {
             ConfirmationCode::new(profile, version, &responder_ks, responder_hash);
 
         assert_eq!(initiator_confirm.sas_words(), responder_confirm.sas_words());
-        assert_eq!(
-            initiator_confirm.sas_decimal(),
-            responder_confirm.sas_decimal(),
-        );
+        assert_eq!(initiator_confirm.sas_decimal(), responder_confirm.sas_decimal(),);
         assert_eq!(
             initiator_confirm.session_fingerprint(),
             responder_confirm.session_fingerprint(),

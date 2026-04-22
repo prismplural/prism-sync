@@ -22,13 +22,8 @@ pub enum RelayError {
     #[error("auth error: {message}")]
     Auth { message: String },
 
-    #[error(
-        "upgrade required: min_signature_version={min_signature_version}, {message}"
-    )]
-    UpgradeRequired {
-        min_signature_version: u8,
-        message: String,
-    },
+    #[error("upgrade required: min_signature_version={min_signature_version}, {message}")]
+    UpgradeRequired { min_signature_version: u8, message: String },
 
     #[error("device identity mismatch: {message}")]
     DeviceIdentityMismatch { message: String },
@@ -125,10 +120,7 @@ pub enum FirstDeviceAdmissionProof {
     AndroidKeyAttestation { certificate_chain: Vec<String> },
 
     /// Apple App Attest attestation object, bound to the relay-issued nonce.
-    AppleAppAttest {
-        key_id: String,
-        attestation_object: String,
-    },
+    AppleAppAttest { key_id: String, attestation_object: String },
 }
 
 /// Registration request for a new device.
@@ -300,7 +292,9 @@ pub(crate) mod base64_bytes {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
         deserializer.deserialize_any(Base64OrBytesVisitor)
     }
 
@@ -341,15 +335,18 @@ pub(crate) mod base64_hash {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{de, Deserializer, Serializer};
 
-    pub(crate) fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(
+        bytes: &[u8; 32],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 32], D::Error> {
         let bytes: Vec<u8> = super::base64_bytes::deserialize(deserializer)?;
-        bytes
-            .try_into()
-            .map_err(|_| de::Error::custom("expected 32 bytes for hash"))
+        bytes.try_into().map_err(|_| de::Error::custom("expected 32 bytes for hash"))
     }
 }
 
@@ -359,15 +356,18 @@ pub(crate) mod base64_nonce {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{de, Deserializer, Serializer};
 
-    pub(crate) fn serialize<S: Serializer>(bytes: &[u8; 24], serializer: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(
+        bytes: &[u8; 24],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 24], D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 24], D::Error> {
         let bytes: Vec<u8> = super::base64_bytes::deserialize(deserializer)?;
-        bytes
-            .try_into()
-            .map_err(|_| de::Error::custom("expected 24 bytes for nonce"))
+        bytes.try_into().map_err(|_| de::Error::custom("expected 24 bytes for nonce"))
     }
 }
 
@@ -388,11 +388,7 @@ pub enum SyncNotification {
     /// New data is available; trigger a pull cycle.
     NewData { server_seq: i64 },
     /// A device was revoked from the sync group.
-    DeviceRevoked {
-        device_id: String,
-        new_epoch: i32,
-        remote_wipe: bool,
-    },
+    DeviceRevoked { device_id: String, new_epoch: i32, remote_wipe: bool },
     /// The epoch was rotated; recover the new epoch key.
     EpochRotated { new_epoch: i32 },
     /// Session token was rotated (handled internally).
@@ -490,7 +486,9 @@ pub trait DeviceRegistry: Send + Sync {
     /// Returns the signed snapshot blob that clients can verify independently
     /// of the relay. Returns `Ok(None)` if no artifact exists (e.g., single-
     /// device groups).
-    async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError>;
+    async fn get_signed_registry(
+        &self,
+    ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError>;
 }
 
 /// Epoch key rotation: posting and retrieving per-device wrapped epoch keys.
@@ -547,10 +545,7 @@ pub trait MediaRelay: Send + Sync {
     ) -> std::result::Result<(), RelayError>;
 
     /// Download an encrypted media blob from the relay.
-    async fn download_media(
-        &self,
-        media_id: &str,
-    ) -> std::result::Result<Vec<u8>, RelayError>;
+    async fn download_media(&self, media_id: &str) -> std::result::Result<Vec<u8>, RelayError>;
 }
 
 /// Transport layer for communicating with the relay server.

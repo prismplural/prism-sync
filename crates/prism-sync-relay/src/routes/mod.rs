@@ -66,9 +66,8 @@ pub(crate) fn verify_signed_request(
         return Err(AppError::Unauthorized);
     }
 
-    let timestamp_i64 = timestamp
-        .parse::<i64>()
-        .map_err(|_| AppError::BadRequest("Invalid X-Prism-Timestamp"))?;
+    let timestamp_i64 =
+        timestamp.parse::<i64>().map_err(|_| AppError::BadRequest("Invalid X-Prism-Timestamp"))?;
     let now = db::now_secs();
     if (now - timestamp_i64).abs() > state.config.signed_request_max_skew_secs {
         return Err(AppError::Unauthorized);
@@ -109,17 +108,14 @@ pub(crate) fn verify_signed_request(
         &auth_identity.ml_dsa_65_public_key,
         &signing_data,
         &signature,
-    ) || auth_identity
-        .prev_ml_dsa_65_public_key
-        .as_ref()
-        .is_some_and(|prev_pk| {
-            auth::verify_hybrid_request_signature(
-                &auth_identity.signing_public_key,
-                prev_pk,
-                &signing_data,
-                &signature,
-            )
-        });
+    ) || auth_identity.prev_ml_dsa_65_public_key.as_ref().is_some_and(|prev_pk| {
+        auth::verify_hybrid_request_signature(
+            &auth_identity.signing_public_key,
+            prev_pk,
+            &signing_data,
+            &signature,
+        )
+    });
 
     if !verified {
         return Err(AppError::Unauthorized);
@@ -140,71 +136,41 @@ pub(crate) fn verify_signed_request(
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
     let snapshot_routes = Router::new()
-        .route(
-            "/v1/sync/{sync_id}/snapshot",
-            put(sync::put_snapshot).get(sync::get_snapshot),
-        )
+        .route("/v1/sync/{sync_id}/snapshot", put(sync::put_snapshot).get(sync::get_snapshot))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
 
     let media_routes = Router::new()
-        .route(
-            "/v1/sync/{sync_id}/media",
-            post(media::upload_media),
-        )
-        .route(
-            "/v1/sync/{sync_id}/media/{media_id}",
-            get(media::download_media),
-        )
+        .route("/v1/sync/{sync_id}/media", post(media::upload_media))
+        .route("/v1/sync/{sync_id}/media/{media_id}", get(media::download_media))
         .layer(DefaultBodyLimit::max(state.config.media_max_file_bytes));
 
     // Routes that require authentication
     let authenticated_routes = Router::new()
         // Sync routes (push/pull/snapshot/delete)
-        .route(
-            "/v1/sync/{sync_id}/changes",
-            put(sync::push_changes).get(sync::pull_changes),
-        )
+        .route("/v1/sync/{sync_id}/changes", put(sync::push_changes).get(sync::pull_changes))
         .merge(snapshot_routes)
         .merge(media_routes)
         .route("/v1/sync/{sync_id}", delete(sync::delete_account))
         // Device routes (list/revoke/rekey/ack)
         .route("/v1/sync/{sync_id}/devices", get(devices::list_devices))
-        .route(
-            "/v1/sync/{sync_id}/devices/{device_id}",
-            delete(devices::delete_device),
-        )
-        .route(
-            "/v1/sync/{sync_id}/devices/{device_id}/revoke",
-            post(devices::post_atomic_revoke),
-        )
+        .route("/v1/sync/{sync_id}/devices/{device_id}", delete(devices::delete_device))
+        .route("/v1/sync/{sync_id}/devices/{device_id}/revoke", post(devices::post_atomic_revoke))
         .route(
             "/v1/sync/{sync_id}/devices/{device_id}/rotate-ml-dsa",
             post(devices::post_rotate_ml_dsa),
         )
         .route("/v1/sync/{sync_id}/rekey", post(devices::post_rekey))
-        .route(
-            "/v1/sync/{sync_id}/rekey/{device_id}",
-            get(devices::get_rekey_artifact),
-        )
+        .route("/v1/sync/{sync_id}/rekey/{device_id}", get(devices::get_rekey_artifact))
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
-        .route(
-            "/v1/sync/{sync_id}/capabilities",
-            get(gifs::get_capabilities),
-        )
+        .route("/v1/sync/{sync_id}/capabilities", get(gifs::get_capabilities))
         // Registry routes (auth + signed)
         .merge(registry::routes())
         // Sharing routes (auth + signed)
-        .route(
-            "/v1/sharing/identity",
-            put(sharing::put_identity).delete(sharing::delete_identity),
-        )
+        .route("/v1/sharing/identity", put(sharing::put_identity).delete(sharing::delete_identity))
         .route("/v1/sharing/prekey", put(sharing::put_prekey))
         .route("/v1/sharing/init", post(sharing::post_init))
         .route("/v1/sharing/init/pending", get(sharing::get_pending_inits))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Routes that do NOT require authentication
     // (WebSocket does message-based auth after upgrade)
@@ -316,16 +282,13 @@ async fn auth_middleware(
                             .unwrap_or(false);
                         return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
                     }
-                    let prev_ml_dsa_65_public_key =
-                        if !device.prev_ml_dsa_65_public_key.is_empty()
-                            && device
-                                .prev_ml_dsa_65_expires_at
-                                .is_some_and(|exp| exp > db::now_secs())
-                        {
-                            Some(device.prev_ml_dsa_65_public_key)
-                        } else {
-                            None
-                        };
+                    let prev_ml_dsa_65_public_key = if !device.prev_ml_dsa_65_public_key.is_empty()
+                        && device.prev_ml_dsa_65_expires_at.is_some_and(|exp| exp > db::now_secs())
+                    {
+                        Some(device.prev_ml_dsa_65_public_key)
+                    } else {
+                        None
+                    };
                     return Ok(AuthResult::Ok(AuthIdentity {
                         sync_id,
                         device_id,

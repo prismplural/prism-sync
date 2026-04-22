@@ -24,11 +24,7 @@ use prism_sync_relay::{
 
 /// Start the relay server in-process on a random port with an in-memory DB.
 /// Returns `(base_url, server_handle, db)`.
-pub async fn start_test_relay() -> (
-    String,
-    tokio::task::JoinHandle<()>,
-    std::sync::Arc<Database>,
-) {
+pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
     let config = Config {
         port: 0,
         db_path: ":memory:".into(),
@@ -100,11 +96,7 @@ pub async fn start_test_relay() -> (
 
 pub async fn start_test_relay_with_config(
     config: Config,
-) -> (
-    String,
-    tokio::task::JoinHandle<()>,
-    std::sync::Arc<Database>,
-) {
+) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
     let db = Database::in_memory().expect("in-memory db");
     let state = AppState::new(db, config);
     let db = state.db.clone();
@@ -115,12 +107,9 @@ pub async fn start_test_relay_with_config(
     let url = format!("http://127.0.0.1:{}", addr.port());
 
     let handle = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
     });
 
     (url, handle, db)
@@ -175,11 +164,9 @@ pub fn sign_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"device_challenge",
-        &data,
-    )
-    .expect("hardcoded device challenge context should be <= 255 bytes");
+    let m_prime =
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"device_challenge", &data)
+            .expect("hardcoded device challenge context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -204,10 +191,7 @@ pub fn apply_signed_headers(
     device_id: &str,
     body: &[u8],
 ) -> RequestBuilder {
-    let ml_dsa_kp = keys
-        .device_secret
-        .ml_dsa_65_keypair(device_id)
-        .unwrap();
+    let ml_dsa_kp = keys.device_secret.ml_dsa_65_keypair(device_id).unwrap();
     apply_signed_headers_hybrid(
         builder,
         &keys.ed25519_signing_key,
@@ -236,11 +220,9 @@ pub fn apply_signed_headers_hybrid(
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
         method, path, sync_id, device_id, body, &timestamp, &nonce,
     );
-    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"http_request",
-        &signing_data,
-    )
-    .expect("hardcoded http request context should be <= 255 bytes");
+    let m_prime =
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
+            .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -251,10 +233,7 @@ pub fn apply_signed_headers_hybrid(
     builder
         .header("X-Prism-Timestamp", timestamp)
         .header("X-Prism-Nonce", nonce)
-        .header(
-            "X-Prism-Signature",
-            base64::engine::general_purpose::STANDARD.encode(&wire),
-        )
+        .header("X-Prism-Signature", base64::engine::general_purpose::STANDARD.encode(&wire))
 }
 
 fn solve_first_device_pow(sync_id: &str, device_id: &str, nonce: &str, difficulty_bits: u8) -> u64 {
@@ -279,10 +258,7 @@ fn solve_first_device_pow(sync_id: &str, device_id: &str, nonce: &str, difficult
             return counter;
         }
         let mask = 0xFFu8 << (8 - remaining_bits);
-        if hash
-            .get(full_zero_bytes)
-            .is_some_and(|byte| byte & mask == 0)
-        {
+        if hash.get(full_zero_bytes).is_some_and(|byte| byte & mask == 0) {
             return counter;
         }
     }
@@ -347,30 +323,19 @@ pub async fn register_device_hybrid(
     device_id: &str,
     keys: &TestDeviceKeys,
 ) -> String {
-    let ml_dsa_kp = keys
-        .device_secret
-        .ml_dsa_65_keypair(device_id)
-        .unwrap();
+    let ml_dsa_kp = keys.device_secret.ml_dsa_65_keypair(device_id).unwrap();
 
     // 1. Fetch nonce
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200, "nonce request failed");
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
     let pow_solution = pow_solution_from_nonce_json(sync_id, device_id, &nonce_json);
 
     // 2. Sign V2 hybrid challenge
-    let challenge_sig = sign_hybrid_challenge(
-        &keys.ed25519_signing_key,
-        &ml_dsa_kp,
-        sync_id,
-        device_id,
-        &nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(&keys.ed25519_signing_key, &ml_dsa_kp, sync_id, device_id, &nonce);
 
     // 3. Register with PQ keys
     let register_resp = client
@@ -392,10 +357,7 @@ pub async fn register_device_hybrid(
     let token_json: Value = register_resp.json().await.unwrap_or_else(|e| {
         panic!("hybrid registration failed (status {status}): {e}");
     });
-    assert!(
-        status.is_success(),
-        "hybrid registration failed: {status} - {token_json}"
-    );
+    assert!(status.is_success(), "hybrid registration failed: {status} - {token_json}");
     token_json["device_session_token"]
         .as_str()
         .expect("missing device_session_token in register response")
@@ -572,10 +534,7 @@ pub fn build_registry_approval(
     approver_keys: &TestDeviceKeys,
     entries: Vec<RegistrySnapshotEntry>,
 ) -> RegistryApproval {
-    let ml_dsa_kp = approver_keys
-        .device_secret
-        .ml_dsa_65_keypair(approver_device_id)
-        .unwrap();
+    let ml_dsa_kp = approver_keys.device_secret.ml_dsa_65_keypair(approver_device_id).unwrap();
     build_registry_approval_hybrid(
         sync_id,
         approver_device_id,
@@ -608,10 +567,7 @@ pub fn build_registry_approval_hybrid(
     )
     .expect("hardcoded registry approval context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-        ed25519_sig: approver_ed25519_key
-            .sign(&m_prime)
-            .to_bytes()
-            .to_vec(),
+        ed25519_sig: approver_ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: approver_ml_dsa_key.sign(&m_prime),
     };
     let mut sig_wire = vec![0x03u8];

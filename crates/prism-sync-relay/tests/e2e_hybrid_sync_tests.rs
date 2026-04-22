@@ -38,18 +38,11 @@ struct MockTaskEntity {
 
 impl MockTaskEntity {
     fn new() -> Self {
-        Self {
-            rows: Mutex::new(HashMap::new()),
-            deleted: Mutex::new(HashMap::new()),
-        }
+        Self { rows: Mutex::new(HashMap::new()), deleted: Mutex::new(HashMap::new()) }
     }
 
     fn get_field(&self, entity_id: &str, field: &str) -> Option<SyncValue> {
-        self.rows
-            .lock()
-            .unwrap()
-            .get(entity_id)
-            .and_then(|row| row.get(field).cloned())
+        self.rows.lock().unwrap().get(entity_id).and_then(|row| row.get(field).cloned())
     }
 
     fn row_count(&self) -> usize {
@@ -66,14 +59,8 @@ impl SyncableEntity for MockTaskEntity {
     fn field_definitions(&self) -> &[SyncFieldDef] {
         static FIELDS: std::sync::LazyLock<Vec<SyncFieldDef>> = std::sync::LazyLock::new(|| {
             vec![
-                SyncFieldDef {
-                    name: "title".to_string(),
-                    sync_type: SyncType::String,
-                },
-                SyncFieldDef {
-                    name: "done".to_string(),
-                    sync_type: SyncType::Bool,
-                },
+                SyncFieldDef { name: "title".to_string(), sync_type: SyncType::String },
+                SyncFieldDef { name: "done".to_string(), sync_type: SyncType::Bool },
             ]
         });
         &FIELDS
@@ -102,21 +89,12 @@ impl SyncableEntity for MockTaskEntity {
     }
 
     async fn soft_delete(&self, entity_id: &str, _hlc: &str) -> prism_sync_core::Result<()> {
-        self.deleted
-            .lock()
-            .unwrap()
-            .insert(entity_id.to_string(), true);
+        self.deleted.lock().unwrap().insert(entity_id.to_string(), true);
         Ok(())
     }
 
     async fn is_deleted(&self, entity_id: &str) -> prism_sync_core::Result<bool> {
-        Ok(self
-            .deleted
-            .lock()
-            .unwrap()
-            .get(entity_id)
-            .copied()
-            .unwrap_or(false))
+        Ok(self.deleted.lock().unwrap().get(entity_id).copied().unwrap_or(false))
     }
 
     async fn hard_delete(&self, entity_id: &str) -> prism_sync_core::Result<()> {
@@ -142,10 +120,7 @@ impl SyncableEntity for MockTaskEntity {
 
 fn test_schema() -> SyncSchema {
     SyncSchema::builder()
-        .entity("tasks", |e| {
-            e.field("title", SyncType::String)
-                .field("done", SyncType::Bool)
-        })
+        .entity("tasks", |e| e.field("title", SyncType::String).field("done", SyncType::Bool))
         .build()
 }
 
@@ -178,17 +153,11 @@ async fn register_joiner_device(
     approver_keys: &TestDeviceKeys,
     all_entries: Vec<prism_sync_core::pairing::models::RegistrySnapshotEntry>,
 ) -> String {
-    let ml_dsa_kp = joiner_keys
-        .device_secret
-        .ml_dsa_65_keypair(joiner_device_id)
-        .unwrap();
+    let ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(joiner_device_id).unwrap();
 
     // 1. Fetch nonce
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200, "nonce request failed");
     let nonce_json: serde_json::Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
@@ -203,12 +172,8 @@ async fn register_joiner_device(
     );
 
     // 3. Build registry approval
-    let registry_approval = build_registry_approval(
-        sync_id,
-        approver_device_id,
-        approver_keys,
-        all_entries,
-    );
+    let registry_approval =
+        build_registry_approval(sync_id, approver_device_id, approver_keys, all_entries);
 
     // 4. Register with registry approval
     let register_resp = client
@@ -230,10 +195,7 @@ async fn register_joiner_device(
     let token_json: serde_json::Value = register_resp.json().await.unwrap_or_else(|e| {
         panic!("joiner registration failed (status {status}): {e}");
     });
-    assert!(
-        status.is_success(),
-        "joiner registration failed: {status} - {token_json}"
-    );
+    assert!(status.is_success(), "joiner registration failed: {status} - {token_json}");
     token_json["device_session_token"]
         .as_str()
         .expect("missing device_session_token in register response")
@@ -412,22 +374,10 @@ async fn e2e_hybrid_batch_push_pull_cross_device() {
     register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_a, &sync_id, &device_b_id, &keys_b);
 
-    create_task_ops(
-        &storage_a,
-        &sync_id,
-        &device_a_id,
-        "task-1",
-        "Buy groceries",
-        "batch-a1",
-    );
+    create_task_ops(&storage_a, &sync_id, &device_a_id, "task-1", "Buy groceries", "batch-a1");
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_a_id,
-        &token_a,
-        &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let engine_a = SyncEngine::new(
         storage_a.clone(),
         relay_a.clone(),
@@ -440,21 +390,10 @@ async fn e2e_hybrid_batch_push_pull_cross_device() {
 
     // ── Device A syncs: pushes hybrid-signed V3 batch ──
     let result_a = engine_a
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_a.ed25519_signing_key,
-            Some(&ml_dsa_a),
-            &device_a_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_a.error.is_none(),
-        "Device A push failed: {:?}",
-        result_a.error
-    );
+    assert!(result_a.error.is_none(), "Device A push failed: {:?}", result_a.error);
     assert_eq!(result_a.pushed, 1, "expected 1 batch pushed from A");
 
     // ── Device B: create storage, engine ──
@@ -464,13 +403,8 @@ async fn e2e_hybrid_batch_push_pull_cross_device() {
     register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_b_id,
-        &token_b,
-        &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let engine_b = SyncEngine::new(
         storage_b.clone(),
         relay_b.clone(),
@@ -483,21 +417,10 @@ async fn e2e_hybrid_batch_push_pull_cross_device() {
 
     // ── Device B syncs: pulls and verifies BOTH Ed25519 + ML-DSA sigs ──
     let result_b = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b.error.is_none(),
-        "Device B pull failed: {:?}",
-        result_b.error
-    );
+    assert!(result_b.error.is_none(), "Device B pull failed: {:?}", result_b.error);
     assert_eq!(result_b.pulled, 1, "expected 1 batch pulled by B");
     assert_eq!(result_b.merged, 2, "expected 2 ops merged (title + done)");
 
@@ -506,56 +429,24 @@ async fn e2e_hybrid_batch_push_pull_cross_device() {
         entity_b.get_field("task-1", "title"),
         Some(SyncValue::String("Buy groceries".to_string()))
     );
-    assert_eq!(
-        entity_b.get_field("task-1", "done"),
-        Some(SyncValue::Bool(false))
-    );
+    assert_eq!(entity_b.get_field("task-1", "done"), Some(SyncValue::Bool(false)));
 
     // ── Device B: create a task and sync ──
-    create_task_ops(
-        &storage_b,
-        &sync_id,
-        &device_b_id,
-        "task-2",
-        "Walk the dog",
-        "batch-b1",
-    );
+    create_task_ops(&storage_b, &sync_id, &device_b_id, "task-2", "Walk the dog", "batch-b1");
 
     let result_b2 = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b2.error.is_none(),
-        "Device B push failed: {:?}",
-        result_b2.error
-    );
+    assert!(result_b2.error.is_none(), "Device B push failed: {:?}", result_b2.error);
     assert_eq!(result_b2.pushed, 1, "expected 1 batch pushed from B");
 
     // ── Device A syncs: pulls B's batch ──
     let result_a2 = engine_a
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_a.ed25519_signing_key,
-            Some(&ml_dsa_a),
-            &device_a_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_a2.error.is_none(),
-        "Device A pull failed: {:?}",
-        result_a2.error
-    );
+    assert!(result_a2.error.is_none(), "Device A pull failed: {:?}", result_a2.error);
     // A pulls 2 batches: its own (seq 1, skipped at merge) + B's (seq 2, merged)
     assert_eq!(result_a2.pulled, 2, "expected 2 batches pulled by A (own + B's)");
     assert_eq!(result_a2.merged, 2, "expected 2 ops merged from B's batch");
@@ -591,13 +482,19 @@ async fn e2e_hybrid_signature_rejection() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
@@ -616,13 +513,8 @@ async fn e2e_hybrid_signature_rejection() {
         "batch-tamper",
     );
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_a_id,
-        &token_a,
-        &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let engine_a = SyncEngine::new(
         storage_a.clone(),
         relay_a.clone(),
@@ -633,14 +525,7 @@ async fn e2e_hybrid_signature_rejection() {
 
     let ml_dsa_a = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
     let result_a = engine_a
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_a.ed25519_signing_key,
-            Some(&ml_dsa_a),
-            &device_a_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
         .await
         .unwrap();
     assert!(result_a.error.is_none(), "push failed: {:?}", result_a.error);
@@ -663,15 +548,13 @@ async fn e2e_hybrid_signature_rejection() {
         if let Some(sig) = envelope.get("signature").and_then(|s| s.as_str()) {
             // Decode the base64 signature, flip a byte in the ML-DSA portion, re-encode
             use base64::Engine;
-            let mut sig_bytes =
-                base64::engine::general_purpose::STANDARD.decode(sig).unwrap();
+            let mut sig_bytes = base64::engine::general_purpose::STANDARD.decode(sig).unwrap();
             // The ML-DSA signature starts after the Ed25519 component.
             // Flip a byte deep inside the ML-DSA portion to corrupt it.
             if sig_bytes.len() > 200 {
                 sig_bytes[200] ^= 0xFF;
             }
-            let tampered_sig =
-                base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
+            let tampered_sig = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
             envelope["signature"] = serde_json::Value::String(tampered_sig);
         }
 
@@ -691,13 +574,8 @@ async fn e2e_hybrid_signature_rejection() {
     register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_b_id,
-        &token_b,
-        &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let engine_b = SyncEngine::new(
         storage_b.clone(),
         relay_b.clone(),
@@ -708,14 +586,7 @@ async fn e2e_hybrid_signature_rejection() {
 
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let result_b = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
 
@@ -725,19 +596,9 @@ async fn e2e_hybrid_signature_rejection() {
         "sync should not error, just skip bad batch: {:?}",
         result_b.error
     );
-    assert_eq!(
-        result_b.pulled, 1,
-        "batch was pulled (received from relay)"
-    );
-    assert_eq!(
-        result_b.merged, 0,
-        "ML-DSA-tampered batch must NOT be merged"
-    );
-    assert_eq!(
-        entity_b.row_count(),
-        0,
-        "no data should arrive from ML-DSA-tampered batch"
-    );
+    assert_eq!(result_b.pulled, 1, "batch was pulled (received from relay)");
+    assert_eq!(result_b.merged, 0, "ML-DSA-tampered batch must NOT be merged");
+    assert_eq!(entity_b.row_count(), 0, "no data should arrive from ML-DSA-tampered batch");
 
     // ── Phase 2: Ed25519 tampering ──
     // Push a NEW valid batch from A, then tamper the Ed25519 portion
@@ -751,14 +612,7 @@ async fn e2e_hybrid_signature_rejection() {
     );
 
     let result_a2 = engine_a
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_a.ed25519_signing_key,
-            Some(&ml_dsa_a),
-            &device_a_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
         .await
         .unwrap();
     assert!(result_a2.error.is_none(), "A push 2 failed: {:?}", result_a2.error);
@@ -800,14 +654,7 @@ async fn e2e_hybrid_signature_rejection() {
 
     // B pulls again — Ed25519-tampered batch must also be rejected
     let result_b2 = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
 
@@ -816,15 +663,8 @@ async fn e2e_hybrid_signature_rejection() {
         "sync should not error on Ed25519-tampered batch: {:?}",
         result_b2.error
     );
-    assert_eq!(
-        result_b2.merged, 0,
-        "Ed25519-tampered batch must NOT be merged"
-    );
-    assert_eq!(
-        entity_b.row_count(),
-        0,
-        "no data should arrive from either tampered batch"
-    );
+    assert_eq!(result_b2.merged, 0, "Ed25519-tampered batch must NOT be merged");
+    assert_eq!(entity_b.row_count(), 0, "no data should arrive from either tampered batch");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -846,25 +686,37 @@ async fn e2e_signed_registry_fetch_and_import() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let device_c_id = generate_device_id();
     let keys_c = TestDeviceKeys::generate(&device_c_id);
     let token_c = register_joiner_device(
-        &client, &url, &sync_id, &device_c_id, &keys_c,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_c_id,
+        &keys_c,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_c_id, &keys_c, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
@@ -875,11 +727,8 @@ async fn e2e_signed_registry_fetch_and_import() {
         registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         registry_snapshot_entry_hybrid(&sync_id, &device_c_id, &keys_c, "active"),
     ];
-    let signed_registry = build_signed_registry_snapshot_hybrid(
-        entries,
-        &keys_a.ed25519_signing_key,
-        &ml_dsa_a,
-    );
+    let signed_registry =
+        build_signed_registry_snapshot_hybrid(entries, &keys_a.ed25519_signing_key, &ml_dsa_a);
 
     // Upload to relay via PUT /v1/sync/{sync_id}/registry
     let path = format!("/v1/sync/{sync_id}/registry");
@@ -904,11 +753,7 @@ async fn e2e_signed_registry_fetch_and_import() {
     .send()
     .await
     .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "registry upload failed: {}",
-        resp.status()
-    );
+    assert!(resp.status().is_success(), "registry upload failed: {}", resp.status());
 
     // ── C pushes a batch ──
     let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
@@ -916,22 +761,10 @@ async fn e2e_signed_registry_fetch_and_import() {
     setup_sync_metadata(&storage_c, &sync_id, &device_c_id);
     register_peer_device(&storage_c, &sync_id, &device_c_id, &keys_c);
 
-    create_task_ops(
-        &storage_c,
-        &sync_id,
-        &device_c_id,
-        "task-from-c",
-        "C's task",
-        "batch-c1",
-    );
+    create_task_ops(&storage_c, &sync_id, &device_c_id, "task-from-c", "C's task", "batch-c1");
 
-    let relay_c = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_c_id,
-        &token_c,
-        &keys_c,
-    ));
+    let relay_c =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_c_id, &token_c, &keys_c));
     let ml_dsa_c = keys_c.device_secret.ml_dsa_65_keypair(&device_c_id).unwrap();
     let engine_c = SyncEngine::new(
         storage_c.clone(),
@@ -941,14 +774,7 @@ async fn e2e_signed_registry_fetch_and_import() {
         SyncConfig::default(),
     );
     let result_c = engine_c
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_c.ed25519_signing_key,
-            Some(&ml_dsa_c),
-            &device_c_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_c.ed25519_signing_key, Some(&ml_dsa_c), &device_c_id, 0)
         .await
         .unwrap();
     assert!(result_c.error.is_none(), "C push failed: {:?}", result_c.error);
@@ -963,13 +789,8 @@ async fn e2e_signed_registry_fetch_and_import() {
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
     // NOTE: B does NOT know C's keys — this is the whole point
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_b_id,
-        &token_b,
-        &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
         storage_b.clone(),
@@ -979,21 +800,10 @@ async fn e2e_signed_registry_fetch_and_import() {
         SyncConfig::default(),
     );
     let result_b = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b.error.is_none(),
-        "B pull failed: {:?}",
-        result_b.error
-    );
+    assert!(result_b.error.is_none(), "B pull failed: {:?}", result_b.error);
     assert_eq!(result_b.merged, 2, "B should have merged C's 2 ops via registry lookup");
     assert_eq!(
         entity_b.get_field("task-from-c", "title"),
@@ -1021,13 +831,19 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
@@ -1047,13 +863,8 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
         "batch-rot-1",
     );
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_a_id,
-        &token_a,
-        &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let ml_dsa_a_gen0 = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
     let engine_a = SyncEngine::new(
         storage_a.clone(),
@@ -1063,14 +874,7 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
         SyncConfig::default(),
     );
     let result = engine_a
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_a.ed25519_signing_key,
-            Some(&ml_dsa_a_gen0),
-            &device_a_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a_gen0), &device_a_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none());
@@ -1082,13 +886,8 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
     register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_b_id,
-        &token_b,
-        &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
         storage_b.clone(),
@@ -1098,14 +897,7 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
         SyncConfig::default(),
     );
     let result = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none());
@@ -1113,10 +905,7 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
 
     // ── A rotates ML-DSA to gen 1 ──
     // Use the SAME DeviceSecret with generation 1 (not a new secret)
-    let ml_dsa_a_gen1 = keys_a
-        .device_secret
-        .ml_dsa_65_keypair_v(&device_a_id, 1)
-        .unwrap();
+    let ml_dsa_a_gen1 = keys_a.device_secret.ml_dsa_65_keypair_v(&device_a_id, 1).unwrap();
 
     // Build continuity proof
     let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof::create(
@@ -1146,9 +935,7 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
     );
 
     // POST rotation to relay
-    let path = format!(
-        "/v1/sync/{sync_id}/devices/{device_a_id}/rotate-ml-dsa"
-    );
+    let path = format!("/v1/sync/{sync_id}/devices/{device_a_id}/rotate-ml-dsa");
     let body = serde_json::json!({
         "new_ml_dsa_pk": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ml_dsa_a_gen1.public_key_bytes()),
         "ml_dsa_key_generation": 1,
@@ -1214,10 +1001,8 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
 
     // Need a new ServerRelay with the gen1 key for A
     let relay_a_gen1 = Arc::new({
-        let ml_dsa_a_gen1_for_relay = keys_a
-            .device_secret
-            .ml_dsa_65_keypair_v(&device_a_id, 1)
-            .unwrap();
+        let ml_dsa_a_gen1_for_relay =
+            keys_a.device_secret.ml_dsa_65_keypair_v(&device_a_id, 1).unwrap();
         ServerRelay::new(
             localhost_url.clone(),
             sync_id.clone(),
@@ -1252,14 +1037,7 @@ async fn e2e_ml_dsa_rotation_with_peer_verification() {
 
     // ── B pulls → generation mismatch → fetches signed registry → imports new key → verifies ──
     let result = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none(), "B pull gen1 failed: {:?}", result.error);
@@ -1289,25 +1067,37 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let device_c_id = generate_device_id();
     let keys_c = TestDeviceKeys::generate(&device_c_id);
     let _token_c = register_joiner_device(
-        &client, &url, &sync_id, &device_c_id, &keys_c,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_c_id,
+        &keys_c,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_c_id, &keys_c, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     // ── A revokes C, rekeys to epoch 1 using real X-Wing KEM ──
     // Generate a real epoch 1 key
@@ -1332,9 +1122,9 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
         let mut salt = Vec::with_capacity(4 + device_id.len());
         salt.extend_from_slice(&new_epoch.to_le_bytes());
         salt.extend_from_slice(device_id.as_bytes());
-        let wrap_key = prism_sync_crypto::kdf::derive_subkey(
-            &shared_secret, &salt, b"prism_epoch_rekey_v2",
-        ).unwrap();
+        let wrap_key =
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+                .unwrap();
         let encrypted_epoch_key =
             prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
         let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
@@ -1344,12 +1134,10 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
         artifact
     }
 
-    let wrapped_key_for_a = build_rekey_artifact(
-        &xwing_a.encapsulation_key_bytes(), &epoch_1_key, 1, &device_a_id,
-    );
-    let wrapped_key_for_b = build_rekey_artifact(
-        &xwing_b.encapsulation_key_bytes(), &epoch_1_key, 1, &device_b_id,
-    );
+    let wrapped_key_for_a =
+        build_rekey_artifact(&xwing_a.encapsulation_key_bytes(), &epoch_1_key, 1, &device_a_id);
+    let wrapped_key_for_b =
+        build_rekey_artifact(&xwing_b.encapsulation_key_bytes(), &epoch_1_key, 1, &device_b_id);
     let mut wrapped_keys = HashMap::new();
     wrapped_keys.insert(device_a_id.clone(), wrapped_key_for_a.clone());
     wrapped_keys.insert(device_b_id.clone(), wrapped_key_for_b.clone());
@@ -1357,10 +1145,7 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
     let encoded_keys: HashMap<String, String> = wrapped_keys
         .iter()
         .map(|(k, v)| {
-            (
-                k.clone(),
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v),
-            )
+            (k.clone(), base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v))
         })
         .collect();
 
@@ -1390,17 +1175,11 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
     .send()
     .await
     .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "revoke failed: {}",
-        resp.status()
-    );
+    assert!(resp.status().is_success(), "revoke failed: {}", resp.status());
 
     // ── B fetches rekey artifact successfully ──
     let b_artifact_resp = client
-        .get(format!(
-            "{url}/v1/sync/{sync_id}/rekey/{device_b_id}?epoch=1"
-        ))
+        .get(format!("{url}/v1/sync/{sync_id}/rekey/{device_b_id}?epoch=1"))
         .header("Authorization", format!("Bearer {token_b}"))
         .header("X-Device-Id", &device_b_id)
         .send()
@@ -1408,14 +1187,10 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
         .unwrap();
     assert_eq!(b_artifact_resp.status(), 200);
     let b_json: serde_json::Value = b_artifact_resp.json().await.unwrap();
-    let recovered_wrapped = b_json["wrapped_key"]
-        .as_str()
-        .expect("wrapped_key should exist");
-    let recovered_artifact = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        recovered_wrapped,
-    )
-    .unwrap();
+    let recovered_wrapped = b_json["wrapped_key"].as_str().expect("wrapped_key should exist");
+    let recovered_artifact =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, recovered_wrapped)
+            .unwrap();
 
     // ── B decrypts the real X-Wing artifact to recover epoch 1 key ──
     assert_eq!(recovered_artifact[0], 0x02, "artifact version should be 0x02");
@@ -1427,9 +1202,9 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
     let mut salt = Vec::with_capacity(4 + device_b_id.len());
     salt.extend_from_slice(&1u32.to_le_bytes());
     salt.extend_from_slice(device_b_id.as_bytes());
-    let unwrap_key = prism_sync_crypto::kdf::derive_subkey(
-        &shared_secret, &salt, b"prism_epoch_rekey_v2",
-    ).unwrap();
+    let unwrap_key =
+        prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+            .unwrap();
     let recovered_epoch_key =
         prism_sync_crypto::aead::xchacha_decrypt(&unwrap_key, encrypted_epoch_key).unwrap();
     assert_eq!(
@@ -1440,9 +1215,7 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
     // ── C tries to fetch rekey artifact → should fail (revoked) ──
     // The auth middleware detects revoked device status and returns 401 (DeviceRevoked)
     let c_artifact_resp = client
-        .get(format!(
-            "{url}/v1/sync/{sync_id}/rekey/{device_c_id}?epoch=1"
-        ))
+        .get(format!("{url}/v1/sync/{sync_id}/rekey/{device_c_id}?epoch=1"))
         .header("Authorization", format!("Bearer {_token_c}"))
         .header("X-Device-Id", &device_c_id)
         .send()
@@ -1461,14 +1234,11 @@ async fn e2e_revoked_device_excluded_from_new_epoch() {
     let mut c_salt = Vec::with_capacity(4 + device_c_id.len());
     c_salt.extend_from_slice(&1u32.to_le_bytes());
     c_salt.extend_from_slice(device_c_id.as_bytes());
-    let c_unwrap_key = prism_sync_crypto::kdf::derive_subkey(
-        &c_shared_secret, &c_salt, b"prism_epoch_rekey_v2",
-    ).unwrap();
+    let c_unwrap_key =
+        prism_sync_crypto::kdf::derive_subkey(&c_shared_secret, &c_salt, b"prism_epoch_rekey_v2")
+            .unwrap();
     let c_result = prism_sync_crypto::aead::xchacha_decrypt(&c_unwrap_key, encrypted_epoch_key);
-    assert!(
-        c_result.is_err(),
-        "C should NOT be able to decrypt B's wrapped epoch key"
-    );
+    assert!(c_result.is_err(), "C should NOT be able to decrypt B's wrapped epoch key");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1490,34 +1260,38 @@ async fn e2e_v2_ed25519_only_batch_rejected() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
     // ── Construct a V2 Ed25519-only batch envelope and push it directly ──
     // Build a real encrypted payload
     let hlc = Hlc::now(&device_a_id, None);
-    let ops = vec![
-        CrdtChange {
-            op_id: format!("tasks:v2task:title:{hlc}:{device_a_id}"),
-            batch_id: Some("batch-v2".to_string()),
-            entity_id: "v2task".to_string(),
-            entity_table: "tasks".to_string(),
-            field_name: "title".to_string(),
-            encoded_value: "\"V2 task\"".to_string(),
-            client_hlc: hlc.to_string(),
-            is_delete: false,
-            device_id: device_a_id.to_string(),
-            epoch: 0,
-            server_seq: None,
-        },
-    ];
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:v2task:title:{hlc}:{device_a_id}"),
+        batch_id: Some("batch-v2".to_string()),
+        entity_id: "v2task".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"V2 task\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_a_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
     let plaintext = CrdtChange::encode_batch(&ops).unwrap();
     let payload_hash = batch_signature::compute_payload_hash(&plaintext);
     let epoch_key = kh.epoch_key(0).unwrap();
@@ -1588,13 +1362,8 @@ async fn e2e_v2_ed25519_only_batch_rejected() {
     register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_b_id,
-        &token_b,
-        &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
         storage_b.clone(),
@@ -1604,23 +1373,13 @@ async fn e2e_v2_ed25519_only_batch_rejected() {
         SyncConfig::default(),
     );
     let result_b = engine_b
-        .sync(
-            &sync_id,
-            &kh,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
 
     assert!(result_b.error.is_none(), "sync should not crash: {:?}", result_b.error);
     assert_eq!(result_b.pulled, 1, "V2 batch was received from relay");
-    assert_eq!(
-        result_b.merged, 0,
-        "V2 Ed25519-only batch must be rejected by V3 verifier"
-    );
+    assert_eq!(result_b.merged, 0, "V2 Ed25519-only batch must be rejected by V3 verifier");
     assert_eq!(entity_b.row_count(), 0, "no data from rejected V2 batch");
 }
 
@@ -1643,25 +1402,37 @@ async fn e2e_xwing_rekey_through_relay() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let device_c_id = generate_device_id();
     let keys_c = TestDeviceKeys::generate(&device_c_id);
     let _token_c = register_joiner_device(
-        &client, &url, &sync_id, &device_c_id, &keys_c,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_c_id,
+        &keys_c,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_c_id, &keys_c, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     // ── A revokes C and posts real X-Wing wrapped epoch-1 keys for A and B ──
     // Generate a real epoch 1 key
@@ -1686,9 +1457,9 @@ async fn e2e_xwing_rekey_through_relay() {
         let mut salt = Vec::with_capacity(4 + device_id.len());
         salt.extend_from_slice(&new_epoch.to_le_bytes());
         salt.extend_from_slice(device_id.as_bytes());
-        let wrap_key = prism_sync_crypto::kdf::derive_subkey(
-            &shared_secret, &salt, b"prism_epoch_rekey_v2",
-        ).unwrap();
+        let wrap_key =
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+                .unwrap();
         let encrypted_epoch_key =
             prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
         let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
@@ -1698,12 +1469,10 @@ async fn e2e_xwing_rekey_through_relay() {
         artifact
     }
 
-    let wrapped_for_a = build_rekey_artifact_t7(
-        &xwing_a.encapsulation_key_bytes(), &epoch_1_key, 1, &device_a_id,
-    );
-    let wrapped_for_b = build_rekey_artifact_t7(
-        &xwing_b.encapsulation_key_bytes(), &epoch_1_key, 1, &device_b_id,
-    );
+    let wrapped_for_a =
+        build_rekey_artifact_t7(&xwing_a.encapsulation_key_bytes(), &epoch_1_key, 1, &device_a_id);
+    let wrapped_for_b =
+        build_rekey_artifact_t7(&xwing_b.encapsulation_key_bytes(), &epoch_1_key, 1, &device_b_id);
 
     let mut wrapped_keys = HashMap::new();
     wrapped_keys.insert(device_a_id.clone(), wrapped_for_a.clone());
@@ -1712,10 +1481,7 @@ async fn e2e_xwing_rekey_through_relay() {
     let encoded_keys: HashMap<String, String> = wrapped_keys
         .iter()
         .map(|(k, v)| {
-            (
-                k.clone(),
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v),
-            )
+            (k.clone(), base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v))
         })
         .collect();
 
@@ -1752,9 +1518,7 @@ async fn e2e_xwing_rekey_through_relay() {
 
     // ── B fetches rekey artifact and recovers epoch 1 key via real X-Wing KEM ──
     let b_resp = client
-        .get(format!(
-            "{url}/v1/sync/{sync_id}/rekey/{device_b_id}?epoch=1"
-        ))
+        .get(format!("{url}/v1/sync/{sync_id}/rekey/{device_b_id}?epoch=1"))
         .header("Authorization", format!("Bearer {token_b}"))
         .header("X-Device-Id", &device_b_id)
         .send()
@@ -1762,14 +1526,10 @@ async fn e2e_xwing_rekey_through_relay() {
         .unwrap();
     assert_eq!(b_resp.status(), 200);
     let b_json: serde_json::Value = b_resp.json().await.unwrap();
-    let recovered_wrapped = b_json["wrapped_key"]
-        .as_str()
-        .expect("wrapped_key should exist");
-    let recovered_artifact = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        recovered_wrapped,
-    )
-    .unwrap();
+    let recovered_wrapped = b_json["wrapped_key"].as_str().expect("wrapped_key should exist");
+    let recovered_artifact =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, recovered_wrapped)
+            .unwrap();
 
     // B decapsulates the real X-Wing artifact
     assert_eq!(recovered_artifact[0], 0x02, "artifact version should be 0x02");
@@ -1779,9 +1539,9 @@ async fn e2e_xwing_rekey_through_relay() {
     let mut b_salt = Vec::with_capacity(4 + device_b_id.len());
     b_salt.extend_from_slice(&1u32.to_le_bytes());
     b_salt.extend_from_slice(device_b_id.as_bytes());
-    let b_unwrap_key = prism_sync_crypto::kdf::derive_subkey(
-        &b_shared_secret, &b_salt, b"prism_epoch_rekey_v2",
-    ).unwrap();
+    let b_unwrap_key =
+        prism_sync_crypto::kdf::derive_subkey(&b_shared_secret, &b_salt, b"prism_epoch_rekey_v2")
+            .unwrap();
     let b_recovered_epoch_key =
         prism_sync_crypto::aead::xchacha_decrypt(&b_unwrap_key, b_encrypted_key).unwrap();
     assert_eq!(
@@ -1791,9 +1551,7 @@ async fn e2e_xwing_rekey_through_relay() {
 
     // ── C tries to get artifact → should fail (revoked) ──
     let c_resp = client
-        .get(format!(
-            "{url}/v1/sync/{sync_id}/rekey/{device_c_id}?epoch=1"
-        ))
+        .get(format!("{url}/v1/sync/{sync_id}/rekey/{device_c_id}?epoch=1"))
         .header("Authorization", format!("Bearer {_token_c}"))
         .header("X-Device-Id", &device_c_id)
         .send()
@@ -1828,21 +1586,19 @@ async fn e2e_xwing_rekey_through_relay() {
 
     // Create ops at epoch 1
     let hlc = Hlc::now(&device_a_id, None);
-    let ops_epoch1 = vec![
-        CrdtChange {
-            op_id: format!("tasks:epoch1-task:title:{hlc}:{device_a_id}"),
-            batch_id: Some("batch-epoch1".to_string()),
-            entity_id: "epoch1-task".to_string(),
-            entity_table: "tasks".to_string(),
-            field_name: "title".to_string(),
-            encoded_value: "\"Epoch 1 data\"".to_string(),
-            client_hlc: hlc.to_string(),
-            is_delete: false,
-            device_id: device_a_id.to_string(),
-            epoch: 1,
-            server_seq: None,
-        },
-    ];
+    let ops_epoch1 = vec![CrdtChange {
+        op_id: format!("tasks:epoch1-task:title:{hlc}:{device_a_id}"),
+        batch_id: Some("batch-epoch1".to_string()),
+        entity_id: "epoch1-task".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Epoch 1 data\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_a_id.to_string(),
+        epoch: 1,
+        server_seq: None,
+    }];
     {
         use prism_sync_core::storage::PendingOp;
         let mut tx = storage_a.begin_tx().unwrap();
@@ -1867,13 +1623,8 @@ async fn e2e_xwing_rekey_through_relay() {
         tx.commit().unwrap();
     }
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_a_id,
-        &token_a,
-        &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let engine_a = SyncEngine::new(
         storage_a.clone(),
         relay_a.clone(),
@@ -1882,21 +1633,10 @@ async fn e2e_xwing_rekey_through_relay() {
         SyncConfig::default(),
     );
     let result = engine_a
-        .sync(
-            &sync_id,
-            &kh_a,
-            &keys_a.ed25519_signing_key,
-            Some(&ml_dsa_a),
-            &device_a_id,
-            0,
-        )
+        .sync(&sync_id, &kh_a, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_none(),
-        "A epoch-1 push failed: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "A epoch-1 push failed: {:?}", result.error);
     assert_eq!(result.pushed, 1, "A should push epoch-1 batch");
 
     // ── B pulls with epoch 1 key recovered via real X-Wing KEM ──
@@ -1910,13 +1650,8 @@ async fn e2e_xwing_rekey_through_relay() {
     let mut kh_b = shared_key_hierarchy();
     kh_b.store_epoch_key(1, zeroize::Zeroizing::new(b_recovered_epoch_key));
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url,
-        &sync_id,
-        &device_b_id,
-        &token_b,
-        &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
         storage_b.clone(),
@@ -1926,22 +1661,14 @@ async fn e2e_xwing_rekey_through_relay() {
         SyncConfig::default(),
     );
     let result = engine_b
-        .sync(
-            &sync_id,
-            &kh_b,
-            &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b),
-            &device_b_id,
-            0,
-        )
+        .sync(&sync_id, &kh_b, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_none(),
-        "B epoch-1 pull failed: {:?}",
-        result.error
+    assert!(result.error.is_none(), "B epoch-1 pull failed: {:?}", result.error);
+    assert_eq!(
+        result.merged, 1,
+        "B should decrypt and merge epoch-1 data using X-Wing-recovered key"
     );
-    assert_eq!(result.merged, 1, "B should decrypt and merge epoch-1 data using X-Wing-recovered key");
     assert_eq!(
         entity_b.get_field("epoch1-task", "title"),
         Some(SyncValue::String("Epoch 1 data".to_string()))
@@ -1968,13 +1695,19 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
@@ -1989,21 +1722,19 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
     // A uses timestamp 1000 (the loser).
     let hlc_a = Hlc::new(1000, 0, &device_a_id);
     let op_id_a = format!("tasks:shared-task:title:{hlc_a}:{device_a_id}");
-    let ops_a = vec![
-        CrdtChange {
-            op_id: op_id_a.clone(),
-            batch_id: Some("batch-conflict-a".to_string()),
-            entity_id: "shared-task".to_string(),
-            entity_table: "tasks".to_string(),
-            field_name: "title".to_string(),
-            encoded_value: "\"from-A\"".to_string(),
-            client_hlc: hlc_a.to_string(),
-            is_delete: false,
-            device_id: device_a_id.to_string(),
-            epoch: 0,
-            server_seq: None,
-        },
-    ];
+    let ops_a = vec![CrdtChange {
+        op_id: op_id_a.clone(),
+        batch_id: Some("batch-conflict-a".to_string()),
+        entity_id: "shared-task".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"from-A\"".to_string(),
+        client_hlc: hlc_a.to_string(),
+        is_delete: false,
+        device_id: device_a_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
     {
         use prism_sync_core::storage::PendingOp;
         let mut tx = storage_a.begin_tx().unwrap();
@@ -2022,7 +1753,8 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
                 client_hlc: op.client_hlc.clone(),
                 created_at: chrono::Utc::now(),
                 pushed_at: None,
-            }).unwrap();
+            })
+            .unwrap();
         }
         // Also write field_version (as the real op_emitter does for local ops)
         tx.upsert_field_version(&FieldVersion {
@@ -2035,18 +1767,20 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
             winning_hlc: hlc_a.to_string(),
             winning_encoded_value: Some("\"from-A\"".to_string()),
             updated_at: chrono::Utc::now(),
-        }).unwrap();
+        })
+        .unwrap();
         tx.commit().unwrap();
     }
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_a_id, &token_a, &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let ml_dsa_a = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
     let engine_a = SyncEngine::new(
-        storage_a.clone(), relay_a.clone(),
+        storage_a.clone(),
+        relay_a.clone(),
         vec![entity_a.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
 
     // ── Device B: set up storage and create SAME task with title="from-B" ──
@@ -2059,21 +1793,19 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
     // B uses timestamp 2000 (the LWW winner).
     let hlc_b = Hlc::new(2000, 0, &device_b_id);
     let op_id_b = format!("tasks:shared-task:title:{hlc_b}:{device_b_id}");
-    let ops_b = vec![
-        CrdtChange {
-            op_id: op_id_b.clone(),
-            batch_id: Some("batch-conflict-b".to_string()),
-            entity_id: "shared-task".to_string(),
-            entity_table: "tasks".to_string(),
-            field_name: "title".to_string(),
-            encoded_value: "\"from-B\"".to_string(),
-            client_hlc: hlc_b.to_string(),
-            is_delete: false,
-            device_id: device_b_id.to_string(),
-            epoch: 0,
-            server_seq: None,
-        },
-    ];
+    let ops_b = vec![CrdtChange {
+        op_id: op_id_b.clone(),
+        batch_id: Some("batch-conflict-b".to_string()),
+        entity_id: "shared-task".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"from-B\"".to_string(),
+        client_hlc: hlc_b.to_string(),
+        is_delete: false,
+        device_id: device_b_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
     {
         use prism_sync_core::storage::PendingOp;
         let mut tx = storage_b.begin_tx().unwrap();
@@ -2092,7 +1824,8 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
                 client_hlc: op.client_hlc.clone(),
                 created_at: chrono::Utc::now(),
                 pushed_at: None,
-            }).unwrap();
+            })
+            .unwrap();
         }
         // Also write field_version (as the real op_emitter does for local ops)
         tx.upsert_field_version(&FieldVersion {
@@ -2105,30 +1838,28 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
             winning_hlc: hlc_b.to_string(),
             winning_encoded_value: Some("\"from-B\"".to_string()),
             updated_at: chrono::Utc::now(),
-        }).unwrap();
+        })
+        .unwrap();
         tx.commit().unwrap();
     }
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_b_id, &token_b, &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
-        storage_b.clone(), relay_b.clone(),
+        storage_b.clone(),
+        relay_b.clone(),
         vec![entity_b.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
 
     // ── Both devices sync concurrently to push their conflicting ops ──
     let (result_a, result_b) = tokio::join!(
-        engine_a.sync(
-            &sync_id, &kh, &keys_a.ed25519_signing_key,
-            Some(&ml_dsa_a), &device_a_id, 0,
-        ),
-        engine_b.sync(
-            &sync_id, &kh, &keys_b.ed25519_signing_key,
-            Some(&ml_dsa_b), &device_b_id, 0,
-        ),
+        engine_a
+            .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0,),
+        engine_b
+            .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0,),
     );
     let result_a = result_a.unwrap();
     let result_b = result_b.unwrap();
@@ -2137,30 +1868,30 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
 
     // ── Both devices sync again to pull the other's changes ──
     // Run sequentially to avoid race conditions on relay read cursors
-    let result_a2 = engine_a.sync(
-        &sync_id, &kh, &keys_a.ed25519_signing_key,
-        Some(&ml_dsa_a), &device_a_id, 0,
-    ).await.unwrap();
+    let result_a2 = engine_a
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
+        .await
+        .unwrap();
     assert!(result_a2.error.is_none(), "A pull failed: {:?}", result_a2.error);
 
-    let result_b2 = engine_b.sync(
-        &sync_id, &kh, &keys_b.ed25519_signing_key,
-        Some(&ml_dsa_b), &device_b_id, 0,
-    ).await.unwrap();
+    let result_b2 = engine_b
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
+        .await
+        .unwrap();
     assert!(result_b2.error.is_none(), "B pull failed: {:?}", result_b2.error);
 
     // One more round to ensure full convergence (in case the second round
     // only pulled some batches due to cursor timing)
-    let result_a3 = engine_a.sync(
-        &sync_id, &kh, &keys_a.ed25519_signing_key,
-        Some(&ml_dsa_a), &device_a_id, 0,
-    ).await.unwrap();
+    let result_a3 = engine_a
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
+        .await
+        .unwrap();
     assert!(result_a3.error.is_none(), "A convergence sync failed: {:?}", result_a3.error);
 
-    let result_b3 = engine_b.sync(
-        &sync_id, &kh, &keys_b.ed25519_signing_key,
-        Some(&ml_dsa_b), &device_b_id, 0,
-    ).await.unwrap();
+    let result_b3 = engine_b
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
+        .await
+        .unwrap();
     assert!(result_b3.error.is_none(), "B convergence sync failed: {:?}", result_b3.error);
 
     // ── Assert convergence via field_versions in storage ──
@@ -2180,10 +1911,7 @@ async fn e2e_concurrent_sync_crdt_conflict_resolution() {
         "Both devices must converge to the same winning value in field_versions: A={:?}, B={:?}",
         fv_a.winning_encoded_value, fv_b.winning_encoded_value,
     );
-    assert_eq!(
-        fv_a.winning_hlc, fv_b.winning_hlc,
-        "Both devices must agree on the winning HLC"
-    );
+    assert_eq!(fv_a.winning_hlc, fv_b.winning_hlc, "Both devices must agree on the winning HLC");
 
     // The LWW winner is B (HLC timestamp 2000 > 1000)
     assert_eq!(
@@ -2219,13 +1947,19 @@ async fn e2e_soft_delete_propagation() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
@@ -2238,18 +1972,20 @@ async fn e2e_soft_delete_propagation() {
 
     create_task_ops(&storage_a, &sync_id, &device_a_id, "del-task", "To be deleted", "batch-del-1");
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_a_id, &token_a, &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let ml_dsa_a = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
     let engine_a = SyncEngine::new(
-        storage_a.clone(), relay_a.clone(),
+        storage_a.clone(),
+        relay_a.clone(),
         vec![entity_a.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
     let result = engine_a
         .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none(), "A create push failed: {:?}", result.error);
     assert_eq!(result.pushed, 1);
 
@@ -2260,18 +1996,20 @@ async fn e2e_soft_delete_propagation() {
     register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_b_id, &token_b, &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
-        storage_b.clone(), relay_b.clone(),
+        storage_b.clone(),
+        relay_b.clone(),
         vec![entity_b.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none(), "B pull failed: {:?}", result.error);
     assert_eq!(result.merged, 2, "B should merge create ops");
     assert_eq!(
@@ -2281,21 +2019,19 @@ async fn e2e_soft_delete_propagation() {
 
     // ── A soft-deletes the task and syncs ──
     let hlc_del = Hlc::now(&device_a_id, None);
-    let del_ops = vec![
-        CrdtChange {
-            op_id: format!("tasks:del-task:is_deleted:{hlc_del}:{device_a_id}"),
-            batch_id: Some("batch-del-2".to_string()),
-            entity_id: "del-task".to_string(),
-            entity_table: "tasks".to_string(),
-            field_name: "is_deleted".to_string(),
-            encoded_value: "true".to_string(),
-            client_hlc: hlc_del.to_string(),
-            is_delete: true,
-            device_id: device_a_id.to_string(),
-            epoch: 0,
-            server_seq: None,
-        },
-    ];
+    let del_ops = vec![CrdtChange {
+        op_id: format!("tasks:del-task:is_deleted:{hlc_del}:{device_a_id}"),
+        batch_id: Some("batch-del-2".to_string()),
+        entity_id: "del-task".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "is_deleted".to_string(),
+        encoded_value: "true".to_string(),
+        client_hlc: hlc_del.to_string(),
+        is_delete: true,
+        device_id: device_a_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
     {
         use prism_sync_core::storage::PendingOp;
         let mut tx = storage_a.begin_tx().unwrap();
@@ -2314,20 +2050,23 @@ async fn e2e_soft_delete_propagation() {
                 client_hlc: op.client_hlc.clone(),
                 created_at: chrono::Utc::now(),
                 pushed_at: None,
-            }).unwrap();
+            })
+            .unwrap();
         }
         tx.commit().unwrap();
     }
     let result = engine_a
         .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none(), "A delete push failed: {:?}", result.error);
     assert_eq!(result.pushed, 1);
 
     // ── B syncs and picks up the soft delete ──
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none(), "B delete pull failed: {:?}", result.error);
     assert_eq!(result.merged, 1, "B should merge the delete op");
 
@@ -2343,21 +2082,19 @@ async fn e2e_soft_delete_propagation() {
     // tombstone protection should reject the title update because the entity
     // is already tombstoned.
     let hlc_resurrect = Hlc::new(hlc_del.timestamp - 1000, 0, &device_b_id);
-    let resurrect_ops = vec![
-        CrdtChange {
-            op_id: format!("tasks:del-task:title:{hlc_resurrect}:{device_b_id}"),
-            batch_id: Some("batch-resurrect".to_string()),
-            entity_id: "del-task".to_string(),
-            entity_table: "tasks".to_string(),
-            field_name: "title".to_string(),
-            encoded_value: "\"Resurrected!\"".to_string(),
-            client_hlc: hlc_resurrect.to_string(),
-            is_delete: false,
-            device_id: device_b_id.to_string(),
-            epoch: 0,
-            server_seq: None,
-        },
-    ];
+    let resurrect_ops = vec![CrdtChange {
+        op_id: format!("tasks:del-task:title:{hlc_resurrect}:{device_b_id}"),
+        batch_id: Some("batch-resurrect".to_string()),
+        entity_id: "del-task".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Resurrected!\"".to_string(),
+        client_hlc: hlc_resurrect.to_string(),
+        is_delete: false,
+        device_id: device_b_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
     {
         use prism_sync_core::storage::PendingOp;
         let mut tx = storage_b.begin_tx().unwrap();
@@ -2376,7 +2113,8 @@ async fn e2e_soft_delete_propagation() {
                 client_hlc: op.client_hlc.clone(),
                 created_at: chrono::Utc::now(),
                 pushed_at: None,
-            }).unwrap();
+            })
+            .unwrap();
         }
         tx.commit().unwrap();
     }
@@ -2384,7 +2122,8 @@ async fn e2e_soft_delete_propagation() {
     // B pushes the resurrect attempt
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none());
 
     // B should still see the entity as deleted (tombstone protection in merge engine
@@ -2419,13 +2158,19 @@ async fn e2e_multi_batch_sync() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
@@ -2436,26 +2181,30 @@ async fn e2e_multi_batch_sync() {
     register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_a, &sync_id, &device_b_id, &keys_b);
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_a_id, &token_a, &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let ml_dsa_a = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
     let engine_a = SyncEngine::new(
-        storage_a.clone(), relay_a.clone(),
+        storage_a.clone(),
+        relay_a.clone(),
         vec![entity_a.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
 
     for i in 1..=5 {
         create_task_ops(
-            &storage_a, &sync_id, &device_a_id,
+            &storage_a,
+            &sync_id,
+            &device_a_id,
             &format!("multi-task-{i}"),
             &format!("Task #{i}"),
             &format!("batch-multi-{i}"),
         );
         let result = engine_a
             .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert!(result.error.is_none(), "A push {i} failed: {:?}", result.error);
         assert_eq!(result.pushed, 1, "A should push 1 batch on iteration {i}");
     }
@@ -2467,18 +2216,20 @@ async fn e2e_multi_batch_sync() {
     register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_b_id, &token_b, &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
-        storage_b.clone(), relay_b.clone(),
+        storage_b.clone(),
+        relay_b.clone(),
         vec![entity_b.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none(), "B pull failed: {:?}", result.error);
     assert_eq!(result.pulled, 5, "B should pull all 5 batches");
     assert_eq!(result.merged, 10, "B should merge 10 ops (2 per task x 5)");
@@ -2513,13 +2264,19 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     let device_b_id = generate_device_id();
     let keys_b = TestDeviceKeys::generate(&device_b_id);
     let token_b = register_joiner_device(
-        &client, &url, &sync_id, &device_b_id, &keys_b,
-        &device_a_id, &keys_a,
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
         ],
-    ).await;
+    )
+    .await;
 
     let kh = shared_key_hierarchy();
 
@@ -2532,18 +2289,20 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
 
     create_task_ops(&storage_a, &sync_id, &device_a_id, "gen-test-1", "Gen0 task", "batch-gen0");
 
-    let relay_a = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_a_id, &token_a, &keys_a,
-    ));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
     let ml_dsa_a_gen0 = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
     let engine_a = SyncEngine::new(
-        storage_a.clone(), relay_a.clone(),
+        storage_a.clone(),
+        relay_a.clone(),
         vec![entity_a.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
     let result = engine_a
         .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a_gen0), &device_a_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none());
     assert_eq!(result.pushed, 1);
 
@@ -2553,18 +2312,20 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
     register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
 
-    let relay_b = Arc::new(make_server_relay(
-        &localhost_url, &sync_id, &device_b_id, &token_b, &keys_b,
-    ));
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
     let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
     let engine_b = SyncEngine::new(
-        storage_b.clone(), relay_b.clone(),
+        storage_b.clone(),
+        relay_b.clone(),
         vec![entity_b.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none());
     assert_eq!(result.merged, 2, "B should verify gen-0 batch");
 
@@ -2572,12 +2333,17 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     let ml_dsa_a_gen1 = keys_a.device_secret.ml_dsa_65_keypair_v(&device_a_id, 1).unwrap();
 
     let proof = prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof::create(
-        &keys_a.device_secret, &device_a_id, 0, 1,
-    ).expect("create continuity proof");
+        &keys_a.device_secret,
+        &device_a_id,
+        0,
+        1,
+    )
+    .expect("create continuity proof");
 
     let entries_gen1 = vec![
         {
-            let mut entry = registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active");
+            let mut entry =
+                registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active");
             entry.ml_dsa_65_public_key = ml_dsa_a_gen1.public_key_bytes();
             entry.ml_dsa_key_generation = 1;
             entry
@@ -2585,7 +2351,10 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
         registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
     ];
     let signed_registry_gen1 = build_signed_registry_snapshot_hybrid_versioned(
-        entries_gen1, &keys_a.ed25519_signing_key, &ml_dsa_a_gen0, 2,
+        entries_gen1,
+        &keys_a.ed25519_signing_key,
+        &ml_dsa_a_gen0,
+        2,
     );
 
     let path = format!("/v1/sync/{sync_id}/devices/{device_a_id}/rotate-ml-dsa");
@@ -2599,12 +2368,22 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     });
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!("{url}{path}"))
+        client
+            .post(format!("{url}{path}"))
             .header("Authorization", format!("Bearer {token_a}"))
             .header("X-Device-Id", &device_a_id)
             .header("Content-Type", "application/json"),
-        &keys_a, "POST", &path, &sync_id, &device_a_id, &body_bytes,
-    ).body(body_bytes).send().await.unwrap();
+        &keys_a,
+        "POST",
+        &path,
+        &sync_id,
+        &device_a_id,
+        &body_bytes,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap();
     assert!(resp.status().is_success(), "rotate-ml-dsa failed: {}", resp.status());
 
     // ── B imports gen-1 registry ──
@@ -2623,7 +2402,8 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
             registered_at: chrono::Utc::now(),
             revoked_at: None,
             ml_dsa_key_generation: 1,
-        }).unwrap();
+        })
+        .unwrap();
         tx.commit().unwrap();
     }
 
@@ -2632,46 +2412,54 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     let relay_a_gen1 = Arc::new({
         let ml_dsa_for_relay = keys_a.device_secret.ml_dsa_65_keypair_v(&device_a_id, 1).unwrap();
         ServerRelay::new(
-            localhost_url.clone(), sync_id.clone(), device_a_id.clone(),
-            token_a.clone(), keys_a.ed25519_signing_key.clone(), ml_dsa_for_relay, None,
-        ).unwrap()
+            localhost_url.clone(),
+            sync_id.clone(),
+            device_a_id.clone(),
+            token_a.clone(),
+            keys_a.ed25519_signing_key.clone(),
+            ml_dsa_for_relay,
+            None,
+        )
+        .unwrap()
     });
     let engine_a_gen1 = SyncEngine::new(
-        storage_a.clone(), relay_a_gen1,
+        storage_a.clone(),
+        relay_a_gen1,
         vec![entity_a.clone() as Arc<dyn SyncableEntity>],
-        test_schema(), SyncConfig::default(),
+        test_schema(),
+        SyncConfig::default(),
     );
     let result = engine_a_gen1
         .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a_gen1), &device_a_id, 1)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none(), "A gen1 push failed: {:?}", result.error);
     assert_eq!(result.pushed, 1);
 
     // B pulls → fetches registry → imports gen-1 key → verifies gen-1 batch
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none());
     assert_eq!(result.merged, 2, "B should merge gen-1 batch");
 
     // ── Now push a batch "signed with gen-0 key" directly into the relay ──
     // This simulates a stale or replayed batch from before the rotation.
     let hlc = Hlc::now(&device_a_id, None);
-    let ops_stale = vec![
-        CrdtChange {
-            op_id: format!("tasks:gen-test-stale:title:{hlc}:{device_a_id}"),
-            batch_id: Some("batch-gen0-stale".to_string()),
-            entity_id: "gen-test-stale".to_string(),
-            entity_table: "tasks".to_string(),
-            field_name: "title".to_string(),
-            encoded_value: "\"Stale gen-0 task\"".to_string(),
-            client_hlc: hlc.to_string(),
-            is_delete: false,
-            device_id: device_a_id.to_string(),
-            epoch: 0,
-            server_seq: None,
-        },
-    ];
+    let ops_stale = vec![CrdtChange {
+        op_id: format!("tasks:gen-test-stale:title:{hlc}:{device_a_id}"),
+        batch_id: Some("batch-gen0-stale".to_string()),
+        entity_id: "gen-test-stale".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Stale gen-0 task\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_a_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
     let plaintext = CrdtChange::encode_batch(&ops_stale).unwrap();
     let payload_hash = batch_signature::compute_payload_hash(&plaintext);
     let epoch_key = kh.epoch_key(0).unwrap();
@@ -2683,34 +2471,50 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     let envelope = batch_signature::sign_batch(
         &keys_a.ed25519_signing_key,
         &ml_dsa_a_gen0,
-        &sync_id, 0, "batch-gen0-stale", "ops", &device_a_id, 0,
-        &payload_hash, nonce, ciphertext,
-    ).unwrap();
+        &sync_id,
+        0,
+        "batch-gen0-stale",
+        "ops",
+        &device_a_id,
+        0,
+        &payload_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap();
 
     // Push the stale batch envelope directly via the relay HTTP API
     let envelope_json = serde_json::to_value(&envelope).unwrap();
     let body_bytes = serde_json::to_vec(&envelope_json).unwrap();
     let path = format!("/v1/sync/{sync_id}/changes");
     let resp = apply_signed_headers(
-        client.put(format!("{url}/v1/sync/{sync_id}/changes"))
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
             .header("Authorization", format!("Bearer {token_a}"))
             .header("X-Device-Id", &device_a_id)
             .header("X-Batch-Id", "batch-gen0-stale")
             .header("Content-Type", "application/json"),
-        &keys_a, "PUT", &path, &sync_id, &device_a_id, &body_bytes,
-    ).body(body_bytes).send().await.unwrap();
+        &keys_a,
+        "PUT",
+        &path,
+        &sync_id,
+        &device_a_id,
+        &body_bytes,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap();
     assert!(resp.status().is_success(), "relay should store the batch opaquely");
 
     // B pulls → the gen-0 batch should be REJECTED because B now has gen-1 key for A
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(result.error.is_none());
     // The stale batch was pulled but should not be merged (sig fails against gen-1 key)
-    assert_eq!(
-        result.merged, 0,
-        "gen-0 batch must be rejected after B imported gen-1 key"
-    );
+    assert_eq!(result.merged, 0, "gen-0 batch must be rejected after B imported gen-1 key");
     assert!(
         entity_b.get_field("gen-test-stale", "title").is_none(),
         "stale gen-0 task should not appear on B"

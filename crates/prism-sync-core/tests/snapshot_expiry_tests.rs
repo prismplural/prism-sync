@@ -139,11 +139,7 @@ async fn push_and_create_snapshot(
         .sync(SYNC_ID, &key_hierarchy, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_none(),
-        "Device A push failed: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "Device A push failed: {:?}", result.error);
 
     // --- Device B setup: pull and merge to populate field_versions ---
     let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
@@ -178,11 +174,7 @@ async fn push_and_create_snapshot(
         .sync(SYNC_ID, &key_hierarchy, &signing_key_b, Some(&ml_dsa_key_b), device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b.error.is_none(),
-        "Device B pull failed: {:?}",
-        result_b.error
-    );
+    assert!(result_b.error.is_none(), "Device B pull failed: {:?}", result_b.error);
     assert!(result_b.merged > 0, "Device B should have merged ops");
 
     // Device B uploads the snapshot
@@ -201,14 +193,7 @@ async fn push_and_create_snapshot(
         .await
         .unwrap();
 
-    (
-        relay,
-        key_hierarchy,
-        signing_key_a,
-        signing_key_b,
-        ml_dsa_key_b,
-        storage_b,
-    )
+    (relay, key_hierarchy, signing_key_a, signing_key_b, ml_dsa_key_b, storage_b)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -275,10 +260,7 @@ async fn test_snapshot_not_targeted_at_uploader() {
         .await
         .expect("bootstrap must succeed for a device that was not the snapshot uploader");
 
-    assert!(
-        count > 0,
-        "joining device should receive entities from snapshot"
-    );
+    assert!(count > 0, "joining device should receive entities from snapshot");
     assert!(
         entity_changes.iter().any(|c| c.entity_id == "task-1"),
         "joining device should see task-1 from snapshot"
@@ -287,10 +269,7 @@ async fn test_snapshot_not_targeted_at_uploader() {
     // Also verify via get_snapshot_for_device that the relay would serve
     // the snapshot to any device when no targeting is set.
     let snap_for_z = relay.get_snapshot_for_device(device_z_id);
-    assert!(
-        snap_for_z.is_some(),
-        "relay should serve untargeted snapshot to any device"
-    );
+    assert!(snap_for_z.is_some(), "relay should serve untargeted snapshot to any device");
     let _ = signing_key_z; // suppress unused warning
 }
 

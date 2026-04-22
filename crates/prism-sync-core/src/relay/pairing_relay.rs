@@ -95,51 +95,31 @@ impl ServerPairingRelay {
                  http://localhost allowed for local development only."
             ));
         }
-        let client = Client::builder()
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-        Ok(Self {
-            base_url: relay_url,
-            client,
-            request_timeout: Duration::from_secs(15),
-        })
+        let client =
+            Client::builder().build().map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        Ok(Self { base_url: relay_url, client, request_timeout: Duration::from_secs(15) })
     }
 
     /// Classify an HTTP status code into a `RelayError`.
     fn classify_error(status: u16, body: &str) -> RelayError {
         match status {
-            401 | 403 => RelayError::Auth {
-                message: format!("HTTP {status}: {body}"),
-            },
-            408 | 504 => RelayError::Timeout {
-                message: format!("HTTP {status}: {body}"),
-            },
-            500..=599 => RelayError::Server {
-                status_code: status,
-                message: body.to_string(),
-            },
-            _ => RelayError::Protocol {
-                message: format!("Unexpected HTTP {status}: {body}"),
-            },
+            401 | 403 => RelayError::Auth { message: format!("HTTP {status}: {body}") },
+            408 | 504 => RelayError::Timeout { message: format!("HTTP {status}: {body}") },
+            500..=599 => RelayError::Server { status_code: status, message: body.to_string() },
+            _ => RelayError::Protocol { message: format!("Unexpected HTTP {status}: {body}") },
         }
     }
 
     /// Classify a reqwest error into a `RelayError`.
     fn classify_reqwest_error(err: reqwest::Error) -> RelayError {
         if err.is_timeout() {
-            RelayError::Timeout {
-                message: err.to_string(),
-            }
+            RelayError::Timeout { message: err.to_string() }
         } else if err.is_connect() || err.is_request() {
-            RelayError::Network {
-                message: err.to_string(),
-            }
+            RelayError::Network { message: err.to_string() }
         } else if let Some(status) = err.status() {
             Self::classify_error(status.as_u16(), &err.to_string())
         } else {
-            RelayError::Network {
-                message: err.to_string(),
-            }
+            RelayError::Network { message: err.to_string() }
         }
     }
 }
@@ -176,14 +156,9 @@ impl PairingRelay for ServerPairingRelay {
             message: format!("Invalid rendezvous_id hex: {e}"),
         })?;
 
-        let id: [u8; 16] = bytes
-            .try_into()
-            .map_err(|v: Vec<u8>| RelayError::Protocol {
-                message: format!(
-                    "rendezvous_id has wrong length: expected 16, got {}",
-                    v.len()
-                ),
-            })?;
+        let id: [u8; 16] = bytes.try_into().map_err(|v: Vec<u8>| RelayError::Protocol {
+            message: format!("rendezvous_id has wrong length: expected 16, got {}", v.len()),
+        })?;
 
         Ok(id)
     }
@@ -209,12 +184,8 @@ impl PairingRelay for ServerPairingRelay {
                     message: format!("Invalid base64 in bootstrap response: {e}"),
                 })
             }
-            204 => Err(RelayError::Protocol {
-                message: "bootstrap not available".to_string(),
-            }),
-            404 => Err(RelayError::Protocol {
-                message: "session not found".to_string(),
-            }),
+            204 => Err(RelayError::Protocol { message: "bootstrap not available".to_string() }),
+            404 => Err(RelayError::Protocol { message: "session not found".to_string() }),
             _ => {
                 let body_text = resp.text().await.unwrap_or_default();
                 Err(Self::classify_error(status, &body_text))
@@ -228,12 +199,8 @@ impl PairingRelay for ServerPairingRelay {
         slot: PairingSlot,
         data: &[u8],
     ) -> Result<(), RelayError> {
-        let url = format!(
-            "{}/v1/pairing/{}/{}",
-            self.base_url,
-            rendezvous_id,
-            slot.as_path_segment()
-        );
+        let url =
+            format!("{}/v1/pairing/{}/{}", self.base_url, rendezvous_id, slot.as_path_segment());
 
         let resp = self
             .client
@@ -248,12 +215,8 @@ impl PairingRelay for ServerPairingRelay {
         let status = resp.status().as_u16();
         match status {
             200 | 204 => Ok(()),
-            409 => Err(RelayError::Protocol {
-                message: "slot already written".to_string(),
-            }),
-            404 => Err(RelayError::Protocol {
-                message: "session not found".to_string(),
-            }),
+            409 => Err(RelayError::Protocol { message: "slot already written".to_string() }),
+            404 => Err(RelayError::Protocol { message: "session not found".to_string() }),
             _ => {
                 let body_text = resp.text().await.unwrap_or_default();
                 Err(Self::classify_error(status, &body_text))
@@ -266,12 +229,8 @@ impl PairingRelay for ServerPairingRelay {
         rendezvous_id: &str,
         slot: PairingSlot,
     ) -> Result<Option<Vec<u8>>, RelayError> {
-        let url = format!(
-            "{}/v1/pairing/{}/{}",
-            self.base_url,
-            rendezvous_id,
-            slot.as_path_segment()
-        );
+        let url =
+            format!("{}/v1/pairing/{}/{}", self.base_url, rendezvous_id, slot.as_path_segment());
 
         let resp = self
             .client
@@ -290,9 +249,7 @@ impl PairingRelay for ServerPairingRelay {
                 Ok(Some(body.to_vec()))
             }
             204 => Ok(None),
-            404 => Err(RelayError::Protocol {
-                message: "session not found".to_string(),
-            }),
+            404 => Err(RelayError::Protocol { message: "session not found".to_string() }),
             _ => {
                 let body_text = resp.text().await.unwrap_or_default();
                 Err(Self::classify_error(status, &body_text))
@@ -336,10 +293,7 @@ pub struct MockPairingRelay {
 
 impl MockPairingRelay {
     pub fn new() -> Self {
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-            next_id_counter: Mutex::new(0),
-        }
+        Self { sessions: Mutex::new(HashMap::new()), next_id_counter: Mutex::new(0) }
     }
 }
 
@@ -363,10 +317,7 @@ impl PairingRelay for MockPairingRelay {
 
         self.sessions.lock().unwrap().insert(
             rendezvous_hex,
-            MockSession {
-                joiner_bootstrap: joiner_bootstrap.to_vec(),
-                slots: HashMap::new(),
-            },
+            MockSession { joiner_bootstrap: joiner_bootstrap.to_vec(), slots: HashMap::new() },
         );
 
         Ok(id)
@@ -376,9 +327,7 @@ impl PairingRelay for MockPairingRelay {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions
             .get(rendezvous_id)
-            .ok_or_else(|| RelayError::Protocol {
-                message: "session not found".to_string(),
-            })?;
+            .ok_or_else(|| RelayError::Protocol { message: "session not found".to_string() })?;
         Ok(session.joiner_bootstrap.clone())
     }
 
@@ -391,15 +340,11 @@ impl PairingRelay for MockPairingRelay {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions
             .get_mut(rendezvous_id)
-            .ok_or_else(|| RelayError::Protocol {
-                message: "session not found".to_string(),
-            })?;
+            .ok_or_else(|| RelayError::Protocol { message: "session not found".to_string() })?;
 
         let slot_name = slot.as_path_segment().to_string();
         if session.slots.contains_key(&slot_name) {
-            return Err(RelayError::Protocol {
-                message: "slot already written".to_string(),
-            });
+            return Err(RelayError::Protocol { message: "slot already written".to_string() });
         }
 
         session.slots.insert(slot_name, data.to_vec());
@@ -414,9 +359,7 @@ impl PairingRelay for MockPairingRelay {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions
             .get(rendezvous_id)
-            .ok_or_else(|| RelayError::Protocol {
-                message: "session not found".to_string(),
-            })?;
+            .ok_or_else(|| RelayError::Protocol { message: "session not found".to_string() })?;
         Ok(session.slots.get(slot.as_path_segment()).cloned())
     }
 
@@ -424,9 +367,7 @@ impl PairingRelay for MockPairingRelay {
         let mut sessions = self.sessions.lock().unwrap();
         sessions
             .remove(rendezvous_id)
-            .ok_or_else(|| RelayError::Protocol {
-                message: "session not found".to_string(),
-            })?;
+            .ok_or_else(|| RelayError::Protocol { message: "session not found".to_string() })?;
         Ok(())
     }
 }
@@ -478,15 +419,9 @@ mod tests {
         let id = relay.create_session(b"boot").await.unwrap();
         let rid = rendezvous_hex(&id);
 
-        relay
-            .put_slot(&rid, PairingSlot::Confirmation, b"first")
-            .await
-            .unwrap();
+        relay.put_slot(&rid, PairingSlot::Confirmation, b"first").await.unwrap();
 
-        let err = relay
-            .put_slot(&rid, PairingSlot::Confirmation, b"second")
-            .await
-            .unwrap_err();
+        let err = relay.put_slot(&rid, PairingSlot::Confirmation, b"second").await.unwrap_err();
 
         assert!(
             err.to_string().contains("slot already written"),
@@ -500,10 +435,7 @@ mod tests {
         let id = relay.create_session(b"boot").await.unwrap();
         let rid = rendezvous_hex(&id);
 
-        let result = relay
-            .get_slot(&rid, PairingSlot::Credentials)
-            .await
-            .unwrap();
+        let result = relay.get_slot(&rid, PairingSlot::Credentials).await.unwrap();
         assert_eq!(result, None);
     }
 
@@ -517,16 +449,10 @@ mod tests {
             "expected 'session not found', got: {err}"
         );
 
-        let err = relay
-            .put_slot("nonexistent", PairingSlot::Init, b"data")
-            .await
-            .unwrap_err();
+        let err = relay.put_slot("nonexistent", PairingSlot::Init, b"data").await.unwrap_err();
         assert!(err.to_string().contains("session not found"));
 
-        let err = relay
-            .get_slot("nonexistent", PairingSlot::Init)
-            .await
-            .unwrap_err();
+        let err = relay.get_slot("nonexistent", PairingSlot::Init).await.unwrap_err();
         assert!(err.to_string().contains("session not found"));
     }
 

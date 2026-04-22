@@ -95,9 +95,7 @@ pub struct SyncSchema {
 
 impl SyncSchema {
     pub fn builder() -> SyncSchemaBuilder {
-        SyncSchemaBuilder {
-            entities: Vec::new(),
-        }
+        SyncSchemaBuilder { entities: Vec::new() }
     }
 
     /// Parse a JSON schema definition into a `SyncSchema`.
@@ -119,21 +117,15 @@ impl SyncSchema {
         let val: serde_json::Value = serde_json::from_str(json)
             .map_err(|e| CoreError::Schema(format!("Invalid schema JSON: {e}")))?;
 
-        let entities = val
-            .get("entities")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                CoreError::Schema("Schema JSON must have an 'entities' object".into())
-            })?;
+        let entities = val.get("entities").and_then(|v| v.as_object()).ok_or_else(|| {
+            CoreError::Schema("Schema JSON must have an 'entities' object".into())
+        })?;
 
         let mut builder = SyncSchema::builder();
         for (table_name, entity_val) in entities {
-            let fields = entity_val
-                .get("fields")
-                .and_then(|v| v.as_object())
-                .ok_or_else(|| {
-                    CoreError::Schema(format!("Entity '{table_name}' must have a 'fields' object"))
-                })?;
+            let fields = entity_val.get("fields").and_then(|v| v.as_object()).ok_or_else(|| {
+                CoreError::Schema(format!("Entity '{table_name}' must have a 'fields' object"))
+            })?;
 
             let field_defs: Vec<(String, SyncType)> = fields
                 .iter()
@@ -198,20 +190,14 @@ impl SyncSchemaBuilder {
         let mut builder = EntityBuilder { fields: Vec::new() };
         configure(&mut builder);
 
-        self.entities.push(SyncEntityDef {
-            table_name: table_name.to_string(),
-            fields: builder.fields,
-        });
+        self.entities
+            .push(SyncEntityDef { table_name: table_name.to_string(), fields: builder.fields });
         self
     }
 
     /// Build the schema.
     pub fn build(self) -> SyncSchema {
-        let entities = self
-            .entities
-            .into_iter()
-            .map(|e| (e.table_name.clone(), e))
-            .collect();
+        let entities = self.entities.into_iter().map(|e| (e.table_name.clone(), e)).collect();
         SyncSchema { entities }
     }
 }
@@ -224,10 +210,7 @@ pub struct EntityBuilder {
 impl EntityBuilder {
     /// Add a field to the entity.
     pub fn field(&mut self, name: &str, sync_type: SyncType) -> &mut Self {
-        self.fields.push(SyncFieldDef {
-            name: name.to_string(),
-            sync_type,
-        });
+        self.fields.push(SyncFieldDef { name: name.to_string(), sync_type });
         self
     }
 }
@@ -327,10 +310,7 @@ mod tests {
     #[test]
     fn schema_builder() {
         let schema = SyncSchema::builder()
-            .entity("tasks", |e| {
-                e.field("title", SyncType::String)
-                    .field("done", SyncType::Bool)
-            })
+            .entity("tasks", |e| e.field("title", SyncType::String).field("done", SyncType::Bool))
             .entity("members", |e| e.field("name", SyncType::String))
             .build();
 
@@ -343,21 +323,12 @@ mod tests {
     #[test]
     fn entity_field_lookup() {
         let schema = SyncSchema::builder()
-            .entity("tasks", |e| {
-                e.field("title", SyncType::String)
-                    .field("done", SyncType::Bool)
-            })
+            .entity("tasks", |e| e.field("title", SyncType::String).field("done", SyncType::Bool))
             .build();
 
         let entity = schema.entity("tasks").unwrap();
-        assert_eq!(
-            entity.field_by_name("title").unwrap().sync_type,
-            SyncType::String
-        );
-        assert_eq!(
-            entity.field_by_name("done").unwrap().sync_type,
-            SyncType::Bool
-        );
+        assert_eq!(entity.field_by_name("title").unwrap().sync_type, SyncType::String);
+        assert_eq!(entity.field_by_name("done").unwrap().sync_type, SyncType::Bool);
         assert!(entity.field_by_name("nonexistent").is_none());
     }
 
@@ -454,10 +425,7 @@ mod tests {
 
     #[test]
     fn sync_value_type_checking() {
-        assert_eq!(
-            SyncValue::String("x".into()).sync_type(),
-            Some(SyncType::String)
-        );
+        assert_eq!(SyncValue::String("x".into()).sync_type(), Some(SyncType::String));
         assert_eq!(SyncValue::Int(1).sync_type(), Some(SyncType::Int));
         assert_eq!(SyncValue::Bool(true).sync_type(), Some(SyncType::Bool));
         assert_eq!(SyncValue::Null.sync_type(), None);

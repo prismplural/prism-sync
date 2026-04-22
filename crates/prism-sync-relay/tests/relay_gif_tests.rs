@@ -135,11 +135,7 @@ async fn start_mock_upstream() -> (String, tokio::task::JoinHandle<()>, Upstream
         Query(query): Query<HashMap<String, String>>,
         State(state): State<UpstreamState>,
     ) -> Json<Value> {
-        state.requests.lock().unwrap().push(RecordedRequest {
-            endpoint: "search",
-            api_key,
-            query,
-        });
+        state.requests.lock().unwrap().push(RecordedRequest { endpoint: "search", api_key, query });
         Json(json!({
             "data": {
                 "data": [{
@@ -262,7 +258,8 @@ async fn self_hosted_proxy_forwards_trending_and_search() {
     config.gif_api_key = Some("relay-secret".into());
     config.gif_request_rate_limit = 10;
 
-    let (url, _relay_handle, sync_id, _device_id, token) = prepare_capabilities_client(config).await;
+    let (url, _relay_handle, sync_id, _device_id, token) =
+        prepare_capabilities_client(config).await;
     let client = Client::new();
 
     let capabilities = client
@@ -275,20 +272,13 @@ async fn self_hosted_proxy_forwards_trending_and_search() {
     let capabilities_json: Value = capabilities.json().await.unwrap();
     assert_eq!(capabilities_json["gifs"]["api_base_url"], "/v1/gifs");
 
-    let trending = client
-        .get(format!("{url}/v1/gifs/trending?per_page=3"))
-        .send()
-        .await
-        .unwrap();
+    let trending = client.get(format!("{url}/v1/gifs/trending?per_page=3")).send().await.unwrap();
     assert_eq!(trending.status(), 200);
     let trending_json: Value = trending.json().await.unwrap();
     assert_eq!(trending_json["data"]["data"][0]["id"], "trend-1");
 
-    let search = client
-        .get(format!("{url}/v1/gifs/search?q=cats&per_page=4"))
-        .send()
-        .await
-        .unwrap();
+    let search =
+        client.get(format!("{url}/v1/gifs/search?q=cats&per_page=4")).send().await.unwrap();
     assert_eq!(search.status(), 200);
     let search_json: Value = search.json().await.unwrap();
     assert_eq!(search_json["data"]["data"][0]["id"], "search-1");
@@ -299,10 +289,7 @@ async fn self_hosted_proxy_forwards_trending_and_search() {
     assert_eq!(requests[0].api_key, "relay-secret");
     assert_eq!(requests[0].query.get("per_page").map(String::as_str), Some("3"));
     assert_eq!(requests[0].query.get("page").map(String::as_str), Some("1"));
-    assert_eq!(
-        requests[0].query.get("content_filter").map(String::as_str),
-        Some("medium")
-    );
+    assert_eq!(requests[0].query.get("content_filter").map(String::as_str), Some("medium"));
     assert_eq!(requests[1].endpoint, "search");
     assert_eq!(requests[1].api_key, "relay-secret");
     assert_eq!(requests[1].query.get("q").map(String::as_str), Some("cats"));
@@ -321,20 +308,13 @@ async fn self_hosted_proxy_rate_limits_requests() {
     config.gif_request_rate_limit = 1;
     config.gif_request_rate_window_secs = 60;
 
-    let (url, _relay_handle, _sync_id, _device_id, _token) = prepare_capabilities_client(config).await;
+    let (url, _relay_handle, _sync_id, _device_id, _token) =
+        prepare_capabilities_client(config).await;
     let client = Client::new();
 
-    let first = client
-        .get(format!("{url}/v1/gifs/trending"))
-        .send()
-        .await
-        .unwrap();
+    let first = client.get(format!("{url}/v1/gifs/trending")).send().await.unwrap();
     assert_eq!(first.status(), 200);
 
-    let second = client
-        .get(format!("{url}/v1/gifs/trending"))
-        .send()
-        .await
-        .unwrap();
+    let second = client.get(format!("{url}/v1/gifs/trending")).send().await.unwrap();
     assert_eq!(second.status(), 429);
 }

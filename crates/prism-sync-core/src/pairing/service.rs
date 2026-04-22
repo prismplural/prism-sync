@@ -67,10 +67,8 @@ impl PairingService {
             .unwrap_or(0);
 
         if observed > current {
-            self.secure_store.set(
-                MIN_SIGNATURE_VERSION_FLOOR_KEY,
-                observed.to_string().as_bytes(),
-            )?;
+            self.secure_store
+                .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, observed.to_string().as_bytes())?;
         }
 
         Ok(())
@@ -108,9 +106,8 @@ impl PairingService {
 
         // 2. Initialize key hierarchy — produces wrapped DEK + salt
         let mut key_hierarchy = KeyHierarchy::new();
-        let (wrapped_dek, salt) = key_hierarchy
-            .initialize(password, &secret_key)
-            .map_err(CoreError::Crypto)?;
+        let (wrapped_dek, salt) =
+            key_hierarchy.initialize(password, &secret_key).map_err(CoreError::Crypto)?;
 
         // 3. Use provided sync_id or generate one (32 random bytes, hex-encoded)
         let sync_id = sync_id_override.unwrap_or_else(EpochManager::generate_sync_id);
@@ -128,21 +125,12 @@ impl PairingService {
         let (device_secret, device_id) = self
             .load_pending_identity()?
             .unwrap_or_else(|| (DeviceSecret::generate(), crate::node_id::generate_node_id()));
-        let signing_key = device_secret
-            .ed25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let exchange_key = device_secret
-            .x25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let pq_signing_key = device_secret
-            .ml_dsa_65_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let pq_kem_key = device_secret
-            .ml_kem_768_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let xwing_key = device_secret
-            .xwing_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
+        let signing_key = device_secret.ed25519_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let exchange_key = device_secret.x25519_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let pq_signing_key =
+            device_secret.ml_dsa_65_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let xwing_key = device_secret.xwing_keypair(&device_id).map_err(CoreError::Crypto)?;
 
         // 5b. Pre-generate a device_id for the joining device (snapshot targeting)
         let joiner_device_id = crate::node_id::generate_node_id();
@@ -175,17 +163,20 @@ impl PairingService {
 
         // 7. Build signed registry snapshot (typed, verifiable device records)
         // registry_version 0 is used for first-device bootstrap (no relay version yet).
-        let registry_snapshot = SignedRegistrySnapshot::new(vec![RegistrySnapshotEntry {
-            sync_id: sync_id.clone(),
-            device_id: device_id.clone(),
-            ed25519_public_key: signing_key.public_key_bytes().to_vec(),
-            x25519_public_key: exchange_key.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
-            ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
-            x_wing_public_key: xwing_key.encapsulation_key_bytes(),
-            status: "active".into(),
-            ml_dsa_key_generation: 0,
-        }], 0);
+        let registry_snapshot = SignedRegistrySnapshot::new(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.clone(),
+                device_id: device_id.clone(),
+                ed25519_public_key: signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
+                x_wing_public_key: xwing_key.encapsulation_key_bytes(),
+                status: "active".into(),
+                ml_dsa_key_generation: 0,
+            }],
+            0,
+        );
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
         // 8. Build the first-device pairing response.
@@ -208,11 +199,7 @@ impl PairingService {
         };
 
         // 9. Build relay with real sync_id
-        let relay = relay_builder(
-            &sync_id,
-            &device_id,
-            response.registration_token.as_deref(),
-        )?;
+        let relay = relay_builder(&sync_id, &device_id, response.registration_token.as_deref())?;
 
         // 10. Fetch registration nonce and build challenge-response (CRITICAL-2)
         let nonce_response = match nonce_response_override {
@@ -257,23 +244,18 @@ impl PairingService {
         self.ratchet_min_signature_version(register_response.min_signature_version)?;
 
         // 11. Persist credentials and device identity to secure store
-        self.secure_store.set(
-            "session_token",
-            register_response.device_session_token.as_bytes(),
-        )?;
         self.secure_store
-            .set("sync_id", credentials.sync_id.as_bytes())?;
+            .set("session_token", register_response.device_session_token.as_bytes())?;
+        self.secure_store.set("sync_id", credentials.sync_id.as_bytes())?;
         self.secure_store.set("relay_url", relay_url.as_bytes())?;
         // Mnemonic is an offline backup credential — it is returned in
         // `credentials.mnemonic` for the caller to display once during setup,
         // but deliberately NOT persisted to the secure store. Change-PIN and
         // device-pairing flows re-prompt the user to type it from their saved
         // backup.
-        self.secure_store
-            .set("wrapped_dek", &credentials.wrapped_dek)?;
+        self.secure_store.set("wrapped_dek", &credentials.wrapped_dek)?;
         self.secure_store.set("dek_salt", &credentials.salt)?;
-        self.secure_store
-            .set("device_secret", device_secret.as_bytes())?;
+        self.secure_store.set("device_secret", device_secret.as_bytes())?;
         self.secure_store.set("device_id", device_id.as_bytes())?;
         self.secure_store.set("epoch", b"0")?;
 
@@ -287,10 +269,8 @@ impl PairingService {
         relay_url: &str,
     ) -> Result<(JoinerCeremony, RendezvousToken)> {
         let (ceremony, token) = JoinerCeremony::start(relay, relay_url).await?;
-        self.secure_store
-            .set("pending_device_secret", ceremony.device_secret().as_bytes())?;
-        self.secure_store
-            .set("pending_device_id", ceremony.device_id().as_bytes())?;
+        self.secure_store.set("pending_device_secret", ceremony.device_secret().as_bytes())?;
+        self.secure_store.set("pending_device_id", ceremony.device_id().as_bytes())?;
         Ok((ceremony, token))
     }
 
@@ -315,11 +295,7 @@ impl PairingService {
         // Publish our confirmation MAC before accepting credentials.
         let confirmation_mac = ceremony.confirmation_mac()?;
         relay
-            .put_slot(
-                &ceremony.rendezvous_id_hex(),
-                PairingSlot::Confirmation,
-                &confirmation_mac,
-            )
+            .put_slot(&ceremony.rendezvous_id_hex(), PairingSlot::Confirmation, &confirmation_mac)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("posting confirmation"), e))?;
 
@@ -361,21 +337,12 @@ impl PairingService {
 
         let device_secret = ceremony.device_secret();
         let device_id = ceremony.device_id().to_string();
-        let signing_key = device_secret
-            .ed25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let exchange_key = device_secret
-            .x25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let pq_signing_key = device_secret
-            .ml_dsa_65_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let pq_kem_key = device_secret
-            .ml_kem_768_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let xwing_key = device_secret
-            .xwing_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
+        let signing_key = device_secret.ed25519_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let exchange_key = device_secret.x25519_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let pq_signing_key =
+            device_secret.ml_dsa_65_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let xwing_key = device_secret.xwing_keypair(&device_id).map_err(CoreError::Crypto)?;
 
         let sync_id = bundle.sync_id.clone();
 
@@ -396,12 +363,22 @@ impl PairingService {
             }
         }
 
+        // Prefer a registration token the joiner seeded into its own secure
+        // store (typed on the "Join an existing group" screen) over the one
+        // the initiator propagated in the credential bundle. The joiner's
+        // intent wins because:
+        //   - If an existing device was paired before tokens were persisted
+        //     in secure_store (older app versions), its bundle has None.
+        //   - If the relay's required token has rotated since the initiator
+        //     paired, the bundle carries a stale value.
+        // In either case the joiner can unblock themselves by typing the
+        // current token instead of re-pairing every device.
+        let seeded_token = self.load_optional_secure_string("registration_token")?;
+        let effective_token: Option<String> =
+            seeded_token.clone().or_else(|| bundle.registration_token.clone());
+
         // Build relay with real sync_id
-        let registration_relay = relay_builder(
-            &sync_id,
-            &device_id,
-            bundle.registration_token.as_deref(),
-        )?;
+        let registration_relay = relay_builder(&sync_id, &device_id, effective_token.as_deref())?;
 
         let nonce_response = registration_relay
             .get_registration_nonce()
@@ -420,16 +397,15 @@ impl PairingService {
         );
 
         let registry_approval =
-            bundle
-                .registry_approval_signature
-                .as_ref()
-                .map(|approval_signature| RegistryApproval {
+            bundle.registry_approval_signature.as_ref().map(|approval_signature| {
+                RegistryApproval {
                     approver_device_id: bundle.inviter_device_id.clone(),
                     approver_ed25519_pk: hex::encode(&bundle.inviter_ed25519_pk),
                     approver_ml_dsa_65_pk: hex::encode(&bundle.inviter_ml_dsa_65_pk),
                     approval_signature: approval_signature.clone(),
                     signed_registry_snapshot: bundle.signed_keyring.clone(),
-                });
+                }
+            });
 
         let register_response = registration_relay
             .register_device(crate::relay::traits::RegisterRequest {
@@ -449,16 +425,11 @@ impl PairingService {
             .map_err(|e| CoreError::from_relay_with_context(Some("registration failed"), e))?;
         self.ratchet_min_signature_version(register_response.min_signature_version)?;
 
+        self.secure_store.set("setup_rollback_marker", b"in_progress")?;
         self.secure_store
-            .set("setup_rollback_marker", b"in_progress")?;
-        self.secure_store.set(
-            "session_token",
-            register_response.device_session_token.as_bytes(),
-        )?;
-        self.secure_store
-            .set("sync_id", bundle.sync_id.as_bytes())?;
-        self.secure_store
-            .set("relay_url", bundle.relay_url.as_bytes())?;
+            .set("session_token", register_response.device_session_token.as_bytes())?;
+        self.secure_store.set("sync_id", bundle.sync_id.as_bytes())?;
+        self.secure_store.set("relay_url", bundle.relay_url.as_bytes())?;
         // Intentionally not persisting `bundle.mnemonic`: the recovery phrase
         // is an offline backup credential. The joiner already has it in
         // memory from the credential bundle and uses it transiently to
@@ -466,35 +437,33 @@ impl PairingService {
         // (change-PIN, pair-new-device).
         self.secure_store.set("wrapped_dek", &bundle.wrapped_dek)?;
         self.secure_store.set("dek_salt", &bundle.salt)?;
-        self.secure_store
-            .set("device_secret", device_secret.as_bytes())?;
+        self.secure_store.set("device_secret", device_secret.as_bytes())?;
         self.secure_store.set("device_id", device_id.as_bytes())?;
-        self.secure_store
-            .set("epoch", bundle.current_epoch.to_string().as_bytes())?;
+        self.secure_store.set("epoch", bundle.current_epoch.to_string().as_bytes())?;
         if bundle.current_epoch > 0 && bundle.epoch_key.len() == 32 {
             use base64::{engine::general_purpose::STANDARD, Engine};
             let encoded = STANDARD.encode(&bundle.epoch_key);
-            self.secure_store.set(
-                &format!("epoch_key_{}", bundle.current_epoch),
-                encoded.as_bytes(),
-            )?;
+            self.secure_store
+                .set(&format!("epoch_key_{}", bundle.current_epoch), encoded.as_bytes())?;
             key_hierarchy.store_epoch_key(
                 bundle.current_epoch,
                 zeroize::Zeroizing::new(bundle.epoch_key.clone()),
             );
         }
-        if let Some(ref token) = bundle.registration_token {
-            self.secure_store
-                .set("registration_token", token.as_bytes())?;
+        // Persist whichever token we actually used so this device can initiate
+        // future pairings. If the joiner seeded a value, it's already in the
+        // secure store; we only need to write the bundle's token when nothing
+        // was seeded. Never overwrite a joiner-seeded value with the bundle's —
+        // the joiner's typed intent should win (see effective_token above).
+        if seeded_token.is_none() {
+            if let Some(ref token) = bundle.registration_token {
+                self.secure_store.set("registration_token", token.as_bytes())?;
+            }
         }
 
         let joiner_bundle_bytes = ceremony.encrypt_joiner_bundle()?;
         relay
-            .put_slot(
-                &ceremony.rendezvous_id_hex(),
-                PairingSlot::Joiner,
-                &joiner_bundle_bytes,
-            )
+            .put_slot(&ceremony.rendezvous_id_hex(), PairingSlot::Joiner, &joiner_bundle_bytes)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("posting joiner bundle"), e))?;
 
@@ -546,18 +515,10 @@ impl PairingService {
         ceremony.verify_joiner_confirmation(&confirmation)?;
 
         let (device_secret, device_id) = self.load_current_device_identity()?;
-        let signing_key = device_secret
-            .ed25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let exchange_key = device_secret
-            .x25519_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let pq_kem_key = device_secret
-            .ml_kem_768_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
-        let xwing_key = device_secret
-            .xwing_keypair(&device_id)
-            .map_err(CoreError::Crypto)?;
+        let signing_key = device_secret.ed25519_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let exchange_key = device_secret.x25519_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).map_err(CoreError::Crypto)?;
+        let xwing_key = device_secret.xwing_keypair(&device_id).map_err(CoreError::Crypto)?;
 
         let mut key_hierarchy = KeyHierarchy::new();
         let sync_id = self.load_secure_string("sync_id")?;
@@ -638,8 +599,7 @@ impl PairingService {
             || bootstrap_record.permanent_xwing_public_key.is_empty()
         {
             return Err(CoreError::Engine(
-                "bootstrap record missing permanent identity keys (V2 required for pairing)"
-                    .into(),
+                "bootstrap record missing permanent identity keys (V2 required for pairing)".into(),
             ));
         }
         snapshot_entries.push(RegistrySnapshotEntry {
@@ -693,11 +653,7 @@ impl PairingService {
 
         let credential_envelope = ceremony.encrypt_credentials(&credential_bundle)?;
         pairing_relay
-            .put_slot(
-                &ceremony.rendezvous_id_hex(),
-                PairingSlot::Credentials,
-                &credential_envelope,
-            )
+            .put_slot(&ceremony.rendezvous_id_hex(), PairingSlot::Credentials, &credential_envelope)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("posting credentials"), e))?;
 
@@ -710,29 +666,17 @@ impl PairingService {
         .await?;
         let joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
 
-        self.secure_store.set(
-            "bootstrap_joiner_bundle",
-            &serde_json::to_vec(&joiner_bundle)?,
-        )?;
-        self.secure_store.set(
-            "bootstrap_joiner_device_id",
-            joiner_bundle.device_id.as_bytes(),
-        )?;
+        self.secure_store.set("bootstrap_joiner_bundle", &serde_json::to_vec(&joiner_bundle)?)?;
+        self.secure_store.set("bootstrap_joiner_device_id", joiner_bundle.device_id.as_bytes())?;
 
         let next_epoch = current_epoch.saturating_add(1);
-        let epoch_key = EpochManager::post_rekey(
-            sync_relay,
-            &mut key_hierarchy,
-            next_epoch,
-        )
-        .await?;
+        let epoch_key =
+            EpochManager::post_rekey(sync_relay, &mut key_hierarchy, next_epoch).await?;
 
-        self.secure_store
-            .set("epoch", next_epoch.to_string().as_bytes())?;
+        self.secure_store.set("epoch", next_epoch.to_string().as_bytes())?;
         use base64::{engine::general_purpose::STANDARD, Engine};
         let encoded = STANDARD.encode(epoch_key.as_slice());
-        self.secure_store
-            .set(&format!("epoch_key_{next_epoch}"), encoded.as_bytes())?;
+        self.secure_store.set(&format!("epoch_key_{next_epoch}"), encoded.as_bytes())?;
 
         pairing_relay
             .delete_session(&ceremony.rendezvous_id_hex())
@@ -748,10 +692,9 @@ impl PairingService {
     }
 
     fn load_current_device_identity(&self) -> Result<(DeviceSecret, String)> {
-        if let (Some(secret_bytes), Some(device_id_bytes)) = (
-            self.secure_store.get("device_secret")?,
-            self.secure_store.get("device_id")?,
-        ) {
+        if let (Some(secret_bytes), Some(device_id_bytes)) =
+            (self.secure_store.get("device_secret")?, self.secure_store.get("device_id")?)
+        {
             let device_id = String::from_utf8(device_id_bytes).map_err(|e| {
                 CoreError::Engine(format!("invalid device id in secure store: {e}"))
             })?;
@@ -762,9 +705,7 @@ impl PairingService {
         if let Some(identity) = self.load_pending_identity()? {
             return Ok(identity);
         }
-        Err(CoreError::Engine(
-            "missing device identity in secure store".into(),
-        ))
+        Err(CoreError::Engine("missing device identity in secure store".into()))
     }
 
     fn load_secure_bytes(&self, key: &str) -> Result<Vec<u8>> {
@@ -805,10 +746,7 @@ impl PairingService {
             )));
         }
 
-        Ok(key_hierarchy
-            .epoch_key(epoch)
-            .map_err(CoreError::Crypto)?
-            .to_vec())
+        Ok(key_hierarchy.epoch_key(epoch).map_err(CoreError::Crypto)?.to_vec())
     }
 
     fn load_optional_secure_string(&self, key: &str) -> Result<Option<String>> {
@@ -835,7 +773,6 @@ impl PairingService {
         let device_secret = DeviceSecret::from_bytes(secret_bytes).map_err(CoreError::Crypto)?;
         Ok(Some((device_secret, device_id)))
     }
-
 }
 
 /// Verify a hybrid invitation signature.
@@ -855,12 +792,7 @@ fn verify_hybrid_invitation(
         .map_err(|e| CoreError::Engine(format!("invitation hybrid signature invalid: {e}")))?;
     match version {
         0x03 => hybrid_sig
-            .verify_v3(
-                signing_data,
-                b"invitation",
-                inviter_ed25519_pk,
-                inviter_ml_dsa_65_pk,
-            )
+            .verify_v3(signing_data, b"invitation", inviter_ed25519_pk, inviter_ml_dsa_65_pk)
             .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?,
         _ => {
             return Err(CoreError::Engine(format!(
@@ -941,9 +873,7 @@ fn find_pow_counter(
         }
     }
 
-    Err(CoreError::Engine(
-        "failed to solve first-device admission challenge".into(),
-    ))
+    Err(CoreError::Engine("failed to solve first-device admission challenge".into()))
 }
 
 fn compute_registration_pow_hash(
@@ -977,9 +907,7 @@ fn pow_hash_meets_difficulty(hash: &[u8; 32], difficulty_bits: u8) -> bool {
     }
 
     let mask = 0xFFu8 << (8 - remaining_bits);
-    hash.get(full_zero_bytes)
-        .map(|byte| byte & mask == 0)
-        .unwrap_or(false)
+    hash.get(full_zero_bytes).map(|byte| byte & mask == 0).unwrap_or(false)
 }
 
 /// Call on app startup to clean up a partially-completed setup.
@@ -1031,9 +959,7 @@ async fn wait_for_pairing_slot_bytes(
         }
     }
 
-    Err(CoreError::Engine(format!(
-        "timed out waiting for {description}"
-    )))
+    Err(CoreError::Engine(format!("timed out waiting for {description}")))
 }
 
 #[cfg(test)]
@@ -1060,10 +986,7 @@ mod tests {
             Ok(self.0.lock().unwrap().get(key).cloned())
         }
         fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_vec());
+            self.0.lock().unwrap().insert(key.to_string(), value.to_vec());
             Ok(())
         }
         fn delete(&self, key: &str) -> Result<()> {
@@ -1082,50 +1005,140 @@ mod tests {
 
     #[async_trait]
     impl SyncTransport for MockRelay {
-        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> { unimplemented!() }
-        async fn push_changes(&self, _batch: OutgoingBatch) -> std::result::Result<i64, RelayError> { unimplemented!() }
-        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn push_changes(
+            &self,
+            _batch: OutgoingBatch,
+        ) -> std::result::Result<i64, RelayError> {
+            unimplemented!()
+        }
+        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl DeviceRegistry for MockRelay {
-        async fn get_registration_nonce(&self) -> std::result::Result<RegistrationNonceResponse, RelayError> {
-            Ok(RegistrationNonceResponse { nonce: uuid::Uuid::new_v4().to_string(), pow_challenge: None, min_signature_version: None })
+        async fn get_registration_nonce(
+            &self,
+        ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+            Ok(RegistrationNonceResponse {
+                nonce: uuid::Uuid::new_v4().to_string(),
+                pow_challenge: None,
+                min_signature_version: None,
+            })
         }
-        async fn register_device(&self, _req: RegisterRequest) -> std::result::Result<RegisterResponse, RelayError> {
-            Ok(RegisterResponse { device_session_token: "mock-session-token".to_string(), min_signature_version: None })
+        async fn register_device(
+            &self,
+            _req: RegisterRequest,
+        ) -> std::result::Result<RegisterResponse, RelayError> {
+            Ok(RegisterResponse {
+                device_session_token: "mock-session-token".to_string(),
+                min_signature_version: None,
+            })
         }
-        async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> { unimplemented!() }
-        async fn revoke_device(&self, _: &str, _: bool, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
-        async fn deregister(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn rotate_ml_dsa(&self, _: &str, _: &[u8], _: u32, _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof, _: Option<&[u8]>) -> std::result::Result<RotateMlDsaResponse, RelayError> { unimplemented!() }
-        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> { Ok(None) }
+        async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
+            unimplemented!()
+        }
+        async fn revoke_device(
+            &self,
+            _: &str,
+            _: bool,
+            _: i32,
+            _: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
+            unimplemented!()
+        }
+        async fn deregister(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn rotate_ml_dsa(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            _: Option<&[u8]>,
+        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn get_signed_registry(
+            &self,
+        ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
+            Ok(None)
+        }
     }
     #[async_trait]
     impl EpochManagement for MockRelay {
-        async fn post_rekey_artifacts(&self, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
-        async fn get_rekey_artifact(&self, _: i32, _: &str) -> std::result::Result<Option<Vec<u8>>, RelayError> { unimplemented!() }
+        async fn post_rekey_artifacts(
+            &self,
+            _: i32,
+            _: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
+            unimplemented!()
+        }
+        async fn get_rekey_artifact(
+            &self,
+            _: i32,
+            _: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl SnapshotExchange for MockRelay {
-        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> { unimplemented!() }
-        async fn put_snapshot(&self, _: i32, _: i64, _: Vec<u8>, _: Option<u64>, _: Option<String>, _: String) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
+            unimplemented!()
+        }
+        async fn put_snapshot(
+            &self,
+            _: i32,
+            _: i64,
+            _: Vec<u8>,
+            _: Option<u64>,
+            _: Option<String>,
+            _: String,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl MediaRelay for MockRelay {
-        async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> { unimplemented!() }
+        async fn upload_media(
+            &self,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl SyncRelay for MockRelay {
-        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> { unimplemented!() }
-        async fn dispose(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+            unimplemented!()
+        }
+        async fn dispose(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
     }
 
     /// Helper: build a relay-builder closure that always returns a MockRelay.
-    fn mock_relay_builder() -> impl FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send {
+    fn mock_relay_builder(
+    ) -> impl FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send {
         |_sync_id, _device_id, _token| Ok(Arc::new(MockRelay) as Arc<dyn SyncRelay>)
     }
 
@@ -1155,59 +1168,150 @@ mod tests {
 
     #[async_trait]
     impl SyncTransport for BootstrapRegistryRelay {
-        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> { unimplemented!() }
-        async fn push_changes(&self, _batch: OutgoingBatch) -> std::result::Result<i64, RelayError> { unimplemented!() }
-        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn pull_changes(&self, _since: i64) -> std::result::Result<PullResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn push_changes(
+            &self,
+            _batch: OutgoingBatch,
+        ) -> std::result::Result<i64, RelayError> {
+            unimplemented!()
+        }
+        async fn ack(&self, _seq: i64) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl DeviceRegistry for BootstrapRegistryRelay {
-        async fn get_registration_nonce(&self) -> std::result::Result<RegistrationNonceResponse, RelayError> {
-            Ok(RegistrationNonceResponse { nonce: "bootstrap-nonce".to_string(), pow_challenge: None, min_signature_version: None })
+        async fn get_registration_nonce(
+            &self,
+        ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+            Ok(RegistrationNonceResponse {
+                nonce: "bootstrap-nonce".to_string(),
+                pow_challenge: None,
+                min_signature_version: None,
+            })
         }
-        async fn register_device(&self, req: RegisterRequest) -> std::result::Result<RegisterResponse, RelayError> {
+        async fn register_device(
+            &self,
+            req: RegisterRequest,
+        ) -> std::result::Result<RegisterResponse, RelayError> {
             let mut state = self.state.lock().unwrap();
             state.register_requests.push(req.clone());
             state.devices.push(DeviceInfo {
-                device_id: req.device_id, epoch: 0, status: "active".to_string(),
-                ed25519_public_key: req.signing_public_key, x25519_public_key: req.x25519_public_key,
-                ml_dsa_65_public_key: req.ml_dsa_65_public_key, ml_kem_768_public_key: req.ml_kem_768_public_key,
-                x_wing_public_key: req.x_wing_public_key, permission: None, ml_dsa_key_generation: 0,
+                device_id: req.device_id,
+                epoch: 0,
+                status: "active".to_string(),
+                ed25519_public_key: req.signing_public_key,
+                x25519_public_key: req.x25519_public_key,
+                ml_dsa_65_public_key: req.ml_dsa_65_public_key,
+                ml_kem_768_public_key: req.ml_kem_768_public_key,
+                x_wing_public_key: req.x_wing_public_key,
+                permission: None,
+                ml_dsa_key_generation: 0,
             });
-            Ok(RegisterResponse { device_session_token: "mock-session-token".to_string(), min_signature_version: None })
+            Ok(RegisterResponse {
+                device_session_token: "mock-session-token".to_string(),
+                min_signature_version: None,
+            })
         }
         async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
             Ok(self.state.lock().unwrap().devices.clone())
         }
-        async fn revoke_device(&self, _: &str, _: bool, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
-        async fn deregister(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn rotate_ml_dsa(&self, _: &str, _: &[u8], _: u32, _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof, _: Option<&[u8]>) -> std::result::Result<RotateMlDsaResponse, RelayError> { unimplemented!() }
-        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> { Ok(None) }
+        async fn revoke_device(
+            &self,
+            _: &str,
+            _: bool,
+            _: i32,
+            _: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
+            unimplemented!()
+        }
+        async fn deregister(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn rotate_ml_dsa(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+            _: Option<&[u8]>,
+        ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+            unimplemented!()
+        }
+        async fn get_signed_registry(
+            &self,
+        ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
+            Ok(None)
+        }
     }
     #[async_trait]
     impl EpochManagement for BootstrapRegistryRelay {
-        async fn post_rekey_artifacts(&self, epoch: i32, keys: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> {
+        async fn post_rekey_artifacts(
+            &self,
+            epoch: i32,
+            keys: HashMap<String, Vec<u8>>,
+        ) -> std::result::Result<i32, RelayError> {
             self.state.lock().unwrap().rekey_posts = Some((epoch, keys));
             Ok(epoch)
         }
-        async fn get_rekey_artifact(&self, _: i32, _: &str) -> std::result::Result<Option<Vec<u8>>, RelayError> { Ok(None) }
+        async fn get_rekey_artifact(
+            &self,
+            _: i32,
+            _: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
+            Ok(None)
+        }
     }
     #[async_trait]
     impl SnapshotExchange for BootstrapRegistryRelay {
-        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> { unimplemented!() }
-        async fn put_snapshot(&self, _: i32, _: i64, _: Vec<u8>, _: Option<u64>, _: Option<String>, _: String) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
+            unimplemented!()
+        }
+        async fn put_snapshot(
+            &self,
+            _: i32,
+            _: i64,
+            _: Vec<u8>,
+            _: Option<u64>,
+            _: Option<String>,
+            _: String,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl MediaRelay for BootstrapRegistryRelay {
-        async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> { unimplemented!() }
+        async fn upload_media(
+            &self,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl SyncRelay for BootstrapRegistryRelay {
-        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> { unimplemented!() }
-        async fn dispose(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+        async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+            unimplemented!()
+        }
+        async fn dispose(&self) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
     }
 
     fn seed_bootstrap_store(
@@ -1223,9 +1327,7 @@ mod tests {
         // not a persisted credential. `complete_bootstrap_initiator` receives
         // it as a parameter from the caller (who would have prompted the user
         // to type it from their offline backup).
-        store
-            .set("device_secret", device_secret.as_bytes())
-            .unwrap();
+        store.set("device_secret", device_secret.as_bytes()).unwrap();
         store.set("device_id", device_id.as_bytes()).unwrap();
         store.set("sync_id", sync_id.as_bytes()).unwrap();
         store.set("relay_url", relay_url.as_bytes()).unwrap();
@@ -1264,9 +1366,8 @@ mod tests {
 
         let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
         let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
-        let inviter_pq_signing_key = device_secret
-            .ml_dsa_65_keypair_v(&device_id, current_generation)
-            .unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
 
         let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
             device_id: device_id.clone(),
@@ -1291,11 +1392,8 @@ mod tests {
             &wrapped_dek,
             &salt,
         );
-        initiator_store
-            .set("registration_token", b"relay-registration-token")
-            .unwrap();
-        let initiator_service =
-            PairingService::new(initiator_store.clone());
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
 
         let joiner_store = Arc::new(MemStore::default());
         let joiner_service = PairingService::new(joiner_store.clone());
@@ -1303,10 +1401,8 @@ mod tests {
 
         let mailbox = Arc::new(MockPairingRelay::new());
 
-        let (mut joiner, token) = joiner_service
-            .start_bootstrap_pairing(mailbox.as_ref(), relay_url)
-            .await
-            .unwrap();
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
         let pending_joiner_id = String::from_utf8(
             joiner_store
                 .get("pending_device_id")
@@ -1316,10 +1412,8 @@ mod tests {
         .unwrap();
         assert_eq!(pending_joiner_id, joiner.device_id());
 
-        let (initiator, initiator_sas) = initiator_service
-            .start_bootstrap_initiator(token, mailbox.as_ref())
-            .await
-            .unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
 
         let joiner_rendezvous_id = joiner.rendezvous_id_hex();
         let joiner_device_id = joiner.device_id().to_string();
@@ -1339,8 +1433,15 @@ mod tests {
                     &[],
                     password,
                     |sync_id, device_id, _token| {
-                        assert_eq!(sync_id.len(), 64, "relay-builder must receive real 64-hex sync_id, got: {sync_id}");
-                        assert!(sync_id.chars().all(|c| c.is_ascii_hexdigit()), "sync_id must be hex");
+                        assert_eq!(
+                            sync_id.len(),
+                            64,
+                            "relay-builder must receive real 64-hex sync_id, got: {sync_id}"
+                        );
+                        assert!(
+                            sync_id.chars().all(|c| c.is_ascii_hexdigit()),
+                            "sync_id must be hex"
+                        );
                         assert!(!device_id.is_empty(), "device_id must not be empty");
                         Ok(joiner_relay as Arc<dyn SyncRelay>)
                     },
@@ -1365,10 +1466,7 @@ mod tests {
         assert!(joiner_snapshot.entries.len() >= 2);
         assert_eq!(
             String::from_utf8(
-                joiner_store
-                    .get("device_id")
-                    .unwrap()
-                    .expect("device id should be persisted")
+                joiner_store.get("device_id").unwrap().expect("device id should be persisted")
             )
             .unwrap(),
             joiner_device_id
@@ -1411,10 +1509,8 @@ mod tests {
             assert!(*next_epoch >= 1);
             assert!(!wrapped_keys.is_empty());
 
-            let approval = register_req
-                .registry_approval
-                .as_ref()
-                .expect("registry approval present");
+            let approval =
+                register_req.registry_approval.as_ref().expect("registry approval present");
             let inviter_pk: [u8; 32] = inviter_signing_key.public_key_bytes();
             let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
                 &approval.signed_registry_snapshot,
@@ -1430,10 +1526,7 @@ mod tests {
             assert_eq!(current_entry.ml_dsa_key_generation, current_generation);
         }
 
-        let err = mailbox
-            .get_bootstrap(&joiner_rendezvous_id)
-            .await
-            .unwrap_err();
+        let err = mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap_err();
         assert!(err.to_string().contains("session not found"));
     }
 
@@ -1481,21 +1574,13 @@ mod tests {
         let joiner_service_task = PairingService::new(joiner_store.clone());
         let mailbox = Arc::new(MockPairingRelay::new());
 
-        let (mut joiner, token) = joiner_service
-            .start_bootstrap_pairing(mailbox.as_ref(), relay_url)
-            .await
-            .unwrap();
-        let (initiator, initiator_sas) = initiator_service
-            .start_bootstrap_initiator(token, mailbox.as_ref())
-            .await
-            .unwrap();
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
 
-        let init_bytes = wait_for_slot(
-            mailbox.as_ref(),
-            &joiner.rendezvous_id_hex(),
-            PairingSlot::Init,
-        )
-        .await;
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner.rendezvous_id_hex(), PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
 
@@ -1509,8 +1594,15 @@ mod tests {
                     &[],
                     password,
                     |sync_id, device_id, _token| {
-                        assert_eq!(sync_id.len(), 64, "relay-builder must receive real 64-hex sync_id, got: {sync_id}");
-                        assert!(sync_id.chars().all(|c| c.is_ascii_hexdigit()), "sync_id must be hex");
+                        assert_eq!(
+                            sync_id.len(),
+                            64,
+                            "relay-builder must receive real 64-hex sync_id, got: {sync_id}"
+                        );
+                        assert!(
+                            sync_id.chars().all(|c| c.is_ascii_hexdigit()),
+                            "sync_id must be hex"
+                        );
                         assert!(!device_id.is_empty(), "device_id must not be empty");
                         Ok(joiner_relay as Arc<dyn SyncRelay>)
                     },
@@ -1703,9 +1795,7 @@ mod tests {
         let err =
             verify_hybrid_invitation(&signing_data, &legacy_wire, &inviter_pk, &inviter_ml_dsa_pk)
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unsupported invitation signature version"));
+        assert!(err.to_string().contains("unsupported invitation signature version"));
     }
 
     #[tokio::test]
@@ -1758,10 +1848,7 @@ mod tests {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("expected error for tampered invitation"),
         };
-        assert!(
-            err_msg.contains("signature invalid"),
-            "expected signature error, got: {err_msg}"
-        );
+        assert!(err_msg.contains("signature invalid"), "expected signature error, got: {err_msg}");
     }
 
     #[tokio::test]
@@ -1813,10 +1900,7 @@ mod tests {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("expected error for wrong inviter key"),
         };
-        assert!(
-            err_msg.contains("signature invalid"),
-            "expected signature error, got: {err_msg}"
-        );
+        assert!(err_msg.contains("signature invalid"), "expected signature error, got: {err_msg}");
     }
 
     #[test]
@@ -1872,52 +1956,138 @@ mod tests {
 
         #[async_trait]
         impl SyncTransport for CapturingRelay {
-            async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> { unimplemented!() }
-            async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> { unimplemented!() }
-            async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> { unimplemented!() }
+            async fn pull_changes(&self, _: i64) -> std::result::Result<PullResponse, RelayError> {
+                unimplemented!()
+            }
+            async fn push_changes(&self, _: OutgoingBatch) -> std::result::Result<i64, RelayError> {
+                unimplemented!()
+            }
+            async fn ack(&self, _: i64) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
         }
         #[async_trait]
         impl DeviceRegistry for CapturingRelay {
-            async fn get_registration_nonce(&self) -> std::result::Result<RegistrationNonceResponse, RelayError> {
-                Ok(RegistrationNonceResponse { nonce: "test-nonce-12345".to_string(), pow_challenge: None, min_signature_version: None })
+            async fn get_registration_nonce(
+                &self,
+            ) -> std::result::Result<RegistrationNonceResponse, RelayError> {
+                Ok(RegistrationNonceResponse {
+                    nonce: "test-nonce-12345".to_string(),
+                    pow_challenge: None,
+                    min_signature_version: None,
+                })
             }
-            async fn register_device(&self, req: RegisterRequest) -> std::result::Result<RegisterResponse, RelayError> {
+            async fn register_device(
+                &self,
+                req: RegisterRequest,
+            ) -> std::result::Result<RegisterResponse, RelayError> {
                 *self.captured_req.lock().unwrap() = Some(req);
-                Ok(RegisterResponse { device_session_token: "mock-token".to_string(), min_signature_version: None })
+                Ok(RegisterResponse {
+                    device_session_token: "mock-token".to_string(),
+                    min_signature_version: None,
+                })
             }
-            async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> { unimplemented!() }
-            async fn revoke_device(&self, _: &str, _: bool, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
-            async fn deregister(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-            async fn rotate_ml_dsa(&self, _: &str, _: &[u8], _: u32, _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof, _: Option<&[u8]>) -> std::result::Result<RotateMlDsaResponse, RelayError> { unimplemented!() }
-            async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> { Ok(None) }
+            async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
+                unimplemented!()
+            }
+            async fn revoke_device(
+                &self,
+                _: &str,
+                _: bool,
+                _: i32,
+                _: HashMap<String, Vec<u8>>,
+            ) -> std::result::Result<i32, RelayError> {
+                unimplemented!()
+            }
+            async fn deregister(&self) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            async fn rotate_ml_dsa(
+                &self,
+                _: &str,
+                _: &[u8],
+                _: u32,
+                _: &prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof,
+                _: Option<&[u8]>,
+            ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
+                unimplemented!()
+            }
+            async fn get_signed_registry(
+                &self,
+            ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
+                Ok(None)
+            }
         }
         #[async_trait]
         impl EpochManagement for CapturingRelay {
-            async fn post_rekey_artifacts(&self, _: i32, _: HashMap<String, Vec<u8>>) -> std::result::Result<i32, RelayError> { unimplemented!() }
-            async fn get_rekey_artifact(&self, _: i32, _: &str) -> std::result::Result<Option<Vec<u8>>, RelayError> { unimplemented!() }
+            async fn post_rekey_artifacts(
+                &self,
+                _: i32,
+                _: HashMap<String, Vec<u8>>,
+            ) -> std::result::Result<i32, RelayError> {
+                unimplemented!()
+            }
+            async fn get_rekey_artifact(
+                &self,
+                _: i32,
+                _: &str,
+            ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
+                unimplemented!()
+            }
         }
         #[async_trait]
         impl SnapshotExchange for CapturingRelay {
-            async fn get_snapshot(&self) -> std::result::Result<Option<SnapshotResponse>, RelayError> { unimplemented!() }
-            async fn put_snapshot(&self, _: i32, _: i64, _: Vec<u8>, _: Option<u64>, _: Option<String>, _: String) -> std::result::Result<(), RelayError> { unimplemented!() }
+            async fn get_snapshot(
+                &self,
+            ) -> std::result::Result<Option<SnapshotResponse>, RelayError> {
+                unimplemented!()
+            }
+            async fn put_snapshot(
+                &self,
+                _: i32,
+                _: i64,
+                _: Vec<u8>,
+                _: Option<u64>,
+                _: Option<String>,
+                _: String,
+            ) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
         }
         #[async_trait]
         impl MediaRelay for CapturingRelay {
-            async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> std::result::Result<(), RelayError> { unimplemented!() }
-            async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> { unimplemented!() }
+            async fn upload_media(
+                &self,
+                _: &str,
+                _: &str,
+                _: Vec<u8>,
+            ) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
+                unimplemented!()
+            }
         }
         #[async_trait]
         impl SyncRelay for CapturingRelay {
-            async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-            async fn connect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-            async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
-            fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> { unimplemented!() }
-            async fn dispose(&self) -> std::result::Result<(), RelayError> { unimplemented!() }
+            async fn delete_sync_group(&self) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            async fn connect_websocket(&self) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            async fn disconnect_websocket(&self) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            fn notifications(&self) -> Pin<Box<dyn Stream<Item = SyncNotification> + Send>> {
+                unimplemented!()
+            }
+            async fn dispose(&self) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
         }
 
-        let relay = Arc::new(CapturingRelay {
-            captured_req: StdMutex::new(None),
-        });
+        let relay = Arc::new(CapturingRelay { captured_req: StdMutex::new(None) });
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(store);
 
@@ -1956,5 +2126,4 @@ mod tests {
     // External integration tests in `tests/consumer_api.rs` and
     // `tests/pairing_failures.rs` also exercise the legacy flow for
     // backwards compatibility and are kept intact.
-
 }

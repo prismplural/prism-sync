@@ -107,14 +107,7 @@ pub async fn put_identity(
     Extension(auth): Extension<AuthIdentity>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(
-        &state,
-        &auth,
-        &headers,
-        "PUT",
-        "/v1/sharing/identity",
-        &body,
-    )?;
+    verify_signed_request(&state, &auth, &headers, "PUT", "/v1/sharing/identity", &body)?;
 
     let req: PublishIdentityRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
@@ -132,9 +125,8 @@ pub async fn put_identity(
         return Err(AppError::PayloadTooLarge("identity_bundle too large"));
     }
 
-    let (bundle_sharing_id, identity_generation) = parse_identity_bundle_metadata(&bundle).ok_or(
-        AppError::BadRequest("Invalid identity_bundle canonical format"),
-    )?;
+    let (bundle_sharing_id, identity_generation) = parse_identity_bundle_metadata(&bundle)
+        .ok_or(AppError::BadRequest("Invalid identity_bundle canonical format"))?;
     if bundle_sharing_id != req.sharing_id {
         return Err(AppError::BadRequest("identity_bundle sharing_id mismatch"));
     }
@@ -260,10 +252,7 @@ pub async fn get_bundle(
     Path(sharing_id): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
     let key = format!("sharing_fetch:{}", client_ip_key(peer_addr));
-    if !state
-        .sharing_fetch_rate_limiter
-        .check(&key, state.config.sharing_fetch_rate_limit, 300)
-    {
+    if !state.sharing_fetch_rate_limiter.check(&key, state.config.sharing_fetch_rate_limit, 300) {
         return Err(AppError::TooManyRequests);
     }
 
@@ -347,9 +336,8 @@ pub async fn post_init(
     }
 
     let b64 = base64::engine::general_purpose::STANDARD;
-    let payload = b64
-        .decode(&req.payload)
-        .map_err(|_| AppError::BadRequest("Invalid base64 payload"))?;
+    let payload =
+        b64.decode(&req.payload).map_err(|_| AppError::BadRequest("Invalid base64 payload"))?;
 
     if payload.len() > state.config.sharing_init_max_payload_bytes {
         return Err(AppError::PayloadTooLarge("payload too large"));
@@ -374,18 +362,12 @@ pub async fn post_init(
 
     match bound_sharing_id {
         Some(ref s) if s == &sender => {}
-        _ => {
-            return Err(AppError::Conflict(
-                "sender_id does not match bound sharing_id",
-            ))
-        }
+        _ => return Err(AppError::Conflict("sender_id does not match bound sharing_id")),
     }
 
     // Rate-limit by sync_id
     let rate_key = format!("sharing_init:{sync_id}");
-    if !state
-        .sharing_init_rate_limiter
-        .check(&rate_key, state.config.sharing_init_rate_limit, 3600)
+    if !state.sharing_init_rate_limiter.check(&rate_key, state.config.sharing_init_rate_limit, 3600)
     {
         return Err(AppError::TooManyRequests);
     }
@@ -441,14 +423,7 @@ pub async fn get_pending_inits(
     headers: HeaderMap,
     Extension(auth): Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(
-        &state,
-        &auth,
-        &headers,
-        "GET",
-        "/v1/sharing/init/pending",
-        &[],
-    )?;
+    verify_signed_request(&state, &auth, &headers, "GET", "/v1/sharing/init/pending", &[])?;
 
     let db = state.db.clone();
     let sync_id = auth.sync_id.clone();
@@ -491,14 +466,7 @@ pub async fn delete_identity(
     headers: HeaderMap,
     Extension(auth): Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(
-        &state,
-        &auth,
-        &headers,
-        "DELETE",
-        "/v1/sharing/identity",
-        &[],
-    )?;
+    verify_signed_request(&state, &auth, &headers, "DELETE", "/v1/sharing/identity", &[])?;
 
     let db = state.db.clone();
     let sync_id = auth.sync_id.clone();

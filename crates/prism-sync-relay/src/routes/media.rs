@@ -13,11 +13,7 @@ use super::{verify_signed_request, AuthIdentity};
 
 /// Validate media_id format: alphanumeric + hyphens only, <= 36 chars.
 fn is_valid_media_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 36
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !id.is_empty() && id.len() <= 36 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Validate content hash format: exactly 64 hex chars.
@@ -27,9 +23,7 @@ fn is_valid_content_hash(hash: &str) -> bool {
 
 /// Build the disk path for a media blob: {storage_path}/{sync_id}/{media_id}
 fn media_file_path(storage_path: &str, sync_id: &str, media_id: &str) -> std::path::PathBuf {
-    std::path::Path::new(storage_path)
-        .join(sync_id)
-        .join(media_id)
+    std::path::Path::new(storage_path).join(sync_id).join(media_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +112,10 @@ pub async fn upload_media(
 
     let inserted = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
 
             // Check quota
             let current_usage = db::get_group_media_usage(&tx, &sid)?;
@@ -182,16 +179,12 @@ pub async fn upload_media(
             db.with_conn(|conn| db::mark_media_deleted(conn, &mid))
         })
         .await;
-        return Err(AppError::Internal(format!(
-            "Failed to write media file: {e}"
-        )));
+        return Err(AppError::Internal(format!("Failed to write media file: {e}")));
     }
 
     // 12. Increment metrics
     state.metrics.inc(&state.metrics.media_uploads);
-    state
-        .metrics
-        .inc_by(&state.metrics.media_bytes_uploaded, size_bytes as u64);
+    state.metrics.inc_by(&state.metrics.media_bytes_uploaded, size_bytes as u64);
 
     // 13. Return JSON
     Ok(Json(serde_json::json!({ "media_id": media_id_owned })))
@@ -239,9 +232,7 @@ pub async fn download_media(
     let storage_path = state.config.media_storage_path.clone();
     let file_path = media_file_path(&storage_path, &metadata.sync_id, &metadata.media_id);
 
-    let file = tokio::fs::File::open(&file_path)
-        .await
-        .map_err(|_| AppError::NotFound)?;
+    let file = tokio::fs::File::open(&file_path).await.map_err(|_| AppError::NotFound)?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
 
@@ -313,19 +304,13 @@ mod tests {
             .unwrap();
 
         // Write file to disk
-        let file_path = media_file_path(
-            tmp.path().to_str().unwrap(),
-            "test-sync-id",
-            "media-001",
-        );
+        let file_path = media_file_path(tmp.path().to_str().unwrap(), "test-sync-id", "media-001");
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         std::fs::write(&file_path, data).unwrap();
 
         // Verify metadata exists
-        let row = state
-            .db
-            .with_read_conn(|conn| db::get_media_metadata(conn, "media-001"))
-            .unwrap();
+        let row =
+            state.db.with_read_conn(|conn| db::get_media_metadata(conn, "media-001")).unwrap();
         let row = row.expect("metadata should exist");
         assert_eq!(row.media_id, "media-001");
         assert_eq!(row.sync_id, "test-sync-id");
@@ -343,10 +328,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = test_state(tmp.path());
 
-        let row = state
-            .db
-            .with_read_conn(|conn| db::get_media_metadata(conn, "nonexistent"))
-            .unwrap();
+        let row =
+            state.db.with_read_conn(|conn| db::get_media_metadata(conn, "nonexistent")).unwrap();
         assert!(row.is_none());
     }
 

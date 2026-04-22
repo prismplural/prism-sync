@@ -69,9 +69,7 @@ impl SharingRelay for MockSharingRelay {
         identity_bundle: &[u8],
     ) -> Result<(), RelayError> {
         let mut state = self.state.lock().unwrap();
-        state
-            .identities
-            .insert(sharing_id.to_string(), identity_bundle.to_vec());
+        state.identities.insert(sharing_id.to_string(), identity_bundle.to_vec());
         Ok(())
     }
 
@@ -127,9 +125,7 @@ impl SharingRelay for MockSharingRelay {
         if state.consumed_init_ids.contains(init_id)
             || state.init_payloads.iter().any(|p| p.init_id == init_id)
         {
-            return Err(RelayError::Protocol {
-                message: format!("Duplicate init_id: {init_id}"),
-            });
+            return Err(RelayError::Protocol { message: format!("Duplicate init_id: {init_id}") });
         }
 
         state.init_payloads.push(StoredInit {
@@ -197,10 +193,7 @@ mod tests {
         let prekey = b"prekey-bundle-data";
 
         relay.publish_identity("alice", identity).await.unwrap();
-        relay
-            .publish_prekey("alice", "device-1", "prekey-1", prekey)
-            .await
-            .unwrap();
+        relay.publish_prekey("alice", "device-1", "prekey-1", prekey).await.unwrap();
 
         let bundle = relay.fetch_prekey_bundle("alice").await.unwrap();
         assert!(bundle.is_some());
@@ -231,10 +224,7 @@ mod tests {
         let relay = MockSharingRelay::new();
         relay.set_sharing_id("bob");
 
-        relay
-            .upload_sharing_init("init-1", "bob", "alice", b"encrypted-payload")
-            .await
-            .unwrap();
+        relay.upload_sharing_init("init-1", "bob", "alice", b"encrypted-payload").await.unwrap();
 
         let pending = relay.fetch_pending_inits().await.unwrap();
         assert_eq!(pending.len(), 1);
@@ -248,10 +238,7 @@ mod tests {
         let relay = MockSharingRelay::new();
         relay.set_sharing_id("bob");
 
-        relay
-            .upload_sharing_init("init-1", "bob", "alice", b"payload")
-            .await
-            .unwrap();
+        relay.upload_sharing_init("init-1", "bob", "alice", b"payload").await.unwrap();
 
         // First fetch returns the payload.
         let pending = relay.fetch_pending_inits().await.unwrap();
@@ -266,14 +253,9 @@ mod tests {
     async fn duplicate_init_id_rejected() {
         let relay = MockSharingRelay::new();
 
-        relay
-            .upload_sharing_init("init-1", "bob", "alice", b"payload-1")
-            .await
-            .unwrap();
+        relay.upload_sharing_init("init-1", "bob", "alice", b"payload-1").await.unwrap();
 
-        let result = relay
-            .upload_sharing_init("init-1", "bob", "alice", b"payload-2")
-            .await;
+        let result = relay.upload_sharing_init("init-1", "bob", "alice", b"payload-2").await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), RelayError::Protocol { .. }));
@@ -285,10 +267,7 @@ mod tests {
         relay.set_sharing_id("alice");
 
         relay.publish_identity("alice", b"identity").await.unwrap();
-        relay
-            .publish_prekey("alice", "device-1", "pk-1", b"prekey")
-            .await
-            .unwrap();
+        relay.publish_prekey("alice", "device-1", "pk-1", b"prekey").await.unwrap();
 
         // Verify data exists.
         // Note: fetch_prekey_bundle is unauthenticated, doesn't need set_sharing_id.
@@ -309,14 +288,8 @@ mod tests {
         relay.set_sharing_id("bob");
 
         // Upload inits for different recipients.
-        relay
-            .upload_sharing_init("init-1", "bob", "alice", b"for-bob")
-            .await
-            .unwrap();
-        relay
-            .upload_sharing_init("init-2", "charlie", "alice", b"for-charlie")
-            .await
-            .unwrap();
+        relay.upload_sharing_init("init-1", "bob", "alice", b"for-bob").await.unwrap();
+        relay.upload_sharing_init("init-2", "charlie", "alice", b"for-charlie").await.unwrap();
 
         // Only bob's init should be returned.
         let pending = relay.fetch_pending_inits().await.unwrap();
@@ -330,10 +303,7 @@ mod tests {
 
         relay.publish_identity("alice", b"bundle-v1").await.unwrap();
         relay.publish_identity("alice", b"bundle-v2").await.unwrap();
-        relay
-            .publish_prekey("alice", "d1", "pk1", b"prekey")
-            .await
-            .unwrap();
+        relay.publish_prekey("alice", "d1", "pk1", b"prekey").await.unwrap();
 
         let (identity, _) = relay.fetch_prekey_bundle("alice").await.unwrap().unwrap();
         assert_eq!(identity, b"bundle-v2");

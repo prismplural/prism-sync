@@ -72,10 +72,9 @@ impl SyncRuntimeKeys {
             None => return Ok(false),
         };
 
-        let json = Zeroizing::new(
-            aead::xchacha_decrypt(&wrap_key, &encrypted)
-                .map_err(|e| CoreError::Storage(StorageError::Logic(format!("decrypt failed: {e}"))))?,
-        );
+        let json = Zeroizing::new(aead::xchacha_decrypt(&wrap_key, &encrypted).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("decrypt failed: {e}")))
+        })?);
 
         let payload: HashMap<String, String> =
             serde_json::from_slice(&json).map_err(|e| CoreError::Serialization(e.to_string()))?;
@@ -83,12 +82,12 @@ impl SyncRuntimeKeys {
         let mut keys: HashMap<u32, Zeroizing<Vec<u8>>> = HashMap::new();
         for (key_str, value_b64) in payload {
             if let Some(epoch_str) = key_str.strip_prefix("epoch_") {
-                let epoch: u32 = epoch_str
-                    .parse()
-                    .map_err(|e| CoreError::Storage(StorageError::Logic(format!("invalid epoch: {e}"))))?;
-                let key_bytes = STANDARD
-                    .decode(&value_b64)
-                    .map_err(|e| CoreError::Storage(StorageError::Logic(format!("base64 decode: {e}"))))?;
+                let epoch: u32 = epoch_str.parse().map_err(|e| {
+                    CoreError::Storage(StorageError::Logic(format!("invalid epoch: {e}")))
+                })?;
+                let key_bytes = STANDARD.decode(&value_b64).map_err(|e| {
+                    CoreError::Storage(StorageError::Logic(format!("base64 decode: {e}")))
+                })?;
                 keys.insert(epoch, Zeroizing::new(key_bytes));
             }
         }
@@ -126,10 +125,7 @@ mod tests {
             Ok(self.0.lock().unwrap().get(key).cloned())
         }
         fn set(&self, key: &str, value: &[u8]) -> CoreResult<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_vec());
+            self.0.lock().unwrap().insert(key.to_string(), value.to_vec());
             Ok(())
         }
         fn delete(&self, key: &str) -> CoreResult<()> {
@@ -158,9 +154,7 @@ mod tests {
         let epoch0_before = kh.epoch_key(0).unwrap().to_vec();
         let epoch3_before = kh.epoch_key(3).unwrap().to_vec();
 
-        SyncRuntimeKeys::persist(&kh, "sync-abc", &store)
-            .await
-            .unwrap();
+        SyncRuntimeKeys::persist(&kh, "sync-abc", &store).await.unwrap();
 
         // Create a fresh KeyHierarchy and restore into it.
         let mut kh2 = KeyHierarchy::new();
@@ -169,9 +163,7 @@ mod tests {
         // that epoch 0 is available.
         kh2.initialize("password", &[1u8; 16]).unwrap();
 
-        let restored = SyncRuntimeKeys::restore(&mut kh2, "sync-abc", &store)
-            .await
-            .unwrap();
+        let restored = SyncRuntimeKeys::restore(&mut kh2, "sync-abc", &store).await.unwrap();
         assert!(restored, "should report keys were restored");
 
         assert_eq!(kh2.epoch_key(0).unwrap(), epoch0_before.as_slice());
@@ -184,9 +176,7 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        let restored = SyncRuntimeKeys::restore(&mut kh, "missing-sync-id", &store)
-            .await
-            .unwrap();
+        let restored = SyncRuntimeKeys::restore(&mut kh, "missing-sync-id", &store).await.unwrap();
         assert!(!restored, "should return false when nothing stored");
     }
 
@@ -200,23 +190,15 @@ mod tests {
         let mut kh_b = unlocked_hierarchy();
         kh_b.store_epoch_key(1, Zeroizing::new(vec![0xBB; 32]));
 
-        SyncRuntimeKeys::persist(&kh_a, "sync-aaa", &store)
-            .await
-            .unwrap();
-        SyncRuntimeKeys::persist(&kh_b, "sync-bbb", &store)
-            .await
-            .unwrap();
+        SyncRuntimeKeys::persist(&kh_a, "sync-aaa", &store).await.unwrap();
+        SyncRuntimeKeys::persist(&kh_b, "sync-bbb", &store).await.unwrap();
 
         let mut out_a = unlocked_hierarchy();
-        SyncRuntimeKeys::restore(&mut out_a, "sync-aaa", &store)
-            .await
-            .unwrap();
+        SyncRuntimeKeys::restore(&mut out_a, "sync-aaa", &store).await.unwrap();
         assert_eq!(out_a.epoch_key(1).unwrap(), &[0xAA; 32]);
 
         let mut out_b = unlocked_hierarchy();
-        SyncRuntimeKeys::restore(&mut out_b, "sync-bbb", &store)
-            .await
-            .unwrap();
+        SyncRuntimeKeys::restore(&mut out_b, "sync-bbb", &store).await.unwrap();
         assert_eq!(out_b.epoch_key(1).unwrap(), &[0xBB; 32]);
     }
 

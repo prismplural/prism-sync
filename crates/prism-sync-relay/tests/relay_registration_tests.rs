@@ -27,11 +27,8 @@ use prism_sync_relay::{
 use common::*;
 
 async fn fetch_nonce(client: &Client, url: &str, sync_id: &str) -> String {
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     nonce_json["nonce"].as_str().unwrap().to_string()
@@ -64,8 +61,7 @@ fn is_first_device_pow_valid(
         return true;
     }
     let mask = 0xFFu8 << (8 - remaining_bits);
-    hash.get(full_zero_bytes)
-        .is_some_and(|byte| byte & mask == 0)
+    hash.get(full_zero_bytes).is_some_and(|byte| byte & mask == 0)
 }
 
 fn apple_attestation_challenge(sync_id: &str, device_id: &str, nonce: &str) -> [u8; 32] {
@@ -100,11 +96,7 @@ fn build_apple_certificate_nonce(auth_data: &[u8], client_data_hash: &[u8; 32]) 
 
 fn build_apple_attestation_extension(nonce: [u8; 32]) -> Vec<u8> {
     use simple_asn1::{to_der, ASN1Block};
-    to_der(&ASN1Block::Sequence(
-        0,
-        vec![ASN1Block::OctetString(0, nonce.to_vec())],
-    ))
-    .unwrap()
+    to_der(&ASN1Block::Sequence(0, vec![ASN1Block::OctetString(0, nonce.to_vec())])).unwrap()
 }
 
 fn build_apple_app_attest_proof(
@@ -123,26 +115,16 @@ fn build_apple_app_attest_proof(
     let attestation_nonce = build_apple_certificate_nonce(&auth_data, &client_data_hash);
 
     let mut leaf_params = CertificateParams::new(vec!["leaf".into()]).unwrap();
-    leaf_params
-        .custom_extensions
-        .push(CustomExtension::from_oid_content(
-            &[1, 2, 840, 113635, 100, 8, 2],
-            build_apple_attestation_extension(attestation_nonce),
-        ));
+    leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
+        &[1, 2, 840, 113635, 100, 8, 2],
+        build_apple_attestation_extension(attestation_nonce),
+    ));
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf_cert = leaf_params
-        .signed_by(&leaf_key, root_cert, root_key)
-        .unwrap();
+    let leaf_cert = leaf_params.signed_by(&leaf_key, root_cert, root_key).unwrap();
 
     let attestation_object = serde_cbor::to_vec(&serde_cbor::Value::Map(BTreeMap::from([
-        (
-            serde_cbor::Value::Text("fmt".into()),
-            serde_cbor::Value::Text("apple-appattest".into()),
-        ),
-        (
-            serde_cbor::Value::Text("authData".into()),
-            serde_cbor::Value::Bytes(auth_data),
-        ),
+        (serde_cbor::Value::Text("fmt".into()), serde_cbor::Value::Text("apple-appattest".into())),
+        (serde_cbor::Value::Text("authData".into()), serde_cbor::Value::Bytes(auth_data)),
         (
             serde_cbor::Value::Text("attStmt".into()),
             serde_cbor::Value::Map(BTreeMap::from([(
@@ -228,29 +210,18 @@ async fn test_registration_flow() {
     let signing_key = &test_keys.ed25519_signing_key;
 
     // 1. Fetch nonce
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().expect("nonce field missing");
     assert!(!nonce.is_empty());
 
     // 2. Sign challenge
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
 
     // 4. Register
     let register_resp = client
@@ -267,11 +238,7 @@ async fn test_registration_flow() {
         .send()
         .await
         .unwrap();
-    assert!(
-        register_resp.status().is_success(),
-        "register failed: {}",
-        register_resp.status()
-    );
+    assert!(register_resp.status().is_success(), "register failed: {}", register_resp.status());
     let token_json: Value = register_resp.json().await.unwrap();
     let token = token_json["device_session_token"].as_str().unwrap();
     assert!(token.len() >= 32, "session token too short");
@@ -299,29 +266,18 @@ async fn test_registration_rejects_bad_challenge() {
     let device_id = generate_device_id();
 
     // Fetch nonce
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
 
     // Use a random key but sign with wrong data (wrong nonce)
     let test_keys = TestDeviceKeys::generate(&device_id);
     let signing_key = &test_keys.ed25519_signing_key;
-    let bad_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let bad_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let bad_sig = sign_hybrid_challenge(
-        signing_key,
-        &bad_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        "wrong-nonce",
-    );
+    let bad_sig =
+        sign_hybrid_challenge(signing_key, &bad_sig_ml_dsa_kp, &sync_id, &device_id, "wrong-nonce");
 
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -337,11 +293,7 @@ async fn test_registration_rejects_bad_challenge() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        register_resp.status(),
-        401,
-        "bad challenge should be rejected"
-    );
+    assert_eq!(register_resp.status(), 401, "bad challenge should be rejected");
 }
 
 #[tokio::test]
@@ -421,12 +373,9 @@ async fn test_registration_rejects_expired_nonce() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://127.0.0.1:{}", addr.port());
     let _handle = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
     });
 
     let client = Client::new();
@@ -436,11 +385,8 @@ async fn test_registration_rejects_expired_nonce() {
     let signing_key = &test_keys.ed25519_signing_key;
 
     // Fetch nonce
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
 
@@ -449,18 +395,10 @@ async fn test_registration_rejects_expired_nonce() {
     // with zero TTL is expired the instant it is created — even within the same
     // second.
 
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
 
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -477,11 +415,7 @@ async fn test_registration_rejects_expired_nonce() {
         .await
         .unwrap();
     // Should fail with 400 (bad request — expired nonce)
-    assert_eq!(
-        register_resp.status(),
-        400,
-        "expired nonce should be rejected"
-    );
+    assert_eq!(register_resp.status(), 400, "expired nonce should be rejected");
 }
 
 // ───────────────────────────── Test: Nonce rate limiting ────────────────
@@ -559,24 +493,16 @@ async fn test_nonce_rate_limiting() {
 
     let client = Client::new();
     let sync_id = generate_sync_id();
-    db.with_conn(|conn| db::create_sync_group(conn, &sync_id, 0))
-        .unwrap();
+    db.with_conn(|conn| db::create_sync_group(conn, &sync_id, 0)).unwrap();
 
     // Existing groups still use the per-sync nonce limiter.
     for i in 0..3 {
-        let resp = client
-            .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
         assert_eq!(resp.status(), 200, "request {i} should succeed");
     }
 
-    let resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(resp.status(), 429, "4th request should be rate-limited");
 }
 
@@ -605,11 +531,7 @@ async fn test_first_device_nonce_rate_limiting_is_ip_scoped() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        429,
-        "4th first-device nonce should be limited"
-    );
+    assert_eq!(resp.status(), 429, "4th first-device nonce should be limited");
 }
 
 #[tokio::test]
@@ -644,11 +566,7 @@ async fn test_first_device_registration_rate_limiting() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        429,
-        "4th first-device admission should be limited"
-    );
+    assert_eq!(resp.status(), 429, "4th first-device admission should be limited");
 }
 
 #[tokio::test]
@@ -769,11 +687,7 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp.status(),
-        507,
-        "brand-new group should hit the smaller storage cap"
-    );
+    assert_eq!(resp.status(), 507, "brand-new group should hit the smaller storage cap");
 }
 
 #[tokio::test]
@@ -851,31 +765,17 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
     let test_keys = TestDeviceKeys::generate(&device_id);
     let signing_key = &test_keys.ed25519_signing_key;
 
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
-    assert_eq!(
-        nonce_json["pow_challenge"]["difficulty_bits"].as_u64(),
-        Some(8)
-    );
+    assert_eq!(nonce_json["pow_challenge"]["difficulty_bits"].as_u64(), Some(8));
     let nonce = nonce_json["nonce"].as_str().unwrap();
 
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
 
     let missing_pow_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -893,31 +793,17 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         .unwrap();
     assert_eq!(missing_pow_resp.status(), 403);
     let missing_body: Value = missing_pow_resp.json().await.unwrap();
-    assert_eq!(
-        missing_body["error"].as_str(),
-        Some("first_device_admission_required")
-    );
+    assert_eq!(missing_body["error"].as_str(), Some("first_device_admission_required"));
 
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
     let invalid_pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &nonce_json)
         .map(|solution| {
             serde_json::json!({
@@ -943,31 +829,17 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         .unwrap();
     assert_eq!(invalid_pow_resp.status(), 403);
     let invalid_body: Value = invalid_pow_resp.json().await.unwrap();
-    assert_eq!(
-        invalid_body["error"].as_str(),
-        Some("first_device_admission_invalid")
-    );
+    assert_eq!(invalid_body["error"].as_str(), Some("first_device_admission_invalid"));
 
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
     let pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &nonce_json).unwrap();
 
     let valid_pow_resp = client
@@ -1065,27 +937,16 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
     let test_keys = TestDeviceKeys::generate(&device_id);
     let signing_key = &test_keys.ed25519_signing_key;
 
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
 
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
     let proof = build_apple_app_attest_proof(
         &sync_id,
         &device_id,
@@ -1193,11 +1054,8 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         register_device(&client, &url, &sync_id, &approver_device_id, &approver_keys).await;
     let joiner_device_id = generate_device_id();
     let joiner_keys = TestDeviceKeys::generate(&joiner_device_id);
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     assert!(
@@ -1206,10 +1064,7 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
     );
     let nonce = nonce_json["nonce"].as_str().unwrap();
 
-    let joiner_ml_dsa_kp = joiner_keys
-        .device_secret
-        .ml_dsa_65_keypair(&joiner_device_id)
-        .unwrap();
+    let joiner_ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
     let challenge_sig = sign_hybrid_challenge(
         &joiner_keys.ed25519_signing_key,
         &joiner_ml_dsa_kp,
@@ -1259,10 +1114,8 @@ async fn test_existing_group_registration_accepts_registry_approval() {
     let joiner_device_id = generate_device_id();
     let joiner_keys = TestDeviceKeys::generate(&joiner_device_id);
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let challenge_sig_ml_dsa_kp = joiner_keys
-        .device_secret
-        .ml_dsa_65_keypair(&joiner_device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp =
+        joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
 
     let challenge_sig = sign_hybrid_challenge(
         &joiner_keys.ed25519_signing_key,
@@ -1321,10 +1174,8 @@ async fn test_existing_group_registration_rejects_stale_registry_approval_after_
     let joiner_device_id = generate_device_id();
     let joiner_keys = TestDeviceKeys::generate(&joiner_device_id);
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let challenge_sig_ml_dsa_kp = joiner_keys
-        .device_secret
-        .ml_dsa_65_keypair(&joiner_device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp =
+        joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
 
     let challenge_sig = sign_hybrid_challenge(
         &joiner_keys.ed25519_signing_key,
@@ -1377,10 +1228,102 @@ async fn test_existing_group_registration_rejects_stale_registry_approval_after_
         .await
         .unwrap();
     assert_eq!(register_resp.status(), 409);
-    assert_eq!(
-        register_resp.text().await.unwrap(),
-        "Stale registry approval"
+    assert_eq!(register_resp.text().await.unwrap(), "Stale registry approval");
+}
+
+// Regression: a sync group that has ever revoked a device must still accept
+// new admissions. The initiator builds its approval snapshot from active
+// devices only, so the server must compare against active-only as well.
+// Before the fix, revoked rows in the DB with no match in the snapshot
+// caused a deterministic 409 "Stale registry approval".
+#[tokio::test]
+async fn test_existing_group_registration_ignores_revoked_devices_in_current_registry() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let approver_device_id = generate_device_id();
+    let approver_keys = TestDeviceKeys::generate(&approver_device_id);
+    let _approver_token =
+        register_device(&client, &url, &sync_id, &approver_device_id, &approver_keys).await;
+
+    // Seed a revoked device directly into the DB to simulate a group whose
+    // membership has changed over time. The initiator never includes revoked
+    // rows in its signed snapshot.
+    let revoked_device_id = generate_device_id();
+    let revoked_keys = TestDeviceKeys::generate(&revoked_device_id);
+    db.with_conn(|conn| {
+        db::register_device_with_pq(
+            conn,
+            &sync_id,
+            &revoked_device_id,
+            revoked_keys.ed25519_signing_key.verifying_key().as_bytes(),
+            &revoked_keys.x25519_pk,
+            &revoked_keys.ml_dsa_pk,
+            &revoked_keys.ml_kem_pk,
+            &[],
+            0,
+        )?;
+        let revoked = db::revoke_device(conn, &sync_id, &revoked_device_id, false)?;
+        assert!(revoked, "revoke_device should mark the row as revoked");
+        Ok(())
+    })
+    .unwrap();
+
+    let joiner_device_id = generate_device_id();
+    let joiner_keys = TestDeviceKeys::generate(&joiner_device_id);
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let joiner_ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
+    let challenge_sig = sign_hybrid_challenge(
+        &joiner_keys.ed25519_signing_key,
+        &joiner_ml_dsa_kp,
+        &sync_id,
+        &joiner_device_id,
+        &nonce,
     );
+
+    // Approval snapshot matches what the real initiator builds: active
+    // members only (approver + new joiner). The revoked row in the DB is
+    // intentionally absent from the snapshot.
+    let registry_approval = build_registry_approval(
+        &sync_id,
+        &approver_device_id,
+        &approver_keys,
+        vec![
+            registry_snapshot_entry_hybrid(&sync_id, &approver_device_id, &approver_keys, "active"),
+            registry_snapshot_entry_hybrid(&sync_id, &joiner_device_id, &joiner_keys, "active"),
+        ],
+    );
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": joiner_device_id,
+            "signing_public_key": hex::encode(joiner_keys.ed25519_signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(joiner_keys.x25519_pk),
+            "ml_dsa_65_public_key": hex::encode(&joiner_keys.ml_dsa_pk),
+            "ml_kem_768_public_key": hex::encode(&joiner_keys.ml_kem_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "registry_approval": registry_approval,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        register_resp.status(),
+        201,
+        "registration should succeed even when the DB has revoked devices not in the snapshot"
+    );
+
+    db.with_conn(|conn| {
+        let devices = db::list_devices(conn, &sync_id)?;
+        assert_eq!(devices.len(), 3, "approver + revoked + joiner");
+        let active: Vec<_> = devices.iter().filter(|d| d.status == "active").collect();
+        assert_eq!(active.len(), 2, "approver + joiner are active");
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1459,19 +1402,13 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
     let test_keys = TestDeviceKeys::generate(&device_id);
     let signing_key = &test_keys.ed25519_signing_key;
 
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
     let pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &nonce_json).unwrap();
-    let other_device_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let other_device_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
     let other_device_sig = sign_hybrid_challenge(
         signing_key,
@@ -1498,16 +1435,10 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         .unwrap();
     assert_eq!(wrong_device_resp.status(), 403);
     let wrong_device_body: Value = wrong_device_resp.json().await.unwrap();
-    assert_eq!(
-        wrong_device_body["error"].as_str(),
-        Some("first_device_admission_invalid")
-    );
+    assert_eq!(wrong_device_body["error"].as_str(), Some("first_device_admission_invalid"));
 
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let first_nonce_json: Value = nonce_resp.json().await.unwrap();
     let first_nonce = first_nonce_json["nonce"].as_str().unwrap().to_string();
@@ -1515,11 +1446,8 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         pow_solution_from_nonce_json(&sync_id, &device_id, &first_nonce_json)
             .expect("PoW solution should be present");
     let mut replay_counter = replay_pow_solution["counter"].as_u64().unwrap();
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let second_nonce_json: Value = nonce_resp.json().await.unwrap();
     let second_nonce = second_nonce_json["nonce"].as_str().unwrap();
@@ -1528,10 +1456,7 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         replay_counter += 1;
     }
     replay_pow_solution["counter"] = serde_json::json!(replay_counter);
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
     let challenge_sig = sign_hybrid_challenge(
         signing_key,
@@ -1558,10 +1483,7 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         .unwrap();
     assert_eq!(replay_nonce_resp.status(), 403);
     let replay_nonce_body: Value = replay_nonce_resp.json().await.unwrap();
-    assert_eq!(
-        replay_nonce_body["error"].as_str(),
-        Some("first_device_admission_invalid")
-    );
+    assert_eq!(replay_nonce_body["error"].as_str(), Some("first_device_admission_invalid"));
 }
 
 // ───────────────────────────── Test 3: Device List ──────────────────────
@@ -1599,10 +1521,7 @@ async fn test_list_devices_returns_public_keys() {
     let signing_pk_bytes = b64.decode(signing_pk_b64).unwrap();
     assert_eq!(
         signing_pk_bytes,
-        keys.ed25519_signing_key
-            .verifying_key()
-            .as_bytes()
-            .as_slice(),
+        keys.ed25519_signing_key.verifying_key().as_bytes().as_slice(),
         "signing public key should match"
     );
 
@@ -1620,11 +1539,7 @@ async fn test_unauthenticated_requests_rejected() {
     let sync_id = generate_sync_id();
 
     // No auth header
-    let resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/devices"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sync/{sync_id}/devices")).send().await.unwrap();
     assert_eq!(resp.status(), 401);
 
     // Invalid token
@@ -1776,9 +1691,7 @@ async fn test_rekey_artifacts_store_and_retrieve() {
         .unwrap();
     assert_eq!(artifact_resp.status(), 200);
     let artifact_json: Value = artifact_resp.json().await.unwrap();
-    let retrieved = b64
-        .decode(artifact_json["wrapped_key"].as_str().unwrap())
-        .unwrap();
+    let retrieved = b64.decode(artifact_json["wrapped_key"].as_str().unwrap()).unwrap();
     assert_eq!(retrieved, wrapped_key_data);
 
     // Non-existent device returns 404
@@ -1880,25 +1793,17 @@ async fn test_nonce_rate_limiting_window_expiry() {
 
     let client = Client::new();
     let sync_id = generate_sync_id();
-    db.with_conn(|conn| db::create_sync_group(conn, &sync_id, 0))
-        .unwrap();
+    db.with_conn(|conn| db::create_sync_group(conn, &sync_id, 0)).unwrap();
 
     // First 2 requests after the initial registration should succeed
     for i in 0..2 {
-        let resp = client
-            .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
         assert_eq!(resp.status(), 200, "request {i} should succeed");
     }
 
     // 3rd request should be rate-limited
-    let resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(resp.status(), 429, "3rd request should be rate-limited");
 
     // Poll until the 1-second rate-limit window expires.
@@ -1906,11 +1811,8 @@ async fn test_nonce_rate_limiting_window_expiry() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let resp = client
-            .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-            .send()
-            .await
-            .unwrap();
+        let resp =
+            client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
         if resp.status() == 200 {
             break; // Window expired, request succeeded
         }
@@ -1940,20 +1842,15 @@ async fn test_existing_group_registration_without_registry_approval_returns_401(
     let signing_key_b = &test_keys_b.ed25519_signing_key;
 
     // Fetch nonce for device B
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 200);
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
 
     // Sign challenge for device B
-    let challenge_sig_ml_dsa_kp = test_keys_b
-        .device_secret
-        .ml_dsa_65_keypair(&device_b_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp =
+        test_keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
 
     let challenge_sig = sign_hybrid_challenge(
         signing_key_b,
@@ -2036,10 +1933,7 @@ async fn test_reregister_existing_device_with_same_keys_succeeds() {
     let signing_key = &test_keys.ed25519_signing_key;
 
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
     let challenge_sig =
         sign_hybrid_challenge(signing_key, &ml_dsa_kp, &sync_id, &device_id, &nonce);
 
@@ -2064,9 +1958,7 @@ async fn test_reregister_existing_device_with_same_keys_succeeds() {
         &sync_id,
         &device_id,
         &test_keys,
-        vec![registry_snapshot_entry_hybrid(
-            &sync_id, &device_id, &test_keys, "active",
-        )],
+        vec![registry_snapshot_entry_hybrid(&sync_id, &device_id, &test_keys, "active")],
     );
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
     let challenge_sig =
@@ -2090,10 +1982,7 @@ async fn test_reregister_existing_device_with_same_keys_succeeds() {
     let status = reregister_resp.status();
     let body_text = reregister_resp.text().await.unwrap();
     let body: Value = serde_json::from_str(&body_text).unwrap_or_default();
-    assert!(
-        status.is_success(),
-        "re-register should succeed: {status} - {body_text}"
-    );
+    assert!(status.is_success(), "re-register should succeed: {status} - {body_text}");
     assert!(body["device_session_token"].as_str().is_some());
 }
 
@@ -2107,10 +1996,7 @@ async fn test_reregister_existing_device_with_changed_signing_key_is_rejected() 
     let replacement_keys = TestDeviceKeys::generate(&device_id);
 
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let original_ml_dsa_kp = original_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let original_ml_dsa_kp = original_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
     let challenge_sig = sign_hybrid_challenge(
         &original_keys.ed25519_signing_key,
         &original_ml_dsa_kp,
@@ -2140,18 +2026,11 @@ async fn test_reregister_existing_device_with_changed_signing_key_is_rejected() 
         &sync_id,
         &device_id,
         &original_keys,
-        vec![registry_snapshot_entry_hybrid(
-            &sync_id,
-            &device_id,
-            &original_keys,
-            "active",
-        )],
+        vec![registry_snapshot_entry_hybrid(&sync_id, &device_id, &original_keys, "active")],
     );
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let replacement_ml_dsa_kp = replacement_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let replacement_ml_dsa_kp =
+        replacement_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
     let challenge_sig = sign_hybrid_challenge(
         &replacement_keys.ed25519_signing_key,
         &replacement_ml_dsa_kp,
@@ -2192,18 +2071,10 @@ async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
     let replacement_x25519_pk = [12u8; 32];
 
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        &nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, &nonce);
 
     let first_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -2239,18 +2110,10 @@ async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
         }],
     );
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        &nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, &nonce);
 
     let reregister_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -2341,11 +2204,7 @@ async fn test_old_revoke_other_path_is_gated() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        revoke_resp.status(),
-        409,
-        "legacy revoke path should be gated"
-    );
+    assert_eq!(revoke_resp.status(), 409, "legacy revoke path should be gated");
 }
 
 // ────────────── Test: Revoke then rekey atomic flow ──────────────
@@ -2376,9 +2235,7 @@ async fn test_revoke_then_rekey_atomic_flow() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let revoke_resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2410,9 +2267,7 @@ async fn test_revoke_then_rekey_atomic_flow() {
         .unwrap();
     assert_eq!(artifact_resp.status(), 200);
     let artifact_json: Value = artifact_resp.json().await.unwrap();
-    let retrieved = b64
-        .decode(artifact_json["wrapped_key"].as_str().unwrap())
-        .unwrap();
+    let retrieved = b64.decode(artifact_json["wrapped_key"].as_str().unwrap()).unwrap();
     assert_eq!(retrieved, wrapped_key_data);
 }
 
@@ -2488,9 +2343,7 @@ async fn test_registration_after_epoch_rotation_via_registry_approval() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let revoke_resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2513,23 +2366,14 @@ async fn test_registration_after_epoch_rotation_via_registry_approval() {
     );
 
     // 3. Verify the sync group is now at epoch 1
-    let epoch = db
-        .with_conn(|conn| db::get_sync_group_epoch(conn, &sync_id))
-        .expect("get epoch");
-    assert_eq!(
-        epoch,
-        Some(1),
-        "sync group should be at epoch 1 after rekey"
-    );
+    let epoch = db.with_conn(|conn| db::get_sync_group_epoch(conn, &sync_id)).expect("get epoch");
+    assert_eq!(epoch, Some(1), "sync group should be at epoch 1 after rekey");
 
     // 4. Register a third device using registry_approval from admin
     let joiner_id = generate_device_id();
     let joiner_keys = TestDeviceKeys::generate(&joiner_id);
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let joiner_ml_dsa_kp = joiner_keys
-        .device_secret
-        .ml_dsa_65_keypair(&joiner_id)
-        .unwrap();
+    let joiner_ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_id).unwrap();
     let challenge_sig = sign_hybrid_challenge(
         &joiner_keys.ed25519_signing_key,
         &joiner_ml_dsa_kp,
@@ -2538,14 +2382,17 @@ async fn test_registration_after_epoch_rotation_via_registry_approval() {
         &nonce,
     );
 
-    // Include the revoked target in the snapshot so it matches the relay's current registry
+    // The initiator builds its snapshot from active devices only (see
+    // complete_bootstrap_initiator in prism-sync-core). The revoked target is
+    // intentionally absent; the server compares against active-only current
+    // membership.
+    let _ = &target_keys;
     let registry_approval = build_registry_approval(
         &sync_id,
         &admin_id,
         &admin_keys,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &admin_id, &admin_keys, "active"),
-            registry_snapshot_entry_hybrid(&sync_id, &target_id, &target_keys, "revoked"),
             registry_snapshot_entry_hybrid(&sync_id, &joiner_id, &joiner_keys, "active"),
         ],
     );
@@ -2636,9 +2483,7 @@ async fn test_stale_registry_approval_after_revoke_is_rejected() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let revoke_resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2657,10 +2502,7 @@ async fn test_stale_registry_approval_after_revoke_is_rejected() {
 
     // Try to register joiner with the stale registry_approval
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let challenge_sig_ml_dsa_kp = joiner_keys
-        .device_secret
-        .ml_dsa_65_keypair(&joiner_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_id).unwrap();
 
     let challenge_sig = sign_hybrid_challenge(
         &joiner_keys.ed25519_signing_key,
@@ -2738,11 +2580,7 @@ async fn test_atomic_revoke_rejects_missing_survivor() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "should reject when wrapped_keys is missing a surviving device"
-    );
+    assert_eq!(resp.status(), 400, "should reject when wrapped_keys is missing a surviving device");
 }
 
 // ─────────── Test: Atomic revoke rejects extra device ID ───────────
@@ -2772,9 +2610,7 @@ async fn test_atomic_revoke_rejects_extra_device_id() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2789,11 +2625,7 @@ async fn test_atomic_revoke_rejects_extra_device_id() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "should reject when wrapped_keys contains an extra device ID"
-    );
+    assert_eq!(resp.status(), 400, "should reject when wrapped_keys contains an extra device ID");
 }
 
 // ─────────── Test: Atomic revoke rejects already revoked target ───────────
@@ -2823,9 +2655,7 @@ async fn test_atomic_revoke_rejects_already_revoked_target() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp1 = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2852,9 +2682,7 @@ async fn test_atomic_revoke_rejects_already_revoked_target() {
     });
     let revoke_body_bytes2 = serde_json::to_vec(&revoke_body2).unwrap();
     let resp2 = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2869,11 +2697,7 @@ async fn test_atomic_revoke_rejects_already_revoked_target() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp2.status(),
-        409,
-        "revoking an already-revoked target should return 409"
-    );
+    assert_eq!(resp2.status(), 409, "revoking an already-revoked target should return 409");
 }
 
 // ─────────── Test: Atomic revoke rejects wrong epoch ───────────
@@ -2902,9 +2726,7 @@ async fn test_atomic_revoke_rejects_wrong_epoch() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2949,9 +2771,7 @@ async fn test_atomic_revoke_rejects_oversized_wrapped_key() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -2966,11 +2786,7 @@ async fn test_atomic_revoke_rejects_oversized_wrapped_key() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "oversized wrapped key should be rejected"
-    );
+    assert_eq!(resp.status(), 400, "oversized wrapped key should be rejected");
 }
 
 // ─────────── Test: Revoke rate limiting ───────────
@@ -3052,12 +2868,9 @@ async fn test_revoke_rate_limiting() {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://127.0.0.1:{}", addr.port());
     let _handle = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
     });
 
     let client = Client::new();
@@ -3156,9 +2969,7 @@ async fn test_atomic_revoke_audit_log() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -3249,10 +3060,8 @@ async fn test_registry_approval_device_mismatch_rejected() {
 
     // Fetch nonce for device-Y
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let challenge_sig_ml_dsa_kp = device_y_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_y_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp =
+        device_y_keys.device_secret.ml_dsa_65_keypair(&device_y_id).unwrap();
 
     let challenge_sig = sign_hybrid_challenge(
         &device_y_keys.ed25519_signing_key,
@@ -3311,10 +3120,7 @@ async fn test_registry_approval_pq_device_mismatch_rejected() {
     );
 
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
-    let challenge_sig_ml_dsa_kp = joiner_keys
-        .device_secret
-        .ml_dsa_65_keypair(&joiner_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_id).unwrap();
     let challenge_sig = sign_hybrid_challenge(
         &joiner_keys.ed25519_signing_key,
         &challenge_sig_ml_dsa_kp,
@@ -3371,10 +3177,7 @@ async fn test_signed_request_below_min_signature_version_returns_403() {
 
     let timestamp = db::now_secs().to_string();
     let nonce = uuid::Uuid::new_v4().to_string();
-    let admin_ml_dsa_kp = admin_keys
-        .device_secret
-        .ml_dsa_65_keypair(&admin_id)
-        .unwrap();
+    let admin_ml_dsa_kp = admin_keys.device_secret.ml_dsa_65_keypair(&admin_id).unwrap();
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
         "POST",
         &path,
@@ -3385,11 +3188,7 @@ async fn test_signed_request_below_min_signature_version_returns_403() {
         &nonce,
     );
     let legacy_sig = prism_sync_crypto::pq::HybridSignature {
-        ed25519_sig: admin_keys
-            .ed25519_signing_key
-            .sign(&signing_data)
-            .to_bytes()
-            .to_vec(),
+        ed25519_sig: admin_keys.ed25519_signing_key.sign(&signing_data).to_bytes().to_vec(),
         ml_dsa_65_sig: admin_ml_dsa_kp.sign(&signing_data),
     };
     let mut legacy_wire = vec![0x02u8];
@@ -3409,11 +3208,7 @@ async fn test_signed_request_below_min_signature_version_returns_403() {
         .await
         .unwrap();
 
-    assert_eq!(
-        resp.status(),
-        403,
-        "below-minimum signature versions should return 403"
-    );
+    assert_eq!(resp.status(), 403, "below-minimum signature versions should return 403");
 }
 
 // ─────────── Test: Unsigned request rejected on atomic revoke ───────────
@@ -3442,9 +3237,7 @@ async fn test_unsigned_request_rejected_on_atomic_revoke() {
 
     // Send with bearer token but NO X-Prism-* headers
     let resp = client
-        .post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        ))
+        .post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"))
         .header("Authorization", format!("Bearer {admin_token}"))
         .header("X-Device-Id", &admin_id)
         .header("Content-Type", "application/json")
@@ -3452,11 +3245,7 @@ async fn test_unsigned_request_rejected_on_atomic_revoke() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "atomic revoke without signature headers should be rejected"
-    );
+    assert_eq!(resp.status(), 400, "atomic revoke without signature headers should be rejected");
 }
 
 // ─────────── Test: Replayed nonce rejected ───────────
@@ -3520,11 +3309,7 @@ async fn test_replayed_nonce_rejected() {
         .send()
         .await
         .unwrap();
-    assert!(
-        resp1.status().is_success(),
-        "first rekey should succeed: {}",
-        resp1.status()
-    );
+    assert!(resp1.status().is_success(), "first rekey should succeed: {}", resp1.status());
 
     // Second request — rekey to epoch 2 but replay the same nonce
     let rekey_body2 = serde_json::json!({
@@ -3544,11 +3329,8 @@ async fn test_replayed_nonce_rejected() {
         &fixed_nonce, // same nonce
     );
     let m_prime2 =
-        prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"http_request",
-            &signing_data2,
-        )
-        .expect("hardcoded http request context should be <= 255 bytes");
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data2)
+            .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig2 = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: keys.ed25519_signing_key.sign(&m_prime2).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_kp.sign(&m_prime2),
@@ -3601,10 +3383,7 @@ async fn test_expired_timestamp_rejected() {
     // Set timestamp 120 seconds in the past (exceeds 60s max skew)
     let old_timestamp = (db::now_secs() - 120).to_string();
     let nonce = uuid::Uuid::new_v4().to_string();
-    let admin_ml_dsa_kp = admin_keys
-        .device_secret
-        .ml_dsa_65_keypair(&admin_id)
-        .unwrap();
+    let admin_ml_dsa_kp = admin_keys.device_secret.ml_dsa_65_keypair(&admin_id).unwrap();
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
         "POST",
         &path,
@@ -3618,11 +3397,7 @@ async fn test_expired_timestamp_rejected() {
         prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
             .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
-        ed25519_sig: admin_keys
-            .ed25519_signing_key
-            .sign(&m_prime)
-            .to_bytes()
-            .to_vec(),
+        ed25519_sig: admin_keys.ed25519_signing_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: admin_ml_dsa_kp.sign(&m_prime),
     };
     let mut wire = vec![0x03u8];
@@ -3669,9 +3444,7 @@ async fn test_atomic_revoke_remote_wipe_true() {
     });
     let revoke_body_bytes = serde_json::to_vec(&revoke_body).unwrap();
     let resp = apply_signed_headers(
-        client.post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        )),
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke")),
         &admin_keys,
         "POST",
         &format!("/v1/sync/{sync_id}/devices/{target_id}/revoke"),
@@ -3777,18 +3550,12 @@ async fn test_concurrent_atomic_revokes_one_wins() {
 
     // Exactly one should succeed (200) and the other should fail (400 epoch mismatch or 409)
     let successes = [status_a, status_b].iter().filter(|&&s| s == 200).count();
-    let failures = [status_a, status_b]
-        .iter()
-        .filter(|&&s| s == 400 || s == 409)
-        .count();
+    let failures = [status_a, status_b].iter().filter(|&&s| s == 400 || s == 409).count();
     assert_eq!(
         successes, 1,
         "exactly one revoke should succeed, got statuses: {status_a}, {status_b}"
     );
-    assert_eq!(
-        failures, 1,
-        "exactly one revoke should fail, got statuses: {status_a}, {status_b}"
-    );
+    assert_eq!(failures, 1, "exactly one revoke should fail, got statuses: {status_a}, {status_b}");
 }
 
 // ─────────── Test: Standalone rekey rejected when needs_rekey ───────────
@@ -3807,8 +3574,7 @@ async fn test_standalone_rekey_rejected_when_needs_rekey() {
     let (_dev2_token, _dev2_id_keys) = prepare_device(&db, &sync_id, &dev2_id).await;
 
     // Manually set needs_rekey = true
-    db.with_conn(|conn| db::set_needs_rekey(conn, &sync_id, true))
-        .expect("set needs_rekey");
+    db.with_conn(|conn| db::set_needs_rekey(conn, &sync_id, true)).expect("set needs_rekey");
 
     let b64 = base64::engine::general_purpose::STANDARD;
     let rekey_body = serde_json::json!({
@@ -3835,11 +3601,7 @@ async fn test_standalone_rekey_rejected_when_needs_rekey() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        resp.status(),
-        409,
-        "standalone rekey should be rejected when needs_rekey is true"
-    );
+    assert_eq!(resp.status(), 409, "standalone rekey should be rejected when needs_rekey is true");
 }
 
 // ─── Test: Standalone rekey allowed after atomic revoke clears needs_rekey ───
@@ -3979,11 +3741,7 @@ async fn test_snapshot_body_limit_allows_large_upload() {
     .send()
     .await
     .unwrap();
-    assert_eq!(
-        changes_resp.status(),
-        413,
-        "3MB changes body should exceed default limit"
-    );
+    assert_eq!(changes_resp.status(), 413, "3MB changes body should exceed default limit");
 }
 
 // ─── Test: Bearer token without signature rejected on destructive endpoints ───
@@ -4012,9 +3770,7 @@ async fn test_bearer_token_without_signature_rejected_on_destructive_endpoints()
         },
     });
     let revoke_resp = client
-        .post(format!(
-            "{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"
-        ))
+        .post(format!("{url}/v1/sync/{sync_id}/devices/{target_id}/revoke"))
         .header("Authorization", format!("Bearer {admin_token}"))
         .header("X-Device-Id", &admin_id)
         .header("Content-Type", "application/json")
@@ -4022,11 +3778,7 @@ async fn test_bearer_token_without_signature_rejected_on_destructive_endpoints()
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        revoke_resp.status(),
-        400,
-        "atomic revoke without signature should return 400"
-    );
+    assert_eq!(revoke_resp.status(), 400, "atomic revoke without signature should return 400");
 
     // 2. POST rekey without signature headers
     let rekey_body = serde_json::json!({
@@ -4045,11 +3797,7 @@ async fn test_bearer_token_without_signature_rejected_on_destructive_endpoints()
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        rekey_resp.status(),
-        400,
-        "rekey without signature should return 400"
-    );
+    assert_eq!(rekey_resp.status(), 400, "rekey without signature should return 400");
 
     // 3. DELETE sync group without signature headers
     let delete_resp = client
@@ -4059,11 +3807,7 @@ async fn test_bearer_token_without_signature_rejected_on_destructive_endpoints()
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        delete_resp.status(),
-        400,
-        "delete sync group without signature should return 400"
-    );
+    assert_eq!(delete_resp.status(), 400, "delete sync group without signature should return 400");
 }
 
 // ───────────────── Registration access control tests ──────────────────
@@ -4151,18 +3895,10 @@ async fn test_open_mode_no_token_configured() {
     assert!(!nonce.is_empty());
 
     // Full registration succeeds without any token
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        &nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, &nonce);
 
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -4208,18 +3944,10 @@ async fn test_token_gated_correct_token() {
     let nonce = nonce_json["nonce"].as_str().unwrap();
 
     // Register with correct token
-    let challenge_sig_ml_dsa_kp = test_keys
-        .device_secret
-        .ml_dsa_65_keypair(&device_id)
-        .unwrap();
+    let challenge_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
-    let challenge_sig = sign_hybrid_challenge(
-        signing_key,
-        &challenge_sig_ml_dsa_kp,
-        &sync_id,
-        &device_id,
-        nonce,
-    );
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
 
     let register_resp = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -4274,11 +4002,7 @@ async fn test_token_gated_wrong_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        register_resp.status(),
-        403,
-        "wrong token on register should return 403"
-    );
+    assert_eq!(register_resp.status(), 403, "wrong token on register should return 403");
 }
 
 #[tokio::test]
@@ -4290,11 +4014,8 @@ async fn test_token_gated_missing_token() {
     let sync_id = generate_sync_id();
 
     // Nonce endpoint with no token header should return 403
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(nonce_resp.status(), 403, "missing token should return 403");
 
     // Register endpoint with no token header should also return 403
@@ -4310,11 +4031,7 @@ async fn test_token_gated_missing_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        register_resp.status(),
-        403,
-        "missing token on register should return 403"
-    );
+    assert_eq!(register_resp.status(), 403, "missing token on register should return 403");
 }
 
 #[tokio::test]
@@ -4326,11 +4043,8 @@ async fn test_registration_disabled() {
     let sync_id = generate_sync_id();
 
     // Nonce endpoint should return 403 when registration is disabled
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(
         nonce_resp.status(),
         403,
@@ -4366,11 +4080,7 @@ async fn test_nonce_endpoint_checks_token() {
     let sync_id = generate_sync_id();
 
     // Without token — 403
-    let resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(resp.status(), 403, "nonce without token should be 403");
 
     // With wrong token — 403

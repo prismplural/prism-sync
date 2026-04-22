@@ -141,15 +141,10 @@ fn test_later_hlc_timestamp_wins_field_conflict() {
         make_op("t1", "title", "\"Late\"", &hlc_late, "dev-b", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
-    assert_eq!(
-        winners.len(),
-        1,
-        "only one op should win for the same field"
-    );
+    assert_eq!(winners.len(), 1, "only one op should win for the same field");
     let winner = winners.values().next().unwrap();
     assert_eq!(winner.op.encoded_value, "\"Late\"");
     assert_eq!(winner.op.device_id, "dev-b");
@@ -170,9 +165,8 @@ fn test_later_hlc_wins_regardless_of_batch_order() {
         make_op("t1", "title", "\"Early\"", &hlc_early, "dev-a", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
@@ -187,14 +181,7 @@ fn test_lower_hlc_loses_against_persisted_field_version() {
 
     let hlc_old = Hlc::new(500, 0, "dev-old");
 
-    let ops = vec![make_op(
-        "t1",
-        "title",
-        "\"OldValue\"",
-        &hlc_old,
-        "dev-old",
-        None,
-    )];
+    let ops = vec![make_op("t1", "title", "\"OldValue\"", &hlc_old, "dev-old", None)];
 
     // Persisted field version has a higher HLC
     let get_fv = |_sync_id: &str,
@@ -219,14 +206,9 @@ fn test_lower_hlc_loses_against_persisted_field_version() {
         }
     };
 
-    let winners = merge
-        .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
 
-    assert!(
-        winners.is_empty(),
-        "old HLC should not beat existing field version"
-    );
+    assert!(winners.is_empty(), "old HLC should not beat existing field version");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -243,27 +225,12 @@ fn test_higher_hlc_counter_wins() {
     let hlc_high_counter = Hlc::new(5000, 5, "dev-b");
 
     let ops = vec![
-        make_op(
-            "t1",
-            "title",
-            "\"LowCounter\"",
-            &hlc_low_counter,
-            "dev-a",
-            None,
-        ),
-        make_op(
-            "t1",
-            "title",
-            "\"HighCounter\"",
-            &hlc_high_counter,
-            "dev-b",
-            None,
-        ),
+        make_op("t1", "title", "\"LowCounter\"", &hlc_low_counter, "dev-a", None),
+        make_op("t1", "title", "\"HighCounter\"", &hlc_high_counter, "dev-b", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
@@ -289,9 +256,8 @@ fn test_device_id_tiebreaker_same_hlc() {
         make_op("t1", "title", "\"FromZulu\"", &hlc_b, "device-zulu", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
@@ -317,9 +283,8 @@ fn test_op_id_tiebreaker_same_hlc_same_device() {
         make_op("t1", "title", "\"OpZ\"", &hlc, "dev-same", Some("op-zzz")),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
@@ -347,9 +312,8 @@ fn test_different_fields_both_preserved() {
         make_op("t1", "done", "true", &hlc_b, "dev-b", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 2, "both ops on different fields should win");
 
@@ -379,16 +343,12 @@ fn test_three_devices_same_field_deterministic_winner() {
         make_op("t1", "title", "\"FromC\"", &hlc_c, "dev-c", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(
-        winner.op.encoded_value, "\"FromB\"",
-        "device B with HLC 3000 should win"
-    );
+    assert_eq!(winner.op.encoded_value, "\"FromB\"", "device B with HLC 3000 should win");
 }
 
 /// Three devices, same HLC timestamp — device_id tiebreaker should give
@@ -401,19 +361,16 @@ fn test_three_devices_same_hlc_device_tiebreaker() {
     let hlc = Hlc::new(5000, 0, "shared-node");
 
     // Try multiple orderings to confirm determinism
-    for ordering in [
-        ["dev-a", "dev-b", "dev-c"],
-        ["dev-c", "dev-a", "dev-b"],
-        ["dev-b", "dev-c", "dev-a"],
-    ] {
+    for ordering in
+        [["dev-a", "dev-b", "dev-c"], ["dev-c", "dev-a", "dev-b"], ["dev-b", "dev-c", "dev-a"]]
+    {
         let ops: Vec<CrdtChange> = ordering
             .iter()
             .map(|dev| make_op("t1", "title", &format!("\"From-{}\"", dev), &hlc, dev, None))
             .collect();
 
-        let winners = merge
-            .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-            .unwrap();
+        let winners =
+            merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
         assert_eq!(winners.len(), 1);
         let winner = winners.values().next().unwrap();
@@ -448,12 +405,7 @@ async fn test_soft_delete_wins_with_later_hlc() {
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -512,10 +464,7 @@ async fn test_soft_delete_wins_with_later_hlc() {
     assert_eq!(result.merged, 1, "delete op should be merged");
 
     // Verify the entity was soft deleted
-    assert!(
-        entity.is_deleted("t-del").await.unwrap(),
-        "entity should be soft deleted"
-    );
+    assert!(entity.is_deleted("t-del").await.unwrap(), "entity should be soft deleted");
 }
 
 /// After a soft delete is tombstoned (is_deleted field_version exists),
@@ -551,23 +500,12 @@ fn test_tombstone_prevents_resurrection() {
 
     // Even with a very high HLC, a title update should be rejected
     let hlc_update = Hlc::new(9999, 0, "dev-updater");
-    let ops = vec![make_op(
-        "t-dead",
-        "title",
-        "\"Resurrected!\"",
-        &hlc_update,
-        "dev-updater",
-        None,
-    )];
+    let ops =
+        vec![make_op("t-dead", "title", "\"Resurrected!\"", &hlc_update, "dev-updater", None)];
 
-    let winners = merge
-        .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
 
-    assert!(
-        winners.is_empty(),
-        "title update on tombstoned entity should be rejected"
-    );
+    assert!(winners.is_empty(), "title update on tombstoned entity should be rejected");
 }
 
 /// A delete op on a tombstoned entity IS allowed (e.g. re-confirming deletion
@@ -604,15 +542,9 @@ fn test_delete_op_allowed_on_tombstoned_entity() {
     let hlc_new_delete = Hlc::new(8000, 0, "dev-other");
     let ops = vec![make_delete_op("t-dead", &hlc_new_delete, "dev-other")];
 
-    let winners = merge
-        .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
 
-    assert_eq!(
-        winners.len(),
-        1,
-        "newer delete op should win over old delete"
-    );
+    assert_eq!(winners.len(), 1, "newer delete op should win over old delete");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -634,16 +566,12 @@ fn test_empty_string_vs_null_later_hlc_wins() {
         make_op("t1", "title", "\"\"", &hlc_empty, "dev-b", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(
-        winner.op.encoded_value, "\"\"",
-        "later HLC (empty string) should win over null"
-    );
+    assert_eq!(winner.op.encoded_value, "\"\"", "later HLC (empty string) should win over null");
 }
 
 /// Null value with higher HLC wins over empty string with lower HLC.
@@ -660,16 +588,12 @@ fn test_null_wins_over_empty_string_with_later_hlc() {
         make_op("t1", "title", "null", &hlc_null, "dev-b", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(
-        winner.op.encoded_value, "null",
-        "later HLC (null) should win over empty string"
-    );
+    assert_eq!(winner.op.encoded_value, "null", "later HLC (null) should win over empty string");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -692,35 +616,17 @@ fn test_rapid_successive_writes_counter_ordering() {
 
     let ops = vec![
         make_op("t1", "title", "\"First\"", &hlc_0, "dev-fast", Some("op-0")),
-        make_op(
-            "t1",
-            "title",
-            "\"Second\"",
-            &hlc_1,
-            "dev-fast",
-            Some("op-1"),
-        ),
+        make_op("t1", "title", "\"Second\"", &hlc_1, "dev-fast", Some("op-1")),
         make_op("t1", "title", "\"Third\"", &hlc_2, "dev-fast", Some("op-2")),
-        make_op(
-            "t1",
-            "title",
-            "\"Fourth\"",
-            &hlc_3,
-            "dev-fast",
-            Some("op-3"),
-        ),
+        make_op("t1", "title", "\"Fourth\"", &hlc_3, "dev-fast", Some("op-3")),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
-    assert_eq!(
-        winner.op.encoded_value, "\"Fourth\"",
-        "highest counter should win"
-    );
+    assert_eq!(winner.op.encoded_value, "\"Fourth\"", "highest counter should win");
     assert_eq!(winner.op.client_hlc, hlc_3.to_string());
 }
 
@@ -735,20 +641,11 @@ fn test_already_applied_ops_skipped() {
     let merge = MergeEngine::new(schema);
 
     let hlc = Hlc::new(5000, 0, "dev-a");
-    let ops = vec![make_op(
-        "t1",
-        "title",
-        "\"Hello\"",
-        &hlc,
-        "dev-a",
-        Some("already-done"),
-    )];
+    let ops = vec![make_op("t1", "title", "\"Hello\"", &hlc, "dev-a", Some("already-done"))];
 
     let is_applied = |op_id: &str| -> prism_sync_core::Result<bool> { Ok(op_id == "already-done") };
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &is_applied, SYNC_ID)
-        .unwrap();
+    let winners = merge.determine_winners(&ops, &no_field_versions, &is_applied, SYNC_ID).unwrap();
 
     assert!(winners.is_empty(), "already-applied op should be skipped");
 }
@@ -767,9 +664,8 @@ fn test_unknown_table_ops_skipped() {
     let mut op = make_op("t1", "title", "\"Hello\"", &hlc, "dev-a", None);
     op.entity_table = "nonexistent_table".to_string();
 
-    let winners = merge
-        .determine_winners(&[op], &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&[op], &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert!(winners.is_empty(), "op for unknown table should be skipped");
 }
@@ -783,9 +679,8 @@ fn test_unknown_field_ops_skipped() {
     let hlc = Hlc::new(5000, 0, "dev-a");
     let op = make_op("t1", "nonexistent_field", "\"Hello\"", &hlc, "dev-a", None);
 
-    let winners = merge
-        .determine_winners(&[op], &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&[op], &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert!(winners.is_empty(), "op for unknown field should be skipped");
 }
@@ -814,25 +709,16 @@ fn test_multiple_entities_resolved_independently() {
         make_op("t2", "title", "\"T2-DevB\"", &hlc_b_early, "dev-b", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 2, "one winner per entity");
 
-    let winner_values: HashMap<String, String> = winners
-        .values()
-        .map(|w| (w.op.entity_id.clone(), w.op.encoded_value.clone()))
-        .collect();
+    let winner_values: HashMap<String, String> =
+        winners.values().map(|w| (w.op.entity_id.clone(), w.op.encoded_value.clone())).collect();
 
-    assert_eq!(
-        winner_values["t1"], "\"T1-DevB\"",
-        "t1: dev-b with HLC 2000 wins"
-    );
-    assert_eq!(
-        winner_values["t2"], "\"T2-DevA\"",
-        "t2: dev-a with HLC 3000 wins"
-    );
+    assert_eq!(winner_values["t1"], "\"T1-DevB\"", "t1: dev-b with HLC 2000 wins");
+    assert_eq!(winner_values["t2"], "\"T2-DevA\"", "t2: dev-a with HLC 3000 wins");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -857,12 +743,7 @@ async fn test_full_sync_concurrent_write_conflict() {
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -892,14 +773,8 @@ async fn test_full_sync_concurrent_write_conflict() {
 
     // Remote sends title="Remote" at HLC 5000 (higher — should win)
     let hlc_remote = Hlc::new(5000, 0, remote_device);
-    let remote_ops = vec![make_op(
-        "t-concurrent",
-        "title",
-        "\"Remote Wins\"",
-        &hlc_remote,
-        remote_device,
-        None,
-    )];
+    let remote_ops =
+        vec![make_op("t-concurrent", "title", "\"Remote Wins\"", &hlc_remote, remote_device, None)];
 
     let envelope = make_encrypted_batch(
         &remote_ops,
@@ -961,12 +836,7 @@ async fn test_full_sync_different_fields_no_conflict() {
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -996,14 +866,7 @@ async fn test_full_sync_different_fields_no_conflict() {
 
     // Remote writes "done" field (different field — no conflict)
     let hlc_remote = Hlc::new(2000, 0, remote_device);
-    let remote_ops = vec![make_op(
-        "t-dual",
-        "done",
-        "true",
-        &hlc_remote,
-        remote_device,
-        None,
-    )];
+    let remote_ops = vec![make_op("t-dual", "done", "true", &hlc_remote, remote_device, None)];
 
     let envelope = make_encrypted_batch(
         &remote_ops,
@@ -1056,14 +919,7 @@ fn test_equal_op_does_not_win() {
     let merge = MergeEngine::new(schema);
 
     let hlc = Hlc::new(5000, 0, "dev-a");
-    let ops = vec![make_op(
-        "t1",
-        "title",
-        "\"Hello\"",
-        &hlc,
-        "dev-a",
-        Some("same-op"),
-    )];
+    let ops = vec![make_op("t1", "title", "\"Hello\"", &hlc, "dev-a", Some("same-op"))];
 
     // Persisted field version has exactly the same HLC and device
     let get_fv = |_sync_id: &str,
@@ -1088,17 +944,12 @@ fn test_equal_op_does_not_win() {
         }
     };
 
-    let winners = merge
-        .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
 
     // The op doesn't strictly win (equal is not greater), but it won't be
     // skipped by idempotency check since we're using no_ops_applied.
     // The merge engine's wins_over returns false for equal, so the op is skipped.
-    assert!(
-        winners.is_empty(),
-        "equal op should not win over existing field version"
-    );
+    assert!(winners.is_empty(), "equal op should not win over existing field version");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1122,9 +973,8 @@ fn test_hlc_node_id_tiebreaker() {
         make_op("t1", "title", "\"NodeB\"", &hlc_b, "same-device", None),
     ];
 
-    let winners = merge
-        .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert_eq!(winners.len(), 1);
     let winner = winners.values().next().unwrap();
@@ -1170,14 +1020,9 @@ fn test_lower_hlc_delete_loses_against_existing_tombstone() {
     let hlc_late_delete = Hlc::new(3000, 0, "dev-other");
     let ops = vec![make_delete_op("t-dead", &hlc_late_delete, "dev-other")];
 
-    let winners = merge
-        .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
 
-    assert!(
-        winners.is_empty(),
-        "lower-HLC delete should lose against existing tombstone"
-    );
+    assert!(winners.is_empty(), "lower-HLC delete should lose against existing tombstone");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1217,24 +1062,12 @@ fn test_undeleted_entity_allows_field_updates() {
 
     // Field update on the un-deleted entity should be accepted
     let hlc_update = Hlc::new(6000, 0, "dev-updater");
-    let ops = vec![make_op(
-        "t-revived",
-        "title",
-        "\"Alive Again\"",
-        &hlc_update,
-        "dev-updater",
-        None,
-    )];
+    let ops =
+        vec![make_op("t-revived", "title", "\"Alive Again\"", &hlc_update, "dev-updater", None)];
 
-    let winners = merge
-        .determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
 
-    assert_eq!(
-        winners.len(),
-        1,
-        "field update on un-deleted entity should be accepted"
-    );
+    assert_eq!(winners.len(), 1, "field update on un-deleted entity should be accepted");
     let winner = winners.values().next().unwrap();
     assert_eq!(winner.op.encoded_value, "\"Alive Again\"");
 }

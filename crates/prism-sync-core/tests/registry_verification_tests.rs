@@ -68,12 +68,8 @@ fn build_signed_registry_blob(
     signer_device_secret: &DeviceSecret,
     signer_device_id: &str,
 ) -> Vec<u8> {
-    let signing_key = signer_device_secret
-        .ed25519_keypair(signer_device_id)
-        .unwrap();
-    let pq_signing_key = signer_device_secret
-        .ml_dsa_65_keypair(signer_device_id)
-        .unwrap();
+    let signing_key = signer_device_secret.ed25519_keypair(signer_device_id).unwrap();
+    let pq_signing_key = signer_device_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
     let snapshot = SignedRegistrySnapshot::new(entries, 1);
     snapshot.sign_hybrid(&signing_key, &pq_signing_key)
 }
@@ -262,14 +258,7 @@ async fn registry_verification_verified_import_happy_path() {
     );
 
     let result = engine
-        .sync(
-            SYNC_ID,
-            &key_hierarchy,
-            &signing_key_a.into_signing_key(),
-            None,
-            device_a_id,
-            0,
-        )
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a.into_signing_key(), None, device_a_id, 0)
         .await
         .unwrap();
 
@@ -327,8 +316,8 @@ fn registry_verification_unverified_merge_blocked() {
     let rotated_record = DeviceRecord {
         sync_id: SYNC_ID.to_string(),
         device_id: "dev-target".to_string(),
-        ed25519_public_key: vec![1u8; 32],    // same
-        x25519_public_key: vec![2u8; 32],     // same
+        ed25519_public_key: vec![1u8; 32],      // same
+        x25519_public_key: vec![2u8; 32],       // same
         ml_dsa_65_public_key: vec![0xBB; 1952], // DIFFERENT
         ml_kem_768_public_key: vec![4u8; 1184], // same
         x_wing_public_key: vec![],
@@ -340,11 +329,7 @@ fn registry_verification_unverified_merge_blocked() {
 
     // merge_relay_device should succeed (not error)
     let result = DeviceRegistryManager::merge_relay_device(&storage, SYNC_ID, &rotated_record);
-    assert!(
-        result.is_ok(),
-        "merge_relay_device should not error, got: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "merge_relay_device should not error, got: {:?}", result.err());
 
     // But the stored record should still have the old ML-DSA key at generation 0
     let stored = storage
@@ -397,9 +382,7 @@ fn registry_verification_verified_import_preserves_generation() {
     let ed25519_b = device_secret_b.ed25519_keypair(device_b_id).unwrap();
     let x25519_b = device_secret_b.x25519_keypair(device_b_id).unwrap();
     // Use generation 3 for the ML-DSA key
-    let ml_dsa_b_gen3 = device_secret_b
-        .ml_dsa_65_keypair_v(device_b_id, 3)
-        .unwrap();
+    let ml_dsa_b_gen3 = device_secret_b.ml_dsa_65_keypair_v(device_b_id, 3).unwrap();
     let ml_kem_b = device_secret_b.ml_kem_768_keypair(device_b_id).unwrap();
 
     let entries = vec![
@@ -431,13 +414,12 @@ fn registry_verification_verified_import_preserves_generation() {
 
     // Import the signed registry
     let result = DeviceRegistryManager::verify_and_import_signed_registry(
-        &storage, SYNC_ID, &signed_blob, None,
+        &storage,
+        SYNC_ID,
+        &signed_blob,
+        None,
     );
-    assert!(
-        result.is_ok(),
-        "verified import should succeed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "verified import should succeed: {:?}", result.err());
 
     // Verify device B's generation was preserved
     let device_b_record = storage
@@ -498,12 +480,12 @@ fn registry_verification_tampered_artifact_rejected() {
     signed_blob[last_idx] ^= 0xFF;
 
     let result = DeviceRegistryManager::verify_and_import_signed_registry(
-        &storage, SYNC_ID, &signed_blob, None,
+        &storage,
+        SYNC_ID,
+        &signed_blob,
+        None,
     );
-    assert!(
-        result.is_err(),
-        "tampered artifact should be rejected, but got Ok"
-    );
+    assert!(result.is_err(), "tampered artifact should be rejected, but got Ok");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -563,12 +545,7 @@ async fn registry_verification_fallback_when_no_artifact() {
     setup_sync_metadata(&storage, device_a_id);
 
     // Register device A locally (so its own ops can be signed)
-    register_device(
-        &relay,
-        &storage,
-        device_a_id,
-        &signing_key_a.verifying_key(),
-    );
+    register_device(&relay, &storage, device_a_id, &signing_key_a.verifying_key());
 
     // DO NOT register device B locally and provide no signed registry.
     // The engine must fail closed and skip device B's batch entirely.
@@ -610,10 +587,8 @@ async fn registry_verification_fallback_when_no_artifact() {
         SyncConfig::default(),
     );
 
-    let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id, 0)
-        .await
-        .unwrap();
+    let result =
+        engine.sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id, 0).await.unwrap();
 
     // Sync must succeed overall (fail closed = skip batch, not abort sync)
     assert!(
@@ -624,17 +599,11 @@ async fn registry_verification_fallback_when_no_artifact() {
     assert!(result.pulled > 0, "expected at least 1 batch pulled");
 
     // The unknown sender's batch must be SKIPPED — no ops merged
-    assert_eq!(
-        result.merged, 0,
-        "expected 0 ops merged from unknown sender (fail closed)"
-    );
+    assert_eq!(result.merged, 0, "expected 0 ops merged from unknown sender (fail closed)");
 
     // Verify that the injected data did NOT arrive
     let title = entity.get_field("task-1", "title");
-    assert_eq!(
-        title, None,
-        "data from unknown sender should not be present (fail closed)"
-    );
+    assert_eq!(title, None, "data from unknown sender should not be present (fail closed)");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -684,20 +653,13 @@ async fn sender_key_info_includes_ml_dsa_keys() {
         .await
         .expect("resolve_sender_keys_with_generation_hint should succeed");
 
-    assert_eq!(
-        info.ed25519_pk,
-        ed25519_kp.public_key_bytes(),
-        "Ed25519 public key should match"
-    );
+    assert_eq!(info.ed25519_pk, ed25519_kp.public_key_bytes(), "Ed25519 public key should match");
     assert_eq!(
         info.ml_dsa_65_pk,
         ml_dsa_kp.public_key_bytes(),
         "ML-DSA-65 public key should match"
     );
-    assert_eq!(
-        info.ml_dsa_key_generation, 0,
-        "ML-DSA key generation should be 0"
-    );
+    assert_eq!(info.ml_dsa_key_generation, 0, "ML-DSA key generation should be 0");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -805,10 +767,7 @@ async fn generation_mismatch_triggers_registry_fetch() {
         .await
         .expect("resolve should succeed after registry fetch");
 
-    assert_eq!(
-        info.ml_dsa_key_generation, 1,
-        "ML-DSA generation should be updated to 1"
-    );
+    assert_eq!(info.ml_dsa_key_generation, 1, "ML-DSA generation should be updated to 1");
     assert_eq!(
         info.ml_dsa_65_pk,
         sender_ml_dsa_gen1.public_key_bytes(),
@@ -1032,13 +991,14 @@ fn revoked_signer_rejected() {
         .expect("revoke should succeed");
 
     // Attempt to import the signed blob — must fail because device A is revoked
-    let result =
-        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob, None);
-
-    assert!(
-        result.is_err(),
-        "revoked signer should be rejected, but got Ok"
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage,
+        SYNC_ID,
+        &signed_blob,
+        None,
     );
+
+    assert!(result.is_err(), "revoked signer should be rejected, but got Ok");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("could not be verified")
@@ -1089,18 +1049,16 @@ fn signer_self_revoked_in_snapshot_rejected() {
     }];
     let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
 
-    let result =
-        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob, None);
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage,
+        SYNC_ID,
+        &signed_blob,
+        None,
+    );
 
-    assert!(
-        result.is_err(),
-        "self-revoked signer in snapshot should be rejected, but got Ok"
-    );
+    assert!(result.is_err(), "self-revoked signer in snapshot should be rejected, but got Ok");
     let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("revoked"),
-        "error should mention revoked status, got: {err_msg}"
-    );
+    assert!(err_msg.contains("revoked"), "error should mention revoked status, got: {err_msg}");
 }
 
 /// The signer must be present in their own snapshot. If device A signs the blob
@@ -1153,13 +1111,14 @@ fn signer_missing_from_own_snapshot_rejected() {
     // Sign with device A's keys (A is absent from the snapshot itself)
     let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
 
-    let result =
-        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &signed_blob, None);
-
-    assert!(
-        result.is_err(),
-        "snapshot missing the signer should be rejected, but got Ok"
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage,
+        SYNC_ID,
+        &signed_blob,
+        None,
     );
+
+    assert!(result.is_err(), "snapshot missing the signer should be rejected, but got Ok");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("signer not present"),
@@ -1236,9 +1195,8 @@ fn stale_registry_version_rejected() {
     let blob_v5 = snapshot_v5.sign_hybrid(&signing_key, &pq_signing_key);
 
     // Import version 5 — should succeed
-    let result = DeviceRegistryManager::verify_and_import_signed_registry(
-        &storage, SYNC_ID, &blob_v5, None,
-    );
+    let result =
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &blob_v5, None);
     assert!(result.is_ok(), "version 5 import should succeed: {:?}", result.err());
     assert_eq!(result.unwrap(), 5, "should return signed version 5");
 
@@ -1248,7 +1206,10 @@ fn stale_registry_version_rejected() {
 
     // Import version 3 with last_imported=5 — must fail
     let result = DeviceRegistryManager::verify_and_import_signed_registry(
-        &storage, SYNC_ID, &blob_v3, Some(5),
+        &storage,
+        SYNC_ID,
+        &blob_v3,
+        Some(5),
     );
     assert!(result.is_err(), "stale version 3 should be rejected when 5 was already imported");
     let err = result.unwrap_err().to_string();
@@ -1259,7 +1220,10 @@ fn stale_registry_version_rejected() {
     let blob_v7 = snapshot_v7.sign_hybrid(&signing_key, &pq_signing_key);
 
     let result = DeviceRegistryManager::verify_and_import_signed_registry(
-        &storage, SYNC_ID, &blob_v7, Some(5),
+        &storage,
+        SYNC_ID,
+        &blob_v7,
+        Some(5),
     );
     assert!(result.is_ok(), "newer version 7 should succeed: {:?}", result.err());
     assert_eq!(result.unwrap(), 7, "should return signed version 7");
@@ -1297,12 +1261,7 @@ async fn bootstrap_from_snapshot_fail_closed() {
     setup_sync_metadata(&storage, device_a_id);
 
     // Register device A locally (not device X — it remains unknown)
-    register_device(
-        &relay,
-        &storage,
-        device_a_id,
-        &signing_key_a.verifying_key(),
-    );
+    register_device(&relay, &storage, device_a_id, &signing_key_a.verifying_key());
 
     // Build a minimal snapshot envelope signed by device X.
     // We use an empty plaintext — the bootstrap will fail before decryption.
@@ -1356,21 +1315,13 @@ async fn bootstrap_from_snapshot_fail_closed() {
 
     // Bootstrap must fail because device X is unknown and no signed registry
     // is available to resolve it (fail-closed behavior).
-    let result = engine
-        .bootstrap_from_snapshot(SYNC_ID, &key_hierarchy)
-        .await;
+    let result = engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await;
 
-    assert!(
-        result.is_err(),
-        "bootstrap from snapshot by unknown sender should fail (fail closed)"
-    );
+    assert!(result.is_err(), "bootstrap from snapshot by unknown sender should fail (fail closed)");
 
     // Verify the entity store remains empty — no data imported
     let title = entity.get_field("task-1", "title");
-    assert_eq!(
-        title, None,
-        "data from unknown snapshot sender should not be imported"
-    );
+    assert_eq!(title, None, "data from unknown snapshot sender should not be imported");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1492,10 +1443,7 @@ async fn hybrid_batch_roundtrip_with_verified_registry() {
         ml_dsa_b.public_key_bytes(),
         "ML-DSA public key for device B should match after registry import"
     );
-    assert_eq!(
-        info.ml_dsa_key_generation, 0,
-        "ML-DSA generation for device B should be 0"
-    );
+    assert_eq!(info.ml_dsa_key_generation, 0, "ML-DSA generation for device B should be 0");
 
     // Verify device B is now in local storage (imported from the signed registry)
     let device_b_record = storage

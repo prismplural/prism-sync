@@ -47,23 +47,13 @@ async fn test_pairing_create_and_get_bootstrap() {
     let bootstrap = b"test-bootstrap-data";
     let (rid, status) = create_pairing_session(&client, &url, bootstrap).await;
     assert_eq!(status, 201);
-    assert_eq!(
-        rid.len(),
-        32,
-        "rendezvous_id should be 32 hex chars (16 bytes)"
-    );
+    assert_eq!(rid.len(), 32, "rendezvous_id should be 32 hex chars (16 bytes)");
 
     // GET bootstrap
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/bootstrap"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/bootstrap")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&body)
-        .unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(&body).unwrap();
     assert_eq!(decoded, bootstrap);
 }
 
@@ -84,16 +74,8 @@ async fn test_pairing_put_get_slots() {
 
     for (slot_name, slot_data) in &slots {
         // GET before PUT -> 204 (not yet set)
-        let resp = client
-            .get(format!("{url}/v1/pairing/{rid}/{slot_name}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            204,
-            "GET {slot_name} before PUT should be 204"
-        );
+        let resp = client.get(format!("{url}/v1/pairing/{rid}/{slot_name}")).send().await.unwrap();
+        assert_eq!(resp.status(), 204, "GET {slot_name} before PUT should be 204");
 
         // PUT the slot
         let resp = client
@@ -102,23 +84,11 @@ async fn test_pairing_put_get_slots() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            204,
-            "PUT {slot_name} should succeed with 204"
-        );
+        assert_eq!(resp.status(), 204, "PUT {slot_name} should succeed with 204");
 
         // GET after PUT -> 200 with data
-        let resp = client
-            .get(format!("{url}/v1/pairing/{rid}/{slot_name}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            200,
-            "GET {slot_name} after PUT should be 200"
-        );
+        let resp = client.get(format!("{url}/v1/pairing/{rid}/{slot_name}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "GET {slot_name} after PUT should be 200");
         let body = resp.bytes().await.unwrap();
         assert_eq!(body.as_ref(), *slot_data);
     }
@@ -158,11 +128,7 @@ async fn test_pairing_nonexistent_session_returns_404() {
     let fake_rid = "00000000000000000000000000000000";
 
     // GET bootstrap -> 404
-    let resp = client
-        .get(format!("{url}/v1/pairing/{fake_rid}/bootstrap"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{fake_rid}/bootstrap")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 
     // PUT slot -> 404
@@ -175,11 +141,7 @@ async fn test_pairing_nonexistent_session_returns_404() {
     assert_eq!(resp.status(), 404);
 
     // GET slot -> 404
-    let resp = client
-        .get(format!("{url}/v1/pairing/{fake_rid}/init"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{fake_rid}/init")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -191,19 +153,11 @@ async fn test_pairing_delete_session() {
     let (rid, _) = create_pairing_session(&client, &url, b"bootstrap").await;
 
     // DELETE -> 204
-    let resp = client
-        .delete(format!("{url}/v1/pairing/{rid}"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.delete(format!("{url}/v1/pairing/{rid}")).send().await.unwrap();
     assert_eq!(resp.status(), 204);
 
     // GET bootstrap after delete -> 404
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/bootstrap"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/bootstrap")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -283,11 +237,7 @@ async fn test_pairing_expired_session_returns_404() {
     assert_eq!(status, 201);
 
     // Session should be expired already (TTL=0)
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/bootstrap"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/bootstrap")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -427,11 +377,7 @@ async fn test_pairing_rate_limiting_ignores_spoofed_forwarded_headers() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        429,
-        "spoofed forwarded headers must not bypass pairing rate limits"
-    );
+    assert_eq!(resp.status(), 429, "spoofed forwarded headers must not bypass pairing rate limits");
 }
 
 #[tokio::test]
@@ -594,12 +540,8 @@ async fn test_pairing_put_slot_payload_too_large() {
 
     // PUT slot with data exceeding limit
     let big_data = vec![0u8; 128];
-    let resp = client
-        .put(format!("{url}/v1/pairing/{rid}/init"))
-        .body(big_data)
-        .send()
-        .await
-        .unwrap();
+    let resp =
+        client.put(format!("{url}/v1/pairing/{rid}/init")).body(big_data).send().await.unwrap();
     assert_eq!(resp.status(), 413);
 }
 
@@ -613,11 +555,7 @@ async fn test_pairing_full_ceremony_flow() {
     assert_eq!(status, 201);
 
     // 2. Existing device gets bootstrap
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/bootstrap"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/bootstrap")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
     // 3. Existing device puts init
@@ -630,11 +568,7 @@ async fn test_pairing_full_ceremony_flow() {
     assert_eq!(resp.status(), 204);
 
     // 4. Joiner gets init
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/init"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/init")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"pairing-init-blob");
 
@@ -648,16 +582,9 @@ async fn test_pairing_full_ceremony_flow() {
     assert_eq!(resp.status(), 204);
 
     // 6. Existing device gets confirmation
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/confirmation"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/confirmation")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.bytes().await.unwrap().as_ref(),
-        b"joiner-confirmation-blob"
-    );
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"joiner-confirmation-blob");
 
     // 7. Existing device puts credentials
     let resp = client
@@ -669,16 +596,9 @@ async fn test_pairing_full_ceremony_flow() {
     assert_eq!(resp.status(), 204);
 
     // 8. Joiner gets credentials
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/credentials"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/credentials")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.bytes().await.unwrap().as_ref(),
-        b"credential-bundle-blob"
-    );
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"credential-bundle-blob");
 
     // 9. Joiner puts joiner bundle
     let resp = client
@@ -690,27 +610,15 @@ async fn test_pairing_full_ceremony_flow() {
     assert_eq!(resp.status(), 204);
 
     // 10. Existing device gets joiner bundle
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/joiner"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/joiner")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"joiner-bundle-blob");
 
     // 11. Delete session
-    let resp = client
-        .delete(format!("{url}/v1/pairing/{rid}"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.delete(format!("{url}/v1/pairing/{rid}")).send().await.unwrap();
     assert_eq!(resp.status(), 204);
 
     // 12. Verify session is gone
-    let resp = client
-        .get(format!("{url}/v1/pairing/{rid}/bootstrap"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/pairing/{rid}/bootstrap")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 }

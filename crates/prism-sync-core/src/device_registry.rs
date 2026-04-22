@@ -58,9 +58,7 @@ impl DeviceRegistryManager {
                 // gossip. Accept if generation strictly increases (prevents rollback).
                 Self::write_device_record(storage, device)
             }
-            Some(_) => Err(CoreError::DeviceKeyChanged {
-                device_id: device.device_id.clone(),
-            }),
+            Some(_) => Err(CoreError::DeviceKeyChanged { device_id: device.device_id.clone() }),
         }
     }
 
@@ -81,13 +79,11 @@ impl DeviceRegistryManager {
             None => Err(CoreError::Storage(StorageError::Logic(format!(
                 "device {device_id} not in registry"
             )))),
-            Some(r) if r.status == "revoked" => Err(CoreError::Storage(StorageError::Logic(format!(
-                "device {device_id} has been revoked"
-            )))),
+            Some(r) if r.status == "revoked" => Err(CoreError::Storage(StorageError::Logic(
+                format!("device {device_id} has been revoked"),
+            ))),
             Some(r) if r.ed25519_public_key != claimed_ed25519_pk => {
-                Err(CoreError::DeviceKeyChanged {
-                    device_id: device_id.to_string(),
-                })
+                Err(CoreError::DeviceKeyChanged { device_id: device_id.to_string() })
             }
             Some(_) => Ok(()),
         }
@@ -171,10 +167,7 @@ impl DeviceRegistryManager {
                 status: device.status.clone(),
                 registered_at: existing.registered_at,
                 revoked_at: if device.status == "revoked" {
-                    existing
-                        .revoked_at
-                        .or(device.revoked_at)
-                        .or_else(|| Some(chrono::Utc::now()))
+                    existing.revoked_at.or(device.revoked_at).or_else(|| Some(chrono::Utc::now()))
                 } else {
                     None
                 },
@@ -210,9 +203,9 @@ impl DeviceRegistryManager {
     /// An epoch rotation should be triggered after revocation to exclude
     /// the device from future encrypted traffic.
     pub fn revoke_device(storage: &dyn SyncStorage, sync_id: &str, device_id: &str) -> Result<()> {
-        let record = storage
-            .get_device_record(sync_id, device_id)?
-            .ok_or_else(|| CoreError::Storage(StorageError::Logic(format!("device {device_id} not in registry"))))?;
+        let record = storage.get_device_record(sync_id, device_id)?.ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic(format!("device {device_id} not in registry")))
+        })?;
 
         let revoked = DeviceRecord {
             status: "revoked".into(),
@@ -237,9 +230,9 @@ impl DeviceRegistryManager {
         new_generation: u32,
         proof: &MlDsaContinuityProof,
     ) -> Result<()> {
-        let existing = storage
-            .get_device_record(sync_id, device_id)?
-            .ok_or_else(|| CoreError::Storage(StorageError::Logic(format!("device {device_id} not in registry"))))?;
+        let existing = storage.get_device_record(sync_id, device_id)?.ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic(format!("device {device_id} not in registry")))
+        })?;
 
         if existing.status == "revoked" {
             return Err(CoreError::Storage(StorageError::Logic(format!(
@@ -248,21 +241,22 @@ impl DeviceRegistryManager {
         }
 
         if new_generation <= existing.ml_dsa_key_generation {
-            return Err(CoreError::DeviceKeyChanged {
-                device_id: device_id.to_string(),
-            });
+            return Err(CoreError::DeviceKeyChanged { device_id: device_id.to_string() });
         }
 
         // Verify the continuity proof against the stored keys
-        let ed25519_pk: [u8; 32] = existing
-            .ed25519_public_key
-            .clone()
-            .try_into()
-            .map_err(|_| CoreError::Storage(StorageError::Logic("invalid ed25519 pk length in registry".into())))?;
+        let ed25519_pk: [u8; 32] =
+            existing.ed25519_public_key.clone().try_into().map_err(|_| {
+                CoreError::Storage(StorageError::Logic(
+                    "invalid ed25519 pk length in registry".into(),
+                ))
+            })?;
 
-        proof
-            .verify(&ed25519_pk, &existing.ml_dsa_65_public_key)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("continuity proof verification failed: {e}"))))?;
+        proof.verify(&ed25519_pk, &existing.ml_dsa_65_public_key).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!(
+                "continuity proof verification failed: {e}"
+            )))
+        })?;
 
         // Update the device record with the new ML-DSA key
         let updated = DeviceRecord {
@@ -312,28 +306,20 @@ impl DeviceRegistryManager {
         }
         let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap()) as usize;
         if remaining.len() < 4 + ed_len + 4 {
-            return Err(CoreError::Engine(
-                "signed registry artifact truncated (ed25519)".into(),
-            ));
+            return Err(CoreError::Engine("signed registry artifact truncated (ed25519)".into()));
         }
         let ml_len_offset = 4 + ed_len;
-        let ml_len = u32::from_le_bytes(
-            remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap(),
-        ) as usize;
+        let ml_len =
+            u32::from_le_bytes(remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap())
+                as usize;
         let signature_len = ml_len_offset + 4 + ml_len;
         if remaining.len() <= signature_len {
-            return Err(CoreError::Engine(
-                "signed registry artifact missing JSON payload".into(),
-            ));
+            return Err(CoreError::Engine("signed registry artifact missing JSON payload".into()));
         }
 
-        let signature = HybridSignature::from_bytes(&remaining[..signature_len]).map_err(
-            |e| {
-                CoreError::Engine(format!(
-                    "invalid hybrid signature in registry artifact: {e}"
-                ))
-            },
-        )?;
+        let signature = HybridSignature::from_bytes(&remaining[..signature_len]).map_err(|e| {
+            CoreError::Engine(format!("invalid hybrid signature in registry artifact: {e}"))
+        })?;
         let json_bytes = &remaining[signature_len..];
 
         // 3. Build signing data (same domain as relay's verification)
@@ -369,8 +355,7 @@ impl DeviceRegistryManager {
 
         if signer_device_id.is_none() {
             return Err(CoreError::Engine(
-                "registry artifact signature could not be verified against any known device"
-                    .into(),
+                "registry artifact signature could not be verified against any known device".into(),
             ));
         }
 
@@ -529,10 +514,7 @@ mod tests {
             DeviceRegistryManager::verify_device_key(&storage, "sync-1", "dev-a", &[1u8; 32]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("revoked"),
-            "expected 'revoked' error, got: {msg}"
-        );
+        assert!(msg.contains("revoked"), "expected 'revoked' error, got: {msg}");
 
         // Device record still exists (not deleted)
         let record = storage.get_device_record("sync-1", "dev-a").unwrap();
@@ -598,10 +580,7 @@ mod tests {
 
         DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &revoked).unwrap();
 
-        let stored = storage
-            .get_device_record("sync-1", "dev-a")
-            .unwrap()
-            .unwrap();
+        let stored = storage.get_device_record("sync-1", "dev-a").unwrap().unwrap();
         assert_eq!(stored.status, "revoked");
         assert_eq!(stored.ed25519_public_key, original.ed25519_public_key);
         assert_eq!(stored.x25519_public_key, original.x25519_public_key);
@@ -631,10 +610,7 @@ mod tests {
         let active_again = make_device("sync-1", "dev-a", &[1u8; 32]);
         DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &active_again).unwrap();
 
-        let stored = storage
-            .get_device_record("sync-1", "dev-a")
-            .unwrap()
-            .unwrap();
+        let stored = storage.get_device_record("sync-1", "dev-a").unwrap().unwrap();
         assert_eq!(stored.status, "revoked");
     }
 
@@ -682,10 +658,7 @@ mod tests {
         .unwrap();
 
         // Verify the new key is stored
-        let stored = storage
-            .get_device_record("sync-1", device_id)
-            .unwrap()
-            .unwrap();
+        let stored = storage.get_device_record("sync-1", device_id).unwrap().unwrap();
         assert_eq!(stored.ml_dsa_key_generation, 1);
         assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_1.public_key_bytes());
     }
@@ -732,10 +705,7 @@ mod tests {
         );
         assert!(result.is_err(), "tampered proof should be rejected");
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("continuity proof verification failed"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("continuity proof verification failed"), "got: {msg}");
     }
 
     #[test]
@@ -834,12 +804,13 @@ mod tests {
         DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &rotated).unwrap();
 
         // The stored record should still have the OLD key and generation
-        let stored = storage
-            .get_device_record("sync-1", device_id)
-            .unwrap()
-            .unwrap();
+        let stored = storage.get_device_record("sync-1", device_id).unwrap().unwrap();
         assert_eq!(stored.ml_dsa_key_generation, 0, "generation should not be updated");
-        assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_0.public_key_bytes(), "ML-DSA key should not be updated");
+        assert_eq!(
+            stored.ml_dsa_65_public_key,
+            ml_dsa_0.public_key_bytes(),
+            "ML-DSA key should not be updated"
+        );
     }
 
     #[test]
@@ -912,7 +883,12 @@ mod tests {
         let ml_dsa_1 = secret.ml_dsa_65_keypair_v(device_id, 1).unwrap();
 
         let result = DeviceRegistryManager::accept_ml_dsa_rotation(
-            &storage, "sync-1", device_id, &ml_dsa_1.public_key_bytes(), 1, &proof,
+            &storage,
+            "sync-1",
+            device_id,
+            &ml_dsa_1.public_key_bytes(),
+            1,
+            &proof,
         );
         assert!(result.is_err(), "rotation on revoked device should fail");
         let msg = result.unwrap_err().to_string();
@@ -968,12 +944,10 @@ mod tests {
         blob.push(0x04u8); // future version byte — not 0x03
         blob.extend_from_slice(b"some payload that would never be parsed");
 
-        let result =
-            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob, None);
-        assert!(
-            result.is_err(),
-            "future registry version byte should be rejected"
+        let result = DeviceRegistryManager::verify_and_import_signed_registry(
+            &storage, "sync-1", &blob, None,
         );
+        assert!(result.is_err(), "future registry version byte should be rejected");
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("unsupported registry artifact version"),
@@ -1010,11 +984,9 @@ mod tests {
         // Invalid JSON payload
         blob.extend_from_slice(b"not valid json {{{{");
 
-        let result =
-            DeviceRegistryManager::verify_and_import_signed_registry(&storage, "sync-1", &blob, None);
-        assert!(
-            result.is_err(),
-            "blob with invalid content should be rejected without panic"
+        let result = DeviceRegistryManager::verify_and_import_signed_registry(
+            &storage, "sync-1", &blob, None,
         );
+        assert!(result.is_err(), "blob with invalid content should be rejected without panic");
     }
 }

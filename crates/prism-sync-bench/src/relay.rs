@@ -50,10 +50,7 @@ pub(crate) async fn register_device(
     signing_key: &SigningKey,
 ) -> Result<String> {
     // 1. Fetch nonce
-    let nonce_resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await?;
+    let nonce_resp = client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await?;
     if !nonce_resp.status().is_success() {
         return Err(anyhow!("nonce request failed: {}", nonce_resp.status()));
     }
@@ -100,7 +97,12 @@ pub(crate) async fn register_device(
 }
 
 /// Build a minimal valid `SignedBatchEnvelope` JSON for testing.
-pub(crate) fn make_test_envelope(sync_id: &str, device_id: &str, batch_id: &str, epoch: i64) -> Value {
+pub(crate) fn make_test_envelope(
+    sync_id: &str,
+    device_id: &str,
+    batch_id: &str,
+    epoch: i64,
+) -> Value {
     let payload_hash = vec![0u8; 32];
     let signature = vec![0u8; 64];
     let nonce = vec![0u8; 24];

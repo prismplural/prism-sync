@@ -32,12 +32,7 @@ pub struct OpEmitter {
 impl OpEmitter {
     pub fn new(device_id: String, sync_id: String, epoch: i32, last_hlc: Option<Hlc>) -> Self {
         let last_hlc = last_hlc.unwrap_or_else(|| Hlc::zero(&device_id));
-        Self {
-            device_id,
-            sync_id,
-            epoch,
-            last_hlc,
-        }
+        Self { device_id, sync_id, epoch, last_hlc }
     }
 
     /// The most recent HLC assigned by this emitter.
@@ -274,9 +269,7 @@ mod tests {
         let mut emitter = make_emitter();
         let fields = make_fields();
 
-        emitter
-            .emit_create(&storage, "members", "ent-1", &fields, "batch-1")
-            .unwrap();
+        emitter.emit_create(&storage, "members", "ent-1", &fields, "batch-1").unwrap();
 
         let ops = storage.load_batch_ops("batch-1").unwrap();
         assert_eq!(ops.len(), 3);
@@ -308,9 +301,7 @@ mod tests {
         let mut changed = HashMap::new();
         changed.insert("name".to_string(), SyncValue::String("Bob".to_string()));
 
-        emitter
-            .emit_update(&storage, "members", "ent-1", &changed, "batch-2")
-            .unwrap();
+        emitter.emit_update(&storage, "members", "ent-1", &changed, "batch-2").unwrap();
 
         let ops = storage.load_batch_ops("batch-2").unwrap();
         assert_eq!(ops.len(), 1);
@@ -325,9 +316,7 @@ mod tests {
         let hlc_before = emitter.last_hlc().clone();
 
         let empty: HashMap<String, SyncValue> = HashMap::new();
-        emitter
-            .emit_update(&storage, "members", "ent-1", &empty, "batch-empty")
-            .unwrap();
+        emitter.emit_update(&storage, "members", "ent-1", &empty, "batch-empty").unwrap();
 
         // No ops stored
         let ops = storage.load_batch_ops("batch-empty").unwrap();
@@ -342,9 +331,7 @@ mod tests {
         let storage = make_storage();
         let mut emitter = make_emitter();
 
-        emitter
-            .emit_delete(&storage, "members", "ent-1", "batch-3")
-            .unwrap();
+        emitter.emit_delete(&storage, "members", "ent-1", "batch-3").unwrap();
 
         let ops = storage.load_batch_ops("batch-3").unwrap();
         assert_eq!(ops.len(), 1);
@@ -361,25 +348,19 @@ mod tests {
         let mut fields1 = HashMap::new();
         fields1.insert("name".to_string(), SyncValue::String("Alice".to_string()));
 
-        emitter
-            .emit_create(&storage, "members", "ent-1", &fields1, "batch-a")
-            .unwrap();
+        emitter.emit_create(&storage, "members", "ent-1", &fields1, "batch-a").unwrap();
         let hlc_after_create = emitter.last_hlc().clone();
 
         let mut fields2 = HashMap::new();
         fields2.insert("name".to_string(), SyncValue::String("Bob".to_string()));
 
-        emitter
-            .emit_update(&storage, "members", "ent-1", &fields2, "batch-b")
-            .unwrap();
+        emitter.emit_update(&storage, "members", "ent-1", &fields2, "batch-b").unwrap();
         let hlc_after_update = emitter.last_hlc().clone();
 
         // HLC must advance: either timestamp increases or counter increments
         assert!(hlc_after_update > hlc_after_create);
 
-        emitter
-            .emit_delete(&storage, "members", "ent-1", "batch-c")
-            .unwrap();
+        emitter.emit_delete(&storage, "members", "ent-1", "batch-c").unwrap();
         let hlc_after_delete = emitter.last_hlc().clone();
 
         assert!(hlc_after_delete > hlc_after_update);
@@ -394,21 +375,15 @@ mod tests {
         fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
         fields.insert("age".to_string(), SyncValue::Int(25));
 
-        emitter
-            .emit_create(&storage, "members", "ent-1", &fields, "batch-fv")
-            .unwrap();
+        emitter.emit_create(&storage, "members", "ent-1", &fields, "batch-fv").unwrap();
 
         // Both fields should have field versions
-        let fv_name = storage
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap();
+        let fv_name = storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap();
         assert!(fv_name.is_some());
         let fv_name = fv_name.unwrap();
         assert_eq!(fv_name.winning_device_id, "a1b2c3d4e5f6");
 
-        let fv_age = storage
-            .get_field_version("sync-1", "members", "ent-1", "age")
-            .unwrap();
+        let fv_age = storage.get_field_version("sync-1", "members", "ent-1", "age").unwrap();
         assert!(fv_age.is_some());
         let fv_age = fv_age.unwrap();
         assert_eq!(fv_age.winning_device_id, "a1b2c3d4e5f6");
@@ -420,14 +395,10 @@ mod tests {
         let mut changed = HashMap::new();
         changed.insert("name".to_string(), SyncValue::String("Bob".to_string()));
 
-        emitter
-            .emit_update(&storage, "members", "ent-1", &changed, "batch-fv2")
-            .unwrap();
+        emitter.emit_update(&storage, "members", "ent-1", &changed, "batch-fv2").unwrap();
 
-        let fv_name_updated = storage
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .unwrap();
+        let fv_name_updated =
+            storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
 
         // The winning HLC for name should be newer than the original
         assert_ne!(fv_name_updated.winning_hlc, fv_name.winning_hlc);
@@ -439,13 +410,9 @@ mod tests {
         let storage = make_storage();
         let mut emitter = make_emitter();
 
-        emitter
-            .emit_delete(&storage, "members", "ent-1", "batch-del")
-            .unwrap();
+        emitter.emit_delete(&storage, "members", "ent-1", "batch-del").unwrap();
 
-        let fv = storage
-            .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
-            .unwrap();
+        let fv = storage.get_field_version("sync-1", "members", "ent-1", DELETED_FIELD).unwrap();
         assert!(fv.is_some());
         let fv = fv.unwrap();
         assert_eq!(fv.field_name, DELETED_FIELD);
@@ -462,22 +429,16 @@ mod tests {
         fields_a.insert("name".to_string(), SyncValue::String("Alice".to_string()));
         fields_a.insert("age".to_string(), SyncValue::Int(25));
 
-        emitter
-            .emit_create(&storage, "members", "ent-1", &fields_a, "batch-A")
-            .unwrap();
+        emitter.emit_create(&storage, "members", "ent-1", &fields_a, "batch-A").unwrap();
 
         // Batch B: update 1 field
         let mut fields_b = HashMap::new();
         fields_b.insert("name".to_string(), SyncValue::String("Bob".to_string()));
 
-        emitter
-            .emit_update(&storage, "members", "ent-1", &fields_b, "batch-B")
-            .unwrap();
+        emitter.emit_update(&storage, "members", "ent-1", &fields_b, "batch-B").unwrap();
 
         // Batch C: delete
-        emitter
-            .emit_delete(&storage, "members", "ent-1", "batch-C")
-            .unwrap();
+        emitter.emit_delete(&storage, "members", "ent-1", "batch-C").unwrap();
 
         // Verify each batch has correct number of ops
         let ops_a = storage.load_batch_ops("batch-A").unwrap();
@@ -505,9 +466,7 @@ mod tests {
         let mut emitter = make_emitter();
         let fields = make_fields();
 
-        emitter
-            .emit_create(&storage, "members", "ent-1", &fields, "batch-hlc")
-            .unwrap();
+        emitter.emit_create(&storage, "members", "ent-1", &fields, "batch-hlc").unwrap();
 
         let ops = storage.load_batch_ops("batch-hlc").unwrap();
         assert_eq!(ops.len(), 3);
@@ -530,9 +489,7 @@ mod tests {
         fields.insert("active".to_string(), SyncValue::Bool(false));
         fields.insert("note".to_string(), SyncValue::Null);
 
-        emitter
-            .emit_create(&storage, "members", "ent-1", &fields, "batch-enc")
-            .unwrap();
+        emitter.emit_create(&storage, "members", "ent-1", &fields, "batch-enc").unwrap();
 
         let ops = storage.load_batch_ops("batch-enc").unwrap();
 

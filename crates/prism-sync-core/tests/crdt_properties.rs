@@ -29,19 +29,15 @@ use common::*;
 /// Generate a valid HLC string with bounded timestamps and counters.
 fn arb_hlc() -> impl Strategy<Value = (i64, u32, String)> {
     (
-        1000_i64..100_000,    // timestamp range (bounded, avoids overflow)
-        0_u32..100,           // counter range
-        "[a-z]{4}",           // node_id (short, deterministic-length)
+        1000_i64..100_000, // timestamp range (bounded, avoids overflow)
+        0_u32..100,        // counter range
+        "[a-z]{4}",        // node_id (short, deterministic-length)
     )
 }
 
 /// Generate a device_id string.
 fn arb_device_id() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("dev-a".to_string()),
-        Just("dev-b".to_string()),
-        Just("dev-c".to_string()),
-    ]
+    prop_oneof![Just("dev-a".to_string()), Just("dev-b".to_string()), Just("dev-c".to_string()),]
 }
 
 /// Generate an encoded field value.
@@ -65,25 +61,23 @@ fn arb_op() -> impl Strategy<Value = CrdtChange> {
         prop_oneof![Just("title"), Just("done")],
         prop_oneof![Just("t1"), Just("t2")],
     )
-        .prop_map(
-            |((ts, counter, node_id), device_id, value, field, entity_id)| {
-                let hlc_str = format!("{ts}:{counter}:{node_id}");
-                let op_id = format!("tasks:{entity_id}:{field}:{hlc_str}:{device_id}");
-                CrdtChange {
-                    op_id,
-                    batch_id: Some("batch-1".to_string()),
-                    entity_id: entity_id.to_string(),
-                    entity_table: "tasks".to_string(),
-                    field_name: field.to_string(),
-                    encoded_value: value,
-                    client_hlc: hlc_str,
-                    is_delete: false,
-                    device_id,
-                    epoch: 0,
-                    server_seq: None,
-                }
-            },
-        )
+        .prop_map(|((ts, counter, node_id), device_id, value, field, entity_id)| {
+            let hlc_str = format!("{ts}:{counter}:{node_id}");
+            let op_id = format!("tasks:{entity_id}:{field}:{hlc_str}:{device_id}");
+            CrdtChange {
+                op_id,
+                batch_id: Some("batch-1".to_string()),
+                entity_id: entity_id.to_string(),
+                entity_table: "tasks".to_string(),
+                field_name: field.to_string(),
+                encoded_value: value,
+                client_hlc: hlc_str,
+                is_delete: false,
+                device_id,
+                epoch: 0,
+                server_seq: None,
+            }
+        })
 }
 
 /// Generate a batch of 1..8 CrdtChange ops.
@@ -97,10 +91,7 @@ fn arb_op_batch() -> impl Strategy<Value = Vec<CrdtChange>> {
 
 fn test_merge_schema() -> SyncSchema {
     SyncSchema::builder()
-        .entity("tasks", |e| {
-            e.field("title", SyncType::String)
-                .field("done", SyncType::Bool)
-        })
+        .entity("tasks", |e| e.field("title", SyncType::String).field("done", SyncType::Bool))
         .build()
 }
 
@@ -130,9 +121,8 @@ fn merge_outcome(
     let schema = test_merge_schema();
     let merge = MergeEngine::new(schema);
 
-    let winners = merge
-        .determine_winners(ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     let mut outcome: HashMap<(String, String), (String, String, String, String)> = HashMap::new();
     for winner in winners.values() {
@@ -165,9 +155,8 @@ fn merge_sequential(
     let merge = MergeEngine::new(schema);
 
     // First pass: merge ops_a from scratch
-    let winners_a = merge
-        .determine_winners(ops_a, &no_field_versions, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners_a =
+        merge.determine_winners(ops_a, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     // Build field versions from winners_a
     let mut field_versions: HashMap<String, FieldVersion> = HashMap::new();
@@ -194,8 +183,7 @@ fn merge_sequential(
     }
 
     // Collect applied op_ids from winners_a
-    let applied_ops: std::collections::HashSet<String> =
-        winners_a.keys().cloned().collect();
+    let applied_ops: std::collections::HashSet<String> = winners_a.keys().cloned().collect();
 
     // Second pass: merge ops_b against winners_a as persisted state
     let get_fv = |_sync_id: &str,
@@ -210,9 +198,7 @@ fn merge_sequential(
     let is_applied =
         |op_id: &str| -> prism_sync_core::Result<bool> { Ok(applied_ops.contains(op_id)) };
 
-    let winners_b = merge
-        .determine_winners(ops_b, &get_fv, &is_applied, SYNC_ID)
-        .unwrap();
+    let winners_b = merge.determine_winners(ops_b, &get_fv, &is_applied, SYNC_ID).unwrap();
 
     // Build final outcome: start from winners_a, overwrite with winners_b
     let mut outcome: HashMap<(String, String), (String, String, String, String)> = HashMap::new();

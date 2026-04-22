@@ -128,11 +128,7 @@ async fn test_push_and_pull_roundtrip() {
         .sync(SYNC_ID, &key_hierarchy_a, &signing_key_a, Some(&ml_dsa_key_a), device_a_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_a.error.is_none(),
-        "push failed: {:?}",
-        result_a.error
-    );
+    assert!(result_a.error.is_none(), "push failed: {:?}", result_a.error);
     assert_eq!(result_a.pushed, 1, "expected 1 batch pushed");
     assert_eq!(relay.batch_count(), 1, "relay should have 1 batch");
 
@@ -163,12 +159,7 @@ async fn test_push_and_pull_roundtrip() {
         &signing_key_a.verifying_key(),
         &ml_dsa_key_a.public_key_bytes(),
     );
-    register_device(
-        &relay,
-        &storage_b,
-        device_b_id,
-        &signing_key_b.verifying_key(),
-    );
+    register_device(&relay, &storage_b, device_b_id, &signing_key_b.verifying_key());
 
     let engine_b = SyncEngine::new(
         storage_b.clone(),
@@ -182,11 +173,7 @@ async fn test_push_and_pull_roundtrip() {
         .sync(SYNC_ID, &key_hierarchy_b, &signing_key_b, None, device_b_id, 0)
         .await
         .unwrap();
-    assert!(
-        result_b.error.is_none(),
-        "pull failed: {:?}",
-        result_b.error
-    );
+    assert!(result_b.error.is_none(), "pull failed: {:?}", result_b.error);
     assert_eq!(result_b.pulled, 1, "expected 1 batch pulled");
     assert_eq!(result_b.merged, 2, "expected 2 ops merged (title + done)");
 
@@ -217,12 +204,7 @@ async fn test_conflict_resolution() {
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -232,10 +214,9 @@ async fn test_conflict_resolution() {
     );
 
     // Local device wrote title="Local Title" at a recent HLC
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64;
     let hlc_local = Hlc::new(now_ms - 5000, 0, local_device);
 
     // Seed a field_version for the local write so merge sees it as the incumbent
@@ -338,12 +319,7 @@ async fn test_signature_verification() {
     let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     // Register remote device with its REAL public key
     register_device_with_pq(
         &relay,
@@ -400,10 +376,7 @@ async fn test_signature_verification() {
         "Signature failure should skip the batch, not abort sync: {:?}",
         result.error
     );
-    assert_eq!(
-        result.pulled, 1,
-        "Bad batch should still be counted as pulled"
-    );
+    assert_eq!(result.pulled, 1, "Bad batch should still be counted as pulled");
     assert_eq!(result.merged, 0, "Bad batch should NOT be merged");
 }
 
@@ -425,12 +398,7 @@ async fn test_payload_hash_verification() {
     let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -514,10 +482,7 @@ async fn test_payload_hash_verification() {
         .unwrap();
 
     // The pull phase should have failed due to payload hash mismatch
-    assert!(
-        result.error.is_some(),
-        "Expected an error from payload hash mismatch, got success"
-    );
+    assert!(result.error.is_some(), "Expected an error from payload hash mismatch, got success");
     let err_msg = result.error.unwrap();
     assert!(
         err_msg.contains("hash") || err_msg.contains("Hash") || err_msg.contains("payload"),
@@ -543,12 +508,7 @@ async fn test_sync_sends_ack_after_pull() {
     let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -602,10 +562,7 @@ async fn test_sync_sends_ack_after_pull() {
     // Verify ack was called with the injected batch's server_seq
     let acks = relay.ack_calls();
     assert_eq!(acks.len(), 1, "expected exactly 1 ack call");
-    assert_eq!(
-        acks[0], injected_seq,
-        "ack should report the max_server_seq from pull"
-    );
+    assert_eq!(acks[0], injected_seq, "ack should report the max_server_seq from pull");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -626,12 +583,7 @@ async fn test_ack_failure_does_not_abort_sync() {
     let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -681,11 +633,7 @@ async fn test_ack_failure_does_not_abort_sync() {
         .unwrap();
 
     // Sync should succeed despite ack failure
-    assert!(
-        result.error.is_none(),
-        "ack failure should not cause sync error: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "ack failure should not cause sync error: {:?}", result.error);
     assert_eq!(result.pulled, 1, "batch should still be pulled");
     assert_eq!(result.merged, 1, "ops should still be merged");
 }
@@ -708,12 +656,7 @@ async fn test_sync_prunes_with_min_acked_seq() {
     let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
 
     setup_sync_metadata(&storage, local_device);
-    register_device(
-        &relay,
-        &storage,
-        local_device,
-        &signing_key_local.verifying_key(),
-    );
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
     register_device_with_pq(
         &relay,
         &storage,
@@ -818,17 +761,12 @@ async fn test_prune_runs_on_empty_pull() {
         SyncConfig::default(),
     );
 
-    let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0)
-        .await
-        .unwrap();
+    let result =
+        engine.sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0).await.unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
 
     // Verify the old applied_op was pruned
-    assert!(
-        result.pruned > 0,
-        "expected pruning on empty pull with min_acked_seq=10"
-    );
+    assert!(result.pruned > 0, "expected pruning on empty pull with min_acked_seq=10");
 
     // Verify the op is actually gone from storage
     assert!(
@@ -882,18 +820,13 @@ async fn test_no_pruning_without_min_acked_seq() {
         SyncConfig::default(),
     );
 
-    let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0)
-        .await
-        .unwrap();
+    let result =
+        engine.sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0).await.unwrap();
     assert!(result.error.is_none(), "sync failed: {:?}", result.error);
     assert_eq!(result.pruned, 0, "should not prune without min_acked_seq");
 
     // Op should still exist
-    assert!(
-        storage.is_op_applied("keep-me").unwrap(),
-        "op should not have been pruned"
-    );
+    assert!(storage.is_op_applied("keep-me").unwrap(), "op should not have been pruned");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -946,15 +879,10 @@ async fn push_without_ml_dsa_key_errors() {
     );
 
     // Call sync with None for ml_dsa_signing_key — push should fail
-    let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0)
-        .await
-        .unwrap();
+    let result =
+        engine.sync(SYNC_ID, &key_hierarchy, &signing_key, None, device_id, 0).await.unwrap();
 
-    assert!(
-        result.error.is_some(),
-        "Expected an error when pushing without ML-DSA signing key"
-    );
+    assert!(result.error.is_some(), "Expected an error when pushing without ML-DSA signing key");
     let err_msg = result.error.unwrap();
     assert!(
         err_msg.contains("ML-DSA signing key required"),
@@ -1055,11 +983,7 @@ async fn push_uses_current_epoch_not_stored_op_epoch() {
         .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_none(),
-        "push should succeed at re-tagged epoch: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "push should succeed at re-tagged epoch: {:?}", result.error);
     assert_eq!(result.pushed, 1, "expected 1 batch pushed");
     assert_eq!(relay.batch_count(), 1, "relay should have 1 envelope");
 
@@ -1113,10 +1037,7 @@ async fn push_still_fails_when_current_epoch_key_missing() {
         .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
         .await
         .unwrap();
-    assert!(
-        result.error.is_some(),
-        "push must fail when current_epoch key is missing"
-    );
+    assert!(result.error.is_some(), "push must fail when current_epoch key is missing");
     let err = result.error.unwrap();
     assert!(
         err.contains("Missing epoch key for push epoch 2"),
@@ -1172,8 +1093,5 @@ async fn push_honors_max_of_current_and_op_epoch() {
 
     let pulled = relay.pull_changes(0).await.unwrap();
     assert_eq!(pulled.batches.len(), 1);
-    assert_eq!(
-        pulled.batches[0].envelope.epoch, 1,
-        "envelope must be at max(current=0, op=1) = 1"
-    );
+    assert_eq!(pulled.batches[0].envelope.epoch, 1, "envelope must be at max(current=0, op=1) = 1");
 }

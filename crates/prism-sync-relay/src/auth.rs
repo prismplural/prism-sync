@@ -30,10 +30,7 @@ pub(crate) fn timing_safe_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (&x, &y)| acc | (x ^ y))
-        == 0
+    a.iter().zip(b.iter()).fold(0u8, |acc, (&x, &y)| acc | (x ^ y)) == 0
 }
 
 /// Verify an Ed25519 challenge signature.
@@ -105,9 +102,7 @@ pub(crate) fn verify_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    signature
-        .verify_v3(&data, b"device_challenge", &pk_bytes, ml_dsa_public_key)
-        .is_ok()
+    signature.verify_v3(&data, b"device_challenge", &pk_bytes, ml_dsa_public_key).is_ok()
 }
 
 /// Validate that a sync ID is a 64-char hex string (32 bytes).
@@ -125,9 +120,7 @@ pub(crate) fn is_valid_sync_id(sync_id: &str) -> bool {
 pub(crate) fn is_valid_device_id(device_id: &str) -> bool {
     !device_id.is_empty()
         && device_id.len() <= 128
-        && device_id
-            .bytes()
-            .all(|b| (0x20..=0x7e).contains(&b) && b != b'|')
+        && device_id.bytes().all(|b| (0x20..=0x7e).contains(&b) && b != b'|')
 }
 
 /// Build canonical bytes that get signed for destructive HTTP requests.
@@ -236,9 +229,7 @@ pub(crate) fn verify_hybrid_request_signature(
         return false;
     };
 
-    signature
-        .verify_v3(signing_data, b"http_request", &pk_bytes, ml_dsa_public_key)
-        .is_ok()
+    signature.verify_v3(signing_data, b"http_request", &pk_bytes, ml_dsa_public_key).is_ok()
 }
 
 /// Write a length-prefixed field: `(data.len() as u32).to_be_bytes() || data`.
@@ -266,11 +257,7 @@ mod tests {
         let pq_public_key = pq_signing_key.public_key_bytes();
 
         let hybrid_sig = HybridSignature {
-            ed25519_sig: ed_signing_key
-                .into_signing_key()
-                .sign(message)
-                .to_bytes()
-                .to_vec(),
+            ed25519_sig: ed_signing_key.into_signing_key().sign(message).to_bytes().to_vec(),
             ml_dsa_65_sig: pq_signing_key.sign(message),
         };
 
@@ -443,12 +430,7 @@ mod tests {
 
         let (versioned_sig, ed_pk, ml_pk) = make_versioned_hybrid_signature(&data, device_id);
         // V2 signatures are now rejected after sunset
-        assert!(!verify_hybrid_request_signature(
-            &ed_pk,
-            &ml_pk,
-            &data,
-            &versioned_sig,
-        ));
+        assert!(!verify_hybrid_request_signature(&ed_pk, &ml_pk, &data, &versioned_sig,));
     }
 
     fn make_versioned_hybrid_signature_v3(
@@ -468,11 +450,7 @@ mod tests {
         let m_prime = build_hybrid_message_representative(context, message)
             .expect("hardcoded test context should be <= 255 bytes");
         let hybrid_sig = HybridSignature {
-            ed25519_sig: ed_signing_key
-                .into_signing_key()
-                .sign(&m_prime)
-                .to_bytes()
-                .to_vec(),
+            ed25519_sig: ed_signing_key.into_signing_key().sign(&m_prime).to_bytes().to_vec(),
             ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
         };
 
@@ -529,12 +507,7 @@ mod tests {
 
         let (versioned_sig, ed_pk, ml_pk) =
             make_versioned_hybrid_signature_v3(&data, b"http_request", device_id);
-        assert!(verify_hybrid_request_signature(
-            &ed_pk,
-            &ml_pk,
-            &data,
-            &versioned_sig,
-        ));
+        assert!(verify_hybrid_request_signature(&ed_pk, &ml_pk, &data, &versioned_sig,));
     }
 
     #[test]

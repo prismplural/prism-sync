@@ -63,13 +63,7 @@ impl CrdtChange {
         let encoded_value = encoded_value.unwrap_or_else(|| "null".to_string());
 
         let op_id = op_id.unwrap_or_else(|| {
-            Self::default_op_id(
-                &entity_table,
-                &entity_id,
-                &field_name,
-                &client_hlc,
-                &device_id,
-            )
+            Self::default_op_id(&entity_table, &entity_id, &field_name, &client_hlc, &device_id)
         });
 
         Self {

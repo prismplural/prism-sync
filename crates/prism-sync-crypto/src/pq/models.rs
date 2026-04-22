@@ -32,11 +32,7 @@ pub struct CapabilityFlags {
 
 impl Default for CapabilityFlags {
     fn default() -> Self {
-        Self {
-            ml_kem_768: true,
-            ml_dsa_65: true,
-            hybrid_signatures: true,
-        }
+        Self { ml_kem_768: true, ml_dsa_65: true, hybrid_signatures: true }
     }
 }
 

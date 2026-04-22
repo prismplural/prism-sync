@@ -105,10 +105,7 @@ impl WebSocketClient {
         let intentional_close = Arc::clone(&self.intentional_close);
         let connected = Arc::clone(&self.connected);
 
-        eprintln!(
-            "[prism_ws] Starting reconnect loop for {}",
-            redact_url(&ws_url)
-        );
+        eprintln!("[prism_ws] Starting reconnect loop for {}", redact_url(&ws_url));
 
         let handle = background_runtime().spawn(async move {
             let safe_url = redact_url(&ws_url);
@@ -215,9 +212,7 @@ impl WebSocketClient {
         // it omits the header, causing tungstenite to reject the handshake with
         // SubProtocolError::NoSubProtocol. Omitting the header entirely avoids
         // this and matches the relay's behavior.
-        let request = ws_url
-            .into_client_request()
-            .map_err(|e| format!("invalid WS URL: {e}"))?;
+        let request = ws_url.into_client_request().map_err(|e| format!("invalid WS URL: {e}"))?;
 
         let safe_url = redact_url(ws_url);
         eprintln!("[prism_ws] TCP/TLS connecting to {safe_url}");
@@ -238,13 +233,10 @@ impl WebSocketClient {
             "device_id": device_id,
             "token": auth_token,
         });
-        write
-            .send(Message::Text(auth_msg.to_string()))
-            .await
-            .map_err(|e| {
-                eprintln!("[prism_ws] Auth send FAILED: {e}");
-                format!("WS auth send failed: {e}")
-            })?;
+        write.send(Message::Text(auth_msg.to_string())).await.map_err(|e| {
+            eprintln!("[prism_ws] Auth send FAILED: {e}");
+            format!("WS auth send failed: {e}")
+        })?;
 
         eprintln!("[prism_ws] Auth frame sent, waiting for messages");
         debug!("WebSocket auth frame sent");
@@ -317,11 +309,7 @@ impl WebSocketClient {
                 let device_id = parsed["device_id"].as_str().unwrap_or("").to_string();
                 let new_epoch = parsed["new_epoch"].as_i64().unwrap_or(0) as i32;
                 let remote_wipe = parsed["remote_wipe"].as_bool().unwrap_or(false);
-                Some(SyncNotification::DeviceRevoked {
-                    device_id,
-                    new_epoch,
-                    remote_wipe,
-                })
+                Some(SyncNotification::DeviceRevoked { device_id, new_epoch, remote_wipe })
             }
             "epoch_rotated" => {
                 let new_epoch = parsed["new_epoch"].as_i64().unwrap_or(0) as i32;

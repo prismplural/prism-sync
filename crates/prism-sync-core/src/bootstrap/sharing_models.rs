@@ -232,13 +232,7 @@ impl SignedPrekey {
             return None;
         }
 
-        Some(Self {
-            prekey_id,
-            device_id,
-            xwing_ek,
-            created_at,
-            signature,
-        })
+        Some(Self { prekey_id, device_id, xwing_ek, created_at, signature })
     }
 
     /// Create and sign a prekey bundle using the identity's signing keys.
@@ -250,13 +244,7 @@ impl SignedPrekey {
         ed25519_sk: &ed25519_dalek::SigningKey,
         ml_dsa_sk: &impl ml_dsa::signature::Signer<ml_dsa::Signature<ml_dsa::MlDsa65>>,
     ) -> Self {
-        let mut prekey = Self {
-            prekey_id,
-            device_id,
-            xwing_ek,
-            created_at,
-            signature: Vec::new(),
-        };
+        let mut prekey = Self { prekey_id, device_id, xwing_ek, created_at, signature: Vec::new() };
 
         let message = prekey.signed_content_bytes();
         let hybrid_sig = HybridSignature::sign_v3(
@@ -611,11 +599,8 @@ mod tests {
         (ed_sk, ml_sk)
     }
 
-    fn sample_identity_bundle() -> (
-        SharingIdentityBundle,
-        SigningKey,
-        ml_dsa::SigningKey<MlDsa65>,
-    ) {
+    fn sample_identity_bundle() -> (SharingIdentityBundle, SigningKey, ml_dsa::SigningKey<MlDsa65>)
+    {
         let (ed_sk, ml_sk) = test_identity_keys();
         let ed_pk = ed_sk.verifying_key().to_bytes();
         let ml_vk = ml_sk.verifying_key();
@@ -893,10 +878,7 @@ mod tests {
 
         assert_eq!(parsed.version, init.version);
         assert_eq!(parsed.init_id, init.init_id);
-        assert_eq!(
-            parsed.sender_identity.sharing_id,
-            init.sender_identity.sharing_id
-        );
+        assert_eq!(parsed.sender_identity.sharing_id, init.sender_identity.sharing_id);
         assert_eq!(parsed.sender_ephemeral_ek, init.sender_ephemeral_ek);
         assert_eq!(parsed.kem_ciphertext, init.kem_ciphertext);
         assert_eq!(parsed.target_prekey_id, init.target_prekey_id);

@@ -33,32 +33,9 @@ async fn prometheus_metrics(
     let m = &state.metrics;
     let connected = state.connected_device_count().await;
 
-    let db = state.db.clone();
-    let (stored_batches, db_size_bytes, freelist_pages) = tokio::task::spawn_blocking(move || {
-        db.with_read_conn(|conn| {
-            let stored_batches: u64 = conn
-                .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))
-                .unwrap_or(0);
-
-            let db_size_bytes: u64 = conn
-                .query_row(
-                    "SELECT page_count * page_size \
-                         FROM pragma_page_count(), pragma_page_size()",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-
-            let freelist_pages: u64 = conn
-                .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
-                .unwrap_or(0);
-
-            Ok::<(u64, u64, u64), rusqlite::Error>((stored_batches, db_size_bytes, freelist_pages))
-        })
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .unwrap_or((0, 0, 0));
+    let stored_batches = m.cached_stored_batches.load(Ordering::Relaxed);
+    let db_size_bytes = m.cached_db_size_bytes.load(Ordering::Relaxed);
+    let freelist_pages = m.cached_freelist_pages.load(Ordering::Relaxed);
 
     let output = format!(
         "# HELP prism_connected_devices Current WebSocket connections\n\
@@ -79,10 +56,7 @@ async fn prometheus_metrics(
         m.last_cleanup_epoch_secs.load(Ordering::Relaxed),
     );
 
-    Ok((
-        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        output,
-    ))
+    Ok(([("content-type", "text/plain; version=0.0.4; charset=utf-8")], output))
 }
 
 /// Reverse-proxy to node-exporter, gated by the same METRICS_TOKEN.
@@ -103,11 +77,7 @@ async fn node_metrics(
         }
     }
 
-    let base_url = state
-        .config
-        .node_exporter_url
-        .as_deref()
-        .ok_or(AppError::NotFound)?;
+    let base_url = state.config.node_exporter_url.as_deref().ok_or(AppError::NotFound)?;
 
     let url = format!("{base_url}/metrics");
     let body = reqwest::get(&url)
@@ -117,8 +87,5 @@ async fn node_metrics(
         .await
         .map_err(|e| AppError::Internal(format!("node-exporter read failed: {e}")))?;
 
-    Ok((
-        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        body,
-    ))
+    Ok(([("content-type", "text/plain; version=0.0.4; charset=utf-8")], body))
 }

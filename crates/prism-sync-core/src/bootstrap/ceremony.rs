@@ -173,10 +173,8 @@ impl JoinerCeremony {
         confirmation.verify_confirmation(&init.confirmation_mac, BootstrapRole::Initiator)?;
 
         // 8. Store state
-        let sas = SasDisplay {
-            words: confirmation.sas_words(),
-            decimal: confirmation.sas_decimal(),
-        };
+        let sas =
+            SasDisplay { words: confirmation.sas_words(), decimal: confirmation.sas_decimal() };
         self.transcript_hash = Some(transcript_hash);
         self.key_schedule = Some(key_schedule);
         self.confirmation = Some(confirmation);
@@ -398,18 +396,12 @@ impl InitiatorCeremony {
         // 10. Post to relay
         use crate::relay::pairing_relay::PairingSlot;
         relay
-            .put_slot(
-                &token.rendezvous_id_hex(),
-                PairingSlot::Init,
-                &init.to_bytes(),
-            )
+            .put_slot(&token.rendezvous_id_hex(), PairingSlot::Init, &init.to_bytes())
             .await
             .map_err(|e| CoreError::Engine(format!("failed to post PairingInit: {e}")))?;
 
-        let sas = SasDisplay {
-            words: confirmation.sas_words(),
-            decimal: confirmation.sas_decimal(),
-        };
+        let sas =
+            SasDisplay { words: confirmation.sas_words(), decimal: confirmation.sas_decimal() };
 
         Ok((
             Self {
@@ -430,10 +422,8 @@ impl InitiatorCeremony {
 
     /// Verify the joiner's confirmation MAC.
     pub fn verify_joiner_confirmation(&self, mac_bytes: &[u8]) -> Result<()> {
-        self.confirmation
-            .verify_confirmation(mac_bytes, BootstrapRole::Responder)?;
-        self.joiner_confirmation_verified
-            .store(true, Ordering::Release);
+        self.confirmation.verify_confirmation(mac_bytes, BootstrapRole::Responder)?;
+        self.joiner_confirmation_verified.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -611,10 +601,7 @@ mod tests {
         )
         .await;
 
-        let err_msg = result
-            .err()
-            .expect("should fail with commitment mismatch")
-            .to_string();
+        let err_msg = result.err().expect("should fail with commitment mismatch").to_string();
         assert!(
             err_msg.contains("commitment mismatch"),
             "expected commitment mismatch error, got: {err_msg}"
@@ -673,10 +660,7 @@ mod tests {
 
         // Try to decrypt with the wrong joiner's key schedule
         let result = joiner2.decrypt_credentials(&cred_envelope);
-        assert!(
-            result.is_err(),
-            "decryption with wrong key schedule should fail"
-        );
+        assert!(result.is_err(), "decryption with wrong key schedule should fail");
 
         // Correct joiner should still succeed
         let _ = joiner.decrypt_credentials(&cred_envelope).unwrap();

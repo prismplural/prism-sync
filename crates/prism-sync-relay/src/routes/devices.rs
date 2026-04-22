@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{auth, db, errors::AppError, state::AppState};
 
-use super::{register::sync_registry_state_with_current_devices, verify_signed_request, AuthIdentity};
+use super::{
+    register::sync_registry_state_with_current_devices, verify_signed_request, AuthIdentity,
+};
 
 const MAX_WRAPPED_KEY_SIZE: usize = 1536; // bumped from 1024 for hybrid X-Wing rekey artifacts (~1193 bytes)
 const THIRTY_DAYS_SECS: i64 = 30 * 24 * 3600;
@@ -172,10 +174,7 @@ pub async fn post_atomic_revoke(
         return Err(AppError::BadRequest("Invalid device ID"));
     }
 
-    let path = format!(
-        "/v1/sync/{}/devices/{}/revoke",
-        auth.sync_id, target_device_id
-    );
+    let path = format!("/v1/sync/{}/devices/{}/revoke", auth.sync_id, target_device_id);
     verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
 
     if !state.revoke_rate_limiter.check(
@@ -188,9 +187,8 @@ pub async fn post_atomic_revoke(
 
     let body_json: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
-    let new_epoch = body_json["new_epoch"]
-        .as_i64()
-        .ok_or(AppError::BadRequest("Missing new_epoch"))?;
+    let new_epoch =
+        body_json["new_epoch"].as_i64().ok_or(AppError::BadRequest("Missing new_epoch"))?;
     let remote_wipe = body_json["remote_wipe"].as_bool().unwrap_or(false);
     let wrapped_keys = parse_wrapped_keys(&body_json)?;
 
@@ -240,10 +238,7 @@ pub async fn post_atomic_revoke(
         )
         .await;
 
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({ "new_epoch": new_epoch })),
-    ))
+    Ok((StatusCode::OK, Json(serde_json::json!({ "new_epoch": new_epoch }))))
 }
 
 fn do_atomic_revoke(
@@ -256,14 +251,10 @@ fn do_atomic_revoke(
     wrapped_keys: &[(String, Vec<u8>)],
 ) -> Result<i64, AppError> {
     if target_device_id == requester_device_id {
-        return Err(AppError::BadRequest(
-            "Self-deregister must use DELETE /devices/{device_id}",
-        ));
+        return Err(AppError::BadRequest("Self-deregister must use DELETE /devices/{device_id}"));
     }
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let tx = conn.unchecked_transaction().map_err(|e| AppError::Internal(e.to_string()))?;
 
     let current_epoch = db::get_sync_group_epoch(&tx, sync_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -354,9 +345,7 @@ pub async fn post_rekey(
         ));
     }
 
-    let epoch = body_json["epoch"]
-        .as_i64()
-        .ok_or(AppError::BadRequest("Missing epoch"))?;
+    let epoch = body_json["epoch"].as_i64().ok_or(AppError::BadRequest("Missing epoch"))?;
     let wrapped_keys = parse_wrapped_keys(&body_json)?;
 
     let sync_id = auth.sync_id.clone();
@@ -385,10 +374,7 @@ pub async fn post_rekey(
         )
         .await;
 
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({ "new_epoch": new_epoch })),
-    ))
+    Ok((StatusCode::OK, Json(serde_json::json!({ "new_epoch": new_epoch }))))
 }
 
 fn do_rekey(
@@ -398,26 +384,20 @@ fn do_rekey(
     epoch: i64,
     wrapped_keys: &[(String, Vec<u8>)],
 ) -> Result<i64, AppError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let tx = conn.unchecked_transaction().map_err(|e| AppError::Internal(e.to_string()))?;
 
     let needs_rekey = db::get_needs_rekey(&tx, sync_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .unwrap_or(false);
     if needs_rekey {
-        return Err(AppError::Conflict(
-            "Rekey after revocation must use the atomic endpoint",
-        ));
+        return Err(AppError::Conflict("Rekey after revocation must use the atomic endpoint"));
     }
 
     let current_epoch = db::get_sync_group_epoch(&tx, sync_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::NotFound)?;
     if epoch != current_epoch + 1 {
-        return Err(AppError::BadRequest(
-            "Rekey epoch must be current_epoch + 1",
-        ));
+        return Err(AppError::BadRequest("Rekey epoch must be current_epoch + 1"));
     }
 
     let expected_devices = active_survivor_set(&tx, sync_id, None)?;
@@ -475,13 +455,9 @@ fn validate_wrapped_keys(
     }
 
     if seen.len() != expected_devices.len()
-        || expected_devices
-            .iter()
-            .any(|id| !seen.contains(id.as_str()))
+        || expected_devices.iter().any(|id| !seen.contains(id.as_str()))
     {
-        return Err(AppError::BadRequest(
-            "wrapped_keys must match the active device set exactly",
-        ));
+        return Err(AppError::BadRequest("wrapped_keys must match the active device set exactly"));
     }
 
     Ok(())
@@ -496,9 +472,8 @@ fn parse_wrapped_keys(body: &serde_json::Value) -> Result<Vec<(String, Vec<u8>)>
     if let Some(map) = body["wrapped_keys"].as_object() {
         let mut result = Vec::with_capacity(map.len());
         for (device_id, val) in map {
-            let b64_str = val
-                .as_str()
-                .ok_or(AppError::BadRequest("wrapped_keys values must be strings"))?;
+            let b64_str =
+                val.as_str().ok_or(AppError::BadRequest("wrapped_keys values must be strings"))?;
             let bytes = b64
                 .decode(b64_str)
                 .map_err(|_| AppError::BadRequest("Invalid base64 in wrapped_keys"))?;
@@ -599,9 +574,8 @@ pub async fn post_ack(
 
     let body_json: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
-    let server_seq = body_json["server_seq"]
-        .as_i64()
-        .ok_or(AppError::BadRequest("Missing server_seq"))?;
+    let server_seq =
+        body_json["server_seq"].as_i64().ok_or(AppError::BadRequest("Missing server_seq"))?;
 
     let db = state.db.clone();
     let sid = auth.sync_id;
@@ -665,10 +639,7 @@ pub async fn post_rotate_ml_dsa(
         return Err(AppError::Forbidden("device_id mismatch"));
     }
 
-    let path = format!(
-        "/v1/sync/{}/devices/{}/rotate-ml-dsa",
-        auth_identity.sync_id, device_id
-    );
+    let path = format!("/v1/sync/{}/devices/{}/rotate-ml-dsa", auth_identity.sync_id, device_id);
     verify_signed_request(&state, &auth_identity, &headers, "POST", &path, &body)?;
 
     let req: RotateMlDsaRequest =
@@ -688,9 +659,7 @@ pub async fn post_rotate_ml_dsa(
 
     let current_gen = device.ml_dsa_key_generation;
     if req.ml_dsa_key_generation <= current_gen {
-        return Err(AppError::Conflict(
-            "generation must be greater than current",
-        ));
+        return Err(AppError::Conflict("generation must be greater than current"));
     }
 
     // Decode base64 fields
@@ -723,17 +692,16 @@ pub async fn post_rotate_ml_dsa(
         .try_into()
         .map_err(|_| AppError::Internal("invalid ed25519 pk length".into()))?;
 
-    proof
-        .verify(&ed25519_pk, &device.ml_dsa_65_public_key)
-        .map_err(|e| {
-            tracing::warn!("ML-DSA continuity proof verification failed: {e}");
-            AppError::BadRequest("invalid continuity proof")
-        })?;
+    proof.verify(&ed25519_pk, &device.ml_dsa_65_public_key).map_err(|e| {
+        tracing::warn!("ML-DSA continuity proof verification failed: {e}");
+        AppError::BadRequest("invalid continuity proof")
+    })?;
 
     // Decode optional signed registry snapshot
-    let signed_snapshot = req.signed_registry_snapshot.as_ref().and_then(|s| {
-        base64::engine::general_purpose::STANDARD.decode(s).ok()
-    });
+    let signed_snapshot = req
+        .signed_registry_snapshot
+        .as_ref()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
 
     // Apply the rotation with a 30-day grace period for the old key
     let grace_expires_at = db::now_secs() + THIRTY_DAYS_SECS;
@@ -743,7 +711,15 @@ pub async fn post_rotate_ml_dsa(
     let did = device_id.clone();
     let applied = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            Ok(do_rotate_ml_dsa(conn, &sid, &did, &new_pk, new_gen, grace_expires_at, signed_snapshot))
+            Ok(do_rotate_ml_dsa(
+                conn,
+                &sid,
+                &did,
+                &new_pk,
+                new_gen,
+                grace_expires_at,
+                signed_snapshot,
+            ))
         })
     })
     .await
@@ -751,14 +727,10 @@ pub async fn post_rotate_ml_dsa(
     .map_err(|e| AppError::Internal(e.to_string()))??;
 
     if !applied {
-        return Err(AppError::Conflict(
-            "rotation was not applied (concurrent rotation?)",
-        ));
+        return Err(AppError::Conflict("rotation was not applied (concurrent rotation?)"));
     }
 
-    Ok(Json(RotateMlDsaResponse {
-        ml_dsa_key_generation: new_gen,
-    }))
+    Ok(Json(RotateMlDsaResponse { ml_dsa_key_generation: new_gen }))
 }
 
 fn do_rotate_ml_dsa(
@@ -770,8 +742,9 @@ fn do_rotate_ml_dsa(
     grace_expires_at: i64,
     signed_snapshot: Option<Vec<u8>>,
 ) -> Result<bool, AppError> {
-    let applied = db::rotate_device_ml_dsa(conn, sync_id, device_id, new_pk, new_gen, grace_expires_at)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let applied =
+        db::rotate_device_ml_dsa(conn, sync_id, device_id, new_pk, new_gen, grace_expires_at)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if applied {
         // Update registry state so clients can detect the key change

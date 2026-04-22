@@ -15,21 +15,11 @@ pub struct DebugLogEntry {
 
 impl fmt::Display for DebugLogEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}] [{}] {}",
-            self.timestamp.to_rfc3339(),
-            self.category,
-            self.message
-        )?;
+        write!(f, "[{}] [{}] {}", self.timestamp.to_rfc3339(), self.category, self.message)?;
         if self.details != serde_json::Value::Null
             && self.details != serde_json::Value::Object(serde_json::Map::new())
         {
-            write!(
-                f,
-                "\n{}",
-                serde_json::to_string_pretty(&self.details).unwrap_or_default()
-            )?;
+            write!(f, "\n{}", serde_json::to_string_pretty(&self.details).unwrap_or_default())?;
         }
         Ok(())
     }
@@ -50,10 +40,7 @@ pub struct SyncDebugLog {
 impl SyncDebugLog {
     /// Create a new debug log with the given maximum entry count.
     pub fn new(max_entries: usize) -> Self {
-        Self {
-            entries: Mutex::new(VecDeque::with_capacity(max_entries)),
-            max_entries,
-        }
+        Self { entries: Mutex::new(VecDeque::with_capacity(max_entries)), max_entries }
     }
 
     /// Create a debug log with the default max (500 entries).
@@ -106,10 +93,7 @@ impl SyncDebugLog {
 
     /// Clear all entries.
     pub fn clear(&self) {
-        self.entries
-            .lock()
-            .expect("debug log mutex poisoned")
-            .clear();
+        self.entries.lock().expect("debug log mutex poisoned").clear();
     }
 
     /// Export all entries as a human-readable text string.

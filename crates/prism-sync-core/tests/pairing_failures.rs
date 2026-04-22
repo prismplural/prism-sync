@@ -21,8 +21,8 @@ use prism_sync_core::pairing::models::{
 use prism_sync_core::pairing::service::{cleanup_failed_setup, PairingService};
 use prism_sync_core::relay::{MockRelay, SyncRelay};
 use prism_sync_core::secure_store::SecureStore;
-use prism_sync_crypto::DeviceSecret;
 use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::DeviceSecret;
 
 use common::MemorySecureStore;
 
@@ -53,9 +53,8 @@ async fn cleanup_failed_setup_removes_partial_state() {
     assert!(store.get("setup_rollback_marker").unwrap().is_some());
 
     // Run cleanup
-    let cleaned = cleanup_failed_setup(store.as_ref(), relay.as_ref())
-        .await
-        .expect("cleanup should succeed");
+    let cleaned =
+        cleanup_failed_setup(store.as_ref(), relay.as_ref()).await.expect("cleanup should succeed");
 
     assert!(cleaned, "cleanup should report it performed cleanup");
 
@@ -76,9 +75,8 @@ async fn cleanup_no_marker_is_noop() {
     // Store some unrelated data
     store.set("unrelated_key", b"keep me").unwrap();
 
-    let cleaned = cleanup_failed_setup(store.as_ref(), relay.as_ref())
-        .await
-        .expect("cleanup should succeed");
+    let cleaned =
+        cleanup_failed_setup(store.as_ref(), relay.as_ref()).await.expect("cleanup should succeed");
 
     assert!(!cleaned, "cleanup should report no cleanup needed");
     // Unrelated data should still be there
@@ -112,9 +110,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
             None,
             None,
             None,
-            |_sync_id, _device_id, _token| {
-                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
-            },
+            |_sync_id, _device_id, _token| Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>),
         )
         .await
         .expect("create_sync_group should succeed");
@@ -132,32 +128,20 @@ async fn approve_flow_produces_verifiable_pairing_response() {
 
     let device_secret_a =
         DeviceSecret::from_bytes(device_secret_bytes).expect("valid device secret");
-    let signing_key_a = device_secret_a
-        .ed25519_keypair(&device_id_a)
-        .expect("ed25519 keypair");
-    let exchange_key_a = device_secret_a
-        .x25519_keypair(&device_id_a)
-        .expect("x25519 keypair");
+    let signing_key_a = device_secret_a.ed25519_keypair(&device_id_a).expect("ed25519 keypair");
+    let exchange_key_a = device_secret_a.x25519_keypair(&device_id_a).expect("x25519 keypair");
 
     // Device B: generate a PairingRequest
     let device_secret_b = DeviceSecret::generate();
     let device_id_b = "joiner-device-b";
-    let signing_key_b = device_secret_b
-        .ed25519_keypair(device_id_b)
-        .expect("ed25519 keypair");
-    let exchange_key_b = device_secret_b
-        .x25519_keypair(device_id_b)
-        .expect("x25519 keypair");
+    let signing_key_b = device_secret_b.ed25519_keypair(device_id_b).expect("ed25519 keypair");
+    let exchange_key_b = device_secret_b.x25519_keypair(device_id_b).expect("x25519 keypair");
     let ed_signing_key_a = device_secret_a
         .ed25519_keypair(&device_id_a)
         .expect("ed25519 signing key")
         .into_signing_key();
-    let pq_signing_key_a = device_secret_a
-        .ml_dsa_65_keypair(&device_id_a)
-        .expect("ml-dsa keypair");
-    let pq_kem_key_a = device_secret_a
-        .ml_kem_768_keypair(&device_id_a)
-        .expect("ml-kem keypair");
+    let pq_signing_key_a = device_secret_a.ml_dsa_65_keypair(&device_id_a).expect("ml-dsa keypair");
+    let pq_kem_key_a = device_secret_a.ml_kem_768_keypair(&device_id_a).expect("ml-kem keypair");
 
     let _request = PairingRequest {
         device_id: device_id_b.to_string(),
@@ -188,17 +172,20 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     let mut signature = vec![0x03];
     signature.extend_from_slice(&hybrid_invitation.to_bytes());
 
-    let registry_snapshot = SignedRegistrySnapshot::new(vec![RegistrySnapshotEntry {
-        sync_id: sync_id.clone(),
-        device_id: device_id_a.clone(),
-        ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
-        x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
-        ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
-        ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
-        x_wing_public_key: Vec::new(),
-        ml_dsa_key_generation: 0,
-        status: "active".into(),
-    }], 0);
+    let registry_snapshot = SignedRegistrySnapshot::new(
+        vec![RegistrySnapshotEntry {
+            sync_id: sync_id.clone(),
+            device_id: device_id_a.clone(),
+            ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
+            x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
+            x_wing_public_key: Vec::new(),
+            ml_dsa_key_generation: 0,
+            status: "active".into(),
+        }],
+        0,
+    );
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {
@@ -284,9 +271,7 @@ async fn join_from_approval_roundtrip() {
             None,
             None,
             None,
-            |_sync_id, _device_id, _token| {
-                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
-            },
+            |_sync_id, _device_id, _token| Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>),
         )
         .await
         .expect("create_sync_group");
@@ -301,38 +286,20 @@ async fn join_from_approval_roundtrip() {
     let device_id_a = String::from_utf8(store_a.get("device_id").unwrap().unwrap()).unwrap();
     let device_secret_a = DeviceSecret::from_bytes(store_a.get("device_secret").unwrap().unwrap())
         .expect("valid device secret");
-    let signing_key_a = device_secret_a
-        .ed25519_keypair(&device_id_a)
-        .expect("keypair");
-    let exchange_key_a = device_secret_a
-        .x25519_keypair(&device_id_a)
-        .expect("keypair");
-    let ed_signing_key_a = device_secret_a
-        .ed25519_keypair(&device_id_a)
-        .expect("keypair")
-        .into_signing_key();
-    let pq_signing_key_a = device_secret_a
-        .ml_dsa_65_keypair(&device_id_a)
-        .expect("keypair");
-    let pq_kem_key_a = device_secret_a
-        .ml_kem_768_keypair(&device_id_a)
-        .expect("keypair");
+    let signing_key_a = device_secret_a.ed25519_keypair(&device_id_a).expect("keypair");
+    let exchange_key_a = device_secret_a.x25519_keypair(&device_id_a).expect("keypair");
+    let ed_signing_key_a =
+        device_secret_a.ed25519_keypair(&device_id_a).expect("keypair").into_signing_key();
+    let pq_signing_key_a = device_secret_a.ml_dsa_65_keypair(&device_id_a).expect("keypair");
+    let pq_kem_key_a = device_secret_a.ml_kem_768_keypair(&device_id_a).expect("keypair");
 
     // ── Device B: generate PairingRequest ──
     let device_secret_b = DeviceSecret::generate();
     let device_id_b = "device-b-roundtrip";
-    let signing_key_b = device_secret_b
-        .ed25519_keypair(device_id_b)
-        .expect("keypair");
-    let exchange_key_b = device_secret_b
-        .x25519_keypair(device_id_b)
-        .expect("keypair");
-    let pq_signing_key_b = device_secret_b
-        .ml_dsa_65_keypair(device_id_b)
-        .expect("keypair");
-    let pq_kem_key_b = device_secret_b
-        .ml_kem_768_keypair(device_id_b)
-        .expect("keypair");
+    let signing_key_b = device_secret_b.ed25519_keypair(device_id_b).expect("keypair");
+    let exchange_key_b = device_secret_b.x25519_keypair(device_id_b).expect("keypair");
+    let pq_signing_key_b = device_secret_b.ml_dsa_65_keypair(device_id_b).expect("keypair");
+    let pq_kem_key_b = device_secret_b.ml_kem_768_keypair(device_id_b).expect("keypair");
 
     let request = PairingRequest {
         device_id: device_id_b.to_string(),
@@ -367,30 +334,33 @@ async fn join_from_approval_roundtrip() {
     let mut signature = vec![0x03];
     signature.extend_from_slice(&hybrid_invitation.to_bytes());
 
-    let registry_snapshot = SignedRegistrySnapshot::new(vec![
-        RegistrySnapshotEntry {
-            sync_id: sync_id.clone(),
-            device_id: device_id_a.clone(),
-            ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
-            x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
-            ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
-            x_wing_public_key: vec![],
-            ml_dsa_key_generation: 0,
-            status: "active".into(),
-        },
-        RegistrySnapshotEntry {
-            sync_id: sync_id.clone(),
-            device_id: device_id_b.to_string(),
-            ed25519_public_key: signing_key_b.public_key_bytes().to_vec(),
-            x25519_public_key: exchange_key_b.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: pq_signing_key_b.public_key_bytes(),
-            ml_kem_768_public_key: pq_kem_key_b.public_key_bytes(),
-            x_wing_public_key: vec![],
-            ml_dsa_key_generation: 0,
-            status: "active".into(),
-        },
-    ], 1);
+    let registry_snapshot = SignedRegistrySnapshot::new(
+        vec![
+            RegistrySnapshotEntry {
+                sync_id: sync_id.clone(),
+                device_id: device_id_a.clone(),
+                ed25519_public_key: signing_key_a.public_key_bytes().to_vec(),
+                x25519_public_key: exchange_key_a.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: pq_signing_key_a.public_key_bytes(),
+                ml_kem_768_public_key: pq_kem_key_a.public_key_bytes(),
+                x_wing_public_key: vec![],
+                ml_dsa_key_generation: 0,
+                status: "active".into(),
+            },
+            RegistrySnapshotEntry {
+                sync_id: sync_id.clone(),
+                device_id: device_id_b.to_string(),
+                ed25519_public_key: signing_key_b.public_key_bytes().to_vec(),
+                x25519_public_key: exchange_key_b.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: pq_signing_key_b.public_key_bytes(),
+                ml_kem_768_public_key: pq_kem_key_b.public_key_bytes(),
+                x_wing_public_key: vec![],
+                ml_dsa_key_generation: 0,
+                status: "active".into(),
+            },
+        ],
+        1,
+    );
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
     let response = PairingResponse {
@@ -446,9 +416,7 @@ async fn create_sync_group_with_registration_token() {
             None,
             None,
             Some("test-token".into()),
-            |_sync_id, _device_id, _token| {
-                Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>)
-            },
+            |_sync_id, _device_id, _token| Ok(Arc::new(MockRelay::new()) as Arc<dyn SyncRelay>),
         )
         .await
         .expect("create_sync_group with registration_token should succeed");

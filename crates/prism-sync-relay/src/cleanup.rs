@@ -2,14 +2,14 @@ use crate::state::AppState;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
-/// Spawn the background cleanup task. Runs once immediately on startup,
-/// then repeats on the configured interval. Returns the [`JoinHandle`] so
-/// the caller can abort it during graceful shutdown.
+/// Spawn the background cleanup task. Runs on the configured interval
+/// (first cycle fires after one full interval, not immediately).
+/// Returns the [`JoinHandle`] so the caller can abort it during graceful shutdown.
 pub fn spawn_cleanup_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     let interval_secs = state.config.cleanup_interval_secs;
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(interval_secs));
-        ticker.tick().await; // first tick fires immediately
+        ticker.tick().await; // consume the immediate first tick; first cleanup fires after one full interval
         loop {
             ticker.tick().await;
             run_cleanup(&state).await;
@@ -70,10 +70,8 @@ async fn run_cleanup(state: &AppState) {
             )?;
 
             // 10. Delete stale sharing prekeys past the serve-age limit.
-            let stale_prekeys = crate::db::cleanup_stale_sharing_prekeys(
-                conn,
-                config.prekey_serve_max_age_secs,
-            )?;
+            let stale_prekeys =
+                crate::db::cleanup_stale_sharing_prekeys(conn, config.prekey_serve_max_age_secs)?;
 
             // 11. Delete expired or long-consumed sharing-init payloads.
             let expired_sharing_inits = crate::db::cleanup_expired_sharing_init_payloads(conn)?;
@@ -87,13 +85,11 @@ async fn run_cleanup(state: &AppState) {
                 crate::db::cleanup_expired_media(conn, config.media_retention_days)?;
 
             // 14. Reclaim freed pages (incremental auto_vacuum)
-            let freelist_before: i64 = conn
-                .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
-                .unwrap_or(0);
+            let freelist_before: i64 =
+                conn.query_row("PRAGMA freelist_count;", [], |r| r.get(0)).unwrap_or(0);
             conn.execute_batch("PRAGMA incremental_vacuum;")?;
-            let freelist_after: i64 = conn
-                .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
-                .unwrap_or(0);
+            let freelist_after: i64 =
+                conn.query_row("PRAGMA freelist_count;", [], |r| r.get(0)).unwrap_or(0);
             let pages_freed = (freelist_before - freelist_after).max(0) as u64;
             Ok::<_, rusqlite::Error>((
                 nonces,
@@ -140,9 +136,7 @@ async fn run_cleanup(state: &AppState) {
             let stale_media_items: Vec<(String, String)> = stale_group_media_ids
                 .into_iter()
                 .flat_map(|(sync_id, media_ids)| {
-                    media_ids
-                        .into_iter()
-                        .map(move |mid| (sync_id.clone(), mid))
+                    media_ids.into_iter().map(move |mid| (sync_id.clone(), mid))
                 })
                 .collect();
             let stale_media_cleaned =
@@ -156,10 +150,10 @@ async fn run_cleanup(state: &AppState) {
             cleanup_empty_media_dirs(&state.config.media_storage_path, &stale_media_items);
             cleanup_empty_media_dirs(&state.config.media_storage_path, &expired_media);
 
-            state.metrics.last_cleanup_epoch_secs.store(
-                crate::db::now_secs() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            state
+                .metrics
+                .last_cleanup_epoch_secs
+                .store(crate::db::now_secs() as u64, std::sync::atomic::Ordering::Relaxed);
             let expired_media_count = expired_media_cleaned + stale_media_cleaned;
             if nonces > 0
                 || revoked_sessions > 0
@@ -200,20 +194,66 @@ async fn run_cleanup(state: &AppState) {
         Err(e) => tracing::error!("cleanup task panic: {e}"),
     }
 
+    // Refresh DB-state metric cache. Runs after the cleanup block regardless
+    // of whether cleanup succeeded, so metrics don't go stale on cleanup errors.
+    // Keeps previous cached values on query failure rather than storing 0.
+    {
+        let db = state.db.clone();
+        let prev_sb =
+            state.metrics.cached_stored_batches.load(std::sync::atomic::Ordering::Relaxed);
+        let prev_ds = state.metrics.cached_db_size_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let prev_fp =
+            state.metrics.cached_freelist_pages.load(std::sync::atomic::Ordering::Relaxed);
+        match tokio::task::spawn_blocking(move || {
+            db.with_read_conn(|conn| {
+                let stored_batches: u64 = conn
+                    .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("metrics cache: stored_batches query failed: {e}");
+                        prev_sb
+                    });
+                let db_size_bytes: u64 = conn
+                    .query_row(
+                        "SELECT page_count * page_size \
+                         FROM pragma_page_count(), pragma_page_size()",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("metrics cache: db_size_bytes query failed: {e}");
+                        prev_ds
+                    });
+                let freelist_pages: u64 = conn
+                    .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("metrics cache: freelist_pages query failed: {e}");
+                        prev_fp
+                    });
+                Ok::<(u64, u64, u64), rusqlite::Error>((
+                    stored_batches,
+                    db_size_bytes,
+                    freelist_pages,
+                ))
+            })
+        })
+        .await
+        {
+            Ok(Ok((sb, ds, fp))) => {
+                state.metrics.cached_stored_batches.store(sb, std::sync::atomic::Ordering::Relaxed);
+                state.metrics.cached_db_size_bytes.store(ds, std::sync::atomic::Ordering::Relaxed);
+                state.metrics.cached_freelist_pages.store(fp, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(Err(e)) => tracing::warn!("metrics cache refresh failed: {e}"),
+            Err(e) => tracing::warn!("metrics cache refresh task panicked: {e}"),
+        }
+    }
+
     // Prune stale entries from the in-memory nonce rate limiter.
-    state
-        .nonce_rate_limiter
-        .prune_stale(state.config.nonce_rate_window_secs);
-    state
-        .revoke_rate_limiter
-        .prune_stale(state.config.revoke_rate_window_secs);
-    state
-        .signed_request_replay_cache
-        .prune_stale(state.config.signed_request_nonce_window_secs);
+    state.nonce_rate_limiter.prune_stale(state.config.nonce_rate_window_secs);
+    state.revoke_rate_limiter.prune_stale(state.config.revoke_rate_window_secs);
+    state.signed_request_replay_cache.prune_stale(state.config.signed_request_nonce_window_secs);
     state.pairing_rate_limiter.prune_stale(60);
-    state
-        .media_upload_rate_limiter
-        .prune_stale(state.config.media_upload_rate_window_secs);
+    state.media_upload_rate_limiter.prune_stale(state.config.media_upload_rate_window_secs);
 }
 
 /// Collect media_ids for sync groups that are about to be pruned.
@@ -252,9 +292,7 @@ fn cleanup_media_files(storage_path: &str, items: &[(String, String)]) -> usize 
     items
         .iter()
         .filter(|(sync_id, media_id)| {
-            let path = std::path::Path::new(storage_path)
-                .join(sync_id)
-                .join(media_id);
+            let path = std::path::Path::new(storage_path).join(sync_id).join(media_id);
             std::fs::remove_file(&path).is_ok()
         })
         .count()
@@ -295,10 +333,8 @@ fn cleanup_abandoned_brand_new_groups(
            )",
     )?;
 
-    let sync_ids: Vec<String> = stmt
-        .query_map([cutoff], |row| row.get(0))?
-        .filter_map(|row| row.ok())
-        .collect();
+    let sync_ids: Vec<String> =
+        stmt.query_map([cutoff], |row| row.get(0))?.filter_map(|row| row.ok()).collect();
 
     for sync_id in &sync_ids {
         let _ = crate::db::delete_sync_group(conn, sync_id)?;

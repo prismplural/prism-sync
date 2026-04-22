@@ -213,12 +213,7 @@ impl RendezvousToken {
             return None;
         }
 
-        Some(Self {
-            version,
-            rendezvous_id,
-            commitment,
-            relay_url_hint,
-        })
+        Some(Self { version, rendezvous_id, commitment, relay_url_hint })
     }
 
     /// Encode as a deep link URL: `prismsync://pair?d={base64url}`
@@ -231,9 +226,7 @@ impl RendezvousToken {
     pub fn from_url(url: &str) -> Option<Self> {
         // Strip the scheme and path to find the query string
         let query = url.split('?').nth(1)?;
-        let d_value = query
-            .split('&')
-            .find_map(|param| param.strip_prefix("d="))?;
+        let d_value = query.split('&').find_map(|param| param.strip_prefix("d="))?;
         let bytes = URL_SAFE_NO_PAD.decode(d_value).ok()?;
         Self::from_bytes(&bytes)
     }
@@ -715,10 +708,7 @@ mod tests {
         assert_eq!(parsed.inviter_device_id, bundle.inviter_device_id);
         assert_eq!(parsed.inviter_ed25519_pk, bundle.inviter_ed25519_pk);
         assert_eq!(parsed.inviter_ml_dsa_65_pk, bundle.inviter_ml_dsa_65_pk);
-        assert_eq!(
-            parsed.registry_approval_signature,
-            bundle.registry_approval_signature
-        );
+        assert_eq!(parsed.registry_approval_signature, bundle.registry_approval_signature);
         assert_eq!(parsed.registration_token, bundle.registration_token);
     }
 }

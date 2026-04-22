@@ -228,43 +228,28 @@ mod tests {
     #[test]
     fn test_first_contact_accept() {
         let new_bytes = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
-        assert_eq!(
-            evaluate_identity(None, &new_bytes, false),
-            TrustDecision::Accept
-        );
+        assert_eq!(evaluate_identity(None, &new_bytes, false), TrustDecision::Accept);
     }
 
     #[test]
     fn test_same_keys_accept() {
         let bundle = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
-        assert_eq!(
-            evaluate_identity(Some(&bundle), &bundle, false),
-            TrustDecision::Accept
-        );
-        assert_eq!(
-            evaluate_identity(Some(&bundle), &bundle, true),
-            TrustDecision::Accept
-        );
+        assert_eq!(evaluate_identity(Some(&bundle), &bundle, false), TrustDecision::Accept);
+        assert_eq!(evaluate_identity(Some(&bundle), &bundle, true), TrustDecision::Accept);
     }
 
     #[test]
     fn test_changed_keys_unverified_warn() {
         let pinned = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
         let new = make_test_bundle_bytes("alice", 1, &[9u8; 32], &[2u8; 48]);
-        assert_eq!(
-            evaluate_identity(Some(&pinned), &new, false),
-            TrustDecision::WarnKeyChange
-        );
+        assert_eq!(evaluate_identity(Some(&pinned), &new, false), TrustDecision::WarnKeyChange);
     }
 
     #[test]
     fn test_changed_keys_verified_block() {
         let pinned = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
         let new = make_test_bundle_bytes("alice", 1, &[9u8; 32], &[2u8; 48]);
-        assert_eq!(
-            evaluate_identity(Some(&pinned), &new, true),
-            TrustDecision::BlockKeyChange
-        );
+        assert_eq!(evaluate_identity(Some(&pinned), &new, true), TrustDecision::BlockKeyChange);
     }
 
     #[test]
@@ -272,10 +257,7 @@ mod tests {
         // Same keys but different generation — should be detected as change.
         let pinned = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
         let new = make_test_bundle_bytes("alice", 2, &[1u8; 32], &[2u8; 48]);
-        assert_eq!(
-            evaluate_identity(Some(&pinned), &new, false),
-            TrustDecision::WarnKeyChange
-        );
+        assert_eq!(evaluate_identity(Some(&pinned), &new, false), TrustDecision::WarnKeyChange);
     }
 
     #[test]
@@ -283,29 +265,17 @@ mod tests {
         let garbage = vec![0xFF, 0x01]; // too short to parse
         let new = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
         // Unverified → Warn
-        assert_eq!(
-            evaluate_identity(Some(&garbage), &new, false),
-            TrustDecision::WarnKeyChange
-        );
+        assert_eq!(evaluate_identity(Some(&garbage), &new, false), TrustDecision::WarnKeyChange);
         // Verified → Block
-        assert_eq!(
-            evaluate_identity(Some(&garbage), &new, true),
-            TrustDecision::BlockKeyChange
-        );
+        assert_eq!(evaluate_identity(Some(&garbage), &new, true), TrustDecision::BlockKeyChange);
     }
 
     #[test]
     fn test_malformed_new_treated_as_change() {
         let pinned = make_test_bundle_bytes("alice", 1, &[1u8; 32], &[2u8; 48]);
         let garbage = vec![0xFF, 0x01];
-        assert_eq!(
-            evaluate_identity(Some(&pinned), &garbage, false),
-            TrustDecision::WarnKeyChange
-        );
-        assert_eq!(
-            evaluate_identity(Some(&pinned), &garbage, true),
-            TrustDecision::BlockKeyChange
-        );
+        assert_eq!(evaluate_identity(Some(&pinned), &garbage, false), TrustDecision::WarnKeyChange);
+        assert_eq!(evaluate_identity(Some(&pinned), &garbage, true), TrustDecision::BlockKeyChange);
     }
 
     #[test]
@@ -317,10 +287,7 @@ mod tests {
         // Change the last byte of the signature in bundle_b
         let last = bundle_b.len() - 1;
         bundle_b[last] ^= 0xFF;
-        assert_eq!(
-            evaluate_identity(Some(&bundle_a), &bundle_b, true),
-            TrustDecision::Accept
-        );
+        assert_eq!(evaluate_identity(Some(&bundle_a), &bundle_b, true), TrustDecision::Accept);
     }
 
     #[test]

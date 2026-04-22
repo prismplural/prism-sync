@@ -48,10 +48,7 @@ pub(crate) async fn run(
     for handle in reg_handles {
         registered_clients.push(handle.await?);
     }
-    let registered = registered_clients
-        .iter()
-        .filter(|c| c.token.is_some())
-        .count();
+    let registered = registered_clients.iter().filter(|c| c.token.is_some()).count();
     let num_groups = registered; // 1 group per client
     println!(
         "Registered {registered}/{num_clients} devices. Starting benchmark for {}s...",
