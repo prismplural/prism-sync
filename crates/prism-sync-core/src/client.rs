@@ -22,6 +22,7 @@ use crate::engine::{SyncConfig, SyncEngine};
 use crate::error::{CoreError, Result};
 use crate::events::{event_channel, SyncEvent};
 use crate::op_emitter::OpEmitter;
+use crate::recovery::{persist_epoch_cache, persist_epoch_key, KeyHierarchyRecoverer};
 use crate::relay::SyncRelay;
 use crate::schema::{SyncSchema, SyncValue};
 use crate::secure_store::SecureStore;
@@ -113,15 +114,13 @@ impl PrismSyncBuilder {
     /// Validates that all required fields are set and that the relay URL
     /// uses HTTPS (unless insecure transport is explicitly allowed).
     pub fn build(self) -> Result<PrismSync> {
-        let schema = self
-            .schema
-            .ok_or_else(|| CoreError::Schema("schema is required".into()))?;
+        let schema = self.schema.ok_or_else(|| CoreError::Schema("schema is required".into()))?;
         let storage = self
             .storage
             .ok_or_else(|| CoreError::Storage(StorageError::Logic("storage is required".into())))?;
-        let secure_store = self
-            .secure_store
-            .ok_or_else(|| CoreError::Storage(StorageError::Logic("secure_store is required".into())))?;
+        let secure_store = self.secure_store.ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("secure_store is required".into()))
+        })?;
 
         // Validate relay URL transport security
         if let Some(ref url) = self.relay_url {
@@ -207,10 +206,8 @@ impl PrismSync {
     /// and persists the wrapped DEK and salt to the secure store. Also
     /// generates a device secret if none exists.
     pub fn initialize(&mut self, password: &str, secret_key: &[u8]) -> Result<()> {
-        let (wrapped_dek, salt) = self
-            .key_hierarchy
-            .initialize(password, secret_key)
-            .map_err(CoreError::Crypto)?;
+        let (wrapped_dek, salt) =
+            self.key_hierarchy.initialize(password, secret_key).map_err(CoreError::Crypto)?;
 
         self.secure_store.set("wrapped_dek", &wrapped_dek)?;
         self.secure_store.set("dek_salt", &salt)?;
@@ -230,10 +227,9 @@ impl PrismSync {
     /// Reads the wrapped DEK and salt from the secure store, then derives
     /// the DEK using `Argon2id(password + secret_key)`.
     pub fn unlock(&mut self, password: &str, secret_key: &[u8]) -> Result<()> {
-        let wrapped_dek = self
-            .secure_store
-            .get("wrapped_dek")?
-            .ok_or_else(|| CoreError::Storage(StorageError::Logic("no wrapped DEK found".into())))?;
+        let wrapped_dek = self.secure_store.get("wrapped_dek")?.ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("no wrapped DEK found".into()))
+        })?;
         let salt = self
             .secure_store
             .get("dek_salt")?
@@ -261,9 +257,7 @@ impl PrismSync {
         dek_bytes: &[u8],
         device_secret_bytes: &[u8],
     ) -> Result<()> {
-        self.key_hierarchy
-            .restore_from_dek(dek_bytes)
-            .map_err(CoreError::Crypto)?;
+        self.key_hierarchy.restore_from_dek(dek_bytes).map_err(CoreError::Crypto)?;
 
         self.device_secret = Some(
             DeviceSecret::from_bytes(device_secret_bytes.to_vec()).map_err(CoreError::Crypto)?,
@@ -342,17 +336,12 @@ impl PrismSync {
     ) {
         let engine = SyncEngine::new(
             self.storage.clone(),
-            relay,
+            relay.clone(),
             self.entities.clone(),
             self.schema.clone(),
             SyncConfig::default(),
         );
-        self.op_emitter = Some(OpEmitter::new(
-            node_id.clone(),
-            sync_id.clone(),
-            epoch,
-            None,
-        ));
+        self.op_emitter = Some(OpEmitter::new(node_id.clone(), sync_id.clone(), epoch, None));
 
         // Derive and store the device signing keys if a DeviceSecret is available.
         if let Some(ref device_secret) = self.device_secret {
@@ -368,7 +357,20 @@ impl PrismSync {
         self.device_id = Some(node_id);
         self.epoch = Some(epoch);
 
-        self.sync_service.set_engine(engine, sync_id);
+        self.sync_service.set_engine(engine, sync_id.clone());
+        self.sync_service.clear_recoverer();
+        if let Some(device_secret) = self.device_secret.as_ref() {
+            if let Ok(recoverer) = KeyHierarchyRecoverer::new(
+                relay,
+                self.storage.clone(),
+                self.secure_store.clone(),
+                device_secret,
+                sync_id,
+                self.device_id.as_ref().expect("device_id set above").clone(),
+            ) {
+                self.sync_service.set_recoverer(Arc::new(recoverer));
+            }
+        }
     }
 
     /// Update the auto-sync configuration.
@@ -394,9 +396,10 @@ impl PrismSync {
         // Best-effort: recover any epoch keys we might be missing before we
         // attempt a pull. Joiners that registered moments after the
         // initiator's post_rekey (or any device that was offline when an
-        // epoch rotation happened) would otherwise hit
-        // "Missing epoch key for epoch N" as soon as pull_phase encountered
-        // a batch at the rotated epoch, with no in-pull recovery path.
+        // epoch rotation happened) would otherwise surface a pull-time
+        // `CoreError::MissingEpochKey { epoch: N }` as soon as the engine
+        // encountered a batch at the rotated epoch, with no preflight path
+        // to fill in the missing key first.
         // Ignoring the return value is intentional — the method already
         // logs and swallows transient relay/crypto failures so a bad
         // network doesn't block the actual sync.
@@ -410,15 +413,18 @@ impl PrismSync {
         let device_id = self.device_id.as_ref().ok_or_else(|| {
             CoreError::Engine("device_id not set — call configure_engine first".into())
         })?;
-        self.sync_service
-            .sync_now(
-                &self.key_hierarchy,
+        let result = self
+            .sync_service
+            .sync_now_with_recovery(
+                &mut self.key_hierarchy,
                 signing_key,
                 self.device_ml_dsa_signing_key.as_ref(),
                 device_id,
                 self.ml_dsa_key_generation.unwrap_or(0),
             )
-            .await
+            .await;
+        self.apply_recovered_epoch_high_water();
+        result
     }
 
     /// Recover any epoch keys we might be missing from the relay.
@@ -436,8 +442,8 @@ impl PrismSync {
     /// for live WebSocket events, so a device that was offline when the
     /// rotation happened (or a joiner whose WebSocket hadn't connected yet
     /// when the initiator's post_rekey fired) would otherwise stay stuck
-    /// at the pre-rotation epoch and fail the next pull with
-    /// `CoreError::Engine("Missing epoch key for epoch N")`.
+    /// at the pre-rotation epoch and fail the next pull with a typed
+    /// `CoreError::MissingEpochKey { epoch: N }`.
     ///
     /// Best-effort: logs and returns `Ok(())` on any relay, crypto, or
     /// storage failure. Sync still proceeds and the normal error surface
@@ -445,15 +451,24 @@ impl PrismSync {
     async fn catch_up_epoch_keys(&mut self) -> Result<()> {
         let relay = match self.sync_service.relay() {
             Some(r) => r.clone(),
-            None => return Ok(()),
+            None => {
+                tracing::debug!("catch_up_epoch_keys: skipped (no relay configured)");
+                return Ok(());
+            }
         };
         let device_id = match self.device_id.as_deref() {
             Some(d) => d.to_string(),
-            None => return Ok(()),
+            None => {
+                tracing::debug!("catch_up_epoch_keys: skipped (no device_id)");
+                return Ok(());
+            }
         };
         let sync_id = match self.sync_service.sync_id() {
             Some(s) => s.to_string(),
-            None => return Ok(()),
+            None => {
+                tracing::debug!("catch_up_epoch_keys: skipped (no sync_id)");
+                return Ok(());
+            }
         };
         let xwing_key = match self.device_secret.as_ref() {
             Some(ds) => match ds.xwing_keypair(&device_id) {
@@ -466,29 +481,57 @@ impl PrismSync {
                     return Ok(());
                 }
             },
-            None => return Ok(()),
+            None => {
+                tracing::debug!("catch_up_epoch_keys: skipped (no device_secret)");
+                return Ok(());
+            }
         };
 
         let start_epoch = self.epoch.unwrap_or(0) as u32;
         let mut target = start_epoch.saturating_add(1);
         let mut highest_available: u32 = start_epoch;
         let mut relay_attempts = 0u32;
+        let mut iterations = 0u32;
+        let mut terminated_because: &'static str = "scan_budget_exhausted";
+
+        tracing::info!(
+            start_epoch,
+            first_target = target,
+            known_epochs = ?self.key_hierarchy.known_epochs(),
+            sync_id = %sync_id,
+            device_id = %device_id,
+            "catch_up_epoch_keys: entering preflight"
+        );
 
         // Bound the skip scan (devices with many cached epochs) and the
         // relay fetches independently so a misbehaving relay can't hang us
         // and a large key_hierarchy doesn't eat our relay budget.
         for _ in 0..4096 {
+            iterations += 1;
             if relay_attempts >= 32 {
+                terminated_because = "relay_attempt_budget_hit";
                 break;
             }
 
             if self.key_hierarchy.has_epoch_key(target) {
+                tracing::debug!(
+                    epoch = target,
+                    action = "skip",
+                    reason = "already_cached",
+                    "catch_up_epoch_keys: iteration"
+                );
                 highest_available = target;
                 target = target.saturating_add(1);
                 continue;
             }
 
             relay_attempts += 1;
+            tracing::debug!(
+                epoch = target,
+                action = "fetch",
+                relay_attempts,
+                "catch_up_epoch_keys: iteration"
+            );
             match relay.get_rekey_artifact(target as i32, &device_id).await {
                 Ok(Some(_)) => {
                     match crate::epoch::EpochManager::handle_rotation(
@@ -506,14 +549,22 @@ impl PrismSync {
                                 "catch_up_epoch_keys: recovered epoch key"
                             );
                             if let Ok(key) = self.key_hierarchy.epoch_key(target) {
-                                if let Err(e) = self
-                                    .secure_store
-                                    .set(&format!("epoch_key_{target}"), key)
+                                if let Err(e) =
+                                    persist_epoch_key(self.secure_store.as_ref(), target, key)
                                 {
                                     tracing::warn!(
                                         epoch = target,
                                         error = %e,
                                         "catch_up_epoch_keys: failed to persist epoch key"
+                                    );
+                                }
+                                if let Err(e) =
+                                    persist_epoch_cache(self.secure_store.as_ref(), target as i32)
+                                {
+                                    tracing::warn!(
+                                        epoch = target,
+                                        error = %e,
+                                        "catch_up_epoch_keys: failed to persist epoch cache"
                                     );
                                 }
                             }
@@ -526,21 +577,47 @@ impl PrismSync {
                                 error = %e,
                                 "catch_up_epoch_keys: handle_rotation failed"
                             );
+                            terminated_because = "handle_rotation_failed";
                             break;
                         }
                     }
                 }
-                Ok(None) => break, // no more artifacts — we're caught up
+                Ok(None) => {
+                    // No artifact for this epoch. Could mean either (a) we're
+                    // fully caught up, or (b) this device was not a survivor
+                    // of that particular rotation — higher epochs may still
+                    // have artifacts for us. Log prominently so we can tell.
+                    tracing::info!(
+                        epoch = target,
+                        start_epoch,
+                        highest_available,
+                        relay_attempts,
+                        "catch_up_epoch_keys: no artifact at target — terminating scan"
+                    );
+                    terminated_because = "no_artifact";
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!(
                         epoch = target,
                         error = %e,
                         "catch_up_epoch_keys: relay fetch failed"
                     );
+                    terminated_because = "relay_fetch_error";
                     break;
                 }
             }
         }
+
+        tracing::info!(
+            start_epoch,
+            highest_available,
+            relay_attempts,
+            iterations,
+            terminated_because,
+            final_known_epochs = ?self.key_hierarchy.known_epochs(),
+            "catch_up_epoch_keys: exit"
+        );
 
         if (highest_available as i32) > self.epoch.unwrap_or(0) {
             let storage = self.storage.clone();
@@ -552,8 +629,11 @@ impl PrismSync {
                 tx.commit()
             })
             .await;
+            let mut persisted = false;
             match update_result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    persisted = true;
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(
                         error = %e,
@@ -567,7 +647,9 @@ impl PrismSync {
                     );
                 }
             }
-            self.advance_epoch(highest_available as i32);
+            if persisted {
+                self.advance_epoch(highest_available as i32);
+            }
         }
 
         Ok(())
@@ -587,15 +669,18 @@ impl PrismSync {
         let device_id = self.device_id.as_ref().ok_or_else(|| {
             CoreError::Engine("device_id not set — call configure_engine first".into())
         })?;
-        self.sync_service
-            .catch_up_if_stale(
-                &self.key_hierarchy,
+        let result = self
+            .sync_service
+            .catch_up_if_stale_with_recovery(
+                &mut self.key_hierarchy,
                 signing_key,
                 self.device_ml_dsa_signing_key.as_ref(),
                 device_id,
                 self.ml_dsa_key_generation.unwrap_or(0),
             )
-            .await
+            .await;
+        self.apply_recovered_epoch_high_water();
+        result
     }
 
     // ── Snapshot operations ──
@@ -654,9 +739,7 @@ impl PrismSync {
     pub async fn bootstrap_from_snapshot(
         &mut self,
     ) -> Result<(u64, Vec<crate::events::EntityChange>)> {
-        self.sync_service
-            .bootstrap_from_snapshot(&self.key_hierarchy)
-            .await
+        self.sync_service.bootstrap_from_snapshot(&self.key_hierarchy).await
     }
 
     // ── Consumer mutation API ──
@@ -773,12 +856,7 @@ impl PrismSync {
         .await?;
 
         let committed_epoch = relay
-            .revoke_device(
-                target_device_id,
-                remote_wipe,
-                new_epoch as i32,
-                wrapped_keys,
-            )
+            .revoke_device(target_device_id, remote_wipe, new_epoch as i32, wrapped_keys)
             .await
             .map_err(CoreError::from_relay)? as u32;
 
@@ -791,11 +869,15 @@ impl PrismSync {
             let encoded = STANDARD.encode(epoch_key);
             self.secure_store()
                 .set(&format!("epoch_key_{committed_epoch}"), encoded.as_bytes())
-                .map_err(|e| CoreError::Storage(StorageError::Logic(format!("failed to persist epoch key: {e}"))))?;
+                .map_err(|e| {
+                    CoreError::Storage(StorageError::Logic(format!(
+                        "failed to persist epoch key: {e}"
+                    )))
+                })?;
         }
-        self.secure_store()
-            .set("epoch", committed_epoch.to_string().as_bytes())
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("failed to persist epoch: {e}"))))?;
+        self.secure_store().set("epoch", committed_epoch.to_string().as_bytes()).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("failed to persist epoch: {e}")))
+        })?;
 
         // 4. Update local epoch in sync metadata
         let storage = self.storage().clone();
@@ -813,6 +895,15 @@ impl PrismSync {
         self.advance_epoch(committed_epoch as i32);
 
         Ok(committed_epoch)
+    }
+
+    fn apply_recovered_epoch_high_water(&mut self) {
+        let Some(recovered_epoch) = self.sync_service.take_recovered_epoch_high_water() else {
+            return;
+        };
+        if self.epoch.unwrap_or(0) < recovered_epoch as i32 {
+            self.advance_epoch(recovered_epoch as i32);
+        }
     }
 
     /// Advance the runtime epoch after a successful rotation or recovery.
@@ -847,11 +938,7 @@ impl PrismSync {
             .and_then(|sid| self.storage.get_sync_metadata(sid).ok().flatten())
             .and_then(|meta| meta.last_successful_sync_at);
 
-        SyncStatus {
-            syncing: self.sync_service.has_engine(),
-            last_sync,
-            pending_ops,
-        }
+        SyncStatus { syncing: self.sync_service.has_engine(), last_sync, pending_ops }
     }
 
     // ── Accessors ──
@@ -963,10 +1050,7 @@ mod tests {
             Ok(self.0.lock().unwrap().get(key).cloned())
         }
         fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_vec());
+            self.0.lock().unwrap().insert(key.to_string(), value.to_vec());
             Ok(())
         }
         fn delete(&self, key: &str) -> Result<()> {
@@ -1037,7 +1121,9 @@ mod tests {
         ) -> std::result::Result<RotateMlDsaResponse, RelayError> {
             unimplemented!()
         }
-        async fn get_signed_registry(&self) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
+        async fn get_signed_registry(
+            &self,
+        ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(None)
         }
     }
@@ -1249,11 +1335,7 @@ mod tests {
             sync.ml_dsa_signing_key().is_some(),
             "ML-DSA signing key should be derived after configure_engine"
         );
-        assert_eq!(
-            sync.ml_dsa_key_generation(),
-            Some(1),
-            "ML-DSA key generation should be 1"
-        );
+        assert_eq!(sync.ml_dsa_key_generation(), Some(1), "ML-DSA key generation should be 1");
 
         // Test refresh to generation 2
         sync.refresh_ml_dsa_key(2).unwrap();
@@ -1268,20 +1350,12 @@ mod tests {
     fn local_storage_key_fails_without_device_secret() {
         let mut sync = make_sync();
         // Unlock the key hierarchy without setting a device secret by using restore_from_dek
-        sync.key_hierarchy_mut()
-            .restore_from_dek(&[0u8; 32])
-            .unwrap();
+        sync.key_hierarchy_mut().restore_from_dek(&[0u8; 32]).unwrap();
         // device_secret is still None — local_storage_key should return an error about it
         let result = sync.local_storage_key();
-        assert!(
-            result.is_err(),
-            "local_storage_key should fail without device secret"
-        );
+        assert!(result.is_err(), "local_storage_key should fail without device secret");
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("device secret"),
-            "error should mention device secret, got: {msg}"
-        );
+        assert!(msg.contains("device secret"), "error should mention device secret, got: {msg}");
     }
 
     #[test]
@@ -1304,10 +1378,6 @@ mod tests {
         // In-memory storage — rekey is a no-op and should succeed
         let new_key = [0xaau8; 32];
         let result = sync.rekey_db(&new_key);
-        assert!(
-            result.is_ok(),
-            "rekey_db should succeed on in-memory storage: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "rekey_db should succeed on in-memory storage: {:?}", result.err());
     }
 }

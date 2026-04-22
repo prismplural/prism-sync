@@ -23,6 +23,7 @@ pub mod node_id;
 pub mod op_emitter;
 pub mod pairing;
 pub mod pruning;
+mod recovery;
 pub mod relay;
 pub mod runtime;
 pub mod runtime_keys;

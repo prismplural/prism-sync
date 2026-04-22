@@ -10,12 +10,14 @@
 //!   DeviceRevoked, EpochRotated) are translated into sync triggers or
 //!   events
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use rand::Rng;
 
@@ -23,11 +25,14 @@ use crate::client::PrismSync;
 use crate::engine::{SyncEngine, SyncResult};
 use crate::epoch::EpochManager;
 use crate::error::{CoreError, RelayErrorCategory, Result};
-use crate::storage::StorageError;
 use crate::events::{ChangeSet, EntityChange, SyncError, SyncErrorKind, SyncEvent};
+use crate::recovery::{
+    persist_epoch_cache, persist_epoch_key, EpochRecoverer, RecoveryCommitToken,
+};
 use crate::relay::traits::SyncNotification;
 use crate::relay::SyncRelay;
 use crate::runtime::background_runtime;
+use crate::storage::StorageError;
 
 /// Why a sync cycle was triggered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +86,43 @@ impl Default for AutoSyncConfig {
 /// failure, matching `AutoSyncConfig::max_retries` semantics.
 const INNER_RETRY_DELAY: Duration = Duration::from_secs(2);
 const INNER_RETRY_MAX: u32 = 3;
+const MAX_REACTIVE_RECOVERIES_PER_SYNC: usize = 8;
+
+struct ReactiveRecoveryState<'a> {
+    key_hierarchy: &'a mut prism_sync_crypto::KeyHierarchy,
+    attempts: HashSet<u32>,
+    tokens: HashMap<u32, RecoveryCommitToken>,
+    recovered_high_water: Option<u32>,
+}
+
+impl<'a> ReactiveRecoveryState<'a> {
+    fn new(key_hierarchy: &'a mut prism_sync_crypto::KeyHierarchy) -> Self {
+        Self {
+            key_hierarchy,
+            attempts: HashSet::new(),
+            tokens: HashMap::new(),
+            recovered_high_water: None,
+        }
+    }
+
+    fn note_recovered_epoch(&mut self, epoch: u32, token: RecoveryCommitToken) {
+        self.tokens.insert(epoch, token);
+        self.recovered_high_water =
+            Some(self.recovered_high_water.map(|current| current.max(epoch)).unwrap_or(epoch));
+    }
+
+    fn forget_recovered_epoch(&mut self, epoch: u32) -> Option<RecoveryCommitToken> {
+        let token = self.tokens.remove(&epoch);
+        self.recovered_high_water = self.tokens.keys().copied().max();
+        token
+    }
+}
+
+enum RecoveryControl {
+    Retry,
+    ReturnErr(CoreError),
+    NotHandled(CoreError),
+}
 
 /// Apply "full jitter" to a base delay: the actual delay is uniformly
 /// distributed between `base/2` and `base`. This prevents thundering-herd
@@ -93,17 +135,11 @@ pub fn jittered_delay(base: Duration) -> Duration {
 }
 
 fn relay_error_retryable(kind: &RelayErrorCategory) -> bool {
-    matches!(
-        kind,
-        RelayErrorCategory::Network | RelayErrorCategory::Server
-    )
+    matches!(kind, RelayErrorCategory::Network | RelayErrorCategory::Server)
 }
 
 fn sync_error_kind_retryable(kind: &SyncErrorKind) -> bool {
-    matches!(
-        kind,
-        SyncErrorKind::Network | SyncErrorKind::Server | SyncErrorKind::Timeout
-    )
+    matches!(kind, SyncErrorKind::Network | SyncErrorKind::Server | SyncErrorKind::Timeout)
 }
 
 fn sync_error_kind_to_relay_category(kind: &SyncErrorKind) -> RelayErrorCategory {
@@ -139,10 +175,7 @@ fn relay_error_kind_to_sync_error_kind(kind: &RelayErrorCategory) -> SyncErrorKi
 /// classification flows through `SyncErrorKind` instead. Mirrors the
 /// invariant in `engine/mod.rs::populate_result_error`.
 fn relay_error_details(error: &CoreError) -> (Option<String>, Option<bool>) {
-    if let CoreError::Relay {
-        code, remote_wipe, ..
-    } = error
-    {
+    if let CoreError::Relay { code, remote_wipe, .. } = error {
         (code.clone(), *remote_wipe)
     } else {
         (None, None)
@@ -218,19 +251,12 @@ pub fn spawn_notification_handler(
                 SyncNotification::NewData { .. } => {
                     let _ = sync_trigger.send(SyncTrigger::WebSocketNewData).await;
                 }
-                SyncNotification::DeviceRevoked {
-                    device_id,
-                    new_epoch: _,
-                    remote_wipe,
-                } => {
+                SyncNotification::DeviceRevoked { device_id, new_epoch: _, remote_wipe } => {
                     // Emit DeviceRevoked for both self and other-device cases.
                     // When another device is revoked, the epoch update will
                     // arrive later via a separate "epoch_rotated" notification
                     // from the rekey endpoint.
-                    let _ = event_tx.send(SyncEvent::DeviceRevoked {
-                        device_id,
-                        remote_wipe,
-                    });
+                    let _ = event_tx.send(SyncEvent::DeviceRevoked { device_id, remote_wipe });
                 }
                 SyncNotification::EpochRotated { new_epoch } => {
                     // Recover the new epoch key before triggering sync.
@@ -298,10 +324,7 @@ async fn recover_epoch_key(
             }
         },
         None => {
-            tracing::warn!(
-                epoch = new_epoch,
-                "epoch recovery: no device secret available"
-            );
+            tracing::warn!(epoch = new_epoch, "epoch recovery: no device secret available");
             return;
         }
     };
@@ -331,10 +354,7 @@ async fn recover_epoch_key(
     .await
     {
         Ok(()) => {
-            tracing::info!(
-                epoch = new_epoch,
-                "epoch recovery: successfully recovered epoch key"
-            );
+            tracing::info!(epoch = new_epoch, "epoch recovery: successfully recovered epoch key");
             true
         }
         Err(e) => {
@@ -351,17 +371,20 @@ async fn recover_epoch_key(
         return;
     }
 
-    // Persist the epoch key to the secure store (base64-encoded, matching the
-    // bootstrap and rekey write paths so load_epoch_key can always decode once).
+    // Persist the epoch key and epoch cache before we update sync_metadata.
     if let Ok(epoch_key) = guard.key_hierarchy().epoch_key(new_epoch) {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        let store_key = format!("epoch_key_{}", new_epoch);
-        let encoded = STANDARD.encode(epoch_key);
-        if let Err(e) = guard.secure_store().set(&store_key, encoded.as_bytes()) {
+        if let Err(e) = persist_epoch_key(guard.secure_store().as_ref(), new_epoch, epoch_key) {
             tracing::warn!(
                 epoch = new_epoch,
                 error = %e,
                 "epoch recovery: failed to persist epoch key to secure store"
+            );
+        }
+        if let Err(e) = persist_epoch_cache(guard.secure_store().as_ref(), new_epoch as i32) {
+            tracing::warn!(
+                epoch = new_epoch,
+                error = %e,
+                "epoch recovery: failed to persist epoch cache"
             );
         }
     }
@@ -431,12 +454,7 @@ fn build_changeset(entity_changes: &[EntityChange]) -> ChangeSet {
         }
     }
 
-    ChangeSet {
-        created,
-        updated,
-        deleted,
-        entity_changes: entity_changes.to_vec(),
-    }
+    ChangeSet { created, updated, deleted, entity_changes: entity_changes.to_vec() }
 }
 
 /// High-level sync orchestration service.
@@ -445,10 +463,12 @@ fn build_changeset(entity_changes: &[EntityChange]) -> ChangeSet {
 /// retry, event emission, and catch-up-if-stale for app resume.
 pub struct SyncService {
     engine: Option<SyncEngine>,
+    recoverer: Option<Arc<dyn EpochRecoverer>>,
     event_tx: broadcast::Sender<SyncEvent>,
     auto_sync_config: AutoSyncConfig,
     sync_id: Option<String>,
     last_sync_time: Option<Instant>,
+    recovered_epoch_high_water: Option<u32>,
     /// Sender for mutation signals into the auto-sync debounce task.
     /// `None` when auto-sync is disabled.
     auto_sync_tx: Option<mpsc::Sender<()>>,
@@ -465,10 +485,12 @@ impl SyncService {
     pub fn new(event_tx: broadcast::Sender<SyncEvent>) -> Self {
         Self {
             engine: None,
+            recoverer: None,
             event_tx,
             auto_sync_config: AutoSyncConfig::default(),
             sync_id: None,
             last_sync_time: None,
+            recovered_epoch_high_water: None,
             auto_sync_tx: None,
             auto_sync_handle: None,
             notification_trigger_tx: None,
@@ -481,6 +503,14 @@ impl SyncService {
     pub fn set_engine(&mut self, engine: SyncEngine, sync_id: String) {
         self.engine = Some(engine);
         self.sync_id = Some(sync_id);
+    }
+
+    pub(crate) fn set_recoverer(&mut self, recoverer: Arc<dyn EpochRecoverer>) {
+        self.recoverer = Some(recoverer);
+    }
+
+    pub(crate) fn clear_recoverer(&mut self) {
+        self.recoverer = None;
     }
 
     /// Borrow the configured relay, if any.
@@ -546,6 +576,10 @@ impl SyncService {
         self.last_sync_time
     }
 
+    pub fn take_recovered_epoch_high_water(&mut self) -> Option<u32> {
+        self.recovered_epoch_high_water.take()
+    }
+
     /// Returns a clone of the auto-sync mutation sender, if auto-sync is
     /// enabled. Callers (e.g. `PrismSync`) use this to notify the debounce
     /// task after recording mutations.
@@ -576,10 +610,9 @@ impl SyncService {
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
     ) -> Result<()> {
-        let engine = self
-            .engine
-            .as_ref()
-            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync engine not configured".into())))?;
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("sync engine not configured".into()))
+        })?;
         let sync_id = self
             .sync_id
             .as_ref()
@@ -608,18 +641,16 @@ impl SyncService {
         &self,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
     ) -> Result<(u64, Vec<EntityChange>)> {
-        let engine = self
-            .engine
-            .as_ref()
-            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync engine not configured".into())))?;
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("sync engine not configured".into()))
+        })?;
         let sync_id = self
             .sync_id
             .as_ref()
             .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync_id not set".into())))?;
 
-        let (count, entity_changes) = engine
-            .bootstrap_from_snapshot(sync_id, key_hierarchy)
-            .await?;
+        let (count, entity_changes) =
+            engine.bootstrap_from_snapshot(sync_id, key_hierarchy).await?;
 
         // Emit RemoteChanges event so Dart's drift sync adapter populates
         // the consumer database from the snapshot data.
@@ -659,37 +690,79 @@ impl SyncService {
         device_id: &str,
         ml_dsa_key_generation: u32,
     ) -> Result<SyncResult> {
-        let engine = self
-            .engine
-            .as_ref()
-            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync engine not configured".into())))?;
+        self.sync_now_impl(
+            Some(key_hierarchy),
+            None,
+            signing_key,
+            ml_dsa_signing_key,
+            device_id,
+            ml_dsa_key_generation,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self, key_hierarchy, signing_key, ml_dsa_signing_key), err)]
+    pub(crate) async fn sync_now_with_recovery(
+        &mut self,
+        key_hierarchy: &mut prism_sync_crypto::KeyHierarchy,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
+        device_id: &str,
+        ml_dsa_key_generation: u32,
+    ) -> Result<SyncResult> {
+        self.sync_now_impl(
+            None,
+            Some(ReactiveRecoveryState::new(key_hierarchy)),
+            signing_key,
+            ml_dsa_signing_key,
+            device_id,
+            ml_dsa_key_generation,
+        )
+        .await
+    }
+
+    async fn sync_now_impl(
+        &mut self,
+        read_only_key_hierarchy: Option<&prism_sync_crypto::KeyHierarchy>,
+        mut reactive_recovery: Option<ReactiveRecoveryState<'_>>,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
+        device_id: &str,
+        ml_dsa_key_generation: u32,
+    ) -> Result<SyncResult> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("sync engine not configured".into()))
+        })?;
         let sync_id = self
             .sync_id
             .as_ref()
             .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync_id not set".into())))?;
 
+        self.recovered_epoch_high_water = None;
         let _ = self.event_tx.send(SyncEvent::SyncStarted);
 
         let mut attempts = 0u32;
-
-        // Holds the last observed failure from an `Ok(result_with_error)`
-        // so we can surface a synthetic `Err` on exhausted retries.
         let mut last_result_with_error: Option<SyncResult> = None;
 
         loop {
+            let sync_key_hierarchy = match reactive_recovery.as_mut() {
+                Some(state) => &*state.key_hierarchy,
+                None => read_only_key_hierarchy.expect("read-only key hierarchy missing"),
+            };
             let outcome = engine
-                .sync(sync_id, key_hierarchy, signing_key, ml_dsa_signing_key, device_id, ml_dsa_key_generation)
+                .sync(
+                    sync_id,
+                    sync_key_hierarchy,
+                    signing_key,
+                    ml_dsa_signing_key,
+                    device_id,
+                    ml_dsa_key_generation,
+                )
                 .await;
 
-            // Compute a shared (retryable, error_kind) signal from either
-            // `Ok(result_with_error)` or `Err(e)`, so both arms flow
-            // through the same retry decision and event emission paths.
             match outcome {
                 Ok(result) => {
                     if let Some(err_kind) = result.error_kind.clone() {
-                        // Engine converted a transport error into a populated
-                        // SyncResult. Decide whether to retry based on the
-                        // structured kind.
                         let retryable = sync_error_kind_retryable(&err_kind);
                         attempts += 1;
                         if retryable && attempts <= INNER_RETRY_MAX {
@@ -698,10 +771,6 @@ impl SyncService {
                             continue;
                         }
 
-                        // Exhausted — route through the shared terminal
-                        // failure helper. Synthetic `CoreError::Relay` is
-                        // built from the fields the engine already copied
-                        // onto the result via `populate_result_error`.
                         let message = result
                             .error
                             .clone()
@@ -715,6 +784,7 @@ impl SyncService {
                             remote_wipe: result.remote_wipe,
                             source: None,
                         };
+                        self.finish_recovery_tracking(reactive_recovery.as_ref());
                         return self.emit_final_failure(
                             result,
                             err_kind,
@@ -725,38 +795,38 @@ impl SyncService {
                         );
                     }
 
-                    // Genuine success — no error in the result.
                     self.last_sync_time = Some(Instant::now());
-
-                    // Emit RemoteChanges event with full entity data if
-                    // any remote changes were merged during this cycle.
                     if !result.entity_changes.is_empty() {
                         let changeset = build_changeset(&result.entity_changes);
                         let _ = self.event_tx.send(SyncEvent::RemoteChanges(changeset));
                     }
 
+                    self.finish_recovery_tracking(reactive_recovery.as_ref());
                     let _ = self.event_tx.send(SyncEvent::SyncCompleted(result.clone()));
                     return Ok(result);
                 }
-                Err(e) => {
-                    let retryable = match &e {
+                Err(error) => {
+                    let error = match self
+                        .handle_reactive_recovery(error, reactive_recovery.as_mut())
+                        .await
+                    {
+                        RecoveryControl::Retry => continue,
+                        RecoveryControl::ReturnErr(error) | RecoveryControl::NotHandled(error) => {
+                            error
+                        }
+                    };
+
+                    let retryable = match &error {
                         CoreError::Relay { kind, .. } => relay_error_retryable(kind),
                         _ => false,
                     };
 
                     attempts += 1;
                     if retryable && attempts <= INNER_RETRY_MAX {
-                        // Stash a synthesized result-with-error so that on
-                        // final failure we still emit a SyncCompleted event
-                        // if all subsequent attempts also return Err. This
-                        // keeps the UI's isSyncing flag in sync even when
-                        // the engine hard-errors. Copy the structured
-                        // error code / remote_wipe too so the final
-                        // SyncCompleted/Error pair carries them.
-                        let (stash_code, stash_wipe) = relay_error_details(&e);
+                        let (stash_code, stash_wipe) = relay_error_details(&error);
                         last_result_with_error = Some(SyncResult {
-                            error_kind: Some(crate::events::classify_core_error(&e)),
-                            error: Some(e.to_string()),
+                            error_kind: Some(crate::events::classify_core_error(&error)),
+                            error: Some(error.to_string()),
                             error_code: stash_code,
                             remote_wipe: stash_wipe,
                             ..SyncResult::default()
@@ -765,37 +835,90 @@ impl SyncService {
                         continue;
                     }
 
-                    // ALL terminal Err paths — including `device_revoked` —
-                    // go through the shared `emit_final_failure` helper so
-                    // the `SyncCompleted -> Error -> DeviceRevoked`
-                    // ordering is enforced by construction. Previously the
-                    // `device_revoked` path returned early without emitting
-                    // `SyncCompleted`, which left the Dart UI stuck in
-                    // `isSyncing: true` on the Err branch (Fix 3 of the
-                    // 2026-04-11 robustness plan).
-                    let error_kind = crate::events::classify_core_error(&e);
-                    let (code, remote_wipe) = relay_error_details(&e);
-                    let message = e.to_string();
-                    let synthetic_result = last_result_with_error
-                        .take()
-                        .unwrap_or_else(|| SyncResult {
+                    let error_kind = crate::events::classify_core_error(&error);
+                    let (code, remote_wipe) = relay_error_details(&error);
+                    let message = error.to_string();
+                    let synthetic_result =
+                        last_result_with_error.take().unwrap_or_else(|| SyncResult {
                             error_kind: Some(error_kind.clone()),
                             error: Some(message.clone()),
                             error_code: code.clone(),
                             remote_wipe,
                             ..SyncResult::default()
                         });
+                    self.finish_recovery_tracking(reactive_recovery.as_ref());
                     return self.emit_final_failure(
                         synthetic_result,
                         error_kind,
                         retryable,
                         message,
-                        e,
+                        error,
                         device_id,
                     );
                 }
             }
         }
+    }
+
+    async fn handle_reactive_recovery(
+        &self,
+        error: CoreError,
+        reactive_recovery: Option<&mut ReactiveRecoveryState<'_>>,
+    ) -> RecoveryControl {
+        let Some(state) = reactive_recovery else {
+            return RecoveryControl::NotHandled(error);
+        };
+        let Some(recoverer) = self.recoverer.as_ref() else {
+            return RecoveryControl::NotHandled(error);
+        };
+
+        match error {
+            CoreError::MissingEpochKey { epoch } => {
+                if state.attempts.len() >= MAX_REACTIVE_RECOVERIES_PER_SYNC {
+                    return RecoveryControl::ReturnErr(CoreError::Engine(
+                        "reactive epoch recovery budget exhausted".into(),
+                    ));
+                }
+                if !state.attempts.insert(epoch) {
+                    return RecoveryControl::ReturnErr(CoreError::MissingEpochKey { epoch });
+                }
+
+                let key_bytes = match recoverer.recover(epoch).await {
+                    Ok(key_bytes) => key_bytes,
+                    Err(error) => return RecoveryControl::ReturnErr(error),
+                };
+                state.key_hierarchy.store_epoch_key(epoch, Zeroizing::new(key_bytes.to_vec()));
+
+                match recoverer.commit_recovered_epoch(epoch, &key_bytes).await {
+                    Ok(token) => {
+                        state.note_recovered_epoch(epoch, token);
+                        RecoveryControl::Retry
+                    }
+                    Err(error) => {
+                        state.key_hierarchy.remove_epoch_key(epoch);
+                        RecoveryControl::ReturnErr(error)
+                    }
+                }
+            }
+            CoreError::DecryptFailed { epoch, source } => {
+                let Some(token) = state.forget_recovered_epoch(epoch) else {
+                    return RecoveryControl::NotHandled(CoreError::DecryptFailed { epoch, source });
+                };
+                state.key_hierarchy.remove_epoch_key(epoch);
+                match recoverer.rollback_recovered_epoch(epoch, token).await {
+                    Ok(()) => {
+                        RecoveryControl::ReturnErr(CoreError::DecryptFailed { epoch, source })
+                    }
+                    Err(error) => RecoveryControl::ReturnErr(error),
+                }
+            }
+            other => RecoveryControl::NotHandled(other),
+        }
+    }
+
+    fn finish_recovery_tracking(&mut self, reactive_recovery: Option<&ReactiveRecoveryState<'_>>) {
+        self.recovered_epoch_high_water =
+            reactive_recovery.and_then(|state| state.recovered_high_water);
     }
 
     /// Shared terminal-failure emission helper for `sync_now`.
@@ -833,13 +956,9 @@ impl SyncService {
         // Derive revocation metadata from the terminal error first (fresh),
         // then from the result (may be stashed from a prior retry iteration).
         let (err_code, err_wipe) = relay_error_details(&err_to_return);
-        let is_revoked = err_code
-            .as_deref()
-            .or(result.error_code.as_deref())
-            == Some("device_revoked");
-        let remote_wipe_flag = err_wipe
-            .or(result.remote_wipe)
-            .unwrap_or(false);
+        let is_revoked =
+            err_code.as_deref().or(result.error_code.as_deref()) == Some("device_revoked");
+        let remote_wipe_flag = err_wipe.or(result.remote_wipe).unwrap_or(false);
         // For the Error event payload, prefer the terminal error's code and
         // wipe, falling back to the result's values.
         let code_for_error = err_code.or(result.error_code.clone());
@@ -889,7 +1008,38 @@ impl SyncService {
             }
         }
         let _ = self
-            .sync_now(key_hierarchy, signing_key, ml_dsa_signing_key, device_id, ml_dsa_key_generation)
+            .sync_now(
+                key_hierarchy,
+                signing_key,
+                ml_dsa_signing_key,
+                device_id,
+                ml_dsa_key_generation,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn catch_up_if_stale_with_recovery(
+        &mut self,
+        key_hierarchy: &mut prism_sync_crypto::KeyHierarchy,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
+        device_id: &str,
+        ml_dsa_key_generation: u32,
+    ) -> Result<()> {
+        if let Some(last) = self.last_sync_time {
+            if last.elapsed() < Duration::from_secs(5) {
+                return Ok(());
+            }
+        }
+        let _ = self
+            .sync_now_with_recovery(
+                key_hierarchy,
+                signing_key,
+                ml_dsa_signing_key,
+                device_id,
+                ml_dsa_key_generation,
+            )
             .await?;
         Ok(())
     }
@@ -1118,10 +1268,8 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<SyncEvent>(16);
         let mut service = SyncService::new(event_tx);
 
-        let trigger_rx = service.set_auto_sync(AutoSyncConfig {
-            enabled: false,
-            ..Default::default()
-        });
+        let trigger_rx =
+            service.set_auto_sync(AutoSyncConfig { enabled: false, ..Default::default() });
         assert!(trigger_rx.is_none());
         assert!(service.auto_sync_tx.is_none());
     }
@@ -1136,9 +1284,7 @@ mod tests {
 
     #[test]
     fn relay_error_category_device_identity_mismatch_is_not_retryable() {
-        assert!(!relay_error_retryable(
-            &RelayErrorCategory::DeviceIdentityMismatch
-        ));
+        assert!(!relay_error_retryable(&RelayErrorCategory::DeviceIdentityMismatch));
     }
 
     #[test]
@@ -1153,10 +1299,7 @@ mod tests {
             source: None,
         };
 
-        assert_eq!(
-            relay_error_details(&error),
-            (Some("device_revoked".into()), Some(true))
-        );
+        assert_eq!(relay_error_details(&error), (Some("device_revoked".into()), Some(true)));
     }
 
     /// `DeviceKeyChanged` is a LOCAL engine error, not a relay response.
@@ -1166,9 +1309,7 @@ mod tests {
     /// instead. Regression guard for Fix 4 of the 2026-04-11 plan.
     #[test]
     fn relay_error_details_returns_none_for_device_key_changed() {
-        let error = CoreError::DeviceKeyChanged {
-            device_id: "dev-a".into(),
-        };
+        let error = CoreError::DeviceKeyChanged { device_id: "dev-a".into() };
 
         assert_eq!(relay_error_details(&error), (None, None));
     }
@@ -1179,6 +1320,15 @@ mod tests {
     fn relay_error_details_returns_none_for_local_errors() {
         let engine_err = CoreError::Engine("missing epoch key".into());
         assert_eq!(relay_error_details(&engine_err), (None, None));
+
+        let missing_epoch_err = CoreError::MissingEpochKey { epoch: 7 };
+        assert_eq!(relay_error_details(&missing_epoch_err), (None, None));
+
+        let decrypt_err = CoreError::DecryptFailed {
+            epoch: 7,
+            source: prism_sync_crypto::CryptoError::DecryptionFailed("bad ciphertext".into()),
+        };
+        assert_eq!(relay_error_details(&decrypt_err), (None, None));
 
         let storage_err = CoreError::Storage(StorageError::Logic("tx aborted".into()));
         assert_eq!(relay_error_details(&storage_err), (None, None));
@@ -1222,10 +1372,8 @@ mod tests {
             .iter()
             .position(|e| matches!(e, SyncEvent::SyncCompleted(_)))
             .expect("must emit SyncCompleted");
-        let error_idx = events
-            .iter()
-            .position(|e| matches!(e, SyncEvent::Error(_)))
-            .expect("must emit Error");
+        let error_idx =
+            events.iter().position(|e| matches!(e, SyncEvent::Error(_))).expect("must emit Error");
         assert!(
             completed_idx < error_idx,
             "SyncCompleted must precede Error (isSyncing reset): events={events:?}"
@@ -1274,24 +1422,16 @@ mod tests {
             .iter()
             .position(|e| matches!(e, SyncEvent::SyncCompleted(_)))
             .expect("must emit SyncCompleted");
-        let error_idx = events
-            .iter()
-            .position(|e| matches!(e, SyncEvent::Error(_)))
-            .expect("must emit Error");
+        let error_idx =
+            events.iter().position(|e| matches!(e, SyncEvent::Error(_))).expect("must emit Error");
         let revoked_idx = events
             .iter()
             .position(|e| matches!(e, SyncEvent::DeviceRevoked { .. }))
             .expect("must emit DeviceRevoked for device_revoked code");
 
         // Ordering: SyncCompleted -> Error -> DeviceRevoked.
-        assert!(
-            completed_idx < error_idx,
-            "SyncCompleted must precede Error: events={events:?}"
-        );
-        assert!(
-            error_idx < revoked_idx,
-            "Error must precede DeviceRevoked: events={events:?}"
-        );
+        assert!(completed_idx < error_idx, "SyncCompleted must precede Error: events={events:?}");
+        assert!(error_idx < revoked_idx, "Error must precede DeviceRevoked: events={events:?}");
 
         // Payload checks.
         if let SyncEvent::Error(err) = &events[error_idx] {
@@ -1299,11 +1439,7 @@ mod tests {
             assert_eq!(err.code.as_deref(), Some("device_revoked"));
             assert_eq!(err.remote_wipe, Some(true));
         }
-        if let SyncEvent::DeviceRevoked {
-            device_id,
-            remote_wipe,
-        } = &events[revoked_idx]
-        {
+        if let SyncEvent::DeviceRevoked { device_id, remote_wipe } = &events[revoked_idx] {
             assert_eq!(device_id, "device-42");
             assert!(*remote_wipe);
         }
@@ -1343,9 +1479,7 @@ mod tests {
 
         let events = drain_events(&mut event_rx);
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, SyncEvent::DeviceRevoked { .. })),
+            !events.iter().any(|e| matches!(e, SyncEvent::DeviceRevoked { .. })),
             "no DeviceRevoked event for non-revoked codes: {events:?}"
         );
     }
@@ -1396,14 +1530,8 @@ mod tests {
         let revoked = events
             .iter()
             .find(|e| matches!(e, SyncEvent::DeviceRevoked { .. }))
-            .expect(
-                "must emit DeviceRevoked even when stashed result lacks code: {events:?}"
-            );
-        if let SyncEvent::DeviceRevoked {
-            device_id,
-            remote_wipe,
-        } = revoked
-        {
+            .expect("must emit DeviceRevoked even when stashed result lacks code: {events:?}");
+        if let SyncEvent::DeviceRevoked { device_id, remote_wipe } = revoked {
             assert_eq!(device_id, "device-42");
             assert!(*remote_wipe, "remote_wipe from terminal error must propagate");
         }

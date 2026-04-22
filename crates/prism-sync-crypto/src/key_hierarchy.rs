@@ -36,11 +36,7 @@ impl Drop for KeyHierarchy {
 
 impl KeyHierarchy {
     pub fn new() -> Self {
-        Self {
-            unlocked: false,
-            dek: Zeroizing::new(Vec::new()),
-            epoch_keys: HashMap::new(),
-        }
+        Self { unlocked: false, dek: Zeroizing::new(Vec::new()), epoch_keys: HashMap::new() }
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -143,14 +139,11 @@ impl KeyHierarchy {
     /// Epoch 0 is derived from DEK. Others must be stored via `store_epoch_key`.
     pub fn epoch_key(&self, epoch: u32) -> Result<&[u8]> {
         self.require_unlocked()?;
-        self.epoch_keys
-            .get(&epoch)
-            .map(|k| k.as_slice())
-            .ok_or_else(|| {
-                CryptoError::InvalidKeyMaterial(format!(
-                    "epoch {epoch} key not available — must be stored via store_epoch_key()"
-                ))
-            })
+        self.epoch_keys.get(&epoch).map(|k| k.as_slice()).ok_or_else(|| {
+            CryptoError::InvalidKeyMaterial(format!(
+                "epoch {epoch} key not available — must be stored via store_epoch_key()"
+            ))
+        })
     }
 
     /// Store an epoch key received during rekey.
@@ -159,18 +152,27 @@ impl KeyHierarchy {
         self.epoch_keys.insert(epoch, key);
     }
 
+    /// Remove a cached epoch key. Removed key material is zeroized on drop.
+    pub fn remove_epoch_key(&mut self, epoch: u32) {
+        self.epoch_keys.remove(&epoch);
+    }
+
     pub fn has_epoch_key(&self, epoch: u32) -> bool {
         self.epoch_keys.contains_key(&epoch)
+    }
+
+    /// Return the sorted list of epochs for which keys are cached in memory.
+    /// Diagnostic-only — does not expose any key material.
+    pub fn known_epochs(&self) -> Vec<u32> {
+        let mut epochs: Vec<u32> = self.epoch_keys.keys().copied().collect();
+        epochs.sort_unstable();
+        epochs
     }
 
     /// Export all cached epoch keys (for SyncRuntimeKeys persistence).
     pub fn export_epoch_keys(&self) -> Result<HashMap<u32, Zeroizing<Vec<u8>>>> {
         self.require_unlocked()?;
-        Ok(self
-            .epoch_keys
-            .iter()
-            .map(|(k, v)| (*k, Zeroizing::new(v.to_vec())))
-            .collect())
+        Ok(self.epoch_keys.iter().map(|(k, v)| (*k, Zeroizing::new(v.to_vec()))).collect())
     }
 
     /// Import epoch keys (for SyncRuntimeKeys restore).
@@ -202,10 +204,7 @@ impl KeyHierarchy {
     /// Ties the device's local database encryption key to both the sync group
     /// identity (via DEK) and the device identity (via DeviceSecret). Returns
     /// an error if the hierarchy is locked or if no DeviceSecret is set.
-    pub fn local_storage_key(
-        &self,
-        device_secret_bytes: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>> {
+    pub fn local_storage_key(&self, device_secret_bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         self.require_unlocked()?;
         kdf::derive_local_storage_key(&self.dek, device_secret_bytes)
     }
@@ -288,9 +287,7 @@ mod tests {
         let secret = test_secret_key();
         let (wrapped, salt) = kh.initialize("password", &secret).unwrap();
         kh.lock();
-        assert!(kh
-            .unlock("wrong_password", &secret, &wrapped, &salt)
-            .is_err());
+        assert!(kh.unlock("wrong_password", &secret, &wrapped, &salt).is_err());
     }
 
     #[test]
@@ -337,8 +334,7 @@ mod tests {
 
         let (new_wrapped, new_salt) = kh.change_password("new_password", &secret).unwrap();
         kh.lock();
-        kh.unlock("new_password", &secret, &new_wrapped, &new_salt)
-            .unwrap();
+        kh.unlock("new_password", &secret, &new_wrapped, &new_salt).unwrap();
         assert_eq!(kh.epoch_key(0).unwrap(), epoch0);
         assert_eq!(*kh.database_key().unwrap(), db_key);
     }
@@ -351,6 +347,23 @@ mod tests {
         kh.store_epoch_key(3, epoch3_key.clone());
         assert!(kh.has_epoch_key(3));
         assert_eq!(kh.epoch_key(3).unwrap(), &*epoch3_key);
+    }
+
+    #[test]
+    fn remove_epoch_key_removes_only_target_epoch() {
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &test_secret_key()).unwrap();
+        let epoch3_key = Zeroizing::new(vec![77u8; 32]);
+        let epoch4_key = Zeroizing::new(vec![88u8; 32]);
+        kh.store_epoch_key(3, epoch3_key);
+        kh.store_epoch_key(4, epoch4_key.clone());
+
+        kh.remove_epoch_key(3);
+
+        assert!(!kh.has_epoch_key(3));
+        assert!(kh.epoch_key(3).is_err());
+        assert_eq!(kh.epoch_key(4).unwrap(), &*epoch4_key);
+        assert!(kh.has_epoch_key(0));
     }
 
     #[test]
@@ -397,9 +410,6 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         let secret_key = mnemonic::to_bytes(&mnemonic::generate()).unwrap();
         kh.initialize("password", &secret_key).unwrap();
-        assert_ne!(
-            signing_key.public_key_bytes().to_vec(),
-            kh.epoch_key(0).unwrap()
-        );
+        assert_ne!(signing_key.public_key_bytes().to_vec(), kh.epoch_key(0).unwrap());
     }
 }

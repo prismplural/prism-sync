@@ -14,12 +14,12 @@ use crate::batch_signature;
 use crate::crdt_change::CrdtChange;
 use crate::device_registry::DeviceRegistryManager;
 use crate::error::{CoreError, Result};
-use crate::storage::StorageError;
 use crate::events::EntityChange;
 use crate::hlc::Hlc;
 use crate::pruning::TombstonePruner;
 use crate::relay::{OutgoingBatch, SyncRelay};
 use crate::schema::{SyncSchema, SyncType};
+use crate::storage::StorageError;
 use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, SyncStorage};
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
@@ -50,13 +50,14 @@ pub struct SenderKeyInfo {
 fn populate_result_error(result: &mut SyncResult, e: &CoreError) {
     result.error_kind = Some(crate::events::classify_core_error(e));
     result.error = Some(e.to_string());
-    if let CoreError::Relay {
-        code, remote_wipe, ..
-    } = e
-    {
+    if let CoreError::Relay { code, remote_wipe, .. } = e {
         result.error_code = code.clone();
         result.remote_wipe = *remote_wipe;
     }
+}
+
+fn should_bubble_pull_error(error: &CoreError) -> bool {
+    matches!(error, CoreError::MissingEpochKey { .. } | CoreError::DecryptFailed { .. })
 }
 
 /// Result of the pull phase, bundling counts with relay-reported metadata.
@@ -103,16 +104,7 @@ impl SyncEngine {
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(SyncState::Idle);
         let merge_engine = MergeEngine::new(schema.clone());
-        Self {
-            storage,
-            relay,
-            entities,
-            schema,
-            config,
-            state_tx,
-            state_rx,
-            merge_engine,
-        }
+        Self { storage, relay, entities, schema, config, state_tx, state_rx, merge_engine }
     }
 
     /// Get the current sync state.
@@ -138,7 +130,11 @@ impl SyncEngine {
     /// `key_hierarchy` provides epoch keys by epoch number (not just "current epoch").
     /// This is critical because pulled batches may span multiple epochs during
     /// epoch rotation -- each batch is decrypted with its own epoch's key.
-    #[tracing::instrument(skip(self, key_hierarchy, signing_key, ml_dsa_signing_key), fields(sync_id, device_id), err)]
+    #[tracing::instrument(
+        skip(self, key_hierarchy, signing_key, ml_dsa_signing_key),
+        fields(sync_id, device_id),
+        err
+    )]
     pub async fn sync(
         &self,
         sync_id: &str,
@@ -174,11 +170,13 @@ impl SyncEngine {
                 }
             }
             Err(e) => {
+                if should_bubble_pull_error(&e) {
+                    self.set_state(SyncState::Error { message: e.to_string() });
+                    return Err(e);
+                }
                 populate_result_error(&mut result, &e);
                 result.duration = start.elapsed();
-                self.set_state(SyncState::Error {
-                    message: e.to_string(),
-                });
+                self.set_state(SyncState::Error { message: e.to_string() });
                 return Ok(result);
             }
         }
@@ -217,7 +215,14 @@ impl SyncEngine {
         // Phase 2: Push
         self.set_state(SyncState::Pushing);
         let push_result = self
-            .push_phase(sync_id, key_hierarchy, signing_key, ml_dsa_signing_key, device_id, ml_dsa_key_generation)
+            .push_phase(
+                sync_id,
+                key_hierarchy,
+                signing_key,
+                ml_dsa_signing_key,
+                device_id,
+                ml_dsa_key_generation,
+            )
             .await;
         match push_result {
             Ok(pushed) => {
@@ -226,9 +231,7 @@ impl SyncEngine {
             Err(e) => {
                 populate_result_error(&mut result, &e);
                 result.duration = start.elapsed();
-                self.set_state(SyncState::Error {
-                    message: e.to_string(),
-                });
+                self.set_state(SyncState::Error { message: e.to_string() });
                 return Ok(result);
             }
         }
@@ -272,11 +275,8 @@ impl SyncEngine {
         let since_seq = meta.map(|m| m.last_pulled_server_seq).unwrap_or(0);
 
         // Pull from relay
-        let pull_response = self
-            .relay
-            .pull_changes(since_seq)
-            .await
-            .map_err(CoreError::from_relay)?;
+        let pull_response =
+            self.relay.pull_changes(since_seq).await.map_err(CoreError::from_relay)?;
 
         let min_acked_seq = pull_response.min_acked_seq;
         let max_server_seq = pull_response.max_server_seq;
@@ -319,47 +319,53 @@ impl SyncEngine {
             // Look up sender's hybrid (Ed25519 + ML-DSA-65) public key from device registry.
             // If the sender device was deregistered (hard-deleted from relay),
             // its public key is gone — skip the batch and advance server_seq.
-            let sender_key_info = match self
-                .resolve_sender_public_key(sync_id, &envelope.sender_device_id)
-                .await
-            {
-                Ok(ki) => ki,
-                Err(e) => {
-                    tracing::warn!(
-                        "Skipping batch from unresolvable sender {}: {e}",
-                        envelope.sender_device_id
-                    );
-                    let storage = self.storage.clone();
-                    let sid = sync_id.to_string();
-                    let seq = batch.server_seq;
-                    tokio::task::spawn_blocking(move || {
-                        let mut tx = storage.begin_tx()?;
-                        tx.update_last_pulled_seq(&sid, seq)?;
-                        tx.commit()
-                    })
-                    .await
-                    .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
-                    total_pulled += 1;
-                    continue;
-                }
-            };
+            let sender_key_info =
+                match self.resolve_sender_public_key(sync_id, &envelope.sender_device_id).await {
+                    Ok(ki) => ki,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping batch from unresolvable sender {}: {e}",
+                            envelope.sender_device_id
+                        );
+                        let storage = self.storage.clone();
+                        let sid = sync_id.to_string();
+                        let seq = batch.server_seq;
+                        tokio::task::spawn_blocking(move || {
+                            let mut tx = storage.begin_tx()?;
+                            tx.update_last_pulled_seq(&sid, seq)?;
+                            tx.commit()
+                        })
+                        .await
+                        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+                        total_pulled += 1;
+                        continue;
+                    }
+                };
 
             // If the sender's envelope declares a newer ML-DSA generation than
             // we have locally, try to refresh from the relay before verifying.
-            let sender_key_info = if envelope.sender_ml_dsa_key_generation > sender_key_info.ml_dsa_key_generation {
-                match self.resolve_sender_keys_with_generation_hint(
-                    sync_id,
-                    &envelope.sender_device_id,
-                    Some(envelope.sender_ml_dsa_key_generation),
-                ).await {
-                    Ok(updated) => updated,
-                    Err(_) => sender_key_info, // Fall back to what we have
-                }
-            } else {
-                sender_key_info
-            };
+            let sender_key_info =
+                if envelope.sender_ml_dsa_key_generation > sender_key_info.ml_dsa_key_generation {
+                    match self
+                        .resolve_sender_keys_with_generation_hint(
+                            sync_id,
+                            &envelope.sender_device_id,
+                            Some(envelope.sender_ml_dsa_key_generation),
+                        )
+                        .await
+                    {
+                        Ok(updated) => updated,
+                        Err(_) => sender_key_info, // Fall back to what we have
+                    }
+                } else {
+                    sender_key_info
+                };
 
-            if let Err(e) = batch_signature::verify_batch_signature(envelope, &sender_key_info.ed25519_pk, &sender_key_info.ml_dsa_65_pk) {
+            if let Err(e) = batch_signature::verify_batch_signature(
+                envelope,
+                &sender_key_info.ed25519_pk,
+                &sender_key_info.ml_dsa_65_pk,
+            ) {
                 tracing::warn!(
                     "Skipping batch {} with invalid signature from {}: {e}",
                     envelope.batch_id,
@@ -381,14 +387,16 @@ impl SyncEngine {
 
             // STEP 2: Decrypt batch using the epoch key from THIS batch's epoch
             // (not "current epoch" -- pulled batches may span multiple epochs)
-            let epoch_key = key_hierarchy
-                .epoch_key(envelope.epoch as u32)
-                .map_err(|_| {
-                    CoreError::Engine(format!(
-                        "Missing epoch key for epoch {} -- may need epoch rotation recovery",
-                        envelope.epoch
-                    ))
-                })?;
+            let epoch_key = key_hierarchy.epoch_key(envelope.epoch as u32).map_err(|_| {
+                tracing::error!(
+                    batch_epoch = envelope.epoch,
+                    server_seq = batch.server_seq,
+                    sender_device_id = %envelope.sender_device_id,
+                    known_epochs = ?key_hierarchy.known_epochs(),
+                    "engine: missing epoch key — cannot decrypt batch"
+                );
+                CoreError::MissingEpochKey { epoch: envelope.epoch as u32 }
+            })?;
             let aad = sync_aad::build_sync_aad(
                 sync_id,
                 &envelope.sender_device_id,
@@ -402,7 +410,7 @@ impl SyncEngine {
                 &envelope.nonce,
                 &aad,
             )
-            .map_err(|e| CoreError::Engine(format!("Decrypt failed: {e}")))?;
+            .map_err(|source| CoreError::DecryptFailed { epoch: envelope.epoch as u32, source })?;
 
             // STEP 3: Verify payload hash matches decrypted plaintext
             batch_signature::verify_payload_hash(envelope, &plaintext)?;
@@ -425,9 +433,8 @@ impl SyncEngine {
 
             // Merge phase
             self.set_state(SyncState::Merging);
-            let (merged, batch_changes) = self
-                .apply_remote_batch(sync_id, &ops, batch.server_seq)
-                .await?;
+            let (merged, batch_changes) =
+                self.apply_remote_batch(sync_id, &ops, batch.server_seq).await?;
             total_merged += merged;
             all_entity_changes.extend(batch_changes);
             total_pulled += 1;
@@ -449,8 +456,7 @@ impl SyncEngine {
         sync_id: &str,
         sender_device_id: &str,
     ) -> Result<SenderKeyInfo> {
-        self.resolve_sender_keys_with_generation_hint(sync_id, sender_device_id, None)
-            .await
+        self.resolve_sender_keys_with_generation_hint(sync_id, sender_device_id, None).await
     }
 
     /// Resolve sender keys, optionally checking for ML-DSA generation freshness.
@@ -591,14 +597,13 @@ impl SyncEngine {
                 // Read the last imported version for monotonicity check
                 let storage = self.storage.clone();
                 let sid = sync_id.to_string();
-                let last_version = tokio::task::spawn_blocking(move || {
-                    storage.get_sync_metadata(&sid)
-                })
-                .await
-                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
-                .ok()
-                .flatten()
-                .and_then(|m| m.last_imported_registry_version);
+                let last_version =
+                    tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+                        .await
+                        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.last_imported_registry_version);
 
                 let storage = self.storage.clone();
                 let sid = sync_id.to_string();
@@ -606,7 +611,10 @@ impl SyncEngine {
 
                 let import_result = tokio::task::spawn_blocking(move || {
                     DeviceRegistryManager::verify_and_import_signed_registry(
-                        &*storage, &sid, &blob, last_version,
+                        &*storage,
+                        &sid,
+                        &blob,
+                        last_version,
                     )
                 })
                 .await
@@ -662,19 +670,13 @@ impl SyncEngine {
                 }
             }
             Ok(None) => {
-                tracing::debug!(
-                    "No signed registry artifact available for device {}",
-                    device_id
-                );
+                tracing::debug!("No signed registry artifact available for device {}", device_id);
                 Err(CoreError::Storage(StorageError::Logic(
                     "No signed registry artifact available".to_string(),
                 )))
             }
             Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch signed registry for device {}: {e}",
-                    device_id
-                );
+                tracing::warn!("Failed to fetch signed registry for device {}: {e}", device_id);
                 Err(CoreError::from_relay(e))
             }
         }
@@ -736,11 +738,8 @@ impl SyncEngine {
             }
 
             // Collect winning ops as a Vec
-            let winning_ops: Vec<CrdtChange> = winners
-                .into_values()
-                .filter(|w| !w.is_bulk_reset)
-                .map(|w| w.op)
-                .collect();
+            let winning_ops: Vec<CrdtChange> =
+                winners.into_values().filter(|w| !w.is_bulk_reset).map(|w| w.op).collect();
 
             Ok::<_, CoreError>((checked, winning_ops))
         })
@@ -764,9 +763,7 @@ impl SyncEngine {
                     entry.is_delete = true;
                     entry.fields.clear();
                 } else {
-                    entry
-                        .fields
-                        .insert(op.field_name.clone(), op.encoded_value.clone());
+                    entry.fields.insert(op.field_name.clone(), op.encoded_value.clone());
                 }
             }
             change_map.into_values().collect::<Vec<_>>()
@@ -789,10 +786,8 @@ impl SyncEngine {
             // Write fields / soft-delete for each winning op
             let write_result: Result<()> = async {
                 for op in &winning_ops {
-                    if let Some(entity) = self
-                        .entities
-                        .iter()
-                        .find(|e| e.table_name() == op.entity_table)
+                    if let Some(entity) =
+                        self.entities.iter().find(|e| e.table_name() == op.entity_table)
                     {
                         if op.is_delete {
                             entity.soft_delete(&op.entity_id, &op.client_hlc).await?;
@@ -913,7 +908,11 @@ impl SyncEngine {
     /// (sent via X-Batch-Id header). If the relay does not deduplicate,
     /// the merge engine handles duplicate batches gracefully via the
     /// `applied_ops` idempotency table.
-    #[tracing::instrument(skip(self, key_hierarchy, signing_key, ml_dsa_signing_key), fields(sync_id, device_id), err)]
+    #[tracing::instrument(
+        skip(self, key_hierarchy, signing_key, ml_dsa_signing_key),
+        fields(sync_id, device_id),
+        err
+    )]
     async fn push_phase(
         &self,
         sync_id: &str,
@@ -1008,8 +1007,9 @@ impl SyncEngine {
                     .map_err(|e| CoreError::Engine(format!("Encrypt failed: {e}")))?;
 
             // Sign the batch
-            let ml_dsa_sk = ml_dsa_signing_key
-                .ok_or_else(|| CoreError::Engine("ML-DSA signing key required for hybrid batch signing".into()))?;
+            let ml_dsa_sk = ml_dsa_signing_key.ok_or_else(|| {
+                CoreError::Engine("ML-DSA signing key required for hybrid batch signing".into())
+            })?;
             let envelope = batch_signature::sign_batch(
                 signing_key,
                 ml_dsa_sk,
@@ -1025,14 +1025,8 @@ impl SyncEngine {
             )?;
 
             // Push to relay
-            let outgoing = OutgoingBatch {
-                batch_id: batch_id.clone(),
-                envelope,
-            };
-            self.relay
-                .push_changes(outgoing)
-                .await
-                .map_err(CoreError::from_relay)?;
+            let outgoing = OutgoingBatch { batch_id: batch_id.clone(), envelope };
+            self.relay.push_changes(outgoing).await.map_err(CoreError::from_relay)?;
 
             // Mark batch as pushed
             let storage = self.storage.clone();
@@ -1147,11 +1141,7 @@ impl SyncEngine {
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
     ) -> Result<(u64, Vec<EntityChange>)> {
         // 1. Download snapshot from relay
-        let snapshot = self
-            .relay
-            .get_snapshot()
-            .await
-            .map_err(CoreError::from_relay)?;
+        let snapshot = self.relay.get_snapshot().await.map_err(CoreError::from_relay)?;
 
         let snapshot = match snapshot {
             Some(s) => s,
@@ -1165,26 +1155,33 @@ impl SyncEngine {
             })?;
 
         // Look up the sender's key material and verify the batch signature
-        let sender_key_info = self
-            .resolve_sender_public_key(sync_id, &envelope.sender_device_id)
-            .await?;
+        let sender_key_info =
+            self.resolve_sender_public_key(sync_id, &envelope.sender_device_id).await?;
 
         // If the sender's envelope declares a newer ML-DSA generation than
         // we have locally, try to refresh from the relay before verifying.
-        let sender_key_info = if envelope.sender_ml_dsa_key_generation > sender_key_info.ml_dsa_key_generation {
-            match self.resolve_sender_keys_with_generation_hint(
-                sync_id,
-                &envelope.sender_device_id,
-                Some(envelope.sender_ml_dsa_key_generation),
-            ).await {
-                Ok(updated) => updated,
-                Err(_) => sender_key_info, // Fall back to what we have
-            }
-        } else {
-            sender_key_info
-        };
+        let sender_key_info =
+            if envelope.sender_ml_dsa_key_generation > sender_key_info.ml_dsa_key_generation {
+                match self
+                    .resolve_sender_keys_with_generation_hint(
+                        sync_id,
+                        &envelope.sender_device_id,
+                        Some(envelope.sender_ml_dsa_key_generation),
+                    )
+                    .await
+                {
+                    Ok(updated) => updated,
+                    Err(_) => sender_key_info, // Fall back to what we have
+                }
+            } else {
+                sender_key_info
+            };
 
-        crate::batch_signature::verify_batch_signature(&envelope, &sender_key_info.ed25519_pk, &sender_key_info.ml_dsa_65_pk)?;
+        crate::batch_signature::verify_batch_signature(
+            &envelope,
+            &sender_key_info.ed25519_pk,
+            &sender_key_info.ml_dsa_65_pk,
+        )?;
 
         // Verify relay-reported metadata matches the signed envelope
         if snapshot.epoch != envelope.epoch {
@@ -1242,8 +1239,9 @@ impl SyncEngine {
     /// fields need to be written into the consumer database.
     fn build_entity_changes_from_snapshot(compressed: &[u8]) -> Result<Vec<EntityChange>> {
         // Decompress zstd
-        let json = zstd::decode_all(std::io::Cursor::new(compressed))
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("zstd decompress failed: {e}"))))?;
+        let json = zstd::decode_all(std::io::Cursor::new(compressed)).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("zstd decompress failed: {e}")))
+        })?;
 
         // Parse snapshot data
         let snapshot: crate::storage::SnapshotData = serde_json::from_slice(&json)?;
@@ -1286,11 +1284,9 @@ impl SyncEngine {
 
 /// Extract sender key material from a DeviceRecord.
 fn pk_from_record(record: &DeviceRecord) -> Result<SenderKeyInfo> {
-    let ed25519_pk: [u8; 32] = record
-        .ed25519_public_key
-        .clone()
-        .try_into()
-        .map_err(|_| CoreError::Storage(StorageError::Logic("invalid ed25519 key length".into())))?;
+    let ed25519_pk: [u8; 32] = record.ed25519_public_key.clone().try_into().map_err(|_| {
+        CoreError::Storage(StorageError::Logic("invalid ed25519 key length".into()))
+    })?;
     Ok(SenderKeyInfo {
         ed25519_pk,
         ml_dsa_65_pk: record.ml_dsa_65_public_key.clone(),
@@ -1332,9 +1328,7 @@ mod tests {
     #[test]
     fn populate_result_error_does_not_set_error_code_for_device_key_changed() {
         let mut result = SyncResult::default();
-        let err = CoreError::DeviceKeyChanged {
-            device_id: "dev-a".into(),
-        };
+        let err = CoreError::DeviceKeyChanged { device_id: "dev-a".into() };
 
         populate_result_error(&mut result, &err);
 
@@ -1356,6 +1350,11 @@ mod tests {
     #[test]
     fn populate_result_error_does_not_set_error_code_for_local_errors() {
         for err in [
+            CoreError::MissingEpochKey { epoch: 2 },
+            CoreError::DecryptFailed {
+                epoch: 2,
+                source: prism_sync_crypto::CryptoError::DecryptionFailed("bad ciphertext".into()),
+            },
             CoreError::Engine("missing epoch key for push epoch 2".into()),
             CoreError::Storage(StorageError::Logic("tx aborted".into())),
         ] {

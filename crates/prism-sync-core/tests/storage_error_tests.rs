@@ -103,8 +103,7 @@ fn transaction_rollback_prevents_partial_state() {
 
     // Begin a transaction, insert metadata, then rollback
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_sync_metadata(&sample_metadata("sync-rollback"))
-        .unwrap();
+    tx.upsert_sync_metadata(&sample_metadata("sync-rollback")).unwrap();
     tx.rollback().unwrap();
 
     // The metadata should not exist
@@ -118,8 +117,7 @@ fn transaction_drop_without_commit_acts_as_rollback() {
 
     {
         let mut tx = storage.begin_tx().unwrap();
-        tx.upsert_sync_metadata(&sample_metadata("sync-drop"))
-            .unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-drop")).unwrap();
         // tx is dropped without commit or rollback
     }
 
@@ -138,26 +136,16 @@ fn transaction_rollback_undoes_multiple_writes() {
 
     // Now start a new tx, do several writes, then rollback
     let mut tx = storage.begin_tx().unwrap();
-    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1"))
-        .unwrap();
-    tx.insert_applied_op(&sample_applied_op("applied-1", 1))
-        .unwrap();
-    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1"))
-        .unwrap();
-    tx.upsert_device_record(&sample_device_record("dev-new"))
-        .unwrap();
+    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1")).unwrap();
+    tx.insert_applied_op(&sample_applied_op("applied-1", 1)).unwrap();
+    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1")).unwrap();
+    tx.upsert_device_record(&sample_device_record("dev-new")).unwrap();
     tx.rollback().unwrap();
 
     // None of those writes should be visible
     assert!(!storage.is_op_applied("applied-1").unwrap());
-    assert!(storage
-        .get_field_version("sync-1", "tasks", "e1", "title")
-        .unwrap()
-        .is_none());
-    assert!(storage
-        .get_device_record("sync-1", "dev-new")
-        .unwrap()
-        .is_none());
+    assert!(storage.get_field_version("sync-1", "tasks", "e1", "title").unwrap().is_none());
+    assert!(storage.get_device_record("sync-1", "dev-new").unwrap().is_none());
     assert!(storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
 }
 
@@ -167,8 +155,7 @@ fn committed_transaction_persists_data() {
 
     let mut tx = storage.begin_tx().unwrap();
     tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
-    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1"))
-        .unwrap();
+    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1")).unwrap();
     tx.commit().unwrap();
 
     // Data should be visible
@@ -190,9 +177,7 @@ fn read_nonexistent_sync_metadata_returns_none() {
 #[test]
 fn read_nonexistent_field_version_returns_none() {
     let storage = make_storage();
-    let fv = storage
-        .get_field_version("sync-1", "tasks", "no-entity", "no-field")
-        .unwrap();
+    let fv = storage.get_field_version("sync-1", "tasks", "no-entity", "no-field").unwrap();
     assert!(fv.is_none());
 }
 
@@ -261,8 +246,7 @@ fn upsert_field_version_overwrites_previous_winner() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1"))
-        .unwrap();
+    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1")).unwrap();
     tx.commit().unwrap();
 
     // Upsert with a new HLC
@@ -274,10 +258,7 @@ fn upsert_field_version_overwrites_previous_winner() {
     tx.upsert_field_version(&fv2).unwrap();
     tx.commit().unwrap();
 
-    let fv = storage
-        .get_field_version("sync-1", "tasks", "e1", "title")
-        .unwrap()
-        .unwrap();
+    let fv = storage.get_field_version("sync-1", "tasks", "e1", "title").unwrap().unwrap();
     assert_eq!(fv.winning_op_id, "op-newer");
     assert_eq!(fv.winning_hlc, "hlc-2");
 }
@@ -287,8 +268,7 @@ fn upsert_device_record_overwrites_existing() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_device_record(&sample_device_record("dev-1"))
-        .unwrap();
+    tx.upsert_device_record(&sample_device_record("dev-1")).unwrap();
     tx.commit().unwrap();
 
     // Upsert with revoked status
@@ -300,10 +280,7 @@ fn upsert_device_record_overwrites_existing() {
     tx.upsert_device_record(&dr2).unwrap();
     tx.commit().unwrap();
 
-    let dr = storage
-        .get_device_record("sync-1", "dev-1")
-        .unwrap()
-        .unwrap();
+    let dr = storage.get_device_record("sync-1", "dev-1").unwrap().unwrap();
     assert_eq!(dr.status, "revoked");
     assert!(dr.revoked_at.is_some());
 }
@@ -313,8 +290,7 @@ fn insert_duplicate_pending_op_id_errors() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.insert_pending_op(&sample_pending_op("dup-op", "batch-1"))
-        .unwrap();
+    tx.insert_pending_op(&sample_pending_op("dup-op", "batch-1")).unwrap();
     // Same op_id again should fail (PRIMARY KEY constraint)
     let result = tx.insert_pending_op(&sample_pending_op("dup-op", "batch-1"));
     assert!(result.is_err(), "duplicate pending op_id should error");
@@ -327,11 +303,9 @@ fn insert_duplicate_applied_op_is_ignored() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-1", 1))
-        .unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-1", 1)).unwrap();
     // INSERT OR IGNORE means duplicate should silently succeed
-    tx.insert_applied_op(&sample_applied_op("aop-1", 1))
-        .unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-1", 1)).unwrap();
     tx.commit().unwrap();
 
     assert!(storage.is_op_applied("aop-1").unwrap());
@@ -367,16 +341,21 @@ fn update_last_successful_sync_creates_metadata_if_missing() {
 }
 
 #[test]
-fn update_current_epoch_on_nonexistent_metadata_is_noop() {
+fn update_current_epoch_creates_metadata_when_missing() {
     let storage = make_storage();
 
-    // UPDATE ... WHERE sync_id = ? on a missing row affects 0 rows — no error
     let mut tx = storage.begin_tx().unwrap();
     tx.update_current_epoch("no-such-sync", 5).unwrap();
     tx.commit().unwrap();
 
-    // Still no metadata
-    assert!(storage.get_sync_metadata("no-such-sync").unwrap().is_none());
+    let meta = storage.get_sync_metadata("no-such-sync").unwrap().unwrap();
+    assert_eq!(meta.sync_id, "no-such-sync");
+    assert_eq!(meta.local_device_id, "");
+    assert_eq!(meta.current_epoch, 5);
+    assert_eq!(meta.last_pulled_server_seq, 0);
+    assert!(meta.last_pushed_at.is_none());
+    assert!(meta.last_successful_sync_at.is_none());
+    assert!(meta.registered_at.is_none());
 }
 
 #[test]
@@ -425,8 +404,7 @@ fn delete_pushed_ops_only_removes_pushed() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1"))
-        .unwrap();
+    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1")).unwrap();
     tx.insert_pending_op(&{
         let mut op = sample_pending_op("op-2", "batch-2");
         op.pushed_at = Some(Utc::now());
@@ -454,9 +432,7 @@ fn prune_applied_ops_when_none_exist_returns_zero() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    let deleted = tx
-        .delete_applied_ops_below_seq("sync-1", 100, 1000)
-        .unwrap();
+    let deleted = tx.delete_applied_ops_below_seq("sync-1", 100, 1000).unwrap();
     tx.commit().unwrap();
     assert_eq!(deleted, 0);
 }
@@ -466,12 +442,9 @@ fn prune_applied_ops_respects_seq_threshold() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-1", 5))
-        .unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-2", 10))
-        .unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-3", 15))
-        .unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-1", 5)).unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-2", 10)).unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-3", 15)).unwrap();
     tx.commit().unwrap();
 
     // Prune ops with server_seq < 12
@@ -488,12 +461,9 @@ fn prune_applied_ops_respects_limit() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-1", 1))
-        .unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-2", 2))
-        .unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-3", 3))
-        .unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-1", 1)).unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-2", 2)).unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-3", 3)).unwrap();
     tx.commit().unwrap();
 
     // Prune all below seq 100, but limit to 2
@@ -517,8 +487,7 @@ fn delete_field_versions_for_nonexistent_entity_is_noop() {
 
     let mut tx = storage.begin_tx().unwrap();
     // Should not error
-    tx.delete_field_versions_for_entity("sync-1", "tasks", "no-such-entity")
-        .unwrap();
+    tx.delete_field_versions_for_entity("sync-1", "tasks", "no-such-entity").unwrap();
     tx.commit().unwrap();
 }
 
@@ -527,33 +496,20 @@ fn delete_field_versions_removes_all_fields_for_entity() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1"))
-        .unwrap();
-    tx.upsert_field_version(&sample_field_version("e1", "done", "hlc-2"))
-        .unwrap();
-    tx.upsert_field_version(&sample_field_version("e2", "title", "hlc-3"))
-        .unwrap();
+    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1")).unwrap();
+    tx.upsert_field_version(&sample_field_version("e1", "done", "hlc-2")).unwrap();
+    tx.upsert_field_version(&sample_field_version("e2", "title", "hlc-3")).unwrap();
     tx.commit().unwrap();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.delete_field_versions_for_entity("sync-1", "tasks", "e1")
-        .unwrap();
+    tx.delete_field_versions_for_entity("sync-1", "tasks", "e1").unwrap();
     tx.commit().unwrap();
 
     // e1 fields should be gone
-    assert!(storage
-        .get_field_version("sync-1", "tasks", "e1", "title")
-        .unwrap()
-        .is_none());
-    assert!(storage
-        .get_field_version("sync-1", "tasks", "e1", "done")
-        .unwrap()
-        .is_none());
+    assert!(storage.get_field_version("sync-1", "tasks", "e1", "title").unwrap().is_none());
+    assert!(storage.get_field_version("sync-1", "tasks", "e1", "done").unwrap().is_none());
     // e2 should remain
-    assert!(storage
-        .get_field_version("sync-1", "tasks", "e2", "title")
-        .unwrap()
-        .is_some());
+    assert!(storage.get_field_version("sync-1", "tasks", "e2", "title").unwrap().is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -574,10 +530,8 @@ fn remove_device_record_works() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_device_record(&sample_device_record("dev-1"))
-        .unwrap();
-    tx.upsert_device_record(&sample_device_record("dev-2"))
-        .unwrap();
+    tx.upsert_device_record(&sample_device_record("dev-1")).unwrap();
+    tx.upsert_device_record(&sample_device_record("dev-2")).unwrap();
     tx.commit().unwrap();
 
     assert_eq!(storage.list_device_records("sync-1").unwrap().len(), 2);
@@ -586,14 +540,8 @@ fn remove_device_record_works() {
     tx.remove_device_record("sync-1", "dev-1").unwrap();
     tx.commit().unwrap();
 
-    assert!(storage
-        .get_device_record("sync-1", "dev-1")
-        .unwrap()
-        .is_none());
-    assert!(storage
-        .get_device_record("sync-1", "dev-2")
-        .unwrap()
-        .is_some());
+    assert!(storage.get_device_record("sync-1", "dev-1").unwrap().is_none());
+    assert!(storage.get_device_record("sync-1", "dev-2").unwrap().is_some());
     assert_eq!(storage.list_device_records("sync-1").unwrap().len(), 1);
 }
 
@@ -631,9 +579,7 @@ fn large_entity_id_round_trips() {
     tx.upsert_field_version(&fv).unwrap();
     tx.commit().unwrap();
 
-    let result = storage
-        .get_field_version("sync-1", "tasks", &large_id, "title")
-        .unwrap();
+    let result = storage.get_field_version("sync-1", "tasks", &large_id, "title").unwrap();
     assert!(result.is_some());
     assert_eq!(result.unwrap().entity_id, large_id);
 }
@@ -648,14 +594,10 @@ fn clear_sync_state_removes_all_data_for_sync_id() {
 
     let mut tx = storage.begin_tx().unwrap();
     tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
-    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1"))
-        .unwrap();
-    tx.insert_applied_op(&sample_applied_op("aop-1", 1))
-        .unwrap();
-    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1"))
-        .unwrap();
-    tx.upsert_device_record(&sample_device_record("dev-1"))
-        .unwrap();
+    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1")).unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-1", 1)).unwrap();
+    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1")).unwrap();
+    tx.upsert_device_record(&sample_device_record("dev-1")).unwrap();
     tx.commit().unwrap();
 
     let mut tx = storage.begin_tx().unwrap();
@@ -665,10 +607,7 @@ fn clear_sync_state_removes_all_data_for_sync_id() {
     assert!(storage.get_sync_metadata("sync-1").unwrap().is_none());
     assert!(storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
     assert!(!storage.is_op_applied("aop-1").unwrap());
-    assert!(storage
-        .get_field_version("sync-1", "tasks", "e1", "title")
-        .unwrap()
-        .is_none());
+    assert!(storage.get_field_version("sync-1", "tasks", "e1", "title").unwrap().is_none());
     assert!(storage.list_device_records("sync-1").unwrap().is_empty());
 }
 
@@ -679,8 +618,7 @@ fn clear_sync_state_does_not_affect_other_sync_ids() {
     let mut tx = storage.begin_tx().unwrap();
     tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
     tx.upsert_sync_metadata(&sample_metadata("sync-2")).unwrap();
-    tx.upsert_device_record(&sample_device_record("dev-1"))
-        .unwrap();
+    tx.upsert_device_record(&sample_device_record("dev-1")).unwrap();
     // Add device for sync-2
     tx.upsert_device_record(&DeviceRecord {
         sync_id: "sync-2".to_string(),
@@ -724,14 +662,12 @@ fn sequential_transactions_work_after_commit() {
 
     // First transaction: insert metadata
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_sync_metadata(&sample_metadata("sync-seq"))
-        .unwrap();
+    tx.upsert_sync_metadata(&sample_metadata("sync-seq")).unwrap();
     tx.commit().unwrap();
 
     // Second transaction: insert more data (mutex is released after commit)
     let mut tx = storage.begin_tx().unwrap();
-    tx.insert_pending_op(&sample_pending_op("op-seq-1", "batch-seq"))
-        .unwrap();
+    tx.insert_pending_op(&sample_pending_op("op-seq-1", "batch-seq")).unwrap();
     tx.commit().unwrap();
 
     // Both writes should be visible
@@ -746,14 +682,12 @@ fn sequential_transactions_work_after_rollback() {
 
     // First transaction: insert then rollback
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_sync_metadata(&sample_metadata("sync-rb"))
-        .unwrap();
+    tx.upsert_sync_metadata(&sample_metadata("sync-rb")).unwrap();
     tx.rollback().unwrap();
 
     // Second transaction should succeed (mutex released after rollback)
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_sync_metadata(&sample_metadata("sync-rb"))
-        .unwrap();
+    tx.upsert_sync_metadata(&sample_metadata("sync-rb")).unwrap();
     tx.commit().unwrap();
 
     assert!(storage.get_sync_metadata("sync-rb").unwrap().is_some());
@@ -766,15 +700,13 @@ fn sequential_transactions_work_after_drop() {
     // First transaction: dropped without commit or rollback
     {
         let mut tx = storage.begin_tx().unwrap();
-        tx.upsert_sync_metadata(&sample_metadata("sync-drop2"))
-            .unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-drop2")).unwrap();
         // tx dropped here — auto-rollback
     }
 
     // Second transaction should succeed (mutex released on drop)
     let mut tx = storage.begin_tx().unwrap();
-    tx.upsert_sync_metadata(&sample_metadata("sync-drop2"))
-        .unwrap();
+    tx.upsert_sync_metadata(&sample_metadata("sync-drop2")).unwrap();
     tx.commit().unwrap();
 
     assert!(storage.get_sync_metadata("sync-drop2").unwrap().is_some());
@@ -797,10 +729,7 @@ fn import_snapshot_garbage_bytes_returns_error() {
     let storage = make_storage();
     let mut tx = storage.begin_tx().unwrap();
     let result = tx.import_snapshot("sync-1", &[0xFF, 0xFE, 0x00, 0x01]);
-    assert!(
-        result.is_err(),
-        "garbage bytes should return Err, not panic"
-    );
+    assert!(result.is_err(), "garbage bytes should return Err, not panic");
 }
 
 #[test]
@@ -809,10 +738,7 @@ fn import_snapshot_truncated_zstd_returns_error() {
     let mut tx = storage.begin_tx().unwrap();
     // Valid zstd magic number (0xFD2FB528 little-endian) but truncated payload
     let result = tx.import_snapshot("sync-1", &[0x28, 0xB5, 0x2F, 0xFD, 0x00]);
-    assert!(
-        result.is_err(),
-        "truncated zstd frame should return Err, not panic"
-    );
+    assert!(result.is_err(), "truncated zstd frame should return Err, not panic");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -859,10 +785,7 @@ fn list_prunable_tombstones_finds_deleted_entities() {
 
     let tombstones = storage.list_prunable_tombstones("sync-1", 10, 100).unwrap();
     assert_eq!(tombstones.len(), 1);
-    assert_eq!(
-        tombstones[0],
-        ("tasks".to_string(), "deleted-entity".to_string())
-    );
+    assert_eq!(tombstones[0], ("tasks".to_string(), "deleted-entity".to_string()));
 
     // With threshold below the seq, should find nothing
     let tombstones = storage.list_prunable_tombstones("sync-1", 3, 100).unwrap();

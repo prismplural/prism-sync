@@ -23,4 +23,5 @@ dependencies:
 dev_dependencies:
   integration_test:
     sdk: flutter
-  flutter_test: any
+  flutter_test:
+    sdk: flutter

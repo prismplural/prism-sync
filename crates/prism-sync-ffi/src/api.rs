@@ -1485,8 +1485,14 @@ pub async fn reconnect_websocket(handle: &PrismSyncHandle) -> Result<(), String>
 ///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 pub async fn on_resume(handle: &PrismSyncHandle) -> Result<(), String> {
-    let mut inner = handle.inner.lock().await;
-    inner.on_resume().await.map_err(|e| e.to_string())
+    let result = {
+        let mut inner = handle.inner.lock().await;
+        inner.on_resume().await
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(encode_handle_core_error(handle, "on_resume", error).await),
+    }
 }
 
 /// Upload an encrypted media blob to the relay.

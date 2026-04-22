@@ -13,11 +13,13 @@ use std::sync::Arc;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
 use prism_sync_core::events::{SyncErrorKind, SyncEvent};
-use prism_sync_core::relay::{InjectedPullError, MockRelay};
+use prism_sync_core::relay::{InjectedPullError, MockRelay, SignedBatchEnvelope};
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::sync_service::SyncService;
 use prism_sync_core::syncable_entity::SyncableEntity;
+use prism_sync_core::{batch_signature, sync_aad, CrdtChange};
 use tokio::sync::broadcast;
+use zeroize::Zeroizing;
 
 use common::*;
 
@@ -54,27 +56,46 @@ async fn make_service(relay: Arc<MockRelay>) -> TestService {
         &ml_dsa_key.public_key_bytes(),
     );
 
-    let engine = SyncEngine::new(
-        storage.clone(),
-        relay,
-        vec![entity],
-        test_schema(),
-        SyncConfig::default(),
-    );
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
 
     let (event_tx, event_rx) = broadcast::channel::<SyncEvent>(64);
     let mut service = SyncService::new(event_tx);
     service.set_engine(engine, SYNC_ID.to_string());
 
-    TestService {
-        service,
-        event_rx,
-        key_hierarchy,
+    TestService { service, event_rx, key_hierarchy, signing_key, ml_dsa_key, device_id, storage }
+}
+
+fn make_encrypted_batch_at_epoch(
+    ops: &[CrdtChange],
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    signing_key: &ed25519_dalek::SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    batch_id: &str,
+    sender_device_id: &str,
+    epoch: i32,
+) -> SignedBatchEnvelope {
+    let plaintext = CrdtChange::encode_batch(ops).unwrap();
+    let payload_hash = batch_signature::compute_payload_hash(&plaintext);
+    let epoch_key = key_hierarchy.epoch_key(epoch as u32).unwrap();
+    let aad = sync_aad::build_sync_aad(SYNC_ID, sender_device_id, epoch, batch_id, "ops");
+    let (ciphertext, nonce) =
+        prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &plaintext, &aad).unwrap();
+
+    batch_signature::sign_batch(
         signing_key,
-        ml_dsa_key,
-        device_id,
-        storage,
-    }
+        ml_dsa_signing_key,
+        SYNC_ID,
+        epoch,
+        batch_id,
+        "ops",
+        sender_device_id,
+        0,
+        &payload_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap()
 }
 
 /// Drain all currently-available events from a broadcast receiver,
@@ -108,11 +129,7 @@ async fn sync_now_retries_on_transient_network_error_and_eventually_succeeds() {
     let fut = service.sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0);
     let result = fut.await.expect("sync_now should eventually succeed");
 
-    assert!(
-        result.error.is_none(),
-        "final result should be clean: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "final result should be clean: {:?}", result.error);
     assert_eq!(
         relay.pull_call_count(),
         3,
@@ -163,17 +180,10 @@ async fn sync_now_emits_sync_completed_before_error_on_exhausted_retries() {
 
     let fut = service.sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0);
     let result = fut.await;
-    assert!(
-        result.is_err(),
-        "exhausted retries must return Err, got Ok"
-    );
+    assert!(result.is_err(), "exhausted retries must return Err, got Ok");
 
     // INNER_RETRY_MAX = 3 additional retries -> 4 total pull attempts.
-    assert_eq!(
-        relay.pull_call_count(),
-        4,
-        "expected 1 initial + 3 retries = 4 total pulls"
-    );
+    assert_eq!(relay.pull_call_count(), 4, "expected 1 initial + 3 retries = 4 total pulls");
 
     let events = drain_events(&mut event_rx);
 
@@ -232,9 +242,7 @@ async fn sync_now_does_not_retry_on_auth_error() {
         ..
     } = make_service(relay.clone()).await;
 
-    let result = service
-        .sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0)
-        .await;
+    let result = service.sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0).await;
     assert!(result.is_err(), "auth error must return Err");
 
     assert_eq!(
@@ -271,16 +279,10 @@ async fn sync_now_retries_on_server_error() {
         ..
     } = make_service(relay.clone()).await;
 
-    let result = service
-        .sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0)
-        .await;
+    let result = service.sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0).await;
     assert!(result.is_err(), "exhausted server errors must return Err");
 
-    assert_eq!(
-        relay.pull_call_count(),
-        4,
-        "expected 1 + 3 retries = 4 total pull attempts on 5xx"
-    );
+    assert_eq!(relay.pull_call_count(), 4, "expected 1 + 3 retries = 4 total pull attempts on 5xx");
 
     let events = drain_events(&mut event_rx);
     let err_event = events
@@ -337,10 +339,7 @@ async fn sync_now_does_not_update_last_sync_time_on_error() {
 #[tokio::test(start_paused = true)]
 async fn sync_now_propagates_device_revoked_code_through_result_error() {
     let relay = Arc::new(MockRelay::new());
-    relay.fail_next_pulls_with(
-        10,
-        InjectedPullError::DeviceRevoked { remote_wipe: true },
-    );
+    relay.fail_next_pulls_with(10, InjectedPullError::DeviceRevoked { remote_wipe: true });
 
     let TestService {
         mut service,
@@ -352,16 +351,12 @@ async fn sync_now_propagates_device_revoked_code_through_result_error() {
         ..
     } = make_service(relay.clone()).await;
 
-    let result = service
-        .sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0)
-        .await;
+    let result = service.sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0).await;
 
     // Revocation surfaces as Err — not retryable.
     let err = result.expect_err("device_revoked must return Err");
     match err {
-        prism_sync_core::CoreError::Relay {
-            code, remote_wipe, ..
-        } => {
+        prism_sync_core::CoreError::Relay { code, remote_wipe, .. } => {
             assert_eq!(
                 code.as_deref(),
                 Some("device_revoked"),
@@ -377,11 +372,7 @@ async fn sync_now_propagates_device_revoked_code_through_result_error() {
     }
 
     // Exactly one pull attempt — auth-class errors are not retryable.
-    assert_eq!(
-        relay.pull_call_count(),
-        1,
-        "device_revoked must not be retried"
-    );
+    assert_eq!(relay.pull_call_count(), 1, "device_revoked must not be retried");
 
     let events = drain_events(&mut event_rx);
 
@@ -407,11 +398,7 @@ async fn sync_now_propagates_device_revoked_code_through_result_error() {
         .iter()
         .find(|e| matches!(e, SyncEvent::DeviceRevoked { .. }))
         .expect("must emit SyncEvent::DeviceRevoked");
-    if let SyncEvent::DeviceRevoked {
-        device_id: did,
-        remote_wipe,
-    } = device_revoked
-    {
+    if let SyncEvent::DeviceRevoked { device_id: did, remote_wipe } = device_revoked {
         assert_eq!(did, &device_id);
         assert!(*remote_wipe, "remote_wipe flag must propagate");
     }
@@ -475,17 +462,11 @@ async fn sync_now_does_not_retry_on_missing_ml_dsa_key_error() {
     // Pass None for ml_dsa_signing_key -> push_phase returns
     // `CoreError::Engine("ML-DSA signing key required ...")`, which
     // `classify_core_error` now maps to `SyncErrorKind::Protocol`.
-    let result = service
-        .sync_now(&kh, &sk, None, &device_id, 0)
-        .await;
+    let result = service.sync_now(&kh, &sk, None, &device_id, 0).await;
 
     // With Protocol classification, Err must surface after 1 attempt.
     assert!(result.is_err(), "local engine error must surface as Err");
-    assert_eq!(
-        relay.pull_call_count(),
-        1,
-        "local engine errors must not retry"
-    );
+    assert_eq!(relay.pull_call_count(), 1, "local engine errors must not retry");
 
     let events = drain_events(&mut event_rx);
     let err_event = events
@@ -500,10 +481,7 @@ async fn sync_now_does_not_retry_on_missing_ml_dsa_key_error() {
         SyncErrorKind::Protocol,
         "local engine error must classify as Protocol (not Network)"
     );
-    assert!(
-        !err_event.retryable,
-        "Protocol errors must not be retryable"
-    );
+    assert!(!err_event.retryable, "Protocol errors must not be retryable");
 
     // Completed event must also carry the Protocol kind so Dart's
     // event-driven drain knows to skip.
@@ -519,4 +497,186 @@ async fn sync_now_does_not_retry_on_missing_ml_dsa_key_error() {
         Some(&SyncErrorKind::Protocol),
         "SyncCompleted.error_kind must be Protocol"
     );
+}
+
+/// A pulled batch at a newer epoch must surface as a local/protocol failure
+/// when the receiver is missing that epoch key. The retry loop must not
+/// treat this like a transient network issue, and relay-only metadata must
+/// stay unset.
+#[tokio::test(start_paused = true)]
+async fn sync_now_does_not_retry_on_missing_epoch_key_pull_error() {
+    let relay = Arc::new(MockRelay::new());
+
+    let TestService {
+        mut service,
+        mut event_rx,
+        key_hierarchy: kh,
+        signing_key: sk,
+        ml_dsa_key: ml_dsa,
+        device_id,
+        storage,
+    } = make_service(relay.clone()).await;
+
+    let remote_device = "device-remote-epoch-miss";
+    let remote_signing_key = make_signing_key();
+    let remote_ml_dsa = make_ml_dsa_keypair();
+    register_device_with_pq(
+        &relay,
+        &storage,
+        remote_device,
+        &remote_signing_key.verifying_key(),
+        &remote_ml_dsa.public_key_bytes(),
+    );
+
+    let mut sender_kh = init_key_hierarchy();
+    sender_kh.store_epoch_key(1, Zeroizing::new(vec![0x11; 32]));
+
+    let hlc = prism_sync_core::Hlc::now(remote_device, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-epoch:title:{}:{remote_device}", hlc),
+        batch_id: Some("batch-missing-epoch".to_string()),
+        entity_id: "task-epoch".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"needs recovery\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: remote_device.to_string(),
+        epoch: 1,
+        server_seq: None,
+    }];
+
+    let envelope = make_encrypted_batch_at_epoch(
+        &ops,
+        &sender_kh,
+        &remote_signing_key,
+        &remote_ml_dsa,
+        "batch-missing-epoch",
+        remote_device,
+        1,
+    );
+    relay.inject_batch(envelope);
+
+    let result = service.sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0).await;
+    assert!(result.is_err(), "missing epoch key must return Err");
+    assert_eq!(
+        relay.pull_call_count(),
+        1,
+        "missing epoch key is local/protocol, so it must not retry"
+    );
+
+    let events = drain_events(&mut event_rx);
+    let err_event = events
+        .iter()
+        .find_map(|e| match e {
+            SyncEvent::Error(err) => Some(err),
+            _ => None,
+        })
+        .expect("must emit Error");
+    assert_eq!(err_event.kind, SyncErrorKind::Protocol);
+    assert!(!err_event.retryable);
+    assert!(err_event.code.is_none());
+    assert!(err_event.remote_wipe.is_none());
+
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            SyncEvent::SyncCompleted(result) => Some(result),
+            _ => None,
+        })
+        .expect("must emit SyncCompleted");
+    assert_eq!(completed.error_kind.as_ref(), Some(&SyncErrorKind::Protocol));
+    assert!(completed.error_code.is_none());
+    assert!(completed.remote_wipe.is_none());
+}
+
+/// If a device has the wrong key material cached for a pulled epoch, the
+/// decrypt failure must surface as a local/protocol failure without retries
+/// or relay-scoped metadata.
+#[tokio::test(start_paused = true)]
+async fn sync_now_does_not_retry_on_epoch_decrypt_failure() {
+    let relay = Arc::new(MockRelay::new());
+
+    let TestService {
+        mut service,
+        mut event_rx,
+        mut key_hierarchy,
+        signing_key: sk,
+        ml_dsa_key: ml_dsa,
+        device_id,
+        storage,
+    } = make_service(relay.clone()).await;
+
+    let remote_device = "device-remote-decrypt-fail";
+    let remote_signing_key = make_signing_key();
+    let remote_ml_dsa = make_ml_dsa_keypair();
+    register_device_with_pq(
+        &relay,
+        &storage,
+        remote_device,
+        &remote_signing_key.verifying_key(),
+        &remote_ml_dsa.public_key_bytes(),
+    );
+
+    key_hierarchy.store_epoch_key(1, Zeroizing::new(vec![0x22; 32]));
+    let mut sender_kh = init_key_hierarchy();
+    sender_kh.store_epoch_key(1, Zeroizing::new(vec![0x33; 32]));
+
+    let hlc = prism_sync_core::Hlc::now(remote_device, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-bad-key:title:{}:{remote_device}", hlc),
+        batch_id: Some("batch-decrypt-fail".to_string()),
+        entity_id: "task-bad-key".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"bad key\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: remote_device.to_string(),
+        epoch: 1,
+        server_seq: None,
+    }];
+
+    let envelope = make_encrypted_batch_at_epoch(
+        &ops,
+        &sender_kh,
+        &remote_signing_key,
+        &remote_ml_dsa,
+        "batch-decrypt-fail",
+        remote_device,
+        1,
+    );
+    relay.inject_batch(envelope);
+
+    let result = service.sync_now(&key_hierarchy, &sk, Some(&ml_dsa), &device_id, 0).await;
+    assert!(result.is_err(), "decrypt failure must return Err");
+    assert_eq!(
+        relay.pull_call_count(),
+        1,
+        "decrypt failure is local/protocol, so it must not retry"
+    );
+
+    let events = drain_events(&mut event_rx);
+    let err_event = events
+        .iter()
+        .find_map(|e| match e {
+            SyncEvent::Error(err) => Some(err),
+            _ => None,
+        })
+        .expect("must emit Error");
+    assert_eq!(err_event.kind, SyncErrorKind::Protocol);
+    assert!(!err_event.retryable);
+    assert!(err_event.code.is_none());
+    assert!(err_event.remote_wipe.is_none());
+
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            SyncEvent::SyncCompleted(result) => Some(result),
+            _ => None,
+        })
+        .expect("must emit SyncCompleted");
+    assert_eq!(completed.error_kind.as_ref(), Some(&SyncErrorKind::Protocol));
+    assert!(completed.error_code.is_none());
+    assert!(completed.remote_wipe.is_none());
 }

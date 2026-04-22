@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:prism_sync/prism_sync.dart';
 
-Future<void> main() async {
-  await RustLib.init();
+void main() {
   runApp(const MyApp());
 }
 
@@ -11,14 +10,11 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final sampleKind = SyncErrorKind.protocol;
     return MaterialApp(
       home: Scaffold(
-        appBar: AppBar(title: const Text('flutter_rust_bridge quickstart')),
-        body: Center(
-          child: Text(
-            'Action: Call Rust `greet("Tom")`\nResult: `${greet(name: "Tom")}`',
-          ),
-        ),
+        appBar: AppBar(title: const Text('prism_sync example')),
+        body: Center(child: Text('Package loaded. Sample kind: $sampleKind')),
       ),
     );
   }

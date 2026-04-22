@@ -8,11 +8,7 @@ pub enum CoreError {
     HlcParse(String),
 
     #[error("HLC clock drift exceeded: drift={drift_ms}ms, max={max_ms}ms, device={device_id}")]
-    ClockDrift {
-        drift_ms: i64,
-        max_ms: i64,
-        device_id: String,
-    },
+    ClockDrift { drift_ms: i64, max_ms: i64, device_id: String },
 
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
@@ -40,6 +36,16 @@ pub enum CoreError {
 
     #[error("device {device_id} key changed")]
     DeviceKeyChanged { device_id: String },
+
+    #[error("missing epoch key for epoch {epoch}")]
+    MissingEpochKey { epoch: u32 },
+
+    #[error("decrypt failed for epoch {epoch}: {source}")]
+    DecryptFailed {
+        epoch: u32,
+        #[source]
+        source: prism_sync_crypto::CryptoError,
+    },
 
     #[error("engine error: {0}")]
     Engine(String),
@@ -84,10 +90,7 @@ impl CoreError {
                 (RelayErrorCategory::Server, Some(status_code), None, None, None)
             }
             RelayError::Auth { .. } => (RelayErrorCategory::Auth, None, None, None, None),
-            RelayError::UpgradeRequired {
-                min_signature_version,
-                ..
-            } => (
+            RelayError::UpgradeRequired { min_signature_version, .. } => (
                 RelayErrorCategory::Auth,
                 Some(403),
                 Some("upgrade_required".to_string()),
@@ -135,10 +138,7 @@ impl CoreError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            CoreError::Relay {
-                kind: RelayErrorCategory::Network | RelayErrorCategory::Server,
-                ..
-            }
+            CoreError::Relay { kind: RelayErrorCategory::Network | RelayErrorCategory::Server, .. }
         )
     }
 }

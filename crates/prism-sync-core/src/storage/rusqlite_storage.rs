@@ -4,11 +4,11 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use super::error::StorageError;
 use super::migrations;
 use super::snapshot_format::*;
 use super::traits::*;
 use super::types::*;
-use super::error::StorageError;
 use crate::error::{CoreError, Result};
 
 // ── Row-mapping helpers ──
@@ -41,21 +41,12 @@ fn fixup_sync_metadata(
     let updated: String = row.get("updated_at")?;
 
     // We do fallible parsing inside rusqlite::Result by mapping errors
-    m.last_pushed_at = last_pushed.and_then(|s| {
-        DateTime::parse_from_rfc3339(&s)
-            .ok()
-            .map(|d| d.with_timezone(&Utc))
-    });
-    m.last_successful_sync_at = last_sync.and_then(|s| {
-        DateTime::parse_from_rfc3339(&s)
-            .ok()
-            .map(|d| d.with_timezone(&Utc))
-    });
-    m.registered_at = registered.and_then(|s| {
-        DateTime::parse_from_rfc3339(&s)
-            .ok()
-            .map(|d| d.with_timezone(&Utc))
-    });
+    m.last_pushed_at = last_pushed
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
+    m.last_successful_sync_at = last_sync
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
+    m.registered_at = registered
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
     m.created_at = DateTime::parse_from_rfc3339(&created)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
@@ -83,11 +74,8 @@ fn row_to_pending_op(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingOp> {
         created_at: DateTime::parse_from_rfc3339(&created_str)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
-        pushed_at: pushed_str.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|d| d.with_timezone(&Utc))
-        }),
+        pushed_at: pushed_str
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
     })
 }
 
@@ -123,11 +111,8 @@ fn row_to_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecor
         registered_at: DateTime::parse_from_rfc3339(&registered_str)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
-        revoked_at: revoked_str.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|d| d.with_timezone(&Utc))
-        }),
+        revoked_at: revoked_str
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
         // SQLite stores as INTEGER (i64); safe for practical generation counts
         ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
     })
@@ -136,29 +121,21 @@ fn row_to_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecor
 // ── Shared query implementations (used by both SyncStorage and SyncStorageTx) ──
 
 fn query_sync_metadata(conn: &Connection, sync_id: &str) -> Result<Option<SyncMetadata>> {
-    conn.query_row(
-        "SELECT * FROM sync_metadata WHERE sync_id = ?1",
-        params![sync_id],
-        |row| {
-            let m = row_to_sync_metadata(row)?;
-            fixup_sync_metadata(m, row)
-        },
-    )
+    conn.query_row("SELECT * FROM sync_metadata WHERE sync_id = ?1", params![sync_id], |row| {
+        let m = row_to_sync_metadata(row)?;
+        fixup_sync_metadata(m, row)
+    })
     .optional()
     .map_err(CoreError::from)
 }
 
 fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT local_batch_id, MIN(created_at) AS first_created \
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT local_batch_id, MIN(created_at) AS first_created \
              FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NULL \
              GROUP BY local_batch_id ORDER BY first_created ASC",
-        )
-        ?;
-    let rows = stmt
-        .query_map(params![sync_id], |row| row.get::<_, String>(0))
-        ?;
+    )?;
+    let rows = stmt.query_map(params![sync_id], |row| row.get::<_, String>(0))?;
     let mut result = Vec::new();
     for r in rows {
         result.push(r?);
@@ -167,15 +144,11 @@ fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<Stri
 }
 
 fn query_batch_ops(conn: &Connection, batch_id: &str) -> Result<Vec<PendingOp>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT * FROM pending_ops WHERE local_batch_id = ?1 \
+    let mut stmt = conn.prepare(
+        "SELECT * FROM pending_ops WHERE local_batch_id = ?1 \
              ORDER BY created_at ASC, client_hlc ASC",
-        )
-        ?;
-    let rows = stmt
-        .query_map(params![batch_id], row_to_pending_op)
-        ?;
+    )?;
+    let rows = stmt.query_map(params![batch_id], row_to_pending_op)?;
     let mut result = Vec::new();
     for r in rows {
         result.push(r?);
@@ -185,13 +158,10 @@ fn query_batch_ops(conn: &Connection, batch_id: &str) -> Result<Vec<PendingOp>> 
 
 fn query_is_op_applied(conn: &Connection, op_id: &str) -> Result<bool> {
     let exists: Option<i32> = conn
-        .query_row(
-            "SELECT 1 FROM applied_ops WHERE op_id = ?1 LIMIT 1",
-            params![op_id],
-            |row| row.get(0),
-        )
-        .optional()
-        ?;
+        .query_row("SELECT 1 FROM applied_ops WHERE op_id = ?1 LIMIT 1", params![op_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
     Ok(exists.is_some())
 }
 
@@ -227,12 +197,8 @@ fn query_device_record(
 }
 
 fn query_list_device_records(conn: &Connection, sync_id: &str) -> Result<Vec<DeviceRecord>> {
-    let mut stmt = conn
-        .prepare("SELECT * FROM device_registry WHERE sync_id = ?1")
-        ?;
-    let rows = stmt
-        .query_map(params![sync_id], row_to_device_record)
-        ?;
+    let mut stmt = conn.prepare("SELECT * FROM device_registry WHERE sync_id = ?1")?;
+    let rows = stmt.query_map(params![sync_id], row_to_device_record)?;
     let mut result = Vec::new();
     for r in rows {
         result.push(r?);
@@ -245,13 +211,11 @@ fn query_count_prunable_applied_ops(
     sync_id: &str,
     below_seq: i64,
 ) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM applied_ops WHERE sync_id = ?1 AND server_seq < ?2",
-            params![sync_id, below_seq],
-            |row| row.get(0),
-        )
-        ?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM applied_ops WHERE sync_id = ?1 AND server_seq < ?2",
+        params![sync_id, below_seq],
+        |row| row.get(0),
+    )?;
     Ok(count as usize)
 }
 
@@ -263,9 +227,8 @@ fn query_list_prunable_tombstones(
 ) -> Result<Vec<(String, String)>> {
     // Find entities whose is_deleted field_version has a winning_encoded_value of "true"
     // and whose winning op was acknowledged (exists in applied_ops with server_seq < below_seq).
-    let mut stmt = conn
-        .prepare(
-            "SELECT fv.entity_table, fv.entity_id \
+    let mut stmt = conn.prepare(
+        "SELECT fv.entity_table, fv.entity_id \
              FROM field_versions fv \
              JOIN applied_ops ao ON ao.op_id = fv.winning_op_id \
              WHERE fv.sync_id = ?1 \
@@ -273,13 +236,10 @@ fn query_list_prunable_tombstones(
                AND fv.winning_encoded_value = 'true' \
                AND ao.server_seq < ?2 \
              LIMIT ?3",
-        )
-        ?;
-    let rows = stmt
-        .query_map(params![sync_id, below_seq, limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        ?;
+    )?;
+    let rows = stmt.query_map(params![sync_id, below_seq, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     let mut result = Vec::new();
     for r in rows {
         result.push(r?);
@@ -309,8 +269,7 @@ fn exec_upsert_sync_metadata(conn: &Connection, meta: &SyncMetadata) -> Result<(
             meta.created_at.to_rfc3339(),
             meta.updated_at.to_rfc3339(),
         ],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -322,8 +281,7 @@ fn exec_update_last_pulled_seq(conn: &Connection, sync_id: &str, seq: i64) -> Re
          VALUES (?1, '', 0, ?2, ?3, ?3) \
          ON CONFLICT(sync_id) DO UPDATE SET last_pulled_server_seq = ?2, updated_at = ?3",
         params![sync_id, seq, now],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -336,18 +294,20 @@ fn exec_update_last_successful_sync(conn: &Connection, sync_id: &str) -> Result<
          VALUES (?1, '', 0, 0, ?2, ?2, ?2) \
          ON CONFLICT(sync_id) DO UPDATE SET last_successful_sync_at = ?2, updated_at = ?2",
         params![sync_id, now],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
 fn exec_update_current_epoch(conn: &Connection, sync_id: &str, epoch: i32) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "UPDATE sync_metadata SET current_epoch = ?1, updated_at = ?2 WHERE sync_id = ?3",
-        params![epoch, now, sync_id],
-    )
-    ?;
+        "INSERT INTO sync_metadata \
+         (sync_id, local_device_id, current_epoch, last_pulled_server_seq, created_at, updated_at) \
+         VALUES (?1, '', ?2, 0, ?3, ?3) \
+         ON CONFLICT(sync_id) DO UPDATE SET \
+         current_epoch = excluded.current_epoch, updated_at = excluded.updated_at",
+        params![sync_id, epoch, now],
+    )?;
     Ok(())
 }
 
@@ -385,8 +345,7 @@ fn exec_insert_pending_op(conn: &Connection, op: &PendingOp) -> Result<()> {
             op.created_at.to_rfc3339(),
             op.pushed_at.map(|d| d.to_rfc3339()),
         ],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -394,8 +353,7 @@ fn exec_mark_batch_pushed(conn: &Connection, batch_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE pending_ops SET pushed_at = ?1 WHERE local_batch_id = ?2",
         params![Utc::now().to_rfc3339(), batch_id],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -403,8 +361,7 @@ fn exec_delete_pushed_ops(conn: &Connection, sync_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NOT NULL",
         params![sync_id],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -422,8 +379,7 @@ fn exec_insert_applied_op(conn: &Connection, op: &AppliedOp) -> Result<()> {
             op.server_seq,
             op.applied_at.to_rfc3339(),
         ],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -444,8 +400,7 @@ fn exec_upsert_field_version(conn: &Connection, fv: &FieldVersion) -> Result<()>
             fv.winning_encoded_value,
             fv.updated_at.to_rfc3339(),
         ],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -469,8 +424,7 @@ fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result
             device.revoked_at.map(|d| d.to_rfc3339()),
             device.ml_dsa_key_generation as i32,
         ],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -478,37 +432,16 @@ fn exec_remove_device_record(conn: &Connection, sync_id: &str, device_id: &str) 
     conn.execute(
         "DELETE FROM device_registry WHERE sync_id = ?1 AND device_id = ?2",
         params![sync_id, device_id],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
 fn exec_clear_sync_state(conn: &Connection, sync_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM pending_ops WHERE sync_id = ?1",
-        params![sync_id],
-    )
-    ?;
-    conn.execute(
-        "DELETE FROM applied_ops WHERE sync_id = ?1",
-        params![sync_id],
-    )
-    ?;
-    conn.execute(
-        "DELETE FROM field_versions WHERE sync_id = ?1",
-        params![sync_id],
-    )
-    ?;
-    conn.execute(
-        "DELETE FROM device_registry WHERE sync_id = ?1",
-        params![sync_id],
-    )
-    ?;
-    conn.execute(
-        "DELETE FROM sync_metadata WHERE sync_id = ?1",
-        params![sync_id],
-    )
-    ?;
+    conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM applied_ops WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM field_versions WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM device_registry WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM sync_metadata WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
 }
 
@@ -520,16 +453,14 @@ fn exec_delete_applied_ops_below_seq(
 ) -> Result<usize> {
     // SQLite supports LIMIT on DELETE when compiled with SQLITE_ENABLE_UPDATE_DELETE_LIMIT,
     // but that is not always available. Use a subquery approach instead.
-    let affected = conn
-        .execute(
-            "DELETE FROM applied_ops WHERE op_id IN ( \
+    let affected = conn.execute(
+        "DELETE FROM applied_ops WHERE op_id IN ( \
                SELECT op_id FROM applied_ops \
                WHERE sync_id = ?1 AND server_seq < ?2 \
                LIMIT ?3 \
              )",
-            params![sync_id, below_seq, limit as i64],
-        )
-        ?;
+        params![sync_id, below_seq, limit as i64],
+    )?;
     Ok(affected)
 }
 
@@ -542,8 +473,7 @@ fn exec_delete_field_versions_for_entity(
     conn.execute(
         "DELETE FROM field_versions WHERE sync_id = ?1 AND entity_table = ?2 AND entity_id = ?3",
         params![sync_id, table, entity_id],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -551,9 +481,7 @@ fn exec_delete_field_versions_for_entity(
 
 fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
     // 1. Query all field_versions for this sync_id
-    let mut fv_stmt = conn
-        .prepare("SELECT * FROM field_versions WHERE sync_id = ?1")
-        ?;
+    let mut fv_stmt = conn.prepare("SELECT * FROM field_versions WHERE sync_id = ?1")?;
     let field_versions: Vec<FieldVersionEntry> = fv_stmt
         .query_map(params![sync_id], |row| {
             Ok(FieldVersionEntry {
@@ -566,15 +494,11 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 winning_encoded_value: row.get("winning_encoded_value")?,
                 updated_at: row.get("updated_at")?,
             })
-        })
-        ?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        ?;
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // 2. Query all device_registry rows for this sync_id
-    let mut dr_stmt = conn
-        .prepare("SELECT * FROM device_registry WHERE sync_id = ?1")
-        ?;
+    let mut dr_stmt = conn.prepare("SELECT * FROM device_registry WHERE sync_id = ?1")?;
     let device_registry: Vec<DeviceRegistryEntry> = dr_stmt
         .query_map(params![sync_id], |row| {
             let ed25519: Vec<u8> = row.get("ed25519_public_key")?;
@@ -594,15 +518,11 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 revoked_at: row.get("revoked_at")?,
                 ml_dsa_key_generation: row.get::<_, i32>("ml_dsa_key_generation")? as u32,
             })
-        })
-        ?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        ?;
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // 3. Query all applied_ops for this sync_id
-    let mut ao_stmt = conn
-        .prepare("SELECT * FROM applied_ops WHERE sync_id = ?1")
-        ?;
+    let mut ao_stmt = conn.prepare("SELECT * FROM applied_ops WHERE sync_id = ?1")?;
     let applied_ops: Vec<AppliedOpEntry> = ao_stmt
         .query_map(params![sync_id], |row| {
             Ok(AppliedOpEntry {
@@ -614,10 +534,8 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
                 server_seq: row.get("server_seq")?,
                 applied_at: row.get("applied_at")?,
             })
-        })
-        ?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        ?;
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // 4. Query sync_metadata for this sync_id
     let meta = query_sync_metadata(conn, sync_id)?;
@@ -646,16 +564,18 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(&snapshot)?;
 
     // 6. Compress with zstd (level 3)
-    let compressed = zstd::encode_all(json.as_slice(), 3)
-        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("zstd compression failed: {e}"))))?;
+    let compressed = zstd::encode_all(json.as_slice(), 3).map_err(|e| {
+        CoreError::Storage(StorageError::Logic(format!("zstd compression failed: {e}")))
+    })?;
 
     Ok(compressed)
 }
 
 fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result<u64> {
     // 1. Decompress zstd
-    let json = zstd::decode_all(data)
-        .map_err(|e| CoreError::Storage(StorageError::Logic(format!("zstd decompression failed: {e}"))))?;
+    let json = zstd::decode_all(data).map_err(|e| {
+        CoreError::Storage(StorageError::Logic(format!("zstd decompression failed: {e}")))
+    })?;
 
     // 2. Parse JSON
     let snapshot: SnapshotData = serde_json::from_slice(&json)?;
@@ -690,23 +610,29 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 fv.winning_encoded_value,
                 fv.updated_at,
             ],
-        )
-        ?;
+        )?;
         entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
     }
 
     // 4. Insert device_registry (INSERT OR REPLACE)
     for dr in &snapshot.device_registry {
-        let ed25519 = hex::decode(&dr.ed25519_public_key)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in ed25519_public_key: {e}"))))?;
-        let x25519 = hex::decode(&dr.x25519_public_key)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in x25519_public_key: {e}"))))?;
-        let ml_dsa = hex::decode(&dr.ml_dsa_65_public_key)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in ml_dsa_65_public_key: {e}"))))?;
-        let ml_kem = hex::decode(&dr.ml_kem_768_public_key)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in ml_kem_768_public_key: {e}"))))?;
-        let x_wing = hex::decode(&dr.x_wing_public_key)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("bad hex in x_wing_public_key: {e}"))))?;
+        let ed25519 = hex::decode(&dr.ed25519_public_key).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("bad hex in ed25519_public_key: {e}")))
+        })?;
+        let x25519 = hex::decode(&dr.x25519_public_key).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("bad hex in x25519_public_key: {e}")))
+        })?;
+        let ml_dsa = hex::decode(&dr.ml_dsa_65_public_key).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("bad hex in ml_dsa_65_public_key: {e}")))
+        })?;
+        let ml_kem = hex::decode(&dr.ml_kem_768_public_key).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!(
+                "bad hex in ml_kem_768_public_key: {e}"
+            )))
+        })?;
+        let x_wing = hex::decode(&dr.x_wing_public_key).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("bad hex in x_wing_public_key: {e}")))
+        })?;
         conn.execute(
             "INSERT OR REPLACE INTO device_registry \
              (sync_id, device_id, ed25519_public_key, x25519_public_key, \
@@ -726,8 +652,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 dr.revoked_at,
                 dr.ml_dsa_key_generation as i32,
             ],
-        )
-        ?;
+        )?;
     }
 
     // 5. Insert applied_ops (INSERT OR IGNORE — idempotent)
@@ -745,8 +670,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 ao.server_seq,
                 ao.applied_at,
             ],
-        )
-        ?;
+        )?;
     }
 
     // 6. Update sync_metadata (last_pulled_server_seq, current_epoch)
@@ -758,15 +682,8 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
          (sync_id, local_device_id, current_epoch, last_pulled_server_seq, \
           needs_rekey, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
-        params![
-            sync_id,
-            local_device_id,
-            sm.current_epoch,
-            sm.last_pulled_server_seq,
-            now,
-        ],
-    )
-    ?;
+        params![sync_id, local_device_id, sm.current_epoch, sm.last_pulled_server_seq, now,],
+    )?;
 
     // 7. Return count of unique entities
     Ok(entities.len() as u64)
@@ -798,17 +715,14 @@ impl RusqliteSyncStorage {
              PRAGMA busy_timeout = 5000;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
-        )
-        ?;
+        )?;
 
         let mut conn = conn;
-        migrations::migrations()
-            .to_latest(&mut conn)
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("Migration failed: {e}"))))?;
+        migrations::migrations().to_latest(&mut conn).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("Migration failed: {e}")))
+        })?;
 
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     /// Create a new encrypted storage backed by an existing connection.
@@ -817,8 +731,9 @@ impl RusqliteSyncStorage {
     /// other database operations. Uses SQLCipher's `PRAGMA key` for AES-256.
     pub fn new_encrypted(conn: Connection, key: &[u8]) -> Result<Self> {
         let hex_key = hex::encode(key);
-        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("PRAGMA key failed: {e}"))))?;
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";")).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("PRAGMA key failed: {e}")))
+        })?;
 
         // Now proceed with normal setup
         Self::new(conn)
@@ -833,13 +748,8 @@ impl RusqliteSyncStorage {
 impl SyncStorage for RusqliteSyncStorage {
     fn begin_tx(&self) -> Result<Box<dyn SyncStorageTx + '_>> {
         let guard = self.conn.lock().expect("SyncStorage mutex poisoned");
-        guard
-            .execute_batch("BEGIN IMMEDIATE")
-            ?;
-        Ok(Box::new(RusqliteTx {
-            conn: guard,
-            committed: false,
-        }))
+        guard.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(Box::new(RusqliteTx { conn: guard, committed: false }))
     }
 
     fn get_sync_metadata(&self, sync_id: &str) -> Result<Option<SyncMetadata>> {
@@ -905,9 +815,13 @@ impl SyncStorage for RusqliteSyncStorage {
 
     fn rekey(&self, new_key: &[u8; 32]) -> Result<()> {
         let hex = new_key.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let conn = self.conn.lock().map_err(|_| CoreError::Storage(StorageError::Logic("lock poisoned".into())))?;
-        conn.execute_batch(&format!("PRAGMA rekey = \"x'{hex}'\";\n"))
-            .map_err(|e| CoreError::Storage(StorageError::Logic(format!("PRAGMA rekey failed: {e}"))))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| CoreError::Storage(StorageError::Logic("lock poisoned".into())))?;
+        conn.execute_batch(&format!("PRAGMA rekey = \"x'{hex}'\";\n")).map_err(|e| {
+            CoreError::Storage(StorageError::Logic(format!("PRAGMA rekey failed: {e}")))
+        })?;
         Ok(())
     }
 }
@@ -1048,17 +962,13 @@ impl SyncStorageTx for RusqliteTx<'_> {
     // ── Transaction lifecycle ──
 
     fn commit(mut self: Box<Self>) -> Result<()> {
-        self.conn
-            .execute_batch("COMMIT")
-            ?;
+        self.conn.execute_batch("COMMIT")?;
         self.committed = true;
         Ok(())
     }
 
     fn rollback(mut self: Box<Self>) -> Result<()> {
-        self.conn
-            .execute_batch("ROLLBACK")
-            ?;
+        self.conn.execute_batch("ROLLBACK")?;
         self.committed = true; // prevent double-rollback in Drop
         Ok(())
     }
@@ -1260,10 +1170,8 @@ mod tests {
         tx.upsert_field_version(&fv1).unwrap();
         tx.commit().unwrap();
 
-        let retrieved = storage
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .unwrap();
+        let retrieved =
+            storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
         assert_eq!(retrieved.winning_op_id, "op-1");
 
         // Upsert with new winning op
@@ -1276,10 +1184,8 @@ mod tests {
         tx.upsert_field_version(&fv2).unwrap();
         tx.commit().unwrap();
 
-        let retrieved = storage
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .unwrap();
+        let retrieved =
+            storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
         assert_eq!(retrieved.winning_op_id, "op-2");
         assert_eq!(retrieved.winning_device_id, "dev2");
     }
@@ -1295,10 +1201,7 @@ mod tests {
         tx.commit().unwrap();
 
         // Get
-        let retrieved = storage
-            .get_device_record("sync-1", "dev-1")
-            .unwrap()
-            .unwrap();
+        let retrieved = storage.get_device_record("sync-1", "dev-1").unwrap().unwrap();
         assert_eq!(retrieved.device_id, "dev-1");
         assert_eq!(retrieved.ed25519_public_key, vec![1, 2, 3, 4]);
         assert_eq!(retrieved.status, "active");
@@ -1317,10 +1220,7 @@ mod tests {
         tx.remove_device_record("sync-1", "dev-1").unwrap();
         tx.commit().unwrap();
 
-        assert!(storage
-            .get_device_record("sync-1", "dev-1")
-            .unwrap()
-            .is_none());
+        assert!(storage.get_device_record("sync-1", "dev-1").unwrap().is_none());
         assert_eq!(storage.list_device_records("sync-1").unwrap().len(), 1);
     }
 
@@ -1371,24 +1271,17 @@ mod tests {
         // Insert data across all tables
         let mut tx = storage.begin_tx().unwrap();
         tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
-        tx.insert_pending_op(&sample_pending_op("op-1", "sync-1", "batch-1"))
-            .unwrap();
-        tx.insert_applied_op(&sample_applied_op("applied-1", "sync-1"))
-            .unwrap();
-        tx.upsert_field_version(&sample_field_version("sync-1"))
-            .unwrap();
-        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1"))
-            .unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-1", "sync-1", "batch-1")).unwrap();
+        tx.insert_applied_op(&sample_applied_op("applied-1", "sync-1")).unwrap();
+        tx.upsert_field_version(&sample_field_version("sync-1")).unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1")).unwrap();
         tx.commit().unwrap();
 
         // Verify data exists
         assert!(storage.get_sync_metadata("sync-1").unwrap().is_some());
         assert!(!storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
         assert!(storage.is_op_applied("applied-1").unwrap());
-        assert!(storage
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .is_some());
+        assert!(storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().is_some());
         assert!(!storage.list_device_records("sync-1").unwrap().is_empty());
 
         // Clear
@@ -1400,10 +1293,7 @@ mod tests {
         assert!(storage.get_sync_metadata("sync-1").unwrap().is_none());
         assert!(storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
         assert!(!storage.is_op_applied("applied-1").unwrap());
-        assert!(storage
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .is_none());
+        assert!(storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().is_none());
         assert!(storage.list_device_records("sync-1").unwrap().is_empty());
     }
 
@@ -1413,10 +1303,8 @@ mod tests {
 
         // Insert two ops in different batches
         let mut tx = storage.begin_tx().unwrap();
-        tx.insert_pending_op(&sample_pending_op("op-1", "sync-1", "batch-1"))
-            .unwrap();
-        tx.insert_pending_op(&sample_pending_op("op-2", "sync-1", "batch-2"))
-            .unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-1", "sync-1", "batch-1")).unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-2", "sync-1", "batch-2")).unwrap();
         // Mark only batch-1 as pushed
         tx.mark_batch_pushed("batch-1").unwrap();
         tx.commit().unwrap();
@@ -1469,24 +1357,60 @@ mod tests {
     }
 
     #[test]
+    fn update_current_epoch_works() {
+        let storage = make_storage();
+        let meta = sample_metadata("sync-1");
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&meta).unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_current_epoch("sync-1", 7).unwrap();
+        tx.commit().unwrap();
+
+        let retrieved = storage.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(retrieved.current_epoch, 7);
+        assert_eq!(retrieved.local_device_id, meta.local_device_id);
+        assert_eq!(retrieved.last_pulled_server_seq, meta.last_pulled_server_seq);
+        assert_eq!(retrieved.last_pushed_at, meta.last_pushed_at);
+        assert_eq!(retrieved.registered_at, meta.registered_at);
+    }
+
+    #[test]
+    fn update_current_epoch_creates_sync_metadata_when_missing() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_current_epoch("sync-1", 7).unwrap();
+        tx.commit().unwrap();
+
+        let retrieved = storage.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(retrieved.sync_id, "sync-1");
+        assert_eq!(retrieved.local_device_id, "");
+        assert_eq!(retrieved.current_epoch, 7);
+        assert_eq!(retrieved.last_pulled_server_seq, 0);
+        assert!(retrieved.last_pushed_at.is_none());
+        assert!(retrieved.last_successful_sync_at.is_none());
+        assert!(retrieved.registered_at.is_none());
+        assert!(!retrieved.needs_rekey);
+        assert!(retrieved.last_imported_registry_version.is_none());
+        assert_eq!(retrieved.created_at, retrieved.updated_at);
+    }
+
+    #[test]
     fn tx_reads_within_transaction() {
         let storage = make_storage();
 
         // Insert data
         let mut tx = storage.begin_tx().unwrap();
-        tx.upsert_field_version(&sample_field_version("sync-1"))
-            .unwrap();
-        tx.insert_applied_op(&sample_applied_op("applied-1", "sync-1"))
-            .unwrap();
-        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1"))
-            .unwrap();
+        tx.upsert_field_version(&sample_field_version("sync-1")).unwrap();
+        tx.insert_applied_op(&sample_applied_op("applied-1", "sync-1")).unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1")).unwrap();
 
         // Read within same transaction (before commit)
         assert!(tx.is_op_applied("applied-1").unwrap());
-        assert!(tx
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .is_some());
+        assert!(tx.get_field_version("sync-1", "members", "ent-1", "name").unwrap().is_some());
         assert!(tx.get_device_record("sync-1", "dev-1").unwrap().is_some());
 
         tx.commit().unwrap();
@@ -1595,25 +1519,18 @@ mod tests {
 
         // Delete field versions for ent-1
         let mut tx = storage.begin_tx().unwrap();
-        tx.delete_field_versions_for_entity("sync-1", "members", "ent-1")
-            .unwrap();
+        tx.delete_field_versions_for_entity("sync-1", "members", "ent-1").unwrap();
         tx.commit().unwrap();
 
         // ent-1 versions should be gone
-        assert!(storage
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .is_none());
+        assert!(storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().is_none());
         assert!(storage
             .get_field_version("sync-1", "members", "ent-1", "is_deleted")
             .unwrap()
             .is_none());
 
         // ent-2 version should remain
-        assert!(storage
-            .get_field_version("sync-1", "members", "ent-2", "name")
-            .unwrap()
-            .is_some());
+        assert!(storage.get_field_version("sync-1", "members", "ent-2", "name").unwrap().is_some());
     }
 
     #[test]
@@ -1700,10 +1617,8 @@ mod tests {
             updated_at: Utc::now(),
         })
         .unwrap();
-        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1"))
-            .unwrap();
-        tx.upsert_device_record(&sample_device_record("sync-1", "dev-2"))
-            .unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1")).unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-2")).unwrap();
         tx.insert_applied_op(&AppliedOp {
             op_id: "applied-1".to_string(),
             sync_id: "sync-1".to_string(),
@@ -1773,17 +1688,12 @@ mod tests {
         assert_eq!(entity_count, 2);
 
         // Verify field_versions were imported
-        let fv = dst
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .unwrap();
+        let fv = dst.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
         assert_eq!(fv.winning_op_id, "op-1");
         assert_eq!(fv.winning_encoded_value, Some("\"Alice\"".to_string()));
 
-        let fv2 = dst
-            .get_field_version("sync-1", "sessions", "ent-2", "started_at")
-            .unwrap()
-            .unwrap();
+        let fv2 =
+            dst.get_field_version("sync-1", "sessions", "ent-2", "started_at").unwrap().unwrap();
         assert_eq!(fv2.winning_op_id, "op-3");
 
         // Verify device_registry was imported
@@ -1827,10 +1737,7 @@ mod tests {
         assert_eq!(count, 2);
 
         // Data should still be correct
-        let fv = dst
-            .get_field_version("sync-1", "members", "ent-1", "name")
-            .unwrap()
-            .unwrap();
+        let fv = dst.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
         assert_eq!(fv.winning_op_id, "op-1");
     }
 
@@ -1872,12 +1779,7 @@ mod tests {
         // Compressed should be smaller than raw JSON
         // (for very small data this may not always hold, but our test data
         // has enough repetition)
-        assert!(
-            blob.len() <= json.len(),
-            "compressed {} >= raw json {}",
-            blob.len(),
-            json.len()
-        );
+        assert!(blob.len() <= json.len(), "compressed {} >= raw json {}", blob.len(), json.len());
     }
 
     #[test]
@@ -1886,10 +1788,7 @@ mod tests {
         populate_for_snapshot(&src);
 
         // Update dev-1 to generation 5
-        let mut dev = src
-            .get_device_record("sync-1", "dev-1")
-            .unwrap()
-            .unwrap();
+        let mut dev = src.get_device_record("sync-1", "dev-1").unwrap().unwrap();
         dev.ml_dsa_key_generation = 5;
         let mut tx = src.begin_tx().unwrap();
         tx.upsert_device_record(&dev).unwrap();
@@ -1903,10 +1802,7 @@ mod tests {
         tx.commit().unwrap();
 
         // Verify non-zero generation survived
-        let imported = dst
-            .get_device_record("sync-1", "dev-1")
-            .unwrap()
-            .unwrap();
+        let imported = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
         assert_eq!(
             imported.ml_dsa_key_generation, 5,
             "ml_dsa_key_generation should survive snapshot round-trip"
@@ -1918,10 +1814,7 @@ mod tests {
         // Use a unique temp file path
         let path = std::env::temp_dir().join(format!(
             "prism_rekey_test_{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
 
         // Create an encrypted database with key [1u8; 32]

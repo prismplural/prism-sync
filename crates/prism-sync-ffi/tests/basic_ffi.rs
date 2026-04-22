@@ -60,11 +60,7 @@ async fn create_handle_succeeds() {
         String::new(),
         None,
     );
-    assert!(
-        result.is_ok(),
-        "create_prism_sync should succeed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "create_prism_sync should succeed: {:?}", result.err());
 }
 
 #[tokio::test]
@@ -77,11 +73,7 @@ async fn create_handle_with_schema_json() {
         schema.into(),
         None,
     );
-    assert!(
-        result.is_ok(),
-        "schema JSON should parse: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "schema JSON should parse: {:?}", result.err());
 }
 
 #[tokio::test]
@@ -127,27 +119,18 @@ async fn create_handle_with_database_key_encrypts_file_db() {
     let plain_conn = rusqlite::Connection::open(&db_path).expect("open DB without key");
     let plain_result: rusqlite::Result<i64> =
         plain_conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0));
-    assert!(
-        plain_result.is_err(),
-        "unencrypted query should fail for encrypted DB"
-    );
+    assert!(plain_result.is_err(), "unencrypted query should fail for encrypted DB");
     drop(plain_conn);
 
     let keyed_conn = rusqlite::Connection::open(&db_path).expect("open DB for keyed read");
-    let hex_key = db_key
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let hex_key = db_key.iter().map(|b| format!("{b:02x}")).collect::<String>();
     keyed_conn
         .execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
         .expect("apply SQLCipher key");
     let table_count: i64 = keyed_conn
         .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
         .expect("query encrypted DB with correct key");
-    assert!(
-        table_count > 0,
-        "encrypted DB should contain migrated tables"
-    );
+    assert!(table_count > 0, "encrypted DB should contain migrated tables");
     drop(keyed_conn);
 
     let _ = std::fs::remove_file(&db_path);
@@ -172,10 +155,7 @@ async fn create_handle_with_database_key_refuses_plaintext_file_db() {
         Some(db_key),
     );
 
-    assert!(
-        result.is_err(),
-        "existing plaintext DB should fail closed instead of being migrated"
-    );
+    assert!(result.is_err(), "existing plaintext DB should fail closed instead of being migrated");
     let err = match result {
         Ok(_) => unreachable!("asserted is_err above"),
         Err(err) => err,
@@ -184,10 +164,7 @@ async fn create_handle_with_database_key_refuses_plaintext_file_db() {
         err.contains("refusing plaintext migration"),
         "error should explain fail-closed behavior, got: {err}"
     );
-    assert!(
-        !db_path.with_extension("db.bak").exists(),
-        "plaintext backup should not be created"
-    );
+    assert!(!db_path.with_extension("db.bak").exists(), "plaintext backup should not be created");
     assert!(
         !db_path.with_extension("db.enc").exists(),
         "encrypted migration sidecar should not be created"
@@ -244,21 +221,13 @@ async fn initialize_fails_without_secure_store() {
     let mnemonic = api::generate_secret_key().unwrap();
     let secret_bytes = api::mnemonic_to_bytes(mnemonic).unwrap();
     let result = api::initialize(&handle, "pw".into(), secret_bytes).await;
-    assert!(
-        result.is_ok(),
-        "initialize should succeed with MemorySecureStore: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "initialize should succeed with MemorySecureStore: {:?}", result.err());
 }
 
 #[tokio::test]
 async fn generate_secret_key_returns_12_words() {
     let key = api::generate_secret_key().unwrap();
-    assert_eq!(
-        key.split_whitespace().count(),
-        12,
-        "BIP39 mnemonic should have 12 words"
-    );
+    assert_eq!(key.split_whitespace().count(), 12, "BIP39 mnemonic should have 12 words");
 }
 
 #[tokio::test]
@@ -269,9 +238,7 @@ async fn database_key_requires_unlock() {
     assert!(result.is_err(), "database_key should fail when locked");
 
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes)
-        .await
-        .unwrap();
+    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
 
     let result = api::database_key(&handle).await;
     assert!(result.is_ok(), "database_key should succeed when unlocked");
@@ -286,9 +253,7 @@ async fn change_password_succeeds() {
     let secret = api::generate_secret_key().unwrap();
     let secret_bytes = secret.as_bytes().to_vec();
 
-    api::initialize(&handle, "old_pw".into(), secret_bytes.clone())
-        .await
-        .unwrap();
+    api::initialize(&handle, "old_pw".into(), secret_bytes.clone()).await.unwrap();
 
     let result = api::change_password(
         &handle,
@@ -307,11 +272,7 @@ async fn change_password_succeeds() {
     // Lock and unlock with new password
     api::lock(&handle).await;
     let unlock = api::unlock(&handle, "new_pw".into(), secret_bytes).await;
-    assert!(
-        unlock.is_ok(),
-        "unlock with new password should succeed: {:?}",
-        unlock.err()
-    );
+    assert!(unlock.is_ok(), "unlock with new password should succeed: {:?}", unlock.err());
 }
 
 // ── Mutation recording (requires configure_engine, tested via status) ──
@@ -351,11 +312,7 @@ async fn record_delete_fails_without_engine() {
 async fn set_auto_sync_succeeds() {
     let handle = make_handle();
     let result = api::set_auto_sync(&handle, true, 400, 2000, 3).await;
-    assert!(
-        result.is_ok(),
-        "set_auto_sync should succeed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "set_auto_sync should succeed: {:?}", result.err());
 
     // Disable
     let result = api::set_auto_sync(&handle, false, 0, 0, 0).await;
@@ -371,6 +328,22 @@ async fn status_returns_valid_json() {
     let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
     assert_eq!(json["syncing"], false);
     assert!(json["pending_ops"].is_number());
+}
+
+#[tokio::test]
+async fn on_resume_returns_structured_error_when_engine_is_not_configured() {
+    let handle = make_handle();
+
+    let result = api::on_resume(&handle).await;
+    let error = result.expect_err("on_resume should fail without configure_engine");
+    assert!(
+        error.contains("PRISM_SYNC_ERROR_JSON:"),
+        "on_resume should return structured error JSON, got: {error}"
+    );
+    assert!(
+        error.contains("\"operation\":\"on_resume\""),
+        "structured on_resume error should include operation name, got: {error}"
+    );
 }
 
 // ── Events ──
@@ -408,13 +381,9 @@ async fn drain_secure_store_includes_epoch_keys() {
         "epoch": base64::engine::general_purpose::STANDARD.encode(b"1"),
         "epoch_key_1": base64::engine::general_purpose::STANDARD.encode([0xAB; 32]),
     });
-    api::seed_secure_store(&handle, entries.to_string())
-        .await
-        .expect("seed secure store");
+    api::seed_secure_store(&handle, entries.to_string()).await.expect("seed secure store");
 
-    let drained = api::drain_secure_store(&handle)
-        .await
-        .expect("drain secure store");
+    let drained = api::drain_secure_store(&handle).await.expect("drain secure store");
     let json: serde_json::Value = serde_json::from_str(&drained).unwrap();
     assert!(
         json.get("epoch_key_1").is_some(),
@@ -444,9 +413,7 @@ async fn drain_exports_all_memorysecurestore_entries() {
         "unknown_future_key": b64(b"forward compat"),
     });
 
-    api::seed_secure_store(&handle, entries.to_string())
-        .await
-        .expect("seed");
+    api::seed_secure_store(&handle, entries.to_string()).await.expect("seed");
 
     let drained = api::drain_secure_store(&handle).await.expect("drain");
     let json: serde_json::Value = serde_json::from_str(&drained).unwrap();
@@ -480,23 +447,17 @@ async fn seed_then_drain_round_trip() {
         "epoch_key_3": b64(&[0x42; 32]),
         "runtime_keys_xyz": b64(b"runtime-payload"),
     });
-    api::seed_secure_store(&handle, seeded.to_string())
-        .await
-        .expect("first seed");
+    api::seed_secure_store(&handle, seeded.to_string()).await.expect("first seed");
 
     let drained1 = api::drain_secure_store(&handle).await.expect("drain");
-    let map1: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&drained1).unwrap();
+    let map1: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&drained1).unwrap();
 
     // Seed a new handle with the drained output and drain again. The two
     // drained maps must be identical.
     let handle2 = make_handle();
-    api::seed_secure_store(&handle2, drained1.clone())
-        .await
-        .expect("reseed");
+    api::seed_secure_store(&handle2, drained1.clone()).await.expect("reseed");
     let drained2 = api::drain_secure_store(&handle2).await.expect("drain2");
-    let map2: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&drained2).unwrap();
+    let map2: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&drained2).unwrap();
 
     assert_eq!(map1, map2, "drain output must be stable across reseed");
     // And every originally-seeded entry must have survived.
@@ -550,32 +511,18 @@ async fn cold_start_recovers_epoch_key_via_drain_seed_round_trip() {
         seed_obj.insert((*k).to_string(), serde_json::Value::String(b64(v)));
     }
     // The critical dynamic key:
-    seed_obj.insert(
-        "epoch_key_1".to_string(),
-        serde_json::Value::String(b64(&epoch_key_bytes)),
-    );
+    seed_obj.insert("epoch_key_1".to_string(), serde_json::Value::String(b64(&epoch_key_bytes)));
     let seeded = serde_json::Value::Object(seed_obj).to_string();
-    api::seed_secure_store(&handle1, seeded)
-        .await
-        .expect("session1 seed");
+    api::seed_secure_store(&handle1, seeded).await.expect("session1 seed");
 
-    let drained1 = api::drain_secure_store(&handle1)
-        .await
-        .expect("session1 drain");
-    let map1: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&drained1).unwrap();
+    let drained1 = api::drain_secure_store(&handle1).await.expect("session1 drain");
+    let map1: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&drained1).unwrap();
 
     // Invariant 1: epoch_key_1 is in the drained map.
-    assert!(
-        map1.get("epoch_key_1").is_some(),
-        "session1 drain must export epoch_key_1"
-    );
+    assert!(map1.get("epoch_key_1").is_some(), "session1 drain must export epoch_key_1");
     // Invariant 2: every static key we seeded is in the drained map.
     for (k, _) in static_keys {
-        assert!(
-            map1.contains_key(*k),
-            "session1 drain missing static key `{k}`: {map1:?}"
-        );
+        assert!(map1.contains_key(*k), "session1 drain missing static key `{k}`: {map1:?}");
     }
 
     // Simulate app termination: drop session1 handle.
@@ -583,23 +530,17 @@ async fn cold_start_recovers_epoch_key_via_drain_seed_round_trip() {
 
     // --- Session 2: new in-memory DB, seed from drained, drain again ---
     let handle2 = make_handle();
-    api::seed_secure_store(&handle2, drained1)
-        .await
-        .expect("session2 seed from drained");
-    let drained2 = api::drain_secure_store(&handle2)
-        .await
-        .expect("session2 drain");
-    let map2: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&drained2).unwrap();
+    api::seed_secure_store(&handle2, drained1).await.expect("session2 seed from drained");
+    let drained2 = api::drain_secure_store(&handle2).await.expect("session2 drain");
+    let map2: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&drained2).unwrap();
 
     // Invariant 3: the epoch key survived the simulated restart byte-for-byte.
     let round_tripped = map2
         .get("epoch_key_1")
         .and_then(|v| v.as_str())
         .expect("epoch_key_1 missing from session2 drain");
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(round_tripped)
-        .expect("valid base64");
+    let decoded =
+        base64::engine::general_purpose::STANDARD.decode(round_tripped).expect("valid base64");
     assert_eq!(
         decoded,
         epoch_key_bytes.to_vec(),
@@ -608,10 +549,7 @@ async fn cold_start_recovers_epoch_key_via_drain_seed_round_trip() {
 
     // Static keys also round-trip.
     for (k, _) in static_keys {
-        assert!(
-            map2.contains_key(*k),
-            "session2 drain missing static key `{k}` after reseed"
-        );
+        assert!(map2.contains_key(*k), "session2 drain missing static key `{k}` after reseed");
     }
 }
 
@@ -629,9 +567,7 @@ async fn local_storage_key_requires_unlock() {
 async fn local_storage_key_succeeds_after_initialize() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes)
-        .await
-        .unwrap();
+    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
 
     let result = api::local_storage_key(&handle).await;
     assert!(
@@ -647,9 +583,7 @@ async fn local_storage_key_succeeds_after_initialize() {
 async fn local_storage_key_differs_from_database_key() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes)
-        .await
-        .unwrap();
+    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
 
     let local_key = api::local_storage_key(&handle).await.unwrap();
     let db_key = api::database_key(&handle).await.unwrap();
@@ -660,31 +594,20 @@ async fn local_storage_key_differs_from_database_key() {
 async fn rekey_db_rejects_wrong_key_length() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes)
-        .await
-        .unwrap();
+    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
 
     // 16 bytes — wrong length
     let result = api::rekey_db(&handle, vec![0u8; 16]).await;
     assert!(result.is_err(), "rekey_db should reject a 16-byte key");
-    assert!(
-        result.unwrap_err().contains("32 bytes"),
-        "error should mention 32 bytes"
-    );
+    assert!(result.unwrap_err().contains("32 bytes"), "error should mention 32 bytes");
 }
 
 #[tokio::test]
 async fn rekey_db_succeeds_with_32_byte_key() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes)
-        .await
-        .unwrap();
+    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
 
     let result = api::rekey_db(&handle, vec![0xbbu8; 32]).await;
-    assert!(
-        result.is_ok(),
-        "rekey_db should succeed on in-memory storage: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "rekey_db should succeed on in-memory storage: {:?}", result.err());
 }

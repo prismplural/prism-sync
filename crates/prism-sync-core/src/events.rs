@@ -21,10 +21,7 @@ pub enum SyncEvent {
     /// A new device joined the sync group.
     DeviceJoined(DeviceInfo),
     /// A device was revoked from the sync group.
-    DeviceRevoked {
-        device_id: String,
-        remote_wipe: bool,
-    },
+    DeviceRevoked { device_id: String, remote_wipe: bool },
     /// The epoch was rotated (new epoch number).
     EpochRotated(u32),
     /// WebSocket real-time connection state changed.
@@ -137,9 +134,10 @@ pub(crate) fn classify_core_error(e: &crate::error::CoreError) -> SyncErrorKind 
         // do not drain. Storage busy-lock flakes are rare enough that
         // the outer auto-sync driver will pick them up on the next
         // cycle without us burning the inner retry budget.
-        CoreError::Engine(_) | CoreError::Storage(_) => {
-            SyncErrorKind::Protocol
-        }
+        CoreError::MissingEpochKey { .. }
+        | CoreError::DecryptFailed { .. }
+        | CoreError::Engine(_)
+        | CoreError::Storage(_) => SyncErrorKind::Protocol,
         CoreError::Schema(_)
         | CoreError::Serialization(_)
         | CoreError::Json(_)

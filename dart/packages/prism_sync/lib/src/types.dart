@@ -181,6 +181,9 @@ enum SyncErrorKind {
   /// Authentication / key error.
   auth,
 
+  /// Device identity no longer matches the registered device.
+  deviceIdentityMismatch,
+
   /// Server returned an error.
   server,
 
