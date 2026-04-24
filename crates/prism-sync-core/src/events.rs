@@ -28,6 +28,12 @@ pub enum SyncEvent {
     WebSocketStateChanged { connected: bool },
     /// A backoff delay was scheduled after a sync failure.
     BackoffScheduled { attempt: u32, delay_secs: u64 },
+    /// Pair-time snapshot upload progress. Emitted by `SyncService` while
+    /// `put_snapshot` streams the body to the relay.
+    SnapshotUploadProgress { sync_id: String, bytes_sent: u64, bytes_total: u64 },
+    /// Pair-time snapshot upload failed. Emitted by `SyncService` before the
+    /// underlying `Err(..)` is returned to the caller.
+    SnapshotUploadFailed { sync_id: String, reason: String },
 }
 
 /// A single entity change with full field data, for consumer DB application.
@@ -144,7 +150,9 @@ pub(crate) fn classify_core_error(e: &crate::error::CoreError) -> SyncErrorKind 
         | CoreError::HlcParse(_)
         | CoreError::UnknownTable(_)
         | CoreError::UnknownField { .. }
-        | CoreError::Crypto(_) => SyncErrorKind::Protocol,
+        | CoreError::Crypto(_)
+        | CoreError::BootstrapNotAllowed(_)
+        | CoreError::SnapshotTooLarge { .. } => SyncErrorKind::Protocol,
     }
 }
 

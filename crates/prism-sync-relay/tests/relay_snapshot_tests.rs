@@ -13,6 +13,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::Client;
 
 use prism_sync_relay::db;
+use prism_sync_relay::snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES;
 
 use common::*;
 
@@ -147,14 +148,19 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
     let decoded_data = BASE64.decode(json["data"].as_str().unwrap()).unwrap();
     assert_eq!(decoded_data.as_slice(), b"targeted-snapshot");
 
-    let post_delete_resp = client
+    // Regression: GET must NOT auto-delete. Retention is now ACK-gated
+    // via DELETE /v1/sync/{sync_id}/snapshot from the target device.
+    let second_get = client
         .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
         .header("Authorization", format!("Bearer {token_b}"))
         .header("X-Device-Id", &device_b_id)
         .send()
         .await
         .unwrap();
-    assert_eq!(post_delete_resp.status(), 404, "snapshot should auto-delete");
+    assert_eq!(second_get.status(), 200, "snapshot must survive a GET (no auto-delete)");
+    let json2: serde_json::Value = second_get.json().await.unwrap();
+    let decoded2 = BASE64.decode(json2["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded2.as_slice(), b"targeted-snapshot");
 }
 
 #[tokio::test]
@@ -201,4 +207,238 @@ async fn test_targeted_snapshot_expires() {
         .await
         .unwrap();
     assert_eq!(expired_resp.status(), 404, "expired snapshot should be hidden");
+}
+
+// ───────────────── Size-limit and DELETE-ACK tests (Phase B.3) ─────────────
+
+/// Issue a signed DELETE against `/v1/sync/{sync_id}/snapshot`.
+async fn delete_snapshot_signed(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+) -> reqwest::Response {
+    let path = format!("/v1/sync/{sync_id}/snapshot");
+    let builder = client
+        .delete(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", device_id);
+    apply_signed_headers(builder, keys, "DELETE", &path, sync_id, device_id, &[])
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_snapshot_accepts_25mb_payload() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // 25 MB baseline — the v-prior limit is comfortably within the new cap.
+    let snapshot = vec![0u8; 25 * 1024 * 1024];
+    let resp = put_snapshot_signed(
+        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "25 MB snapshot should be accepted");
+}
+
+#[tokio::test]
+async fn test_snapshot_accepts_140mb_payload() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // 140 MB — above the v-prior 25 MB cap, below the new 150 MB wire cap.
+    // Exercises both the raised router body limit and the raised handler
+    // body.len() check.
+    let snapshot = vec![0u8; 140 * 1024 * 1024];
+    let resp = put_snapshot_signed(
+        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "140 MB snapshot should be accepted under the new cap");
+}
+
+#[tokio::test]
+async fn test_snapshot_rejects_over_wire_limit() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // 151 MB — 1 MB over the MAX_SNAPSHOT_WIRE_BYTES cap. The router
+    // body-limit layer should reject before the handler runs; in that
+    // case axum returns 413 (Payload Too Large) directly.
+    let snapshot = vec![0u8; 151 * 1024 * 1024];
+    assert!(snapshot.len() > MAX_SNAPSHOT_WIRE_BYTES);
+    let resp = put_snapshot_signed(
+        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 413, "oversize snapshot should be rejected with 413");
+}
+
+#[tokio::test]
+async fn test_get_snapshot_does_not_auto_delete() {
+    // Regression: GET used to auto-delete after cross-device download.
+    // With ACK-gated retention the snapshot must survive any number of
+    // GETs until the target device explicitly DELETEs it.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner_id = generate_device_id();
+    let (token_joiner, _keys_joiner) = prepare_device(&db, &sync_id, &joiner_id).await;
+
+    let put_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "7",
+        b"persistent-snapshot".to_vec(),
+        &[("X-For-Device-Id", &joiner_id)],
+    )
+    .await;
+    assert_eq!(put_resp.status(), 204);
+
+    for attempt in 0..3 {
+        let resp = client
+            .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+            .header("Authorization", format!("Bearer {token_joiner}"))
+            .header("X-Device-Id", &joiner_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "GET #{attempt} must still find the snapshot");
+        let json: serde_json::Value = resp.json().await.unwrap();
+        let decoded = BASE64.decode(json["data"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded.as_slice(), b"persistent-snapshot");
+    }
+}
+
+#[tokio::test]
+async fn test_delete_snapshot_by_target_device_removes_it() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner_id = generate_device_id();
+    let (token_joiner, keys_joiner) = prepare_device(&db, &sync_id, &joiner_id).await;
+
+    let put_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "9",
+        b"ack-me".to_vec(),
+        &[("X-For-Device-Id", &joiner_id)],
+    )
+    .await;
+    assert_eq!(put_resp.status(), 204);
+
+    // Target device ACKs the snapshot — expect 204.
+    let del_resp = delete_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &joiner_id,
+        &token_joiner,
+        &keys_joiner,
+    )
+    .await;
+    assert_eq!(del_resp.status(), 204, "target device should be able to ACK-delete");
+
+    // Subsequent GET returns 404.
+    let get_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token_joiner}"))
+        .header("X-Device-Id", &joiner_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), 404, "snapshot should be gone after ACK-delete");
+}
+
+#[tokio::test]
+async fn test_delete_snapshot_by_non_target_device_is_forbidden() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner_id = generate_device_id();
+    let (_token_joiner, _keys_joiner) = prepare_device(&db, &sync_id, &joiner_id).await;
+
+    // Third device registered on the same sync group — not the snapshot target.
+    let attacker_id = generate_device_id();
+    let (token_attacker, keys_attacker) = prepare_device(&db, &sync_id, &attacker_id).await;
+
+    let put_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "9",
+        b"hands-off".to_vec(),
+        &[("X-For-Device-Id", &joiner_id)],
+    )
+    .await;
+    assert_eq!(put_resp.status(), 204);
+
+    let resp = delete_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &attacker_id,
+        &token_attacker,
+        &keys_attacker,
+    )
+    .await;
+    assert_eq!(resp.status(), 403, "non-target device must not be able to ACK-delete");
+}
+
+#[tokio::test]
+async fn test_delete_snapshot_when_missing_returns_404() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let resp =
+        delete_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys).await;
+    assert_eq!(resp.status(), 404, "DELETE with no snapshot present should be 404");
 }

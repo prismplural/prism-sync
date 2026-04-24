@@ -29,6 +29,7 @@ pub mod runtime;
 pub mod runtime_keys;
 pub mod schema;
 pub mod secure_store;
+pub mod snapshot_limits;
 pub mod storage;
 pub mod sync_aad;
 pub mod sync_service;

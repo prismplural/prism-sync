@@ -8,12 +8,13 @@ use axum::{
 use base64::Engine;
 use serde::Deserialize;
 
-use crate::{db, errors::AppError, state::AppState};
+use crate::{
+    db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState,
+};
 
 use super::{verify_signed_request, AuthIdentity};
 
 const MAX_CHANGESET_SIZE: usize = 1_024 * 1_024; // 1 MB
-const MAX_SNAPSHOT_SIZE: usize = 25 * 1_024 * 1_024; // 25 MB
 const DEFAULT_PULL_LIMIT: i64 = 100;
 
 // ---------------------------------------------------------------------------
@@ -276,32 +277,11 @@ pub async fn get_snapshot(
                 }
             }
 
-            // Auto-delete after the intended recipient downloads it. For legacy
-            // snapshots without a target, preserve the existing cross-device
-            // deletion behavior.
-            let should_delete = snap
-                .target_device_id
-                .as_deref()
-                .map(|target| target == auth.device_id)
-                .unwrap_or_else(|| {
-                    snap.uploaded_by_device_id
-                        .as_deref()
-                        .is_some_and(|uploader| uploader != auth.device_id)
-                });
-            if should_delete {
-                let db = state.db.clone();
-                let sid = auth.sync_id.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    db.with_conn(|conn| db::delete_snapshot(conn, &sid))
-                })
-                .await;
-                tracing::debug!(
-                    sync_id = %trunc(&auth.sync_id),
-                    device_id = %trunc(&auth.device_id),
-                    "Snapshot auto-deleted after cross-device download"
-                );
-            }
-
+            // Retention is ACK-gated: the target device issues
+            // `DELETE /v1/sync/{sync_id}/snapshot` once the snapshot has
+            // been applied locally. TTL-based cleanup still fires via
+            // `cleanup_expired_snapshots` for snapshots uploaded with an
+            // explicit `X-Snapshot-TTL`.
             let b64 = base64::engine::general_purpose::STANDARD;
             Ok(Json(serde_json::json!({
                 "epoch": snap.epoch,
@@ -313,6 +293,71 @@ pub async fn get_snapshot(
         }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// delete_snapshot — DELETE /v1/sync/{sync_id}/snapshot
+// ---------------------------------------------------------------------------
+
+/// Acknowledge-and-delete the pair-time bootstrap snapshot. Only the device
+/// the snapshot was targeted at (`for_device_id` / `target_device_id`) may
+/// delete it. Returns 404 if no snapshot exists, 403 if the caller is not
+/// the target, and 204 on success.
+pub async fn delete_snapshot(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthIdentity>,
+    Path(path_sync_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    if path_sync_id != auth.sync_id {
+        return Err(AppError::Forbidden("sync_id mismatch"));
+    }
+
+    let path = format!("/v1/sync/{}/snapshot", auth.sync_id);
+    verify_signed_request(&state, &auth, &headers, "DELETE", &path, &[])?;
+
+    let db = state.db.clone();
+    let sid = auth.sync_id.clone();
+
+    let snapshot = tokio::task::spawn_blocking({
+        let db = db.clone();
+        let sid = sid.clone();
+        move || db.with_read_conn(|conn| db::get_snapshot(conn, &sid))
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let snap = snapshot.ok_or(AppError::NotFound)?;
+
+    // Only the targeted device may ACK-delete. Untargeted (legacy)
+    // snapshots have no `for_device_id` and therefore no ACK handshake —
+    // the caller must not be allowed to short-circuit TTL cleanup.
+    match snap.target_device_id.as_deref() {
+        Some(target) if target == auth.device_id => {}
+        Some(_) => return Err(AppError::Forbidden("Snapshot is targeted at a different device")),
+        None => return Err(AppError::Forbidden("Snapshot has no target device to ACK")),
+    }
+
+    let deleted = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| db::delete_snapshot(conn, &sid))
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if !deleted {
+        // Race: TTL cleanup removed the row between our lookup and delete.
+        return Err(AppError::NotFound);
+    }
+
+    tracing::debug!(
+        sync_id = %trunc(&auth.sync_id),
+        device_id = %trunc(&auth.device_id),
+        "Snapshot ACK-deleted by target device"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -330,8 +375,8 @@ pub async fn put_snapshot(
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
 
-    if body.len() > MAX_SNAPSHOT_SIZE {
-        return Err(AppError::PayloadTooLarge("Snapshot exceeds 25 MB limit"));
+    if body.len() > MAX_SNAPSHOT_WIRE_BYTES {
+        return Err(AppError::PayloadTooLarge("Snapshot exceeds wire size limit"));
     }
 
     let path = format!("/v1/sync/{}/snapshot", auth.sync_id);

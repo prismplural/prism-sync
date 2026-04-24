@@ -18,9 +18,10 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::engine::{SyncConfig, SyncEngine};
+use crate::engine::{BootstrapReport, SeedRecord, SyncConfig, SyncEngine};
 use crate::error::{CoreError, Result};
-use crate::events::{event_channel, SyncEvent};
+use crate::events::{event_channel, EntityChange, SyncEvent};
+use crate::hlc::Hlc;
 use crate::op_emitter::OpEmitter;
 use crate::recovery::{
     commit_recovered_epoch_material, persist_epoch_cache, persist_epoch_key, KeyHierarchyRecoverer,
@@ -343,7 +344,34 @@ impl PrismSync {
             self.schema.clone(),
             SyncConfig::default(),
         );
-        self.op_emitter = Some(OpEmitter::new(node_id.clone(), sync_id.clone(), epoch, None));
+
+        // Seed the OpEmitter's HLC watermark from the max HLC across all
+        // currently-stored `field_versions`. Without this, a freshly
+        // configured engine starts its emitter at `Hlc::zero`, which can
+        // produce a smaller HLC than rows imported from a snapshot or
+        // seeded via `bootstrap_existing_state` — the first local mutation
+        // then races the seeded row and loses on the HLC tiebreaker.
+        let max_hlc =
+            match self.storage.list_all_field_version_hlcs(&sync_id) {
+                Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
+                    Ok(max) => max,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "configure_engine: failed to parse stored HLCs — starting emitter at zero"
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configure_engine: failed to list field_version HLCs — starting emitter at zero"
+                    );
+                    None
+                }
+            };
+        self.op_emitter = Some(OpEmitter::new(node_id.clone(), sync_id.clone(), epoch, max_hlc));
 
         // Derive and store the device signing keys if a DeviceSecret is available.
         if let Some(ref device_secret) = self.device_secret {
@@ -738,10 +766,63 @@ impl PrismSync {
     ///
     /// Requires [`configure_engine`](Self::configure_engine) to have been
     /// called.
-    pub async fn bootstrap_from_snapshot(
-        &mut self,
-    ) -> Result<(u64, Vec<crate::events::EntityChange>)> {
+    pub async fn bootstrap_from_snapshot(&mut self) -> Result<(u64, Vec<EntityChange>)> {
         self.sync_service.bootstrap_from_snapshot(&self.key_hierarchy).await
+    }
+
+    /// Seed `field_versions` from pre-existing local data (first-device
+    /// bootstrap). No relay traffic; no `pending_ops` produced.
+    ///
+    /// See [`SyncEngine::bootstrap_existing_state`] for semantics and guards.
+    /// Also re-seeds the live `OpEmitter`'s HLC watermark after seeding so
+    /// subsequent `record_create` calls stamp strictly greater HLCs.
+    pub async fn bootstrap_existing_state(
+        &mut self,
+        records: Vec<SeedRecord>,
+    ) -> Result<BootstrapReport> {
+        let report = self.sync_service.bootstrap_existing_state(records).await?;
+
+        // Re-read the max HLC from storage and update the live emitter so
+        // that any subsequent record_create/record_update uses a strictly
+        // greater HLC than anything that was just seeded.
+        if let (Some(sync_id), Some(emitter)) =
+            (self.sync_service.sync_id(), self.op_emitter.as_mut())
+        {
+            match self.storage.list_all_field_version_hlcs(sync_id) {
+                Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
+                    Ok(Some(max)) => {
+                        if &max > emitter.last_hlc() {
+                            emitter.set_last_hlc(max);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "bootstrap_existing_state: failed to parse stored HLCs after seeding"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "bootstrap_existing_state: failed to read stored HLCs after seeding"
+                    );
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Acknowledge that the downloaded snapshot has been applied locally.
+    ///
+    /// Instructs the relay to delete the snapshot via
+    /// `DELETE /v1/sync/{id}/snapshot`. Idempotent: a relay-side 404 is
+    /// mapped to `Ok(())` so concurrent joiners and expired-TTL cases don't
+    /// surface as errors.
+    pub async fn acknowledge_snapshot_applied(&self) -> Result<()> {
+        self.sync_service.acknowledge_snapshot_applied().await
     }
 
     // ── Consumer mutation API ──
@@ -1267,7 +1348,11 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1479,7 +1564,12 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1586,6 +1676,77 @@ mod tests {
         assert!(!sync.sync_service.has_engine());
         configure(&mut sync);
         assert!(sync.sync_service.has_engine());
+    }
+
+    /// Regression guard for the HLC-init bug: if `field_versions` contains a
+    /// pre-existing row (e.g. from a snapshot import or a prior
+    /// `bootstrap_existing_state`), `configure_engine` must seed the live
+    /// `OpEmitter`'s `last_hlc` from the max across those rows. Otherwise the
+    /// first local mutation stamps a smaller HLC and loses the CRDT
+    /// tiebreaker against remote state.
+    #[test]
+    fn configure_engine_seeds_hlc_from_existing_field_versions() {
+        use crate::hlc::Hlc;
+        use crate::storage::FieldVersion;
+
+        let schema = SyncSchema::builder()
+            .entity("members", |e| e.field("name", SyncType::String))
+            .build();
+        let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
+
+        // Pre-populate field_versions with a high-counter HLC to make the
+        // :9/:10 ordering bug easy to catch.
+        let pre_hlc = "1234567890:99:preseeddev001";
+        {
+            use crate::storage::SyncStorage;
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "pre-1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-pre".to_string(),
+                winning_device_id: "preseeddev001".to_string(),
+                winning_hlc: pre_hlc.to_string(),
+                winning_encoded_value: Some("\"Pre\"".to_string()),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let secure_store = Arc::new(MemStore::default());
+        let mut sync = PrismSync::builder()
+            .schema(schema)
+            .storage(Arc::new(storage))
+            .secure_store(secure_store)
+            .build()
+            .expect("build should succeed");
+
+        configure(&mut sync);
+
+        let pre_parsed = Hlc::from_string(pre_hlc).unwrap();
+        let emitter_hlc = sync.op_emitter.as_ref().expect("emitter").last_hlc().clone();
+        assert!(
+            emitter_hlc >= pre_parsed,
+            "emitter HLC {emitter_hlc:?} must be >= pre-seeded HLC {pre_parsed:?}"
+        );
+
+        // A subsequent record_create must mint an HLC strictly greater than
+        // the pre-existing one.
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Post".to_string()));
+        sync.record_create("members", "post-1", &fields).unwrap();
+        let fv = sync
+            .storage
+            .get_field_version("sync-1", "members", "post-1", "name")
+            .unwrap()
+            .unwrap();
+        let post_hlc = Hlc::from_string(&fv.winning_hlc).unwrap();
+        assert!(
+            post_hlc > pre_parsed,
+            "post-configure HLC {post_hlc:?} must exceed pre-seeded HLC {pre_parsed:?}"
+        );
     }
 
     #[test]

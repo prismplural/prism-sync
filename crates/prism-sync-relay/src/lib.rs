@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub(crate) mod errors;
 pub mod routes;
+pub mod snapshot_limits;
 pub mod state;
 
 pub use config::GifProviderMode;

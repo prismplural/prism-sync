@@ -1298,6 +1298,7 @@ async fn bootstrap_from_snapshot_fail_closed() {
             None,
             None,
             device_x_id.to_string(),
+            None,
         )
         .await
         .unwrap();

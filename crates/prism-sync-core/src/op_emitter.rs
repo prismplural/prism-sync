@@ -45,6 +45,18 @@ impl OpEmitter {
         self.epoch = new_epoch;
     }
 
+    /// Advance the emitter's HLC watermark. The next `tick()` will produce
+    /// an HLC strictly greater than either `new_hlc` or the current
+    /// wall-clock time, whichever is larger.
+    ///
+    /// Used after bootstrap/snapshot imports so locally minted HLCs never
+    /// fall behind state that was seeded from an external source.
+    pub fn set_last_hlc(&mut self, new_hlc: Hlc) {
+        if new_hlc > self.last_hlc {
+            self.last_hlc = new_hlc;
+        }
+    }
+
     /// Tick the HLC once and return the new value.
     fn tick(&mut self) -> Hlc {
         self.last_hlc = Hlc::now(&self.device_id, Some(&self.last_hlc));
@@ -178,6 +190,66 @@ impl OpEmitter {
             field_count = changed_fields.len(),
             batch_id = local_batch_id,
             "Queued update ops"
+        );
+
+        Ok(())
+    }
+
+    /// Populate `field_versions` for an entity without emitting a `pending_op`.
+    ///
+    /// Used exclusively by the first-device bootstrap path to reconstruct
+    /// CRDT state from pre-existing local data. Callers MUST guarantee the
+    /// resulting state should not be pushed to the relay — there is no
+    /// legitimate code path that mixes seeded rows with normal mutations,
+    /// because bootstrap runs before first sync on the first device.
+    ///
+    /// Semantics: identical to `emit_create` except that we skip
+    /// `insert_pending_op`. We still tick the HLC once and stamp every
+    /// field in this invocation with that HLC, and we still upsert one
+    /// `field_versions` row per field. Writes happen inside a single
+    /// `BEGIN IMMEDIATE` transaction.
+    #[allow(dead_code)] // Wired into `client::bootstrap_existing_state` by a follow-up patch.
+    pub(crate) fn seed_fields(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        fields: &HashMap<String, SyncValue>,
+    ) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        let hlc = self.tick();
+        let hlc_string = hlc.to_string();
+        let now = Utc::now();
+
+        let mut tx = storage.begin_tx()?;
+
+        for (field_name, value) in fields {
+            let op_id = Uuid::new_v4().to_string();
+            let encoded = encode_value(value);
+
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: self.sync_id.clone(),
+                entity_table: entity_table.to_string(),
+                entity_id: entity_id.to_string(),
+                field_name: field_name.clone(),
+                winning_op_id: op_id,
+                winning_device_id: self.device_id.clone(),
+                winning_hlc: hlc_string.clone(),
+                winning_encoded_value: Some(encoded),
+                updated_at: now,
+            })?;
+        }
+
+        tx.commit()?;
+
+        tracing::debug!(
+            table = entity_table,
+            entity_id = entity_id,
+            field_count = fields.len(),
+            "Seeded field_versions for bootstrap"
         );
 
         Ok(())
@@ -476,6 +548,52 @@ mod tests {
         for op in &ops {
             assert_eq!(&op.client_hlc, hlc);
         }
+    }
+
+    #[test]
+    fn seed_fields_upserts_field_versions_but_not_pending_ops() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        let fields = make_fields();
+
+        emitter.seed_fields(&storage, "members", "ent-seed", &fields).unwrap();
+
+        // field_versions rows exist for each field
+        for field_name in ["name", "age", "active"] {
+            let fv = storage
+                .get_field_version("sync-1", "members", "ent-seed", field_name)
+                .unwrap()
+                .expect("field_version should exist after seed_fields");
+            assert_eq!(fv.winning_device_id, "a1b2c3d4e5f6");
+            assert!(fv.winning_encoded_value.is_some());
+        }
+
+        // No pending_ops produced — no unpushed batches for this sync group
+        let batch_ids = storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert!(
+            batch_ids.is_empty(),
+            "seed_fields must NOT produce pending_ops (got batches: {batch_ids:?})"
+        );
+
+        // HLC advances on next emit_create: must be greater than the seeded HLC
+        let seeded_hlc = emitter.last_hlc().clone();
+        let mut more = HashMap::new();
+        more.insert("name".to_string(), SyncValue::String("Carol".to_string()));
+        emitter.emit_create(&storage, "members", "ent-next", &more, "batch-after-seed").unwrap();
+        assert!(emitter.last_hlc() > &seeded_hlc);
+    }
+
+    #[test]
+    fn seed_fields_skips_empty_fields() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        let hlc_before = emitter.last_hlc().clone();
+
+        let empty: HashMap<String, SyncValue> = HashMap::new();
+        emitter.seed_fields(&storage, "members", "ent-empty", &empty).unwrap();
+
+        // HLC should NOT have advanced when nothing was seeded
+        assert_eq!(*emitter.last_hlc(), hlc_before);
     }
 
     #[test]

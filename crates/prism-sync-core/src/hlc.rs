@@ -114,6 +114,28 @@ impl Hlc {
         Self { timestamp: max_ts, counter: new_counter, node_id: local_node_id.to_string() }
     }
 
+    /// Parse a slice of HLC strings and return the max per `Hlc::Ord`.
+    ///
+    /// Returns `Ok(None)` if the slice is empty. The first parse error is
+    /// propagated — callers are expected to pass well-formed HLC strings
+    /// read from `field_versions`.
+    ///
+    /// This exists because a SQL `MAX(winning_hlc)` compares strings
+    /// lexicographically and gets the order wrong for counters: `":9"`
+    /// sorts after `":10"`. Callers that need the true HLC max must read
+    /// all candidate strings and compare them here.
+    pub fn parse_many_and_max(values: &[String]) -> Result<Option<Hlc>> {
+        let mut best: Option<Hlc> = None;
+        for v in values {
+            let parsed = Self::from_string(v)?;
+            best = Some(match best {
+                Some(cur) if cur >= parsed => cur,
+                _ => parsed,
+            });
+        }
+        Ok(best)
+    }
+
     /// Check if clock drift exceeds the given tolerance.
     ///
     /// Only rejects timestamps from the FUTURE beyond the tolerance.
@@ -336,6 +358,54 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(a);
         assert!(set.contains(&b));
+    }
+
+    #[test]
+    fn parse_many_and_max_handles_counter_overflow() {
+        // Regression for the `:9` vs `:10` bug: a SQL MAX would return
+        // `1700000000:9:nodeA` (because `'9' > '1'` lexicographically).
+        // parse_many_and_max must return the true HLC max.
+        let values = vec![
+            "1700000000:9:nodeA".to_string(),
+            "1700000000:10:nodeA".to_string(),
+        ];
+        let max = Hlc::parse_many_and_max(&values).unwrap().expect("non-empty input");
+        assert_eq!(max.counter, 10);
+        assert_eq!(max.timestamp, 1700000000);
+        assert_eq!(max.node_id, "nodeA");
+    }
+
+    #[test]
+    fn parse_many_and_max_empty_returns_none() {
+        let values: Vec<String> = Vec::new();
+        assert!(Hlc::parse_many_and_max(&values).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_many_and_max_prefers_higher_timestamp() {
+        let values = vec![
+            "1700000000:99:nodeA".to_string(),
+            "1700000001:0:nodeA".to_string(),
+        ];
+        let max = Hlc::parse_many_and_max(&values).unwrap().unwrap();
+        assert_eq!(max.timestamp, 1700000001);
+        assert_eq!(max.counter, 0);
+    }
+
+    #[test]
+    fn parse_many_and_max_breaks_ties_by_node_id() {
+        let values = vec![
+            "1700000000:5:aaa".to_string(),
+            "1700000000:5:zzz".to_string(),
+        ];
+        let max = Hlc::parse_many_and_max(&values).unwrap().unwrap();
+        assert_eq!(max.node_id, "zzz");
+    }
+
+    #[test]
+    fn parse_many_and_max_propagates_parse_error() {
+        let values = vec!["not-a-valid-hlc".to_string()];
+        assert!(Hlc::parse_many_and_max(&values).is_err());
     }
 
     #[test]

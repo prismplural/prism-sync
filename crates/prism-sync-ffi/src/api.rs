@@ -296,6 +296,19 @@ fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> Stri
         if let Some(remote_wipe) = remote_wipe {
             payload["remote_wipe"] = serde_json::json!(remote_wipe);
         }
+    } else if let prism_sync_core::CoreError::BootstrapNotAllowed(reason) = &error {
+        // First-device bootstrap guard failed. Surface a stable `code` so the
+        // Dart side can render a user-friendly message without string-matching
+        // against the English `message`.
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("bootstrap_not_allowed");
+        payload["reason"] = serde_json::json!(reason);
+    } else if let prism_sync_core::CoreError::SnapshotTooLarge { bytes } = &error {
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("snapshot_too_large");
+        payload["bytes"] = serde_json::json!(bytes);
+        payload["limit_bytes"] =
+            serde_json::json!(prism_sync_core::snapshot_limits::MAX_SNAPSHOT_COMPRESSED_BYTES);
     } else {
         payload["error_type"] = serde_json::json!("core");
     }
@@ -398,6 +411,19 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "type": "BackoffScheduled",
             "attempt": attempt,
             "delay_secs": delay_secs,
+        }),
+        SyncEvent::SnapshotUploadProgress { sync_id, bytes_sent, bytes_total } => {
+            serde_json::json!({
+                "type": "SnapshotUploadProgress",
+                "sync_id": sync_id,
+                "bytes_sent": bytes_sent,
+                "bytes_total": bytes_total,
+            })
+        }
+        SyncEvent::SnapshotUploadFailed { sync_id, reason } => serde_json::json!({
+            "type": "SnapshotUploadFailed",
+            "sync_id": sync_id,
+            "reason": reason,
         }),
     }
 }
@@ -1276,6 +1302,106 @@ pub async fn record_delete(
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
     inner.record_delete(&table, &entity_id).map_err(|e| e.to_string())
+}
+
+// ── First-device bootstrap ──
+
+/// Seed `field_versions` from pre-existing local data for the first device in
+/// a sync group. No relay traffic; no `pending_ops` produced.
+///
+/// `records_json` is a JSON array of seed records:
+///
+/// ```json
+/// [
+///   { "table": "members", "entity_id": "...", "fields": { "name": "Alice", "emoji": "..." } },
+///   ...
+/// ]
+/// ```
+///
+/// The inner `fields` object follows the same natural-JSON shape as
+/// [`record_create`]: `null`, strings, integers, and booleans.
+///
+/// Returns a JSON object with `entity_count` and `snapshot_bytes`:
+/// ```json
+/// { "entity_count": 42, "snapshot_bytes": 1234567 }
+/// ```
+///
+/// Errors propagate via the standard structured-error encoding. In particular:
+/// - `BootstrapNotAllowed` (a device is already registered, a remote has been
+///   pulled, or applied_ops rows exist) carries `code: "bootstrap_not_allowed"`.
+/// - `SnapshotTooLarge` carries `code: "snapshot_too_large"`, `bytes`, and
+///   `limit_bytes` so the UI can surface the numbers without string parsing.
+pub async fn bootstrap_existing_state(
+    handle: &PrismSyncHandle,
+    records_json: String,
+) -> Result<String, String> {
+    // Parse the records array.
+    let value: serde_json::Value = serde_json::from_str(&records_json)
+        .map_err(|e| format!("Invalid records JSON: {e}"))?;
+    let arr = value.as_array().ok_or_else(|| "records JSON must be an array".to_string())?;
+
+    let mut records: Vec<prism_sync_core::engine::SeedRecord> = Vec::with_capacity(arr.len());
+    for (idx, entry) in arr.iter().enumerate() {
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("records[{idx}] must be an object"))?;
+        let table = obj
+            .get("table")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("records[{idx}].table must be a string"))?
+            .to_string();
+        let entity_id = obj
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("records[{idx}].entity_id must be a string"))?
+            .to_string();
+        let fields_value = obj
+            .get("fields")
+            .ok_or_else(|| format!("records[{idx}].fields missing"))?;
+        let fields_map = fields_value
+            .as_object()
+            .ok_or_else(|| format!("records[{idx}].fields must be an object"))?;
+        let mut fields = HashMap::with_capacity(fields_map.len());
+        for (key, v) in fields_map {
+            let sv = json_value_to_sync_value(key, v)
+                .map_err(|e| format!("records[{idx}].fields: {e}"))?;
+            fields.insert(key.clone(), sv);
+        }
+        records.push(prism_sync_core::engine::SeedRecord { table, entity_id, fields });
+    }
+
+    let mut inner = handle.inner.lock().await;
+    match inner.bootstrap_existing_state(records).await {
+        Ok(report) => {
+            let json = serde_json::json!({
+                "entity_count": report.entity_count,
+                "snapshot_bytes": report.snapshot_bytes,
+            });
+            Ok(json.to_string())
+        }
+        Err(e) => {
+            drop(inner);
+            Err(encode_handle_core_error(handle, "bootstrap_existing_state", e).await)
+        }
+    }
+}
+
+/// Acknowledge that a downloaded snapshot has been applied locally, telling
+/// the relay to delete the stored blob (`DELETE /v1/sync/{id}/snapshot`).
+///
+/// Idempotent: a `NotFound` response maps to `Ok(())`. Older relays that
+/// don't implement `DELETE /snapshot` will return 405 Method Not Allowed;
+/// the engine folds that to `Ok(())` too and the snapshot TTL-expires
+/// relay-side.
+pub async fn acknowledge_snapshot_applied(handle: &PrismSyncHandle) -> Result<(), String> {
+    let inner = handle.inner.lock().await;
+    match inner.acknowledge_snapshot_applied().await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            drop(inner);
+            Err(encode_handle_core_error(handle, "acknowledge_snapshot_applied", e).await)
+        }
+    }
 }
 
 // ── Sync control ──
@@ -3144,11 +3270,21 @@ pub async fn complete_joiner_ceremony(
 ///
 /// Parses the rendezvous token from QR/deep-link bytes, fetches the joiner's
 /// bootstrap, verifies the commitment, and posts the PairingInit. Returns
-/// the SAS display codes for user verification:
+/// the SAS display codes for user verification plus the joiner's device_id:
 ///
 /// ```json
-/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// {
+///   "sas_words": "apple banana cherry",
+///   "sas_decimal": "123456",
+///   "joiner_device_id": "c3d4..."
+/// }
 /// ```
+///
+/// `joiner_device_id` is captured from the bootstrap record fetched at
+/// ceremony start and is stable for the remainder of the ceremony. The Dart
+/// caller threads it through to `uploadPairingSnapshot(..., forDeviceId:)`
+/// so the joiner can later `DELETE /v1/sync/{id}/snapshot` under its own
+/// identity.
 ///
 /// The `InitiatorCeremony` state is stored in the handle for the subsequent
 /// call to [`complete_initiator_ceremony`].
@@ -3174,6 +3310,8 @@ pub async fn start_initiator_ceremony(
         }
     };
 
+    let joiner_device_id = ceremony.joiner_device_id().to_string();
+
     // Store ceremony state for complete_initiator_ceremony
     handle
         .initiator_ceremony
@@ -3184,6 +3322,7 @@ pub async fn start_initiator_ceremony(
     let result = serde_json::json!({
         "sas_words": sas.words,
         "sas_decimal": sas.decimal,
+        "joiner_device_id": joiner_device_id,
     });
     Ok(result.to_string())
 }

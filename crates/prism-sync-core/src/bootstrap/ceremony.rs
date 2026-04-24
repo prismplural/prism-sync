@@ -284,7 +284,6 @@ pub struct InitiatorCeremony {
     commitment: [u8; 32],
     #[allow(dead_code)]
     relay_url: String,
-    #[allow(dead_code)]
     bootstrap_record: JoinerBootstrapRecord,
     #[allow(dead_code)]
     local_keys: PairingPublicKeys,
@@ -471,6 +470,14 @@ impl InitiatorCeremony {
     /// The transcript hash binding this session.
     pub fn transcript_hash(&self) -> &[u8; 32] {
         &self.transcript_hash
+    }
+
+    /// The joiner's device ID, known from the bootstrap record fetched at
+    /// ceremony start. Used by the initiator to target `for_device_id` on
+    /// the pairing snapshot so the joiner's subsequent
+    /// `DELETE /v1/sync/{id}/snapshot` ACK passes the relay's auth check.
+    pub fn joiner_device_id(&self) -> &str {
+        &self.bootstrap_record.device_id
     }
 }
 

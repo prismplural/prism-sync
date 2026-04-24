@@ -478,6 +478,43 @@ fn exec_delete_field_versions_for_entity(
     Ok(())
 }
 
+fn query_list_all_field_version_hlcs(conn: &Connection, sync_id: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT winning_hlc FROM field_versions WHERE sync_id = ?1")?;
+    let rows = stmt.query_map(params![sync_id], |row| row.get::<_, String>(0))?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+fn exec_delete_all_pending_ops(conn: &Connection, sync_id: &str) -> Result<usize> {
+    let affected =
+        conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
+    Ok(affected)
+}
+
+fn query_has_any_applied_ops(conn: &Connection, sync_id: &str) -> Result<bool> {
+    let exists: Option<i32> = conn
+        .query_row(
+            "SELECT 1 FROM applied_ops WHERE sync_id = ?1 LIMIT 1",
+            params![sync_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn query_count_devices_in_group(conn: &Connection, sync_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM device_registry WHERE sync_id = ?1",
+        params![sync_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 // ── Snapshot helpers ──
 
 fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
@@ -824,6 +861,36 @@ impl SyncStorage for RusqliteSyncStorage {
             CoreError::Storage(StorageError::Logic(format!("PRAGMA rekey failed: {e}")))
         })?;
         Ok(())
+    }
+
+    fn list_all_field_version_hlcs(&self, sync_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_list_all_field_version_hlcs(&conn, sync_id)
+    }
+
+    fn delete_all_pending_ops(&self, sync_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match exec_delete_all_pending_ops(&conn, sync_id) {
+            Ok(n) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn has_any_applied_ops(&self, sync_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_has_any_applied_ops(&conn, sync_id)
+    }
+
+    fn count_devices_in_group(&self, sync_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_count_devices_in_group(&conn, sync_id)
     }
 }
 
@@ -1809,6 +1876,125 @@ mod tests {
             imported.ml_dsa_key_generation, 5,
             "ml_dsa_key_generation should survive snapshot round-trip"
         );
+    }
+
+    // ── Bootstrap-support method tests ──
+
+    #[test]
+    fn list_all_field_version_hlcs_returns_every_winning_hlc() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-1".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "1700000000:9:dev1".to_string(),
+            winning_encoded_value: Some("\"Alice\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "pronouns".to_string(),
+            winning_op_id: "op-2".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "1700000000:10:dev1".to_string(),
+            winning_encoded_value: Some("\"she/her\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        // Different sync group — must be excluded
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-2".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-x".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-x".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "1700000999:0:dev1".to_string(),
+            winning_encoded_value: Some("\"Other\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut hlcs = storage.list_all_field_version_hlcs("sync-1").unwrap();
+        hlcs.sort();
+        assert_eq!(hlcs, vec!["1700000000:10:dev1".to_string(), "1700000000:9:dev1".to_string()]);
+
+        // Counter-order regression: the true max is :10, not :9.
+        let max = crate::hlc::Hlc::parse_many_and_max(&hlcs).unwrap().unwrap();
+        assert_eq!(max.counter, 10);
+
+        // Empty sync group returns empty vec, not an error.
+        let empty = storage.list_all_field_version_hlcs("sync-empty").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn delete_all_pending_ops_removes_only_this_sync_group() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-1", "sync-1", "batch-1")).unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-2", "sync-1", "batch-2")).unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-3", "sync-other", "batch-other")).unwrap();
+        tx.commit().unwrap();
+
+        let removed = storage.delete_all_pending_ops("sync-1").unwrap();
+        assert_eq!(removed, 2);
+
+        // Target sync group: no ops left
+        assert!(storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+
+        // Other sync group: untouched
+        let other = storage.get_unpushed_batch_ids("sync-other").unwrap();
+        assert_eq!(other, vec!["batch-other".to_string()]);
+
+        // Calling again on an empty sync group returns 0.
+        let removed_again = storage.delete_all_pending_ops("sync-1").unwrap();
+        assert_eq!(removed_again, 0);
+    }
+
+    #[test]
+    fn has_any_applied_ops_reflects_state() {
+        let storage = make_storage();
+
+        // Empty: false
+        assert!(!storage.has_any_applied_ops("sync-1").unwrap());
+
+        // Insert an applied op for sync-1
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_applied_op(&sample_applied_op("applied-1", "sync-1")).unwrap();
+        tx.commit().unwrap();
+        assert!(storage.has_any_applied_ops("sync-1").unwrap());
+
+        // Different sync group: still false
+        assert!(!storage.has_any_applied_ops("sync-other").unwrap());
+    }
+
+    #[test]
+    fn count_devices_in_group_counts_registered_devices() {
+        let storage = make_storage();
+
+        assert_eq!(storage.count_devices_in_group("sync-1").unwrap(), 0);
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1")).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(storage.count_devices_in_group("sync-1").unwrap(), 1);
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-2")).unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-other", "dev-x")).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(storage.count_devices_in_group("sync-1").unwrap(), 2);
+        assert_eq!(storage.count_devices_in_group("sync-other").unwrap(), 1);
     }
 
     #[test]

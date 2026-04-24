@@ -1099,7 +1099,11 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<crate::relay::traits::SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1277,7 +1281,11 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<crate::relay::traits::SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -2050,7 +2058,11 @@ mod tests {
                 _: Option<u64>,
                 _: Option<String>,
                 _: String,
+                _: Option<crate::relay::traits::SnapshotUploadProgress>,
             ) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
                 unimplemented!()
             }
         }

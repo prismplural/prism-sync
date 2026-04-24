@@ -376,7 +376,11 @@ mod tests {
             _ttl_secs: Option<u64>,
             _for_device_id: Option<String>,
             _sender_device_id: String,
+            _progress: Option<crate::relay::traits::SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }

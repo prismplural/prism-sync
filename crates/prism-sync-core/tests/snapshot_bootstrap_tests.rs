@@ -192,6 +192,7 @@ async fn push_and_create_snapshot(
             0,
             Some(300),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -295,6 +296,7 @@ async fn test_snapshot_bootstrap_then_incremental() {
             &ml_dsa_key_b,
             0,
             Some(300),
+            None,
             None,
         )
         .await
@@ -732,6 +734,7 @@ async fn test_bootstrap_rejects_tampered_signature() {
             None,
             None,
             snapshot.sender_device_id.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -813,6 +816,7 @@ async fn test_bootstrap_rejects_snapshot_payload_hash_mismatch() {
             None,
             None,
             snapshot.sender_device_id.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -872,6 +876,7 @@ async fn test_bootstrap_rejects_aad_mismatch() {
             None,
             None,
             snapshot.sender_device_id.clone(),
+            None,
         )
         .await
         .unwrap();

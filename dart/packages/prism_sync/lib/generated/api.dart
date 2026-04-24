@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `json_value_to_sync_value`, `load_device_ml_dsa_generation`, `lock_or_recover`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `import_signed_registry`, `install_trace_subscriber_once`, `json_value_to_sync_value`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -189,6 +189,49 @@ Future<void> recordDelete({
   table: table,
   entityId: entityId,
 );
+
+/// Seed `field_versions` from pre-existing local data for the first device in
+/// a sync group. No relay traffic; no `pending_ops` produced.
+///
+/// `records_json` is a JSON array of seed records:
+///
+/// ```json
+/// [
+///   { "table": "members", "entity_id": "...", "fields": { "name": "Alice", "emoji": "..." } },
+///   ...
+/// ]
+/// ```
+///
+/// The inner `fields` object follows the same natural-JSON shape as
+/// [`record_create`]: `null`, strings, integers, and booleans.
+///
+/// Returns a JSON object with `entity_count` and `snapshot_bytes`:
+/// ```json
+/// { "entity_count": 42, "snapshot_bytes": 1234567 }
+/// ```
+///
+/// Errors propagate via the standard structured-error encoding. In particular:
+/// - `BootstrapNotAllowed` (a device is already registered, a remote has been
+///   pulled, or applied_ops rows exist) carries `code: "bootstrap_not_allowed"`.
+/// - `SnapshotTooLarge` carries `code: "snapshot_too_large"`, `bytes`, and
+///   `limit_bytes` so the UI can surface the numbers without string parsing.
+Future<String> bootstrapExistingState({
+  required PrismSyncHandle handle,
+  required String recordsJson,
+}) => RustLib.instance.api.crateApiBootstrapExistingState(
+  handle: handle,
+  recordsJson: recordsJson,
+);
+
+/// Acknowledge that a downloaded snapshot has been applied locally, telling
+/// the relay to delete the stored blob (`DELETE /v1/sync/{id}/snapshot`).
+///
+/// Idempotent: a `NotFound` response maps to `Ok(())`. Older relays that
+/// don't implement `DELETE /snapshot` will return 405 Method Not Allowed;
+/// the engine folds that to `Ok(())` too and the snapshot TTL-expires
+/// relay-side.
+Future<void> acknowledgeSnapshotApplied({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiAcknowledgeSnapshotApplied(handle: handle);
 
 /// Configure auto-sync (debounced push after mutations + WebSocket pull).
 ///
@@ -709,11 +752,21 @@ Future<String> completeJoinerCeremony({
 ///
 /// Parses the rendezvous token from QR/deep-link bytes, fetches the joiner's
 /// bootstrap, verifies the commitment, and posts the PairingInit. Returns
-/// the SAS display codes for user verification:
+/// the SAS display codes for user verification plus the joiner's device_id:
 ///
 /// ```json
-/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// {
+///   "sas_words": "apple banana cherry",
+///   "sas_decimal": "123456",
+///   "joiner_device_id": "c3d4..."
+/// }
 /// ```
+///
+/// `joiner_device_id` is captured from the bootstrap record fetched at
+/// ceremony start and is stable for the remainder of the ceremony. The Dart
+/// caller threads it through to `uploadPairingSnapshot(..., forDeviceId:)`
+/// so the joiner can later `DELETE /v1/sync/{id}/snapshot` under its own
+/// identity.
 ///
 /// The `InitiatorCeremony` state is stored in the handle for the subsequent
 /// call to [`complete_initiator_ceremony`].

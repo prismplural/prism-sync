@@ -22,14 +22,14 @@ use zeroize::Zeroizing;
 use rand::Rng;
 
 use crate::client::PrismSync;
-use crate::engine::{SyncEngine, SyncResult};
+use crate::engine::{BootstrapReport, SeedRecord, SyncEngine, SyncResult};
 use crate::epoch::EpochManager;
 use crate::error::{CoreError, RelayErrorCategory, Result};
 use crate::events::{ChangeSet, EntityChange, SyncError, SyncErrorKind, SyncEvent};
 use crate::recovery::{
     persist_epoch_cache, persist_epoch_key, EpochRecoverer, RecoveryCommitToken,
 };
-use crate::relay::traits::SyncNotification;
+use crate::relay::traits::{SnapshotUploadProgress, SyncNotification};
 use crate::relay::SyncRelay;
 use crate::runtime::background_runtime;
 use crate::storage::StorageError;
@@ -596,8 +596,14 @@ impl SyncService {
 
     /// Upload an encrypted pairing snapshot to the relay.
     ///
-    /// Delegates to [`SyncEngine::upload_pairing_snapshot`]. Requires
-    /// the engine to be configured.
+    /// Wraps [`SyncEngine::upload_pairing_snapshot`] with:
+    /// - a progress callback that emits `SyncEvent::SnapshotUploadProgress`
+    ///   on each chunk yielded by the underlying streamed upload, and
+    /// - a `SyncEvent::SnapshotUploadFailed` emission on error before the
+    ///   `Err(..)` is returned to the caller.
+    ///
+    /// The server-relay layer throttles progress callbacks to at most one
+    /// per 64 KiB / 200 ms, so the event channel does not get flooded.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_pairing_snapshot(
         &self,
@@ -617,7 +623,20 @@ impl SyncService {
             .sync_id
             .as_ref()
             .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync_id not set".into())))?;
-        engine
+
+        // Build progress callback that emits SyncEvent::SnapshotUploadProgress.
+        let event_tx = self.event_tx.clone();
+        let sync_id_cb = sync_id.clone();
+        let progress: SnapshotUploadProgress =
+            Arc::new(move |bytes_sent: u64, bytes_total: u64| {
+                let _ = event_tx.send(SyncEvent::SnapshotUploadProgress {
+                    sync_id: sync_id_cb.clone(),
+                    bytes_sent,
+                    bytes_total,
+                });
+            });
+
+        let result = engine
             .upload_pairing_snapshot(
                 sync_id,
                 key_hierarchy,
@@ -628,8 +647,44 @@ impl SyncService {
                 ml_dsa_key_generation,
                 ttl_secs,
                 for_device_id,
+                Some(progress),
             )
-            .await
+            .await;
+
+        if let Err(ref e) = result {
+            let _ = self.event_tx.send(SyncEvent::SnapshotUploadFailed {
+                sync_id: sync_id.clone(),
+                reason: e.to_string(),
+            });
+        }
+
+        result
+    }
+
+    /// Seed local `field_versions` from pre-existing data (first-device
+    /// bootstrap). Delegates to [`SyncEngine::bootstrap_existing_state`].
+    pub async fn bootstrap_existing_state(
+        &self,
+        records: Vec<SeedRecord>,
+    ) -> Result<BootstrapReport> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("sync engine not configured".into()))
+        })?;
+        let sync_id = self
+            .sync_id
+            .as_ref()
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("sync_id not set".into())))?;
+        engine.bootstrap_existing_state(sync_id, records).await
+    }
+
+    /// Delete the snapshot on the relay (pair-time ACK handshake). Idempotent
+    /// on `RelayError::NotFound`. Delegates to
+    /// [`SyncEngine::acknowledge_snapshot_applied`].
+    pub async fn acknowledge_snapshot_applied(&self) -> Result<()> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("sync engine not configured".into()))
+        })?;
+        engine.acknowledge_snapshot_applied().await
     }
 
     /// Download and apply a bootstrap snapshot from the relay.
