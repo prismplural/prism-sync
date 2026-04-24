@@ -442,3 +442,101 @@ async fn test_delete_snapshot_when_missing_returns_404() {
         delete_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys).await;
     assert_eq!(resp.status(), 404, "DELETE with no snapshot present should be 404");
 }
+
+// Regression: after the router split (only PUT gets the 150 MB layer,
+// GET + DELETE sit under the normal 10 MiB authenticated cap), the
+// bodyless methods must still function correctly even if a client
+// sends a payload. Body limits are about DoS — since GET/DELETE ignore
+// the body, the limit is hygiene only, not a correctness concern.
+#[tokio::test]
+async fn test_snapshot_get_accepts_request_with_body() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // Upload a snapshot so GET can find it.
+    let put_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        b"present".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(put_resp.status(), 204);
+
+    // GET with a small body should still succeed. reqwest sets
+    // Content-Length for us; axum ignores the body on GET handlers so
+    // this exercises the "GET is bodyless but a client might still ship
+    // bytes" hygiene path.
+    let get_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .body(vec![0u8; 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_resp.status(),
+        200,
+        "GET must succeed regardless of body (body is ignored)",
+    );
+}
+
+#[tokio::test]
+async fn test_snapshot_delete_accepts_request_with_body() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner_id = generate_device_id();
+    let (token_joiner, keys_joiner) = prepare_device(&db, &sync_id, &joiner_id).await;
+
+    let put_resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "1",
+        b"delete-me".to_vec(),
+        &[("X-For-Device-Id", &joiner_id)],
+    )
+    .await;
+    assert_eq!(put_resp.status(), 204);
+
+    // DELETE with a body should still succeed. The signed-header
+    // canonicalisation hashes an empty body, so we send a body that
+    // won't match the signature of the real payload (signature is
+    // still valid because it signs the empty body). The server must
+    // process the DELETE regardless of the request body.
+    let path = format!("/v1/sync/{sync_id}/snapshot");
+    let builder = client
+        .delete(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token_joiner}"))
+        .header("X-Device-Id", &joiner_id)
+        .body(vec![0u8; 1024]);
+    let resp =
+        apply_signed_headers(builder, &keys_joiner, "DELETE", &path, &sync_id, &joiner_id, &[])
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(
+        resp.status(),
+        204,
+        "DELETE must succeed regardless of body (body is ignored)",
+    );
+}

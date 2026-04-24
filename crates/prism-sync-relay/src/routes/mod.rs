@@ -141,14 +141,12 @@ pub(crate) fn verify_signed_request(
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
     // Snapshot PUT accepts the full encrypted+base64 envelope (up to
-    // ~150 MB). GET and DELETE carry no body but share the route. The
-    // per-route body limit layer overrides the global smaller cap that
-    // applies to all other routes (see `small_body_limit` below).
-    let snapshot_routes = Router::new()
-        .route(
-            "/v1/sync/{sync_id}/snapshot",
-            put(sync::put_snapshot).get(sync::get_snapshot).delete(sync::delete_snapshot),
-        )
+    // ~150 MB). GET and DELETE carry no bodies in practice, so they live
+    // in the normal authenticated router under the global 10 MiB cap —
+    // there is no reason to give unbounded body room to methods that
+    // don't read a body. The large body-limit layer is scoped to PUT only.
+    let snapshot_put_route = Router::new()
+        .route("/v1/sync/{sync_id}/snapshot", put(sync::put_snapshot))
         .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_WIRE_BYTES))
         .layer(RequestBodyLimitLayer::new(MAX_SNAPSHOT_WIRE_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -166,6 +164,12 @@ pub fn router(state: AppState) -> Router {
         // Sync routes (push/pull)
         .route("/v1/sync/{sync_id}/changes", put(sync::push_changes).get(sync::pull_changes))
         .route("/v1/sync/{sync_id}", delete(sync::delete_account))
+        // Snapshot GET + DELETE: bodyless, so they sit under the normal
+        // 10 MiB cap alongside the other authenticated routes.
+        .route(
+            "/v1/sync/{sync_id}/snapshot",
+            get(sync::get_snapshot).delete(sync::delete_snapshot),
+        )
         // Device routes (list/revoke/rekey/ack)
         .route("/v1/sync/{sync_id}/devices", get(devices::list_devices))
         .route("/v1/sync/{sync_id}/devices/{device_id}", delete(devices::delete_device))
@@ -192,7 +196,8 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
 
-    let authenticated_routes = authenticated_routes.merge(snapshot_routes).merge(media_routes);
+    let authenticated_routes =
+        authenticated_routes.merge(snapshot_put_route).merge(media_routes);
 
     // Routes that do NOT require authentication
     // (WebSocket does message-based auth after upgrade)
