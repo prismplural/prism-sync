@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use tracing::warn;
 
 use super::error::StorageError;
 use super::migrations;
@@ -845,6 +846,7 @@ impl Drop for RusqliteTx<'_> {
     fn drop(&mut self) {
         if !self.committed {
             // Auto-rollback on drop (same as rusqlite::Transaction behavior)
+            warn!("SyncStorageTx dropped without explicit commit or rollback; rolling back");
             let _ = self.conn.execute_batch("ROLLBACK");
         }
     }

@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use tokio::runtime::Runtime;
+use tracing::debug;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -22,7 +23,7 @@ pub fn background_runtime() -> &'static Runtime {
         // available". The call is safe to make multiple times — subsequent calls
         // return Err and are silently ignored.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        eprintln!("[prism_sync_bg] rustls ring provider installed (or already set)");
+        debug!("[prism_sync_bg] rustls ring provider installed (or already set)");
 
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)

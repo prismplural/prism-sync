@@ -841,7 +841,7 @@ impl prism_sync_core::secure_store::SecureStore for MemorySecureStore {
 /// This is critical for FFI safety — a panic across the Dart/Rust boundary is UB.
 fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
-        eprintln!("[prism_sync_ffi] mutex poisoned, recovering inner value");
+        tracing::warn!("[prism_sync_ffi] mutex poisoned, recovering inner value");
         poisoned.into_inner()
     })
 }
@@ -1155,7 +1155,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     // connect() spawns a background reconnect loop and never blocks).
     if let Err(e) = relay.connect_websocket().await {
         // Non-fatal: WebSocket will reconnect automatically with backoff.
-        eprintln!("[prism_sync_ffi] WebSocket connect failed (non-fatal): {e}");
+        tracing::warn!("[prism_sync_ffi] WebSocket connect failed (non-fatal): {e}");
     }
 
     // Store relay so set_auto_sync can wire up the notification handler.

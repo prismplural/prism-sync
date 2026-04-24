@@ -105,7 +105,7 @@ impl WebSocketClient {
         let intentional_close = Arc::clone(&self.intentional_close);
         let connected = Arc::clone(&self.connected);
 
-        eprintln!("[prism_ws] Starting reconnect loop for {}", redact_url(&ws_url));
+        info!("[prism_ws] Starting reconnect loop for {}", redact_url(&ws_url));
 
         let handle = background_runtime().spawn(async move {
             let safe_url = redact_url(&ws_url);
@@ -114,11 +114,11 @@ impl WebSocketClient {
             loop {
                 if intentional_close.load(Ordering::SeqCst) {
                     debug!("WebSocket intentional close, stopping reconnect loop");
-                    eprintln!("[prism_ws] Intentional close, stopping");
+                    debug!("[prism_ws] Intentional close, stopping");
                     break;
                 }
 
-                eprintln!("[prism_ws] Connecting to {safe_url} (attempt {attempt})");
+                info!("[prism_ws] Connecting to {safe_url} (attempt {attempt})");
                 connected.store(false, Ordering::SeqCst);
 
                 // Wrap in catch_unwind to surface panics (e.g. rustls
@@ -153,23 +153,20 @@ impl WebSocketClient {
                     Ok(Ok(())) => {
                         // Clean disconnect or intentional close.
                         if intentional_close.load(Ordering::SeqCst) {
-                            eprintln!("[prism_ws] Intentional close after run_connection");
+                            debug!("[prism_ws] Intentional close after run_connection");
                             break;
                         }
                         // Unexpected clean close — reconnect.
-                        eprintln!(
-                            "[prism_ws] Connection closed cleanly (unexpected), reconnecting"
-                        );
+                        warn!("[prism_ws] Connection closed cleanly (unexpected), reconnecting");
                         attempt = 0;
                     }
                     Ok(Err(e)) => {
-                        warn!("WebSocket connection error: {e}");
-                        eprintln!("[prism_ws] Connection error (attempt {attempt}): {e}");
+                        warn!("[prism_ws] Connection error (attempt {attempt}): {e}");
                     }
                 }
 
                 if intentional_close.load(Ordering::SeqCst) {
-                    eprintln!("[prism_ws] Intentional close after error, stopping");
+                    debug!("[prism_ws] Intentional close after error, stopping");
                     break;
                 }
 
@@ -215,14 +212,14 @@ impl WebSocketClient {
         let request = ws_url.into_client_request().map_err(|e| format!("invalid WS URL: {e}"))?;
 
         let safe_url = redact_url(ws_url);
-        eprintln!("[prism_ws] TCP/TLS connecting to {safe_url}");
+        info!("[prism_ws] TCP/TLS connecting to {safe_url}");
         let connect_result = tokio_tungstenite::connect_async(request).await;
         let (ws_stream, _response) = connect_result.map_err(|e| {
-            eprintln!("[prism_ws] connect_async FAILED: {e}");
+            warn!("[prism_ws] connect_async FAILED: {e}");
             format!("WS connect failed: {e}")
         })?;
 
-        eprintln!("[prism_ws] Connected successfully to {safe_url}");
+        info!("[prism_ws] Connected successfully to {safe_url}");
         info!("WebSocket connected to {ws_url}");
 
         let (mut write, mut read) = ws_stream.split();
@@ -234,11 +231,11 @@ impl WebSocketClient {
             "token": auth_token,
         });
         write.send(Message::Text(auth_msg.to_string())).await.map_err(|e| {
-            eprintln!("[prism_ws] Auth send FAILED: {e}");
+            warn!("[prism_ws] Auth send FAILED: {e}");
             format!("WS auth send failed: {e}")
         })?;
 
-        eprintln!("[prism_ws] Auth frame sent, waiting for messages");
+        debug!("[prism_ws] Auth frame sent, waiting for messages");
         debug!("WebSocket auth frame sent");
 
         // Ping timer.
@@ -327,7 +324,7 @@ impl WebSocketClient {
                 connected.store(true, Ordering::SeqCst);
                 let _ = notification_tx
                     .send(SyncNotification::ConnectionStateChanged { connected: true });
-                eprintln!("[prism_ws] auth_ok received — authenticated successfully");
+                debug!("[prism_ws] auth_ok received — authenticated successfully");
                 debug!("WebSocket auth_ok received");
                 None
             }

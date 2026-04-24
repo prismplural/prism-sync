@@ -845,8 +845,7 @@ impl SyncRelay for ServerRelay {
 
     async fn connect_websocket(&self) -> Result<(), RelayError> {
         let ws_url = self.ws_url();
-        eprintln!("[prism_relay] connect_websocket url={}", redact_url(&ws_url));
-        debug!("connect_websocket url={}", redact_url(&ws_url));
+        debug!("[prism_relay] connect_websocket url={}", redact_url(&ws_url));
 
         let ws = WebSocketClient::new(
             ws_url,
