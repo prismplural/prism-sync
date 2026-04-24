@@ -4,15 +4,12 @@ End-to-end encrypted CRDT sync library in Rust. Add private, multi-device sync t
 with field-level conflict resolution and zero-knowledge encryption — the relay server stores
 only encrypted blobs and never sees plaintext.
 
-Used by [Prism](https://github.com/prismplural/prism-app) and designed to be embeddable in
-other apps via a schema-driven API.
-
 ## Highlights
 
 - **Field-level CRDTs** — Last-Write-Wins with Hybrid Logical Clocks, not row-level overwrites
 - **Zero-knowledge relay** — the server sees encrypted blobs, device IDs, and timing; never content
 - **Post-quantum ready** — hybrid Ed25519 + ML-DSA-65 signatures, X-Wing (X25519 + ML-KEM-768) epoch rekey
-- **Schema-driven** — define your entities and fields; the engine handles merge, versioning, and tombstones
+- **Self-contained** — crypto, storage, sync engine, relay server, and FFI bindings in one repo
 - **Flutter integration** — Dart bindings, Drift adapter, and Riverpod providers included
 
 ## How It Works
@@ -124,19 +121,30 @@ cargo test -p prism-sync-relay            # Relay server
 | Transport | HTTPS/WSS required (enforced at builder and relay constructor) |
 | Memory | All key material in `Zeroizing<Vec<u8>>` — auto-zeroed on drop |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and threat model,
-and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and threat model.
 
-## Self-hosting a relay
+## Self-Hosting
 
-See [`self-host/SELF-HOSTING.md`](self-host/SELF-HOSTING.md) for Docker Compose
-and Kubernetes deployment guides. The relay stores only encrypted blobs, so
-running your own gives you full control over your data without requiring any
-cryptographic trust in the operator.
+The relay server is included in this repo and can be self-hosted with Docker or built from
+source. See the [self-hosting guide](self-host/SELF-HOSTING.md) for setup instructions,
+Kubernetes manifests, and configuration reference.
+
+## AI Disclosure
+
+Prism uses AI for development. Prism is written by a plural system that actually uses it
+every day. We use Claude extensively as a coding tool.
+
+The security architecture, design decisions, interface — the things that make this app what
+it is — are ours. The encryption is fully auditable and open source regardless of what tools
+wrote it, and we hope the app's quality stands on its own.
 
 ## Contributing
 
-Contributions are welcome. Please open an issue first to discuss what you'd like to change.
+Contributions are welcome! Whether it's bug reports, feature ideas, or pull requests — all
+help is appreciated. For larger changes, opening an issue first helps us coordinate and
+avoid duplicated effort.
+
+By submitting a pull request, you agree to the [Contributor License Agreement](CLA.md).
 
 ## License
 
