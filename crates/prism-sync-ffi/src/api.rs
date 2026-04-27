@@ -846,6 +846,87 @@ fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
     })
 }
 
+/// Stable error prefix returned when an FFI ceremony entry point is invoked
+/// while another pairing ceremony is already in flight on the same handle.
+///
+/// Dart code can match on this prefix to surface a "complete or abandon the
+/// existing ceremony" error to the user without crashing the in-progress
+/// state. Phase 4E of the sync-pairing-reset hardening plan.
+const CEREMONY_IN_PROGRESS_PREFIX: &str = "CEREMONY_IN_PROGRESS";
+
+/// Guard against starting/completing a ceremony while another is in flight.
+///
+/// `start_*` callers pass `kind = StartGuard::Initiator` or
+/// `StartGuard::Joiner` — both ceremony slots must be empty before a fresh
+/// start.
+///
+/// `complete_*` callers pass `kind = StartGuard::CompleteInitiator` or
+/// `StartGuard::CompleteJoiner` — only the *opposite* slot is checked
+/// (mixing types is nonsensical), the matching slot is consumed by the
+/// caller's own `take()`.
+fn guard_ceremony_in_progress(
+    handle: &PrismSyncHandle,
+    kind: CeremonyGuardKind,
+) -> Result<(), String> {
+    let initiator_present = lock_or_recover(&handle.initiator_ceremony).is_some();
+    let joiner_present = lock_or_recover(&handle.joiner_ceremony).is_some();
+    match kind {
+        CeremonyGuardKind::StartInitiator => {
+            if initiator_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is already in progress; \
+                     complete or abandon the existing one before starting a new one"
+                ));
+            }
+            if joiner_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: a joiner ceremony is in progress; \
+                     cannot start an initiator ceremony on the same handle"
+                ));
+            }
+        }
+        CeremonyGuardKind::StartJoiner => {
+            if joiner_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: a joiner ceremony is already in progress; \
+                     complete or abandon the existing one before starting a new one"
+                ));
+            }
+            if initiator_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is in progress; \
+                     cannot start a joiner ceremony on the same handle"
+                ));
+            }
+        }
+        CeremonyGuardKind::CompleteInitiator => {
+            if joiner_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: a joiner ceremony is in progress; \
+                     cannot complete an initiator ceremony on the same handle"
+                ));
+            }
+        }
+        CeremonyGuardKind::CompleteJoiner => {
+            if initiator_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is in progress; \
+                     cannot complete a joiner ceremony on the same handle"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CeremonyGuardKind {
+    StartInitiator,
+    StartJoiner,
+    CompleteInitiator,
+    CompleteJoiner,
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Public FFI API
 // ══════════════════════════════════════════════════════════════════════
@@ -2271,6 +2352,48 @@ pub async fn delete_sync_group(
     }
 }
 
+/// Clear all sync-DB rows for the given `sync_id`.
+///
+/// Wipes `pending_ops`, `applied_ops`, `field_versions`, `device_registry`,
+/// and `sync_metadata` rows scoped to `sync_id`. Used by the reset-data path
+/// (Phase 2B) as belt-and-suspenders before deleting the sync DB file, and
+/// by any future cleanup of orphaned/abandoned sync_ids.
+///
+/// **Safety guard:** by default, refuses to clear the *currently active*
+/// `sync_id` (the one configured on the live engine). Callers that
+/// intentionally clear the active sync_id (e.g. the reset path, which then
+/// disposes the handle) must pass `force_active=true`.
+///
+/// The Drift app DB is not touched — only the Rust-managed sync DB.
+pub async fn clear_sync_state(
+    handle: &PrismSyncHandle,
+    sync_id: String,
+    force_active: bool,
+) -> Result<(), String> {
+    let storage = {
+        let inner = handle.inner.lock().await;
+        if !force_active {
+            if let Some(active) = inner.sync_service().sync_id() {
+                if active == sync_id {
+                    return Err(
+                        "refusing to clear_sync_state for the active sync_id; pass \
+                         force_active=true if intentional"
+                            .into(),
+                    );
+                }
+            }
+        }
+        inner.storage().clone()
+    };
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut tx = storage.begin_tx().map_err(|e| e.to_string())?;
+        tx.clear_sync_state(&sync_id).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ── Device info ──
 
 /// Get this device's node ID (12-char hex identifier).
@@ -2907,6 +3030,7 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
 /// to [`get_joiner_sas`] and [`complete_joiner_ceremony`].
 pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::StartJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     let inner = handle.inner.lock().await;
@@ -3008,6 +3132,7 @@ pub async fn complete_joiner_ceremony(
     password: String,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     // Take the ceremony out — it won't be needed again after completion
@@ -3157,6 +3282,7 @@ pub async fn start_initiator_ceremony(
     token_bytes: Vec<u8>,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::StartInitiator)?;
     let token = RendezvousToken::from_bytes(&token_bytes)
         .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
 
@@ -3206,6 +3332,7 @@ pub async fn complete_initiator_ceremony(
     mnemonic: String,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteInitiator)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     // Take the ceremony out — it won't be needed again after completion
@@ -4240,6 +4367,367 @@ mod tests {
         assert_eq!(
             storage.get_sync_metadata(sync_id).unwrap().unwrap().last_imported_registry_version,
             Some(1)
+        );
+    }
+
+    // ── Phase 1C: clear_sync_state FFI ──
+
+    fn make_pending_op(sync_id: &str, op_id: &str, batch_id: &str) -> prism_sync_core::storage::PendingOp {
+        prism_sync_core::storage::PendingOp {
+            op_id: op_id.to_string(),
+            sync_id: sync_id.to_string(),
+            epoch: 0,
+            device_id: "dev-1".to_string(),
+            local_batch_id: batch_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            encoded_value: "value".to_string(),
+            is_delete: false,
+            client_hlc: "0:0:dev-1".to_string(),
+            created_at: Utc::now(),
+            pushed_at: None,
+        }
+    }
+
+    fn make_metadata(sync_id: &str) -> SyncMetadata {
+        let now = Utc::now();
+        SyncMetadata {
+            sync_id: sync_id.to_string(),
+            local_device_id: "dev-1".to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: 0,
+            last_pushed_at: None,
+            last_successful_sync_at: None,
+            registered_at: None,
+            needs_rekey: false,
+            last_imported_registry_version: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Seeds two sync_ids' rows into the handle's storage, then calls the FFI
+    /// `clear_sync_state(sid_a, force_active=false)` and asserts only sid_a's
+    /// rows are removed.
+    #[tokio::test]
+    async fn clear_sync_state_drops_only_target_sync_id() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let storage = {
+            let inner = handle.inner.lock().await;
+            inner.storage().clone()
+        };
+
+        // Seed metadata + a pending op for two sync_ids.
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&make_metadata("sync-a")).unwrap();
+            tx.upsert_sync_metadata(&make_metadata("sync-b")).unwrap();
+            tx.insert_pending_op(&make_pending_op("sync-a", "op-a", "batch-a")).unwrap();
+            tx.insert_pending_op(&make_pending_op("sync-b", "op-b", "batch-b")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert!(storage.get_sync_metadata("sync-a").unwrap().is_some());
+        assert!(storage.get_sync_metadata("sync-b").unwrap().is_some());
+        assert!(!storage.get_unpushed_batch_ids("sync-a").unwrap().is_empty());
+        assert!(!storage.get_unpushed_batch_ids("sync-b").unwrap().is_empty());
+
+        // No engine configured → sync_service.sync_id() is None → guard does
+        // not trip even with force_active=false.
+        super::clear_sync_state(&handle, "sync-a".to_string(), false)
+            .await
+            .expect("clear_sync_state should succeed for non-active sync_id");
+
+        // sync-a rows gone, sync-b rows preserved.
+        assert!(storage.get_sync_metadata("sync-a").unwrap().is_none());
+        assert!(storage.get_unpushed_batch_ids("sync-a").unwrap().is_empty());
+        assert!(storage.get_sync_metadata("sync-b").unwrap().is_some());
+        assert!(!storage.get_unpushed_batch_ids("sync-b").unwrap().is_empty());
+    }
+
+    /// With the engine configured to a specific sync_id, calling
+    /// `clear_sync_state` with that sync_id and `force_active=false` must be
+    /// refused with a stable error.
+    #[tokio::test]
+    async fn clear_sync_state_refuses_active_sync_id_without_force() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        // Seed rows so we can also assert they're untouched on refusal.
+        let storage = {
+            let inner = handle.inner.lock().await;
+            inner.storage().clone()
+        };
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&make_metadata("active-sync")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Configure the engine so sync_service.sync_id() == "active-sync".
+        let relay: Arc<dyn prism_sync_core::relay::SyncRelay> = Arc::new(MockRelay::new());
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.configure_engine(relay, "active-sync".to_string(), "dev-1".to_string(), 0, 0);
+        }
+
+        let err = super::clear_sync_state(&handle, "active-sync".to_string(), false)
+            .await
+            .expect_err("must refuse to clear active sync_id without force");
+        assert!(
+            err.contains("refusing to clear_sync_state for the active sync_id"),
+            "unexpected error message: {err}"
+        );
+
+        // Rows still present.
+        assert!(storage.get_sync_metadata("active-sync").unwrap().is_some());
+    }
+
+    /// Same setup as the refusal test, but with `force_active=true` the call
+    /// must succeed and remove the rows.
+    #[tokio::test]
+    async fn clear_sync_state_with_force_active_succeeds() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let storage = {
+            let inner = handle.inner.lock().await;
+            inner.storage().clone()
+        };
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&make_metadata("active-sync")).unwrap();
+            tx.insert_pending_op(&make_pending_op("active-sync", "op-1", "batch-1")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let relay: Arc<dyn prism_sync_core::relay::SyncRelay> = Arc::new(MockRelay::new());
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.configure_engine(relay, "active-sync".to_string(), "dev-1".to_string(), 0, 0);
+        }
+
+        super::clear_sync_state(&handle, "active-sync".to_string(), true)
+            .await
+            .expect("clear_sync_state with force_active should succeed");
+
+        assert!(storage.get_sync_metadata("active-sync").unwrap().is_none());
+        assert!(storage.get_unpushed_batch_ids("active-sync").unwrap().is_empty());
+    }
+
+    // ── Phase 4E: concurrent-ceremony guard ──
+    //
+    // The guard inspects `Option::is_some()` on the ceremony slots. We
+    // populate those slots with real ceremony values constructed against an
+    // in-memory `MockPairingRelay`, then drive the FFI entry points and
+    // verify they short-circuit with the `CEREMONY_IN_PROGRESS` prefix
+    // before touching any relay or doing any heavy work.
+
+    fn plant_joiner_slot(handle: &PrismSyncHandle, ceremony: JoinerCeremony) {
+        *lock_or_recover(&handle.joiner_ceremony) = Some(ceremony);
+    }
+
+    fn plant_initiator_slot(handle: &PrismSyncHandle, ceremony: InitiatorCeremony) {
+        *lock_or_recover(&handle.initiator_ceremony) = Some(ceremony);
+    }
+
+    /// Build a real joiner ceremony against an in-memory `MockPairingRelay`.
+    async fn make_real_joiner_ceremony() -> (
+        JoinerCeremony,
+        prism_sync_core::bootstrap::RendezvousToken,
+        Arc<prism_sync_core::relay::MockPairingRelay>,
+    ) {
+        let relay = Arc::new(prism_sync_core::relay::MockPairingRelay::new());
+        let (ceremony, token) = JoinerCeremony::start(relay.as_ref(), "https://relay.example.com")
+            .await
+            .expect("joiner ceremony start");
+        (ceremony, token, relay)
+    }
+
+    /// Build a real initiator ceremony by first standing up a joiner side
+    /// against the same `MockPairingRelay` and then consuming the token.
+    async fn make_real_initiator_ceremony() -> InitiatorCeremony {
+        let (_joiner, token, relay) = make_real_joiner_ceremony().await;
+        let initiator_secret = prism_sync_crypto::DeviceSecret::generate();
+        let initiator_device_id = prism_sync_core::node_id::generate_node_id();
+        let (ceremony, _sas) = InitiatorCeremony::start(
+            token,
+            relay.as_ref(),
+            &initiator_secret,
+            &initiator_device_id,
+        )
+        .await
+        .expect("initiator ceremony start");
+        ceremony
+    }
+
+    #[test]
+    fn ceremony_guard_emits_stable_error_prefix() {
+        // Dart-side error matching keys off this prefix.
+        assert_eq!(CEREMONY_IN_PROGRESS_PREFIX, "CEREMONY_IN_PROGRESS");
+    }
+
+    #[tokio::test]
+    async fn start_initiator_ceremony_refuses_when_initiator_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let ceremony = make_real_initiator_ceremony().await;
+        plant_initiator_slot(&handle, ceremony);
+
+        // Token bytes are irrelevant — guard fires before parsing.
+        let err = start_initiator_ceremony(&handle, vec![0xAA; 64])
+            .await
+            .expect_err("guard must refuse second start_initiator_ceremony");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("initiator ceremony is already in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_initiator_ceremony_refuses_when_joiner_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+
+        let err = start_initiator_ceremony(&handle, vec![0xAA; 64])
+            .await
+            .expect_err("guard must refuse start_initiator_ceremony when joiner in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("joiner ceremony is in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_joiner_ceremony_refuses_when_joiner_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+
+        let err = start_joiner_ceremony(&handle)
+            .await
+            .expect_err("guard must refuse second start_joiner_ceremony");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("joiner ceremony is already in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_joiner_ceremony_refuses_when_initiator_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let ceremony = make_real_initiator_ceremony().await;
+        plant_initiator_slot(&handle, ceremony);
+
+        let err = start_joiner_ceremony(&handle)
+            .await
+            .expect_err("guard must refuse start_joiner_ceremony when initiator in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("initiator ceremony is in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn complete_initiator_ceremony_refuses_when_joiner_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+
+        let err = complete_initiator_ceremony(&handle, "pw".into(), "phrase".into())
+            .await
+            .expect_err("guard must refuse complete_initiator while joiner in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_joiner_ceremony_refuses_when_initiator_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let ceremony = make_real_initiator_ceremony().await;
+        plant_initiator_slot(&handle, ceremony);
+
+        let err = complete_joiner_ceremony(&handle, "pw".into())
+            .await
+            .expect_err("guard must refuse complete_joiner while initiator in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
         );
     }
 }

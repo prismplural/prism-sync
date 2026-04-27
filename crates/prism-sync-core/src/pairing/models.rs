@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
 use prism_sync_crypto::pq::HybridSignature;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Ed25519 signature length in bytes.
 const ED25519_SIG_LEN: usize = 64;
@@ -342,6 +345,51 @@ const REGISTRY_SNAPSHOT_DOMAIN: &[u8] = b"PRISM_SYNC_REGISTRY_V1\x00";
 const REGISTRY_SNAPSHOT_DOMAIN_V2: &[u8] = b"PRISM_SYNC_REGISTRY_V2\x00";
 const REGISTRY_SNAPSHOT_DOMAIN_V3: &[u8] = b"PRISM_SYNC_REGISTRY_V3\x00";
 
+/// Well-known AAD used by [`compute_epoch_key_hash`] to bind the per-epoch
+/// commitment under a domain that is distinct from any sync-ciphertext AAD.
+///
+/// Changing this byte string invalidates all previously-computed hashes and
+/// therefore breaks signed-registry verification — only bump it together with
+/// a registry version bump.
+const REGISTRY_EPOCH_HASH_AAD: &[u8] = b"prism_registry_epoch_hash_v1";
+
+/// First `registry_version` value for which `current_epoch` and
+/// `epoch_key_hashes` are required to be populated.
+///
+/// Snapshots with `registry_version >= SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING`
+/// MUST carry a non-empty `epoch_key_hashes` map (covering at least the
+/// signed `current_epoch`). Older snapshots are accepted under a tolerance
+/// window with a logged deprecation warning and will become a hard error in
+/// a future release once all peers have rolled forward.
+///
+/// Choice of value: pre-existing in-tree producers under
+/// `crates/prism-sync-core/src/` always passed `registry_version: 0`, so the
+/// first version that requires the new fields is `1`.
+pub const SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING: i64 = 1;
+
+/// Compute the domain-separated epoch-key commitment used inside
+/// [`SignedRegistrySnapshot::epoch_key_hashes`].
+///
+/// Defined as `SHA-256(wrap(epoch_key, REGISTRY_EPOCH_HASH_AAD))` where
+/// `wrap` is XChaCha20-Poly1305 with the epoch key as the AEAD key, the
+/// well-known AAD as the AAD, an all-zero nonce, and empty plaintext.
+///
+/// The all-zero nonce is safe here because the output is never decrypted —
+/// it is hashed into a commitment. The AAD makes the commitment unforgeable
+/// without the epoch key, which is the property we need for the signed
+/// registry to anchor per-epoch state.
+pub fn compute_epoch_key_hash(epoch_key: &[u8; 32]) -> [u8; 32] {
+    let mac = prism_sync_crypto::aead::xchacha_aead_mac_zero_nonce(
+        epoch_key.as_slice(),
+        REGISTRY_EPOCH_HASH_AAD,
+    )
+    .expect("xchacha_aead_mac_zero_nonce with 32-byte key cannot fail");
+    let digest = Sha256::digest(&mac);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// A single device entry inside a [`SignedRegistrySnapshot`].
 ///
 /// Mirrors the fields of [`crate::storage::DeviceRecord`] that are relevant
@@ -381,12 +429,55 @@ pub struct SignedRegistrySnapshot {
     /// For snapshots decoded from V1/V2 wire format, this defaults to `0`.
     #[serde(default)]
     pub registry_version: i64,
+    /// The current epoch the producing device believed it was in when the
+    /// snapshot was signed.
+    ///
+    /// Cryptographically anchors registry state to the epoch ratchet so that
+    /// a malicious relay cannot fabricate epoch state during pairing
+    /// reconciliation. See [`SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING`].
+    #[serde(default)]
+    pub current_epoch: u32,
+    /// Per-epoch commitments produced via [`compute_epoch_key_hash`].
+    ///
+    /// Keys are epoch numbers. Values are 32-byte commitments unforgeable
+    /// without knowledge of the underlying epoch key. A receiver that holds
+    /// the same epoch key locally can recompute the commitment and verify
+    /// that the signed registry agrees with its local epoch ratchet.
+    ///
+    /// Required for `registry_version >= SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING`.
+    #[serde(default)]
+    pub epoch_key_hashes: BTreeMap<u32, [u8; 32]>,
 }
 
 impl SignedRegistrySnapshot {
     /// Build a snapshot from a list of device entries with a registry version.
+    ///
+    /// The new `current_epoch` and `epoch_key_hashes` fields default to `0`
+    /// and empty respectively. Use [`Self::new_with_epoch_binding`] when
+    /// producing a snapshot at or above
+    /// [`SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING`].
     pub fn new(entries: Vec<RegistrySnapshotEntry>, registry_version: i64) -> Self {
-        Self { entries, registry_version }
+        Self {
+            entries,
+            registry_version,
+            current_epoch: 0,
+            epoch_key_hashes: BTreeMap::new(),
+        }
+    }
+
+    /// Build a snapshot that cryptographically binds the current epoch and
+    /// per-epoch key commitments into the signed payload.
+    ///
+    /// `epoch_key_hashes` must contain at least an entry for `current_epoch`.
+    /// Callers typically populate it with every epoch the local key
+    /// hierarchy holds keys for (via [`compute_epoch_key_hash`]).
+    pub fn new_with_epoch_binding(
+        entries: Vec<RegistrySnapshotEntry>,
+        registry_version: i64,
+        current_epoch: u32,
+        epoch_key_hashes: BTreeMap<u32, [u8; 32]>,
+    ) -> Self {
+        Self { entries, registry_version, current_epoch, epoch_key_hashes }
     }
 
     /// Canonical JSON encoding used for both signing and wire transport.
@@ -420,20 +511,53 @@ impl SignedRegistrySnapshot {
 
     /// Canonical JSON encoding for V3 wire format.
     ///
-    /// Produces a wrapper object `{ "registry_version": i64, "entries": [...] }`
-    /// with entries sorted by `device_id` for deterministic output.
+    /// Produces a wrapper object
+    /// `{ "registry_version": i64, "current_epoch": u32, "epoch_key_hashes": {epoch: hex32}, "entries": [...] }`
+    /// with entries sorted by `device_id` and epoch_key_hashes sorted by
+    /// epoch (`BTreeMap`) for deterministic output. The new
+    /// `current_epoch`/`epoch_key_hashes` fields are skipped when at default
+    /// values to preserve byte-for-byte compatibility with legacy snapshots
+    /// (registry_version < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING).
     pub fn canonical_json_v3(&self) -> Vec<u8> {
         let mut sorted = self.entries.clone();
         sorted.sort_by(|a, b| a.device_id.cmp(&b.device_id));
 
-        #[derive(serde::Serialize)]
-        struct Wrapper<'a> {
-            registry_version: i64,
-            entries: &'a [RegistrySnapshotEntry],
-        }
+        // Skip current_epoch+epoch_key_hashes from JSON output entirely when
+        // they're at defaults AND registry_version is below the binding
+        // threshold. Above the threshold, always include both fields even if
+        // empty so verification can detect tampered "zeroing" attacks.
+        let omit_epoch_binding = self.registry_version
+            < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING
+            && self.current_epoch == 0
+            && self.epoch_key_hashes.is_empty();
 
-        serde_json::to_vec(&Wrapper { registry_version: self.registry_version, entries: &sorted })
+        if omit_epoch_binding {
+            #[derive(serde::Serialize)]
+            struct LegacyWrapper<'a> {
+                registry_version: i64,
+                entries: &'a [RegistrySnapshotEntry],
+            }
+            serde_json::to_vec(&LegacyWrapper {
+                registry_version: self.registry_version,
+                entries: &sorted,
+            })
             .unwrap_or_default()
+        } else {
+            #[derive(serde::Serialize)]
+            struct Wrapper<'a> {
+                registry_version: i64,
+                current_epoch: u32,
+                epoch_key_hashes: &'a BTreeMap<u32, [u8; 32]>,
+                entries: &'a [RegistrySnapshotEntry],
+            }
+            serde_json::to_vec(&Wrapper {
+                registry_version: self.registry_version,
+                current_epoch: self.current_epoch,
+                epoch_key_hashes: &self.epoch_key_hashes,
+                entries: &sorted,
+            })
+            .unwrap_or_default()
+        }
     }
 
     /// Build the V3 signing payload: `PRISM_SYNC_REGISTRY_V3\x00 || canonical_json_v3()`.
@@ -510,7 +634,12 @@ impl SignedRegistrySnapshot {
         let entries: Vec<RegistrySnapshotEntry> = serde_json::from_slice(json_bytes)
             .map_err(|e| format!("registry snapshot JSON invalid: {e}"))?;
 
-        Ok(Self { entries, registry_version: 0 })
+        Ok(Self {
+            entries,
+            registry_version: 0,
+            current_epoch: 0,
+            epoch_key_hashes: BTreeMap::new(),
+        })
     }
 
     /// Verify and decode a hybrid-signed snapshot from its wire format.
@@ -561,13 +690,49 @@ impl SignedRegistrySnapshot {
         #[derive(serde::Deserialize)]
         struct Wrapper {
             registry_version: i64,
+            #[serde(default)]
+            current_epoch: u32,
+            #[serde(default)]
+            epoch_key_hashes: BTreeMap<u32, [u8; 32]>,
             entries: Vec<RegistrySnapshotEntry>,
         }
 
         let wrapper: Wrapper = serde_json::from_slice(json_bytes)
             .map_err(|e| format!("registry snapshot JSON invalid: {e}"))?;
 
-        Ok(Self { entries: wrapper.entries, registry_version: wrapper.registry_version })
+        // Enforce that snapshots claiming the new registry-version floor
+        // actually carry the binding fields, and that the binding map covers
+        // the signed current_epoch. Older snapshots are accepted with a
+        // logged deprecation warning so we can ship the wire change before
+        // every producer in the network has rolled forward; this tolerance
+        // window is intended to close in a follow-up release.
+        if wrapper.registry_version >= SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING {
+            if wrapper.epoch_key_hashes.is_empty() {
+                return Err(format!(
+                    "registry_version {} requires non-empty epoch_key_hashes",
+                    wrapper.registry_version
+                ));
+            }
+            if !wrapper.epoch_key_hashes.contains_key(&wrapper.current_epoch) {
+                return Err(format!(
+                    "registry epoch_key_hashes missing entry for current_epoch {}",
+                    wrapper.current_epoch
+                ));
+            }
+        } else {
+            tracing::warn!(
+                registry_version = wrapper.registry_version,
+                "deprecated: signed registry snapshot lacks current_epoch / epoch_key_hashes binding (registry_version < {}); legacy tolerance is temporary and will be removed in a future release",
+                SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING
+            );
+        }
+
+        Ok(Self {
+            entries: wrapper.entries,
+            registry_version: wrapper.registry_version,
+            current_epoch: wrapper.current_epoch,
+            epoch_key_hashes: wrapper.epoch_key_hashes,
+        })
     }
 
     /// Convert snapshot entries to [`crate::storage::DeviceRecord`]s for import.
