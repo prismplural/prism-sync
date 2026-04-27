@@ -2287,7 +2287,7 @@ pub async fn delete_sync_group(
 /// (see `docs/plans/fronting-per-member-sessions.md` §4.2). Performs no relay
 /// I/O — purely local.
 pub async fn reset_sync_state(handle: &PrismSyncHandle) -> Result<(), String> {
-    let inner = handle.inner.lock().await;
+    let mut inner = handle.inner.lock().await;
     inner.reset_sync_state().await.map_err(|e| e.to_string())
 }
 

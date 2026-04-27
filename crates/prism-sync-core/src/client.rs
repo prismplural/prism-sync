@@ -842,7 +842,16 @@ impl PrismSync {
     /// Used as the "Approach A" cutover hook by app-layer migrations that need
     /// to reshape synced entities incompatibly — the device is severed from
     /// its old sync group and re-pairs against the migrated peer.
-    pub async fn reset_sync_state(&self) -> Result<()> {
+    ///
+    /// In addition to wiping the persistent engine tables, this nulls out the
+    /// in-memory runtime state that `configure_engine` populated: the
+    /// `OpEmitter`, the device signing keys (Ed25519 + ML-DSA), the device
+    /// id, the epoch, and the `SyncService` engine + auto-sync task. Without
+    /// this, a host that re-seeded credentials from its own keychain on next
+    /// launch could re-attach to the OLD sync group with the in-memory
+    /// state still pointing at it. The sync_quarantine table on the host
+    /// side is NOT touched by this call (see method-level note above).
+    pub async fn reset_sync_state(&mut self) -> Result<()> {
         let sync_id = self
             .sync_service
             .sync_id()
@@ -857,7 +866,22 @@ impl PrismSync {
             Ok(())
         })
         .await
-        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        // Tear down in-memory runtime state. Order matters only insofar as
+        // `clear_engine` aborts the auto-sync task before we drop key
+        // material — any in-flight sync cycle will fail cleanly with
+        // "sync not configured" rather than racing against half-cleared
+        // state.
+        self.sync_service.clear_engine();
+        self.op_emitter = None;
+        self.device_signing_key = None;
+        self.device_ml_dsa_signing_key = None;
+        self.ml_dsa_key_generation = None;
+        self.device_id = None;
+        self.epoch = None;
+
+        Ok(())
     }
 
     // ── Epoch rotation ──
@@ -2005,9 +2029,100 @@ mod tests {
         assert!(sync.storage().list_device_records("sync-1").unwrap().is_empty());
     }
 
+    /// `reset_sync_state` must also tear down the in-memory runtime state
+    /// that `configure_engine` populated. Previously it only wiped the
+    /// engine's persistent tables, leaving `op_emitter`, the device id,
+    /// epoch, and the `SyncService` engine intact — so a host that
+    /// re-seeded credentials from its own keychain on next launch could
+    /// silently re-attach to the OLD sync group with the in-memory state
+    /// still pointing at it. Codex P1 #5.
+    #[tokio::test]
+    async fn reset_sync_state_clears_runtime_engine_and_keys() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        seed_all_tables(sync.storage(), "sync-1");
+
+        // Pre-conditions established by `configure_engine`.
+        assert!(sync.op_emitter.is_some(), "op_emitter set by configure");
+        assert!(sync.device_id.is_some(), "device_id set by configure");
+        assert!(sync.epoch.is_some(), "epoch set by configure");
+        assert!(sync.sync_service.has_engine(), "engine set by configure");
+        assert_eq!(sync.sync_service.sync_id(), Some("sync-1"));
+
+        sync.reset_sync_state().await.unwrap();
+
+        // In-memory runtime state torn down — device is in the same shape
+        // as immediately after `PrismSync::builder().build()`.
+        assert!(sync.op_emitter.is_none(), "op_emitter cleared");
+        assert!(sync.device_signing_key.is_none(), "Ed25519 signing key cleared");
+        assert!(
+            sync.device_ml_dsa_signing_key.is_none(),
+            "ML-DSA signing key cleared"
+        );
+        assert!(sync.ml_dsa_key_generation.is_none(), "ML-DSA generation cleared");
+        assert!(sync.device_id.is_none(), "device_id cleared");
+        assert!(sync.epoch.is_none(), "epoch cleared");
+        assert!(!sync.sync_service.has_engine(), "engine cleared");
+        assert!(sync.sync_service.sync_id().is_none(), "sync_id cleared");
+    }
+
+    /// After reset, the standard mutation entry points must fail closed
+    /// rather than silently accepting writes that would never sync.
+    #[tokio::test]
+    async fn record_create_after_reset_returns_engine_error() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // Sanity: writes succeed pre-reset.
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        sync.record_create("members", "ent-pre", &fields).unwrap();
+
+        sync.reset_sync_state().await.unwrap();
+
+        let err = sync
+            .record_create("members", "ent-post", &fields)
+            .expect_err("record_create must fail after reset");
+        assert!(
+            err.to_string().to_lowercase().contains("not configured"),
+            "expected 'sync not configured' style error, got: {err}"
+        );
+    }
+
+    /// With auto-sync enabled, reset must abort the debounce task and
+    /// drop the mutation sender so no further sync cycles fire against
+    /// the (now-cleared) old sync group.
+    #[tokio::test]
+    async fn reset_sync_state_disables_auto_sync() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // Enable auto-sync; verify the sender is live before reset.
+        let _trigger_rx = sync.sync_service.set_auto_sync(crate::sync_service::AutoSyncConfig {
+            enabled: true,
+            debounce: std::time::Duration::from_millis(50),
+            ..Default::default()
+        });
+        assert!(
+            sync.sync_service.auto_sync_sender().is_some(),
+            "auto-sync sender should be live after set_auto_sync(enabled=true)"
+        );
+
+        sync.reset_sync_state().await.unwrap();
+
+        assert!(
+            sync.sync_service.auto_sync_sender().is_none(),
+            "auto-sync sender must be None after reset"
+        );
+        assert!(
+            sync.sync_service.notification_trigger_sender().is_none(),
+            "notification trigger sender must be None after reset"
+        );
+    }
+
     #[tokio::test]
     async fn reset_sync_state_errors_when_sync_not_configured() {
-        let sync = make_sync();
+        let mut sync = make_sync();
         let err = sync.reset_sync_state().await.unwrap_err();
         assert!(
             err.to_string().contains("sync_id not set"),

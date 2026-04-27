@@ -505,6 +505,32 @@ impl SyncService {
         self.sync_id = Some(sync_id);
     }
 
+    /// Tear down the configured engine and any auto-sync infrastructure.
+    ///
+    /// Mirrors `set_engine` in reverse so that `reset_sync_state` can leave
+    /// the service in the same shape it was in immediately after `new` (no
+    /// engine, no sync_id, no auto-sync task, no notification trigger).
+    /// After this call, `has_engine()` returns `false`, `sync_id()` returns
+    /// `None`, and `auto_sync_sender()` returns `None` — any subsequent
+    /// `record_create` etc. via `PrismSync` will fail with the standard
+    /// "sync not configured" error until `configure_engine` is called again
+    /// as part of a fresh pairing flow.
+    pub fn clear_engine(&mut self) {
+        self.engine = None;
+        self.sync_id = None;
+        self.last_sync_time = None;
+        self.recovered_epoch_high_water = None;
+        if let Some(handle) = self.auto_sync_handle.take() {
+            handle.abort();
+        }
+        self.auto_sync_tx = None;
+        self.notification_trigger_tx = None;
+        // Reset config to default so a future re-configure starts from the
+        // same baseline as a fresh `SyncService`.
+        self.auto_sync_config = AutoSyncConfig::default();
+        self.clear_recoverer();
+    }
+
     pub(crate) fn set_recoverer(&mut self, recoverer: Arc<dyn EpochRecoverer>) {
         self.recoverer = Some(recoverer);
     }
