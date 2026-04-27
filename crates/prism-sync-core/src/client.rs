@@ -814,6 +814,52 @@ impl PrismSync {
         result
     }
 
+    // ── Sync state reset ──
+
+    /// Atomically wipe all local sync engine state for the configured sync
+    /// group, leaving the device unpaired and ready to re-pair from scratch.
+    ///
+    /// Clears, in a single `BEGIN IMMEDIATE` transaction:
+    /// - `pending_ops` (unpushed local mutations)
+    /// - `applied_ops` (history of remote ops we've merged)
+    /// - `field_versions` (per-field LWW winners — CRDT merge state)
+    /// - `sync_metadata` (HLC bookkeeping, last-sync timestamps, epoch, etc.)
+    /// - `device_registry` (the paired-devices list)
+    ///
+    /// The transaction is all-or-nothing: a failure rolls back leaving the
+    /// engine state intact. After a successful wipe the device must call
+    /// [`configure_engine`](Self::configure_engine) again as part of a fresh
+    /// pairing flow before any sync operation will succeed.
+    ///
+    /// Note on `sync_quarantine`: that table lives in the host's Drift schema
+    /// (Dart side), not in the Rust sync engine, so it is *not* touched here.
+    /// Hosts that maintain such a table must clear it themselves alongside
+    /// this call.
+    ///
+    /// Returns `Err(CoreError::Engine)` if no sync group is currently
+    /// configured (i.e. `configure_engine` has not been called).
+    ///
+    /// Used as the "Approach A" cutover hook by app-layer migrations that need
+    /// to reshape synced entities incompatibly — the device is severed from
+    /// its old sync group and re-pairs against the migrated peer.
+    pub async fn reset_sync_state(&self) -> Result<()> {
+        let sync_id = self
+            .sync_service
+            .sync_id()
+            .ok_or_else(|| CoreError::Engine("sync_id not set — call configure_engine first".into()))?
+            .to_string();
+
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut tx = storage.begin_tx()?;
+            tx.clear_sync_state(&sync_id)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
+    }
+
     // ── Epoch rotation ──
 
     /// Revoke a device and rotate to a new epoch with a fresh epoch key.
@@ -1842,5 +1888,148 @@ mod tests {
         assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
         assert!(sync.secure_store().get("epoch").unwrap().is_none());
         assert!(sync.secure_store().get("epoch_key_1").unwrap().is_none());
+    }
+
+    // ── reset_sync_state ──
+
+    fn seed_all_tables(storage: &Arc<dyn SyncStorage>, sync_id: &str) {
+        use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, PendingOp, SyncMetadata};
+        use chrono::Utc;
+
+        let now = Utc::now();
+        // Op ids are PRIMARY KEY across the whole table (not per sync_id), so
+        // include sync_id in derived ids to keep multi-group seeding from
+        // colliding.
+        let pending_op_id = format!("op-pending-{sync_id}");
+        let applied_op_id = format!("op-applied-{sync_id}");
+        let batch_id = format!("batch-{sync_id}");
+        let metadata = SyncMetadata {
+            sync_id: sync_id.to_string(),
+            local_device_id: "device-abc".to_string(),
+            current_epoch: 1,
+            last_pulled_server_seq: 42,
+            last_pushed_at: Some(now),
+            last_successful_sync_at: Some(now),
+            registered_at: Some(now),
+            needs_rekey: false,
+            last_imported_registry_version: Some(7),
+            created_at: now,
+            updated_at: now,
+        };
+        let pending = PendingOp {
+            op_id: pending_op_id,
+            sync_id: sync_id.to_string(),
+            epoch: 1,
+            device_id: "dev1".to_string(),
+            local_batch_id: batch_id,
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            encoded_value: "\"Alice\"".to_string(),
+            is_delete: false,
+            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            created_at: now,
+            pushed_at: None,
+        };
+        let applied = AppliedOp {
+            op_id: applied_op_id.clone(),
+            sync_id: sync_id.to_string(),
+            epoch: 1,
+            device_id: "dev1".to_string(),
+            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            server_seq: 10,
+            applied_at: now,
+        };
+        let fv = FieldVersion {
+            sync_id: sync_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: applied_op_id,
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            winning_encoded_value: Some("\"Alice\"".to_string()),
+            updated_at: now,
+        };
+        let device = DeviceRecord {
+            sync_id: sync_id.to_string(),
+            device_id: "dev1".to_string(),
+            ed25519_public_key: vec![1, 2, 3, 4],
+            x25519_public_key: vec![5, 6, 7, 8],
+            ml_dsa_65_public_key: vec![9u8; 1952],
+            ml_kem_768_public_key: vec![10u8; 1184],
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            registered_at: now,
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&metadata).unwrap();
+        tx.insert_pending_op(&pending).unwrap();
+        tx.insert_applied_op(&applied).unwrap();
+        tx.upsert_field_version(&fv).unwrap();
+        tx.upsert_device_record(&device).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_sync_state_wipes_all_engine_tables() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        seed_all_tables(sync.storage(), "sync-1");
+
+        // Sanity: every table has data before the wipe.
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_some());
+        assert!(!sync.storage().get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+        assert!(sync.storage().is_op_applied("op-applied-sync-1").unwrap());
+        assert!(sync
+            .storage()
+            .get_field_version("sync-1", "members", "ent-1", "name")
+            .unwrap()
+            .is_some());
+        assert!(!sync.storage().list_device_records("sync-1").unwrap().is_empty());
+
+        sync.reset_sync_state().await.unwrap();
+
+        // Every table is empty after the wipe.
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
+        assert!(sync.storage().get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+        assert!(!sync.storage().is_op_applied("op-applied-sync-1").unwrap());
+        assert!(sync
+            .storage()
+            .get_field_version("sync-1", "members", "ent-1", "name")
+            .unwrap()
+            .is_none());
+        assert!(sync.storage().list_device_records("sync-1").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_sync_state_errors_when_sync_not_configured() {
+        let sync = make_sync();
+        let err = sync.reset_sync_state().await.unwrap_err();
+        assert!(
+            err.to_string().contains("sync_id not set"),
+            "expected 'sync_id not set' error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_sync_state_only_clears_configured_sync_group() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        // Seed both the configured group ("sync-1") and a foreign group.
+        seed_all_tables(sync.storage(), "sync-1");
+        seed_all_tables(sync.storage(), "sync-other");
+
+        sync.reset_sync_state().await.unwrap();
+
+        // Configured group is gone; foreign group is untouched.
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
+        assert!(sync.storage().list_device_records("sync-1").unwrap().is_empty());
+
+        assert!(sync.storage().get_sync_metadata("sync-other").unwrap().is_some());
+        assert!(!sync.storage().list_device_records("sync-other").unwrap().is_empty());
     }
 }

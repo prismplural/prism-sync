@@ -2271,6 +2271,26 @@ pub async fn delete_sync_group(
     }
 }
 
+/// Atomically wipe all local sync engine state for the configured sync group.
+///
+/// Clears `pending_ops`, `applied_ops`, `field_versions`, `sync_metadata`, and
+/// the paired-devices list (`device_registry`) inside a single
+/// `BEGIN IMMEDIATE` transaction. After this returns successfully the device
+/// is unpaired from its sync group and must re-pair before any further sync
+/// operation will succeed.
+///
+/// The host's Drift-side `sync_quarantine` table (if any) is *not* touched —
+/// that lives outside the Rust engine and must be cleared by the host
+/// alongside this call.
+///
+/// Used as the "Approach A" cutover hook by the per-member fronting migration
+/// (see `docs/plans/fronting-per-member-sessions.md` §4.2). Performs no relay
+/// I/O — purely local.
+pub async fn reset_sync_state(handle: &PrismSyncHandle) -> Result<(), String> {
+    let inner = handle.inner.lock().await;
+    inner.reset_sync_state().await.map_err(|e| e.to_string())
+}
+
 // ── Device info ──
 
 /// Get this device's node ID (12-char hex identifier).

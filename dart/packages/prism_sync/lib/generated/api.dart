@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `json_value_to_sync_value`, `load_device_ml_dsa_generation`, `lock_or_recover`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `import_signed_registry`, `install_trace_subscriber_once`, `json_value_to_sync_value`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_fields_json`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -477,6 +477,24 @@ Future<void> deleteSyncGroup({
   deviceId: deviceId,
   sessionToken: sessionToken,
 );
+
+/// Atomically wipe all local sync engine state for the configured sync group.
+///
+/// Clears `pending_ops`, `applied_ops`, `field_versions`, `sync_metadata`, and
+/// the paired-devices list (`device_registry`) inside a single
+/// `BEGIN IMMEDIATE` transaction. After this returns successfully the device
+/// is unpaired from its sync group and must re-pair before any further sync
+/// operation will succeed.
+///
+/// The host's Drift-side `sync_quarantine` table (if any) is *not* touched —
+/// that lives outside the Rust engine and must be cleared by the host
+/// alongside this call.
+///
+/// Used as the "Approach A" cutover hook by the per-member fronting migration
+/// (see `docs/plans/fronting-per-member-sessions.md` §4.2). Performs no relay
+/// I/O — purely local.
+Future<void> resetSyncState({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiResetSyncState(handle: handle);
 
 /// Get this device's node ID (12-char hex identifier).
 ///
