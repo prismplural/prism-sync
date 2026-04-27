@@ -486,6 +486,7 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
         fields.insert("count".to_string(), SyncValue::Int(42));
+        fields.insert("score".to_string(), SyncValue::Real(3.5));
         fields.insert("active".to_string(), SyncValue::Bool(false));
         fields.insert("note".to_string(), SyncValue::Null);
 
@@ -497,6 +498,7 @@ mod tests {
             match op.field_name.as_str() {
                 "name" => assert_eq!(op.encoded_value, "\"Alice\""),
                 "count" => assert_eq!(op.encoded_value, "42"),
+                "score" => assert_eq!(op.encoded_value, "3.5"),
                 "active" => assert_eq!(op.encoded_value, "false"),
                 "note" => assert_eq!(op.encoded_value, "null"),
                 other => panic!("Unexpected field: {other}"),

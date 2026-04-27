@@ -44,6 +44,7 @@ pub struct EntityChange {
     /// Values use the same encoding as `encode_value` / `decode_value`:
     /// - String -> JSON string (e.g. `"\"hello\""`)
     /// - Int -> JSON number (e.g. `"42"`)
+    /// - Real -> JSON number (e.g. `"3.14"`)
     /// - Bool -> `"true"` / `"false"`
     /// - DateTime -> JSON-encoded ISO-8601 (e.g. `"\"2026-03-15T12:00:00.000Z\""`)
     /// - Blob -> JSON-encoded base64 (e.g. `"\"3q2+7w==\""`)

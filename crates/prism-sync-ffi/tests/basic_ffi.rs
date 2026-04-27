@@ -49,6 +49,21 @@ fn make_handle_with_schema() -> prism_sync_ffi::api::PrismSyncHandle {
     .expect("create_prism_sync with schema should succeed")
 }
 
+fn app_sync_schema_json() -> Option<String> {
+    let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../app");
+    if !app_dir.exists() {
+        return None;
+    }
+    let path = app_dir.join("lib/core/sync/sync_schema.dart");
+    let source = std::fs::read_to_string(path).expect("failed to read app sync schema");
+
+    let marker = "const String prismSyncSchema = '''";
+    let start = source.find(marker).expect("prismSyncSchema const should exist") + marker.len();
+    let rest = &source[start..];
+    let end = rest.find("''';").expect("prismSyncSchema const should be closed");
+    Some(rest[..end].trim().to_string())
+}
+
 // ── Construction ──
 
 #[tokio::test]
@@ -74,6 +89,23 @@ async fn create_handle_with_schema_json() {
         None,
     );
     assert!(result.is_ok(), "schema JSON should parse: {:?}", result.err());
+}
+
+#[tokio::test]
+async fn create_handle_accepts_app_prism_sync_schema() {
+    let Some(schema) = app_sync_schema_json() else {
+        eprintln!("skipping app-schema FFI parse test; app sync schema is not present");
+        return;
+    };
+
+    let result = api::create_prism_sync(
+        "https://localhost:8080".into(),
+        ":memory:".into(),
+        false,
+        schema,
+        None,
+    );
+    assert!(result.is_ok(), "app schema JSON should parse: {:?}", result.err());
 }
 
 #[tokio::test]

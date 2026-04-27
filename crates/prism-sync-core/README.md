@@ -48,6 +48,7 @@ let schema = SyncSchema::builder()
         e.field("title", SyncType::String)
          .field("done", SyncType::Bool)
          .field("priority", SyncType::Int)
+         .field("score", SyncType::Real)
     })
     .build();
 
@@ -71,6 +72,7 @@ sync.configure_engine(relay, sync_id, node_id, epoch);
 let mut fields = HashMap::new();
 fields.insert("title".into(), SyncValue::String("Buy milk".into()));
 fields.insert("done".into(), SyncValue::Bool(false));
+fields.insert("score".into(), SyncValue::Real(3.5));
 sync.record_create("tasks", "task-1", &fields)?;
 
 // 6. Sync

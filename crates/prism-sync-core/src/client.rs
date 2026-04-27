@@ -26,7 +26,7 @@ use crate::recovery::{
     commit_recovered_epoch_material, persist_epoch_cache, persist_epoch_key, KeyHierarchyRecoverer,
 };
 use crate::relay::SyncRelay;
-use crate::schema::{SyncSchema, SyncValue};
+use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::secure_store::SecureStore;
 use crate::storage::{StorageError, SyncStorage};
 use crate::sync_service::{AutoSyncConfig, SyncService};
@@ -756,6 +756,10 @@ impl PrismSync {
         entity_id: &str,
         fields: &HashMap<String, SyncValue>,
     ) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        self.validate_mutation_fields(table, fields)?;
         let emitter = self
             .op_emitter
             .as_mut()
@@ -780,6 +784,13 @@ impl PrismSync {
         entity_id: &str,
         changed_fields: &HashMap<String, SyncValue>,
     ) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        if changed_fields.is_empty() {
+            return Ok(());
+        }
+        self.validate_mutation_fields(table, changed_fields)?;
         let emitter = self
             .op_emitter
             .as_mut()
@@ -800,6 +811,10 @@ impl PrismSync {
     /// Creates a tombstone op (`is_deleted = true`). Returns an error if the
     /// sync engine has not been configured.
     pub fn record_delete(&mut self, table: &str, entity_id: &str) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        self.schema.entity(table).ok_or_else(|| CoreError::UnknownTable(table.to_string()))?;
         let emitter = self
             .op_emitter
             .as_mut()
@@ -812,6 +827,24 @@ impl PrismSync {
             }
         }
         result
+    }
+
+    fn validate_mutation_fields(
+        &self,
+        table: &str,
+        fields: &HashMap<String, SyncValue>,
+    ) -> Result<()> {
+        let entity =
+            self.schema.entity(table).ok_or_else(|| CoreError::UnknownTable(table.to_string()))?;
+
+        for (field_name, value) in fields {
+            let field = entity.field_by_name(field_name).ok_or_else(|| {
+                CoreError::UnknownField { table: table.to_string(), field: field_name.clone() }
+            })?;
+            validate_sync_value_type(table, field_name, field.sync_type, value)?;
+        }
+
+        Ok(())
     }
 
     // ── Epoch rotation ──
@@ -1133,6 +1166,57 @@ impl PrismSync {
     /// Access the device secret, if initialized.
     pub fn device_secret(&self) -> Option<&DeviceSecret> {
         self.device_secret.as_ref()
+    }
+}
+
+fn validate_sync_value_type(
+    table: &str,
+    field: &str,
+    expected: SyncType,
+    value: &SyncValue,
+) -> Result<()> {
+    if let SyncValue::Real(value) = value {
+        if !value.is_finite() {
+            return Err(CoreError::Schema(format!(
+                "field '{table}.{field}' received non-finite Real value"
+            )));
+        }
+    }
+
+    if value.is_null() {
+        return Ok(());
+    }
+
+    let matches = match (expected, value) {
+        (SyncType::String, SyncValue::String(_)) => true,
+        (SyncType::Int, SyncValue::Int(_)) => true,
+        (SyncType::Real, SyncValue::Real(_)) => true,
+        (SyncType::Real, SyncValue::Int(_)) => true,
+        (SyncType::Bool, SyncValue::Bool(_)) => true,
+        (SyncType::DateTime, SyncValue::DateTime(_)) => true,
+        (SyncType::Blob, SyncValue::Blob(_)) => true,
+        _ => false,
+    };
+
+    if matches {
+        Ok(())
+    } else {
+        Err(CoreError::Schema(format!(
+            "field '{table}.{field}' expects {expected:?}, got {}",
+            sync_value_type_name(value)
+        )))
+    }
+}
+
+fn sync_value_type_name(value: &SyncValue) -> &'static str {
+    match value {
+        SyncValue::Null => "Null",
+        SyncValue::String(_) => "String",
+        SyncValue::Int(_) => "Int",
+        SyncValue::Real(_) => "Real",
+        SyncValue::Bool(_) => "Bool",
+        SyncValue::DateTime(_) => "DateTime",
+        SyncValue::Blob(_) => "Blob",
     }
 }
 
@@ -1557,6 +1641,7 @@ mod tests {
                 e.field("name", SyncType::String)
                     .field("age", SyncType::Int)
                     .field("active", SyncType::Bool)
+                    .field("score", SyncType::Real)
             })
             .build();
         let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
@@ -1635,6 +1720,65 @@ mod tests {
         let update_ops = sync.storage.load_batch_ops(&batch_ids[1]).unwrap();
         assert_eq!(update_ops.len(), 1);
         assert_eq!(update_ops[0].field_name, "name");
+    }
+
+    #[test]
+    fn record_create_rejects_real_for_int_field() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut fields = HashMap::new();
+        fields.insert("age".to_string(), SyncValue::Real(25.5));
+
+        let err = sync.record_create("members", "ent-1", &fields).unwrap_err();
+        assert!(err.to_string().contains("expects Int, got Real"), "unexpected error: {err}");
+        assert!(sync.storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_create_allows_int_for_real_field() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut fields = HashMap::new();
+        fields.insert("score".to_string(), SyncValue::Int(8));
+
+        sync.record_create("members", "ent-1", &fields).unwrap();
+
+        let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
+        let ops = sync.storage.load_batch_ops(&batch_ids[0]).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].field_name, "score");
+        assert_eq!(ops[0].encoded_value, "8");
+    }
+
+    #[test]
+    fn record_create_rejects_non_finite_real() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut fields = HashMap::new();
+        fields.insert("score".to_string(), SyncValue::Real(f64::NAN));
+
+        let err = sync.record_create("members", "ent-1", &fields).unwrap_err();
+        assert!(err.to_string().contains("non-finite Real"), "unexpected error: {err}");
+        assert!(sync.storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_update_rejects_unknown_field() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut changed = HashMap::new();
+        changed.insert("unknown".to_string(), SyncValue::String("value".to_string()));
+
+        let err = sync.record_update("members", "ent-1", &changed).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field: members.unknown"),
+            "unexpected error: {err}"
+        );
+        assert!(sync.storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
     }
 
     #[test]

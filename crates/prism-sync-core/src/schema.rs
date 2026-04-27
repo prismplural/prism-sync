@@ -10,6 +10,7 @@ use crate::error::{CoreError, Result};
 pub enum SyncType {
     String,
     Int,
+    Real,
     Bool,
     DateTime,
     Blob,
@@ -23,6 +24,7 @@ pub enum SyncValue {
     Null,
     String(String),
     Int(i64),
+    Real(f64),
     Bool(bool),
     DateTime(DateTime<Utc>),
     Blob(Vec<u8>),
@@ -34,6 +36,7 @@ impl SyncValue {
             SyncValue::Null => None,
             SyncValue::String(_) => Some(SyncType::String),
             SyncValue::Int(_) => Some(SyncType::Int),
+            SyncValue::Real(_) => Some(SyncType::Real),
             SyncValue::Bool(_) => Some(SyncType::Bool),
             SyncValue::DateTime(_) => Some(SyncType::DateTime),
             SyncValue::Blob(_) => Some(SyncType::Blob),
@@ -81,6 +84,7 @@ impl SyncEntityDef {
 ///          .field("done", SyncType::Bool)
 ///          .field("due_date", SyncType::DateTime)
 ///          .field("priority", SyncType::Int)
+///          .field("score", SyncType::Real)
 ///     })
 ///     .entity("members", |e| {
 ///         e.field("name", SyncType::String)
@@ -136,6 +140,7 @@ impl SyncSchema {
                     let sync_type = match type_str {
                         "String" => SyncType::String,
                         "Int" => SyncType::Int,
+                        "Real" => SyncType::Real,
                         "Bool" => SyncType::Bool,
                         "DateTime" => SyncType::DateTime,
                         "Blob" => SyncType::Blob,
@@ -224,6 +229,7 @@ impl EntityBuilder {
 /// - Null: literal string `"null"`
 /// - String: JSON-encoded string (with quotes): `"\"hello\""`
 /// - Int: JSON number: `"42"`
+/// - Real: JSON number: `"3.14"`
 /// - Bool: `"true"` / `"false"`
 /// - DateTime: JSON-encoded ISO-8601: `"\"2026-03-15T12:00:00.000Z\""`
 /// - Blob: JSON-encoded base64: `"\"base64data...\""`
@@ -232,6 +238,13 @@ pub fn encode_value(value: &SyncValue) -> String {
         SyncValue::Null => "null".to_string(),
         SyncValue::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".to_string()),
         SyncValue::Int(i) => serde_json::to_string(i).unwrap_or_else(|_| "null".to_string()),
+        SyncValue::Real(f) => {
+            if f.is_finite() {
+                serde_json::to_string(f).unwrap_or_else(|_| "null".to_string())
+            } else {
+                "null".to_string()
+            }
+        }
         SyncValue::Bool(b) => serde_json::to_string(b).unwrap_or_else(|_| "null".to_string()),
         SyncValue::DateTime(dt) => {
             // Dart format: ISO-8601 with millisecond precision
@@ -275,6 +288,17 @@ pub fn decode_value(encoded: &str, sync_type: SyncType) -> Result<SyncValue> {
                 CoreError::Serialization(format!("Expected int, got: {json_val}"))
             })?;
             Ok(SyncValue::Int(i))
+        }
+        SyncType::Real => {
+            let f = json_val.as_f64().ok_or_else(|| {
+                CoreError::Serialization(format!("Expected real number, got: {json_val}"))
+            })?;
+            if !f.is_finite() {
+                return Err(CoreError::Serialization(format!(
+                    "Expected finite real number, got: {json_val}"
+                )));
+            }
+            Ok(SyncValue::Real(f))
         }
         SyncType::Bool => {
             let b = json_val.as_bool().ok_or_else(|| {
@@ -333,6 +357,17 @@ mod tests {
     }
 
     #[test]
+    fn schema_from_json_accepts_real() {
+        let schema = SyncSchema::from_json(
+            r#"{"entities":{"settings":{"fields":{"wake_after_hours":"Real"}}}}"#,
+        )
+        .unwrap();
+
+        let entity = schema.entity("settings").unwrap();
+        assert_eq!(entity.field_by_name("wake_after_hours").unwrap().sync_type, SyncType::Real);
+    }
+
+    #[test]
     fn encode_decode_null() {
         let encoded = encode_value(&SyncValue::Null);
         assert_eq!(encoded, "null");
@@ -373,6 +408,21 @@ mod tests {
         assert_eq!(encoded, "-100");
         let decoded = decode_value(&encoded, SyncType::Int).unwrap();
         assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_real() {
+        let val = SyncValue::Real(8.5);
+        let encoded = encode_value(&val);
+        assert_eq!(encoded, "8.5");
+        let decoded = decode_value(&encoded, SyncType::Real).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn decode_real_accepts_integer_json_number() {
+        let decoded = decode_value("8", SyncType::Real).unwrap();
+        assert_eq!(decoded, SyncValue::Real(8.0));
     }
 
     #[test]
@@ -424,9 +474,15 @@ mod tests {
     }
 
     #[test]
+    fn decode_real_type_mismatch() {
+        assert!(decode_value("\"8.5\"", SyncType::Real).is_err());
+    }
+
+    #[test]
     fn sync_value_type_checking() {
         assert_eq!(SyncValue::String("x".into()).sync_type(), Some(SyncType::String));
         assert_eq!(SyncValue::Int(1).sync_type(), Some(SyncType::Int));
+        assert_eq!(SyncValue::Real(1.5).sync_type(), Some(SyncType::Real));
         assert_eq!(SyncValue::Bool(true).sync_type(), Some(SyncType::Bool));
         assert_eq!(SyncValue::Null.sync_type(), None);
         assert!(SyncValue::Null.is_null());

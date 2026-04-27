@@ -57,13 +57,14 @@ Never edit files in `dart/packages/prism_sync/lib/generated/` manually -- they a
 ### Pairing
 | Function | Description |
 |----------|-------------|
-| `create_sync_group(handle, password, relay_url)` | Create a new sync group, returns sync metadata JSON |
-| `prepare_pending_device_identity(handle)` | Persist a pending joiner identity before relay-based pairing |
-| `create_pairing_session(handle)` | Create initiator-side relay rendezvous metadata |
-| `start_joiner_pairing(handle, relay_url, rendezvous_token)` | Start the relay-based joiner ceremony |
-| `start_initiator_pairing(handle, rendezvous_token)` | Start the relay-based initiator ceremony |
-| `poll_pairing_status(handle, rendezvous_token)` | Poll pairing state until SAS/credentials are ready |
-| `complete_pairing(handle, rendezvous_token, sas_confirmed, password)` | Complete the relay-based pairing ceremony |
+| `create_sync_group(handle, password, relay_url)` | Create new sync group, returns invite JSON |
+| `start_joiner_ceremony(handle)` | Start relay-based joiner pairing ceremony, returns rendezvous token |
+| `get_joiner_sas(handle)` | Poll for initiator and return SAS verification codes |
+| `complete_joiner_ceremony(handle, password)` | Complete joiner ceremony after SAS confirmation |
+| `start_initiator_ceremony(handle, ...)` | Start relay-based initiator pairing ceremony |
+| `complete_initiator_ceremony(handle)` | Complete initiator ceremony after SAS confirmation |
+
+> **Removed:** `join_from_qr`, `join_from_url`, and `join_from_response_json` (compact QR/URL pairing transport) were replaced by the relay-based pairing ceremony with SAS verification.
 
 ### Device Management
 | Function | Description |
@@ -125,6 +126,7 @@ All async FFI functions use `tokio::sync::Mutex` to safely hold the lock across 
       "fields": {
         "name": "String",
         "age": "Int",
+        "score": "Real",
         "active": "Bool",
         "avatar": "Blob",
         "created_at": "DateTime"
@@ -134,7 +136,7 @@ All async FFI functions use `tokio::sync::Mutex` to safely hold the lock across 
 }
 ```
 
-Supported types: `String`, `Int`, `Bool`, `DateTime`, `Blob`.
+Supported types: `String`, `Int`, `Real`, `Bool`, `DateTime`, `Blob`.
 
 ## Regenerating Bindings
 

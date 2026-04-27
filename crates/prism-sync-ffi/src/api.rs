@@ -23,7 +23,7 @@ use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
-use prism_sync_core::schema::{SyncSchema, SyncValue};
+use prism_sync_core::schema::{SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
@@ -150,6 +150,7 @@ const _: () = {
 ///       "fields": {
 ///         "name": "String",
 ///         "age": "Int",
+///         "score": "Real",
 ///         "active": "Bool",
 ///         "avatar": "Blob",
 ///         "created_at": "DateTime"
@@ -164,6 +165,7 @@ fn parse_schema_json(json: &str) -> Result<SyncSchema, String> {
 
 // ── Helper: Parse fields JSON to HashMap<String, SyncValue> ──
 
+#[cfg(test)]
 fn parse_fields_json(json: &str) -> Result<HashMap<String, SyncValue>, String> {
     let map: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(json).map_err(|e| format!("Invalid fields JSON: {e}"))?;
@@ -175,6 +177,86 @@ fn parse_fields_json(json: &str) -> Result<HashMap<String, SyncValue>, String> {
     Ok(result)
 }
 
+fn parse_fields_json_for_schema(
+    json: &str,
+    schema: &SyncSchema,
+    table: &str,
+) -> Result<HashMap<String, SyncValue>, String> {
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("Invalid fields JSON: {e}"))?;
+    let entity = schema.entity(table).ok_or_else(|| format!("Unknown table '{table}'"))?;
+
+    let mut result = HashMap::new();
+    for (key, value) in map {
+        let field =
+            entity.field_by_name(&key).ok_or_else(|| format!("Unknown field '{table}.{key}'"))?;
+        let sv = json_value_to_sync_value_for_type(&key, &value, field.sync_type)?;
+        result.insert(key, sv);
+    }
+    Ok(result)
+}
+
+fn json_value_to_sync_value_for_type(
+    key: &str,
+    value: &serde_json::Value,
+    sync_type: SyncType,
+) -> Result<SyncValue, String> {
+    if value.is_null() {
+        return Ok(SyncValue::Null);
+    }
+
+    match sync_type {
+        SyncType::String => value
+            .as_str()
+            .map(|s| SyncValue::String(s.to_string()))
+            .ok_or_else(|| format!("Expected string for field '{key}'")),
+        SyncType::Int => json_number_to_i64(key, value).map(SyncValue::Int),
+        SyncType::Real => {
+            let f =
+                value.as_f64().ok_or_else(|| format!("Expected real number for field '{key}'"))?;
+            if f.is_finite() {
+                Ok(SyncValue::Real(f))
+            } else {
+                Err(format!("Unsupported float value for field '{key}'"))
+            }
+        }
+        SyncType::Bool => value
+            .as_bool()
+            .map(SyncValue::Bool)
+            .ok_or_else(|| format!("Expected boolean for field '{key}'")),
+        SyncType::DateTime => {
+            let s =
+                value.as_str().ok_or_else(|| format!("Expected date string for field '{key}'"))?;
+            let dt = s
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .map_err(|e| format!("Invalid date string for field '{key}': {e}"))?;
+            Ok(SyncValue::DateTime(dt))
+        }
+        SyncType::Blob => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("Expected base64 string for field '{key}'"))?;
+            let bytes = BASE64
+                .decode(s)
+                .map_err(|e| format!("Invalid base64 string for field '{key}': {e}"))?;
+            Ok(SyncValue::Blob(bytes))
+        }
+    }
+}
+
+fn json_number_to_i64(key: &str, value: &serde_json::Value) -> Result<i64, String> {
+    if let Some(i) = value.as_i64() {
+        return Ok(i);
+    }
+    let f = value.as_f64().ok_or_else(|| format!("Expected integer for field '{key}'"))?;
+    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        Ok(f as i64)
+    } else {
+        Err(format!("Expected integer for field '{key}'"))
+    }
+}
+
+#[cfg(test)]
 fn json_value_to_sync_value(key: &str, value: &serde_json::Value) -> Result<SyncValue, String> {
     match value {
         serde_json::Value::Null => Ok(SyncValue::Null),
@@ -185,6 +267,8 @@ fn json_value_to_sync_value(key: &str, value: &serde_json::Value) -> Result<Sync
             } else if let Some(f) = n.as_f64() {
                 if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
                     Ok(SyncValue::Int(f as i64))
+                } else if f.is_finite() {
+                    Ok(SyncValue::Real(f))
                 } else {
                     Err(format!("Unsupported float value for field '{key}'"))
                 }
@@ -209,6 +293,7 @@ fn json_value_to_sync_value(key: &str, value: &serde_json::Value) -> Result<Sync
 /// Encoding rules (see `encode_value` in prism-sync-core):
 /// - `"null"` -> JSON null
 /// - `"42"` / `"-100"` -> JSON number (Int)
+/// - `"3.14"` -> JSON number (Real)
 /// - `"true"` / `"false"` -> JSON boolean (Bool)
 /// - `"\"hello\""` -> JSON string `"hello"` (String)
 /// - `"\"2026-03-15T12:00:00.000Z\""` -> JSON string (DateTime as ISO-8601)
@@ -1323,7 +1408,7 @@ pub async fn change_password(
 /// Record a new entity creation.
 ///
 /// `fields_json` is a JSON object: `{"field_name": value, ...}`.
-/// Supported value types: null, string, integer, boolean.
+/// Supported value types: null, string, integer, real number, boolean.
 pub async fn record_create(
     handle: &PrismSyncHandle,
     table: String,
@@ -1331,7 +1416,7 @@ pub async fn record_create(
     fields_json: String,
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    let fields = parse_fields_json(&fields_json)?;
+    let fields = parse_fields_json_for_schema(&fields_json, inner.schema(), &table)?;
     inner.record_create(&table, &entity_id, &fields).map_err(|e| e.to_string())
 }
 
@@ -1345,7 +1430,7 @@ pub async fn record_update(
     changed_fields_json: String,
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    let fields = parse_fields_json(&changed_fields_json)?;
+    let fields = parse_fields_json_for_schema(&changed_fields_json, inner.schema(), &table)?;
     inner.record_update(&table, &entity_id, &fields).map_err(|e| e.to_string())
 }
 
@@ -3972,6 +4057,46 @@ mod tests {
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
     use std::sync::Arc;
+
+    #[test]
+    fn parse_schema_json_accepts_real_type() {
+        let schema =
+            parse_schema_json(r#"{"entities":{"settings":{"fields":{"score":"Real"}}}}"#).unwrap();
+
+        let field = schema.entity("settings").unwrap().field_by_name("score").unwrap();
+        assert_eq!(field.sync_type, prism_sync_core::schema::SyncType::Real);
+    }
+
+    #[test]
+    fn parse_fields_json_accepts_real_numbers() {
+        let fields = parse_fields_json(r#"{"score":8.5}"#).unwrap();
+
+        assert_eq!(fields.get("score"), Some(&SyncValue::Real(8.5)));
+    }
+
+    #[test]
+    fn parse_fields_json_for_schema_coerces_wire_strings_to_typed_values() {
+        let schema = parse_schema_json(
+            r#"{"entities":{"settings":{"fields":{"score":"Real","created_at":"DateTime","avatar":"Blob"}}}}"#,
+        )
+        .unwrap();
+
+        let fields = parse_fields_json_for_schema(
+            r#"{"score":8,"created_at":"2026-04-27T12:34:56.789Z","avatar":"AAECAw=="}"#,
+            &schema,
+            "settings",
+        )
+        .unwrap();
+
+        assert_eq!(fields.get("score"), Some(&SyncValue::Real(8.0)));
+        assert!(matches!(fields.get("created_at"), Some(SyncValue::DateTime(_))));
+        assert_eq!(fields.get("avatar"), Some(&SyncValue::Blob(vec![0, 1, 2, 3])));
+    }
+
+    #[test]
+    fn encoded_real_value_round_trips_to_json_number() {
+        assert_eq!(encoded_value_to_json("8.5"), serde_json::json!(8.5));
+    }
 
     fn make_device_record(
         sync_id: &str,
