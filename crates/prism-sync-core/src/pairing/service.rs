@@ -265,6 +265,8 @@ impl PairingService {
         self.secure_store.set("device_secret", device_secret.as_bytes())?;
         self.secure_store.set("device_id", device_id.as_bytes())?;
         self.secure_store.set("epoch", b"0")?;
+        self.secure_store.delete("pending_device_secret")?;
+        self.secure_store.delete("pending_device_id")?;
 
         Ok((credentials, response))
     }
@@ -800,10 +802,7 @@ impl PairingService {
             "joiner bundle",
         )
         .await?;
-        let joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
-
-        self.secure_store.set("bootstrap_joiner_bundle", &serde_json::to_vec(&joiner_bundle)?)?;
-        self.secure_store.set("bootstrap_joiner_device_id", joiner_bundle.device_id.as_bytes())?;
+        let _joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
 
         let next_epoch = current_epoch.saturating_add(1);
         let epoch_key =
@@ -819,6 +818,8 @@ impl PairingService {
             .delete_session(&ceremony.rendezvous_id_hex())
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("deleting pairing session"), e))?;
+        self.secure_store.delete("bootstrap_joiner_bundle")?;
+        self.secure_store.delete("bootstrap_joiner_device_id")?;
 
         Ok(())
     }
@@ -1269,7 +1270,6 @@ async fn wait_for_pairing_slot_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::JoinerBundle;
     use crate::relay::pairing_relay::PairingRelay;
     use crate::relay::traits::*;
     use crate::relay::MockPairingRelay;
@@ -2192,13 +2192,8 @@ mod tests {
             "relay-registration-token"
         );
 
-        let stored_joiner_bundle = initiator_store
-            .get("bootstrap_joiner_bundle")
-            .unwrap()
-            .expect("initiator should persist joiner bundle");
-        let stored_joiner_bundle: JoinerBundle =
-            serde_json::from_slice(&stored_joiner_bundle).unwrap();
-        assert_eq!(stored_joiner_bundle.device_id, joiner_device_id);
+        assert!(initiator_store.get("bootstrap_joiner_bundle").unwrap().is_none());
+        assert!(initiator_store.get("bootstrap_joiner_device_id").unwrap().is_none());
 
         {
             let state = registry_relay.state.lock().unwrap();
@@ -2781,6 +2776,10 @@ mod tests {
     async fn create_sync_group_persists_device_identity() {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(store.clone());
+        let pending_secret = DeviceSecret::generate();
+        let pending_device_id = "abc123def456";
+        store.set("pending_device_secret", pending_secret.as_bytes()).unwrap();
+        store.set("pending_device_id", pending_device_id.as_bytes()).unwrap();
 
         let (_creds, _response) = service
             .create_sync_group(
@@ -2799,12 +2798,14 @@ mod tests {
         // Device secret and device id should be persisted
         let device_secret = store.get("device_secret").unwrap();
         assert!(device_secret.is_some());
-        assert_eq!(device_secret.unwrap().len(), 32);
+        assert_eq!(device_secret.unwrap(), pending_secret.as_bytes());
 
         let device_id = store.get("device_id").unwrap();
         assert!(device_id.is_some());
         let device_id_str = String::from_utf8(device_id.unwrap()).unwrap();
-        assert_eq!(device_id_str.len(), 12); // node_id is 12 hex chars
+        assert_eq!(device_id_str, pending_device_id);
+        assert!(store.get("pending_device_secret").unwrap().is_none());
+        assert!(store.get("pending_device_id").unwrap().is_none());
     }
 
     #[tokio::test]
