@@ -24,6 +24,14 @@ class DriftSyncEntity {
   /// Check whether a row is soft-deleted (isDeleted flag).
   final Future<bool> Function(String id) isDeleted;
 
+  /// Resolve the canonical sync `entity_id` for a Drift row.
+  ///
+  /// Defaults to `row.id`. Override when the sync layer keys an entity
+  /// under a derived value — e.g. PK-linked groups use `pk-group:$uuid`,
+  /// not the local Drift row id. Used by the bootstrap pass on first-device
+  /// setup so emitted ops match the IDs live writes would use.
+  final String Function(dynamic row) entityIdFor;
+
   DriftSyncEntity({
     required this.tableName,
     required this.toSyncFields,
@@ -31,5 +39,7 @@ class DriftSyncEntity {
     required this.hardDelete,
     required this.readRow,
     required this.isDeleted,
-  });
+    String Function(dynamic row)? entityIdFor,
+  }) : entityIdFor =
+            entityIdFor ?? ((row) => (row as dynamic).id as String);
 }

@@ -300,9 +300,13 @@ impl SyncTransport for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse pull response: {e}"),
-        })?;
+        // A decode failure here is almost always a truncated body from a mid-flight
+        // network drop — not a malformed payload from the relay. Route it through
+        // the same classifier as the original send error so it lands as Network
+        // (transient, retryable) instead of Protocol (hard error). The next sync
+        // cycle re-pulls cleanly and the user never sees a spurious failure.
+        let json: serde_json::Value =
+            resp.json().await.map_err(Self::classify_reqwest_error)?;
 
         let max_server_seq = json["max_server_seq"].as_i64().unwrap_or(0);
         let min_acked_seq = json["min_acked_seq"].as_i64();

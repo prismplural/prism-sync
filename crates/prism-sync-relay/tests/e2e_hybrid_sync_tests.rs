@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use common::*;
@@ -20,8 +20,10 @@ use reqwest::Client;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
 use prism_sync_core::relay::ServerRelay;
-use prism_sync_core::schema::{SyncFieldDef, SyncSchema, SyncType, SyncValue};
-use prism_sync_core::storage::{DeviceRecord, FieldVersion, RusqliteSyncStorage, SyncStorage};
+use prism_sync_core::schema::{encode_value, SyncFieldDef, SyncSchema, SyncType, SyncValue};
+use prism_sync_core::storage::{
+    DeviceRecord, FieldVersion, PendingOp, RusqliteSyncStorage, SyncStorage,
+};
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{batch_signature, sync_aad, CrdtChange, Hlc, SyncMetadata};
 use prism_sync_crypto::KeyHierarchy;
@@ -64,6 +66,87 @@ impl SyncableEntity for MockTaskEntity {
             ]
         });
         &FIELDS
+    }
+
+    async fn read_row(
+        &self,
+        entity_id: &str,
+    ) -> prism_sync_core::Result<Option<HashMap<String, SyncValue>>> {
+        Ok(self.rows.lock().unwrap().get(entity_id).cloned())
+    }
+
+    async fn write_fields(
+        &self,
+        entity_id: &str,
+        fields: &HashMap<String, SyncValue>,
+        _hlc: &str,
+        _is_new: bool,
+    ) -> prism_sync_core::Result<()> {
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows.entry(entity_id.to_string()).or_default();
+        for (k, v) in fields {
+            row.insert(k.clone(), v.clone());
+        }
+        Ok(())
+    }
+
+    async fn soft_delete(&self, entity_id: &str, _hlc: &str) -> prism_sync_core::Result<()> {
+        self.deleted.lock().unwrap().insert(entity_id.to_string(), true);
+        Ok(())
+    }
+
+    async fn is_deleted(&self, entity_id: &str) -> prism_sync_core::Result<bool> {
+        Ok(self.deleted.lock().unwrap().get(entity_id).copied().unwrap_or(false))
+    }
+
+    async fn hard_delete(&self, entity_id: &str) -> prism_sync_core::Result<()> {
+        self.rows.lock().unwrap().remove(entity_id);
+        self.deleted.lock().unwrap().remove(entity_id);
+        Ok(())
+    }
+
+    async fn begin_batch(&self) -> prism_sync_core::Result<()> {
+        Ok(())
+    }
+    async fn commit_batch(&self) -> prism_sync_core::Result<()> {
+        Ok(())
+    }
+    async fn rollback_batch(&self) -> prism_sync_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Dynamic test entity used for app-schema probes.
+struct CapturingEntity {
+    table_name: String,
+    fields: Vec<SyncFieldDef>,
+    rows: Mutex<HashMap<String, HashMap<String, SyncValue>>>,
+    deleted: Mutex<HashMap<String, bool>>,
+}
+
+impl CapturingEntity {
+    fn new(table_name: String, fields: Vec<SyncFieldDef>) -> Self {
+        Self {
+            table_name,
+            fields,
+            rows: Mutex::new(HashMap::new()),
+            deleted: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get_field(&self, entity_id: &str, field: &str) -> Option<SyncValue> {
+        self.rows.lock().unwrap().get(entity_id).and_then(|row| row.get(field).cloned())
+    }
+}
+
+#[async_trait::async_trait]
+impl SyncableEntity for CapturingEntity {
+    fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    fn field_definitions(&self) -> &[SyncFieldDef] {
+        &self.fields
     }
 
     async fn read_row(
@@ -309,6 +392,103 @@ fn create_task_ops(
     tx.commit().unwrap();
 }
 
+#[derive(Clone)]
+struct TypeProbe {
+    type_name: String,
+    table: String,
+    field: String,
+    entity_id: String,
+    expected: SyncValue,
+}
+
+fn app_sync_schema_json() -> Option<String> {
+    let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../app");
+    if !app_dir.exists() {
+        return None;
+    }
+    let path = app_dir.join("lib/core/sync/sync_schema.dart");
+    let source = std::fs::read_to_string(path).expect("failed to read app sync schema");
+
+    let marker = "const String prismSyncSchema = '''";
+    let start = source.find(marker).expect("prismSyncSchema const should exist") + marker.len();
+    let rest = &source[start..];
+    let end = rest.find("''';").expect("prismSyncSchema const should be closed");
+    Some(rest[..end].trim().to_string())
+}
+
+fn type_probe_value(type_name: &str) -> SyncValue {
+    match type_name {
+        "String" => SyncValue::String("schema-probe".to_string()),
+        "Int" => SyncValue::Int(42),
+        "Real" => SyncValue::Real(7.25),
+        "Bool" => SyncValue::Bool(true),
+        "DateTime" => {
+            let dt = "2026-04-27T12:34:56.789Z".parse().unwrap();
+            SyncValue::DateTime(dt)
+        }
+        "Blob" => SyncValue::Blob(vec![0x00, 0x01, 0x7F, 0x80, 0xFF]),
+        other => panic!("app schema uses unsupported SyncType {other:?}; add a probe value"),
+    }
+}
+
+fn app_schema_type_probes(schema_json: &str) -> Vec<TypeProbe> {
+    let value: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+    let entities = value["entities"].as_object().expect("schema entities object");
+    let mut by_type = BTreeMap::<String, TypeProbe>::new();
+
+    for (table, entity) in entities {
+        let fields = entity["fields"].as_object().expect("schema fields object");
+        for (field, field_type) in fields {
+            let type_name = field_type.as_str().expect("field type string");
+            by_type.entry(type_name.to_string()).or_insert_with(|| {
+                let expected = type_probe_value(type_name);
+                TypeProbe {
+                    type_name: type_name.to_string(),
+                    table: table.clone(),
+                    field: field.clone(),
+                    entity_id: format!("app-schema-type-probe-{}", type_name.to_lowercase()),
+                    expected,
+                }
+            });
+        }
+    }
+
+    by_type.into_values().collect()
+}
+
+fn create_app_schema_type_probe_ops(
+    storage: &RusqliteSyncStorage,
+    sync_id: &str,
+    device_id: &str,
+    probes: &[TypeProbe],
+    batch_id: &str,
+) {
+    let hlc = Hlc::now(device_id, None);
+    let mut tx = storage.begin_tx().unwrap();
+    for probe in probes {
+        tx.insert_pending_op(&PendingOp {
+            op_id: format!(
+                "{}:{}:{}:{}:{}",
+                probe.table, probe.entity_id, probe.field, hlc, device_id
+            ),
+            sync_id: sync_id.to_string(),
+            epoch: 0,
+            device_id: device_id.to_string(),
+            local_batch_id: batch_id.to_string(),
+            entity_table: probe.table.clone(),
+            entity_id: probe.entity_id.clone(),
+            field_name: probe.field.clone(),
+            encoded_value: encode_value(&probe.expected),
+            is_delete: false,
+            client_hlc: hlc.to_string(),
+            created_at: chrono::Utc::now(),
+            pushed_at: None,
+        })
+        .unwrap();
+    }
+    tx.commit().unwrap();
+}
+
 /// Create a ServerRelay for a device. Requires the relay URL (as http://localhost:{port}).
 fn make_server_relay(
     base_url: &str,
@@ -461,6 +641,135 @@ async fn e2e_hybrid_batch_push_pull_cross_device() {
     assert_eq!(entity_a.row_count(), 1, "A should have 1 remote task from B");
     // entity_b has task-1 from A (merged via pull)
     assert_eq!(entity_b.row_count(), 1, "B should have 1 remote task from A");
+}
+
+#[tokio::test]
+async fn e2e_app_schema_declared_types_round_trip_through_real_relay() {
+    let Some(schema_json) = app_sync_schema_json() else {
+        eprintln!("skipping app-schema type probe; app sync schema is not present");
+        return;
+    };
+    let schema = SyncSchema::from_json(&schema_json).expect("app sync schema should parse");
+    let probes = app_schema_type_probes(&schema_json);
+    assert!(!probes.is_empty(), "app sync schema should declare at least one field type");
+
+    let (url, _server, _db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let device_b_id = generate_device_id();
+    let keys_b = TestDeviceKeys::generate(&device_b_id);
+    let token_b = register_joiner_device(
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
+        vec![
+            registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
+            registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
+        ],
+    )
+    .await;
+
+    let tables: BTreeMap<String, Vec<SyncFieldDef>> = probes
+        .iter()
+        .map(|probe| {
+            let fields = schema
+                .entity(&probe.table)
+                .unwrap_or_else(|| panic!("schema should contain table {}", probe.table))
+                .fields
+                .clone();
+            (probe.table.clone(), fields)
+        })
+        .collect();
+
+    let make_entities =
+        || -> (Vec<Arc<dyn SyncableEntity>>, HashMap<String, Arc<CapturingEntity>>) {
+            let mut trait_objects = Vec::<Arc<dyn SyncableEntity>>::new();
+            let mut by_table = HashMap::<String, Arc<CapturingEntity>>::new();
+            for (table, fields) in &tables {
+                let entity = Arc::new(CapturingEntity::new(table.clone(), fields.clone()));
+                trait_objects.push(entity.clone() as Arc<dyn SyncableEntity>);
+                by_table.insert(table.clone(), entity);
+            }
+            (trait_objects, by_table)
+        };
+
+    let kh = shared_key_hierarchy();
+
+    let storage_a = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage_a, &sync_id, &device_a_id);
+    register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_a, &sync_id, &device_b_id, &keys_b);
+    create_app_schema_type_probe_ops(
+        &storage_a,
+        &sync_id,
+        &device_a_id,
+        &probes,
+        "batch-app-schema-type-probes",
+    );
+    let (entities_a, _) = make_entities();
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
+    let engine_a = SyncEngine::new(
+        storage_a.clone(),
+        relay_a,
+        entities_a,
+        schema.clone(),
+        SyncConfig::default(),
+    );
+    let ml_dsa_a = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
+
+    let result_a = engine_a
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(result_a.error.is_none(), "Device A push failed: {:?}", result_a.error);
+    assert_eq!(result_a.pushed, 1, "expected one app-schema type probe batch");
+
+    let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage_b, &sync_id, &device_b_id);
+    register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
+    let (entities_b, entity_b_by_table) = make_entities();
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
+    let engine_b = SyncEngine::new(storage_b, relay_b, entities_b, schema, SyncConfig::default());
+    let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
+
+    let result_b = engine_b
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
+        .await
+        .unwrap();
+    assert!(result_b.error.is_none(), "Device B pull failed: {:?}", result_b.error);
+    assert_eq!(result_b.pulled, 1, "expected one app-schema type probe batch pulled");
+    assert_eq!(
+        result_b.merged,
+        probes.len() as u64,
+        "expected every probed app schema type to merge"
+    );
+
+    for probe in &probes {
+        let entity = entity_b_by_table
+            .get(&probe.table)
+            .unwrap_or_else(|| panic!("missing capture entity for {}", probe.table));
+        assert_eq!(
+            entity.get_field(&probe.entity_id, &probe.field),
+            Some(probe.expected.clone()),
+            "app schema type {} should round-trip through relay via {}.{}",
+            probe.type_name,
+            probe.table,
+            probe.field
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -162,8 +162,13 @@ impl PairingService {
         let signed_invitation_hex = hex::encode(&invitation_wire);
 
         // 7. Build signed registry snapshot (typed, verifiable device records)
-        // registry_version 0 is used for first-device bootstrap (no relay version yet).
-        let registry_snapshot = SignedRegistrySnapshot::new(
+        // First-device bootstrap signs at the new floor with an explicit
+        // commitment to epoch 0 so the registry is anchored to the local
+        // epoch ratchet from inception. See Phase 3 prerequisite in
+        // docs/plans/sync-pairing-reset-hardening.md.
+        let registry_version = SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+        let epoch_key_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
             vec![RegistrySnapshotEntry {
                 sync_id: sync_id.clone(),
                 device_id: device_id.clone(),
@@ -175,7 +180,9 @@ impl PairingService {
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             }],
+            registry_version,
             0,
+            epoch_key_hashes,
         );
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
@@ -614,9 +621,22 @@ impl PairingService {
             ml_dsa_key_generation: 0,
         });
 
-        // registry_version 0 is a placeholder; relay-tracked versioning will be
-        // bound into the snapshot in a future protocol update.
-        let registry_snapshot = SignedRegistrySnapshot::new(snapshot_entries, 0);
+        // Bind the local epoch ratchet into the signed registry: the
+        // initiator commits to the epoch it believes itself to be in and to a
+        // hash of every epoch key it currently holds. Joiners and (in later
+        // phases) reconciliation paths use this to detect a malicious relay
+        // that fabricates registry/epoch state. registry_version stays at the
+        // current floor here — the in-tree relay-driven version progression
+        // happens via the FFI rotate_ml_dsa path, which carries its own
+        // monotonic counter.
+        let registry_version = SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+        let epoch_key_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            snapshot_entries,
+            registry_version,
+            current_epoch,
+            epoch_key_hashes,
+        );
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
         // V3 hybrid registry approval signature (labeled WNS)
@@ -773,6 +793,24 @@ impl PairingService {
         let device_secret = DeviceSecret::from_bytes(secret_bytes).map_err(CoreError::Crypto)?;
         Ok(Some((device_secret, device_id)))
     }
+}
+
+/// Build the per-epoch commitment map carried in
+/// [`SignedRegistrySnapshot::epoch_key_hashes`] from every epoch key the
+/// local key hierarchy currently holds.
+///
+/// Anchors the signed registry to the device's local epoch ratchet so a
+/// malicious relay cannot fabricate registry/epoch state during pairing
+/// reconciliation.
+fn build_epoch_key_hashes(
+    key_hierarchy: &KeyHierarchy,
+) -> Result<std::collections::BTreeMap<u32, [u8; 32]>> {
+    let entries = key_hierarchy.epoch_keys_iter().map_err(CoreError::Crypto)?;
+    let mut out = std::collections::BTreeMap::new();
+    for (epoch, key) in entries {
+        out.insert(epoch, compute_epoch_key_hash(key));
+    }
+    Ok(out)
 }
 
 /// Verify a hybrid invitation signature.
