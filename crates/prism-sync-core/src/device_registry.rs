@@ -8,6 +8,7 @@
 //! the pinned keys, raising an error on mismatch (TOFU model).
 
 use crate::error::{CoreError, Result};
+use crate::pairing::{SignedRegistrySnapshot, SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING};
 use crate::storage::{DeviceRecord, StorageError, SyncStorage};
 use prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof;
 
@@ -288,135 +289,19 @@ impl DeviceRegistryManager {
         artifact_blob: &[u8],
         last_imported_version: Option<i64>,
     ) -> Result<i64> {
-        use prism_sync_crypto::pq::HybridSignature;
-
-        // 1. Check version byte
-        let Some((&version, remaining)) = artifact_blob.split_first() else {
-            return Err(CoreError::Engine("signed registry artifact is empty".into()));
-        };
-        if version != 0x03 {
-            return Err(CoreError::Engine(format!(
-                "unsupported registry artifact version: 0x{version:02x}, expected 0x03"
-            )));
-        }
-
-        // 2. Parse the hybrid signature to find where JSON starts
-        if remaining.len() < 8 {
-            return Err(CoreError::Engine("signed registry artifact too short".into()));
-        }
-        let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap()) as usize;
-        if remaining.len() < 4 + ed_len + 4 {
-            return Err(CoreError::Engine("signed registry artifact truncated (ed25519)".into()));
-        }
-        let ml_len_offset = 4 + ed_len;
-        let ml_len =
-            u32::from_le_bytes(remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap())
-                as usize;
-        let signature_len = ml_len_offset + 4 + ml_len;
-        if remaining.len() <= signature_len {
-            return Err(CoreError::Engine("signed registry artifact missing JSON payload".into()));
-        }
-
-        let signature = HybridSignature::from_bytes(&remaining[..signature_len]).map_err(|e| {
-            CoreError::Engine(format!("invalid hybrid signature in registry artifact: {e}"))
-        })?;
-        let json_bytes = &remaining[signature_len..];
-
-        // 3. Build signing data (same domain as relay's verification)
-        let mut signing_data =
-            Vec::with_capacity(b"PRISM_SYNC_REGISTRY_V3\x00".len() + json_bytes.len());
-        signing_data.extend_from_slice(b"PRISM_SYNC_REGISTRY_V3\x00");
-        signing_data.extend_from_slice(json_bytes);
-
-        // 4. Try to verify against any locally known device's keys
-        let local_devices = storage.list_device_records(sync_id)?;
-        let mut signer_device_id: Option<String> = None;
-        for device in &local_devices {
-            if device.status == "revoked" {
-                continue; // skip revoked devices — they retain their keys but must not sign
-            }
-            if device.ed25519_public_key.len() != 32 || device.ml_dsa_65_public_key.is_empty() {
-                continue;
-            }
-            let ed_pk: [u8; 32] = device.ed25519_public_key.clone().try_into().unwrap();
-            if signature
-                .verify_v3(
-                    &signing_data,
-                    b"registry_snapshot",
-                    &ed_pk,
-                    &device.ml_dsa_65_public_key,
-                )
-                .is_ok()
-            {
-                signer_device_id = Some(device.device_id.clone());
-                break;
-            }
-        }
-
-        if signer_device_id.is_none() {
-            return Err(CoreError::Engine(
-                "registry artifact signature could not be verified against any known device".into(),
-            ));
-        }
-
-        // 5. Parse and import device entries
-        // The JSON entries use byte arrays (not hex) for public keys
-        #[derive(serde::Deserialize)]
-        struct RegistryEntry {
-            sync_id: String,
-            device_id: String,
-            ed25519_public_key: Vec<u8>,
-            x25519_public_key: Vec<u8>,
-            #[serde(default)]
-            ml_dsa_65_public_key: Vec<u8>,
-            #[serde(default)]
-            ml_kem_768_public_key: Vec<u8>,
-            #[serde(default)]
-            x_wing_public_key: Vec<u8>,
-            status: String,
-            #[serde(default)]
-            ml_dsa_key_generation: u32,
-        }
-
-        // V3 format wraps entries in {"registry_version": N, "entries": [...]}
-        #[derive(serde::Deserialize)]
-        struct RegistryWrapper {
-            registry_version: i64,
-            entries: Vec<RegistryEntry>,
-        }
-
-        let wrapper: RegistryWrapper = serde_json::from_slice(json_bytes)
-            .map_err(|e| CoreError::Engine(format!("invalid registry artifact JSON: {e}")))?;
+        let snapshot = Self::verify_signed_registry_snapshot(storage, sync_id, artifact_blob)?;
 
         // 4a. Monotonicity check — reject stale or replayed artifacts
-        if wrapper.registry_version <= last_imported_version.unwrap_or(-1) {
+        if snapshot.registry_version <= last_imported_version.unwrap_or(-1) {
             return Err(CoreError::Engine(format!(
                 "stale registry artifact: version {} <= last imported {}",
-                wrapper.registry_version,
+                snapshot.registry_version,
                 last_imported_version.unwrap_or(-1)
             )));
         }
 
-        let signed_version = wrapper.registry_version;
-        let entries = wrapper.entries;
-
-        // 5a. Require signer to appear and be non-revoked in their own snapshot.
-        //     This catches self-contradictory snapshots and closes the revocation
-        //     window between when we skip the key above and what the payload says.
-        let signer_id = signer_device_id.unwrap(); // safe: checked above (is_none returned)
-        match entries.iter().find(|e| e.device_id == signer_id) {
-            None => {
-                return Err(CoreError::Engine(
-                    "registry signer not present in own snapshot".into(),
-                ));
-            }
-            Some(entry) if entry.status == "revoked" => {
-                return Err(CoreError::Engine(
-                    "registry signed by device that marks itself as revoked".into(),
-                ));
-            }
-            _ => {} // signer is present and not revoked — proceed
-        }
+        let signed_version = snapshot.registry_version;
+        let entries = snapshot.entries;
 
         let device_records: Vec<DeviceRecord> = entries
             .into_iter()
@@ -442,6 +327,67 @@ impl DeviceRegistryManager {
         Self::import_keyring(storage, sync_id, &device_records)?;
 
         Ok(signed_version)
+    }
+
+    /// Verify a signed registry artifact against any locally known active
+    /// device and return the decoded snapshot without importing it.
+    pub fn verify_signed_registry_snapshot(
+        storage: &dyn SyncStorage,
+        sync_id: &str,
+        artifact_blob: &[u8],
+    ) -> Result<SignedRegistrySnapshot> {
+        let local_devices = storage.list_device_records(sync_id)?;
+        let mut last_error: Option<String> = None;
+
+        for device in &local_devices {
+            if device.status == "revoked" {
+                continue;
+            }
+            if device.ed25519_public_key.len() != 32 || device.ml_dsa_65_public_key.is_empty() {
+                continue;
+            }
+            let ed_pk: [u8; 32] = device.ed25519_public_key.clone().try_into().unwrap();
+            match SignedRegistrySnapshot::verify_and_decode_hybrid(
+                artifact_blob,
+                &ed_pk,
+                &device.ml_dsa_65_public_key,
+            ) {
+                Ok(snapshot) => {
+                    match snapshot.entries.iter().find(|e| e.device_id == device.device_id) {
+                        None => {
+                            return Err(CoreError::Engine(
+                                "registry signer not present in own snapshot".into(),
+                            ));
+                        }
+                        Some(entry) if entry.status == "revoked" => {
+                            return Err(CoreError::Engine(
+                                "registry signed by device that marks itself as revoked".into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    if snapshot.registry_version < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING {
+                        tracing::warn!(
+                            registry_version = snapshot.registry_version,
+                            "deprecated: signed registry artifact lacks current_epoch / epoch_key_hashes binding (registry_version < {})",
+                            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING
+                        );
+                    }
+                    return Ok(snapshot);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(CoreError::Engine(match last_error {
+            Some(e) => format!(
+                "registry artifact signature could not be verified against any known device: {e}"
+            ),
+            None => "registry artifact signature could not be verified against any known device"
+                .to_string(),
+        }))
     }
 }
 

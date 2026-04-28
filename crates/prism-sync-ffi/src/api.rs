@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -16,7 +16,9 @@ use prism_sync_core::bootstrap::{
 };
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::service::PairingService;
-use prism_sync_core::pairing::{RegistrySnapshotEntry, SignedRegistrySnapshot};
+use prism_sync_core::pairing::{
+    compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
+};
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
 use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
@@ -2584,11 +2586,9 @@ pub async fn clear_sync_state(
         if !force_active {
             if let Some(active) = inner.sync_service().sync_id() {
                 if active == sync_id {
-                    return Err(
-                        "refusing to clear_sync_state for the active sync_id; pass \
+                    return Err("refusing to clear_sync_state for the active sync_id; pass \
                          force_active=true if intentional"
-                            .into(),
-                    );
+                        .into());
                 }
             }
         }
@@ -3818,6 +3818,16 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             .map_err(|e| e.to_string())?
             .and_then(|meta| meta.last_imported_registry_version)
     };
+    let current_epoch = {
+        let sid = sync_id.clone();
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .map(|meta| meta.current_epoch.max(0) as u32)
+            .unwrap_or(0)
+    };
     let relay_registry_version =
         relay.get_signed_registry().await.ok().flatten().map(|response| response.registry_version);
     let next_registry_version = next_registry_snapshot_version(
@@ -3845,8 +3855,15 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     // Sign with the OLD ML-DSA key — that's the key peers have pinned.
     // Include the NEW ML-DSA key for the rotating device in the snapshot.
     let signed_snapshot = {
-        let inner = handle.inner.lock().await;
-        let storage = inner.storage().clone();
+        let (storage, epoch_key_hashes) = {
+            let inner = handle.inner.lock().await;
+            (inner.storage().clone(), build_epoch_key_hashes_for_registry(inner.key_hierarchy())?)
+        };
+        if !epoch_key_hashes.contains_key(&current_epoch) {
+            return Err(format!(
+                "signed registry epoch_key_hashes missing current_epoch {current_epoch}"
+            ));
+        }
         let sid = sync_id.clone();
         let did = device_id.clone();
         let new_pk_for_snapshot = new_pk.clone();
@@ -3880,7 +3897,12 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             })
             .collect();
 
-        let snapshot = SignedRegistrySnapshot::new(entries, next_registry_version);
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            next_registry_version,
+            current_epoch,
+            epoch_key_hashes,
+        );
 
         // Sign with Ed25519 (unchanged) + OLD ML-DSA key (what peers have pinned)
         let ed25519_key = device_secret
@@ -4171,6 +4193,19 @@ fn next_registry_snapshot_version(
         + 1
 }
 
+fn build_epoch_key_hashes_for_registry(
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+) -> Result<BTreeMap<u32, [u8; 32]>, String> {
+    let entries = key_hierarchy
+        .epoch_keys_iter()
+        .map_err(|e| format!("failed to enumerate epoch keys for signed registry: {e}"))?;
+    let mut epoch_key_hashes = BTreeMap::new();
+    for (epoch, key) in entries {
+        epoch_key_hashes.insert(epoch, compute_epoch_key_hash(key));
+    }
+    Ok(epoch_key_hashes)
+}
+
 /// Get the current ML-DSA key generation for this device.
 ///
 /// Returns the generation number (0 for initial key, increments on each rotation).
@@ -4322,11 +4357,13 @@ mod tests {
         new_generation: u32,
         registry_version: i64,
     ) -> Vec<u8> {
+        let mut epoch_key_hashes = BTreeMap::new();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&[0x42; 32]));
         let ed25519_key = device_secret.ed25519_keypair(device_id).unwrap();
         let old_ml_dsa_key =
             device_secret.ml_dsa_65_keypair_v(device_id, new_generation - 1).unwrap();
         let new_record = make_device_record(sync_id, device_id, device_secret, new_generation);
-        SignedRegistrySnapshot::new(
+        SignedRegistrySnapshot::new_with_epoch_binding(
             vec![RegistrySnapshotEntry {
                 sync_id: sync_id.to_string(),
                 device_id: device_id.to_string(),
@@ -4339,6 +4376,8 @@ mod tests {
                 ml_dsa_key_generation: new_generation,
             }],
             registry_version,
+            0,
+            epoch_key_hashes,
         )
         .sign_hybrid(&ed25519_key, &old_ml_dsa_key)
     }
@@ -4634,7 +4673,11 @@ mod tests {
 
     // ── Phase 1C: clear_sync_state FFI ──
 
-    fn make_pending_op(sync_id: &str, op_id: &str, batch_id: &str) -> prism_sync_core::storage::PendingOp {
+    fn make_pending_op(
+        sync_id: &str,
+        op_id: &str,
+        batch_id: &str,
+    ) -> prism_sync_core::storage::PendingOp {
         prism_sync_core::storage::PendingOp {
             op_id: op_id.to_string(),
             sync_id: sync_id.to_string(),

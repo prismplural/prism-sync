@@ -14,12 +14,15 @@
 //! Total: ~1193 bytes
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{CoreError, Result};
+use crate::pairing::compute_epoch_key_hash;
+use crate::recovery::{persist_epoch_cache, persist_epoch_key};
 use crate::relay::SyncRelay;
+use crate::secure_store::SecureStore;
 use crate::storage::StorageError;
-use prism_sync_crypto::{DeviceXWingKey, KeyHierarchy};
+use prism_sync_crypto::{DeviceSecret, DeviceXWingKey, KeyHierarchy};
 use zeroize::Zeroizing;
 
 /// X-Wing ciphertext size in bytes.
@@ -88,6 +91,13 @@ pub(crate) fn decapsulate_and_decrypt_artifact(
 
 /// Stateless helper for epoch rotation operations.
 pub struct EpochManager;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochCatchUpResult {
+    pub start_epoch: u32,
+    pub relay_epoch: u32,
+    pub recovered_through: u32,
+}
 
 impl EpochManager {
     /// Handle an epoch rotation event: fetch the new epoch key from the relay,
@@ -210,16 +220,164 @@ impl EpochManager {
     pub async fn post_rekey(
         relay: &dyn SyncRelay,
         key_hierarchy: &mut KeyHierarchy,
+        device_id: &str,
         new_epoch: u32,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let (epoch_key, wrapped_keys) = Self::prepare_wrapped_keys(relay, new_epoch, None).await?;
 
-        key_hierarchy.store_epoch_key(new_epoch, Zeroizing::new(epoch_key.to_vec()));
-        relay.post_rekey_artifacts(new_epoch as i32, wrapped_keys).await.map_err(|e| {
-            CoreError::Storage(StorageError::Logic(format!("failed to post rekey artifacts: {e}")))
-        })?;
+        let committed_epoch = match relay.post_rekey_artifacts(new_epoch as i32, wrapped_keys).await
+        {
+            Ok(epoch) if epoch == new_epoch as i32 => new_epoch,
+            Ok(epoch) => {
+                return Err(CoreError::Storage(StorageError::Logic(format!(
+                    "relay committed unexpected rekey epoch {epoch}, expected {new_epoch}"
+                ))));
+            }
+            Err(relay_error) => {
+                let error = CoreError::from_relay(relay_error);
+                if !error.is_retryable() {
+                    return Err(error);
+                }
+                if !Self::reconcile_post_rekey_commit(relay, device_id, new_epoch).await {
+                    return Err(error);
+                }
+
+                tracing::info!(
+                    device_id = %device_id,
+                    epoch = new_epoch,
+                    "post_rekey: reconciled ambiguous relay failure after remote commit"
+                );
+                new_epoch
+            }
+        };
+
+        key_hierarchy.store_epoch_key(committed_epoch, Zeroizing::new(epoch_key.to_vec()));
 
         Ok(epoch_key)
+    }
+
+    pub async fn catch_up_epoch_keys(
+        relay: &dyn SyncRelay,
+        key_hierarchy: &mut KeyHierarchy,
+        secure_store: &dyn SecureStore,
+        device_secret: &DeviceSecret,
+        device_id: &str,
+        local_epoch: u32,
+        relay_epoch: u32,
+        epoch_key_hashes: &BTreeMap<u32, [u8; 32]>,
+    ) -> Result<EpochCatchUpResult> {
+        let mut recovered_through = local_epoch;
+        if relay_epoch <= local_epoch {
+            return Ok(EpochCatchUpResult {
+                start_epoch: local_epoch,
+                relay_epoch,
+                recovered_through,
+            });
+        }
+
+        let xwing = device_secret.xwing_keypair(device_id)?;
+
+        for epoch in local_epoch.saturating_add(1)..=relay_epoch {
+            let expected_hash = epoch_key_hashes.get(&epoch).ok_or_else(|| {
+                CoreError::Engine(format!(
+                    "signed registry missing epoch_key_hash for epoch {epoch}"
+                ))
+            })?;
+
+            let key_bytes = if key_hierarchy.has_epoch_key(epoch) {
+                Zeroizing::new(key_hierarchy.epoch_key(epoch)?.to_vec())
+            } else {
+                let artifact =
+                    relay.get_rekey_artifact(epoch as i32, device_id).await?.ok_or_else(|| {
+                        CoreError::Storage(StorageError::Logic(format!(
+                            "no rekey artifact for epoch {epoch}"
+                        )))
+                    })?;
+                decapsulate_and_decrypt_artifact(&artifact, &xwing, epoch, device_id)?
+            };
+
+            let key_array: [u8; 32] = key_bytes.as_slice().try_into().map_err(|_| {
+                CoreError::Crypto(prism_sync_crypto::CryptoError::InvalidKeyMaterial(format!(
+                    "epoch {epoch} key has unexpected length {}",
+                    key_bytes.len()
+                )))
+            })?;
+            let actual_hash = compute_epoch_key_hash(&key_array);
+            if actual_hash != *expected_hash {
+                return Err(CoreError::Engine(format!(
+                    "epoch key hash mismatch for epoch {epoch}"
+                )));
+            }
+
+            persist_epoch_key(secure_store, epoch, &key_array)?;
+            if !key_hierarchy.has_epoch_key(epoch) {
+                key_hierarchy.store_epoch_key(epoch, Zeroizing::new(key_array.to_vec()));
+            }
+            persist_epoch_cache(secure_store, epoch as i32)?;
+            recovered_through = epoch;
+        }
+
+        Ok(EpochCatchUpResult { start_epoch: local_epoch, relay_epoch, recovered_through })
+    }
+
+    async fn reconcile_post_rekey_commit(
+        relay: &dyn SyncRelay,
+        device_id: &str,
+        expected_epoch: u32,
+    ) -> bool {
+        let devices = match relay.list_devices().await {
+            Ok(devices) => devices,
+            Err(error) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    epoch = expected_epoch,
+                    error = %error,
+                    "post_rekey: reconciliation failed to list devices"
+                );
+                return false;
+            }
+        };
+
+        let Some(self_device) = devices.iter().find(|device| device.device_id == device_id) else {
+            tracing::warn!(
+                device_id = %device_id,
+                epoch = expected_epoch,
+                "post_rekey: reconciliation could not find local device in relay registry"
+            );
+            return false;
+        };
+
+        if self_device.status != "active" || self_device.epoch != expected_epoch as i32 {
+            tracing::info!(
+                device_id = %device_id,
+                epoch = expected_epoch,
+                relay_status = %self_device.status,
+                relay_epoch = self_device.epoch,
+                "post_rekey: reconciliation did not prove local device advanced"
+            );
+            return false;
+        }
+
+        match relay.get_rekey_artifact(expected_epoch as i32, device_id).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::info!(
+                    device_id = %device_id,
+                    epoch = expected_epoch,
+                    "post_rekey: reconciliation found no local rekey artifact"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    epoch = expected_epoch,
+                    error = %error,
+                    "post_rekey: reconciliation failed to fetch local rekey artifact"
+                );
+                false
+            }
+        }
     }
 
     /// Generate a new sync_id: 32 random bytes, hex-encoded (64 chars).
@@ -251,6 +409,7 @@ mod tests {
     // Integration tests for handle_rotation and post_rekey using mock relay.
 
     use crate::relay::traits::*;
+    use crate::secure_store::SecureStore;
     use async_trait::async_trait;
     use futures_util::Stream;
     use prism_sync_crypto::DeviceSecret;
@@ -258,20 +417,101 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
 
+    #[derive(Clone, Copy)]
+    enum PostRekeyBehavior {
+        Success,
+        CommitThenNetworkError,
+        NetworkErrorBeforeCommit,
+        AdvanceWithoutArtifactThenNetworkError,
+    }
+
     struct MockRelay {
         artifact: Option<Vec<u8>>,
-        devices: Vec<DeviceInfo>,
+        devices: Mutex<Vec<DeviceInfo>>,
+        artifacts: Mutex<HashMap<(i32, String), Vec<u8>>>,
+        artifact_error_epoch: Mutex<Option<i32>>,
         #[allow(clippy::type_complexity)]
         posted_artifacts: Mutex<Option<(i32, HashMap<String, Vec<u8>>)>>,
+        post_rekey_behavior: PostRekeyBehavior,
     }
 
     impl MockRelay {
         fn new_with_artifact(artifact: Option<Vec<u8>>) -> Self {
-            Self { artifact, devices: Vec::new(), posted_artifacts: Mutex::new(None) }
+            Self {
+                artifact,
+                devices: Mutex::new(Vec::new()),
+                artifacts: Mutex::new(HashMap::new()),
+                artifact_error_epoch: Mutex::new(None),
+                posted_artifacts: Mutex::new(None),
+                post_rekey_behavior: PostRekeyBehavior::Success,
+            }
         }
 
         fn new_with_devices(devices: Vec<DeviceInfo>) -> Self {
-            Self { artifact: None, devices, posted_artifacts: Mutex::new(None) }
+            Self::new_with_devices_and_behavior(devices, PostRekeyBehavior::Success)
+        }
+
+        fn new_with_devices_and_behavior(
+            devices: Vec<DeviceInfo>,
+            post_rekey_behavior: PostRekeyBehavior,
+        ) -> Self {
+            Self {
+                artifact: None,
+                devices: Mutex::new(devices),
+                artifacts: Mutex::new(HashMap::new()),
+                artifact_error_epoch: Mutex::new(None),
+                posted_artifacts: Mutex::new(None),
+                post_rekey_behavior,
+            }
+        }
+
+        fn advance_active_devices(&self, epoch: i32) {
+            for device in self.devices.lock().unwrap().iter_mut() {
+                if device.status == "active" {
+                    device.epoch = epoch;
+                }
+            }
+        }
+
+        fn commit_rekey(&self, epoch: i32, keys: HashMap<String, Vec<u8>>) {
+            self.advance_active_devices(epoch);
+            let mut artifacts = self.artifacts.lock().unwrap();
+            for (device_id, artifact) in keys {
+                artifacts.insert((epoch, device_id), artifact);
+            }
+        }
+
+        fn insert_artifact(&self, epoch: i32, device_id: &str, artifact: Vec<u8>) {
+            self.artifacts.lock().unwrap().insert((epoch, device_id.to_string()), artifact);
+        }
+
+        fn set_artifact_error_epoch(&self, epoch: i32) {
+            *self.artifact_error_epoch.lock().unwrap() = Some(epoch);
+        }
+
+        fn lost_response_error() -> RelayError {
+            RelayError::Network { message: "response lost after commit".to_string() }
+        }
+    }
+
+    #[derive(Default)]
+    struct MemStore(Mutex<HashMap<String, Vec<u8>>>);
+
+    impl SecureStore for MemStore {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        fn set(&self, key: &str, value: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
+        fn clear(&self) -> Result<()> {
+            self.0.lock().unwrap().clear();
+            Ok(())
         }
     }
 
@@ -313,7 +553,7 @@ mod tests {
             })
         }
         async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
-            Ok(self.devices.clone())
+            Ok(self.devices.lock().unwrap().clone())
         }
         async fn revoke_device(
             &self,
@@ -351,15 +591,40 @@ mod tests {
             epoch: i32,
             keys: HashMap<String, Vec<u8>>,
         ) -> std::result::Result<i32, RelayError> {
-            *self.posted_artifacts.lock().unwrap() = Some((epoch, keys));
-            Ok(epoch)
+            *self.posted_artifacts.lock().unwrap() = Some((epoch, keys.clone()));
+            match self.post_rekey_behavior {
+                PostRekeyBehavior::Success => {
+                    self.commit_rekey(epoch, keys);
+                    Ok(epoch)
+                }
+                PostRekeyBehavior::CommitThenNetworkError => {
+                    self.commit_rekey(epoch, keys);
+                    Err(Self::lost_response_error())
+                }
+                PostRekeyBehavior::NetworkErrorBeforeCommit => Err(Self::lost_response_error()),
+                PostRekeyBehavior::AdvanceWithoutArtifactThenNetworkError => {
+                    self.advance_active_devices(epoch);
+                    Err(Self::lost_response_error())
+                }
+            }
         }
         async fn get_rekey_artifact(
             &self,
-            _epoch: i32,
-            _device_id: &str,
+            epoch: i32,
+            device_id: &str,
         ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
-            Ok(self.artifact.clone())
+            if *self.artifact_error_epoch.lock().unwrap() == Some(epoch) {
+                return Err(RelayError::Network {
+                    message: format!("artifact fetch failed for epoch {epoch}"),
+                });
+            }
+            Ok(self
+                .artifacts
+                .lock()
+                .unwrap()
+                .get(&(epoch, device_id.to_string()))
+                .cloned()
+                .or_else(|| self.artifact.clone()))
         }
     }
 
@@ -448,6 +713,10 @@ mod tests {
         artifact.extend_from_slice(&ciphertext);
         artifact.extend_from_slice(&encrypted_epoch_key);
         artifact
+    }
+
+    fn epoch_hashes(entries: &[(u32, [u8; 32])]) -> BTreeMap<u32, [u8; 32]> {
+        entries.iter().map(|(epoch, key)| (*epoch, compute_epoch_key_hash(key))).collect()
     }
 
     fn make_devices(
@@ -584,7 +853,7 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        EpochManager::post_rekey(&relay, &mut kh, 2).await.unwrap();
+        EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await.unwrap();
 
         let posted = relay.posted_artifacts.lock().unwrap();
         let (epoch, keys) = posted.as_ref().unwrap();
@@ -617,6 +886,253 @@ mod tests {
         // Verify decrypted epoch key matches what was stored in the hierarchy
         let stored_key = kh.epoch_key(2).unwrap();
         assert_eq!(decrypted, stored_key, "decrypted key should match stored epoch key");
+    }
+
+    #[tokio::test]
+    async fn post_rekey_reconciles_commit_after_lost_response() {
+        let sender_secret = DeviceSecret::generate();
+        let receiver_secret = DeviceSecret::generate();
+        let devices = make_devices(&sender_secret, &receiver_secret);
+        let relay = MockRelay::new_with_devices_and_behavior(
+            devices,
+            PostRekeyBehavior::CommitThenNetworkError,
+        );
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let returned_key = EpochManager::post_rekey(&relay, &mut kh, "sender", 2)
+            .await
+            .expect("committed relay state should reconcile lost response");
+
+        assert!(kh.has_epoch_key(2));
+        assert_eq!(kh.epoch_key(2).unwrap(), returned_key.as_slice());
+    }
+
+    #[tokio::test]
+    async fn post_rekey_errors_when_lost_response_did_not_commit() {
+        let sender_secret = DeviceSecret::generate();
+        let receiver_secret = DeviceSecret::generate();
+        let devices = make_devices(&sender_secret, &receiver_secret);
+        let relay = MockRelay::new_with_devices_and_behavior(
+            devices,
+            PostRekeyBehavior::NetworkErrorBeforeCommit,
+        );
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let result = EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await;
+
+        assert!(result.is_err(), "uncommitted ambiguous failure must remain an error");
+        assert!(!kh.has_epoch_key(2), "uncommitted epoch key should not be stored locally");
+    }
+
+    #[tokio::test]
+    async fn post_rekey_errors_when_reconciled_artifact_is_absent() {
+        let sender_secret = DeviceSecret::generate();
+        let receiver_secret = DeviceSecret::generate();
+        let devices = make_devices(&sender_secret, &receiver_secret);
+        let relay = MockRelay::new_with_devices_and_behavior(
+            devices,
+            PostRekeyBehavior::AdvanceWithoutArtifactThenNetworkError,
+        );
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let result = EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await;
+
+        assert!(result.is_err(), "advanced epoch without artifact must not reconcile");
+        assert!(!kh.has_epoch_key(2), "unconfirmed epoch key should not be stored locally");
+    }
+
+    #[tokio::test]
+    async fn catch_up_epoch_keys_recovers_and_advances_secure_epoch() {
+        let device_secret = DeviceSecret::generate();
+        let device_id = "sender";
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+
+        let relay = MockRelay::new_with_artifact(None);
+        relay.insert_artifact(1, device_id, build_v2_artifact(&xwing, &epoch_1_key, 1, device_id));
+        relay.insert_artifact(2, device_id, build_v2_artifact(&xwing, &epoch_2_key, 2, device_id));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let store = MemStore::default();
+        let hashes = epoch_hashes(&[(1, epoch_1_key), (2, epoch_2_key)]);
+
+        let result = EpochManager::catch_up_epoch_keys(
+            &relay,
+            &mut kh,
+            &store,
+            &device_secret,
+            device_id,
+            0,
+            2,
+            &hashes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            EpochCatchUpResult { start_epoch: 0, relay_epoch: 2, recovered_through: 2 }
+        );
+        assert_eq!(kh.epoch_key(1).unwrap(), &epoch_1_key);
+        assert_eq!(kh.epoch_key(2).unwrap(), &epoch_2_key);
+        assert!(store.get("epoch_key_1").unwrap().is_some());
+        assert!(store.get("epoch_key_2").unwrap().is_some());
+        assert_eq!(store.get("epoch").unwrap().unwrap(), b"2");
+    }
+
+    #[tokio::test]
+    async fn catch_up_epoch_keys_stops_before_missing_artifact_epoch() {
+        let device_secret = DeviceSecret::generate();
+        let device_id = "sender";
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+
+        let relay = MockRelay::new_with_artifact(None);
+        relay.insert_artifact(1, device_id, build_v2_artifact(&xwing, &epoch_1_key, 1, device_id));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let store = MemStore::default();
+        let hashes = epoch_hashes(&[(1, epoch_1_key), (2, epoch_2_key)]);
+
+        let result = EpochManager::catch_up_epoch_keys(
+            &relay,
+            &mut kh,
+            &store,
+            &device_secret,
+            device_id,
+            0,
+            2,
+            &hashes,
+        )
+        .await;
+
+        assert!(result.is_err(), "missing epoch 2 artifact should fail");
+        assert_eq!(kh.epoch_key(1).unwrap(), &epoch_1_key);
+        assert!(!kh.has_epoch_key(2));
+        assert!(store.get("epoch_key_1").unwrap().is_some());
+        assert!(store.get("epoch_key_2").unwrap().is_none());
+        assert_eq!(store.get("epoch").unwrap().unwrap(), b"1");
+    }
+
+    #[tokio::test]
+    async fn catch_up_epoch_keys_advances_verified_prefix_on_mid_loop_network_error() {
+        let device_secret = DeviceSecret::generate();
+        let device_id = "sender";
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+
+        let relay = MockRelay::new_with_artifact(None);
+        relay.insert_artifact(1, device_id, build_v2_artifact(&xwing, &epoch_1_key, 1, device_id));
+        relay.insert_artifact(2, device_id, build_v2_artifact(&xwing, &epoch_2_key, 2, device_id));
+        relay.set_artifact_error_epoch(2);
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let store = MemStore::default();
+        let hashes = epoch_hashes(&[(1, epoch_1_key), (2, epoch_2_key)]);
+
+        let result = EpochManager::catch_up_epoch_keys(
+            &relay,
+            &mut kh,
+            &store,
+            &device_secret,
+            device_id,
+            0,
+            2,
+            &hashes,
+        )
+        .await;
+
+        assert!(result.is_err(), "epoch 2 network error should fail catch-up");
+        assert_eq!(kh.epoch_key(1).unwrap(), &epoch_1_key);
+        assert!(!kh.has_epoch_key(2));
+        assert!(store.get("epoch_key_1").unwrap().is_some());
+        assert!(store.get("epoch_key_2").unwrap().is_none());
+        assert_eq!(store.get("epoch").unwrap().unwrap(), b"1");
+    }
+
+    #[tokio::test]
+    async fn catch_up_epoch_keys_rejects_hash_mismatch_without_advancing_epoch() {
+        let device_secret = DeviceSecret::generate();
+        let device_id = "sender";
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+        let wrong_epoch_2_key = [0x33u8; 32];
+
+        let relay = MockRelay::new_with_artifact(None);
+        relay.insert_artifact(1, device_id, build_v2_artifact(&xwing, &epoch_1_key, 1, device_id));
+        relay.insert_artifact(2, device_id, build_v2_artifact(&xwing, &epoch_2_key, 2, device_id));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let store = MemStore::default();
+        let hashes = epoch_hashes(&[(1, epoch_1_key), (2, wrong_epoch_2_key)]);
+
+        let result = EpochManager::catch_up_epoch_keys(
+            &relay,
+            &mut kh,
+            &store,
+            &device_secret,
+            device_id,
+            0,
+            2,
+            &hashes,
+        )
+        .await;
+
+        assert!(result.is_err(), "hash mismatch should fail");
+        assert_eq!(kh.epoch_key(1).unwrap(), &epoch_1_key);
+        assert!(!kh.has_epoch_key(2));
+        assert!(store.get("epoch_key_2").unwrap().is_none());
+        assert_eq!(store.get("epoch").unwrap().unwrap(), b"1");
+    }
+
+    #[tokio::test]
+    async fn catch_up_epoch_keys_requires_signed_hash_for_each_epoch() {
+        let device_secret = DeviceSecret::generate();
+        let device_id = "sender";
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+
+        let relay = MockRelay::new_with_artifact(None);
+        relay.insert_artifact(1, device_id, build_v2_artifact(&xwing, &epoch_1_key, 1, device_id));
+        relay.insert_artifact(2, device_id, build_v2_artifact(&xwing, &epoch_2_key, 2, device_id));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let store = MemStore::default();
+        let hashes = epoch_hashes(&[(1, epoch_1_key)]);
+
+        let result = EpochManager::catch_up_epoch_keys(
+            &relay,
+            &mut kh,
+            &store,
+            &device_secret,
+            device_id,
+            0,
+            2,
+            &hashes,
+        )
+        .await;
+
+        assert!(result.is_err(), "missing signed hash for epoch 2 should fail");
+        assert_eq!(kh.epoch_key(1).unwrap(), &epoch_1_key);
+        assert!(!kh.has_epoch_key(2));
+        assert!(store.get("epoch_key_2").unwrap().is_none());
+        assert_eq!(store.get("epoch").unwrap().unwrap(), b"1");
     }
 
     #[tokio::test]
@@ -714,7 +1230,7 @@ mod tests {
         // Epoch 2 key should not exist yet
         assert!(!kh.has_epoch_key(2));
 
-        let returned_key = EpochManager::post_rekey(&relay, &mut kh, 2).await.unwrap();
+        let returned_key = EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await.unwrap();
 
         // Epoch 2 key should now be stored in the hierarchy
         assert!(kh.has_epoch_key(2));

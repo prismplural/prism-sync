@@ -9,11 +9,14 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use prism_sync_core::device_registry::DeviceRegistryManager;
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
-use prism_sync_core::pairing::{RegistrySnapshotEntry, SignedRegistrySnapshot};
+use prism_sync_core::pairing::{
+    compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
+};
 use prism_sync_core::relay::traits::SignedRegistryResponse;
 use prism_sync_core::relay::{DeviceInfo, MockRelay, SignedBatchEnvelope};
 use prism_sync_core::schema::SyncValue;
@@ -70,8 +73,15 @@ fn build_signed_registry_blob(
 ) -> Vec<u8> {
     let signing_key = signer_device_secret.ed25519_keypair(signer_device_id).unwrap();
     let pq_signing_key = signer_device_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
-    let snapshot = SignedRegistrySnapshot::new(entries, 1);
+    let snapshot =
+        SignedRegistrySnapshot::new_with_epoch_binding(entries, 1, 0, test_epoch_key_hashes());
     snapshot.sign_hybrid(&signing_key, &pq_signing_key)
+}
+
+fn test_epoch_key_hashes() -> BTreeMap<u32, [u8; 32]> {
+    let mut hashes = BTreeMap::new();
+    hashes.insert(0, compute_epoch_key_hash(&[0x42; 32]));
+    hashes
 }
 
 /// Register a device in storage only (not the relay). Useful for setting up
@@ -1191,7 +1201,12 @@ fn stale_registry_version_rejected() {
     // Build a signed blob at version 5
     let signing_key = device_secret_a.ed25519_keypair(device_a_id).unwrap();
     let pq_signing_key = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
-    let snapshot_v5 = SignedRegistrySnapshot::new(entries.clone(), 5);
+    let snapshot_v5 = SignedRegistrySnapshot::new_with_epoch_binding(
+        entries.clone(),
+        5,
+        0,
+        test_epoch_key_hashes(),
+    );
     let blob_v5 = snapshot_v5.sign_hybrid(&signing_key, &pq_signing_key);
 
     // Import version 5 — should succeed
@@ -1201,7 +1216,12 @@ fn stale_registry_version_rejected() {
     assert_eq!(result.unwrap(), 5, "should return signed version 5");
 
     // Build a signed blob at version 3 (stale replay)
-    let snapshot_v3 = SignedRegistrySnapshot::new(entries.clone(), 3);
+    let snapshot_v3 = SignedRegistrySnapshot::new_with_epoch_binding(
+        entries.clone(),
+        3,
+        0,
+        test_epoch_key_hashes(),
+    );
     let blob_v3 = snapshot_v3.sign_hybrid(&signing_key, &pq_signing_key);
 
     // Import version 3 with last_imported=5 — must fail
@@ -1216,7 +1236,8 @@ fn stale_registry_version_rejected() {
     assert!(err.contains("stale"), "error should mention staleness: {err}");
 
     // Build a signed blob at version 7 (newer) — should succeed
-    let snapshot_v7 = SignedRegistrySnapshot::new(entries, 7);
+    let snapshot_v7 =
+        SignedRegistrySnapshot::new_with_epoch_binding(entries, 7, 0, test_epoch_key_hashes());
     let blob_v7 = snapshot_v7.sign_hybrid(&signing_key, &pq_signing_key);
 
     let result = DeviceRegistryManager::verify_and_import_signed_registry(
@@ -1227,6 +1248,50 @@ fn stale_registry_version_rejected() {
     );
     assert!(result.is_ok(), "newer version 7 should succeed: {:?}", result.err());
     assert_eq!(result.unwrap(), 7, "should return signed version 7");
+}
+
+#[test]
+fn signed_registry_import_requires_epoch_binding_at_version_floor() {
+    let device_a_id = "device-a-binding-required";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_kp_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_kp_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_kp_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_kp_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let storage = RusqliteSyncStorage::in_memory().unwrap();
+    setup_sync_metadata(&storage, "other");
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_kp_a.public_key_bytes(),
+        &x25519_kp_a.public_key_bytes(),
+        &ml_dsa_kp_a.public_key_bytes(),
+        &ml_kem_kp_a.public_key_bytes(),
+        0,
+    );
+
+    let entries = vec![RegistrySnapshotEntry {
+        sync_id: SYNC_ID.into(),
+        device_id: device_a_id.into(),
+        ed25519_public_key: ed25519_kp_a.public_key_bytes().to_vec(),
+        x25519_public_key: x25519_kp_a.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: ml_dsa_kp_a.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_kp_a.public_key_bytes(),
+        x_wing_public_key: Vec::new(),
+        status: "active".into(),
+        ml_dsa_key_generation: 0,
+    }];
+
+    let signing_key = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let pq_signing_key = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let blob = SignedRegistrySnapshot::new(entries, 1).sign_hybrid(&signing_key, &pq_signing_key);
+
+    let result =
+        DeviceRegistryManager::verify_and_import_signed_registry(&storage, SYNC_ID, &blob, None);
+    assert!(result.is_err(), "version-floor import without epoch binding should fail");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("requires non-empty epoch_key_hashes"), "unexpected error: {err}");
 }
 
 // ── G2: bootstrap fail-closed for unknown snapshot senders ───────────────
@@ -1240,7 +1305,7 @@ fn stale_registry_version_rejected() {
 /// bootstrap_from_snapshot returns Err.
 #[tokio::test]
 async fn bootstrap_from_snapshot_fail_closed() {
-    use prism_sync_core::relay::traits::{SnapshotExchange as _, SyncRelay as _};
+    use prism_sync_core::relay::traits::SnapshotExchange as _;
 
     let key_hierarchy = init_key_hierarchy();
 

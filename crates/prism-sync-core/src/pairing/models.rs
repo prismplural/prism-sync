@@ -457,12 +457,7 @@ impl SignedRegistrySnapshot {
     /// producing a snapshot at or above
     /// [`SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING`].
     pub fn new(entries: Vec<RegistrySnapshotEntry>, registry_version: i64) -> Self {
-        Self {
-            entries,
-            registry_version,
-            current_epoch: 0,
-            epoch_key_hashes: BTreeMap::new(),
-        }
+        Self { entries, registry_version, current_epoch: 0, epoch_key_hashes: BTreeMap::new() }
     }
 
     /// Build a snapshot that cryptographically binds the current epoch and
@@ -988,6 +983,74 @@ mod tests {
         assert_eq!(decoded.entries.len(), 2);
         assert_eq!(decoded.entries[0].device_id, "dev-a");
         assert_eq!(decoded.entries[1].device_id, "dev-b");
+    }
+
+    #[test]
+    fn snapshot_hybrid_rejects_version_floor_without_epoch_hashes() {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let ed_pk = signing_key.public_key_bytes();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pq_pk = pq_signing_key.public_key_bytes();
+        let entries = sample_snapshot().entries;
+        let snapshot =
+            SignedRegistrySnapshot::new(entries, SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING);
+
+        let signed = snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        let err =
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &ed_pk, &pq_pk).unwrap_err();
+
+        assert!(err.contains("requires non-empty epoch_key_hashes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn snapshot_hybrid_rejects_missing_current_epoch_hash() {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let ed_pk = signing_key.public_key_bytes();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pq_pk = pq_signing_key.public_key_bytes();
+        let mut epoch_key_hashes = BTreeMap::new();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&[0x42; 32]));
+        let entries = sample_snapshot().entries;
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            1,
+            epoch_key_hashes,
+        );
+
+        let signed = snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        let err =
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &ed_pk, &pq_pk).unwrap_err();
+
+        assert!(err.contains("missing entry for current_epoch 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn snapshot_hybrid_accepts_epoch_binding() {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let ed_pk = signing_key.public_key_bytes();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pq_pk = pq_signing_key.public_key_bytes();
+        let mut epoch_key_hashes = BTreeMap::new();
+        let hash = compute_epoch_key_hash(&[0x42; 32]);
+        epoch_key_hashes.insert(0, hash);
+        let entries = sample_snapshot().entries;
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            0,
+            epoch_key_hashes,
+        );
+
+        let signed = snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        let decoded =
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &ed_pk, &pq_pk).unwrap();
+
+        assert_eq!(decoded.current_epoch, 0);
+        assert_eq!(decoded.epoch_key_hashes.get(&0), Some(&hash));
     }
 
     #[test]
