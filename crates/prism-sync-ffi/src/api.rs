@@ -23,7 +23,7 @@ use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
-use prism_sync_core::schema::{SyncSchema, SyncType, SyncValue};
+use prism_sync_core::schema::{parse_datetime_utc, SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
@@ -227,8 +227,7 @@ fn json_value_to_sync_value_for_type(
         SyncType::DateTime => {
             let s =
                 value.as_str().ok_or_else(|| format!("Expected date string for field '{key}'"))?;
-            let dt = s
-                .parse::<chrono::DateTime<chrono::Utc>>()
+            let dt = parse_datetime_utc(s)
                 .map_err(|e| format!("Invalid date string for field '{key}': {e}"))?;
             Ok(SyncValue::DateTime(dt))
         }

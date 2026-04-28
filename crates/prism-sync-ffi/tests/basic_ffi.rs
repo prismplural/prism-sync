@@ -320,6 +320,37 @@ async fn record_create_fails_without_engine() {
 }
 
 #[tokio::test]
+async fn record_create_accepts_dart_offsetless_datetime_before_engine_check() {
+    let schema = r#"{"entities":{"events":{"fields":{"created_at":"DateTime"}}}}"#;
+    let handle = api::create_prism_sync(
+        "https://localhost:8080".into(),
+        ":memory:".into(),
+        false,
+        schema.into(),
+        None,
+    )
+    .expect("create_prism_sync with DateTime schema should succeed");
+
+    let result = api::record_create(
+        &handle,
+        "events".into(),
+        "event-1".into(),
+        r#"{"created_at":"2026-04-27T12:34:56.789"}"#.into(),
+    )
+    .await;
+
+    let error = result.expect_err("record_create should still fail before configure_engine");
+    assert!(
+        error.contains("sync not configured"),
+        "DateTime parsing should pass and reach engine configuration check, got: {error}"
+    );
+    assert!(
+        !error.contains("Invalid date string"),
+        "Dart offsetless DateTime should not be rejected, got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn record_update_fails_without_engine() {
     let handle = make_handle_with_schema();
     let fields = r#"{"name": "Bob"}"#;

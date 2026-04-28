@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 
 use crate::error::{CoreError, Result};
 
@@ -28,6 +28,24 @@ pub enum SyncValue {
     Bool(bool),
     DateTime(DateTime<Utc>),
     Blob(Vec<u8>),
+}
+
+/// Parse DateTime strings accepted by the sync wire format.
+///
+/// Canonical sync values are RFC3339 UTC strings with a trailing `Z`, but the
+/// Flutter app has historically emitted Dart `DateTime.toIso8601String()`
+/// values directly. For non-UTC Dart DateTimes that format has no timezone
+/// suffix, so accept those legacy strings and interpret them as UTC rather
+/// than rejecting whole bootstrap rows.
+pub fn parse_datetime_utc(s: &str) -> Result<DateTime<Utc>> {
+    if let Ok(dt) = s.parse::<DateTime<Utc>>() {
+        return Ok(dt);
+    }
+
+    let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+        .map_err(|e| CoreError::Serialization(format!("Invalid ISO-8601 date '{s}': {e}")))?;
+    Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
 impl SyncValue {
@@ -310,9 +328,7 @@ pub fn decode_value(encoded: &str, sync_type: SyncType) -> Result<SyncValue> {
             let s = json_val.as_str().ok_or_else(|| {
                 CoreError::Serialization(format!("Expected date string, got: {json_val}"))
             })?;
-            let dt = s.parse::<DateTime<Utc>>().map_err(|e| {
-                CoreError::Serialization(format!("Invalid ISO-8601 date '{s}': {e}"))
-            })?;
+            let dt = parse_datetime_utc(s)?;
             Ok(SyncValue::DateTime(dt))
         }
         SyncType::Blob => {
@@ -451,6 +467,22 @@ mod tests {
         assert_eq!(encoded, "\"2026-03-15T12:00:00.000Z\"");
         let decoded = decode_value(&encoded, SyncType::DateTime).unwrap();
         assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn decode_datetime_accepts_dart_offsetless_iso8601() {
+        let decoded = decode_value("\"2026-04-27T12:34:56.789\"", SyncType::DateTime).unwrap();
+        let expected = "2026-04-27T12:34:56.789Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(decoded, SyncValue::DateTime(expected));
+    }
+
+    #[test]
+    fn decode_datetime_accepts_dart_offsetless_microseconds() {
+        let decoded = decode_value("\"2026-04-27T12:34:56.789123\"", SyncType::DateTime).unwrap();
+        let expected = "2026-04-27T12:34:56.789123Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(decoded, SyncValue::DateTime(expected));
     }
 
     #[test]
