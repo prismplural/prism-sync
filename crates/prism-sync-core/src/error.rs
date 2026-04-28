@@ -40,6 +40,12 @@ pub enum CoreError {
     #[error("missing epoch key for epoch {epoch}")]
     MissingEpochKey { epoch: u32 },
 
+    #[error("epoch mismatch: local_epoch={local_epoch}, relay_epoch={relay_epoch}: {message}")]
+    EpochMismatch { local_epoch: u32, relay_epoch: u32, message: String },
+
+    #[error("epoch key mismatch for epoch {epoch}: {message}")]
+    EpochKeyMismatch { epoch: u32, message: String },
+
     #[error("decrypt failed for epoch {epoch}: {source}")]
     DecryptFailed {
         epoch: u32,
@@ -129,12 +135,8 @@ impl CoreError {
             | RelayError::KeyChanged { .. } => {
                 (RelayErrorCategory::Protocol, None, None, None, None)
             }
-            RelayError::NotFound => {
-                (RelayErrorCategory::Server, Some(404), None, None, None)
-            }
-            RelayError::Forbidden { .. } => {
-                (RelayErrorCategory::Auth, Some(403), None, None, None)
-            }
+            RelayError::NotFound => (RelayErrorCategory::Server, Some(404), None, None, None),
+            RelayError::Forbidden { .. } => (RelayErrorCategory::Auth, Some(403), None, None, None),
             RelayError::Http { status, .. } => {
                 (RelayErrorCategory::Server, Some(status), None, None, None)
             }

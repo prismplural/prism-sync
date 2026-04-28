@@ -142,6 +142,8 @@ pub(crate) fn classify_core_error(e: &crate::error::CoreError) -> SyncErrorKind 
         // the outer auto-sync driver will pick them up on the next
         // cycle without us burning the inner retry budget.
         CoreError::MissingEpochKey { .. }
+        | CoreError::EpochMismatch { .. }
+        | CoreError::EpochKeyMismatch { .. }
         | CoreError::DecryptFailed { .. }
         | CoreError::Engine(_)
         | CoreError::Storage(_) => SyncErrorKind::Protocol,

@@ -394,6 +394,17 @@ fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> Stri
         payload["bytes"] = serde_json::json!(bytes);
         payload["limit_bytes"] =
             serde_json::json!(prism_sync_core::snapshot_limits::MAX_SNAPSHOT_COMPRESSED_BYTES);
+    } else if let prism_sync_core::CoreError::EpochMismatch { local_epoch, relay_epoch, .. } =
+        &error
+    {
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("epoch_mismatch");
+        payload["local_epoch"] = serde_json::json!(local_epoch);
+        payload["relay_epoch"] = serde_json::json!(relay_epoch);
+    } else if let prism_sync_core::CoreError::EpochKeyMismatch { epoch, .. } = &error {
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("epoch_key_mismatch");
+        payload["epoch"] = serde_json::json!(epoch);
     } else {
         payload["error_type"] = serde_json::json!("core");
     }
@@ -1502,15 +1513,13 @@ pub async fn bootstrap_existing_state(
     records_json: String,
 ) -> Result<String, String> {
     // Parse the records array.
-    let value: serde_json::Value = serde_json::from_str(&records_json)
-        .map_err(|e| format!("Invalid records JSON: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&records_json).map_err(|e| format!("Invalid records JSON: {e}"))?;
     let arr = value.as_array().ok_or_else(|| "records JSON must be an array".to_string())?;
 
     let mut records: Vec<prism_sync_core::engine::SeedRecord> = Vec::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
-        let obj = entry
-            .as_object()
-            .ok_or_else(|| format!("records[{idx}] must be an object"))?;
+        let obj = entry.as_object().ok_or_else(|| format!("records[{idx}] must be an object"))?;
         let table = obj
             .get("table")
             .and_then(|v| v.as_str())
@@ -1521,9 +1530,8 @@ pub async fn bootstrap_existing_state(
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("records[{idx}].entity_id must be a string"))?
             .to_string();
-        let fields_value = obj
-            .get("fields")
-            .ok_or_else(|| format!("records[{idx}].fields missing"))?;
+        let fields_value =
+            obj.get("fields").ok_or_else(|| format!("records[{idx}].fields missing"))?;
         let fields_map = fields_value
             .as_object()
             .ok_or_else(|| format!("records[{idx}].fields must be an object"))?;
@@ -3432,7 +3440,10 @@ pub async fn complete_joiner_ceremony(
         .ok_or("device_secret not found after join")?;
     inner.restore_runtime_keys(dek, &device_secret_bytes).map_err(|e| e.to_string())?;
 
-    // Restore epoch keys into the live key hierarchy
+    // Restore epoch keys into the live key hierarchy. Bootstrap join may
+    // catch up through multiple epochs before returning, while a bundle that
+    // starts at epoch > 1 may only carry the current epoch plus newly recovered
+    // keys. Load every stored key, but require the current epoch key to exist.
     let epoch_val = inner
         .secure_store()
         .get("epoch")
@@ -3441,31 +3452,33 @@ pub async fn complete_joiner_ceremony(
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
-    if epoch_val > 0 {
-        let key_name = format!("epoch_key_{}", epoch_val);
+    for epoch in 1..=epoch_val {
+        let key_name = format!("epoch_key_{}", epoch);
         match inner.secure_store().get(&key_name) {
             Ok(Some(stored)) => match BASE64.decode(&stored) {
                 Ok(decoded) if decoded.len() == 32 => {
                     inner
                         .key_hierarchy_mut()
-                        .store_epoch_key(epoch_val, zeroize::Zeroizing::new(decoded));
+                        .store_epoch_key(epoch, zeroize::Zeroizing::new(decoded));
                 }
                 Ok(decoded) => {
                     return Err(format!(
                         "epoch_key_{} has wrong length ({}, expected 32)",
-                        epoch_val,
+                        epoch,
                         decoded.len(),
                     ));
                 }
                 Err(e) => {
-                    return Err(format!("epoch_key_{} base64 decode failed: {e}", epoch_val,));
+                    return Err(format!("epoch_key_{} base64 decode failed: {e}", epoch,));
                 }
             },
             Ok(None) => {
-                return Err(format!("epoch_key_{} not found in secure store", epoch_val,));
+                if epoch == epoch_val {
+                    return Err(format!("epoch_key_{} not found in secure store", epoch,));
+                }
             }
             Err(e) => {
-                return Err(format!("Failed to read epoch_key_{}: {e}", epoch_val));
+                return Err(format!("Failed to read epoch_key_{}: {e}", epoch));
             }
         }
     }
@@ -4891,6 +4904,40 @@ mod tests {
     fn ceremony_guard_emits_stable_error_prefix() {
         // Dart-side error matching keys off this prefix.
         assert_eq!(CEREMONY_IN_PROGRESS_PREFIX, "CEREMONY_IN_PROGRESS");
+    }
+
+    #[test]
+    fn encode_core_error_surfaces_epoch_mismatch_code_and_epochs() {
+        let encoded = encode_core_error(
+            "complete_bootstrap_join",
+            prism_sync_core::CoreError::EpochMismatch {
+                local_epoch: 2,
+                relay_epoch: 4,
+                message: "relay advanced during pairing".into(),
+            },
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(encoded.strip_prefix(STRUCTURED_ERROR_PREFIX).unwrap()).unwrap();
+        assert_eq!(payload["code"], "epoch_mismatch");
+        assert_eq!(payload["local_epoch"], 2);
+        assert_eq!(payload["relay_epoch"], 4);
+    }
+
+    #[test]
+    fn encode_core_error_surfaces_epoch_key_mismatch_code() {
+        let encoded = encode_core_error(
+            "complete_bootstrap_join",
+            prism_sync_core::CoreError::EpochKeyMismatch {
+                epoch: 3,
+                message: "hash mismatch".into(),
+            },
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(encoded.strip_prefix(STRUCTURED_ERROR_PREFIX).unwrap()).unwrap();
+        assert_eq!(payload["code"], "epoch_key_mismatch");
+        assert_eq!(payload["epoch"], 3);
     }
 
     #[tokio::test]
