@@ -145,11 +145,75 @@ fn setup_sole_device(
     (sync, storage)
 }
 
+fn setup_sole_device_without_metadata() -> (PrismSync, Arc<RusqliteSyncStorage>) {
+    let schema = bootstrap_schema();
+    let storage: Arc<RusqliteSyncStorage> = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_device_record(&DeviceRecord {
+            sync_id: SYNC_ID.to_string(),
+            device_id: "device-a".to_string(),
+            ed25519_public_key: vec![1u8; 32],
+            x25519_public_key: vec![2u8; 32],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    let mut sync = PrismSync::builder()
+        .schema(schema)
+        .storage(storage.clone())
+        .secure_store(Arc::new(MemorySecureStore::new()))
+        .entity(entity)
+        .build()
+        .unwrap();
+
+    sync.initialize("pw", &[7u8; 16]).unwrap();
+    sync.configure_engine(
+        Arc::new(MockRelay::new()),
+        SYNC_ID.to_string(),
+        "device-a".to_string(),
+        0,
+        0,
+    );
+
+    (sync, storage)
+}
+
 fn task_record(id: &str, title: &str, done: bool) -> SeedRecord {
     let mut fields: HashMap<String, SyncValue> = HashMap::new();
     fields.insert("title".to_string(), SyncValue::String(title.to_string()));
     fields.insert("done".to_string(), SyncValue::Bool(done));
     SeedRecord { table: "tasks".to_string(), entity_id: id.to_string(), fields }
+}
+
+#[tokio::test]
+async fn bootstrap_initializes_missing_sync_metadata_for_new_group() {
+    let (mut sync, storage) = setup_sole_device_without_metadata();
+    assert!(storage.get_sync_metadata(SYNC_ID).unwrap().is_none());
+
+    let report =
+        sync.bootstrap_existing_state(vec![task_record("t-1", "first", false)]).await.unwrap();
+    assert!(report.snapshot_bytes > 0);
+
+    let metadata = storage
+        .get_sync_metadata(SYNC_ID)
+        .unwrap()
+        .expect("bootstrap should create sync_metadata before snapshot export");
+    assert_eq!(metadata.local_device_id, "device-a");
+    assert_eq!(metadata.current_epoch, 0);
+    assert_eq!(metadata.last_pulled_server_seq, 0);
+    assert!(!storage.export_snapshot(SYNC_ID).unwrap().is_empty());
 }
 
 #[tokio::test]

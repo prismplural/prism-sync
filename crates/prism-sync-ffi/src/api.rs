@@ -26,7 +26,7 @@ use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
 use prism_sync_core::schema::{parse_datetime_utc, SyncSchema, SyncType, SyncValue};
-use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
+use prism_sync_core::storage::{RusqliteSyncStorage, SyncMetadata, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
     background_runtime, spawn_notification_handler, DeviceRegistryManager,
@@ -2241,6 +2241,8 @@ pub async fn create_sync_group(
         &[self_record],
     )
     .map_err(|e| format!("failed to seed local device registry: {e}"))?;
+    ensure_local_sync_metadata(inner.storage().as_ref(), &response.sync_id, &device_id, 0)
+        .map_err(|e| format!("failed to seed local sync metadata: {e}"))?;
 
     let result = serde_json::json!({
         "sync_id": response.sync_id,
@@ -3455,6 +3457,24 @@ pub async fn complete_joiner_ceremony(
     )
     .map_err(|e| e.to_string())?;
 
+    // Seed local metadata before the snapshot import runs. `import_snapshot`
+    // preserves an existing `local_device_id`, but falls back to the snapshot's
+    // metadata when no row exists. For a joiner that fallback is the inviter's
+    // device id, so create/repair the row here with this device's identity.
+    let device_id = inner
+        .secure_store()
+        .get("device_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or("device_id not found after bootstrap join")?;
+    let current_epoch = i32::try_from(registry_snapshot.current_epoch).map_err(|_| {
+        format!(
+            "registry current_epoch {} exceeds local storage range",
+            registry_snapshot.current_epoch
+        )
+    })?;
+    ensure_local_sync_metadata(inner.storage().as_ref(), &sync_id, &device_id, current_epoch)?;
+
     // Restore runtime keys so configureEngine etc. work
     let dek = key_hierarchy.dek().map_err(|e| e.to_string())?;
     let device_secret_bytes = inner
@@ -3509,6 +3529,40 @@ pub async fn complete_joiner_ceremony(
 
     let result = serde_json::json!({ "sync_id": sync_id });
     Ok(result.to_string())
+}
+
+fn ensure_local_sync_metadata(
+    storage: &dyn SyncStorage,
+    sync_id: &str,
+    device_id: &str,
+    current_epoch: i32,
+) -> Result<(), String> {
+    let now = chrono::Utc::now();
+    let metadata = match storage.get_sync_metadata(sync_id).map_err(|e| e.to_string())? {
+        Some(mut metadata) => {
+            metadata.local_device_id = device_id.to_string();
+            metadata.current_epoch = metadata.current_epoch.max(current_epoch);
+            metadata.updated_at = now;
+            metadata
+        }
+        None => SyncMetadata {
+            sync_id: sync_id.to_string(),
+            local_device_id: device_id.to_string(),
+            current_epoch,
+            last_pulled_server_seq: 0,
+            last_pushed_at: None,
+            last_successful_sync_at: None,
+            registered_at: Some(now),
+            needs_rekey: false,
+            last_imported_registry_version: None,
+            created_at: now,
+            updated_at: now,
+        },
+    };
+    let mut tx = storage.begin_tx().map_err(|e| e.to_string())?;
+    tx.upsert_sync_metadata(&metadata).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Start the initiator side of the relay-based PQ pairing ceremony.
@@ -3716,17 +3770,9 @@ pub async fn complete_initiator_ceremony(
             // next launch reads the same epoch we're advancing to. Without
             // this, restart drops self.epoch back to the pre-rekey value
             // (configure_engine prefers sync_metadata over secure_store).
-            let storage = inner.storage().clone();
-            let sid_for_meta = sync_id.clone();
             let ne = new_epoch as i32;
-            tokio::task::spawn_blocking(move || {
-                let mut tx = storage.begin_tx()?;
-                tx.update_current_epoch(&sid_for_meta, ne)?;
-                tx.commit()
-            })
-            .await
-            .map_err(|e| format!("join sync_metadata update task: {e}"))?
-            .map_err(|e| format!("update sync_metadata.current_epoch: {e}"))?;
+            ensure_local_sync_metadata(inner.storage().as_ref(), &sync_id, &device_id, ne)
+                .map_err(|e| format!("update sync_metadata.current_epoch: {e}"))?;
 
             inner.advance_epoch(new_epoch as i32);
         }
@@ -4747,6 +4793,39 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn ensure_local_sync_metadata_creates_missing_row() {
+        let storage = RusqliteSyncStorage::in_memory().unwrap();
+
+        ensure_local_sync_metadata(&storage, "sync-join", "joiner-device", 3).unwrap();
+
+        let meta = storage.get_sync_metadata("sync-join").unwrap().unwrap();
+        assert_eq!(meta.local_device_id, "joiner-device");
+        assert_eq!(meta.current_epoch, 3);
+        assert_eq!(meta.last_pulled_server_seq, 0);
+    }
+
+    #[test]
+    fn ensure_local_sync_metadata_repairs_local_device_id_without_regressing_progress() {
+        let storage = RusqliteSyncStorage::in_memory().unwrap();
+        let mut metadata = make_metadata("sync-join");
+        metadata.local_device_id = "inviter-device".to_string();
+        metadata.current_epoch = 5;
+        metadata.last_pulled_server_seq = 42;
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&metadata).unwrap();
+            tx.commit().unwrap();
+        }
+
+        ensure_local_sync_metadata(&storage, "sync-join", "joiner-device", 3).unwrap();
+
+        let meta = storage.get_sync_metadata("sync-join").unwrap().unwrap();
+        assert_eq!(meta.local_device_id, "joiner-device");
+        assert_eq!(meta.current_epoch, 5);
+        assert_eq!(meta.last_pulled_server_seq, 42);
     }
 
     /// Seeds two sync_ids' rows into the handle's storage, then calls the FFI

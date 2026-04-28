@@ -23,7 +23,7 @@ use crate::relay::{OutgoingBatch, SyncRelay};
 use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::snapshot_limits;
 use crate::storage::StorageError;
-use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, SyncStorage};
+use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, SyncMetadata, SyncStorage};
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
 
@@ -1252,18 +1252,52 @@ impl SyncEngine {
         let devices = tokio::task::spawn_blocking(move || storage.list_device_records(&sid))
             .await
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
-        let node_id = devices
+        let first_device = devices
             .first()
-            .map(|d| d.device_id.clone())
             .ok_or_else(|| CoreError::Engine("no device record found for seed".into()))?;
+        let node_id = first_device.device_id.clone();
+        let registered_at = Some(first_device.registered_at.clone());
 
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
-        let current_epoch = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+        let metadata = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
             .await
-            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??
-            .map(|m| m.current_epoch)
-            .unwrap_or(0);
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        let current_epoch = metadata.as_ref().map(|m| m.current_epoch).unwrap_or(0);
+
+        if metadata.as_ref().map_or(true, |m| m.local_device_id.is_empty()) {
+            let storage = self.storage.clone();
+            let sid = sync_id.to_string();
+            let node_id_for_metadata = node_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let now = chrono::Utc::now();
+                let metadata = match metadata {
+                    Some(mut metadata) => {
+                        metadata.local_device_id = node_id_for_metadata;
+                        metadata.updated_at = now;
+                        metadata
+                    }
+                    None => SyncMetadata {
+                        sync_id: sid,
+                        local_device_id: node_id_for_metadata,
+                        current_epoch,
+                        last_pulled_server_seq: 0,
+                        last_pushed_at: None,
+                        last_successful_sync_at: None,
+                        registered_at,
+                        needs_rekey: false,
+                        last_imported_registry_version: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                };
+                let mut tx = storage.begin_tx()?;
+                tx.upsert_sync_metadata(&metadata)?;
+                tx.commit()
+            })
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        }
 
         // Seed inside spawn_blocking so each table-scoped tx stays inside
         // the blocking pool and we don't reach for a tokio reactor.
