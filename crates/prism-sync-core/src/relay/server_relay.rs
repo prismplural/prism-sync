@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -299,9 +300,13 @@ impl SyncTransport for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse pull response: {e}"),
-        })?;
+        // A decode failure here is almost always a truncated body from a mid-flight
+        // network drop — not a malformed payload from the relay. Route it through
+        // the same classifier as the original send error so it lands as Network
+        // (transient, retryable) instead of Protocol (hard error). The next sync
+        // cycle re-pulls cleanly and the user never sees a spurious failure.
+        let json: serde_json::Value =
+            resp.json().await.map_err(Self::classify_reqwest_error)?;
 
         let max_server_seq = json["max_server_seq"].as_i64().unwrap_or(0);
         let min_acked_seq = json["min_acked_seq"].as_i64();
@@ -728,18 +733,28 @@ impl SnapshotExchange for ServerRelay {
         &self,
         _epoch: i32,
         server_seq_at: i64,
-        data: Vec<u8>,
+        envelope_bytes: Vec<u8>,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
-        sender_device_id: String,
+        uploader_device_id: String,
+        progress: Option<SnapshotUploadProgress>,
     ) -> Result<(), RelayError> {
         let url = format!("{}/snapshot", self.base_path());
         let path = self.canonical_path("/snapshot");
-        debug!("put_snapshot server_seq_at={server_seq_at}");
+        debug!(
+            "put_snapshot server_seq_at={server_seq_at} bytes={}",
+            envelope_bytes.len()
+        );
 
+        let total: u64 = envelope_bytes.len() as u64;
+
+        // Sign before we move the bytes into the streamed body — the
+        // signature binds to the full payload hash, so the server can still
+        // verify regardless of chunking.
         let mut req = self
-            .apply_signed_auth(self.client.put(&url), "PUT", &path, &data)
-            .header("X-Server-Seq-At", server_seq_at.to_string());
+            .apply_signed_auth(self.client.put(&url), "PUT", &path, &envelope_bytes)
+            .header("X-Server-Seq-At", server_seq_at.to_string())
+            .header("Content-Length", total.to_string());
 
         if let Some(ttl) = ttl_secs {
             req = req.header("X-Snapshot-TTL", ttl.to_string());
@@ -747,10 +762,57 @@ impl SnapshotExchange for ServerRelay {
         if let Some(ref device_id) = for_device_id {
             req = req.header("X-For-Device-Id", device_id);
         }
-        req = req.header("X-Sender-Device-Id", &sender_device_id);
+        req = req.header("X-Sender-Device-Id", &uploader_device_id);
+
+        // Build a chunked stream so the body is sent in 64 KiB pieces.
+        // Each yielded chunk notifies the progress callback, throttled to at
+        // most one invocation per max(64 KiB, 200 ms).
+        const CHUNK_SIZE: usize = 64 * 1024;
+        const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
+        let progress_cb = progress.clone();
+        let last_emit: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+
+        let envelope = Arc::new(envelope_bytes);
+        let len = envelope.len();
+
+        // State: (current offset). `unfold` yields `Vec<u8>` chunks until we
+        // hit the end.
+        let stream = futures_util::stream::unfold(0usize, move |offset| {
+            let envelope = envelope.clone();
+            let progress_cb = progress_cb.clone();
+            let last_emit = last_emit.clone();
+            async move {
+                if offset >= len {
+                    return None;
+                }
+                let end = (offset + CHUNK_SIZE).min(len);
+                let chunk: Vec<u8> = envelope[offset..end].to_vec();
+                let new_offset = end;
+
+                if let Some(cb) = progress_cb.as_ref() {
+                    let now = Instant::now();
+                    let mut guard = last_emit.lock().unwrap();
+                    let is_final = new_offset >= len;
+                    let should_emit = match *guard {
+                        None => true,
+                        Some(last) => is_final || now.duration_since(last) >= PROGRESS_INTERVAL,
+                    };
+                    if should_emit {
+                        *guard = Some(now);
+                        drop(guard);
+                        cb(new_offset as u64, total);
+                    }
+                }
+
+                Some((Ok::<Vec<u8>, std::io::Error>(chunk), new_offset))
+            }
+        });
+
+        let body = reqwest::Body::wrap_stream(stream);
 
         let resp = req
-            .body(data)
+            .body(body)
             .timeout(self.snapshot_timeout)
             .send()
             .await
@@ -762,7 +824,40 @@ impl SnapshotExchange for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
+        // Ensure a final progress tick lands with `(total, total)` so callers
+        // see 100% even if the server relay buffered the last chunk.
+        if let Some(cb) = progress.as_ref() {
+            cb(total, total);
+        }
+
         Ok(())
+    }
+
+    async fn delete_snapshot(&self) -> Result<(), RelayError> {
+        let path = self.canonical_path("/snapshot");
+        let url = format!("{}{}", self.base_url, path);
+        debug!("delete_snapshot");
+
+        let resp = self
+            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        match status {
+            204 | 200 => Ok(()),
+            404 => Err(RelayError::NotFound),
+            403 => {
+                let body_text = resp.text().await.unwrap_or_default();
+                Err(RelayError::Forbidden { message: body_text })
+            }
+            _ => {
+                let body_text = resp.text().await.unwrap_or_default();
+                Err(RelayError::Http { status, body: body_text })
+            }
+        }
     }
 }
 

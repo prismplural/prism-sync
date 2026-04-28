@@ -1,11 +1,19 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Callback invoked by `put_snapshot` to report upload progress.
+///
+/// Arguments are `(bytes_sent_cumulative, bytes_total)`. The callback is
+/// invoked on each yielded upload chunk; server-side streaming throttles the
+/// frequency so consumers do not need to rate-limit further.
+pub type SnapshotUploadProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Error type for relay operations.
 #[derive(Debug, Error)]
@@ -42,6 +50,15 @@ pub enum RelayError {
 
     #[error("device revoked (remote_wipe={remote_wipe})")]
     DeviceRevoked { remote_wipe: bool },
+
+    #[error("not found")]
+    NotFound,
+
+    #[error("forbidden: {message}")]
+    Forbidden { message: String },
+
+    #[error("http error ({status}): {body}")]
+    Http { status: u16, body: String },
 }
 
 impl RelayError {
@@ -59,6 +76,9 @@ impl RelayError {
             RelayError::ClockSkew { .. } => RelayErrorKind::ClockSkew,
             RelayError::KeyChanged { .. } => RelayErrorKind::KeyChanged,
             RelayError::DeviceRevoked { .. } => RelayErrorKind::DeviceRevoked,
+            RelayError::NotFound => RelayErrorKind::NotFound,
+            RelayError::Forbidden { .. } => RelayErrorKind::Forbidden,
+            RelayError::Http { .. } => RelayErrorKind::Http,
         }
     }
 
@@ -85,6 +105,9 @@ pub enum RelayErrorKind {
     ClockSkew,
     KeyChanged,
     DeviceRevoked,
+    NotFound,
+    Forbidden,
+    Http,
 }
 
 // ── Request/Response types ──
@@ -521,16 +544,28 @@ pub trait SnapshotExchange: Send + Sync {
     ///
     /// Optional `ttl_secs` makes the snapshot ephemeral (auto-deleted after TTL).
     /// Optional `for_device_id` targets the snapshot at a specific device
-    /// (relay deletes it after that device downloads it).
+    /// (relay deletes it after that device downloads it). Optional `progress`
+    /// callback is invoked as the body streams — `(bytes_sent, bytes_total)`.
     async fn put_snapshot(
         &self,
         epoch: i32,
         server_seq_at: i64,
-        data: Vec<u8>,
+        envelope_bytes: Vec<u8>,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
-        sender_device_id: String,
+        uploader_device_id: String,
+        progress: Option<SnapshotUploadProgress>,
     ) -> std::result::Result<(), RelayError>;
+
+    /// Explicitly delete the snapshot stored for this sync group.
+    ///
+    /// Used by the pair-time ACK handshake: the joiner calls this after it
+    /// successfully imports the snapshot so the relay stops holding the blob.
+    /// `Ok(())` means the snapshot was deleted or never existed;
+    /// `Err(RelayError::NotFound)` means the relay confirmed no snapshot row
+    /// was present at the moment of the call (the caller may treat this as
+    /// idempotent success).
+    async fn delete_snapshot(&self) -> std::result::Result<(), RelayError>;
 }
 
 /// Media upload and download.

@@ -63,6 +63,7 @@ let schema = SyncSchema::builder()
     .entity("tasks", |e| {
         e.field("title", SyncType::String)
          .field("done", SyncType::Bool)
+         .field("score", SyncType::Real)
     })
     .build();
 

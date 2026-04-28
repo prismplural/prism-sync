@@ -70,6 +70,53 @@ pub trait SyncStorage: Send + Sync {
     /// Re-encrypt the underlying storage with a new 32-byte key.
     /// No-op for in-memory impls.
     fn rekey(&self, new_key: &[u8; 32]) -> Result<()>;
+
+    /// List every `winning_hlc` string currently stored in `field_versions`
+    /// for this sync group.
+    ///
+    /// Used by the first-device bootstrap path to compute the max HLC
+    /// across all seeded rows. A SQL `MAX(winning_hlc)` would compare
+    /// strings lexicographically — wrong for HLCs, because `":9"` sorts
+    /// after `":10"`. Callers parse with `Hlc::from_string` and compare
+    /// via `Hlc::Ord` instead.
+    ///
+    /// Default: empty (no-op).
+    fn list_all_field_version_hlcs(&self, _sync_id: &str) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Delete every `pending_ops` row for this sync group, transactionally.
+    /// Returns the number of rows deleted.
+    ///
+    /// Used only by the first-device bootstrap guard cleanup path. In that
+    /// path, any rows in `pending_ops` are orphans from a previous failed
+    /// bootstrap attempt — there is no legitimate code path that could
+    /// have produced a to-be-pushed mutation before first-pair.
+    ///
+    /// Default: 0 (no-op).
+    fn delete_all_pending_ops(&self, _sync_id: &str) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Check whether this sync group has any `applied_ops` rows.
+    ///
+    /// Cheap `SELECT 1 ... LIMIT 1`. Used by the first-device bootstrap
+    /// setup-only guard to prove we have never merged a remote op.
+    ///
+    /// Default: false (no-op).
+    fn has_any_applied_ops(&self, _sync_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Count entries in `device_registry` for this sync group.
+    ///
+    /// Used by the first-device bootstrap setup-only guard: `== 1` proves
+    /// this device is the sole registered device.
+    ///
+    /// Default: 0 (no-op).
+    fn count_devices_in_group(&self, _sync_id: &str) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Transactional operations on sync storage — obtained from `SyncStorage::begin_tx()`.

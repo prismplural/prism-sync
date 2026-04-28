@@ -16,13 +16,40 @@ use crate::device_registry::DeviceRegistryManager;
 use crate::error::{CoreError, Result};
 use crate::events::EntityChange;
 use crate::hlc::Hlc;
+use crate::op_emitter::OpEmitter;
 use crate::pruning::TombstonePruner;
+use crate::relay::traits::{RelayError, SnapshotUploadProgress};
 use crate::relay::{OutgoingBatch, SyncRelay};
-use crate::schema::{SyncSchema, SyncType};
+use crate::schema::{SyncSchema, SyncType, SyncValue};
+use crate::snapshot_limits;
 use crate::storage::StorageError;
 use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, SyncStorage};
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
+
+/// A single entity bundle used by `bootstrap_existing_state` to seed
+/// `field_versions` from pre-existing local data.
+///
+/// Each record contributes one HLC-stamped entity to the CRDT state without
+/// emitting any `pending_ops` — these rows are purely local reconstruction,
+/// not mutations to be pushed.
+#[derive(Debug, Clone)]
+pub struct SeedRecord {
+    pub table: String,
+    pub entity_id: String,
+    pub fields: HashMap<String, SyncValue>,
+}
+
+/// Summary of a `bootstrap_existing_state` dry run.
+#[derive(Debug, Clone)]
+pub struct BootstrapReport {
+    /// Number of entities seeded.
+    pub entity_count: u64,
+    /// Size of the zstd-compressed snapshot blob produced by
+    /// `export_snapshot` after seeding. Reported so the UI can surface
+    /// how large the initial state is.
+    pub snapshot_bytes: u64,
+}
 
 /// Key material resolved for a batch sender device.
 pub struct SenderKeyInfo {
@@ -1054,6 +1081,11 @@ impl SyncEngine {
     ///
     /// The existing device calls this after generating an invite. The snapshot
     /// is encrypted with the current epoch key and uploaded with a TTL.
+    ///
+    /// The size of the raw zstd-compressed export is checked against
+    /// `MAX_SNAPSHOT_COMPRESSED_BYTES` BEFORE any encryption or network work.
+    /// Oversized state fails with `CoreError::SnapshotTooLarge { bytes }` and
+    /// the relay is never contacted.
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_pairing_snapshot(
         &self,
@@ -1066,6 +1098,7 @@ impl SyncEngine {
         ml_dsa_key_generation: u32,
         ttl_secs: Option<u64>,
         for_device_id: Option<String>,
+        progress: Option<SnapshotUploadProgress>,
     ) -> Result<()> {
         // 1. Export snapshot from storage (already zstd-compressed)
         let storage = self.storage.clone();
@@ -1073,6 +1106,13 @@ impl SyncEngine {
         let snapshot_data = tokio::task::spawn_blocking(move || storage.export_snapshot(&sid))
             .await
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        // 1b. Size probe — reject oversized snapshots BEFORE encrypting or
+        // contacting the relay. This is the compressed-byte gate; the outer
+        // wire-byte limit is enforced relay-side.
+        if snapshot_data.len() > snapshot_limits::MAX_SNAPSHOT_COMPRESSED_BYTES {
+            return Err(CoreError::SnapshotTooLarge { bytes: snapshot_data.len() });
+        }
 
         // 2. Get last pulled seq as the snapshot point
         let storage = self.storage.clone();
@@ -1121,11 +1161,174 @@ impl SyncEngine {
                 ttl_secs,
                 for_device_id,
                 device_id.to_string(),
+                progress,
             )
             .await
             .map_err(CoreError::from_relay)?;
 
         Ok(())
+    }
+
+    /// Seed `field_versions` from pre-existing local data (first-device
+    /// bootstrap, Phase A of `docs/plans/first-device-bootstrap-snapshot.md`).
+    ///
+    /// This is the offline prep step: the existing Drift tables are walked on
+    /// the Dart side, turned into `SeedRecord`s, and handed to us. For each
+    /// record we emit one HLC-stamped `field_versions` write without a
+    /// `pending_op`, so nothing will be pushed to the relay. After seeding we
+    /// compute the max HLC across all seeded rows and feed it back into a
+    /// fresh `OpEmitter` so any subsequent `record_create` uses a strictly
+    /// greater HLC. Finally we run a local-only size probe to catch
+    /// oversized states before the user tries to pair.
+    ///
+    /// Guard invariants (all must hold, otherwise returns
+    /// `CoreError::BootstrapNotAllowed`):
+    /// - `count_devices_in_group(sync_id) == 1`: sole registered device.
+    /// - `last_pulled_server_seq == 0`: never pulled from a relay.
+    /// - `has_any_applied_ops == false`: never merged a remote op.
+    pub async fn bootstrap_existing_state(
+        &self,
+        sync_id: &str,
+        records: Vec<SeedRecord>,
+    ) -> Result<BootstrapReport> {
+        // ── Guard ─────────────────────────────────────────────────────────
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let device_count = tokio::task::spawn_blocking(move || storage.count_devices_in_group(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        if device_count != 1 {
+            return Err(CoreError::BootstrapNotAllowed(format!(
+                "expected exactly 1 device in registry, found {device_count}"
+            )));
+        }
+
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let last_pulled = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??
+            .map(|m| m.last_pulled_server_seq)
+            .unwrap_or(0);
+        if last_pulled != 0 {
+            return Err(CoreError::BootstrapNotAllowed(format!(
+                "last_pulled_server_seq must be 0 to bootstrap, found {last_pulled}"
+            )));
+        }
+
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let has_applied = tokio::task::spawn_blocking(move || storage.has_any_applied_ops(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        if has_applied {
+            return Err(CoreError::BootstrapNotAllowed(
+                "applied_ops table is non-empty; cannot bootstrap".into(),
+            ));
+        }
+
+        // ── Cleanup orphan pending_ops ────────────────────────────────────
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let removed = tokio::task::spawn_blocking(move || storage.delete_all_pending_ops(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        if removed > 0 {
+            tracing::info!(
+                count = removed,
+                "bootstrap_existing_state: cleared orphan pending_ops"
+            );
+        }
+
+        let entity_count = records.len() as u64;
+
+        // ── Seed ──────────────────────────────────────────────────────────
+        // Pull node_id and epoch from storage metadata so the emitter uses
+        // the correct identity without requiring the caller to thread it
+        // through. We need at least one device record to exist — the guard
+        // above proved device_count == 1.
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let devices = tokio::task::spawn_blocking(move || storage.list_device_records(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        let node_id = devices
+            .first()
+            .map(|d| d.device_id.clone())
+            .ok_or_else(|| CoreError::Engine("no device record found for seed".into()))?;
+
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let current_epoch = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??
+            .map(|m| m.current_epoch)
+            .unwrap_or(0);
+
+        // Seed inside spawn_blocking so each table-scoped tx stays inside
+        // the blocking pool and we don't reach for a tokio reactor.
+        let storage_clone = self.storage.clone();
+        let sync_id_owned = sync_id.to_string();
+        let records_owned = records;
+        let node_id_clone = node_id.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Group by table so each tx touches a single table.
+            let mut by_table: HashMap<String, Vec<SeedRecord>> = HashMap::new();
+            for rec in records_owned {
+                by_table.entry(rec.table.clone()).or_default().push(rec);
+            }
+
+            let mut emitter =
+                OpEmitter::new(node_id_clone, sync_id_owned, current_epoch, None);
+
+            for (_table, group) in by_table {
+                for rec in group {
+                    // Reuse the emitter — it ticks HLCs monotonically so
+                    // every entity gets a strictly greater HLC than the
+                    // previous one even though they land in their own
+                    // transactions.
+                    emitter.seed_fields(&*storage_clone, &rec.table, &rec.entity_id, &rec.fields)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        // ── Size probe (local dry-run) ────────────────────────────────────
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let blob = tokio::task::spawn_blocking(move || storage.export_snapshot(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        if blob.len() > snapshot_limits::MAX_SNAPSHOT_COMPRESSED_BYTES {
+            return Err(CoreError::SnapshotTooLarge { bytes: blob.len() });
+        }
+
+        Ok(BootstrapReport { entity_count, snapshot_bytes: blob.len() as u64 })
+    }
+
+    /// Acknowledge that a downloaded snapshot has been applied locally,
+    /// instructing the relay to delete the stored blob. Idempotent —
+    /// `RelayError::NotFound` is mapped to `Ok(())`.
+    ///
+    /// Older relays that predate the `DELETE /v1/sync/{id}/snapshot`
+    /// endpoint respond with HTTP 405 Method Not Allowed. We fold that to
+    /// `Ok(())` too and rely on the relay-side TTL to clean up the stored
+    /// blob; otherwise the joiner would surface a spurious pairing error on
+    /// an otherwise successful bootstrap.
+    pub async fn acknowledge_snapshot_applied(&self) -> Result<()> {
+        match self.relay.delete_snapshot().await {
+            Ok(()) => Ok(()),
+            Err(RelayError::NotFound) => Ok(()),
+            Err(RelayError::Http { status: 405, .. }) => {
+                tracing::debug!(
+                    "Snapshot ACK not supported by legacy relay (405); snapshot will TTL-expire on the relay side."
+                );
+                Ok(())
+            }
+            Err(e) => Err(CoreError::from_relay(e)),
+        }
     }
 
     /// Download and apply a snapshot for initial device bootstrap.

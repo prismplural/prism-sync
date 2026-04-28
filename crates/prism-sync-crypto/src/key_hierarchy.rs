@@ -169,6 +169,33 @@ impl KeyHierarchy {
         epochs
     }
 
+    /// Iterate over (epoch, key) pairs in ascending epoch order.
+    ///
+    /// Yields a 32-byte array reference for each cached epoch key. Returns
+    /// `Err` if any epoch key is not exactly 32 bytes (which would indicate
+    /// corrupt state). The returned references borrow the `KeyHierarchy`
+    /// — the caller must not keep them past the next mutation.
+    pub fn epoch_keys_iter(&self) -> Result<Vec<(u32, &[u8; 32])>> {
+        self.require_unlocked()?;
+        let mut entries: Vec<(u32, &[u8; 32])> = Vec::with_capacity(self.epoch_keys.len());
+        let mut epochs: Vec<u32> = self.epoch_keys.keys().copied().collect();
+        epochs.sort_unstable();
+        for epoch in epochs {
+            let key_vec = self
+                .epoch_keys
+                .get(&epoch)
+                .expect("epoch key just enumerated should exist");
+            let key_arr: &[u8; 32] = key_vec.as_slice().try_into().map_err(|_| {
+                CryptoError::InvalidKeyMaterial(format!(
+                    "epoch {epoch} key has unexpected length {}",
+                    key_vec.len()
+                ))
+            })?;
+            entries.push((epoch, key_arr));
+        }
+        Ok(entries)
+    }
+
     /// Export all cached epoch keys (for SyncRuntimeKeys persistence).
     pub fn export_epoch_keys(&self) -> Result<HashMap<u32, Zeroizing<Vec<u8>>>> {
         self.require_unlocked()?;

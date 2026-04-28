@@ -27,7 +27,12 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
-use crate::{auth, db, errors::AppError, state::AppState};
+use crate::{
+    auth, db,
+    errors::AppError,
+    snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES,
+    state::AppState,
+};
 
 /// Authenticated identity injected into request extensions by auth middleware.
 #[derive(Debug, Clone)]
@@ -135,22 +140,36 @@ pub(crate) fn verify_signed_request(
 
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
-    let snapshot_routes = Router::new()
-        .route("/v1/sync/{sync_id}/snapshot", put(sync::put_snapshot).get(sync::get_snapshot))
-        .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
+    // Snapshot PUT accepts the full encrypted+base64 envelope (up to
+    // ~150 MB). GET and DELETE carry no bodies in practice, so they live
+    // in the normal authenticated router under the global 10 MiB cap —
+    // there is no reason to give unbounded body room to methods that
+    // don't read a body. The large body-limit layer is scoped to PUT only.
+    let snapshot_put_route = Router::new()
+        .route("/v1/sync/{sync_id}/snapshot", put(sync::put_snapshot))
+        .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_WIRE_BYTES))
+        .layer(RequestBodyLimitLayer::new(MAX_SNAPSHOT_WIRE_BYTES))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     let media_routes = Router::new()
         .route("/v1/sync/{sync_id}/media", post(media::upload_media))
         .route("/v1/sync/{sync_id}/media/{media_id}", get(media::download_media))
-        .layer(DefaultBodyLimit::max(state.config.media_max_file_bytes));
+        .layer(DefaultBodyLimit::max(state.config.media_max_file_bytes))
+        .layer(RequestBodyLimitLayer::new(state.config.media_max_file_bytes))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
-    // Routes that require authentication
+    // Routes that require authentication (small-body — capped at 10 MiB by
+    // the global body limit applied below).
     let authenticated_routes = Router::new()
-        // Sync routes (push/pull/snapshot/delete)
+        // Sync routes (push/pull)
         .route("/v1/sync/{sync_id}/changes", put(sync::push_changes).get(sync::pull_changes))
-        .merge(snapshot_routes)
-        .merge(media_routes)
         .route("/v1/sync/{sync_id}", delete(sync::delete_account))
+        // Snapshot GET + DELETE: bodyless, so they sit under the normal
+        // 10 MiB cap alongside the other authenticated routes.
+        .route(
+            "/v1/sync/{sync_id}/snapshot",
+            get(sync::get_snapshot).delete(sync::delete_snapshot),
+        )
         // Device routes (list/revoke/rekey/ack)
         .route("/v1/sync/{sync_id}/devices", get(devices::list_devices))
         .route("/v1/sync/{sync_id}/devices/{device_id}", delete(devices::delete_device))
@@ -170,7 +189,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sharing/prekey", put(sharing::put_prekey))
         .route("/v1/sharing/init", post(sharing::post_init))
         .route("/v1/sharing/init/pending", get(sharing::get_pending_inits))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        // 10 MiB default body limit for these routes. Snapshot and media
+        // routes are merged in below already wearing their own larger
+        // limits, so they bypass this cap.
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
+
+    let authenticated_routes =
+        authenticated_routes.merge(snapshot_put_route).merge(media_routes);
 
     // Routes that do NOT require authentication
     // (WebSocket does message-based auth after upgrade)
@@ -181,7 +208,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/gifs/trending", get(gifs::get_trending))
         .route("/v1/gifs/search", get(gifs::search_gifs))
         // Public sharing route (no auth, rate-limited by IP)
-        .route("/v1/sharing/{sharing_id}/bundle", get(sharing::get_bundle));
+        .route("/v1/sharing/{sharing_id}/bundle", get(sharing::get_bundle))
+        // Public surfaces have no large-body requirement. Keep the
+        // historical 10 MiB cap as a defensive ceiling.
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
 
     // Relay is accessed only by native clients — no browser origin is expected.
     // Default CorsLayer rejects all cross-origin requests.
@@ -196,8 +227,9 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         )
         .layer(cors)
-        // 10 MiB default body limit (snapshot + media routes override with higher limits)
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        // Body limits are applied per sub-router above so the snapshot PUT
+        // can accept MAX_SNAPSHOT_WIRE_BYTES while everything else stays
+        // capped at 10 MiB (or media_max_file_bytes for media routes).
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(
             TraceLayer::new_for_http()

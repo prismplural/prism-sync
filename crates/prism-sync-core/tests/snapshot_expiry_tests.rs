@@ -189,6 +189,7 @@ async fn push_and_create_snapshot(
             0,
             Some(300),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -370,6 +371,7 @@ async fn test_snapshot_upload_with_device_targeting() {
             0,
             Some(300),
             Some("target-device-123".to_string()),
+            None,
         )
         .await
         .unwrap();

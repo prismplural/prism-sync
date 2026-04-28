@@ -11,7 +11,7 @@ use super::traits::{
     DeviceInfo, DeviceRegistry, EpochManagement, MediaRelay, OutgoingBatch, PullResponse,
     ReceivedBatch, RegisterRequest, RegisterResponse, RegistrationNonceResponse, RelayError,
     RotateMlDsaResponse, SignedBatchEnvelope, SignedRegistryResponse, SnapshotExchange,
-    SnapshotResponse, SyncNotification, SyncRelay, SyncTransport,
+    SnapshotResponse, SnapshotUploadProgress, SyncNotification, SyncRelay, SyncTransport,
 };
 
 /// In-memory mock implementation of [`SyncRelay`] for testing.
@@ -391,15 +391,37 @@ impl SnapshotExchange for MockRelay {
         &self,
         epoch: i32,
         server_seq_at: i64,
-        data: Vec<u8>,
+        envelope_bytes: Vec<u8>,
         _ttl_secs: Option<u64>,
         for_device_id: Option<String>,
-        sender_device_id: String,
+        uploader_device_id: String,
+        progress: Option<SnapshotUploadProgress>,
     ) -> Result<(), RelayError> {
+        let total = envelope_bytes.len() as u64;
         let mut state = self.state.lock().unwrap();
-        state.snapshot = Some(SnapshotResponse { epoch, server_seq_at, data, sender_device_id });
+        state.snapshot = Some(SnapshotResponse {
+            epoch,
+            server_seq_at,
+            data: envelope_bytes,
+            sender_device_id: uploader_device_id,
+        });
         state.snapshot_target_device_id = for_device_id;
+        drop(state);
+        if let Some(cb) = progress {
+            cb(total, total);
+        }
         Ok(())
+    }
+
+    async fn delete_snapshot(&self) -> Result<(), RelayError> {
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.is_some() {
+            state.snapshot = None;
+            state.snapshot_target_device_id = None;
+            Ok(())
+        } else {
+            Err(RelayError::NotFound)
+        }
     }
 }
 
@@ -542,7 +564,10 @@ mod tests {
     async fn snapshot_round_trip() {
         let relay = MockRelay::new();
         assert!(relay.get_snapshot().await.unwrap().is_none());
-        relay.put_snapshot(1, 10, vec![9, 8, 7], None, None, "device-1".to_string()).await.unwrap();
+        relay
+            .put_snapshot(1, 10, vec![9, 8, 7], None, None, "device-1".to_string(), None)
+            .await
+            .unwrap();
         let snap = relay.get_snapshot().await.unwrap().unwrap();
         assert_eq!(snap.epoch, 1);
         assert_eq!(snap.server_seq_at, 10);
@@ -566,13 +591,17 @@ mod tests {
                 None,
                 Some("device-a".to_string()),
                 "sender-1".to_string(),
+                None,
             )
             .await
             .unwrap();
         assert_eq!(relay.snapshot_target_device_id(), Some("device-a".to_string()));
 
         // Replace with an untargeted snapshot.
-        relay.put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string()).await.unwrap();
+        relay
+            .put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string(), None)
+            .await
+            .unwrap();
         assert_eq!(relay.snapshot_target_device_id(), None);
     }
 
@@ -589,6 +618,7 @@ mod tests {
                 None,
                 Some("device-a".to_string()),
                 "sender-1".to_string(),
+                None,
             )
             .await
             .unwrap();
@@ -603,7 +633,10 @@ mod tests {
         );
 
         // Untargeted snapshot is served to any device.
-        relay.put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string()).await.unwrap();
+        relay
+            .put_snapshot(1, 6, vec![4, 5, 6], None, None, "sender-1".to_string(), None)
+            .await
+            .unwrap();
         assert!(relay.get_snapshot_for_device("device-b").is_some());
         assert!(relay.get_snapshot_for_device("device-c").is_some());
     }

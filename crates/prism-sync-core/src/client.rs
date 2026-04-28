@@ -18,15 +18,17 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::engine::{SyncConfig, SyncEngine};
+use crate::device_registry::DeviceRegistryManager;
+use crate::engine::{BootstrapReport, SeedRecord, SyncConfig, SyncEngine};
+use crate::epoch::EpochManager;
 use crate::error::{CoreError, Result};
-use crate::events::{event_channel, SyncEvent};
+use crate::events::{event_channel, EntityChange, SyncEvent};
+use crate::hlc::Hlc;
 use crate::op_emitter::OpEmitter;
-use crate::recovery::{
-    commit_recovered_epoch_material, persist_epoch_cache, persist_epoch_key, KeyHierarchyRecoverer,
-};
+use crate::pairing::SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+use crate::recovery::{commit_recovered_epoch_material, KeyHierarchyRecoverer};
 use crate::relay::SyncRelay;
-use crate::schema::{SyncSchema, SyncValue};
+use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::secure_store::SecureStore;
 use crate::storage::{StorageError, SyncStorage};
 use crate::sync_service::{AutoSyncConfig, SyncService};
@@ -343,7 +345,34 @@ impl PrismSync {
             self.schema.clone(),
             SyncConfig::default(),
         );
-        self.op_emitter = Some(OpEmitter::new(node_id.clone(), sync_id.clone(), epoch, None));
+
+        // Seed the OpEmitter's HLC watermark from the max HLC across all
+        // currently-stored `field_versions`. Without this, a freshly
+        // configured engine starts its emitter at `Hlc::zero`, which can
+        // produce a smaller HLC than rows imported from a snapshot or
+        // seeded via `bootstrap_existing_state` — the first local mutation
+        // then races the seeded row and loses on the HLC tiebreaker.
+        let max_hlc =
+            match self.storage.list_all_field_version_hlcs(&sync_id) {
+                Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
+                    Ok(max) => max,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "configure_engine: failed to parse stored HLCs — starting emitter at zero"
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configure_engine: failed to list field_version HLCs — starting emitter at zero"
+                    );
+                    None
+                }
+            };
+        self.op_emitter = Some(OpEmitter::new(node_id.clone(), sync_id.clone(), epoch, max_hlc));
 
         // Derive and store the device signing keys if a DeviceSecret is available.
         if let Some(ref device_secret) = self.device_secret {
@@ -431,13 +460,10 @@ impl PrismSync {
 
     /// Recover any epoch keys we might be missing from the relay.
     ///
-    /// Iterates forward from the current runtime epoch and asks the relay
-    /// for the per-device wrapped rekey artifact for each subsequent epoch.
-    /// When an artifact is available, the X-Wing KEM is run against the
-    /// device's own decapsulation key to unwrap the epoch key, which is
-    /// then stored in the live key hierarchy and persisted to the secure
-    /// store. When a fetch returns `None`, the loop stops — that's the
-    /// relay's signal that no further rotations are waiting.
+    /// Uses the relay's latest signed registry as the authority for the
+    /// target epoch and per-epoch key commitments, then asks the relay for
+    /// each missing per-device rekey artifact. A recovered key is accepted
+    /// only after it matches the hash committed by that verified registry.
     ///
     /// This covers the "missed EpochRotated notification" case. The normal
     /// recovery path in sync_service::spawn_notification_handler only fires
@@ -447,9 +473,9 @@ impl PrismSync {
     /// at the pre-rotation epoch and fail the next pull with a typed
     /// `CoreError::MissingEpochKey { epoch: N }`.
     ///
-    /// Best-effort: logs and returns `Ok(())` on any relay, crypto, or
-    /// storage failure. Sync still proceeds and the normal error surface
-    /// reports the underlying problem if recovery didn't fix it.
+    /// Best-effort: logs and returns `Ok(())` on any relay, registry,
+    /// crypto, or storage failure. Sync still proceeds and the normal error
+    /// surface reports the underlying problem if recovery didn't fix it.
     async fn catch_up_epoch_keys(&mut self) -> Result<()> {
         let relay = match self.sync_service.relay() {
             Some(r) => r.clone(),
@@ -472,159 +498,176 @@ impl PrismSync {
                 return Ok(());
             }
         };
-        let xwing_key = match self.device_secret.as_ref() {
-            Some(ds) => match ds.xwing_keypair(&device_id) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "catch_up_epoch_keys: failed to derive X-Wing keypair"
-                    );
-                    return Ok(());
-                }
-            },
-            None => {
-                tracing::debug!("catch_up_epoch_keys: skipped (no device_secret)");
+        let Some(device_secret) = self.device_secret.as_ref() else {
+            tracing::debug!("catch_up_epoch_keys: skipped (no device_secret)");
+            return Ok(());
+        };
+
+        let local_epoch = self.epoch.unwrap_or(0).max(0) as u32;
+        let devices = match relay.list_devices().await {
+            Ok(devices) => devices,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "catch_up_epoch_keys: failed to list devices"
+                );
                 return Ok(());
             }
         };
-
-        let start_epoch = self.epoch.unwrap_or(0) as u32;
-        let mut target = start_epoch.saturating_add(1);
-        let mut highest_available: u32 = start_epoch;
-        let mut relay_attempts = 0u32;
-        let mut iterations = 0u32;
-        let mut terminated_because: &'static str = "scan_budget_exhausted";
+        let Some(current_device) = devices.iter().find(|device| device.device_id == device_id)
+        else {
+            tracing::warn!(
+                device_id = %device_id,
+                "catch_up_epoch_keys: current device missing from relay device list"
+            );
+            return Ok(());
+        };
+        if current_device.status != "active" {
+            tracing::warn!(
+                device_id = %device_id,
+                status = %current_device.status,
+                "catch_up_epoch_keys: current device is not active"
+            );
+            return Ok(());
+        }
+        let relay_epoch = current_device.epoch.max(0) as u32;
+        if relay_epoch <= local_epoch {
+            tracing::debug!(
+                local_epoch,
+                relay_epoch,
+                "catch_up_epoch_keys: skipped (local epoch is current)"
+            );
+            return Ok(());
+        }
 
         tracing::info!(
-            start_epoch,
-            first_target = target,
+            local_epoch,
+            relay_epoch,
             known_epochs = ?self.key_hierarchy.known_epochs(),
             sync_id = %sync_id,
             device_id = %device_id,
             "catch_up_epoch_keys: entering preflight"
         );
 
-        // Bound the skip scan (devices with many cached epochs) and the
-        // relay fetches independently so a misbehaving relay can't hang us
-        // and a large key_hierarchy doesn't eat our relay budget.
-        for _ in 0..4096 {
-            iterations += 1;
-            if relay_attempts >= 32 {
-                terminated_because = "relay_attempt_budget_hit";
-                break;
-            }
-
-            if self.key_hierarchy.has_epoch_key(target) {
-                tracing::debug!(
-                    epoch = target,
-                    action = "skip",
-                    reason = "already_cached",
-                    "catch_up_epoch_keys: iteration"
+        let registry_response = match relay.get_signed_registry().await {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                tracing::warn!(
+                    local_epoch,
+                    relay_epoch,
+                    "catch_up_epoch_keys: relay is ahead but no signed registry is available"
                 );
-                highest_available = target;
-                target = target.saturating_add(1);
-                continue;
+                return Ok(());
             }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "catch_up_epoch_keys: failed to fetch signed registry"
+                );
+                return Ok(());
+            }
+        };
+        let storage = self.storage.clone();
+        let sid = sync_id.clone();
+        let blob = registry_response.artifact_blob.clone();
+        let snapshot = match tokio::task::spawn_blocking(move || {
+            DeviceRegistryManager::verify_signed_registry_snapshot(&*storage, &sid, &blob)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "catch_up_epoch_keys: signed registry verification failed"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "catch_up_epoch_keys: signed registry verification task failed"
+                );
+                return Ok(());
+            }
+        };
 
-            relay_attempts += 1;
-            tracing::debug!(
-                epoch = target,
-                action = "fetch",
-                relay_attempts,
-                "catch_up_epoch_keys: iteration"
+        if snapshot.registry_version < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING {
+            tracing::warn!(
+                registry_version = snapshot.registry_version,
+                "catch_up_epoch_keys: signed registry version cannot prove epoch keys"
             );
-            match relay.get_rekey_artifact(target as i32, &device_id).await {
-                Ok(Some(_)) => {
-                    match crate::epoch::EpochManager::handle_rotation(
-                        relay.as_ref(),
-                        &mut self.key_hierarchy,
-                        target,
-                        &device_id,
-                        &xwing_key,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            tracing::info!(
-                                epoch = target,
-                                "catch_up_epoch_keys: recovered epoch key"
-                            );
-                            if let Ok(key) = self.key_hierarchy.epoch_key(target) {
-                                if let Err(e) =
-                                    persist_epoch_key(self.secure_store.as_ref(), target, key)
-                                {
-                                    tracing::warn!(
-                                        epoch = target,
-                                        error = %e,
-                                        "catch_up_epoch_keys: failed to persist epoch key"
-                                    );
-                                }
-                                if let Err(e) =
-                                    persist_epoch_cache(self.secure_store.as_ref(), target as i32)
-                                {
-                                    tracing::warn!(
-                                        epoch = target,
-                                        error = %e,
-                                        "catch_up_epoch_keys: failed to persist epoch cache"
-                                    );
-                                }
-                            }
-                            highest_available = target;
-                            target = target.saturating_add(1);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                epoch = target,
-                                error = %e,
-                                "catch_up_epoch_keys: handle_rotation failed"
-                            );
-                            terminated_because = "handle_rotation_failed";
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // No artifact for this epoch. Could mean either (a) we're
-                    // fully caught up, or (b) this device was not a survivor
-                    // of that particular rotation — higher epochs may still
-                    // have artifacts for us. Log prominently so we can tell.
-                    tracing::info!(
-                        epoch = target,
-                        start_epoch,
-                        highest_available,
-                        relay_attempts,
-                        "catch_up_epoch_keys: no artifact at target — terminating scan"
-                    );
-                    terminated_because = "no_artifact";
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        epoch = target,
-                        error = %e,
-                        "catch_up_epoch_keys: relay fetch failed"
-                    );
-                    terminated_because = "relay_fetch_error";
-                    break;
-                }
-            }
+            return Ok(());
+        }
+        if snapshot.current_epoch < relay_epoch {
+            tracing::warn!(
+                registry_epoch = snapshot.current_epoch,
+                relay_epoch,
+                "catch_up_epoch_keys: signed registry lags relay epoch"
+            );
+            return Ok(());
+        }
+        let Some(current_entry) =
+            snapshot.entries.iter().find(|entry| entry.device_id == device_id)
+        else {
+            tracing::warn!(
+                device_id = %device_id,
+                "catch_up_epoch_keys: signed registry missing current device"
+            );
+            return Ok(());
+        };
+        if current_entry.status != "active" {
+            tracing::warn!(
+                device_id = %device_id,
+                status = %current_entry.status,
+                "catch_up_epoch_keys: signed registry marks current device non-active"
+            );
+            return Ok(());
         }
 
+        let target_epoch = snapshot.current_epoch.max(relay_epoch);
+        let catch_up = EpochManager::catch_up_epoch_keys(
+            relay.as_ref(),
+            &mut self.key_hierarchy,
+            self.secure_store.as_ref(),
+            device_secret,
+            &device_id,
+            local_epoch,
+            target_epoch,
+            &snapshot.epoch_key_hashes,
+        )
+        .await;
+        let recovered_through = match catch_up {
+            Ok(result) => result.recovered_through,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "catch_up_epoch_keys: verified catch-up failed"
+                );
+                self.secure_store
+                    .get("epoch")
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|epoch| *epoch > local_epoch)
+                    .unwrap_or(local_epoch)
+            }
+        };
+
         tracing::info!(
-            start_epoch,
-            highest_available,
-            relay_attempts,
-            iterations,
-            terminated_because,
+            local_epoch,
+            relay_epoch,
+            registry_epoch = snapshot.current_epoch,
+            recovered_through,
             final_known_epochs = ?self.key_hierarchy.known_epochs(),
             "catch_up_epoch_keys: exit"
         );
 
-        if (highest_available as i32) > self.epoch.unwrap_or(0) {
+        if recovered_through > local_epoch {
             let storage = self.storage.clone();
             let sid = sync_id;
-            let ne = highest_available as i32;
+            let ne = recovered_through as i32;
             let update_result = tokio::task::spawn_blocking(move || {
                 let mut tx = storage.begin_tx()?;
                 tx.update_current_epoch(&sid, ne)?;
@@ -650,7 +693,7 @@ impl PrismSync {
                 }
             }
             if persisted {
-                self.advance_epoch(highest_available as i32);
+                self.advance_epoch(recovered_through as i32);
             }
         }
 
@@ -738,10 +781,63 @@ impl PrismSync {
     ///
     /// Requires [`configure_engine`](Self::configure_engine) to have been
     /// called.
-    pub async fn bootstrap_from_snapshot(
-        &mut self,
-    ) -> Result<(u64, Vec<crate::events::EntityChange>)> {
+    pub async fn bootstrap_from_snapshot(&mut self) -> Result<(u64, Vec<EntityChange>)> {
         self.sync_service.bootstrap_from_snapshot(&self.key_hierarchy).await
+    }
+
+    /// Seed `field_versions` from pre-existing local data (first-device
+    /// bootstrap). No relay traffic; no `pending_ops` produced.
+    ///
+    /// See [`SyncEngine::bootstrap_existing_state`] for semantics and guards.
+    /// Also re-seeds the live `OpEmitter`'s HLC watermark after seeding so
+    /// subsequent `record_create` calls stamp strictly greater HLCs.
+    pub async fn bootstrap_existing_state(
+        &mut self,
+        records: Vec<SeedRecord>,
+    ) -> Result<BootstrapReport> {
+        let report = self.sync_service.bootstrap_existing_state(records).await?;
+
+        // Re-read the max HLC from storage and update the live emitter so
+        // that any subsequent record_create/record_update uses a strictly
+        // greater HLC than anything that was just seeded.
+        if let (Some(sync_id), Some(emitter)) =
+            (self.sync_service.sync_id(), self.op_emitter.as_mut())
+        {
+            match self.storage.list_all_field_version_hlcs(sync_id) {
+                Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
+                    Ok(Some(max)) => {
+                        if &max > emitter.last_hlc() {
+                            emitter.set_last_hlc(max);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "bootstrap_existing_state: failed to parse stored HLCs after seeding"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "bootstrap_existing_state: failed to read stored HLCs after seeding"
+                    );
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Acknowledge that the downloaded snapshot has been applied locally.
+    ///
+    /// Instructs the relay to delete the snapshot via
+    /// `DELETE /v1/sync/{id}/snapshot`. Idempotent: a relay-side 404 is
+    /// mapped to `Ok(())` so concurrent joiners and expired-TTL cases don't
+    /// surface as errors.
+    pub async fn acknowledge_snapshot_applied(&self) -> Result<()> {
+        self.sync_service.acknowledge_snapshot_applied().await
     }
 
     // ── Consumer mutation API ──
@@ -756,6 +852,10 @@ impl PrismSync {
         entity_id: &str,
         fields: &HashMap<String, SyncValue>,
     ) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        self.validate_mutation_fields(table, fields)?;
         let emitter = self
             .op_emitter
             .as_mut()
@@ -780,6 +880,13 @@ impl PrismSync {
         entity_id: &str,
         changed_fields: &HashMap<String, SyncValue>,
     ) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        if changed_fields.is_empty() {
+            return Ok(());
+        }
+        self.validate_mutation_fields(table, changed_fields)?;
         let emitter = self
             .op_emitter
             .as_mut()
@@ -800,6 +907,10 @@ impl PrismSync {
     /// Creates a tombstone op (`is_deleted = true`). Returns an error if the
     /// sync engine has not been configured.
     pub fn record_delete(&mut self, table: &str, entity_id: &str) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        self.schema.entity(table).ok_or_else(|| CoreError::UnknownTable(table.to_string()))?;
         let emitter = self
             .op_emitter
             .as_mut()
@@ -880,6 +991,24 @@ impl PrismSync {
         self.ml_dsa_key_generation = None;
         self.device_id = None;
         self.epoch = None;
+
+        Ok(())
+    }
+
+    fn validate_mutation_fields(
+        &self,
+        table: &str,
+        fields: &HashMap<String, SyncValue>,
+    ) -> Result<()> {
+        let entity =
+            self.schema.entity(table).ok_or_else(|| CoreError::UnknownTable(table.to_string()))?;
+
+        for (field_name, value) in fields {
+            let field = entity.field_by_name(field_name).ok_or_else(|| {
+                CoreError::UnknownField { table: table.to_string(), field: field_name.clone() }
+            })?;
+            validate_sync_value_type(table, field_name, field.sync_type, value)?;
+        }
 
         Ok(())
     }
@@ -1206,14 +1335,66 @@ impl PrismSync {
     }
 }
 
+fn validate_sync_value_type(
+    table: &str,
+    field: &str,
+    expected: SyncType,
+    value: &SyncValue,
+) -> Result<()> {
+    if let SyncValue::Real(value) = value {
+        if !value.is_finite() {
+            return Err(CoreError::Schema(format!(
+                "field '{table}.{field}' received non-finite Real value"
+            )));
+        }
+    }
+
+    if value.is_null() {
+        return Ok(());
+    }
+
+    let matches = match (expected, value) {
+        (SyncType::String, SyncValue::String(_)) => true,
+        (SyncType::Int, SyncValue::Int(_)) => true,
+        (SyncType::Real, SyncValue::Real(_)) => true,
+        (SyncType::Real, SyncValue::Int(_)) => true,
+        (SyncType::Bool, SyncValue::Bool(_)) => true,
+        (SyncType::DateTime, SyncValue::DateTime(_)) => true,
+        (SyncType::Blob, SyncValue::Blob(_)) => true,
+        _ => false,
+    };
+
+    if matches {
+        Ok(())
+    } else {
+        Err(CoreError::Schema(format!(
+            "field '{table}.{field}' expects {expected:?}, got {}",
+            sync_value_type_name(value)
+        )))
+    }
+}
+
+fn sync_value_type_name(value: &SyncValue) -> &'static str {
+    match value {
+        SyncValue::Null => "Null",
+        SyncValue::String(_) => "String",
+        SyncValue::Int(_) => "Int",
+        SyncValue::Real(_) => "Real",
+        SyncValue::Bool(_) => "Bool",
+        SyncValue::DateTime(_) => "DateTime",
+        SyncValue::Blob(_) => "Blob",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::op_emitter::DELETED_FIELD;
+    use crate::pairing::{compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot};
     use crate::relay::traits::*;
     use crate::schema::SyncType;
     use crate::secure_store::SecureStore;
-    use crate::storage::RusqliteSyncStorage;
+    use crate::storage::{DeviceRecord, RusqliteSyncStorage};
     use async_trait::async_trait;
     use futures_util::Stream;
     use std::collections::HashMap;
@@ -1337,7 +1518,11 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1386,6 +1571,7 @@ mod tests {
     struct RevokeTestRelayState {
         devices: Vec<DeviceInfo>,
         artifacts: HashMap<(i32, String), Vec<u8>>,
+        signed_registry: Option<SignedRegistryResponse>,
         behavior: RevokeBehavior,
         revoke_calls: u32,
     }
@@ -1400,6 +1586,7 @@ mod tests {
                 state: Mutex::new(RevokeTestRelayState {
                     devices,
                     artifacts: HashMap::new(),
+                    signed_registry: None,
                     behavior,
                     revoke_calls: 0,
                 }),
@@ -1408,6 +1595,14 @@ mod tests {
 
         fn revoke_calls(&self) -> u32 {
             self.state.lock().unwrap().revoke_calls
+        }
+
+        fn insert_artifact(&self, epoch: i32, device_id: &str, artifact: Vec<u8>) {
+            self.state.lock().unwrap().artifacts.insert((epoch, device_id.to_string()), artifact);
+        }
+
+        fn set_signed_registry(&self, signed_registry: SignedRegistryResponse) {
+            self.state.lock().unwrap().signed_registry = Some(signed_registry);
         }
 
         fn commit_revoke(
@@ -1512,7 +1707,7 @@ mod tests {
         async fn get_signed_registry(
             &self,
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-            Ok(None)
+            Ok(self.state.lock().unwrap().signed_registry.clone())
         }
     }
 
@@ -1549,7 +1744,12 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1621,12 +1821,99 @@ mod tests {
         }
     }
 
+    fn make_device_record(sync_id: &str, info: &DeviceInfo) -> DeviceRecord {
+        let now = chrono::Utc::now();
+        DeviceRecord {
+            sync_id: sync_id.to_string(),
+            device_id: info.device_id.clone(),
+            ed25519_public_key: info.ed25519_public_key.clone(),
+            x25519_public_key: info.x25519_public_key.clone(),
+            ml_dsa_65_public_key: info.ml_dsa_65_public_key.clone(),
+            ml_kem_768_public_key: info.ml_kem_768_public_key.clone(),
+            x_wing_public_key: info.x_wing_public_key.clone(),
+            status: info.status.clone(),
+            registered_at: now,
+            revoked_at: None,
+            ml_dsa_key_generation: info.ml_dsa_key_generation,
+        }
+    }
+
+    fn make_registry_entry(sync_id: &str, info: &DeviceInfo) -> RegistrySnapshotEntry {
+        RegistrySnapshotEntry {
+            sync_id: sync_id.to_string(),
+            device_id: info.device_id.clone(),
+            ed25519_public_key: info.ed25519_public_key.clone(),
+            x25519_public_key: info.x25519_public_key.clone(),
+            ml_dsa_65_public_key: info.ml_dsa_65_public_key.clone(),
+            ml_kem_768_public_key: info.ml_kem_768_public_key.clone(),
+            x_wing_public_key: info.x_wing_public_key.clone(),
+            status: info.status.clone(),
+            ml_dsa_key_generation: info.ml_dsa_key_generation,
+        }
+    }
+
+    fn build_v2_artifact(
+        receiver_xwing: &prism_sync_crypto::DeviceXWingKey,
+        epoch_key: &[u8],
+        epoch: u32,
+        device_id: &str,
+    ) -> Vec<u8> {
+        use prism_sync_crypto::pq::hybrid_kem::XWingKem;
+
+        let ek_bytes = receiver_xwing.encapsulation_key_bytes();
+        let ek = XWingKem::encapsulation_key_from_bytes(&ek_bytes).unwrap();
+        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+        let (ciphertext, shared_secret_raw) = XWingKem::encapsulate(&ek, &mut rng);
+        let shared_secret = zeroize::Zeroizing::new(shared_secret_raw);
+
+        let mut salt = Vec::with_capacity(4 + device_id.len());
+        salt.extend_from_slice(&epoch.to_le_bytes());
+        salt.extend_from_slice(device_id.as_bytes());
+        let wrap_key =
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+                .unwrap();
+        let encrypted_epoch_key =
+            prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
+
+        let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
+        artifact.push(0x02);
+        artifact.extend_from_slice(&ciphertext);
+        artifact.extend_from_slice(&encrypted_epoch_key);
+        artifact
+    }
+
+    fn signed_registry_response(
+        sync_id: &str,
+        signer_secret: &DeviceSecret,
+        signer_device_id: &str,
+        device_info: &DeviceInfo,
+        current_epoch: u32,
+        epoch_keys: &[(u32, [u8; 32])],
+    ) -> SignedRegistryResponse {
+        let signing_key = signer_secret.ed25519_keypair(signer_device_id).unwrap();
+        let pq_signing_key = signer_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
+        let epoch_key_hashes =
+            epoch_keys.iter().map(|(epoch, key)| (*epoch, compute_epoch_key_hash(key))).collect();
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![make_registry_entry(sync_id, device_info)],
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            current_epoch,
+            epoch_key_hashes,
+        );
+        SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: snapshot.sign_hybrid(&signing_key, &pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        }
+    }
+
     fn make_sync() -> PrismSync {
         let schema = SyncSchema::builder()
             .entity("members", |e| {
                 e.field("name", SyncType::String)
                     .field("age", SyncType::Int)
                     .field("active", SyncType::Bool)
+                    .field("score", SyncType::Real)
             })
             .build();
         let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
@@ -1650,12 +1937,165 @@ mod tests {
         );
     }
 
+    fn prepare_verified_epoch_catch_up(
+        include_epoch_2_artifact: bool,
+    ) -> (PrismSync, Arc<RevokeTestRelay>, String, [u8; 32], [u8; 32]) {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let sync_id = "sync-1";
+        let self_device_id = "a1b2c3d4e5f6";
+        let device_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let device_info = make_device_info(self_device_id, &device_secret, 2, "active");
+        DeviceRegistryManager::pin_device(
+            sync.storage().as_ref(),
+            sync_id,
+            &make_device_record(sync_id, &device_info),
+        )
+        .unwrap();
+
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+        let xwing_key = device_secret.xwing_keypair(self_device_id).unwrap();
+
+        let relay =
+            Arc::new(RevokeTestRelay::new(vec![device_info.clone()], RevokeBehavior::Success));
+        relay.insert_artifact(
+            1,
+            self_device_id,
+            build_v2_artifact(&xwing_key, &epoch_1_key, 1, self_device_id),
+        );
+        if include_epoch_2_artifact {
+            relay.insert_artifact(
+                2,
+                self_device_id,
+                build_v2_artifact(&xwing_key, &epoch_2_key, 2, self_device_id),
+            );
+        }
+        relay.set_signed_registry(signed_registry_response(
+            sync_id,
+            &device_secret,
+            self_device_id,
+            &device_info,
+            2,
+            &[(0, epoch_0_key), (1, epoch_1_key), (2, epoch_2_key)],
+        ));
+
+        sync.configure_engine(relay.clone(), sync_id.to_string(), self_device_id.to_string(), 0, 0);
+
+        (sync, relay, self_device_id.to_string(), epoch_1_key, epoch_2_key)
+    }
+
+    #[tokio::test]
+    async fn sync_preflight_catches_up_epoch_keys_from_verified_registry() {
+        let (mut sync, _relay, _device_id, epoch_1_key, epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        assert_eq!(sync.epoch(), Some(2));
+        assert_eq!(sync.key_hierarchy().epoch_key(1).unwrap(), &epoch_1_key);
+        assert_eq!(sync.key_hierarchy().epoch_key(2).unwrap(), &epoch_2_key);
+        assert!(sync.secure_store().get("epoch_key_1").unwrap().is_some());
+        assert!(sync.secure_store().get("epoch_key_2").unwrap().is_some());
+        assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn sync_preflight_advances_only_verified_prefix_when_artifact_missing() {
+        let (mut sync, _relay, _device_id, epoch_1_key, _epoch_2_key) =
+            prepare_verified_epoch_catch_up(false);
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        assert_eq!(sync.epoch(), Some(1));
+        assert_eq!(sync.key_hierarchy().epoch_key(1).unwrap(), &epoch_1_key);
+        assert!(!sync.key_hierarchy().has_epoch_key(2));
+        assert!(sync.secure_store().get("epoch_key_1").unwrap().is_some());
+        assert!(sync.secure_store().get("epoch_key_2").unwrap().is_none());
+        assert_eq!(sync.secure_store().get("epoch").unwrap().unwrap().as_slice(), b"1");
+        assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 1);
+    }
+
     #[test]
     fn configure_engine_sets_engine() {
         let mut sync = make_sync();
         assert!(!sync.sync_service.has_engine());
         configure(&mut sync);
         assert!(sync.sync_service.has_engine());
+    }
+
+    /// Regression guard for the HLC-init bug: if `field_versions` contains a
+    /// pre-existing row (e.g. from a snapshot import or a prior
+    /// `bootstrap_existing_state`), `configure_engine` must seed the live
+    /// `OpEmitter`'s `last_hlc` from the max across those rows. Otherwise the
+    /// first local mutation stamps a smaller HLC and loses the CRDT
+    /// tiebreaker against remote state.
+    #[test]
+    fn configure_engine_seeds_hlc_from_existing_field_versions() {
+        use crate::hlc::Hlc;
+        use crate::storage::FieldVersion;
+
+        let schema = SyncSchema::builder()
+            .entity("members", |e| e.field("name", SyncType::String))
+            .build();
+        let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
+
+        // Pre-populate field_versions with a high-counter HLC to make the
+        // :9/:10 ordering bug easy to catch.
+        let pre_hlc = "1234567890:99:preseeddev001";
+        {
+            use crate::storage::SyncStorage;
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "pre-1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-pre".to_string(),
+                winning_device_id: "preseeddev001".to_string(),
+                winning_hlc: pre_hlc.to_string(),
+                winning_encoded_value: Some("\"Pre\"".to_string()),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let secure_store = Arc::new(MemStore::default());
+        let mut sync = PrismSync::builder()
+            .schema(schema)
+            .storage(Arc::new(storage))
+            .secure_store(secure_store)
+            .build()
+            .expect("build should succeed");
+
+        configure(&mut sync);
+
+        let pre_parsed = Hlc::from_string(pre_hlc).unwrap();
+        let emitter_hlc = sync.op_emitter.as_ref().expect("emitter").last_hlc().clone();
+        assert!(
+            emitter_hlc >= pre_parsed,
+            "emitter HLC {emitter_hlc:?} must be >= pre-seeded HLC {pre_parsed:?}"
+        );
+
+        // A subsequent record_create must mint an HLC strictly greater than
+        // the pre-existing one.
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Post".to_string()));
+        sync.record_create("members", "post-1", &fields).unwrap();
+        let fv = sync
+            .storage
+            .get_field_version("sync-1", "members", "post-1", "name")
+            .unwrap()
+            .unwrap();
+        let post_hlc = Hlc::from_string(&fv.winning_hlc).unwrap();
+        assert!(
+            post_hlc > pre_parsed,
+            "post-configure HLC {post_hlc:?} must exceed pre-seeded HLC {pre_parsed:?}"
+        );
     }
 
     #[test]
@@ -1705,6 +2145,65 @@ mod tests {
         let update_ops = sync.storage.load_batch_ops(&batch_ids[1]).unwrap();
         assert_eq!(update_ops.len(), 1);
         assert_eq!(update_ops[0].field_name, "name");
+    }
+
+    #[test]
+    fn record_create_rejects_real_for_int_field() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut fields = HashMap::new();
+        fields.insert("age".to_string(), SyncValue::Real(25.5));
+
+        let err = sync.record_create("members", "ent-1", &fields).unwrap_err();
+        assert!(err.to_string().contains("expects Int, got Real"), "unexpected error: {err}");
+        assert!(sync.storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_create_allows_int_for_real_field() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut fields = HashMap::new();
+        fields.insert("score".to_string(), SyncValue::Int(8));
+
+        sync.record_create("members", "ent-1", &fields).unwrap();
+
+        let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
+        let ops = sync.storage.load_batch_ops(&batch_ids[0]).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].field_name, "score");
+        assert_eq!(ops[0].encoded_value, "8");
+    }
+
+    #[test]
+    fn record_create_rejects_non_finite_real() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut fields = HashMap::new();
+        fields.insert("score".to_string(), SyncValue::Real(f64::NAN));
+
+        let err = sync.record_create("members", "ent-1", &fields).unwrap_err();
+        assert!(err.to_string().contains("non-finite Real"), "unexpected error: {err}");
+        assert!(sync.storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_update_rejects_unknown_field() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut changed = HashMap::new();
+        changed.insert("unknown".to_string(), SyncValue::String("value".to_string()));
+
+        let err = sync.record_update("members", "ent-1", &changed).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field: members.unknown"),
+            "unexpected error: {err}"
+        );
+        assert!(sync.storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
     }
 
     #[test]

@@ -49,6 +49,21 @@ fn make_handle_with_schema() -> prism_sync_ffi::api::PrismSyncHandle {
     .expect("create_prism_sync with schema should succeed")
 }
 
+fn app_sync_schema_json() -> Option<String> {
+    let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../app");
+    if !app_dir.exists() {
+        return None;
+    }
+    let path = app_dir.join("lib/core/sync/sync_schema.dart");
+    let source = std::fs::read_to_string(path).expect("failed to read app sync schema");
+
+    let marker = "const String prismSyncSchema = '''";
+    let start = source.find(marker).expect("prismSyncSchema const should exist") + marker.len();
+    let rest = &source[start..];
+    let end = rest.find("''';").expect("prismSyncSchema const should be closed");
+    Some(rest[..end].trim().to_string())
+}
+
 // ── Construction ──
 
 #[tokio::test]
@@ -74,6 +89,23 @@ async fn create_handle_with_schema_json() {
         None,
     );
     assert!(result.is_ok(), "schema JSON should parse: {:?}", result.err());
+}
+
+#[tokio::test]
+async fn create_handle_accepts_app_prism_sync_schema() {
+    let Some(schema) = app_sync_schema_json() else {
+        eprintln!("skipping app-schema FFI parse test; app sync schema is not present");
+        return;
+    };
+
+    let result = api::create_prism_sync(
+        "https://localhost:8080".into(),
+        ":memory:".into(),
+        false,
+        schema,
+        None,
+    );
+    assert!(result.is_ok(), "app schema JSON should parse: {:?}", result.err());
 }
 
 #[tokio::test]
@@ -285,6 +317,37 @@ async fn record_create_fails_without_engine() {
     let result = api::record_create(&handle, "members".into(), "ent-1".into(), fields.into()).await;
     assert!(result.is_err(), "record_create should fail without engine");
     assert!(result.unwrap_err().contains("sync not configured"));
+}
+
+#[tokio::test]
+async fn record_create_accepts_dart_offsetless_datetime_before_engine_check() {
+    let schema = r#"{"entities":{"events":{"fields":{"created_at":"DateTime"}}}}"#;
+    let handle = api::create_prism_sync(
+        "https://localhost:8080".into(),
+        ":memory:".into(),
+        false,
+        schema.into(),
+        None,
+    )
+    .expect("create_prism_sync with DateTime schema should succeed");
+
+    let result = api::record_create(
+        &handle,
+        "events".into(),
+        "event-1".into(),
+        r#"{"created_at":"2026-04-27T12:34:56.789"}"#.into(),
+    )
+    .await;
+
+    let error = result.expect_err("record_create should still fail before configure_engine");
+    assert!(
+        error.contains("sync not configured"),
+        "DateTime parsing should pass and reach engine configuration check, got: {error}"
+    );
+    assert!(
+        !error.contains("Invalid date string"),
+        "Dart offsetless DateTime should not be rejected, got: {error}"
+    );
 }
 
 #[tokio::test]

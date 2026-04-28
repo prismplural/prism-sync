@@ -18,7 +18,7 @@ use crate::pairing::models::*;
 use crate::relay::pairing_relay::{PairingRelay, PairingSlot};
 use crate::relay::traits::{
     FirstDeviceAdmissionProof, ProofOfWorkChallenge, ProofOfWorkSolution,
-    RegistrationNonceResponse, RegistryApproval,
+    RegistrationNonceResponse, RegistryApproval, SignedRegistryResponse,
 };
 use crate::relay::SyncRelay;
 use crate::secure_store::SecureStore;
@@ -162,8 +162,13 @@ impl PairingService {
         let signed_invitation_hex = hex::encode(&invitation_wire);
 
         // 7. Build signed registry snapshot (typed, verifiable device records)
-        // registry_version 0 is used for first-device bootstrap (no relay version yet).
-        let registry_snapshot = SignedRegistrySnapshot::new(
+        // First-device bootstrap signs at the new floor with an explicit
+        // commitment to epoch 0 so the registry is anchored to the local
+        // epoch ratchet from inception. See Phase 3 prerequisite in
+        // docs/plans/sync-pairing-reset-hardening.md.
+        let registry_version = SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+        let epoch_key_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
             vec![RegistrySnapshotEntry {
                 sync_id: sync_id.clone(),
                 device_id: device_id.clone(),
@@ -175,7 +180,9 @@ impl PairingService {
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
             }],
+            registry_version,
             0,
+            epoch_key_hashes,
         );
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
@@ -258,6 +265,8 @@ impl PairingService {
         self.secure_store.set("device_secret", device_secret.as_bytes())?;
         self.secure_store.set("device_id", device_id.as_bytes())?;
         self.secure_store.set("epoch", b"0")?;
+        self.secure_store.delete("pending_device_secret")?;
+        self.secure_store.delete("pending_device_id")?;
 
         Ok((credentials, response))
     }
@@ -334,6 +343,12 @@ impl PairingService {
         key_hierarchy
             .unlock(password, &secret_key, &bundle.wrapped_dek, &bundle.salt)
             .map_err(CoreError::Crypto)?;
+        verify_bundle_epoch_anchor(
+            &registry_snapshot,
+            bundle.current_epoch,
+            &bundle.epoch_key,
+            &key_hierarchy,
+        )?;
 
         let device_secret = ceremony.device_secret();
         let device_id = ceremony.device_id().to_string();
@@ -461,6 +476,50 @@ impl PairingService {
             }
         }
 
+        let latest_registry_snapshot = fetch_and_verify_latest_join_registry(
+            registration_relay.as_ref(),
+            &registry_snapshot,
+            bundle.current_epoch,
+        )
+        .await?;
+        verify_epoch_key_hash_in_snapshot(
+            &latest_registry_snapshot,
+            bundle.current_epoch,
+            &bundle.epoch_key,
+            &key_hierarchy,
+        )?;
+        let final_registry_snapshot =
+            if latest_registry_snapshot.current_epoch > bundle.current_epoch {
+                let catch_up = EpochManager::catch_up_epoch_keys(
+                    registration_relay.as_ref(),
+                    &mut key_hierarchy,
+                    self.secure_store.as_ref(),
+                    &device_secret,
+                    &device_id,
+                    bundle.current_epoch,
+                    latest_registry_snapshot.current_epoch,
+                    &latest_registry_snapshot.epoch_key_hashes,
+                )
+                .await
+                .map_err(|e| {
+                    classify_joiner_catch_up_error(
+                        bundle.current_epoch,
+                        latest_registry_snapshot.current_epoch,
+                        e,
+                    )
+                })?;
+                if catch_up.recovered_through < latest_registry_snapshot.current_epoch {
+                    return Err(CoreError::EpochMismatch {
+                        local_epoch: catch_up.recovered_through,
+                        relay_epoch: latest_registry_snapshot.current_epoch,
+                        message: "joiner could not recover all relay epoch keys".into(),
+                    });
+                }
+                latest_registry_snapshot
+            } else {
+                latest_registry_snapshot
+            };
+
         let joiner_bundle_bytes = ceremony.encrypt_joiner_bundle()?;
         relay
             .put_slot(&ceremony.rendezvous_id_hex(), PairingSlot::Joiner, &joiner_bundle_bytes)
@@ -471,7 +530,7 @@ impl PairingService {
         self.secure_store.delete("pending_device_secret")?;
         self.secure_store.delete("pending_device_id")?;
 
-        Ok((key_hierarchy, registry_snapshot))
+        Ok((key_hierarchy, final_registry_snapshot))
     }
 
     /// Start the initiator side of the bootstrap ceremony.
@@ -533,11 +592,10 @@ impl PairingService {
         key_hierarchy
             .unlock(password, &secret_key, &wrapped_dek, &salt)
             .map_err(CoreError::Crypto)?;
-        let current_epoch = self
+        let mut current_epoch = self
             .load_secure_string("epoch")?
             .parse::<u32>()
             .map_err(|e| CoreError::Engine(format!("invalid stored epoch value: {e}")))?;
-        let epoch_key = self.load_epoch_key(&key_hierarchy, current_epoch)?;
 
         let bootstrap_bytes = pairing_relay
             .get_bootstrap(&ceremony.rendezvous_id_hex())
@@ -552,16 +610,83 @@ impl PairingService {
             .map_err(|e| CoreError::from_relay_with_context(Some("listing devices"), e))?;
         devices.retain(|device| device.status == "active");
 
-        let current_ml_dsa_generation = devices
-            .iter()
-            .find(|device| device.device_id == device_id)
-            .map(|device| device.ml_dsa_key_generation)
-            .ok_or_else(|| {
+        let current_device =
+            devices.iter().find(|device| device.device_id == device_id).ok_or_else(|| {
                 CoreError::Engine("current device missing from active relay device list".into())
             })?;
+        let current_ml_dsa_generation = current_device.ml_dsa_key_generation;
+        let relay_epoch = current_device.epoch.max(0) as u32;
         let pq_signing_key = device_secret
             .ml_dsa_65_keypair_v(&device_id, current_ml_dsa_generation)
             .map_err(CoreError::Crypto)?;
+
+        if relay_epoch > current_epoch {
+            let registry_response = sync_relay
+                .get_signed_registry()
+                .await
+                .map_err(|e| {
+                    CoreError::from_relay_with_context(
+                        Some("fetching signed registry for epoch catch-up"),
+                        e,
+                    )
+                })?
+                .ok_or_else(|| {
+                    CoreError::Engine(format!(
+                        "relay epoch {relay_epoch} is ahead of local epoch {current_epoch}, but no signed registry is available"
+                    ))
+                })?;
+            let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+                &registry_response.artifact_blob,
+                &signing_key.public_key_bytes(),
+                &pq_signing_key.public_key_bytes(),
+            )
+            .map_err(|e| {
+                CoreError::Engine(format!(
+                    "signed registry verification failed during epoch catch-up: {e}"
+                ))
+            })?;
+            if snapshot.registry_version < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING {
+                return Err(CoreError::Engine(format!(
+                    "signed registry version {} cannot prove epoch catch-up keys",
+                    snapshot.registry_version
+                )));
+            }
+            if snapshot.current_epoch < relay_epoch {
+                return Err(CoreError::Engine(format!(
+                    "signed registry current_epoch {} lags relay epoch {relay_epoch}",
+                    snapshot.current_epoch
+                )));
+            }
+            let current_entry =
+                snapshot.entries.iter().find(|entry| entry.device_id == device_id).ok_or_else(
+                    || {
+                        CoreError::Engine(
+                            "signed registry missing current device during epoch catch-up".into(),
+                        )
+                    },
+                )?;
+            if current_entry.status != "active" {
+                return Err(CoreError::Engine(format!(
+                    "signed registry marks current device as {} during epoch catch-up",
+                    current_entry.status
+                )));
+            }
+
+            let target_epoch = snapshot.current_epoch.max(relay_epoch);
+            let result = EpochManager::catch_up_epoch_keys(
+                sync_relay,
+                &mut key_hierarchy,
+                self.secure_store.as_ref(),
+                &device_secret,
+                &device_id,
+                current_epoch,
+                target_epoch,
+                &snapshot.epoch_key_hashes,
+            )
+            .await?;
+            current_epoch = result.recovered_through;
+        }
+        let epoch_key = self.load_epoch_key(&key_hierarchy, current_epoch)?;
 
         let mut snapshot_entries: Vec<RegistrySnapshotEntry> = devices
             .into_iter()
@@ -614,9 +739,22 @@ impl PairingService {
             ml_dsa_key_generation: 0,
         });
 
-        // registry_version 0 is a placeholder; relay-tracked versioning will be
-        // bound into the snapshot in a future protocol update.
-        let registry_snapshot = SignedRegistrySnapshot::new(snapshot_entries, 0);
+        // Bind the local epoch ratchet into the signed registry: the
+        // initiator commits to the epoch it believes itself to be in and to a
+        // hash of every epoch key it currently holds. Joiners and (in later
+        // phases) reconciliation paths use this to detect a malicious relay
+        // that fabricates registry/epoch state. registry_version stays at the
+        // current floor here — the in-tree relay-driven version progression
+        // happens via the FFI rotate_ml_dsa path, which carries its own
+        // monotonic counter.
+        let registry_version = SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+        let epoch_key_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            snapshot_entries,
+            registry_version,
+            current_epoch,
+            epoch_key_hashes,
+        );
         let signed_keyring = registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
 
         // V3 hybrid registry approval signature (labeled WNS)
@@ -664,14 +802,12 @@ impl PairingService {
             "joiner bundle",
         )
         .await?;
-        let joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
-
-        self.secure_store.set("bootstrap_joiner_bundle", &serde_json::to_vec(&joiner_bundle)?)?;
-        self.secure_store.set("bootstrap_joiner_device_id", joiner_bundle.device_id.as_bytes())?;
+        let _joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
 
         let next_epoch = current_epoch.saturating_add(1);
         let epoch_key =
-            EpochManager::post_rekey(sync_relay, &mut key_hierarchy, next_epoch).await?;
+            EpochManager::post_rekey(sync_relay, &mut key_hierarchy, &device_id, next_epoch)
+                .await?;
 
         self.secure_store.set("epoch", next_epoch.to_string().as_bytes())?;
         use base64::{engine::general_purpose::STANDARD, Engine};
@@ -682,6 +818,8 @@ impl PairingService {
             .delete_session(&ceremony.rendezvous_id_hex())
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("deleting pairing session"), e))?;
+        self.secure_store.delete("bootstrap_joiner_bundle")?;
+        self.secure_store.delete("bootstrap_joiner_device_id")?;
 
         Ok(())
     }
@@ -772,6 +910,173 @@ impl PairingService {
             .map_err(|e| CoreError::Engine(format!("invalid pending device id: {e}")))?;
         let device_secret = DeviceSecret::from_bytes(secret_bytes).map_err(CoreError::Crypto)?;
         Ok(Some((device_secret, device_id)))
+    }
+}
+
+/// Build the per-epoch commitment map carried in
+/// [`SignedRegistrySnapshot::epoch_key_hashes`] from every epoch key the
+/// local key hierarchy currently holds.
+///
+/// Anchors the signed registry to the device's local epoch ratchet so a
+/// malicious relay cannot fabricate registry/epoch state during pairing
+/// reconciliation.
+fn build_epoch_key_hashes(
+    key_hierarchy: &KeyHierarchy,
+) -> Result<std::collections::BTreeMap<u32, [u8; 32]>> {
+    let entries = key_hierarchy.epoch_keys_iter().map_err(CoreError::Crypto)?;
+    let mut out = std::collections::BTreeMap::new();
+    for (epoch, key) in entries {
+        out.insert(epoch, compute_epoch_key_hash(key));
+    }
+    Ok(out)
+}
+
+fn verify_bundle_epoch_anchor(
+    snapshot: &SignedRegistrySnapshot,
+    bundle_epoch: u32,
+    bundle_epoch_key: &[u8],
+    key_hierarchy: &KeyHierarchy,
+) -> Result<()> {
+    if snapshot.registry_version < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING {
+        return Err(CoreError::EpochMismatch {
+            local_epoch: bundle_epoch,
+            relay_epoch: snapshot.current_epoch,
+            message: format!(
+                "credential bundle signed registry version {} cannot prove epoch keys",
+                snapshot.registry_version
+            ),
+        });
+    }
+    if snapshot.current_epoch != bundle_epoch {
+        return Err(CoreError::EpochMismatch {
+            local_epoch: bundle_epoch,
+            relay_epoch: snapshot.current_epoch,
+            message: "credential bundle epoch does not match signed registry epoch".into(),
+        });
+    }
+    verify_epoch_key_hash_in_snapshot(snapshot, bundle_epoch, bundle_epoch_key, key_hierarchy)
+}
+
+fn verify_epoch_key_hash_in_snapshot(
+    snapshot: &SignedRegistrySnapshot,
+    epoch: u32,
+    epoch_key: &[u8],
+    key_hierarchy: &KeyHierarchy,
+) -> Result<()> {
+    let expected_hash =
+        snapshot.epoch_key_hashes.get(&epoch).ok_or_else(|| CoreError::EpochKeyMismatch {
+            epoch,
+            message: "signed registry is missing this epoch hash".into(),
+        })?;
+    let key = if epoch_key.is_empty() && epoch == 0 {
+        key_hierarchy.epoch_key(0).map_err(CoreError::Crypto)?
+    } else {
+        epoch_key
+    };
+    let key: [u8; 32] = key.try_into().map_err(|_| CoreError::EpochKeyMismatch {
+        epoch,
+        message: format!("credential bundle epoch key has length {}, expected 32", key.len()),
+    })?;
+    let actual_hash = compute_epoch_key_hash(&key);
+    if actual_hash != *expected_hash {
+        return Err(CoreError::EpochKeyMismatch {
+            epoch,
+            message: "local epoch key does not match signed registry hash".into(),
+        });
+    }
+    Ok(())
+}
+
+async fn fetch_and_verify_latest_join_registry(
+    relay: &dyn SyncRelay,
+    bundle_snapshot: &SignedRegistrySnapshot,
+    bundle_epoch: u32,
+) -> Result<SignedRegistrySnapshot> {
+    let response = relay
+        .get_signed_registry()
+        .await
+        .map_err(|e| CoreError::from_relay_with_context(Some("fetching signed registry"), e))?
+        .ok_or_else(|| CoreError::EpochMismatch {
+            local_epoch: bundle_epoch,
+            relay_epoch: bundle_epoch,
+            message: "relay did not provide a signed registry after join registration".into(),
+        })?;
+    let latest = verify_signed_registry_with_bundle_anchors(&response, bundle_snapshot)?;
+    if latest.registry_version < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING {
+        return Err(CoreError::EpochMismatch {
+            local_epoch: bundle_epoch,
+            relay_epoch: latest.current_epoch,
+            message: format!(
+                "latest signed registry version {} cannot prove epoch keys",
+                latest.registry_version
+            ),
+        });
+    }
+    if latest.current_epoch < bundle_epoch {
+        return Err(CoreError::EpochMismatch {
+            local_epoch: bundle_epoch,
+            relay_epoch: latest.current_epoch,
+            message: "latest signed registry is behind credential bundle epoch".into(),
+        });
+    }
+    if !latest.epoch_key_hashes.contains_key(&latest.current_epoch) {
+        return Err(CoreError::EpochKeyMismatch {
+            epoch: latest.current_epoch,
+            message: "latest signed registry missing current epoch key hash".into(),
+        });
+    }
+    Ok(latest)
+}
+
+fn verify_signed_registry_with_bundle_anchors(
+    response: &SignedRegistryResponse,
+    bundle_snapshot: &SignedRegistrySnapshot,
+) -> Result<SignedRegistrySnapshot> {
+    let mut last_error = None;
+    for entry in bundle_snapshot.entries.iter().filter(|entry| entry.status == "active") {
+        let Ok(ed25519_pk) = <[u8; 32]>::try_from(entry.ed25519_public_key.as_slice()) else {
+            continue;
+        };
+        if entry.ml_dsa_65_public_key.is_empty() {
+            continue;
+        }
+        match SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &response.artifact_blob,
+            &ed25519_pk,
+            &entry.ml_dsa_65_public_key,
+        ) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(CoreError::EpochMismatch {
+        local_epoch: bundle_snapshot.current_epoch,
+        relay_epoch: bundle_snapshot.current_epoch,
+        message: format!(
+            "latest signed registry could not be verified by any credential bundle device key{}",
+            last_error.map(|e| format!(": {e}")).unwrap_or_default()
+        ),
+    })
+}
+
+fn classify_joiner_catch_up_error(
+    local_epoch: u32,
+    relay_epoch: u32,
+    error: CoreError,
+) -> CoreError {
+    let message = error.to_string();
+    if message.contains("hash mismatch") || message.contains("missing epoch_key_hash") {
+        CoreError::EpochKeyMismatch {
+            epoch: relay_epoch,
+            message: format!("joiner epoch catch-up could not verify recovered key: {message}"),
+        }
+    } else {
+        CoreError::EpochMismatch {
+            local_epoch,
+            relay_epoch,
+            message: format!("joiner epoch catch-up failed: {message}"),
+        }
     }
 }
 
@@ -965,7 +1270,6 @@ async fn wait_for_pairing_slot_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::JoinerBundle;
     use crate::relay::pairing_relay::PairingRelay;
     use crate::relay::traits::*;
     use crate::relay::MockPairingRelay;
@@ -1099,7 +1403,11 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<crate::relay::traits::SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1147,6 +1455,9 @@ mod tests {
         devices: Vec<DeviceInfo>,
         register_requests: Vec<RegisterRequest>,
         rekey_posts: Option<(i32, HashMap<String, Vec<u8>>)>,
+        rekey_artifacts: HashMap<(i32, String), Vec<u8>>,
+        signed_registry: Option<SignedRegistryResponse>,
+        advance_after_artifact_fetch: Option<(i32, i32)>,
     }
 
     #[derive(Clone, Default)]
@@ -1161,8 +1472,28 @@ mod tests {
                     devices,
                     register_requests: Vec::new(),
                     rekey_posts: None,
+                    rekey_artifacts: HashMap::new(),
+                    signed_registry: None,
+                    advance_after_artifact_fetch: None,
                 })),
             }
+        }
+
+        fn insert_rekey_artifact(&self, epoch: i32, device_id: &str, artifact: Vec<u8>) {
+            self.state
+                .lock()
+                .unwrap()
+                .rekey_artifacts
+                .insert((epoch, device_id.to_string()), artifact);
+        }
+
+        fn set_signed_registry(&self, signed_registry: SignedRegistryResponse) {
+            self.state.lock().unwrap().signed_registry = Some(signed_registry);
+        }
+
+        fn advance_active_devices_after_artifact_fetch(&self, trigger_epoch: i32, new_epoch: i32) {
+            self.state.lock().unwrap().advance_after_artifact_fetch =
+                Some((trigger_epoch, new_epoch));
         }
     }
 
@@ -1198,6 +1529,15 @@ mod tests {
         ) -> std::result::Result<RegisterResponse, RelayError> {
             let mut state = self.state.lock().unwrap();
             state.register_requests.push(req.clone());
+            if state.signed_registry.is_none() {
+                if let Some(approval) = &req.registry_approval {
+                    state.signed_registry = Some(SignedRegistryResponse {
+                        registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                        artifact_blob: approval.signed_registry_snapshot.clone(),
+                        artifact_kind: "signed_registry_snapshot".to_string(),
+                    });
+                }
+            }
             state.devices.push(DeviceInfo {
                 device_id: req.device_id,
                 epoch: 0,
@@ -1243,7 +1583,7 @@ mod tests {
         async fn get_signed_registry(
             &self,
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-            Ok(None)
+            Ok(self.state.lock().unwrap().signed_registry.clone())
         }
     }
     #[async_trait]
@@ -1253,15 +1593,52 @@ mod tests {
             epoch: i32,
             keys: HashMap<String, Vec<u8>>,
         ) -> std::result::Result<i32, RelayError> {
-            self.state.lock().unwrap().rekey_posts = Some((epoch, keys));
+            let mut state = self.state.lock().unwrap();
+            let current_epoch = state
+                .devices
+                .iter()
+                .filter(|device| device.status == "active")
+                .map(|device| device.epoch)
+                .max()
+                .unwrap_or(0);
+            if epoch <= current_epoch {
+                return Err(RelayError::Protocol {
+                    message: format!(
+                        "stale rekey epoch {epoch}; relay is already at epoch {current_epoch}"
+                    ),
+                });
+            }
+            for device in &mut state.devices {
+                if device.status == "active" {
+                    device.epoch = epoch;
+                }
+            }
+            for (device_id, artifact) in &keys {
+                state.rekey_artifacts.insert((epoch, device_id.clone()), artifact.clone());
+            }
+            state.rekey_posts = Some((epoch, keys));
             Ok(epoch)
         }
         async fn get_rekey_artifact(
             &self,
-            _: i32,
-            _: &str,
+            epoch: i32,
+            device_id: &str,
         ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
-            Ok(None)
+            let mut state = self.state.lock().unwrap();
+            let artifact = state.rekey_artifacts.get(&(epoch, device_id.to_string())).cloned();
+            if artifact.is_some() {
+                if let Some((trigger_epoch, new_epoch)) = state.advance_after_artifact_fetch {
+                    if epoch == trigger_epoch {
+                        for device in &mut state.devices {
+                            if device.status == "active" {
+                                device.epoch = new_epoch;
+                            }
+                        }
+                        state.advance_after_artifact_fetch = None;
+                    }
+                }
+            }
+            Ok(artifact)
         }
     }
     #[async_trait]
@@ -1277,7 +1654,11 @@ mod tests {
             _: Option<u64>,
             _: Option<String>,
             _: String,
+            _: Option<crate::relay::traits::SnapshotUploadProgress>,
         ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1348,6 +1729,333 @@ mod tests {
             sleep(Duration::from_millis(25)).await;
         }
         panic!("timed out waiting for slot {slot:?}");
+    }
+
+    fn build_v2_artifact(
+        receiver_xwing: &prism_sync_crypto::DeviceXWingKey,
+        epoch_key: &[u8],
+        epoch: u32,
+        device_id: &str,
+    ) -> Vec<u8> {
+        use prism_sync_crypto::pq::hybrid_kem::XWingKem;
+
+        let ek_bytes = receiver_xwing.encapsulation_key_bytes();
+        let ek = XWingKem::encapsulation_key_from_bytes(&ek_bytes).unwrap();
+        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+        let (ciphertext, shared_secret_raw) = XWingKem::encapsulate(&ek, &mut rng);
+        let shared_secret = zeroize::Zeroizing::new(shared_secret_raw);
+
+        let mut salt = Vec::with_capacity(4 + device_id.len());
+        salt.extend_from_slice(&epoch.to_le_bytes());
+        salt.extend_from_slice(device_id.as_bytes());
+        let wrap_key =
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+                .unwrap();
+        let encrypted_epoch_key =
+            prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
+
+        let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
+        artifact.push(0x02);
+        artifact.extend_from_slice(&ciphertext);
+        artifact.extend_from_slice(&encrypted_epoch_key);
+        artifact
+    }
+
+    #[tokio::test]
+    async fn bootstrap_joiner_catches_up_when_relay_registry_advanced() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let inviter_secret = DeviceSecret::generate();
+        let inviter_device_id = crate::node_id::generate_node_id();
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut inviter_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = inviter_hierarchy.initialize(password, &secret_key).unwrap();
+        let epoch_0_key: [u8; 32] = inviter_hierarchy.epoch_key(0).unwrap().try_into().unwrap();
+        let epoch_1_key = [0x77u8; 32];
+
+        let inviter_signing_key = inviter_secret.ed25519_keypair(&inviter_device_id).unwrap();
+        let inviter_exchange_key = inviter_secret.x25519_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_signing_key = inviter_secret.ml_dsa_65_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_kem_key = inviter_secret.ml_kem_768_keypair(&inviter_device_id).unwrap();
+        let inviter_xwing_key = inviter_secret.xwing_keypair(&inviter_device_id).unwrap();
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let mailbox = Arc::new(MockPairingRelay::new());
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, _sas) =
+            InitiatorCeremony::start(token, mailbox.as_ref(), &inviter_secret, &inviter_device_id)
+                .await
+                .unwrap();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner.rendezvous_id_hex(), PairingSlot::Init).await;
+        joiner.process_pairing_init(&init_bytes).unwrap();
+        initiator.verify_joiner_confirmation(&joiner.confirmation_mac().unwrap()).unwrap();
+
+        let joiner_secret = joiner.device_secret();
+        let joiner_device_id = joiner.device_id().to_string();
+        let joiner_signing_key = joiner_secret.ed25519_keypair(&joiner_device_id).unwrap();
+        let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
+        let joiner_xwing_key = joiner_secret.xwing_keypair(&joiner_device_id).unwrap();
+
+        let entries = vec![
+            RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: inviter_device_id.clone(),
+                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: 0,
+            },
+            RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: joiner_device_id.clone(),
+                ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: 0,
+            },
+        ];
+
+        let mut bundle_hashes = std::collections::BTreeMap::new();
+        bundle_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        let bundle_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries.clone(),
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            0,
+            bundle_hashes,
+        );
+        let credential_bundle = BootstrapCredentialBundle {
+            sync_id: sync_id.to_string(),
+            relay_url: relay_url.to_string(),
+            mnemonic: mnemonic.clone(),
+            wrapped_dek: wrapped_dek.clone(),
+            salt: salt.clone(),
+            current_epoch: 0,
+            epoch_key: Vec::new(),
+            signed_keyring: bundle_snapshot
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            inviter_device_id: inviter_device_id.clone(),
+            inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
+            inviter_ml_dsa_65_pk: inviter_pq_signing_key.public_key_bytes(),
+            registry_approval_signature: None,
+            registration_token: None,
+        };
+        let encrypted_credentials = initiator.encrypt_credentials(&credential_bundle).unwrap();
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: inviter_device_id.clone(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        }]));
+        registry_relay.insert_rekey_artifact(
+            1,
+            &joiner_device_id,
+            build_v2_artifact(&joiner_xwing_key, &epoch_1_key, 1, &joiner_device_id),
+        );
+        let mut latest_hashes = std::collections::BTreeMap::new();
+        latest_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        latest_hashes.insert(1, compute_epoch_key_hash(&epoch_1_key));
+        let latest_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            1,
+            latest_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+            artifact_blob: latest_snapshot
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        let (joiner_hierarchy, returned_snapshot) = joiner_service
+            .complete_bootstrap_join(
+                &joiner,
+                mailbox.as_ref(),
+                &encrypted_credentials,
+                password,
+                |_sync_id, _device_id, _token| Ok(registry_relay as Arc<dyn SyncRelay>),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(returned_snapshot.current_epoch, 1);
+        assert!(joiner_hierarchy.has_epoch_key(1));
+        assert_eq!(joiner_store.get("epoch").unwrap().unwrap(), b"1");
+        assert!(joiner_store.get("epoch_key_1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_joiner_fails_loud_when_advanced_epoch_artifact_missing() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        let inviter_secret = DeviceSecret::generate();
+        let inviter_device_id = crate::node_id::generate_node_id();
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut inviter_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = inviter_hierarchy.initialize(password, &secret_key).unwrap();
+        let epoch_0_key: [u8; 32] = inviter_hierarchy.epoch_key(0).unwrap().try_into().unwrap();
+        let epoch_1_key = [0x88u8; 32];
+
+        let inviter_signing_key = inviter_secret.ed25519_keypair(&inviter_device_id).unwrap();
+        let inviter_exchange_key = inviter_secret.x25519_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_signing_key = inviter_secret.ml_dsa_65_keypair(&inviter_device_id).unwrap();
+        let inviter_pq_kem_key = inviter_secret.ml_kem_768_keypair(&inviter_device_id).unwrap();
+        let inviter_xwing_key = inviter_secret.xwing_keypair(&inviter_device_id).unwrap();
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let mailbox = Arc::new(MockPairingRelay::new());
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, _sas) =
+            InitiatorCeremony::start(token, mailbox.as_ref(), &inviter_secret, &inviter_device_id)
+                .await
+                .unwrap();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner.rendezvous_id_hex(), PairingSlot::Init).await;
+        joiner.process_pairing_init(&init_bytes).unwrap();
+        initiator.verify_joiner_confirmation(&joiner.confirmation_mac().unwrap()).unwrap();
+
+        let joiner_secret = joiner.device_secret();
+        let joiner_device_id = joiner.device_id().to_string();
+        let joiner_signing_key = joiner_secret.ed25519_keypair(&joiner_device_id).unwrap();
+        let joiner_exchange_key = joiner_secret.x25519_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_signing_key = joiner_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
+        let joiner_pq_kem_key = joiner_secret.ml_kem_768_keypair(&joiner_device_id).unwrap();
+        let joiner_xwing_key = joiner_secret.xwing_keypair(&joiner_device_id).unwrap();
+
+        let entries = vec![
+            RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: inviter_device_id.clone(),
+                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: 0,
+            },
+            RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: joiner_device_id.clone(),
+                ed25519_public_key: joiner_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: joiner_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: joiner_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: joiner_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: 0,
+            },
+        ];
+
+        let mut bundle_hashes = std::collections::BTreeMap::new();
+        bundle_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        let bundle_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries.clone(),
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            0,
+            bundle_hashes,
+        );
+        let credential_bundle = BootstrapCredentialBundle {
+            sync_id: sync_id.to_string(),
+            relay_url: relay_url.to_string(),
+            mnemonic,
+            wrapped_dek,
+            salt,
+            current_epoch: 0,
+            epoch_key: Vec::new(),
+            signed_keyring: bundle_snapshot
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            inviter_device_id: inviter_device_id.clone(),
+            inviter_ed25519_pk: inviter_signing_key.public_key_bytes().to_vec(),
+            inviter_ml_dsa_65_pk: inviter_pq_signing_key.public_key_bytes(),
+            registry_approval_signature: None,
+            registration_token: None,
+        };
+        let encrypted_credentials = initiator.encrypt_credentials(&credential_bundle).unwrap();
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: inviter_device_id.clone(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        }]));
+        let mut latest_hashes = std::collections::BTreeMap::new();
+        latest_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        latest_hashes.insert(1, compute_epoch_key_hash(&epoch_1_key));
+        let latest_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            1,
+            latest_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+            artifact_blob: latest_snapshot
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        let err = match joiner_service
+            .complete_bootstrap_join(
+                &joiner,
+                mailbox.as_ref(),
+                &encrypted_credentials,
+                password,
+                |_sync_id, _device_id, _token| Ok(registry_relay as Arc<dyn SyncRelay>),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected epoch mismatch"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, CoreError::EpochMismatch { local_epoch: 0, relay_epoch: 1, .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            mailbox
+                .get_slot(&joiner.rendezvous_id_hex(), PairingSlot::Joiner)
+                .await
+                .unwrap()
+                .is_none(),
+            "joiner must not acknowledge pairing before verified epoch catch-up"
+        );
+        assert!(joiner_store.get("epoch_key_1").unwrap().is_none());
+        assert_eq!(joiner_store.get("epoch").unwrap().unwrap(), b"0");
+        let _ = joiner_xwing_key;
     }
 
     #[tokio::test]
@@ -1484,13 +2192,8 @@ mod tests {
             "relay-registration-token"
         );
 
-        let stored_joiner_bundle = initiator_store
-            .get("bootstrap_joiner_bundle")
-            .unwrap()
-            .expect("initiator should persist joiner bundle");
-        let stored_joiner_bundle: JoinerBundle =
-            serde_json::from_slice(&stored_joiner_bundle).unwrap();
-        assert_eq!(stored_joiner_bundle.device_id, joiner_device_id);
+        assert!(initiator_store.get("bootstrap_joiner_bundle").unwrap().is_none());
+        assert!(initiator_store.get("bootstrap_joiner_device_id").unwrap().is_none());
 
         {
             let state = registry_relay.state.lock().unwrap();
@@ -1528,6 +2231,415 @@ mod tests {
 
         let err = mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap_err();
         assert!(err.to_string().contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_initiator_catches_up_before_rekey_when_relay_ahead() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        let epoch_0_key: [u8; 32] = key_hierarchy.epoch_key(0).unwrap().try_into().unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 2,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+        }]));
+        registry_relay.insert_rekey_artifact(
+            1,
+            &device_id,
+            build_v2_artifact(&inviter_xwing_key, &epoch_1_key, 1, &device_id),
+        );
+        registry_relay.insert_rekey_artifact(
+            2,
+            &device_id,
+            build_v2_artifact(&inviter_xwing_key, &epoch_2_key, 2, &device_id),
+        );
+
+        let mut epoch_key_hashes = std::collections::BTreeMap::new();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        epoch_key_hashes.insert(1, compute_epoch_key_hash(&epoch_1_key));
+        epoch_key_hashes.insert(2, compute_epoch_key_hash(&epoch_2_key));
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device_id.clone(),
+                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: current_generation,
+            }],
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            2,
+            epoch_key_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: registry_snapshot
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service_task
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+                .unwrap()
+        });
+
+        initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+            )
+            .await
+            .unwrap();
+
+        let (joiner_key_hierarchy, joiner_snapshot) = joiner_handle.await.unwrap();
+        assert!(joiner_key_hierarchy.is_unlocked());
+        assert_eq!(joiner_snapshot.current_epoch, 2);
+
+        assert!(initiator_store.get("epoch_key_1").unwrap().is_some());
+        assert!(initiator_store.get("epoch_key_2").unwrap().is_some());
+        assert_eq!(initiator_store.get("epoch").unwrap().unwrap(), b"3");
+
+        let state = registry_relay.state.lock().unwrap();
+        let (next_epoch, wrapped_keys) = state.rekey_posts.as_ref().unwrap();
+        assert_eq!(*next_epoch, 3);
+        assert!(wrapped_keys.contains_key(&device_id));
+
+        let err = mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap_err();
+        assert!(err.to_string().contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_initiator_stops_before_rekey_when_catch_up_artifact_missing() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        let epoch_0_key: [u8; 32] = key_hierarchy.epoch_key(0).unwrap().try_into().unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 2,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+        }]));
+        registry_relay.insert_rekey_artifact(
+            1,
+            &device_id,
+            build_v2_artifact(&inviter_xwing_key, &epoch_1_key, 1, &device_id),
+        );
+
+        let mut epoch_key_hashes = std::collections::BTreeMap::new();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        epoch_key_hashes.insert(1, compute_epoch_key_hash(&epoch_1_key));
+        epoch_key_hashes.insert(2, compute_epoch_key_hash(&epoch_2_key));
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device_id.clone(),
+                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: current_generation,
+            }],
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            2,
+            epoch_key_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: registry_snapshot
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store);
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        let confirmation = joiner.confirmation_mac().unwrap();
+        mailbox
+            .put_slot(&joiner_rendezvous_id, PairingSlot::Confirmation, &confirmation)
+            .await
+            .unwrap();
+
+        let err = initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no rekey artifact for epoch 2"));
+        assert!(initiator_store.get("epoch_key_1").unwrap().is_some());
+        assert!(initiator_store.get("epoch_key_2").unwrap().is_none());
+        assert_eq!(initiator_store.get("epoch").unwrap().unwrap(), b"1");
+        assert!(registry_relay.state.lock().unwrap().rekey_posts.is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_initiator_does_not_write_next_epoch_on_toctou_rekey_reject() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        let epoch_0_key: [u8; 32] = key_hierarchy.epoch_key(0).unwrap().try_into().unwrap();
+        let epoch_1_key = [0x11u8; 32];
+        let epoch_2_key = [0x22u8; 32];
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 2,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+        }]));
+        registry_relay.insert_rekey_artifact(
+            1,
+            &device_id,
+            build_v2_artifact(&inviter_xwing_key, &epoch_1_key, 1, &device_id),
+        );
+        registry_relay.insert_rekey_artifact(
+            2,
+            &device_id,
+            build_v2_artifact(&inviter_xwing_key, &epoch_2_key, 2, &device_id),
+        );
+        registry_relay.advance_active_devices_after_artifact_fetch(2, 3);
+
+        let mut epoch_key_hashes = std::collections::BTreeMap::new();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        epoch_key_hashes.insert(1, compute_epoch_key_hash(&epoch_1_key));
+        epoch_key_hashes.insert(2, compute_epoch_key_hash(&epoch_2_key));
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device_id.clone(),
+                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: current_generation,
+            }],
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            2,
+            epoch_key_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: registry_snapshot
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store);
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service_task
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+                .unwrap()
+        });
+
+        let err = initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+            )
+            .await
+            .unwrap_err();
+        let _ = joiner_handle.await.unwrap();
+
+        assert!(err.to_string().contains("stale rekey epoch 3"), "unexpected error: {err}");
+        assert!(initiator_store.get("epoch_key_1").unwrap().is_some());
+        assert!(initiator_store.get("epoch_key_2").unwrap().is_some());
+        assert!(initiator_store.get("epoch_key_3").unwrap().is_none());
+        assert_eq!(initiator_store.get("epoch").unwrap().unwrap(), b"2");
+        assert!(registry_relay.state.lock().unwrap().rekey_posts.is_none());
     }
 
     #[tokio::test]
@@ -1664,6 +2776,10 @@ mod tests {
     async fn create_sync_group_persists_device_identity() {
         let store = Arc::new(MemStore::default());
         let service = PairingService::new(store.clone());
+        let pending_secret = DeviceSecret::generate();
+        let pending_device_id = "abc123def456";
+        store.set("pending_device_secret", pending_secret.as_bytes()).unwrap();
+        store.set("pending_device_id", pending_device_id.as_bytes()).unwrap();
 
         let (_creds, _response) = service
             .create_sync_group(
@@ -1682,12 +2798,14 @@ mod tests {
         // Device secret and device id should be persisted
         let device_secret = store.get("device_secret").unwrap();
         assert!(device_secret.is_some());
-        assert_eq!(device_secret.unwrap().len(), 32);
+        assert_eq!(device_secret.unwrap(), pending_secret.as_bytes());
 
         let device_id = store.get("device_id").unwrap();
         assert!(device_id.is_some());
         let device_id_str = String::from_utf8(device_id.unwrap()).unwrap();
-        assert_eq!(device_id_str.len(), 12); // node_id is 12 hex chars
+        assert_eq!(device_id_str, pending_device_id);
+        assert!(store.get("pending_device_secret").unwrap().is_none());
+        assert!(store.get("pending_device_id").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2050,7 +3168,11 @@ mod tests {
                 _: Option<u64>,
                 _: Option<String>,
                 _: String,
+                _: Option<crate::relay::traits::SnapshotUploadProgress>,
             ) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            async fn delete_snapshot(&self) -> std::result::Result<(), RelayError> {
                 unimplemented!()
             }
         }

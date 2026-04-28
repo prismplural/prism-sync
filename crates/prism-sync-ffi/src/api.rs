@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -16,14 +16,16 @@ use prism_sync_core::bootstrap::{
 };
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::service::PairingService;
-use prism_sync_core::pairing::{RegistrySnapshotEntry, SignedRegistrySnapshot};
+use prism_sync_core::pairing::{
+    compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
+};
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
 use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
-use prism_sync_core::schema::{SyncSchema, SyncValue};
+use prism_sync_core::schema::{parse_datetime_utc, SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
@@ -150,6 +152,7 @@ const _: () = {
 ///       "fields": {
 ///         "name": "String",
 ///         "age": "Int",
+///         "score": "Real",
 ///         "active": "Bool",
 ///         "avatar": "Blob",
 ///         "created_at": "DateTime"
@@ -164,6 +167,7 @@ fn parse_schema_json(json: &str) -> Result<SyncSchema, String> {
 
 // ── Helper: Parse fields JSON to HashMap<String, SyncValue> ──
 
+#[cfg(test)]
 fn parse_fields_json(json: &str) -> Result<HashMap<String, SyncValue>, String> {
     let map: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(json).map_err(|e| format!("Invalid fields JSON: {e}"))?;
@@ -173,6 +177,84 @@ fn parse_fields_json(json: &str) -> Result<HashMap<String, SyncValue>, String> {
         result.insert(key, sv);
     }
     Ok(result)
+}
+
+fn parse_fields_json_for_schema(
+    json: &str,
+    schema: &SyncSchema,
+    table: &str,
+) -> Result<HashMap<String, SyncValue>, String> {
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("Invalid fields JSON: {e}"))?;
+    let entity = schema.entity(table).ok_or_else(|| format!("Unknown table '{table}'"))?;
+
+    let mut result = HashMap::new();
+    for (key, value) in map {
+        let field =
+            entity.field_by_name(&key).ok_or_else(|| format!("Unknown field '{table}.{key}'"))?;
+        let sv = json_value_to_sync_value_for_type(&key, &value, field.sync_type)?;
+        result.insert(key, sv);
+    }
+    Ok(result)
+}
+
+fn json_value_to_sync_value_for_type(
+    key: &str,
+    value: &serde_json::Value,
+    sync_type: SyncType,
+) -> Result<SyncValue, String> {
+    if value.is_null() {
+        return Ok(SyncValue::Null);
+    }
+
+    match sync_type {
+        SyncType::String => value
+            .as_str()
+            .map(|s| SyncValue::String(s.to_string()))
+            .ok_or_else(|| format!("Expected string for field '{key}'")),
+        SyncType::Int => json_number_to_i64(key, value).map(SyncValue::Int),
+        SyncType::Real => {
+            let f =
+                value.as_f64().ok_or_else(|| format!("Expected real number for field '{key}'"))?;
+            if f.is_finite() {
+                Ok(SyncValue::Real(f))
+            } else {
+                Err(format!("Unsupported float value for field '{key}'"))
+            }
+        }
+        SyncType::Bool => value
+            .as_bool()
+            .map(SyncValue::Bool)
+            .ok_or_else(|| format!("Expected boolean for field '{key}'")),
+        SyncType::DateTime => {
+            let s =
+                value.as_str().ok_or_else(|| format!("Expected date string for field '{key}'"))?;
+            let dt = parse_datetime_utc(s)
+                .map_err(|e| format!("Invalid date string for field '{key}': {e}"))?;
+            Ok(SyncValue::DateTime(dt))
+        }
+        SyncType::Blob => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| format!("Expected base64 string for field '{key}'"))?;
+            let bytes = BASE64
+                .decode(s)
+                .map_err(|e| format!("Invalid base64 string for field '{key}': {e}"))?;
+            Ok(SyncValue::Blob(bytes))
+        }
+    }
+}
+
+fn json_number_to_i64(key: &str, value: &serde_json::Value) -> Result<i64, String> {
+    if let Some(i) = value.as_i64() {
+        return Ok(i);
+    }
+    let f = value.as_f64().ok_or_else(|| format!("Expected integer for field '{key}'"))?;
+    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        Ok(f as i64)
+    } else {
+        Err(format!("Expected integer for field '{key}'"))
+    }
 }
 
 fn json_value_to_sync_value(key: &str, value: &serde_json::Value) -> Result<SyncValue, String> {
@@ -185,6 +267,8 @@ fn json_value_to_sync_value(key: &str, value: &serde_json::Value) -> Result<Sync
             } else if let Some(f) = n.as_f64() {
                 if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
                     Ok(SyncValue::Int(f as i64))
+                } else if f.is_finite() {
+                    Ok(SyncValue::Real(f))
                 } else {
                     Err(format!("Unsupported float value for field '{key}'"))
                 }
@@ -209,6 +293,7 @@ fn json_value_to_sync_value(key: &str, value: &serde_json::Value) -> Result<Sync
 /// Encoding rules (see `encode_value` in prism-sync-core):
 /// - `"null"` -> JSON null
 /// - `"42"` / `"-100"` -> JSON number (Int)
+/// - `"3.14"` -> JSON number (Real)
 /// - `"true"` / `"false"` -> JSON boolean (Bool)
 /// - `"\"hello\""` -> JSON string `"hello"` (String)
 /// - `"\"2026-03-15T12:00:00.000Z\""` -> JSON string (DateTime as ISO-8601)
@@ -296,6 +381,30 @@ fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> Stri
         if let Some(remote_wipe) = remote_wipe {
             payload["remote_wipe"] = serde_json::json!(remote_wipe);
         }
+    } else if let prism_sync_core::CoreError::BootstrapNotAllowed(reason) = &error {
+        // First-device bootstrap guard failed. Surface a stable `code` so the
+        // Dart side can render a user-friendly message without string-matching
+        // against the English `message`.
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("bootstrap_not_allowed");
+        payload["reason"] = serde_json::json!(reason);
+    } else if let prism_sync_core::CoreError::SnapshotTooLarge { bytes } = &error {
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("snapshot_too_large");
+        payload["bytes"] = serde_json::json!(bytes);
+        payload["limit_bytes"] =
+            serde_json::json!(prism_sync_core::snapshot_limits::MAX_SNAPSHOT_COMPRESSED_BYTES);
+    } else if let prism_sync_core::CoreError::EpochMismatch { local_epoch, relay_epoch, .. } =
+        &error
+    {
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("epoch_mismatch");
+        payload["local_epoch"] = serde_json::json!(local_epoch);
+        payload["relay_epoch"] = serde_json::json!(relay_epoch);
+    } else if let prism_sync_core::CoreError::EpochKeyMismatch { epoch, .. } = &error {
+        payload["error_type"] = serde_json::json!("core");
+        payload["code"] = serde_json::json!("epoch_key_mismatch");
+        payload["epoch"] = serde_json::json!(epoch);
     } else {
         payload["error_type"] = serde_json::json!("core");
     }
@@ -398,6 +507,19 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "type": "BackoffScheduled",
             "attempt": attempt,
             "delay_secs": delay_secs,
+        }),
+        SyncEvent::SnapshotUploadProgress { sync_id, bytes_sent, bytes_total } => {
+            serde_json::json!({
+                "type": "SnapshotUploadProgress",
+                "sync_id": sync_id,
+                "bytes_sent": bytes_sent,
+                "bytes_total": bytes_total,
+            })
+        }
+        SyncEvent::SnapshotUploadFailed { sync_id, reason } => serde_json::json!({
+            "type": "SnapshotUploadFailed",
+            "sync_id": sync_id,
+            "reason": reason,
         }),
     }
 }
@@ -846,6 +968,87 @@ fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
     })
 }
 
+/// Stable error prefix returned when an FFI ceremony entry point is invoked
+/// while another pairing ceremony is already in flight on the same handle.
+///
+/// Dart code can match on this prefix to surface a "complete or abandon the
+/// existing ceremony" error to the user without crashing the in-progress
+/// state. Phase 4E of the sync-pairing-reset hardening plan.
+const CEREMONY_IN_PROGRESS_PREFIX: &str = "CEREMONY_IN_PROGRESS";
+
+/// Guard against starting/completing a ceremony while another is in flight.
+///
+/// `start_*` callers pass `kind = StartGuard::Initiator` or
+/// `StartGuard::Joiner` — both ceremony slots must be empty before a fresh
+/// start.
+///
+/// `complete_*` callers pass `kind = StartGuard::CompleteInitiator` or
+/// `StartGuard::CompleteJoiner` — only the *opposite* slot is checked
+/// (mixing types is nonsensical), the matching slot is consumed by the
+/// caller's own `take()`.
+fn guard_ceremony_in_progress(
+    handle: &PrismSyncHandle,
+    kind: CeremonyGuardKind,
+) -> Result<(), String> {
+    let initiator_present = lock_or_recover(&handle.initiator_ceremony).is_some();
+    let joiner_present = lock_or_recover(&handle.joiner_ceremony).is_some();
+    match kind {
+        CeremonyGuardKind::StartInitiator => {
+            if initiator_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is already in progress; \
+                     complete or abandon the existing one before starting a new one"
+                ));
+            }
+            if joiner_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: a joiner ceremony is in progress; \
+                     cannot start an initiator ceremony on the same handle"
+                ));
+            }
+        }
+        CeremonyGuardKind::StartJoiner => {
+            if joiner_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: a joiner ceremony is already in progress; \
+                     complete or abandon the existing one before starting a new one"
+                ));
+            }
+            if initiator_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is in progress; \
+                     cannot start a joiner ceremony on the same handle"
+                ));
+            }
+        }
+        CeremonyGuardKind::CompleteInitiator => {
+            if joiner_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: a joiner ceremony is in progress; \
+                     cannot complete an initiator ceremony on the same handle"
+                ));
+            }
+        }
+        CeremonyGuardKind::CompleteJoiner => {
+            if initiator_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is in progress; \
+                     cannot complete a joiner ceremony on the same handle"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CeremonyGuardKind {
+    StartInitiator,
+    StartJoiner,
+    CompleteInitiator,
+    CompleteJoiner,
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Public FFI API
 // ══════════════════════════════════════════════════════════════════════
@@ -1242,7 +1445,7 @@ pub async fn change_password(
 /// Record a new entity creation.
 ///
 /// `fields_json` is a JSON object: `{"field_name": value, ...}`.
-/// Supported value types: null, string, integer, boolean.
+/// Supported value types: null, string, integer, real number, boolean.
 pub async fn record_create(
     handle: &PrismSyncHandle,
     table: String,
@@ -1250,7 +1453,7 @@ pub async fn record_create(
     fields_json: String,
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    let fields = parse_fields_json(&fields_json)?;
+    let fields = parse_fields_json_for_schema(&fields_json, inner.schema(), &table)?;
     inner.record_create(&table, &entity_id, &fields).map_err(|e| e.to_string())
 }
 
@@ -1264,7 +1467,7 @@ pub async fn record_update(
     changed_fields_json: String,
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    let fields = parse_fields_json(&changed_fields_json)?;
+    let fields = parse_fields_json_for_schema(&changed_fields_json, inner.schema(), &table)?;
     inner.record_update(&table, &entity_id, &fields).map_err(|e| e.to_string())
 }
 
@@ -1276,6 +1479,103 @@ pub async fn record_delete(
 ) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
     inner.record_delete(&table, &entity_id).map_err(|e| e.to_string())
+}
+
+// ── First-device bootstrap ──
+
+/// Seed `field_versions` from pre-existing local data for the first device in
+/// a sync group. No relay traffic; no `pending_ops` produced.
+///
+/// `records_json` is a JSON array of seed records:
+///
+/// ```json
+/// [
+///   { "table": "members", "entity_id": "...", "fields": { "name": "Alice", "emoji": "..." } },
+///   ...
+/// ]
+/// ```
+///
+/// The inner `fields` object follows the same natural-JSON shape as
+/// [`record_create`]: `null`, strings, integers, and booleans.
+///
+/// Returns a JSON object with `entity_count` and `snapshot_bytes`:
+/// ```json
+/// { "entity_count": 42, "snapshot_bytes": 1234567 }
+/// ```
+///
+/// Errors propagate via the standard structured-error encoding. In particular:
+/// - `BootstrapNotAllowed` (a device is already registered, a remote has been
+///   pulled, or applied_ops rows exist) carries `code: "bootstrap_not_allowed"`.
+/// - `SnapshotTooLarge` carries `code: "snapshot_too_large"`, `bytes`, and
+///   `limit_bytes` so the UI can surface the numbers without string parsing.
+pub async fn bootstrap_existing_state(
+    handle: &PrismSyncHandle,
+    records_json: String,
+) -> Result<String, String> {
+    // Parse the records array.
+    let value: serde_json::Value =
+        serde_json::from_str(&records_json).map_err(|e| format!("Invalid records JSON: {e}"))?;
+    let arr = value.as_array().ok_or_else(|| "records JSON must be an array".to_string())?;
+
+    let mut records: Vec<prism_sync_core::engine::SeedRecord> = Vec::with_capacity(arr.len());
+    for (idx, entry) in arr.iter().enumerate() {
+        let obj = entry.as_object().ok_or_else(|| format!("records[{idx}] must be an object"))?;
+        let table = obj
+            .get("table")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("records[{idx}].table must be a string"))?
+            .to_string();
+        let entity_id = obj
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("records[{idx}].entity_id must be a string"))?
+            .to_string();
+        let fields_value =
+            obj.get("fields").ok_or_else(|| format!("records[{idx}].fields missing"))?;
+        let fields_map = fields_value
+            .as_object()
+            .ok_or_else(|| format!("records[{idx}].fields must be an object"))?;
+        let mut fields = HashMap::with_capacity(fields_map.len());
+        for (key, v) in fields_map {
+            let sv = json_value_to_sync_value(key, v)
+                .map_err(|e| format!("records[{idx}].fields: {e}"))?;
+            fields.insert(key.clone(), sv);
+        }
+        records.push(prism_sync_core::engine::SeedRecord { table, entity_id, fields });
+    }
+
+    let mut inner = handle.inner.lock().await;
+    match inner.bootstrap_existing_state(records).await {
+        Ok(report) => {
+            let json = serde_json::json!({
+                "entity_count": report.entity_count,
+                "snapshot_bytes": report.snapshot_bytes,
+            });
+            Ok(json.to_string())
+        }
+        Err(e) => {
+            drop(inner);
+            Err(encode_handle_core_error(handle, "bootstrap_existing_state", e).await)
+        }
+    }
+}
+
+/// Acknowledge that a downloaded snapshot has been applied locally, telling
+/// the relay to delete the stored blob (`DELETE /v1/sync/{id}/snapshot`).
+///
+/// Idempotent: a `NotFound` response maps to `Ok(())`. Older relays that
+/// don't implement `DELETE /snapshot` will return 405 Method Not Allowed;
+/// the engine folds that to `Ok(())` too and the snapshot TTL-expires
+/// relay-side.
+pub async fn acknowledge_snapshot_applied(handle: &PrismSyncHandle) -> Result<(), String> {
+    let inner = handle.inner.lock().await;
+    match inner.acknowledge_snapshot_applied().await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            drop(inner);
+            Err(encode_handle_core_error(handle, "acknowledge_snapshot_applied", e).await)
+        }
+    }
 }
 
 // ── Sync control ──
@@ -2285,10 +2585,54 @@ pub async fn delete_sync_group(
 ///
 /// Used as the "Approach A" cutover hook by the per-member fronting migration
 /// (see `docs/plans/fronting-per-member-sessions.md` §4.2). Performs no relay
-/// I/O — purely local.
+/// I/O — purely local. Requires a configured engine (`configure_engine` must
+/// have been called) — for the cleanup-resume path that runs without a
+/// configured engine, use [`clear_sync_state`] instead.
 pub async fn reset_sync_state(handle: &PrismSyncHandle) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
     inner.reset_sync_state().await.map_err(|e| e.to_string())
+}
+
+/// Clear all sync-DB rows for the given `sync_id`.
+///
+/// Wipes `pending_ops`, `applied_ops`, `field_versions`, `device_registry`,
+/// and `sync_metadata` rows scoped to `sync_id`. Used by the reset-data path
+/// (Phase 2B) as belt-and-suspenders before deleting the sync DB file, and
+/// by any future cleanup of orphaned/abandoned sync_ids — including the
+/// fronting-migration cleanup-resume path, which has no live engine to call
+/// [`reset_sync_state`] against.
+///
+/// **Safety guard:** by default, refuses to clear the *currently active*
+/// `sync_id` (the one configured on the live engine). Callers that
+/// intentionally clear the active sync_id (e.g. the reset path, which then
+/// disposes the handle) must pass `force_active=true`.
+///
+/// The Drift app DB is not touched — only the Rust-managed sync DB.
+pub async fn clear_sync_state(
+    handle: &PrismSyncHandle,
+    sync_id: String,
+    force_active: bool,
+) -> Result<(), String> {
+    let storage = {
+        let inner = handle.inner.lock().await;
+        if !force_active {
+            if let Some(active) = inner.sync_service().sync_id() {
+                if active == sync_id {
+                    return Err("refusing to clear_sync_state for the active sync_id; pass \
+                         force_active=true if intentional"
+                        .into());
+                }
+            }
+        }
+        inner.storage().clone()
+    };
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut tx = storage.begin_tx().map_err(|e| e.to_string())?;
+        tx.clear_sync_state(&sync_id).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ── Device info ──
@@ -2927,6 +3271,7 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
 /// to [`get_joiner_sas`] and [`complete_joiner_ceremony`].
 pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::StartJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     let inner = handle.inner.lock().await;
@@ -3028,6 +3373,7 @@ pub async fn complete_joiner_ceremony(
     password: String,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     // Take the ceremony out — it won't be needed again after completion
@@ -3118,7 +3464,10 @@ pub async fn complete_joiner_ceremony(
         .ok_or("device_secret not found after join")?;
     inner.restore_runtime_keys(dek, &device_secret_bytes).map_err(|e| e.to_string())?;
 
-    // Restore epoch keys into the live key hierarchy
+    // Restore epoch keys into the live key hierarchy. Bootstrap join may
+    // catch up through multiple epochs before returning, while a bundle that
+    // starts at epoch > 1 may only carry the current epoch plus newly recovered
+    // keys. Load every stored key, but require the current epoch key to exist.
     let epoch_val = inner
         .secure_store()
         .get("epoch")
@@ -3127,31 +3476,33 @@ pub async fn complete_joiner_ceremony(
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
-    if epoch_val > 0 {
-        let key_name = format!("epoch_key_{}", epoch_val);
+    for epoch in 1..=epoch_val {
+        let key_name = format!("epoch_key_{}", epoch);
         match inner.secure_store().get(&key_name) {
             Ok(Some(stored)) => match BASE64.decode(&stored) {
                 Ok(decoded) if decoded.len() == 32 => {
                     inner
                         .key_hierarchy_mut()
-                        .store_epoch_key(epoch_val, zeroize::Zeroizing::new(decoded));
+                        .store_epoch_key(epoch, zeroize::Zeroizing::new(decoded));
                 }
                 Ok(decoded) => {
                     return Err(format!(
                         "epoch_key_{} has wrong length ({}, expected 32)",
-                        epoch_val,
+                        epoch,
                         decoded.len(),
                     ));
                 }
                 Err(e) => {
-                    return Err(format!("epoch_key_{} base64 decode failed: {e}", epoch_val,));
+                    return Err(format!("epoch_key_{} base64 decode failed: {e}", epoch,));
                 }
             },
             Ok(None) => {
-                return Err(format!("epoch_key_{} not found in secure store", epoch_val,));
+                if epoch == epoch_val {
+                    return Err(format!("epoch_key_{} not found in secure store", epoch,));
+                }
             }
             Err(e) => {
-                return Err(format!("Failed to read epoch_key_{}: {e}", epoch_val));
+                return Err(format!("Failed to read epoch_key_{}: {e}", epoch));
             }
         }
     }
@@ -3164,11 +3515,21 @@ pub async fn complete_joiner_ceremony(
 ///
 /// Parses the rendezvous token from QR/deep-link bytes, fetches the joiner's
 /// bootstrap, verifies the commitment, and posts the PairingInit. Returns
-/// the SAS display codes for user verification:
+/// the SAS display codes for user verification plus the joiner's device_id:
 ///
 /// ```json
-/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// {
+///   "sas_words": "apple banana cherry",
+///   "sas_decimal": "123456",
+///   "joiner_device_id": "c3d4..."
+/// }
 /// ```
+///
+/// `joiner_device_id` is captured from the bootstrap record fetched at
+/// ceremony start and is stable for the remainder of the ceremony. The Dart
+/// caller threads it through to `uploadPairingSnapshot(..., forDeviceId:)`
+/// so the joiner can later `DELETE /v1/sync/{id}/snapshot` under its own
+/// identity.
 ///
 /// The `InitiatorCeremony` state is stored in the handle for the subsequent
 /// call to [`complete_initiator_ceremony`].
@@ -3177,6 +3538,7 @@ pub async fn start_initiator_ceremony(
     token_bytes: Vec<u8>,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::StartInitiator)?;
     let token = RendezvousToken::from_bytes(&token_bytes)
         .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
 
@@ -3194,6 +3556,8 @@ pub async fn start_initiator_ceremony(
         }
     };
 
+    let joiner_device_id = ceremony.joiner_device_id().to_string();
+
     // Store ceremony state for complete_initiator_ceremony
     handle
         .initiator_ceremony
@@ -3204,6 +3568,7 @@ pub async fn start_initiator_ceremony(
     let result = serde_json::json!({
         "sas_words": sas.words,
         "sas_decimal": sas.decimal,
+        "joiner_device_id": joiner_device_id,
     });
     Ok(result.to_string())
 }
@@ -3226,6 +3591,7 @@ pub async fn complete_initiator_ceremony(
     mnemonic: String,
 ) -> Result<String, String> {
     enforce_handle_signature_version_floor(handle).await?;
+    guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteInitiator)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
     // Take the ceremony out — it won't be needed again after completion
@@ -3489,6 +3855,16 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             .map_err(|e| e.to_string())?
             .and_then(|meta| meta.last_imported_registry_version)
     };
+    let current_epoch = {
+        let sid = sync_id.clone();
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .map(|meta| meta.current_epoch.max(0) as u32)
+            .unwrap_or(0)
+    };
     let relay_registry_version =
         relay.get_signed_registry().await.ok().flatten().map(|response| response.registry_version);
     let next_registry_version = next_registry_snapshot_version(
@@ -3516,8 +3892,15 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     // Sign with the OLD ML-DSA key — that's the key peers have pinned.
     // Include the NEW ML-DSA key for the rotating device in the snapshot.
     let signed_snapshot = {
-        let inner = handle.inner.lock().await;
-        let storage = inner.storage().clone();
+        let (storage, epoch_key_hashes) = {
+            let inner = handle.inner.lock().await;
+            (inner.storage().clone(), build_epoch_key_hashes_for_registry(inner.key_hierarchy())?)
+        };
+        if !epoch_key_hashes.contains_key(&current_epoch) {
+            return Err(format!(
+                "signed registry epoch_key_hashes missing current_epoch {current_epoch}"
+            ));
+        }
         let sid = sync_id.clone();
         let did = device_id.clone();
         let new_pk_for_snapshot = new_pk.clone();
@@ -3551,7 +3934,12 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             })
             .collect();
 
-        let snapshot = SignedRegistrySnapshot::new(entries, next_registry_version);
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            next_registry_version,
+            current_epoch,
+            epoch_key_hashes,
+        );
 
         // Sign with Ed25519 (unchanged) + OLD ML-DSA key (what peers have pinned)
         let ed25519_key = device_secret
@@ -3842,6 +4230,19 @@ fn next_registry_snapshot_version(
         + 1
 }
 
+fn build_epoch_key_hashes_for_registry(
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+) -> Result<BTreeMap<u32, [u8; 32]>, String> {
+    let entries = key_hierarchy
+        .epoch_keys_iter()
+        .map_err(|e| format!("failed to enumerate epoch keys for signed registry: {e}"))?;
+    let mut epoch_key_hashes = BTreeMap::new();
+    for (epoch, key) in entries {
+        epoch_key_hashes.insert(epoch, compute_epoch_key_hash(key));
+    }
+    Ok(epoch_key_hashes)
+}
+
 /// Get the current ML-DSA key generation for this device.
 ///
 /// Returns the generation number (0 for initial key, increments on each rotation).
@@ -3865,6 +4266,46 @@ mod tests {
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
     use std::sync::Arc;
+
+    #[test]
+    fn parse_schema_json_accepts_real_type() {
+        let schema =
+            parse_schema_json(r#"{"entities":{"settings":{"fields":{"score":"Real"}}}}"#).unwrap();
+
+        let field = schema.entity("settings").unwrap().field_by_name("score").unwrap();
+        assert_eq!(field.sync_type, prism_sync_core::schema::SyncType::Real);
+    }
+
+    #[test]
+    fn parse_fields_json_accepts_real_numbers() {
+        let fields = parse_fields_json(r#"{"score":8.5}"#).unwrap();
+
+        assert_eq!(fields.get("score"), Some(&SyncValue::Real(8.5)));
+    }
+
+    #[test]
+    fn parse_fields_json_for_schema_coerces_wire_strings_to_typed_values() {
+        let schema = parse_schema_json(
+            r#"{"entities":{"settings":{"fields":{"score":"Real","created_at":"DateTime","avatar":"Blob"}}}}"#,
+        )
+        .unwrap();
+
+        let fields = parse_fields_json_for_schema(
+            r#"{"score":8,"created_at":"2026-04-27T12:34:56.789Z","avatar":"AAECAw=="}"#,
+            &schema,
+            "settings",
+        )
+        .unwrap();
+
+        assert_eq!(fields.get("score"), Some(&SyncValue::Real(8.0)));
+        assert!(matches!(fields.get("created_at"), Some(SyncValue::DateTime(_))));
+        assert_eq!(fields.get("avatar"), Some(&SyncValue::Blob(vec![0, 1, 2, 3])));
+    }
+
+    #[test]
+    fn encoded_real_value_round_trips_to_json_number() {
+        assert_eq!(encoded_value_to_json("8.5"), serde_json::json!(8.5));
+    }
 
     fn make_device_record(
         sync_id: &str,
@@ -3953,11 +4394,13 @@ mod tests {
         new_generation: u32,
         registry_version: i64,
     ) -> Vec<u8> {
+        let mut epoch_key_hashes = BTreeMap::new();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&[0x42; 32]));
         let ed25519_key = device_secret.ed25519_keypair(device_id).unwrap();
         let old_ml_dsa_key =
             device_secret.ml_dsa_65_keypair_v(device_id, new_generation - 1).unwrap();
         let new_record = make_device_record(sync_id, device_id, device_secret, new_generation);
-        SignedRegistrySnapshot::new(
+        SignedRegistrySnapshot::new_with_epoch_binding(
             vec![RegistrySnapshotEntry {
                 sync_id: sync_id.to_string(),
                 device_id: device_id.to_string(),
@@ -3970,6 +4413,8 @@ mod tests {
                 ml_dsa_key_generation: new_generation,
             }],
             registry_version,
+            0,
+            epoch_key_hashes,
         )
         .sign_hybrid(&ed25519_key, &old_ml_dsa_key)
     }
@@ -4260,6 +4705,405 @@ mod tests {
         assert_eq!(
             storage.get_sync_metadata(sync_id).unwrap().unwrap().last_imported_registry_version,
             Some(1)
+        );
+    }
+
+    // ── Phase 1C: clear_sync_state FFI ──
+
+    fn make_pending_op(
+        sync_id: &str,
+        op_id: &str,
+        batch_id: &str,
+    ) -> prism_sync_core::storage::PendingOp {
+        prism_sync_core::storage::PendingOp {
+            op_id: op_id.to_string(),
+            sync_id: sync_id.to_string(),
+            epoch: 0,
+            device_id: "dev-1".to_string(),
+            local_batch_id: batch_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            encoded_value: "value".to_string(),
+            is_delete: false,
+            client_hlc: "0:0:dev-1".to_string(),
+            created_at: Utc::now(),
+            pushed_at: None,
+        }
+    }
+
+    fn make_metadata(sync_id: &str) -> SyncMetadata {
+        let now = Utc::now();
+        SyncMetadata {
+            sync_id: sync_id.to_string(),
+            local_device_id: "dev-1".to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: 0,
+            last_pushed_at: None,
+            last_successful_sync_at: None,
+            registered_at: None,
+            needs_rekey: false,
+            last_imported_registry_version: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Seeds two sync_ids' rows into the handle's storage, then calls the FFI
+    /// `clear_sync_state(sid_a, force_active=false)` and asserts only sid_a's
+    /// rows are removed.
+    #[tokio::test]
+    async fn clear_sync_state_drops_only_target_sync_id() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let storage = {
+            let inner = handle.inner.lock().await;
+            inner.storage().clone()
+        };
+
+        // Seed metadata + a pending op for two sync_ids.
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&make_metadata("sync-a")).unwrap();
+            tx.upsert_sync_metadata(&make_metadata("sync-b")).unwrap();
+            tx.insert_pending_op(&make_pending_op("sync-a", "op-a", "batch-a")).unwrap();
+            tx.insert_pending_op(&make_pending_op("sync-b", "op-b", "batch-b")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert!(storage.get_sync_metadata("sync-a").unwrap().is_some());
+        assert!(storage.get_sync_metadata("sync-b").unwrap().is_some());
+        assert!(!storage.get_unpushed_batch_ids("sync-a").unwrap().is_empty());
+        assert!(!storage.get_unpushed_batch_ids("sync-b").unwrap().is_empty());
+
+        // No engine configured → sync_service.sync_id() is None → guard does
+        // not trip even with force_active=false.
+        super::clear_sync_state(&handle, "sync-a".to_string(), false)
+            .await
+            .expect("clear_sync_state should succeed for non-active sync_id");
+
+        // sync-a rows gone, sync-b rows preserved.
+        assert!(storage.get_sync_metadata("sync-a").unwrap().is_none());
+        assert!(storage.get_unpushed_batch_ids("sync-a").unwrap().is_empty());
+        assert!(storage.get_sync_metadata("sync-b").unwrap().is_some());
+        assert!(!storage.get_unpushed_batch_ids("sync-b").unwrap().is_empty());
+    }
+
+    /// With the engine configured to a specific sync_id, calling
+    /// `clear_sync_state` with that sync_id and `force_active=false` must be
+    /// refused with a stable error.
+    #[tokio::test]
+    async fn clear_sync_state_refuses_active_sync_id_without_force() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        // Seed rows so we can also assert they're untouched on refusal.
+        let storage = {
+            let inner = handle.inner.lock().await;
+            inner.storage().clone()
+        };
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&make_metadata("active-sync")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Configure the engine so sync_service.sync_id() == "active-sync".
+        let relay: Arc<dyn prism_sync_core::relay::SyncRelay> = Arc::new(MockRelay::new());
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.configure_engine(relay, "active-sync".to_string(), "dev-1".to_string(), 0, 0);
+        }
+
+        let err = super::clear_sync_state(&handle, "active-sync".to_string(), false)
+            .await
+            .expect_err("must refuse to clear active sync_id without force");
+        assert!(
+            err.contains("refusing to clear_sync_state for the active sync_id"),
+            "unexpected error message: {err}"
+        );
+
+        // Rows still present.
+        assert!(storage.get_sync_metadata("active-sync").unwrap().is_some());
+    }
+
+    /// Same setup as the refusal test, but with `force_active=true` the call
+    /// must succeed and remove the rows.
+    #[tokio::test]
+    async fn clear_sync_state_with_force_active_succeeds() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let storage = {
+            let inner = handle.inner.lock().await;
+            inner.storage().clone()
+        };
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&make_metadata("active-sync")).unwrap();
+            tx.insert_pending_op(&make_pending_op("active-sync", "op-1", "batch-1")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let relay: Arc<dyn prism_sync_core::relay::SyncRelay> = Arc::new(MockRelay::new());
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.configure_engine(relay, "active-sync".to_string(), "dev-1".to_string(), 0, 0);
+        }
+
+        super::clear_sync_state(&handle, "active-sync".to_string(), true)
+            .await
+            .expect("clear_sync_state with force_active should succeed");
+
+        assert!(storage.get_sync_metadata("active-sync").unwrap().is_none());
+        assert!(storage.get_unpushed_batch_ids("active-sync").unwrap().is_empty());
+    }
+
+    // ── Phase 4E: concurrent-ceremony guard ──
+    //
+    // The guard inspects `Option::is_some()` on the ceremony slots. We
+    // populate those slots with real ceremony values constructed against an
+    // in-memory `MockPairingRelay`, then drive the FFI entry points and
+    // verify they short-circuit with the `CEREMONY_IN_PROGRESS` prefix
+    // before touching any relay or doing any heavy work.
+
+    fn plant_joiner_slot(handle: &PrismSyncHandle, ceremony: JoinerCeremony) {
+        *lock_or_recover(&handle.joiner_ceremony) = Some(ceremony);
+    }
+
+    fn plant_initiator_slot(handle: &PrismSyncHandle, ceremony: InitiatorCeremony) {
+        *lock_or_recover(&handle.initiator_ceremony) = Some(ceremony);
+    }
+
+    /// Build a real joiner ceremony against an in-memory `MockPairingRelay`.
+    async fn make_real_joiner_ceremony() -> (
+        JoinerCeremony,
+        prism_sync_core::bootstrap::RendezvousToken,
+        Arc<prism_sync_core::relay::MockPairingRelay>,
+    ) {
+        let relay = Arc::new(prism_sync_core::relay::MockPairingRelay::new());
+        let (ceremony, token) = JoinerCeremony::start(relay.as_ref(), "https://relay.example.com")
+            .await
+            .expect("joiner ceremony start");
+        (ceremony, token, relay)
+    }
+
+    /// Build a real initiator ceremony by first standing up a joiner side
+    /// against the same `MockPairingRelay` and then consuming the token.
+    async fn make_real_initiator_ceremony() -> InitiatorCeremony {
+        let (_joiner, token, relay) = make_real_joiner_ceremony().await;
+        let initiator_secret = prism_sync_crypto::DeviceSecret::generate();
+        let initiator_device_id = prism_sync_core::node_id::generate_node_id();
+        let (ceremony, _sas) = InitiatorCeremony::start(
+            token,
+            relay.as_ref(),
+            &initiator_secret,
+            &initiator_device_id,
+        )
+        .await
+        .expect("initiator ceremony start");
+        ceremony
+    }
+
+    #[test]
+    fn ceremony_guard_emits_stable_error_prefix() {
+        // Dart-side error matching keys off this prefix.
+        assert_eq!(CEREMONY_IN_PROGRESS_PREFIX, "CEREMONY_IN_PROGRESS");
+    }
+
+    #[test]
+    fn encode_core_error_surfaces_epoch_mismatch_code_and_epochs() {
+        let encoded = encode_core_error(
+            "complete_bootstrap_join",
+            prism_sync_core::CoreError::EpochMismatch {
+                local_epoch: 2,
+                relay_epoch: 4,
+                message: "relay advanced during pairing".into(),
+            },
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(encoded.strip_prefix(STRUCTURED_ERROR_PREFIX).unwrap()).unwrap();
+        assert_eq!(payload["code"], "epoch_mismatch");
+        assert_eq!(payload["local_epoch"], 2);
+        assert_eq!(payload["relay_epoch"], 4);
+    }
+
+    #[test]
+    fn encode_core_error_surfaces_epoch_key_mismatch_code() {
+        let encoded = encode_core_error(
+            "complete_bootstrap_join",
+            prism_sync_core::CoreError::EpochKeyMismatch {
+                epoch: 3,
+                message: "hash mismatch".into(),
+            },
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(encoded.strip_prefix(STRUCTURED_ERROR_PREFIX).unwrap()).unwrap();
+        assert_eq!(payload["code"], "epoch_key_mismatch");
+        assert_eq!(payload["epoch"], 3);
+    }
+
+    #[tokio::test]
+    async fn start_initiator_ceremony_refuses_when_initiator_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let ceremony = make_real_initiator_ceremony().await;
+        plant_initiator_slot(&handle, ceremony);
+
+        // Token bytes are irrelevant — guard fires before parsing.
+        let err = start_initiator_ceremony(&handle, vec![0xAA; 64])
+            .await
+            .expect_err("guard must refuse second start_initiator_ceremony");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("initiator ceremony is already in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_initiator_ceremony_refuses_when_joiner_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+
+        let err = start_initiator_ceremony(&handle, vec![0xAA; 64])
+            .await
+            .expect_err("guard must refuse start_initiator_ceremony when joiner in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("joiner ceremony is in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_joiner_ceremony_refuses_when_joiner_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+
+        let err = start_joiner_ceremony(&handle)
+            .await
+            .expect_err("guard must refuse second start_joiner_ceremony");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("joiner ceremony is already in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn start_joiner_ceremony_refuses_when_initiator_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let ceremony = make_real_initiator_ceremony().await;
+        plant_initiator_slot(&handle, ceremony);
+
+        let err = start_joiner_ceremony(&handle)
+            .await
+            .expect_err("guard must refuse start_joiner_ceremony when initiator in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+        assert!(err.contains("initiator ceremony is in progress"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn complete_initiator_ceremony_refuses_when_joiner_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+
+        let err = complete_initiator_ceremony(&handle, "pw".into(), "phrase".into())
+            .await
+            .expect_err("guard must refuse complete_initiator while joiner in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_joiner_ceremony_refuses_when_initiator_in_progress() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let ceremony = make_real_initiator_ceremony().await;
+        plant_initiator_slot(&handle, ceremony);
+
+        let err = complete_joiner_ceremony(&handle, "pw".into())
+            .await
+            .expect_err("guard must refuse complete_joiner while initiator in flight");
+        assert!(
+            err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
+            "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
         );
     }
 }

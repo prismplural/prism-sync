@@ -126,7 +126,11 @@ impl SnapshotExchange for RekeyMockRelay {
         _: Option<u64>,
         _: Option<String>,
         _: String,
+        _: Option<prism_sync_core::relay::SnapshotUploadProgress>,
     ) -> Result<(), RelayError> {
+        unimplemented!()
+    }
+    async fn delete_snapshot(&self) -> Result<(), RelayError> {
         unimplemented!()
     }
 }

@@ -28,6 +28,12 @@ pub enum SyncEvent {
     WebSocketStateChanged { connected: bool },
     /// A backoff delay was scheduled after a sync failure.
     BackoffScheduled { attempt: u32, delay_secs: u64 },
+    /// Pair-time snapshot upload progress. Emitted by `SyncService` while
+    /// `put_snapshot` streams the body to the relay.
+    SnapshotUploadProgress { sync_id: String, bytes_sent: u64, bytes_total: u64 },
+    /// Pair-time snapshot upload failed. Emitted by `SyncService` before the
+    /// underlying `Err(..)` is returned to the caller.
+    SnapshotUploadFailed { sync_id: String, reason: String },
 }
 
 /// A single entity change with full field data, for consumer DB application.
@@ -44,6 +50,7 @@ pub struct EntityChange {
     /// Values use the same encoding as `encode_value` / `decode_value`:
     /// - String -> JSON string (e.g. `"\"hello\""`)
     /// - Int -> JSON number (e.g. `"42"`)
+    /// - Real -> JSON number (e.g. `"3.14"`)
     /// - Bool -> `"true"` / `"false"`
     /// - DateTime -> JSON-encoded ISO-8601 (e.g. `"\"2026-03-15T12:00:00.000Z\""`)
     /// - Blob -> JSON-encoded base64 (e.g. `"\"3q2+7w==\""`)
@@ -135,6 +142,8 @@ pub(crate) fn classify_core_error(e: &crate::error::CoreError) -> SyncErrorKind 
         // the outer auto-sync driver will pick them up on the next
         // cycle without us burning the inner retry budget.
         CoreError::MissingEpochKey { .. }
+        | CoreError::EpochMismatch { .. }
+        | CoreError::EpochKeyMismatch { .. }
         | CoreError::DecryptFailed { .. }
         | CoreError::Engine(_)
         | CoreError::Storage(_) => SyncErrorKind::Protocol,
@@ -144,7 +153,9 @@ pub(crate) fn classify_core_error(e: &crate::error::CoreError) -> SyncErrorKind 
         | CoreError::HlcParse(_)
         | CoreError::UnknownTable(_)
         | CoreError::UnknownField { .. }
-        | CoreError::Crypto(_) => SyncErrorKind::Protocol,
+        | CoreError::Crypto(_)
+        | CoreError::BootstrapNotAllowed(_)
+        | CoreError::SnapshotTooLarge { .. } => SyncErrorKind::Protocol,
     }
 }
 

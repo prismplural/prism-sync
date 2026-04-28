@@ -40,6 +40,12 @@ pub enum CoreError {
     #[error("missing epoch key for epoch {epoch}")]
     MissingEpochKey { epoch: u32 },
 
+    #[error("epoch mismatch: local_epoch={local_epoch}, relay_epoch={relay_epoch}: {message}")]
+    EpochMismatch { local_epoch: u32, relay_epoch: u32, message: String },
+
+    #[error("epoch key mismatch for epoch {epoch}: {message}")]
+    EpochKeyMismatch { epoch: u32, message: String },
+
     #[error("decrypt failed for epoch {epoch}: {source}")]
     DecryptFailed {
         epoch: u32,
@@ -58,6 +64,18 @@ pub enum CoreError {
 
     #[error("unknown field: {table}.{field}")]
     UnknownField { table: String, field: String },
+
+    /// First-device bootstrap was invoked on a handle that is not in the
+    /// pre-first-sync "sole device" state. The string names the specific
+    /// guard condition that failed.
+    #[error("bootstrap not allowed: {0}")]
+    BootstrapNotAllowed(String),
+
+    /// Local snapshot probe produced a zstd-compressed blob larger than
+    /// `MAX_SNAPSHOT_COMPRESSED_BYTES`. Reported to the caller before any
+    /// upload is attempted.
+    #[error("snapshot too large: {bytes} bytes exceeds compressed limit")]
+    SnapshotTooLarge { bytes: usize },
 }
 
 /// Coarse relay error classification for retry logic.
@@ -116,6 +134,11 @@ impl CoreError {
             | RelayError::ClockSkew { .. }
             | RelayError::KeyChanged { .. } => {
                 (RelayErrorCategory::Protocol, None, None, None, None)
+            }
+            RelayError::NotFound => (RelayErrorCategory::Server, Some(404), None, None, None),
+            RelayError::Forbidden { .. } => (RelayErrorCategory::Auth, Some(403), None, None, None),
+            RelayError::Http { status, .. } => {
+                (RelayErrorCategory::Server, Some(status), None, None, None)
             }
         };
 

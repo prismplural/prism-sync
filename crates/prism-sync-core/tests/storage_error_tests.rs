@@ -612,6 +612,33 @@ fn clear_sync_state_removes_all_data_for_sync_id() {
 }
 
 #[test]
+fn clear_sync_state_idempotent() {
+    let storage = make_storage();
+
+    let mut tx = storage.begin_tx().unwrap();
+    tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+    tx.insert_pending_op(&sample_pending_op("op-1", "batch-1")).unwrap();
+    tx.insert_applied_op(&sample_applied_op("aop-1", 1)).unwrap();
+    tx.upsert_field_version(&sample_field_version("e1", "title", "hlc-1")).unwrap();
+    tx.upsert_device_record(&sample_device_record("dev-1")).unwrap();
+    tx.commit().unwrap();
+
+    let mut tx = storage.begin_tx().unwrap();
+    tx.clear_sync_state("sync-1").unwrap();
+    tx.commit().unwrap();
+
+    let mut tx = storage.begin_tx().unwrap();
+    tx.clear_sync_state("sync-1").unwrap();
+    tx.commit().unwrap();
+
+    assert!(storage.get_sync_metadata("sync-1").unwrap().is_none());
+    assert!(storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+    assert!(!storage.is_op_applied("aop-1").unwrap());
+    assert!(storage.get_field_version("sync-1", "tasks", "e1", "title").unwrap().is_none());
+    assert!(storage.list_device_records("sync-1").unwrap().is_empty());
+}
+
+#[test]
 fn clear_sync_state_does_not_affect_other_sync_ids() {
     let storage = make_storage();
 

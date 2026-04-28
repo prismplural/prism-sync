@@ -103,6 +103,35 @@ pub fn xchacha_decrypt_from_sync(
         .map_err(|_| CryptoError::DecryptionFailed("decryption failed or AAD mismatch".into()))
 }
 
+/// Compute a deterministic AEAD-based MAC over the given AAD with the given
+/// key, using XChaCha20-Poly1305 with an all-zero nonce and empty plaintext.
+///
+/// Returns `nonce (24 bytes) || ciphertext+MAC` — for empty plaintext this
+/// is `24 bytes nonce || 16 bytes Poly1305 tag` = 40 bytes.
+///
+/// Only safe for hash-material / commitment use cases where the AAD is a
+/// well-known domain-separating string and the input is never used as
+/// confidentiality material. The all-zero nonce is acceptable here because
+/// the output is never decrypted — it is hashed (e.g., via SHA-256) to form
+/// a commitment. The AAD makes the output unforgeable without the key.
+///
+/// Do NOT use this for encrypting any sensitive plaintext: the all-zero
+/// nonce would leak plaintext on key reuse.
+pub fn xchacha_aead_mac_zero_nonce(key: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid key: {e}")))?;
+    let zero_nonce = [0u8; XCHACHA_NONCE_LEN];
+    let xnonce = XNonce::from_slice(&zero_nonce);
+    let payload = chacha20poly1305::aead::Payload { msg: &[], aad };
+    let ciphertext = cipher
+        .encrypt(xnonce, payload)
+        .map_err(|e| CryptoError::EncryptionFailed(format!("encryption failed: {e}")))?;
+    let mut out = Vec::with_capacity(XCHACHA_NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&zero_nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
 // ── Cross-language test helpers (test-only, deterministic nonce) ──
 
 #[cfg(test)]
