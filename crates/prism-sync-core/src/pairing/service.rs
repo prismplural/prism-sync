@@ -597,6 +597,15 @@ impl PairingService {
             .parse::<u32>()
             .map_err(|e| CoreError::Engine(format!("invalid stored epoch value: {e}")))?;
 
+        // After a successful `revoke_and_rekey`, post_rekey, or epoch
+        // recovery, the new epoch key is persisted to secure_store as
+        // `epoch_key_{N}` (see commit_recovered_epoch_material) but
+        // `KeyHierarchy::unlock` only seeds epoch 0. Without restoring
+        // the higher-epoch keys here, `build_epoch_key_hashes` below
+        // would only commit to epoch 0, and the joiner would reject the
+        // bundle with "epoch_key_hashes missing entry for current_epoch".
+        self.restore_persisted_epoch_keys(&mut key_hierarchy, current_epoch)?;
+
         let bootstrap_bytes = pairing_relay
             .get_bootstrap(&ceremony.rendezvous_id_hex())
             .await
@@ -749,6 +758,17 @@ impl PairingService {
         // monotonic counter.
         let registry_version = SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
         let epoch_key_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        // Belt-and-suspenders: catch the bug where the inviter ships a
+        // snapshot with current_epoch > 0 but no epoch_key_hash for it.
+        // The joiner's deserializer rejects the same shape, but failing
+        // here gives a clearer error tied to the inviter's own state
+        // (and avoids posting a malformed bundle to the relay at all).
+        if !epoch_key_hashes.contains_key(&current_epoch) {
+            return Err(CoreError::Engine(format!(
+                "inviter key_hierarchy is missing epoch {current_epoch} — \
+                 cannot sign registry snapshot whose current_epoch is {current_epoch}",
+            )));
+        }
         let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
             snapshot_entries,
             registry_version,
@@ -865,26 +885,63 @@ impl PairingService {
 
         let key_name = format!("epoch_key_{epoch}");
         if let Some(stored) = self.secure_store.get(&key_name)? {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            // Tolerant decode: sync_service.rs historically wrote raw bytes while
-            // the bootstrap/rekey paths write base64. Try base64 first; if the
-            // result is exactly 32 bytes it's the real key. Otherwise fall back to
-            // treating the stored bytes as raw key material.
-            if let Ok(decoded) = STANDARD.decode(&stored) {
-                if decoded.len() == 32 {
-                    return Ok(decoded);
-                }
-            }
-            if stored.len() == 32 {
-                return Ok(stored);
-            }
-            return Err(CoreError::Engine(format!(
-                "invalid {key_name} in secure store: expected 32-byte key, got {} bytes",
-                stored.len()
-            )));
+            return Self::decode_persisted_epoch_key(&key_name, stored);
         }
 
         Ok(key_hierarchy.epoch_key(epoch).map_err(CoreError::Crypto)?.to_vec())
+    }
+
+    /// Restore every persisted `epoch_key_{N}` (1..=current_epoch) from the
+    /// secure store into the in-memory [`KeyHierarchy`].
+    ///
+    /// `KeyHierarchy::unlock` only seeds epoch 0 from the DEK. Higher-epoch
+    /// keys live in the secure store after each `revoke_and_rekey`,
+    /// `post_rekey`, or epoch-recovery commit (see
+    /// `commit_recovered_epoch_material`). This restore is required before
+    /// any path that needs to expose `epoch_key_hashes` for epochs > 0 —
+    /// notably [`Self::complete_bootstrap_initiator`], which signs a
+    /// snapshot whose `epoch_key_hashes` must include the bundle's
+    /// `current_epoch` or the joiner rejects the bundle.
+    ///
+    /// Missing keys are silently skipped — an epoch may legitimately have
+    /// no persisted entry on a device that joined after that epoch's
+    /// rekey but caught up at a higher epoch in one step. Malformed keys
+    /// are an error: a corrupt persisted entry shouldn't be silently
+    /// dropped.
+    fn restore_persisted_epoch_keys(
+        &self,
+        key_hierarchy: &mut KeyHierarchy,
+        current_epoch: u32,
+    ) -> Result<()> {
+        for epoch in 1..=current_epoch {
+            let key_name = format!("epoch_key_{epoch}");
+            let Some(stored) = self.secure_store.get(&key_name)? else {
+                continue;
+            };
+            let decoded = Self::decode_persisted_epoch_key(&key_name, stored)?;
+            key_hierarchy.store_epoch_key(epoch, zeroize::Zeroizing::new(decoded));
+        }
+        Ok(())
+    }
+
+    /// Tolerant decode shared by [`Self::load_epoch_key`] and
+    /// [`Self::restore_persisted_epoch_keys`]: try base64 first, then fall
+    /// back to raw bytes. `sync_service.rs` historically wrote raw bytes
+    /// while the bootstrap/rekey paths write base64, so we accept both.
+    fn decode_persisted_epoch_key(key_name: &str, stored: Vec<u8>) -> Result<Vec<u8>> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if let Ok(decoded) = STANDARD.decode(&stored) {
+            if decoded.len() == 32 {
+                return Ok(decoded);
+            }
+        }
+        if stored.len() == 32 {
+            return Ok(stored);
+        }
+        Err(CoreError::Engine(format!(
+            "invalid {key_name} in secure store: expected 32-byte key, got {} bytes",
+            stored.len()
+        )))
     }
 
     fn load_optional_secure_string(&self, key: &str) -> Result<Option<String>> {
@@ -3248,4 +3305,184 @@ mod tests {
     // External integration tests in `tests/consumer_api.rs` and
     // `tests/pairing_failures.rs` also exercise the legacy flow for
     // backwards compatibility and are kept intact.
+
+    /// Unit test for the helper itself: post-revoke / post-rekey flows
+    /// persist `epoch_key_{N}` to the secure store, but a freshly-unlocked
+    /// `KeyHierarchy` only has epoch 0. The helper must restore each
+    /// persisted epoch key into the hierarchy so downstream consumers
+    /// (`build_epoch_key_hashes`, etc.) see the full set.
+    #[test]
+    fn restore_persisted_epoch_keys_loads_secure_store_entries() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let store = Arc::new(MemStore::default());
+        // Mix base64 and raw to exercise the tolerant decode (the bootstrap
+        // path writes base64; sync_service.rs historically wrote raw).
+        let key1 = [0xAAu8; 32];
+        let key2 = [0xBBu8; 32];
+        let key3 = [0xCCu8; 32];
+        store.set("epoch_key_1", STANDARD.encode(key1).as_bytes()).unwrap();
+        store.set("epoch_key_2", &key2).unwrap();
+        store.set("epoch_key_3", STANDARD.encode(key3).as_bytes()).unwrap();
+
+        let service = PairingService::new(store.clone());
+        let mut hierarchy = KeyHierarchy::new();
+        // Unlock so epoch 0 is present and the hierarchy accepts writes.
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        hierarchy.initialize("pw", &secret_key).unwrap();
+
+        service.restore_persisted_epoch_keys(&mut hierarchy, 3).unwrap();
+
+        let restored: std::collections::BTreeMap<u32, [u8; 32]> = hierarchy
+            .epoch_keys_iter()
+            .unwrap()
+            .into_iter()
+            .map(|(epoch, key)| (epoch, *key))
+            .collect();
+        // Expect epoch 0 (from initialize) plus 1/2/3 from secure store.
+        assert!(restored.contains_key(&0));
+        assert_eq!(restored.get(&1), Some(&key1));
+        assert_eq!(restored.get(&2), Some(&key2));
+        assert_eq!(restored.get(&3), Some(&key3));
+    }
+
+    /// Regression test for the silent post-revoke pairing failure: the
+    /// inviter's `complete_bootstrap_initiator` used to build a fresh
+    /// `KeyHierarchy` containing only epoch 0, then sign a snapshot with
+    /// `current_epoch` taken from the secure store (e.g. 1 after a
+    /// `revoke_and_rekey`). The resulting bundle's `epoch_key_hashes` map
+    /// only had an entry for epoch 0, so the joiner rejected it with
+    /// "registry epoch_key_hashes missing entry for current_epoch 1".
+    ///
+    /// Mirrors `bootstrap_pairing_round_trip_and_rekey` but seeds the
+    /// initiator at epoch=1 with a persisted `epoch_key_1`, simulating
+    /// the state after a successful `revoke_and_rekey`.
+    #[tokio::test]
+    async fn bootstrap_initiator_includes_post_revoke_epoch_in_snapshot() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        // Relay reports the inviter at epoch 1 (matches local) — no
+        // catch-up branch will run, so the bug fires if it's still there.
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+        }]));
+
+        // Seed initiator store at epoch=1 with persisted epoch_key_1, the
+        // shape `revoke_and_rekey` leaves behind.
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("epoch", b"1").unwrap();
+        let epoch_1_key = [0x77u8; 32];
+        {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            initiator_store
+                .set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes())
+                .unwrap();
+        }
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
+
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service_task
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+                .unwrap()
+        });
+
+        initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+            )
+            .await
+            .expect("post-revoke initiator must produce a valid bundle");
+
+        // The joiner accepts the bundle iff the inviter's snapshot
+        // includes `epoch_key_hashes[current_epoch]`. Pre-fix, this would
+        // have panicked with "registry epoch_key_hashes missing entry for
+        // current_epoch 1".
+        let (_joiner_key_hierarchy, joiner_snapshot) = joiner_handle.await.unwrap();
+        // Bundle's current_epoch reflects the post-rekey advance (initiator
+        // bumps to next_epoch after registering the joiner).
+        assert!(joiner_snapshot.current_epoch >= 1);
+        assert!(
+            joiner_snapshot.epoch_key_hashes.contains_key(&joiner_snapshot.current_epoch),
+            "joiner snapshot missing epoch_key_hash for its own current_epoch {}",
+            joiner_snapshot.current_epoch
+        );
+        // The pre-revoke epoch (1) must also be retained in the hash map
+        // — the inviter committed to BOTH epoch 0 and epoch 1, even though
+        // only epoch 1 is "current".
+        assert!(
+            joiner_snapshot.epoch_key_hashes.contains_key(&1),
+            "joiner snapshot missing epoch_key_hash for the pre-rekey epoch 1"
+        );
+        assert_eq!(
+            joiner_snapshot.epoch_key_hashes.get(&1),
+            Some(&compute_epoch_key_hash(&epoch_1_key)),
+            "epoch_key_hash for epoch 1 must hash the persisted post-revoke key"
+        );
+    }
 }
