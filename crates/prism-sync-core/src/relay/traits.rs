@@ -512,6 +512,15 @@ pub trait DeviceRegistry: Send + Sync {
     async fn get_signed_registry(
         &self,
     ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError>;
+
+    /// Publish a signed registry snapshot for this sync group.
+    ///
+    /// The relay stores the opaque artifact; peers verify its signature and
+    /// epoch bindings locally before trusting it.
+    async fn put_signed_registry(
+        &self,
+        signed_registry_snapshot: &[u8],
+    ) -> std::result::Result<i64, RelayError>;
 }
 
 /// Epoch key rotation: posting and retrieving per-device wrapped epoch keys.
@@ -524,6 +533,7 @@ pub trait EpochManagement: Send + Sync {
         &self,
         epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> std::result::Result<i32, RelayError>;
 
     /// Fetch this device's wrapped epoch key for a given epoch.

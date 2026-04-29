@@ -107,15 +107,11 @@ impl ServerRelay {
     }
 
     fn current_session_token(&self) -> String {
-        self.device_session_token
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.device_session_token.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     fn update_session_token(&self, token: String) {
-        *self.device_session_token.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            token;
+        *self.device_session_token.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
     }
 
     fn apply_signed_auth(
@@ -317,8 +313,7 @@ impl SyncTransport for ServerRelay {
         // the same classifier as the original send error so it lands as Network
         // (transient, retryable) instead of Protocol (hard error). The next sync
         // cycle re-pulls cleanly and the user never sees a spurious failure.
-        let json: serde_json::Value =
-            resp.json().await.map_err(Self::classify_reqwest_error)?;
+        let json: serde_json::Value = resp.json().await.map_err(Self::classify_reqwest_error)?;
 
         let max_server_seq = json["max_server_seq"].as_i64().unwrap_or(0);
         let min_acked_seq = json["min_acked_seq"].as_i64();
@@ -632,6 +627,43 @@ impl DeviceRegistry for ServerRelay {
 
         Ok(Some(response))
     }
+
+    async fn put_signed_registry(
+        &self,
+        signed_registry_snapshot: &[u8],
+    ) -> Result<i64, RelayError> {
+        let path = self.canonical_path("/registry");
+        let url = format!("{}{}", self.base_url, path);
+        debug!("put_signed_registry bytes={}", signed_registry_snapshot.len());
+
+        let body = serde_json::json!({
+            "signed_registry_snapshot": BASE64.encode(signed_registry_snapshot),
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode registry request: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.put(&url), "PUT", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse registry response: {e}"),
+        })?;
+
+        Ok(json["registry_version"].as_i64().unwrap_or(0))
+    }
 }
 
 #[async_trait]
@@ -640,6 +672,7 @@ impl EpochManagement for ServerRelay {
         &self,
         epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<i32, RelayError> {
         let path = self.canonical_path("/rekey");
         let url = format!("{}{}", self.base_url, path);
@@ -652,6 +685,7 @@ impl EpochManagement for ServerRelay {
         let body = serde_json::json!({
             "epoch": epoch,
             "wrapped_keys": encoded_keys,
+            "signed_registry_snapshot": signed_registry_snapshot.map(|s| BASE64.encode(s)),
         });
         let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
             message: format!("Failed to encode rekey request: {e}"),
@@ -760,10 +794,7 @@ impl SnapshotExchange for ServerRelay {
     ) -> Result<(), RelayError> {
         let url = format!("{}/snapshot", self.base_path());
         let path = self.canonical_path("/snapshot");
-        debug!(
-            "put_snapshot server_seq_at={server_seq_at} bytes={}",
-            envelope_bytes.len()
-        );
+        debug!("put_snapshot server_seq_at={server_seq_at} bytes={}", envelope_bytes.len());
 
         let total: u64 = envelope_bytes.len() as u64;
 
@@ -1035,10 +1066,8 @@ mod tests {
     fn test_relay(initial_session_token: &str) -> ServerRelay {
         let device_id = "test-device";
         let device_secret = prism_sync_crypto::DeviceSecret::generate();
-        let signing_key = device_secret
-            .ed25519_keypair(device_id)
-            .expect("test ed25519 key")
-            .into_signing_key();
+        let signing_key =
+            device_secret.ed25519_keypair(device_id).expect("test ed25519 key").into_signing_key();
         let ml_dsa_key = device_secret.ml_dsa_65_keypair(device_id).expect("test ml-dsa key");
 
         ServerRelay::new(

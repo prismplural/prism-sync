@@ -13,7 +13,7 @@
 //!     .build()?;
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -25,7 +25,10 @@ use crate::error::{CoreError, Result};
 use crate::events::{event_channel, EntityChange, SyncEvent};
 use crate::hlc::Hlc;
 use crate::op_emitter::OpEmitter;
-use crate::pairing::SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+use crate::pairing::{
+    compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
+    SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+};
 use crate::recovery::{commit_recovered_epoch_material, KeyHierarchyRecoverer};
 use crate::relay::SyncRelay;
 use crate::schema::{SyncSchema, SyncType, SyncValue};
@@ -352,26 +355,25 @@ impl PrismSync {
         // produce a smaller HLC than rows imported from a snapshot or
         // seeded via `bootstrap_existing_state` — the first local mutation
         // then races the seeded row and loses on the HLC tiebreaker.
-        let max_hlc =
-            match self.storage.list_all_field_version_hlcs(&sync_id) {
-                Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
-                    Ok(max) => max,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "configure_engine: failed to parse stored HLCs — starting emitter at zero"
-                        );
-                        None
-                    }
-                },
+        let max_hlc = match self.storage.list_all_field_version_hlcs(&sync_id) {
+            Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
+                Ok(max) => max,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "configure_engine: failed to list field_version HLCs — starting emitter at zero"
+                        "configure_engine: failed to parse stored HLCs — starting emitter at zero"
                     );
                     None
                 }
-            };
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "configure_engine: failed to list field_version HLCs — starting emitter at zero"
+                );
+                None
+            }
+        };
         self.op_emitter = Some(OpEmitter::new(node_id.clone(), sync_id.clone(), epoch, max_hlc));
 
         // Derive and store the device signing keys if a DeviceSecret is available.
@@ -531,6 +533,25 @@ impl PrismSync {
             return Ok(());
         }
         let relay_epoch = current_device.epoch.max(0) as u32;
+        if relay_epoch == local_epoch {
+            if let Err(error) = self
+                .repair_signed_registry_epoch_if_needed(
+                    relay.as_ref(),
+                    &sync_id,
+                    &device_id,
+                    relay_epoch,
+                    &devices,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    relay_epoch,
+                    local_epoch,
+                    "catch_up_epoch_keys: signed registry epoch repair failed"
+                );
+            }
+        }
         if relay_epoch <= local_epoch {
             tracing::debug!(
                 local_epoch,
@@ -698,6 +719,107 @@ impl PrismSync {
         }
 
         Ok(())
+    }
+
+    async fn repair_signed_registry_epoch_if_needed(
+        &self,
+        relay: &dyn SyncRelay,
+        sync_id: &str,
+        device_id: &str,
+        target_epoch: u32,
+        devices: &[crate::relay::traits::DeviceInfo],
+    ) -> Result<()> {
+        if !self.key_hierarchy.has_epoch_key(target_epoch) {
+            return Ok(());
+        }
+
+        let device_secret = self.device_secret.as_ref().ok_or_else(|| {
+            CoreError::Engine("device secret not set — call configure_engine first".into())
+        })?;
+        let signing_key = device_secret.ed25519_keypair(device_id).map_err(CoreError::Crypto)?;
+        let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
+            CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
+        })?;
+
+        let registry_version = match relay.get_signed_registry().await {
+            Ok(Some(response)) => {
+                let current_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+                    &response.artifact_blob,
+                    &signing_key.public_key_bytes(),
+                    &pq_signing_key.public_key_bytes(),
+                )
+                .map_err(|e| {
+                    CoreError::Engine(format!(
+                        "signed registry verification failed before epoch repair: {e}"
+                    ))
+                })?;
+                if current_snapshot.current_epoch >= target_epoch {
+                    return Ok(());
+                }
+                current_snapshot
+                    .registry_version
+                    .max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+            }
+            Ok(None) => SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            Err(error) => return Err(CoreError::from_relay(error)),
+        };
+
+        let epoch_key_hashes = Self::build_epoch_key_hashes_for_registry(&self.key_hierarchy)?;
+        if !epoch_key_hashes.contains_key(&target_epoch) {
+            return Ok(());
+        }
+
+        let entries: Vec<RegistrySnapshotEntry> = devices
+            .iter()
+            .filter(|device| device.status == "active")
+            .map(|device| RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device.device_id.clone(),
+                ed25519_public_key: device.ed25519_public_key.clone(),
+                x25519_public_key: device.x25519_public_key.clone(),
+                ml_dsa_65_public_key: device.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: device.ml_kem_768_public_key.clone(),
+                x_wing_public_key: device.x_wing_public_key.clone(),
+                status: device.status.clone(),
+                ml_dsa_key_generation: device.ml_dsa_key_generation,
+            })
+            .collect();
+
+        if !entries.iter().any(|entry| entry.device_id == device_id) {
+            return Err(CoreError::Engine(
+                "cannot repair signed registry: current device missing from active relay list"
+                    .into(),
+            ));
+        }
+
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            registry_version,
+            target_epoch,
+            epoch_key_hashes,
+        );
+        let signed = snapshot.sign_hybrid(&signing_key, pq_signing_key);
+        let _ = relay.put_signed_registry(&signed).await.map_err(CoreError::from_relay)?;
+
+        tracing::info!(
+            epoch = target_epoch,
+            sync_id = %sync_id,
+            device_id = %device_id,
+            "catch_up_epoch_keys: repaired signed registry epoch binding"
+        );
+
+        Ok(())
+    }
+
+    fn build_epoch_key_hashes_for_registry(
+        key_hierarchy: &KeyHierarchy,
+    ) -> Result<BTreeMap<u32, [u8; 32]>> {
+        let entries = key_hierarchy.epoch_keys_iter().map_err(CoreError::Crypto)?;
+        let mut out = BTreeMap::new();
+        for (epoch, key) in entries {
+            out.insert(epoch, compute_epoch_key_hash(key));
+        }
+        Ok(out)
     }
 
     /// App lifecycle hook: catch up sync if stale (>5 s since last sync).
@@ -966,7 +1088,9 @@ impl PrismSync {
         let sync_id = self
             .sync_service
             .sync_id()
-            .ok_or_else(|| CoreError::Engine("sync_id not set — call configure_engine first".into()))?
+            .ok_or_else(|| {
+                CoreError::Engine("sync_id not set — call configure_engine first".into())
+            })?
             .to_string();
 
         let storage = self.storage.clone();
@@ -1485,6 +1609,9 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(None)
         }
+        async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+            Ok(0)
+        }
     }
 
     #[async_trait]
@@ -1493,6 +1620,7 @@ mod tests {
             &self,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -1709,6 +1837,18 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(self.state.lock().unwrap().signed_registry.clone())
         }
+        async fn put_signed_registry(
+            &self,
+            signed_registry_snapshot: &[u8],
+        ) -> std::result::Result<i64, RelayError> {
+            let mut state = self.state.lock().unwrap();
+            state.signed_registry = Some(SignedRegistryResponse {
+                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                artifact_blob: signed_registry_snapshot.to_vec(),
+                artifact_kind: "signed_registry_snapshot".to_string(),
+            });
+            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64)
+        }
     }
 
     #[async_trait]
@@ -1717,6 +1857,7 @@ mod tests {
             &self,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -2004,6 +2145,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_preflight_repairs_lagging_signed_registry_when_local_epoch_is_current() {
+        let (mut sync, relay, device_id, epoch_1_key, _epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+
+        sync.catch_up_epoch_keys().await.unwrap();
+        assert_eq!(sync.epoch(), Some(2));
+
+        let device_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let device_info = relay.state.lock().unwrap().devices[0].clone();
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        relay.set_signed_registry(signed_registry_response(
+            "sync-1",
+            &device_secret,
+            &device_id,
+            &device_info,
+            1,
+            &[(0, epoch_0_key), (1, epoch_1_key)],
+        ));
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        let repaired = relay.state.lock().unwrap().signed_registry.clone().unwrap();
+        let signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let pq_signing_key = device_secret.ml_dsa_65_keypair(&device_id).unwrap();
+        let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &repaired.artifact_blob,
+            &signing_key.public_key_bytes(),
+            &pq_signing_key.public_key_bytes(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.current_epoch, 2);
+        assert!(snapshot.epoch_key_hashes.contains_key(&2));
+    }
+
+    #[tokio::test]
     async fn sync_preflight_advances_only_verified_prefix_when_artifact_missing() {
         let (mut sync, _relay, _device_id, epoch_1_key, _epoch_2_key) =
             prepare_verified_epoch_catch_up(false);
@@ -2038,9 +2215,8 @@ mod tests {
         use crate::hlc::Hlc;
         use crate::storage::FieldVersion;
 
-        let schema = SyncSchema::builder()
-            .entity("members", |e| e.field("name", SyncType::String))
-            .build();
+        let schema =
+            SyncSchema::builder().entity("members", |e| e.field("name", SyncType::String)).build();
         let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
 
         // Pre-populate field_versions with a high-counter HLC to make the
@@ -2086,11 +2262,8 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), SyncValue::String("Post".to_string()));
         sync.record_create("members", "post-1", &fields).unwrap();
-        let fv = sync
-            .storage
-            .get_field_version("sync-1", "members", "post-1", "name")
-            .unwrap()
-            .unwrap();
+        let fv =
+            sync.storage.get_field_version("sync-1", "members", "post-1", "name").unwrap().unwrap();
         let post_hlc = Hlc::from_string(&fv.winning_hlc).unwrap();
         assert!(
             post_hlc > pre_parsed,
@@ -2554,10 +2727,7 @@ mod tests {
         // as immediately after `PrismSync::builder().build()`.
         assert!(sync.op_emitter.is_none(), "op_emitter cleared");
         assert!(sync.device_signing_key.is_none(), "Ed25519 signing key cleared");
-        assert!(
-            sync.device_ml_dsa_signing_key.is_none(),
-            "ML-DSA signing key cleared"
-        );
+        assert!(sync.device_ml_dsa_signing_key.is_none(), "ML-DSA signing key cleared");
         assert!(sync.ml_dsa_key_generation.is_none(), "ML-DSA generation cleared");
         assert!(sync.device_id.is_none(), "device_id cleared");
         assert!(sync.epoch.is_none(), "epoch cleared");

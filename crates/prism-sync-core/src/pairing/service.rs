@@ -825,9 +825,34 @@ impl PairingService {
         let _joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
 
         let next_epoch = current_epoch.saturating_add(1);
-        let epoch_key =
-            EpochManager::post_rekey(sync_relay, &mut key_hierarchy, &device_id, next_epoch)
-                .await?;
+        let (next_epoch_key, wrapped_keys) =
+            EpochManager::prepare_wrapped_keys(sync_relay, next_epoch, None).await?;
+        let next_epoch_key_array: [u8; 32] =
+            next_epoch_key.as_slice().try_into().map_err(|_| {
+                CoreError::Engine(format!(
+                    "generated epoch key for epoch {next_epoch} has invalid length"
+                ))
+            })?;
+        let mut next_epoch_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        next_epoch_hashes.insert(next_epoch, compute_epoch_key_hash(&next_epoch_key_array));
+        let post_rekey_registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            registry_snapshot.entries.clone(),
+            registry_snapshot.registry_version,
+            next_epoch,
+            next_epoch_hashes,
+        );
+        let signed_post_rekey_registry =
+            post_rekey_registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        let epoch_key = EpochManager::post_prepared_rekey(
+            sync_relay,
+            &mut key_hierarchy,
+            &device_id,
+            next_epoch,
+            next_epoch_key,
+            wrapped_keys,
+            Some(&signed_post_rekey_registry),
+        )
+        .await?;
 
         self.secure_store.set("epoch", next_epoch.to_string().as_bytes())?;
         use base64::{engine::general_purpose::STANDARD, Engine};
@@ -1429,6 +1454,9 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(None)
         }
+        async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+            Ok(0)
+        }
     }
     #[async_trait]
     impl EpochManagement for MockRelay {
@@ -1436,6 +1464,7 @@ mod tests {
             &self,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -1642,6 +1671,18 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(self.state.lock().unwrap().signed_registry.clone())
         }
+        async fn put_signed_registry(
+            &self,
+            signed_registry_snapshot: &[u8],
+        ) -> std::result::Result<i64, RelayError> {
+            let mut state = self.state.lock().unwrap();
+            state.signed_registry = Some(SignedRegistryResponse {
+                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                artifact_blob: signed_registry_snapshot.to_vec(),
+                artifact_kind: "signed_registry_snapshot".to_string(),
+            });
+            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64)
+        }
     }
     #[async_trait]
     impl EpochManagement for BootstrapRegistryRelay {
@@ -1649,6 +1690,7 @@ mod tests {
             &self,
             epoch: i32,
             keys: HashMap<String, Vec<u8>>,
+            signed_registry_snapshot: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             let mut state = self.state.lock().unwrap();
             let current_epoch = state
@@ -1672,6 +1714,13 @@ mod tests {
             }
             for (device_id, artifact) in &keys {
                 state.rekey_artifacts.insert((epoch, device_id.clone()), artifact.clone());
+            }
+            if let Some(snapshot) = signed_registry_snapshot {
+                state.signed_registry = Some(SignedRegistryResponse {
+                    registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                    artifact_blob: snapshot.to_vec(),
+                    artifact_kind: "signed_registry_snapshot".to_string(),
+                });
             }
             state.rekey_posts = Some((epoch, keys));
             Ok(epoch)
@@ -2433,6 +2482,15 @@ mod tests {
         let (next_epoch, wrapped_keys) = state.rekey_posts.as_ref().unwrap();
         assert_eq!(*next_epoch, 3);
         assert!(wrapped_keys.contains_key(&device_id));
+        let post_rekey_registry = state.signed_registry.as_ref().unwrap();
+        let post_rekey_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &post_rekey_registry.artifact_blob,
+            &inviter_signing_key.public_key_bytes(),
+            &inviter_pq_signing_key.public_key_bytes(),
+        )
+        .unwrap();
+        assert_eq!(post_rekey_snapshot.current_epoch, 3);
+        assert!(post_rekey_snapshot.epoch_key_hashes.contains_key(&3));
 
         let err = mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap_err();
         assert!(err.to_string().contains("session not found"));
@@ -3192,6 +3250,9 @@ mod tests {
             ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
                 Ok(None)
             }
+            async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+                Ok(0)
+            }
         }
         #[async_trait]
         impl EpochManagement for CapturingRelay {
@@ -3199,6 +3260,7 @@ mod tests {
                 &self,
                 _: i32,
                 _: HashMap<String, Vec<u8>>,
+                _: Option<&[u8]>,
             ) -> std::result::Result<i32, RelayError> {
                 unimplemented!()
             }
@@ -3409,9 +3471,7 @@ mod tests {
         let epoch_1_key = [0x77u8; 32];
         {
             use base64::{engine::general_purpose::STANDARD, Engine};
-            initiator_store
-                .set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes())
-                .unwrap();
+            initiator_store.set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes()).unwrap();
         }
         initiator_store.set("registration_token", b"relay-registration-token").unwrap();
         let initiator_service = PairingService::new(initiator_store.clone());

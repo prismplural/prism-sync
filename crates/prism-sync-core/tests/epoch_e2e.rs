@@ -88,6 +88,9 @@ impl DeviceRegistry for RekeyMockRelay {
     async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
         Ok(None)
     }
+    async fn put_signed_registry(&self, _: &[u8]) -> Result<i64, RelayError> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
@@ -96,6 +99,7 @@ impl EpochManagement for RekeyMockRelay {
         &self,
         epoch: i32,
         keys: HashMap<String, Vec<u8>>,
+        _signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<i32, RelayError> {
         let mut artifacts = self.artifacts.lock().unwrap();
         for (device_id, wrapped) in keys {

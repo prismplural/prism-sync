@@ -224,8 +224,30 @@ impl EpochManager {
         new_epoch: u32,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let (epoch_key, wrapped_keys) = Self::prepare_wrapped_keys(relay, new_epoch, None).await?;
+        Self::post_prepared_rekey(
+            relay,
+            key_hierarchy,
+            device_id,
+            new_epoch,
+            epoch_key,
+            wrapped_keys,
+            None,
+        )
+        .await
+    }
 
-        let committed_epoch = match relay.post_rekey_artifacts(new_epoch as i32, wrapped_keys).await
+    pub async fn post_prepared_rekey(
+        relay: &dyn SyncRelay,
+        key_hierarchy: &mut KeyHierarchy,
+        device_id: &str,
+        new_epoch: u32,
+        epoch_key: Zeroizing<Vec<u8>>,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let committed_epoch = match relay
+            .post_rekey_artifacts(new_epoch as i32, wrapped_keys, signed_registry_snapshot)
+            .await
         {
             Ok(epoch) if epoch == new_epoch as i32 => new_epoch,
             Ok(epoch) => {
@@ -582,6 +604,9 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(None)
         }
+        async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+            Ok(0)
+        }
     }
 
     #[async_trait]
@@ -590,6 +615,7 @@ mod tests {
             &self,
             epoch: i32,
             keys: HashMap<String, Vec<u8>>,
+            _signed_registry_snapshot: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             *self.posted_artifacts.lock().unwrap() = Some((epoch, keys.clone()));
             match self.post_rekey_behavior {
