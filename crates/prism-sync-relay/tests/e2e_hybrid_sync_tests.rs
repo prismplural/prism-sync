@@ -19,6 +19,7 @@ use common::*;
 use reqwest::Client;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
+use prism_sync_core::relay::traits::{DeviceRegistry, RegisterRequest};
 use prism_sync_core::relay::ServerRelay;
 use prism_sync_core::schema::{encode_value, SyncFieldDef, SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{
@@ -508,6 +509,47 @@ fn make_server_relay(
         None,
     )
     .expect("ServerRelay::new should succeed with localhost URL")
+}
+
+#[tokio::test]
+async fn server_relay_uses_registration_session_for_followup_auth() {
+    let (url, _server, _db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let ml_dsa_kp = keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
+    let relay = make_server_relay(&localhost_url, &sync_id, &device_id, "", &keys);
+
+    let nonce_response = relay.get_registration_nonce().await.unwrap();
+    let challenge_sig = sign_hybrid_challenge(
+        &keys.ed25519_signing_key,
+        &ml_dsa_kp,
+        &sync_id,
+        &device_id,
+        &nonce_response.nonce,
+    );
+
+    relay
+        .register_device(RegisterRequest {
+            device_id: device_id.clone(),
+            signing_public_key: keys.ed25519_signing_key.verifying_key().as_bytes().to_vec(),
+            x25519_public_key: keys.x25519_pk.to_vec(),
+            ml_dsa_65_public_key: keys.ml_dsa_pk.clone(),
+            ml_kem_768_public_key: keys.ml_kem_pk.clone(),
+            x_wing_public_key: Vec::new(),
+            registration_challenge: challenge_sig,
+            nonce: nonce_response.nonce,
+            pow_solution: None,
+            first_device_admission_proof: None,
+            registry_approval: None,
+        })
+        .await
+        .unwrap();
+
+    let devices = relay.list_devices().await.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, device_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

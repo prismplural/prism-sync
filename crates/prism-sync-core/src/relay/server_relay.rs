@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ pub struct ServerRelay {
     base_url: String,
     sync_id: String,
     device_id: String,
-    device_session_token: String,
+    device_session_token: RwLock<String>,
     request_signing_key: SigningKey,
     request_ml_dsa_signing_key: prism_sync_crypto::DevicePqSigningKey,
     registration_token: Option<String>,
@@ -80,7 +80,7 @@ impl ServerRelay {
             base_url,
             sync_id,
             device_id,
-            device_session_token,
+            device_session_token: RwLock::new(device_session_token),
             request_signing_key,
             request_ml_dsa_signing_key,
             registration_token,
@@ -102,8 +102,20 @@ impl ServerRelay {
 
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder
-            .header("Authorization", format!("Bearer {}", self.device_session_token))
+            .header("Authorization", format!("Bearer {}", self.current_session_token()))
             .header("X-Device-Id", &self.device_id)
+    }
+
+    fn current_session_token(&self) -> String {
+        self.device_session_token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn update_session_token(&self, token: String) {
+        *self.device_session_token.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            token;
     }
 
     fn apply_signed_auth(
@@ -438,9 +450,16 @@ impl DeviceRegistry for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        resp.json::<RegisterResponse>().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse register response: {e}"),
-        })
+        let register_response = resp.json::<RegisterResponse>().await.map_err(|e| {
+            RelayError::Protocol { message: format!("Failed to parse register response: {e}") }
+        })?;
+
+        // Pairing creates this relay before a session token exists, then
+        // reuses it for authenticated registry/snapshot calls after
+        // registration succeeds.
+        self.update_session_token(register_response.device_session_token.clone());
+
+        Ok(register_response)
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
@@ -945,7 +964,7 @@ impl SyncRelay for ServerRelay {
         let ws = WebSocketClient::new(
             ws_url,
             self.device_id.clone(),
-            self.device_session_token.clone(),
+            self.current_session_token(),
             self.notification_tx.clone(),
         );
         ws.connect().await;
@@ -1013,12 +1032,58 @@ mod tests {
     use super::ServerRelay;
     use crate::relay::traits::{RegisterRequest, RegistryApproval, RelayError};
 
+    fn test_relay(initial_session_token: &str) -> ServerRelay {
+        let device_id = "test-device";
+        let device_secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = device_secret
+            .ed25519_keypair(device_id)
+            .expect("test ed25519 key")
+            .into_signing_key();
+        let ml_dsa_key = device_secret.ml_dsa_65_keypair(device_id).expect("test ml-dsa key");
+
+        ServerRelay::new(
+            "http://localhost".to_string(),
+            "00".repeat(32),
+            device_id.to_string(),
+            initial_session_token.to_string(),
+            signing_key,
+            ml_dsa_key,
+            None,
+        )
+        .expect("test relay")
+    }
+
     #[test]
     fn classify_error_keeps_device_revoked_response_structured() {
         let err =
             ServerRelay::classify_error(401, r#"{"error":"device_revoked","remote_wipe":true}"#);
 
         assert!(matches!(err, RelayError::DeviceRevoked { remote_wipe: true }));
+    }
+
+    #[test]
+    fn updated_session_token_is_used_for_auth_headers() {
+        let relay = test_relay("");
+
+        let before = relay
+            .apply_auth(relay.client.get("http://localhost/test"))
+            .build()
+            .expect("request before update");
+        assert_eq!(
+            before.headers().get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer ")
+        );
+
+        relay.update_session_token("registered-session-token".to_string());
+
+        let after = relay
+            .apply_auth(relay.client.get("http://localhost/test"))
+            .build()
+            .expect("request after update");
+        assert_eq!(
+            after.headers().get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer registered-session-token")
+        );
     }
 
     #[test]
