@@ -12,6 +12,8 @@ use crate::pairing::{SignedRegistrySnapshot, SIGNED_REGISTRY_VERSION_MIN_WITH_EP
 use crate::storage::{DeviceRecord, StorageError, SyncStorage};
 use prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof;
 
+const SUPPORTED_REGISTRY_ARTIFACT_VERSION: u8 = 0x03;
+
 /// Stateless helper for device registry operations.
 ///
 /// All state lives in the [`SyncStorage`] implementation; this struct provides
@@ -336,6 +338,20 @@ impl DeviceRegistryManager {
         sync_id: &str,
         artifact_blob: &[u8],
     ) -> Result<SignedRegistrySnapshot> {
+        match artifact_blob.first().copied() {
+            Some(SUPPORTED_REGISTRY_ARTIFACT_VERSION) => {}
+            Some(version) => {
+                return Err(CoreError::Engine(format!(
+                    "unsupported registry artifact version 0x{version:02x}; expected 0x{SUPPORTED_REGISTRY_ARTIFACT_VERSION:02x}"
+                )));
+            }
+            None => {
+                return Err(CoreError::Engine(
+                    "unsupported registry artifact version: missing version byte".into(),
+                ));
+            }
+        }
+
         let local_devices = storage.list_device_records(sync_id)?;
         let mut last_error: Option<String> = None;
 

@@ -9,12 +9,13 @@ use rand::RngCore;
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use prism_sync_core::{
-    pairing::models::{RegistrySnapshotEntry, SignedRegistrySnapshot},
+    pairing::models::{compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot},
     relay::traits::RegistryApproval,
 };
-use prism_sync_crypto::DeviceSecret;
+use prism_sync_crypto::{DeviceSecret, KeyHierarchy};
 use prism_sync_relay::{
     config::Config,
     db::{self, Database},
@@ -495,7 +496,12 @@ pub fn build_signed_registry_snapshot_hybrid_versioned(
     ml_dsa_key: &prism_sync_crypto::DevicePqSigningKey,
     registry_version: i64,
 ) -> Vec<u8> {
-    let snapshot = SignedRegistrySnapshot::new(entries, registry_version);
+    let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+        entries,
+        registry_version,
+        0,
+        test_epoch_key_hashes(),
+    );
     let canonical_json_v3 = snapshot.canonical_json_v3();
 
     let mut signing_data =
@@ -518,6 +524,18 @@ pub fn build_signed_registry_snapshot_hybrid_versioned(
     wire.extend_from_slice(&sig_bytes);
     wire.extend_from_slice(&canonical_json_v3);
     wire
+}
+
+fn test_epoch_key_hashes() -> BTreeMap<u32, [u8; 32]> {
+    let mut key_hierarchy = KeyHierarchy::new();
+    key_hierarchy.initialize("test-password", &[0u8; 16]).unwrap();
+    let epoch_0_key: [u8; 32] = key_hierarchy
+        .epoch_key(0)
+        .expect("test key hierarchy should have epoch 0")
+        .try_into()
+        .expect("epoch 0 key should be 32 bytes");
+
+    BTreeMap::from([(0, compute_epoch_key_hash(&epoch_0_key))])
 }
 
 /// Deterministic hash for a signed registry snapshot wire payload.
