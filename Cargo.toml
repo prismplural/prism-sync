@@ -17,9 +17,9 @@ rust-version = "1.75"
 # ── Workspace dependencies ───────────────────────────────────────────────────
 [workspace.dependencies]
 # Internal crates
-prism-sync-crypto = { path = "crates/prism-sync-crypto" }
-prism-sync-core = { path = "crates/prism-sync-core" }
-prism-sync-relay = { path = "crates/prism-sync-relay" }
+prism-sync-crypto = { path = "crates/prism-sync-crypto", version = "0.1.0" }
+prism-sync-core = { path = "crates/prism-sync-core", version = "0.1.0" }
+prism-sync-relay = { path = "crates/prism-sync-relay", version = "0.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -1,6 +1,6 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# Vulnerability advisories are denied by default in cargo-deny 0.19+.
+unmaintained = "workspace"
 yanked = "deny"
 
 [licenses]
@@ -11,12 +11,19 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
+]
+exceptions = [
+    { allow = ["CC0-1.0"], crate = "bip39" },
+    { allow = ["CC0-1.0"], crate = "bitcoin_hashes" },
+    { allow = ["CC0-1.0"], crate = "hex-conservative" },
+    { allow = ["Zlib"], crate = "foldhash" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 deny = [
     { name = "serde_cbor", reason = "unmaintained; use ciborium for CBOR payloads" },
 ]
