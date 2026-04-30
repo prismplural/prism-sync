@@ -166,20 +166,10 @@ impl PairingResponse {
             || first_byte == Some(HYBRID_SIGNATURE_VERSION_V3)
         {
             // V2/V3 hybrid format: [version][HybridSignature][JSON]
-            // Parse length-prefixed hybrid sig to find JSON start
             let remaining = &self.signed_keyring[1..];
-            if remaining.len() < 8 {
+            let Ok(signature_len) = HybridSignature::encoded_len(remaining) else {
                 return "existing_group";
-            }
-            let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap_or([0; 4])) as usize;
-            if remaining.len() < 4 + ed_len + 4 {
-                return "existing_group";
-            }
-            let ml_len_offset = 4 + ed_len;
-            let ml_len = u32::from_le_bytes(
-                remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap_or([0; 4]),
-            ) as usize;
-            let signature_len = ml_len_offset + 4 + ml_len;
+            };
             if remaining.len() <= signature_len {
                 return "existing_group";
             }
@@ -654,18 +644,8 @@ impl SignedRegistrySnapshot {
             return Err("signed snapshot missing V3 hybrid signature version".into());
         }
 
-        if remaining.len() < 8 {
-            return Err("registry snapshot signature invalid: hybrid signature too short".into());
-        }
-        let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap()) as usize;
-        if remaining.len() < 4 + ed_len + 4 {
-            return Err("registry snapshot signature invalid: hybrid signature truncated".into());
-        }
-        let ml_len_offset = 4 + ed_len;
-        let ml_len =
-            u32::from_le_bytes(remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap())
-                as usize;
-        let signature_len = ml_len_offset + 4 + ml_len;
+        let signature_len = HybridSignature::encoded_len(remaining)
+            .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
         if remaining.len() <= signature_len {
             return Err("signed snapshot missing JSON payload".into());
         }
@@ -907,6 +887,17 @@ mod tests {
         let mut resp = sample_response();
         resp.signed_keyring = vec![0xFF; 100]; // garbage
         assert_eq!(resp.admission_context(), "existing_group");
+    }
+
+    #[test]
+    fn admission_context_oversized_hybrid_signature_len_returns_existing_group() {
+        let mut resp = sample_response();
+        resp.signed_keyring = vec![HYBRID_SIGNATURE_VERSION_V3];
+        resp.signed_keyring.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let result = std::panic::catch_unwind(|| resp.admission_context());
+        assert!(result.is_ok(), "oversized hybrid signature length should not panic");
+        assert_eq!(result.unwrap(), "existing_group");
     }
 
     // ── SignedRegistrySnapshot tests ──
@@ -1161,6 +1152,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("signature invalid"));
+    }
+
+    #[test]
+    fn snapshot_hybrid_rejects_oversized_signature_len_without_panic() {
+        let mut signed = vec![HYBRID_SIGNATURE_VERSION_V3];
+        signed.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let result = std::panic::catch_unwind(|| {
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &[0u8; 32], &[0u8; 1952])
+        });
+
+        assert!(result.is_ok(), "oversized hybrid signature length should not panic");
+        let err = result.unwrap().unwrap_err();
+        assert!(err.contains("registry snapshot signature invalid"), "unexpected error: {err}");
     }
 
     #[test]

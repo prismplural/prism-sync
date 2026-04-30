@@ -23,10 +23,8 @@ use prism_sync_relay::{
     state::AppState,
 };
 
-/// Start the relay server in-process on a random port with an in-memory DB.
-/// Returns `(base_url, server_handle, db)`.
-pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
-    let config = Config {
+pub fn test_config() -> Config {
+    Config {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
@@ -90,15 +88,24 @@ pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sy
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
-    };
+    }
+}
 
+/// Start the relay server in-process on a random port with an in-memory DB.
+/// Returns `(base_url, server_handle, db)`.
+pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
+    let config = test_config();
     start_test_relay_with_config(config).await
 }
 
 pub async fn start_test_relay_with_config(
     config: Config,
 ) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
-    let db = Database::in_memory().expect("in-memory db");
+    let db = if config.db_path == ":memory:" {
+        Database::in_memory().expect("in-memory db")
+    } else {
+        Database::open(&config.db_path, config.reader_pool_size).expect("test db")
+    };
     let state = AppState::new(db, config);
     let db = state.db.clone();
     let app = routes::router(state);

@@ -251,7 +251,7 @@ const SAS_WORDS: [&str; 256] = [
     "dahlia",
     "dune",
     "egret",
-    "ember",
+    "elder",
     "fennel",
     "fig",
     "garland",
@@ -483,6 +483,14 @@ mod tests {
         // Each word should be from the word list
         for word in &words {
             assert!(SAS_WORDS.contains(word), "word '{word}' not in SAS_WORDS list");
+        }
+    }
+
+    #[test]
+    fn word_list_entries_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for word in SAS_WORDS {
+            assert!(seen.insert(word), "duplicate SAS word: {word}");
         }
     }
 

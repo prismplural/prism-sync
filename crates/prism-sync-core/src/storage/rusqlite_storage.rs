@@ -478,9 +478,25 @@ fn exec_delete_field_versions_for_entity(
     Ok(())
 }
 
+fn exec_delete_non_tombstone_field_versions_for_entity(
+    conn: &Connection,
+    sync_id: &str,
+    table: &str,
+    entity_id: &str,
+) -> Result<usize> {
+    let affected = conn.execute(
+        "DELETE FROM field_versions \
+         WHERE sync_id = ?1 \
+           AND entity_table = ?2 \
+           AND entity_id = ?3 \
+           AND field_name <> 'is_deleted'",
+        params![sync_id, table, entity_id],
+    )?;
+    Ok(affected)
+}
+
 fn query_list_all_field_version_hlcs(conn: &Connection, sync_id: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT winning_hlc FROM field_versions WHERE sync_id = ?1")?;
+    let mut stmt = conn.prepare("SELECT winning_hlc FROM field_versions WHERE sync_id = ?1")?;
     let rows = stmt.query_map(params![sync_id], |row| row.get::<_, String>(0))?;
     let mut result = Vec::new();
     for r in rows {
@@ -490,8 +506,7 @@ fn query_list_all_field_version_hlcs(conn: &Connection, sync_id: &str) -> Result
 }
 
 fn exec_delete_all_pending_ops(conn: &Connection, sync_id: &str) -> Result<usize> {
-    let affected =
-        conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
+    let affected = conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
     Ok(affected)
 }
 
@@ -756,7 +771,7 @@ impl RusqliteSyncStorage {
         )?;
 
         let mut conn = conn;
-        migrations::migrations().to_latest(&mut conn).map_err(|e| {
+        migrations::apply(&mut conn).map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("Migration failed: {e}")))
         })?;
 
@@ -1022,6 +1037,15 @@ impl SyncStorageTx for RusqliteTx<'_> {
         entity_id: &str,
     ) -> Result<()> {
         exec_delete_field_versions_for_entity(&self.conn, sync_id, table, entity_id)
+    }
+
+    fn delete_non_tombstone_field_versions_for_entity(
+        &mut self,
+        sync_id: &str,
+        table: &str,
+        entity_id: &str,
+    ) -> Result<usize> {
+        exec_delete_non_tombstone_field_versions_for_entity(&self.conn, sync_id, table, entity_id)
     }
 
     fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64> {
@@ -1599,6 +1623,64 @@ mod tests {
             .is_none());
 
         // ent-2 version should remain
+        assert!(storage.get_field_version("sync-1", "members", "ent-2", "name").unwrap().is_some());
+    }
+
+    #[test]
+    fn pruning_delete_non_tombstone_field_versions_preserves_is_deleted() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-1".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_encoded_value: Some("\"Alice\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "is_deleted".to_string(),
+            winning_op_id: "op-2".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            winning_encoded_value: Some("true".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-2".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-3".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "2026-01-01T00:00:00.000Z:0003:dev1".to_string(),
+            winning_encoded_value: Some("\"Bob\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        let deleted = tx
+            .delete_non_tombstone_field_versions_for_entity("sync-1", "members", "ent-1")
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().is_none());
+        assert!(storage
+            .get_field_version("sync-1", "members", "ent-1", "is_deleted")
+            .unwrap()
+            .is_some());
         assert!(storage.get_field_version("sync-1", "members", "ent-2", "name").unwrap().is_some());
     }
 

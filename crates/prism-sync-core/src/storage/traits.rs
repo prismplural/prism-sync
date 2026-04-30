@@ -188,6 +188,19 @@ pub trait SyncStorageTx {
         Ok(())
     }
 
+    /// Delete non-tombstone field_versions rows for a specific entity.
+    /// Used when hard-deleting a tombstoned entity while preserving the
+    /// `is_deleted` row that prevents stale ops from resurrecting it.
+    /// Returns the number of rows deleted. Default: 0 (no-op).
+    fn delete_non_tombstone_field_versions_for_entity(
+        &mut self,
+        _sync_id: &str,
+        _table: &str,
+        _entity_id: &str,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Import sync state from a snapshot blob (zstd-compressed JSON).
     /// Returns the number of unique entities restored.
     fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64>;

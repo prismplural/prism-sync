@@ -8,9 +8,7 @@ use axum::{
 use base64::Engine;
 use serde::Deserialize;
 
-use crate::{
-    db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState,
-};
+use crate::{db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState};
 
 use super::{verify_signed_request, AuthIdentity};
 
@@ -339,12 +337,11 @@ pub async fn delete_snapshot(
         None => return Err(AppError::Forbidden("Snapshot has no target device to ACK")),
     }
 
-    let deleted = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| db::delete_snapshot(conn, &sid))
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let deleted =
+        tokio::task::spawn_blocking(move || db.with_conn(|conn| db::delete_snapshot(conn, &sid)))
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if !deleted {
         // Race: TTL cleanup removed the row between our lookup and delete.

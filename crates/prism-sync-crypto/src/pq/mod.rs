@@ -10,7 +10,6 @@ pub use models::*;
 
 use crate::error::{CryptoError, Result};
 use ed25519_dalek::Signer as Ed25519Signer;
-use ed25519_dalek::Verifier as Ed25519Verifier;
 use ml_dsa::signature::Signer as MlDsaSigner;
 use ml_dsa::signature::Verifier as MlDsaVerifier;
 use ml_dsa::MlDsa65;
@@ -84,46 +83,35 @@ impl HybridSignature {
     /// Verify both signatures over `message`.
     ///
     /// Both the Ed25519 and ML-DSA-65 signatures are checked. To avoid
-    /// leaking which signature failed via timing, both are always evaluated
-    /// before returning an error.
+    /// leaking which signature failed via timing or outward errors, both are
+    /// always evaluated before returning a generic verification error.
     pub fn verify(&self, message: &[u8], ed25519_pk: &[u8; 32], ml_dsa_pk: &[u8]) -> Result<()> {
         // Verify Ed25519
-        let ed_result = (|| -> Result<()> {
-            let vk = ed25519_dalek::VerifyingKey::from_bytes(ed25519_pk)
-                .map_err(|e| CryptoError::InvalidKeyMaterial(format!("ed25519 public key: {e}")))?;
-            let sig = ed25519_dalek::Signature::from_slice(&self.ed25519_sig)
-                .map_err(|e| CryptoError::InvalidKeyMaterial(format!("ed25519 signature: {e}")))?;
-            vk.verify(message, &sig)
-                .map_err(|e| CryptoError::SignatureVerificationFailed(format!("ed25519: {e}")))?;
+        let ed_result = (|| -> std::result::Result<(), ()> {
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(ed25519_pk).map_err(|_| ())?;
+            let sig = ed25519_dalek::Signature::from_slice(&self.ed25519_sig).map_err(|_| ())?;
+            vk.verify_strict(message, &sig).map_err(|_| ())?;
             Ok(())
         })();
 
         // Verify ML-DSA-65
-        let ml_result = (|| -> Result<()> {
+        let ml_result = (|| -> std::result::Result<(), ()> {
             let enc_arr =
-                ml_dsa::EncodedVerifyingKey::<MlDsa65>::try_from(ml_dsa_pk).map_err(|_| {
-                    CryptoError::InvalidKeyMaterial(format!(
-                        "ml-dsa-65 public key: expected {} bytes, got {}",
-                        std::mem::size_of::<ml_dsa::EncodedVerifyingKey<MlDsa65>>(),
-                        ml_dsa_pk.len()
-                    ))
-                })?;
+                ml_dsa::EncodedVerifyingKey::<MlDsa65>::try_from(ml_dsa_pk).map_err(|_| ())?;
             let vk = ml_dsa::VerifyingKey::<MlDsa65>::decode(&enc_arr);
 
             let sig = ml_dsa::Signature::<MlDsa65>::try_from(self.ml_dsa_65_sig.as_slice())
-                .map_err(|e| {
-                    CryptoError::InvalidKeyMaterial(format!("ml-dsa-65 signature: {e}"))
-                })?;
-            vk.verify(message, &sig)
-                .map_err(|e| CryptoError::SignatureVerificationFailed(format!("ml-dsa-65: {e}")))?;
+                .map_err(|_| ())?;
+            vk.verify(message, &sig).map_err(|_| ())?;
             Ok(())
         })();
 
         // Both must succeed — check both before returning
         match (ed_result, ml_result) {
             (Ok(()), Ok(())) => Ok(()),
-            (Err(e), _) => Err(e),
-            (_, Err(e)) => Err(e),
+            _ => Err(CryptoError::SignatureVerificationFailed(
+                "hybrid signature verification failed".into(),
+            )),
         }
     }
 
@@ -179,37 +167,44 @@ impl HybridSignature {
         self.verify(&m_prime, ed25519_pk, ml_dsa_pk)
     }
 
+    /// Return the byte length of the hybrid signature encoded at the start of
+    /// `data`, accepting trailing bytes owned by an outer envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `data` is truncated, has invalid component lengths,
+    /// or if offset arithmetic overflows on the target platform.
+    pub fn encoded_len(data: &[u8]) -> Result<usize> {
+        let ed_len = read_len_le(data, 0, "ed25519")?;
+        if ed_len != ED25519_SIG_LEN {
+            return Err(CryptoError::InvalidKeyMaterial(format!(
+                "ed25519 signature: expected {ED25519_SIG_LEN} bytes, got {ed_len}"
+            )));
+        }
+
+        let ml_len_offset = checked_add(4, ed_len, "ml-dsa length offset")?;
+        let ml_len = read_len_le(data, ml_len_offset, "ml-dsa-65")?;
+        if ml_len != ML_DSA_65_SIG_LEN {
+            return Err(CryptoError::InvalidKeyMaterial(format!(
+                "ml-dsa-65 signature: expected {ML_DSA_65_SIG_LEN} bytes, got {ml_len}"
+            )));
+        }
+
+        let ml_sig_offset = checked_add(ml_len_offset, 4, "ml-dsa signature offset")?;
+        let expected_total = checked_add(ml_sig_offset, ml_len, "hybrid signature length")?;
+        if data.len() < expected_total {
+            return Err(CryptoError::InvalidKeyMaterial(format!(
+                "hybrid signature truncated: expected {expected_total} bytes, got {}",
+                data.len()
+            )));
+        }
+
+        Ok(expected_total)
+    }
+
     /// Deserialize from wire format, validating expected signature sizes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 8 {
-            return Err(CryptoError::InvalidKeyMaterial(
-                "hybrid signature too short: need at least 8 bytes for length headers".into(),
-            ));
-        }
-
-        let ed_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-
-        if data.len() < 4 + ed_len + 4 {
-            return Err(CryptoError::InvalidKeyMaterial(format!(
-                "hybrid signature truncated: ed25519_len={ed_len} but only {} bytes remain",
-                data.len() - 4
-            )));
-        }
-
-        let ed_sig = data[4..4 + ed_len].to_vec();
-
-        let ml_offset = 4 + ed_len;
-        let ml_len =
-            u32::from_le_bytes(data[ml_offset..ml_offset + 4].try_into().unwrap()) as usize;
-
-        if data.len() < ml_offset + 4 + ml_len {
-            return Err(CryptoError::InvalidKeyMaterial(format!(
-                "hybrid signature truncated: ml_dsa_len={ml_len} but only {} bytes remain",
-                data.len() - ml_offset - 4
-            )));
-        }
-
-        let expected_total = ml_offset + 4 + ml_len;
+        let expected_total = Self::encoded_len(data)?;
         if data.len() != expected_total {
             return Err(CryptoError::InvalidKeyMaterial(format!(
                 "hybrid signature has trailing data: expected {expected_total} bytes, got {}",
@@ -217,24 +212,37 @@ impl HybridSignature {
             )));
         }
 
-        let ml_sig = data[ml_offset + 4..ml_offset + 4 + ml_len].to_vec();
+        let ed_start = 4;
+        let ed_end = ed_start + ED25519_SIG_LEN;
+        let ml_start = ed_end + 4;
+        let ml_end = ml_start + ML_DSA_65_SIG_LEN;
 
-        if ed_sig.len() != ED25519_SIG_LEN {
-            return Err(CryptoError::InvalidKeyMaterial(format!(
-                "ed25519 signature: expected {ED25519_SIG_LEN} bytes, got {}",
-                ed_sig.len()
-            )));
-        }
-
-        if ml_sig.len() != ML_DSA_65_SIG_LEN {
-            return Err(CryptoError::InvalidKeyMaterial(format!(
-                "ml-dsa-65 signature: expected {ML_DSA_65_SIG_LEN} bytes, got {}",
-                ml_sig.len()
-            )));
-        }
+        let ed_sig = data[ed_start..ed_end].to_vec();
+        let ml_sig = data[ml_start..ml_end].to_vec();
 
         Ok(HybridSignature { ed25519_sig: ed_sig, ml_dsa_65_sig: ml_sig })
     }
+}
+
+fn read_len_le(data: &[u8], offset: usize, label: &str) -> Result<usize> {
+    let end = checked_add(offset, 4, "length field end")?;
+    let bytes = data.get(offset..end).ok_or_else(|| {
+        CryptoError::InvalidKeyMaterial(format!(
+            "hybrid signature truncated: missing {label} length"
+        ))
+    })?;
+    let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+        CryptoError::InvalidKeyMaterial(format!(
+            "hybrid signature malformed: invalid {label} length"
+        ))
+    })?;
+    Ok(u32::from_le_bytes(arr) as usize)
+}
+
+fn checked_add(lhs: usize, rhs: usize, what: &str) -> Result<usize> {
+    lhs.checked_add(rhs).ok_or_else(|| {
+        CryptoError::InvalidKeyMaterial(format!("hybrid signature length overflow: {what}"))
+    })
 }
 
 #[cfg(test)]
@@ -384,6 +392,60 @@ mod tests {
         let mut bytes = sig.to_bytes();
         bytes.push(0xFF); // append trailing byte
         assert!(HybridSignature::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn hybrid_signature_encoded_len_accepts_trailing_payload() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let sig = HybridSignature::sign(b"test", &ed_sk, &ml_sk);
+        let mut bytes = sig.to_bytes();
+        let sig_len = bytes.len();
+        bytes.extend_from_slice(br#"{"entries":[]}"#);
+
+        assert_eq!(HybridSignature::encoded_len(&bytes).unwrap(), sig_len);
+        assert!(HybridSignature::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn hybrid_signature_from_bytes_rejects_oversized_ed25519_len_without_panic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let result = std::panic::catch_unwind(|| HybridSignature::from_bytes(&bytes));
+        assert!(result.is_ok(), "oversized ed25519 length should not panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn hybrid_signature_from_bytes_rejects_oversized_ml_dsa_len_without_panic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(ED25519_SIG_LEN as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0u8; ED25519_SIG_LEN]);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let result = std::panic::catch_unwind(|| HybridSignature::from_bytes(&bytes));
+        assert!(result.is_ok(), "oversized ML-DSA length should not panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn hybrid_signature_verify_error_does_not_name_failed_component() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let sig = HybridSignature::sign(b"test", &ed_sk, &ml_sk);
+        let wrong_ed_sk = ed25519_keypair();
+
+        let ml_vk = ml_sk.verifying_key();
+        let ml_pk_encoded = ml_vk.encode();
+        let ml_pk_bytes = AsRef::<[u8]>::as_ref(&ml_pk_encoded);
+        let err =
+            sig.verify(b"test", &wrong_ed_sk.verifying_key().to_bytes(), ml_pk_bytes).unwrap_err();
+        let err = err.to_string();
+
+        assert!(err.contains("hybrid signature verification failed"), "got: {err}");
+        assert!(!err.contains("ed25519"), "component detail leaked: {err}");
+        assert!(!err.contains("ml-dsa"), "component detail leaked: {err}");
     }
 
     #[test]

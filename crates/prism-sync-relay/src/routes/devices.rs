@@ -615,24 +615,31 @@ pub async fn post_ack(
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
     let server_seq =
         body_json["server_seq"].as_i64().ok_or(AppError::BadRequest("Missing server_seq"))?;
+    if server_seq < 0 {
+        return Err(AppError::BadRequest("server_seq must be non-negative"));
+    }
 
     let db = state.db.clone();
     let sid = auth.sync_id;
     let did = auth.device_id;
-    let stale_threshold = state.config.stale_device_secs as i64;
 
-    tokio::task::spawn_blocking(move || {
+    let accepted = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            db::upsert_device_receipt(conn, &sid, &did, server_seq)?;
-            match db::get_safe_prune_seq(conn, &sid, stale_threshold)? {
-                Some(safe_seq) => db::prune_batches_before(conn, &sid, safe_seq),
-                None => Ok(0),
+            let latest_seq = db::get_latest_seq(conn, &sid)?;
+            if server_seq > latest_seq {
+                return Ok(false);
             }
+            db::upsert_device_receipt(conn, &sid, &did, server_seq)?;
+            Ok(true)
         })
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if !accepted {
+        return Err(AppError::BadRequest("server_seq exceeds latest server sequence"));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

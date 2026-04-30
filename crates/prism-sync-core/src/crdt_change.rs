@@ -85,6 +85,27 @@ impl CrdtChange {
         self.field_name == BULK_RESET_FIELD
     }
 
+    /// Validate that this op's embedded attribution matches the verified
+    /// sender identity from its signed relay envelope.
+    pub fn validate_attribution(&self, sender_device_id: &str) -> Result<()> {
+        if self.device_id != sender_device_id {
+            return Err(CoreError::Engine(format!(
+                "CRDT op attribution mismatch for {}: op.device_id={} envelope.sender_device_id={}",
+                self.op_id, self.device_id, sender_device_id
+            )));
+        }
+
+        let hlc = Hlc::from_string(&self.client_hlc)?;
+        if hlc.node_id != sender_device_id {
+            return Err(CoreError::Engine(format!(
+                "CRDT op HLC attribution mismatch for {}: client_hlc.node_id={} envelope.sender_device_id={}",
+                self.op_id, hlc.node_id, sender_device_id
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Field-level Last-Write-Wins comparison.
     ///
     /// Three-level tiebreaker (matching Dart implementation):
@@ -197,6 +218,28 @@ mod tests {
         assert!(!change.is_bulk_reset());
         change.field_name = BULK_RESET_FIELD.to_string();
         assert!(change.is_bulk_reset());
+    }
+
+    #[test]
+    fn validate_attribution_accepts_matching_sender() {
+        let change = make_change("op1", "1000:0:device1", "device1");
+        change.validate_attribution("device1").unwrap();
+    }
+
+    #[test]
+    fn validate_attribution_rejects_mismatched_device_id() {
+        let change = make_change("op1", "1000:0:device1", "device2");
+        let err = change.validate_attribution("device1").unwrap_err().to_string();
+        assert!(err.contains("op.device_id=device2"), "{err}");
+        assert!(err.contains("envelope.sender_device_id=device1"), "{err}");
+    }
+
+    #[test]
+    fn validate_attribution_rejects_mismatched_hlc_node_id() {
+        let change = make_change("op1", "1000:0:device2", "device1");
+        let err = change.validate_attribution("device1").unwrap_err().to_string();
+        assert!(err.contains("client_hlc.node_id=device2"), "{err}");
+        assert!(err.contains("envelope.sender_device_id=device1"), "{err}");
     }
 
     #[test]

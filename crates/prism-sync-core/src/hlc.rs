@@ -3,6 +3,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CoreError, Result};
 
+/// Maximum accepted HLC node id length in bytes.
+///
+/// Local node ids are documented as 12-char hex strings. This bound is
+/// intentionally more generous to avoid rejecting legacy/test ids while still
+/// preventing unbounded remote input from amplifying storage and comparisons.
+pub const MAX_NODE_ID_LEN: usize = 64;
+
 /// Hybrid Logical Clock for CRDT sync.
 ///
 /// Format: `timestamp:counter:nodeId`
@@ -48,16 +55,27 @@ impl Hlc {
         let timestamp = parts[0]
             .parse::<i64>()
             .map_err(|e| CoreError::HlcParse(format!("Invalid timestamp '{}': {e}", parts[0])))?;
+        if timestamp < 0 {
+            return Err(CoreError::HlcParse(format!("Invalid timestamp '{}': negative", parts[0])));
+        }
+
         let counter = parts[1]
             .parse::<u32>()
             .map_err(|e| CoreError::HlcParse(format!("Invalid counter '{}': {e}", parts[1])))?;
+
+        if parts[2].len() > MAX_NODE_ID_LEN {
+            return Err(CoreError::HlcParse(format!(
+                "Invalid node_id length {} (max {MAX_NODE_ID_LEN})",
+                parts[2].len()
+            )));
+        }
         let node_id = parts[2].to_string();
 
         Ok(Self { timestamp, counter, node_id })
     }
 
     /// Get current wall-clock time in milliseconds since Unix epoch.
-    fn now_ms() -> i64 {
+    pub(crate) fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before Unix epoch")
@@ -141,8 +159,19 @@ impl Hlc {
     /// Only rejects timestamps from the FUTURE beyond the tolerance.
     /// Past timestamps are always accepted — old data is normal in a CRDT.
     pub fn is_drift_exceeded(&self, max_drift_ms: i64) -> bool {
-        let now = Self::now_ms();
-        self.timestamp - now > max_drift_ms
+        self.future_drift_ms() > max_drift_ms.max(0)
+    }
+
+    /// Return how far this HLC is ahead of local wall-clock time.
+    ///
+    /// Past or current timestamps return 0.
+    pub fn future_drift_ms(&self) -> i64 {
+        self.timestamp.saturating_sub(Self::now_ms()).max(0)
+    }
+
+    /// Return true when this HLC is ahead of local wall-clock time.
+    pub fn is_future(&self) -> bool {
+        self.future_drift_ms() > 0
     }
 }
 
@@ -203,8 +232,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_negative_timestamp() {
+        assert!(Hlc::from_string("-1:0:node").is_err());
+    }
+
+    #[test]
     fn parse_invalid_counter() {
         assert!(Hlc::from_string("1000:notanumber:node").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_overlong_node_id() {
+        let overlong = "a".repeat(MAX_NODE_ID_LEN + 1);
+        assert!(Hlc::from_string(&format!("1000:0:{overlong}")).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_max_length_node_id() {
+        let max_node = "a".repeat(MAX_NODE_ID_LEN);
+        let hlc = Hlc::from_string(&format!("1000:0:{max_node}")).unwrap();
+        assert_eq!(hlc.node_id, max_node);
     }
 
     #[test]
@@ -365,10 +412,7 @@ mod tests {
         // Regression for the `:9` vs `:10` bug: a SQL MAX would return
         // `1700000000:9:nodeA` (because `'9' > '1'` lexicographically).
         // parse_many_and_max must return the true HLC max.
-        let values = vec![
-            "1700000000:9:nodeA".to_string(),
-            "1700000000:10:nodeA".to_string(),
-        ];
+        let values = vec!["1700000000:9:nodeA".to_string(), "1700000000:10:nodeA".to_string()];
         let max = Hlc::parse_many_and_max(&values).unwrap().expect("non-empty input");
         assert_eq!(max.counter, 10);
         assert_eq!(max.timestamp, 1700000000);
@@ -383,10 +427,7 @@ mod tests {
 
     #[test]
     fn parse_many_and_max_prefers_higher_timestamp() {
-        let values = vec![
-            "1700000000:99:nodeA".to_string(),
-            "1700000001:0:nodeA".to_string(),
-        ];
+        let values = vec!["1700000000:99:nodeA".to_string(), "1700000001:0:nodeA".to_string()];
         let max = Hlc::parse_many_and_max(&values).unwrap().unwrap();
         assert_eq!(max.timestamp, 1700000001);
         assert_eq!(max.counter, 0);
@@ -394,10 +435,7 @@ mod tests {
 
     #[test]
     fn parse_many_and_max_breaks_ties_by_node_id() {
-        let values = vec![
-            "1700000000:5:aaa".to_string(),
-            "1700000000:5:zzz".to_string(),
-        ];
+        let values = vec!["1700000000:5:aaa".to_string(), "1700000000:5:zzz".to_string()];
         let max = Hlc::parse_many_and_max(&values).unwrap().unwrap();
         assert_eq!(max.node_id, "zzz");
     }

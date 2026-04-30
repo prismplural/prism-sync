@@ -242,10 +242,9 @@ async fn test_snapshot_accepts_25mb_payload() {
 
     // 25 MB baseline — the v-prior limit is comfortably within the new cap.
     let snapshot = vec![0u8; 25 * 1024 * 1024];
-    let resp = put_snapshot_signed(
-        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
-    )
-    .await;
+    let resp =
+        put_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[])
+            .await;
     assert_eq!(resp.status(), 204, "25 MB snapshot should be accepted");
 }
 
@@ -262,10 +261,9 @@ async fn test_snapshot_accepts_140mb_payload() {
     // Exercises both the raised router body limit and the raised handler
     // body.len() check.
     let snapshot = vec![0u8; 140 * 1024 * 1024];
-    let resp = put_snapshot_signed(
-        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
-    )
-    .await;
+    let resp =
+        put_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[])
+            .await;
     assert_eq!(resp.status(), 204, "140 MB snapshot should be accepted under the new cap");
 }
 
@@ -283,10 +281,9 @@ async fn test_snapshot_rejects_over_wire_limit() {
     // case axum returns 413 (Payload Too Large) directly.
     let snapshot = vec![0u8; 151 * 1024 * 1024];
     assert!(snapshot.len() > MAX_SNAPSHOT_WIRE_BYTES);
-    let resp = put_snapshot_signed(
-        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
-    )
-    .await;
+    let resp =
+        put_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[])
+            .await;
     assert_eq!(resp.status(), 413, "oversize snapshot should be rejected with 413");
 }
 
@@ -363,15 +360,9 @@ async fn test_delete_snapshot_by_target_device_removes_it() {
     assert_eq!(put_resp.status(), 204);
 
     // Target device ACKs the snapshot — expect 204.
-    let del_resp = delete_snapshot_signed(
-        &client,
-        &url,
-        &sync_id,
-        &joiner_id,
-        &token_joiner,
-        &keys_joiner,
-    )
-    .await;
+    let del_resp =
+        delete_snapshot_signed(&client, &url, &sync_id, &joiner_id, &token_joiner, &keys_joiner)
+            .await;
     assert_eq!(del_resp.status(), 204, "target device should be able to ACK-delete");
 
     // Subsequent GET returns 404.
@@ -438,8 +429,7 @@ async fn test_delete_snapshot_when_missing_returns_404() {
     let keys = TestDeviceKeys::generate(&device_id);
     let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
-    let resp =
-        delete_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys).await;
+    let resp = delete_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys).await;
     assert_eq!(resp.status(), 404, "DELETE with no snapshot present should be 404");
 }
 
@@ -484,11 +474,7 @@ async fn test_snapshot_get_accepts_request_with_body() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        get_resp.status(),
-        200,
-        "GET must succeed regardless of body (body is ignored)",
-    );
+    assert_eq!(get_resp.status(), 200, "GET must succeed regardless of body (body is ignored)",);
 }
 
 #[tokio::test]
@@ -534,9 +520,5 @@ async fn test_snapshot_delete_accepts_request_with_body() {
             .send()
             .await
             .unwrap();
-    assert_eq!(
-        resp.status(),
-        204,
-        "DELETE must succeed regardless of body (body is ignored)",
-    );
+    assert_eq!(resp.status(), 204, "DELETE must succeed regardless of body (body is ignored)",);
 }

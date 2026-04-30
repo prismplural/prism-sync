@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ml_dsa::MlDsa65;
 use ml_kem::MlKem768;
 use rand::{rngs::OsRng, RngCore};
@@ -141,7 +141,7 @@ impl DeviceSigningKey {
             .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid public key: {e}")))?;
         let sig = Signature::from_slice(signature)
             .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid signature: {e}")))?;
-        verifying_key.verify(message, &sig).map_err(|_| {
+        verifying_key.verify_strict(message, &sig).map_err(|_| {
             CryptoError::SignatureVerificationFailed("Ed25519 signature does not match".into())
         })
     }

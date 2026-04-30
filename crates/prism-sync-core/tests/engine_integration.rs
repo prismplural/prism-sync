@@ -12,10 +12,13 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 
-use prism_sync_core::engine::{SyncConfig, SyncEngine};
-use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope, SyncTransport};
+use prism_sync_core::engine::{SyncConfig, SyncEngine, SyncResult};
+use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope, SnapshotExchange, SyncTransport};
 use prism_sync_core::schema::SyncValue;
-use prism_sync_core::storage::RusqliteSyncStorage;
+use prism_sync_core::storage::{
+    AppliedOpEntry, DeviceRegistryEntry, FieldVersionEntry, RusqliteSyncStorage, SnapshotData,
+    SyncMetadataEntry, SyncStorage, SNAPSHOT_VERSION,
+};
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{batch_signature, sync_aad, CoreError, CrdtChange, Hlc};
 
@@ -34,6 +37,26 @@ fn make_encrypted_batch(
     batch_id: &str,
     sender_device_id: &str,
 ) -> SignedBatchEnvelope {
+    make_encrypted_batch_with_generation(
+        ops,
+        key_hierarchy,
+        signing_key,
+        ml_dsa_signing_key,
+        batch_id,
+        sender_device_id,
+        0,
+    )
+}
+
+fn make_encrypted_batch_with_generation(
+    ops: &[CrdtChange],
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    signing_key: &SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    batch_id: &str,
+    sender_device_id: &str,
+    sender_ml_dsa_key_generation: u32,
+) -> SignedBatchEnvelope {
     let plaintext = CrdtChange::encode_batch(ops).unwrap();
     let payload_hash = batch_signature::compute_payload_hash(&plaintext);
     let epoch_key = key_hierarchy.epoch_key(0).unwrap();
@@ -49,12 +72,551 @@ fn make_encrypted_batch(
         batch_id,
         "ops",
         sender_device_id,
-        0,
+        sender_ml_dsa_key_generation,
         &payload_hash,
         nonce,
         ciphertext,
     )
     .unwrap()
+}
+
+fn make_snapshot_envelope_bytes(
+    snapshot: &SnapshotData,
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    signing_key: &SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    batch_id: &str,
+    sender_device_id: &str,
+    server_seq_at: i64,
+) -> Vec<u8> {
+    let json = serde_json::to_vec(snapshot).unwrap();
+    let compressed = zstd::encode_all(json.as_slice(), 3).unwrap();
+    let payload_hash = batch_signature::compute_payload_hash(&compressed);
+    let epoch_key = key_hierarchy.epoch_key(0).unwrap();
+    let aad = sync_aad::build_snapshot_aad(SYNC_ID, sender_device_id, 0, server_seq_at);
+    let (ciphertext, nonce) =
+        prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &compressed, &aad).unwrap();
+
+    let envelope = batch_signature::sign_batch(
+        signing_key,
+        ml_dsa_signing_key,
+        SYNC_ID,
+        0,
+        batch_id,
+        "snapshot",
+        sender_device_id,
+        0,
+        &payload_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap();
+
+    serde_json::to_vec(&envelope).unwrap()
+}
+
+fn task_title_op(op_id: &str, device_id: &str, hlc_node_id: &str) -> CrdtChange {
+    let hlc = Hlc::new(1_710_500_000_000, 0, hlc_node_id);
+    CrdtChange {
+        op_id: op_id.to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-attribution".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Forged title\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }
+}
+
+async fn pull_injected_sender_batch(
+    ops: Vec<CrdtChange>,
+) -> (SyncResult, Arc<RusqliteSyncStorage>, Arc<MockTaskEntity>) {
+    pull_injected_sender_batch_with_config(ops, SyncConfig::default()).await
+}
+
+async fn pull_injected_sender_batch_with_config(
+    ops: Vec<CrdtChange>,
+    config: SyncConfig,
+) -> (SyncResult, Arc<RusqliteSyncStorage>, Arc<MockTaskEntity>) {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let envelope = make_encrypted_batch(
+        &ops,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-attribution",
+        sender_id,
+    );
+    relay.inject_batch(envelope);
+
+    let engine = SyncEngine::new(storage.clone(), relay, vec![entity_ref], test_schema(), config);
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    (result, storage, entity)
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+fn snapshot_device_entry(
+    device_id: &str,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    ml_dsa_pk: &[u8],
+) -> DeviceRegistryEntry {
+    DeviceRegistryEntry {
+        device_id: device_id.to_string(),
+        ed25519_public_key: hex::encode(verifying_key.to_bytes()),
+        x25519_public_key: hex::encode([0u8; 32]),
+        ml_dsa_65_public_key: hex::encode(ml_dsa_pk),
+        ml_kem_768_public_key: String::new(),
+        x_wing_public_key: String::new(),
+        status: "active".to_string(),
+        registered_at: "2024-03-15T00:00:00Z".to_string(),
+        revoked_at: None,
+        ml_dsa_key_generation: 0,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Attribution binding regressions
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn rejects_entire_batch_when_op_device_id_differs_from_envelope_sender() {
+    let sender_id = "device-sender";
+    let good = task_title_op("op-good", sender_id, sender_id);
+    let bad = CrdtChange {
+        op_id: "op-bad-device".to_string(),
+        field_name: "done".to_string(),
+        encoded_value: "true".to_string(),
+        ..task_title_op("op-bad-device", "device-forged", "device-forged")
+    };
+
+    let (result, storage, entity) = pull_injected_sender_batch(vec![good, bad]).await;
+
+    let err = result.error.as_deref().unwrap_or("");
+    assert!(err.contains("CRDT op attribution mismatch"), "{err}");
+    assert_eq!(result.merged, 0);
+    assert_eq!(entity.get_field("task-attribution", "title"), None);
+    assert_eq!(entity.get_field("task-attribution", "done"), None);
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "bad-attribution batch must not advance the pull cursor"
+    );
+}
+
+#[tokio::test]
+async fn rejects_batch_when_op_hlc_node_differs_from_envelope_sender() {
+    let sender_id = "device-sender";
+    let op = task_title_op("op-bad-hlc", sender_id, "device-forged");
+
+    let (result, storage, entity) = pull_injected_sender_batch(vec![op]).await;
+
+    let err = result.error.as_deref().unwrap_or("");
+    assert!(err.contains("CRDT op HLC attribution mismatch"), "{err}");
+    assert_eq!(result.merged, 0);
+    assert_eq!(entity.get_field("task-attribution", "title"), None);
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "bad-attribution batch must not advance the pull cursor"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_import_accepts_rows_from_trusted_non_uploader_device() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 7;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let source_hlc = Hlc::new(1_710_500_000_000, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-snapshot".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: source_hlc.clone(),
+            winning_device_id: source_id.to_string(),
+            winning_op_id: "op-source-snapshot".to_string(),
+            winning_encoded_value: Some("\"Source snapshot row\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        applied_ops: vec![AppliedOpEntry {
+            op_id: "op-source-snapshot".to_string(),
+            sync_id: SYNC_ID.to_string(),
+            epoch: 0,
+            device_id: source_id.to_string(),
+            client_hlc: source_hlc,
+            server_seq: server_seq_at,
+            applied_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-trusted-source",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    let (count, entity_changes) =
+        engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(
+        storage
+            .get_field_version(SYNC_ID, "tasks", "task-snapshot", "title")
+            .unwrap()
+            .unwrap()
+            .winning_device_id,
+        source_id
+    );
+    assert!(storage.is_op_applied("op-source-snapshot").unwrap());
+    assert_eq!(entity_changes.len(), 1);
+    assert_eq!(entity_changes[0].fields.get("title"), Some(&"\"Source snapshot row\"".to_string()));
+}
+
+#[tokio::test]
+async fn snapshot_import_rejects_rows_from_untrusted_foreign_device() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let foreign_id = "device-forged";
+    let server_seq_at = 7;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let foreign_hlc = Hlc::new(1_710_500_000_000, 0, foreign_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-snapshot".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: foreign_hlc.clone(),
+            winning_device_id: foreign_id.to_string(),
+            winning_op_id: "op-foreign-snapshot".to_string(),
+            winning_encoded_value: Some("\"Foreign snapshot row\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: Vec::new(),
+        applied_ops: Vec::new(),
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-attribution",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    let result = engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await;
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("snapshot field_versions references untrusted device"), "{err}");
+    assert!(
+        storage.get_field_version(SYNC_ID, "tasks", "task-snapshot", "title").unwrap().is_none(),
+        "foreign-attribution snapshot row must not be imported"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HLC hardening regressions
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn drops_malformed_hlc_op_without_blocking_good_ops_in_same_batch() {
+    let sender_id = "device-sender";
+    let good_hlc = Hlc::new(current_time_ms() - 1_000, 0, sender_id);
+
+    let good = CrdtChange {
+        op_id: "op-good-hlc".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-malformed-hlc".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Accepted title\"".to_string(),
+        client_hlc: good_hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    let malformed = CrdtChange {
+        op_id: "op-malformed-hlc".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-malformed-hlc".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "done".to_string(),
+        encoded_value: "true".to_string(),
+        client_hlc: "-1:0:device-sender".to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (result, storage, entity) = pull_injected_sender_batch(vec![good, malformed]).await;
+
+    assert!(result.error.is_none(), "malformed HLC op should be dropped: {:?}", result.error);
+    assert_eq!(result.pulled, 1);
+    assert_eq!(result.merged, 1);
+    assert_eq!(
+        entity.get_field("task-malformed-hlc", "title"),
+        Some(SyncValue::String("Accepted title".to_string()))
+    );
+    assert_eq!(entity.get_field("task-malformed-hlc", "done"), None);
+    assert!(storage.is_op_applied("op-good-hlc").unwrap());
+    assert!(!storage.is_op_applied("op-malformed-hlc").unwrap());
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        1,
+        "batch cursor should advance after dropping only the malformed op"
+    );
+}
+
+#[tokio::test]
+async fn drops_future_drifted_op_without_blocking_good_ops_in_same_batch() {
+    let sender_id = "device-sender";
+    let now_ms = current_time_ms();
+    let good_hlc = Hlc::new(now_ms - 1_000, 0, sender_id);
+    let future_hlc = Hlc::new(now_ms + 120_000, 0, sender_id);
+
+    let good = CrdtChange {
+        op_id: "op-good-hlc".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-hlc-drift".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Accepted title\"".to_string(),
+        client_hlc: good_hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    let future_drifted = CrdtChange {
+        op_id: "op-future-hlc".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-hlc-drift".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "done".to_string(),
+        encoded_value: "true".to_string(),
+        client_hlc: future_hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (result, storage, entity) = pull_injected_sender_batch_with_config(
+        vec![good, future_drifted],
+        SyncConfig { max_clock_drift_ms: 1_000 },
+    )
+    .await;
+
+    assert!(result.error.is_none(), "future-drifted op should be dropped: {:?}", result.error);
+    assert_eq!(result.pulled, 1);
+    assert_eq!(result.merged, 1);
+    assert_eq!(
+        entity.get_field("task-hlc-drift", "title"),
+        Some(SyncValue::String("Accepted title".to_string()))
+    );
+    assert_eq!(entity.get_field("task-hlc-drift", "done"), None);
+    assert!(storage.is_op_applied("op-good-hlc").unwrap());
+    assert!(!storage.is_op_applied("op-future-hlc").unwrap());
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        1,
+        "batch cursor should advance after applying the non-drifted ops"
+    );
+}
+
+#[tokio::test]
+async fn skips_batch_when_envelope_generation_differs_from_registry_generation() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_local = make_signing_key();
+    let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
+    let local_device = "device-local";
+    let remote_device = "device-remote";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, local_device);
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
+    register_device_with_pq(
+        &relay,
+        &storage,
+        remote_device,
+        &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
+    );
+
+    let hlc = Hlc::new(current_time_ms() - 1_000, 0, remote_device);
+    let ops = vec![CrdtChange {
+        op_id: "op-generation-mismatch".to_string(),
+        batch_id: Some("batch-generation-mismatch".to_string()),
+        entity_id: "task-generation-mismatch".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Should not merge\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: remote_device.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+
+    let envelope = make_encrypted_batch_with_generation(
+        &ops,
+        &key_hierarchy,
+        &signing_key_remote,
+        &ml_dsa_key_remote,
+        "batch-generation-mismatch",
+        remote_device,
+        1,
+    );
+    relay.inject_batch(envelope);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay,
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "generation mismatch should skip batch: {:?}", result.error);
+    assert_eq!(result.pulled, 1);
+    assert_eq!(result.merged, 0);
+    assert_eq!(entity.get_field("task-generation-mismatch", "title"), None);
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        1,
+        "bad-generation batch should be skipped and acknowledged like other bad signatures"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

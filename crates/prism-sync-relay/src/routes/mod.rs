@@ -28,10 +28,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::{
-    auth, db,
-    errors::AppError,
-    snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES,
-    state::AppState,
+    auth, db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState,
 };
 
 /// Authenticated identity injected into request extensions by auth middleware.
@@ -126,12 +123,18 @@ pub(crate) fn verify_signed_request(
         return Err(AppError::Unauthorized);
     }
 
-    let replay_key = format!("sig:{}\x00{}", auth_identity.device_id, nonce);
-    if !state.signed_request_replay_cache.check(
-        &replay_key,
-        1,
-        state.config.signed_request_nonce_window_secs,
-    ) {
+    let nonce_window = i64::try_from(state.config.signed_request_nonce_window_secs)
+        .map_err(|_| AppError::Internal("signed request nonce window is too large".into()))?;
+    let expires_at = now
+        .checked_add(nonce_window)
+        .ok_or_else(|| AppError::Internal("signed request nonce expiry overflow".into()))?;
+    let nonce_accepted = state
+        .db
+        .with_conn(|conn| {
+            db::record_signed_request_nonce(conn, &auth_identity.device_id, nonce, expires_at, now)
+        })
+        .map_err(AppError::from)?;
+    if !nonce_accepted {
         return Err(AppError::Unauthorized);
     }
 
@@ -166,10 +169,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{sync_id}", delete(sync::delete_account))
         // Snapshot GET + DELETE: bodyless, so they sit under the normal
         // 10 MiB cap alongside the other authenticated routes.
-        .route(
-            "/v1/sync/{sync_id}/snapshot",
-            get(sync::get_snapshot).delete(sync::delete_snapshot),
-        )
+        .route("/v1/sync/{sync_id}/snapshot", get(sync::get_snapshot).delete(sync::delete_snapshot))
         // Device routes (list/revoke/rekey/ack)
         .route("/v1/sync/{sync_id}/devices", get(devices::list_devices))
         .route("/v1/sync/{sync_id}/devices/{device_id}", delete(devices::delete_device))
@@ -196,8 +196,7 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
 
-    let authenticated_routes =
-        authenticated_routes.merge(snapshot_put_route).merge(media_routes);
+    let authenticated_routes = authenticated_routes.merge(snapshot_put_route).merge(media_routes);
 
     // Routes that do NOT require authentication
     // (WebSocket does message-based auth after upgrade)

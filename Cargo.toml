@@ -76,8 +76,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 
 # Database
-rusqlite = "0.31"
-rusqlite_migration = "1"
+rusqlite = "0.37"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }

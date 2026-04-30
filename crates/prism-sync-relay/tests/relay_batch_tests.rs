@@ -9,6 +9,9 @@
 
 mod common;
 
+use base64::Engine;
+use ed25519_dalek::Signer;
+use prism_sync_relay::db;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -43,6 +46,69 @@ async fn push_signed(
     .send()
     .await
     .unwrap()
+}
+
+/// Helper: ACK a server sequence with signed headers.
+async fn ack_signed(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    server_seq: i64,
+) -> reqwest::Response {
+    let body_bytes = serde_json::to_vec(&serde_json::json!({ "server_seq": server_seq })).unwrap();
+    let path = format!("/v1/sync/{sync_id}/ack");
+    apply_signed_headers(
+        client
+            .post(format!("{url}/v1/sync/{sync_id}/ack"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", device_id)
+            .header("Content-Type", "application/json"),
+        keys,
+        "POST",
+        &path,
+        sync_id,
+        device_id,
+        &body_bytes,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_signed_headers_with_nonce(
+    builder: reqwest::RequestBuilder,
+    keys: &TestDeviceKeys,
+    method: &str,
+    path: &str,
+    sync_id: &str,
+    device_id: &str,
+    body: &[u8],
+    timestamp: &str,
+    nonce: &str,
+) -> reqwest::RequestBuilder {
+    let ml_dsa_key = keys.device_secret.ml_dsa_65_keypair(device_id).unwrap();
+    let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
+        method, path, sync_id, device_id, body, timestamp, nonce,
+    );
+    let m_prime =
+        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
+            .expect("hardcoded http request context should be <= 255 bytes");
+    let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
+        ed25519_sig: keys.ed25519_signing_key.sign(&m_prime).to_bytes().to_vec(),
+        ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
+    };
+    let mut wire = vec![0x03u8];
+    wire.extend_from_slice(&hybrid_sig.to_bytes());
+
+    builder
+        .header("X-Prism-Timestamp", timestamp)
+        .header("X-Prism-Nonce", nonce)
+        .header("X-Prism-Signature", base64::engine::general_purpose::STANDARD.encode(&wire))
 }
 
 // ───────────────────────────── Test 2: Push + Pull Roundtrip ────────────
@@ -118,10 +184,91 @@ async fn test_push_pull_roundtrip() {
     );
 }
 
+#[tokio::test]
+async fn test_signed_request_replay_rejected_after_relay_restart() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.db_path = temp_dir.path().join("relay.db").to_string_lossy().to_string();
+    config.media_storage_path = temp_dir.path().join("media").to_string_lossy().to_string();
+
+    let (url, server, db) = start_test_relay_with_config(config.clone()).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let envelope = make_test_envelope(&sync_id, &device_id, "batch-replay", 0);
+    let body_bytes = serde_json::to_vec(&envelope).unwrap();
+    let path = format!("/v1/sync/{sync_id}/changes");
+    let timestamp = prism_sync_relay::db::now_secs().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+
+    let first_resp = apply_signed_headers_with_nonce(
+        client
+            .put(format!("{url}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &keys,
+        "PUT",
+        &path,
+        &sync_id,
+        &device_id,
+        &body_bytes,
+        &timestamp,
+        &nonce,
+    )
+    .body(body_bytes.clone())
+    .send()
+    .await
+    .unwrap();
+    assert!(
+        first_resp.status().is_success(),
+        "initial signed push failed: {}",
+        first_resp.status()
+    );
+
+    server.abort();
+    let _ = server.await;
+    drop(db);
+
+    let (url_after_restart, restarted_server, _restarted_db) =
+        start_test_relay_with_config(config).await;
+    let replay_resp = apply_signed_headers_with_nonce(
+        client
+            .put(format!("{url_after_restart}/v1/sync/{sync_id}/changes"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &keys,
+        "PUT",
+        &path,
+        &sync_id,
+        &device_id,
+        &body_bytes,
+        &timestamp,
+        &nonce,
+    )
+    .body(body_bytes)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        replay_resp.status(),
+        401,
+        "replayed signed request should be rejected after restart"
+    );
+
+    restarted_server.abort();
+    let _ = restarted_server.await;
+}
+
 // ───────────────────────────── Test 5: ACK and Pruning ──────────────────
 
 #[tokio::test]
-async fn test_ack_triggers_pruning() {
+async fn test_ack_does_not_prune_synchronously() {
     let (url, _server, _db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
@@ -163,28 +310,11 @@ async fn test_ack_triggers_pruning() {
     assert_eq!(put_snap.status(), 204);
 
     // ACK up to last_seq (this is the only device, so min_acked = last_seq)
-    let ack_body = serde_json::to_vec(&serde_json::json!({ "server_seq": last_seq })).unwrap();
-    let ack_path = format!("/v1/sync/{sync_id}/ack");
-    let ack_resp = apply_signed_headers(
-        client
-            .post(format!("{url}/v1/sync/{sync_id}/ack"))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("X-Device-Id", &device_id)
-            .header("Content-Type", "application/json"),
-        &keys,
-        "POST",
-        &ack_path,
-        &sync_id,
-        &device_id,
-        &ack_body,
-    )
-    .body(ack_body)
-    .send()
-    .await
-    .unwrap();
+    let ack_resp = ack_signed(&client, &url, &sync_id, &device_id, &token, &keys, last_seq).await;
     assert_eq!(ack_resp.status(), 204);
 
-    // Pull from 0 — batches before the safe prune point should be gone
+    // Pull from 0 immediately after ACK. Periodic cleanup owns pruning, so
+    // /ack must not delete any retained batch history synchronously.
     let pull_resp = client
         .get(format!("{url}/v1/sync/{sync_id}/changes?since=0"))
         .header("Authorization", format!("Bearer {token}"))
@@ -195,10 +325,105 @@ async fn test_ack_triggers_pruning() {
     assert_eq!(pull_resp.status(), 200);
     let pull_json: Value = pull_resp.json().await.unwrap();
     let remaining = pull_json["batches"].as_array().unwrap().len();
-    // Pruning deletes batches with id < safe_prune_seq.
-    // safe_prune_seq = min(snapshot_seq_at, min_acked_seq) = min(last_seq, last_seq) = last_seq.
-    // Batches with id < last_seq should be pruned; only the last batch (id == last_seq) remains.
-    assert!(remaining <= 1, "expected at most 1 batch after ack+prune, got {remaining}");
+    assert_eq!(remaining, 5, "ack must not prune batches synchronously");
+}
+
+#[tokio::test]
+async fn test_ack_above_latest_seq_returns_400() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let envelope = make_test_envelope(&sync_id, &device_id, "batch-001", 0);
+    let push_resp =
+        push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+    assert!(push_resp.status().is_success());
+    let push_json: Value = push_resp.json().await.unwrap();
+    let server_seq = push_json["server_seq"].as_i64().unwrap();
+
+    let ack_resp =
+        ack_signed(&client, &url, &sync_id, &device_id, &token, &keys, server_seq + 1).await;
+    assert_eq!(ack_resp.status(), 400, "ack above latest server seq should be rejected");
+}
+
+#[tokio::test]
+async fn test_cleanup_pruning_requires_group_wide_snapshot() {
+    let (url, _server, relay_db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let device_b_id = generate_device_id();
+    let (token_b, keys_b) = prepare_device(&relay_db, &sync_id, &device_b_id).await;
+
+    let mut last_seq = 0i64;
+    for i in 0..5 {
+        let envelope = make_test_envelope(&sync_id, &device_a_id, &format!("batch-{i:03}"), 0);
+        let resp =
+            push_signed(&client, &url, &sync_id, &device_a_id, &token_a, &keys_a, &envelope).await;
+        assert!(resp.status().is_success(), "push failed: {}", resp.status());
+        let json: Value = resp.json().await.unwrap();
+        last_seq = json["server_seq"].as_i64().unwrap();
+    }
+
+    let ack_a =
+        ack_signed(&client, &url, &sync_id, &device_a_id, &token_a, &keys_a, last_seq).await;
+    assert_eq!(ack_a.status(), 204);
+    let ack_b =
+        ack_signed(&client, &url, &sync_id, &device_b_id, &token_b, &keys_b, last_seq).await;
+    assert_eq!(ack_b.status(), 204);
+
+    relay_db
+        .with_conn(|conn| {
+            let future = db::now_secs() + 3600;
+
+            db::upsert_snapshot(
+                conn,
+                &sync_id,
+                0,
+                last_seq,
+                b"targeted-snapshot",
+                Some(future),
+                Some(&device_b_id),
+                Some(&device_a_id),
+            )?;
+            assert_eq!(
+                db::get_safe_prune_seq(conn, &sync_id, 3600)?,
+                None,
+                "targeted snapshots must not authorize group-wide pruning"
+            );
+            let pruned = db::prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 0, "targeted snapshot must not prune retained batches");
+            let batches = db::get_batches_since(conn, &sync_id, 0, 100)?;
+            assert_eq!(batches.len(), 5);
+
+            db::upsert_snapshot(
+                conn,
+                &sync_id,
+                0,
+                last_seq,
+                b"group-wide-snapshot",
+                Some(future),
+                None,
+                Some(&device_a_id),
+            )?;
+            assert_eq!(db::get_safe_prune_seq(conn, &sync_id, 3600)?, Some(last_seq));
+            let pruned = db::prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 4, "group-wide snapshot should permit cleanup pruning");
+            let batches = db::get_batches_since(conn, &sync_id, 0, 100)?;
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].server_seq, last_seq);
+
+            Ok(())
+        })
+        .unwrap();
 }
 
 // ───────────────────────────── Test 7: Epoch mismatch on push ───────────

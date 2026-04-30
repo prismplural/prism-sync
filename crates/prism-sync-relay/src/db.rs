@@ -326,6 +326,16 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_nonces_expires
             ON registration_nonces(expires_at);
 
+        -- Signed request replay cache
+        CREATE TABLE IF NOT EXISTS signed_request_nonces (
+            device_id   TEXT NOT NULL,
+            nonce       TEXT NOT NULL,
+            expires_at  INTEGER NOT NULL,
+            PRIMARY KEY (device_id, nonce)
+        );
+        CREATE INDEX IF NOT EXISTS idx_signed_request_nonces_expires
+            ON signed_request_nonces(expires_at);
+
         -- Device receipts (tracks each device's last acknowledged server_seq)
         CREATE TABLE IF NOT EXISTS device_receipts (
             sync_id         TEXT NOT NULL,
@@ -1483,6 +1493,36 @@ pub fn cleanup_expired_nonces(conn: &Connection) -> Result<usize, rusqlite::Erro
     conn.execute("DELETE FROM registration_nonces WHERE expires_at <= ?1", params![now])
 }
 
+/// Record a signed request nonce if it has not already been seen for this
+/// device within the replay window. Returns true when the nonce was accepted.
+pub fn record_signed_request_nonce(
+    conn: &Connection,
+    device_id: &str,
+    nonce: &str,
+    expires_at: i64,
+    now: i64,
+) -> Result<bool, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM signed_request_nonces
+         WHERE device_id = ?1 AND nonce = ?2 AND expires_at <= ?3",
+        params![device_id, nonce, now],
+    )?;
+
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO signed_request_nonces (device_id, nonce, expires_at)
+         VALUES (?1, ?2, ?3)",
+        params![device_id, nonce, expires_at],
+    )?;
+
+    Ok(inserted > 0)
+}
+
+/// Remove expired signed request replay nonces. Returns the number removed.
+pub fn cleanup_expired_signed_request_nonces(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    conn.execute("DELETE FROM signed_request_nonces WHERE expires_at <= ?1", params![now])
+}
+
 /// Remove expired revoked-session markers.
 pub fn cleanup_expired_revoked_sessions(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
@@ -1680,9 +1720,10 @@ pub fn get_min_acked_seq(
     )
 }
 
-/// Get the safe pruning sequence: min of (snapshot seq, min acked seq excluding stale).
-/// If no snapshot exists (or it has expired), uses min_acked_seq alone so that
-/// pruning is not blocked at steady state when no snapshot is at rest.
+/// Get the safe pruning sequence: min of (group-wide snapshot seq, min acked
+/// seq excluding stale). Returns `None` when no unexpired group-wide snapshot
+/// exists; batch pruning must never rely on ACKs alone or on snapshots that
+/// only one target device can read.
 pub fn get_safe_prune_seq(
     conn: &Connection,
     sync_id: &str,
@@ -1691,6 +1732,7 @@ pub fn get_safe_prune_seq(
     let snapshot_seq: Option<i64> = conn
         .query_row(
             "SELECT server_seq_at FROM snapshots WHERE sync_id = ?1
+               AND target_device_id IS NULL
                AND (expires_at IS NULL OR expires_at >= unixepoch())",
             params![sync_id],
             |row| row.get(0),
@@ -1702,8 +1744,7 @@ pub fn get_safe_prune_seq(
     match (snapshot_seq, min_acked) {
         (Some(snap), Some(acked)) => Ok(Some(snap.min(acked))),
         (Some(snap), None) => Ok(Some(snap)),
-        (None, Some(acked)) => Ok(Some(acked)),
-        (None, None) => Ok(None),
+        (None, _) => Ok(None),
     }
 }
 
@@ -1714,6 +1755,32 @@ pub fn prune_batches_before(
     before_seq: i64,
 ) -> Result<usize, rusqlite::Error> {
     conn.execute("DELETE FROM batches WHERE sync_id = ?1 AND id < ?2", params![sync_id, before_seq])
+}
+
+/// Prune acknowledged batch history only for sync groups that currently have
+/// an unexpired group-wide snapshot. Returns the total number of batch rows
+/// deleted.
+pub fn prune_batches_with_unexpired_snapshots(
+    conn: &Connection,
+    stale_threshold_secs: i64,
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT sync_id
+         FROM snapshots
+         WHERE target_device_id IS NULL
+           AND (expires_at IS NULL OR expires_at >= unixepoch())",
+    )?;
+    let sync_ids =
+        stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+
+    let mut pruned = 0usize;
+    for sync_id in sync_ids {
+        if let Some(safe_seq) = get_safe_prune_seq(conn, &sync_id, stale_threshold_secs)? {
+            pruned += prune_batches_before(conn, &sync_id, safe_seq)?;
+        }
+    }
+
+    Ok(pruned)
 }
 
 // ---------------------------------------------------------------------------
@@ -2844,6 +2911,45 @@ mod tests {
     }
 
     #[test]
+    fn test_signed_request_nonce_replay_and_cleanup() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let now = now_secs();
+
+            assert!(record_signed_request_nonce(conn, "dev1", "nonce-1", now + 60, now)?);
+            assert!(!record_signed_request_nonce(conn, "dev1", "nonce-1", now + 60, now)?);
+
+            assert!(record_signed_request_nonce(conn, "dev1", "nonce-2", now + 60, now)?);
+            assert!(record_signed_request_nonce(conn, "dev2", "nonce-1", now + 60, now)?);
+
+            conn.execute(
+                "INSERT INTO signed_request_nonces (device_id, nonce, expires_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["dev1", "reusable", now - 1],
+            )?;
+            assert!(record_signed_request_nonce(conn, "dev1", "reusable", now + 60, now)?);
+
+            conn.execute(
+                "INSERT INTO signed_request_nonces (device_id, nonce, expires_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["dev1", "expired", now - 1],
+            )?;
+            let cleaned = cleanup_expired_signed_request_nonces(conn)?;
+            assert_eq!(cleaned, 1);
+
+            let expired_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM signed_request_nonces WHERE nonce = 'expired'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(expired_count, 0);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn test_insert_batch_and_get_batches_since() {
         let db = test_db();
         db.with_conn(|conn| {
@@ -3236,15 +3342,15 @@ mod tests {
             touch_device(conn, "sg1", "dev1")?;
             touch_device(conn, "sg1", "dev2")?;
 
-            // No snapshot, no receipts => min_acked is 0 (COALESCE), so prune seq is 0
+            // No snapshot, no receipts => no prune point.
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(0));
+            assert_eq!(seq, None);
 
-            // No snapshot, with receipts => uses min_acked_seq alone
+            // No snapshot, with receipts => still no prune point.
             upsert_device_receipt(conn, "sg1", "dev1", 5)?;
             upsert_device_receipt(conn, "sg1", "dev2", 8)?;
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(5));
+            assert_eq!(seq, None);
 
             // Add snapshot at seq 10 — now min(snapshot=10, min_acked=5) => 5
             upsert_snapshot(conn, "sg1", 0, 10, b"snap", None, None, None)?;
@@ -3257,10 +3363,10 @@ mod tests {
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
             assert_eq!(seq, Some(10));
 
-            // Delete snapshot => falls back to min_acked_seq alone (15)
+            // Delete snapshot => no prune point even with ACKs.
             delete_snapshot(conn, "sg1")?;
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(15));
+            assert_eq!(seq, None);
 
             Ok(())
         })
@@ -3280,9 +3386,9 @@ mod tests {
             let past = now_secs() - 100;
             upsert_snapshot(conn, "sg1", 0, 5, b"snap", Some(past), None, None)?;
 
-            // Expired snapshot should be ignored; falls back to min_acked_seq (20)
+            // Expired snapshot should be ignored; ACKs alone do not permit pruning.
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(20));
+            assert_eq!(seq, None);
 
             // Non-expired snapshot should be respected
             let future = now_secs() + 3600;
@@ -3480,10 +3586,10 @@ mod tests {
         .unwrap();
     }
 
-    /// Test 2: Pruning works without snapshot — push batches, ACK all from
-    /// all devices, verify get_safe_prune_seq returns min_acked_seq.
+    /// Test 2: Cleanup pruning requires an unexpired snapshot even when all
+    /// devices have ACKed retained history.
     #[test]
-    fn test_pruning_works_without_snapshot() {
+    fn test_no_snapshot_cleanup_prunes_nothing() {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
@@ -3503,30 +3609,28 @@ mod tests {
             upsert_device_receipt(conn, "sg1", "dev1", seq3)?;
             upsert_device_receipt(conn, "sg1", "dev2", seq3)?;
 
-            // Safe prune seq should be seq3 (min of all acked)
+            // Safe prune seq should not exist without an unexpired snapshot.
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(safe, Some(seq3));
+            assert_eq!(safe, None);
 
-            // Prune everything before seq3
-            let pruned = prune_batches_before(conn, "sg1", seq3)?;
-            assert_eq!(pruned, 2, "should prune seq1 and seq2");
+            // Periodic cleanup pruning must leave all batches intact.
+            let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 0, "cleanup must not prune without a snapshot");
 
-            // Only 3 batches remain
+            // All 5 batches remain.
             let remaining = get_batches_since(conn, "sg1", 0, 100)?;
-            assert_eq!(remaining.len(), 3);
-            assert_eq!(remaining[0].server_seq, seq3);
+            assert_eq!(remaining.len(), 5);
 
             // Advance both devices to seq5
             upsert_device_receipt(conn, "sg1", "dev1", seq5)?;
             upsert_device_receipt(conn, "sg1", "dev2", seq5)?;
 
-            // Safe prune seq should now be seq5
+            // Still no safe prune point without a snapshot.
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(safe, Some(seq5));
+            assert_eq!(safe, None);
 
-            // Prune before seq5
-            let pruned = prune_batches_before(conn, "sg1", seq5)?;
-            assert_eq!(pruned, 2, "should prune seq3 and seq4");
+            let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 0, "cleanup must still not prune without a snapshot");
 
             Ok(())
         })
@@ -3715,20 +3819,19 @@ mod tests {
             let seq_10 = batches[9].server_seq;
             upsert_device_receipt(conn, "sg1", "dev1", seq_10)?;
 
-            // No snapshot, so safe prune is just min_acked (seq_10)
+            // No snapshot, so ACKs alone do not create a safe prune point.
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(safe, Some(seq_10));
+            assert_eq!(safe, None);
 
-            // Prune up to acked point
-            let pruned = prune_batches_before(conn, "sg1", seq_10)?;
-            assert_eq!(pruned, 9, "should prune 9 batches (seq < seq_10)");
+            let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 0, "cleanup must not prune without a snapshot");
 
             // Can still push more
             let new_seq = insert_batch(conn, "sg1", 0, "dev1", "b_new", b"new_data")?;
-            assert!(new_seq > 0, "should successfully push after pruning");
+            assert!(new_seq > 0, "should successfully push without pruning");
 
             let batches = get_batches_since(conn, "sg1", 0, 100)?;
-            assert_eq!(batches.len(), 12, "11 remaining + 1 new");
+            assert_eq!(batches.len(), 21, "20 existing + 1 new");
 
             Ok(())
         })

@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(panic.payload = %payload, panic.location = %location, "thread panicked");
     }));
 
-    let mut config = Config::from_env();
+    let mut config = Config::try_from_env().context("invalid relay configuration")?;
     let port = config.port;
 
     let db = Database::open(&config.db_path, config.reader_pool_size)

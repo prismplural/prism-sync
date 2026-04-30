@@ -1,5 +1,5 @@
 #[cfg(test)]
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use prism_sync_crypto::pq::HybridSignature;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -66,7 +66,7 @@ pub fn verify_ed25519_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    verifying_key.verify(&data, &sig).is_ok()
+    verifying_key.verify_strict(&data, &sig).is_ok()
 }
 
 /// Verify a hybrid registration challenge signature.
@@ -201,7 +201,7 @@ pub fn verify_request_signature(
     let Ok(sig) = Signature::from_slice(signature) else {
         return false;
     };
-    verifying_key.verify(signing_data, &sig).is_ok()
+    verifying_key.verify_strict(signing_data, &sig).is_ok()
 }
 
 /// Verify a hybrid signature over canonical request signing data.

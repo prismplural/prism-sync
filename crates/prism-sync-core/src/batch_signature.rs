@@ -173,6 +173,9 @@ pub fn sign_batch(
 ///
 /// Both Ed25519 and ML-DSA-65 signatures must verify.
 /// Does NOT verify payload_hash (that requires decryption first).
+/// Does NOT compare the envelope generation with the trusted registry
+/// generation; use [`verify_batch_signature_for_generation`] when that value
+/// is available.
 pub fn verify_batch_signature(
     envelope: &SignedBatchEnvelope,
     sender_ed25519_pk: &[u8; 32],
@@ -193,14 +196,32 @@ pub fn verify_batch_signature(
         .map_err(|e| CoreError::Serialization(format!("hybrid signature: {e}")))?;
 
     hybrid_sig.verify_v3(&canonical, b"sync_batch", sender_ed25519_pk, sender_ml_dsa_pk).map_err(
-        |e| {
-            CoreError::Storage(StorageError::Logic(format!(
-                "Batch signature verification failed: {e}"
-            )))
-        },
+        |_| CoreError::Storage(StorageError::Logic("Batch signature verification failed".into())),
     )?;
 
     Ok(())
+}
+
+/// Verify a batch signature and require the envelope's ML-DSA key generation
+/// to match the locally trusted registry generation.
+///
+/// # Errors
+///
+/// Returns an error if the envelope generation differs from the trusted
+/// registry generation, the signature cannot be parsed, or verification fails.
+pub fn verify_batch_signature_for_generation(
+    envelope: &SignedBatchEnvelope,
+    sender_ed25519_pk: &[u8; 32],
+    sender_ml_dsa_pk: &[u8],
+    registry_ml_dsa_key_generation: u32,
+) -> Result<()> {
+    if envelope.sender_ml_dsa_key_generation != registry_ml_dsa_key_generation {
+        return Err(CoreError::Storage(StorageError::Logic(
+            "Batch signature verification failed".to_string(),
+        )));
+    }
+
+    verify_batch_signature(envelope, sender_ed25519_pk, sender_ml_dsa_pk)
 }
 
 /// Verify that the decrypted payload matches the envelope's payload_hash.
@@ -449,6 +470,40 @@ mod tests {
         envelope.sender_ml_dsa_key_generation = 1;
 
         assert!(verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk).is_err());
+    }
+
+    #[test]
+    fn registry_generation_mismatch_fails_before_verify() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        assert!(
+            verify_batch_signature_for_generation(&envelope, &ed25519_pk, &ml_dsa_pk, 0).is_ok()
+        );
+
+        let err = verify_batch_signature_for_generation(&envelope, &ed25519_pk, &ml_dsa_pk, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Batch signature verification failed"), "got: {err}");
+        assert!(!err.contains("generation"), "generation detail leaked: {err}");
+    }
+
+    #[test]
+    fn oversized_hybrid_signature_len_returns_error_not_panic() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        let mut envelope = sample_envelope(&signing_key, &ml_dsa_key);
+        envelope.signature = u32::MAX.to_le_bytes().to_vec();
+
+        let result =
+            std::panic::catch_unwind(|| verify_batch_signature(&envelope, &ed25519_pk, &ml_dsa_pk));
+        assert!(result.is_ok(), "oversized signature length should not panic");
+        assert!(result.unwrap().is_err());
     }
 
     #[test]

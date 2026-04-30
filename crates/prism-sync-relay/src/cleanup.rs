@@ -23,8 +23,9 @@ async fn run_cleanup(state: &AppState) {
 
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            // 1. Expire registration nonces (> nonce_expiry_secs old)
+            // 1. Expire registration and signed-request replay nonces.
             let nonces = crate::db::cleanup_expired_nonces(conn)?;
+            let signed_request_nonces = crate::db::cleanup_expired_signed_request_nonces(conn)?;
             let revoked_sessions = crate::db::cleanup_expired_revoked_sessions(conn)?;
 
             // 2. Mark stale devices (> stale_device_secs no activity).
@@ -51,40 +52,48 @@ async fn run_cleanup(state: &AppState) {
                 config.abandoned_brand_new_group_ttl_secs() as i64,
             )?;
 
-            // 6. Delete expired ephemeral snapshots
+            // 6. Delete expired ephemeral snapshots before snapshot-gated
+            //    pruning so stale snapshot rows cannot authorize history loss.
             let expired_snapshots = crate::db::cleanup_expired_snapshots(conn)?;
 
-            // 7. Remove superseded registry artifacts now that the current
+            // 7. Prune acknowledged batch history only when an unexpired
+            //    group-wide snapshot exists for the sync group.
+            let pruned_batches = crate::db::prune_batches_with_unexpired_snapshots(
+                conn,
+                config.stale_device_secs as i64,
+            )?;
+
+            // 8. Remove superseded registry artifacts now that the current
             //    registry state is persisted separately.
             let superseded_registry_artifacts =
                 crate::db::cleanup_superseded_registry_state_artifacts(conn)?;
 
-            // 8. Remove expired pairing sessions.
+            // 9. Remove expired pairing sessions.
             let expired_pairing_sessions = crate::db::cleanup_expired_pairing_sessions(conn)?;
 
-            // 9. Garbage-collect revoked tombstones only after no retained
+            // 10. Garbage-collect revoked tombstones only after no retained
             //    history rows still reference them.
             let revoked_tombstones = crate::db::cleanup_revoked_device_tombstones(
                 conn,
                 config.revoked_tombstone_retention_secs as i64,
             )?;
 
-            // 10. Delete stale sharing prekeys past the serve-age limit.
+            // 11. Delete stale sharing prekeys past the serve-age limit.
             let stale_prekeys =
                 crate::db::cleanup_stale_sharing_prekeys(conn, config.prekey_serve_max_age_secs)?;
 
-            // 11. Delete expired or long-consumed sharing-init payloads.
+            // 12. Delete expired or long-consumed sharing-init payloads.
             let expired_sharing_inits = crate::db::cleanup_expired_sharing_init_payloads(conn)?;
 
-            // 12. Clear expired ML-DSA grace keys (post-rotation old keys).
+            // 13. Clear expired ML-DSA grace keys (post-rotation old keys).
             let expired_grace_keys =
                 crate::db::cleanup_expired_ml_dsa_grace_keys(conn, crate::db::now_secs())?;
 
-            // 13. Expire old media blobs past retention period.
+            // 14. Expire old media blobs past retention period.
             let expired_media =
                 crate::db::cleanup_expired_media(conn, config.media_retention_days)?;
 
-            // 14. Reclaim freed pages (incremental auto_vacuum)
+            // 15. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 =
                 conn.query_row("PRAGMA freelist_count;", [], |r| r.get(0)).unwrap_or(0);
             conn.execute_batch("PRAGMA incremental_vacuum;")?;
@@ -93,6 +102,7 @@ async fn run_cleanup(state: &AppState) {
             let pages_freed = (freelist_before - freelist_after).max(0) as u64;
             Ok::<_, rusqlite::Error>((
                 nonces,
+                signed_request_nonces,
                 revoked_sessions,
                 stale,
                 revoked_groups,
@@ -100,6 +110,7 @@ async fn run_cleanup(state: &AppState) {
                 stale_group_media_ids,
                 abandoned_new_groups,
                 expired_snapshots,
+                pruned_batches,
                 superseded_registry_artifacts,
                 expired_pairing_sessions,
                 revoked_tombstones,
@@ -116,6 +127,7 @@ async fn run_cleanup(state: &AppState) {
     match result {
         Ok(Ok((
             nonces,
+            signed_request_nonces,
             revoked_sessions,
             stale,
             revoked_groups,
@@ -123,6 +135,7 @@ async fn run_cleanup(state: &AppState) {
             stale_group_media_ids,
             abandoned_new_groups,
             expired_snapshots,
+            pruned_batches,
             superseded_registry_artifacts,
             expired_pairing_sessions,
             revoked_tombstones,
@@ -156,12 +169,14 @@ async fn run_cleanup(state: &AppState) {
                 .store(crate::db::now_secs() as u64, std::sync::atomic::Ordering::Relaxed);
             let expired_media_count = expired_media_cleaned + stale_media_cleaned;
             if nonces > 0
+                || signed_request_nonces > 0
                 || revoked_sessions > 0
                 || stale > 0
                 || !revoked_groups.is_empty()
                 || pruned > 0
                 || abandoned_new_groups > 0
                 || expired_snapshots > 0
+                || pruned_batches > 0
                 || superseded_registry_artifacts > 0
                 || expired_pairing_sessions > 0
                 || revoked_tombstones > 0
@@ -173,9 +188,11 @@ async fn run_cleanup(state: &AppState) {
             {
                 tracing::info!(
                     nonces,
+                    signed_request_nonces,
                     revoked_sessions,
                     stale,
                     pruned,
+                    pruned_batches,
                     abandoned_new_groups,
                     expired_snapshots,
                     superseded_registry_artifacts,
@@ -248,10 +265,9 @@ async fn run_cleanup(state: &AppState) {
         }
     }
 
-    // Prune stale entries from the in-memory nonce rate limiter.
+    // Prune stale entries from in-memory rate limiters.
     state.nonce_rate_limiter.prune_stale(state.config.nonce_rate_window_secs);
     state.revoke_rate_limiter.prune_stale(state.config.revoke_rate_window_secs);
-    state.signed_request_replay_cache.prune_stale(state.config.signed_request_nonce_window_secs);
     state.pairing_rate_limiter.prune_stale(60);
     state.media_upload_rate_limiter.prune_stale(state.config.media_upload_rate_window_secs);
 }

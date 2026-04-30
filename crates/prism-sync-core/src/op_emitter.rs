@@ -32,6 +32,17 @@ pub struct OpEmitter {
 impl OpEmitter {
     pub fn new(device_id: String, sync_id: String, epoch: i32, last_hlc: Option<Hlc>) -> Self {
         let last_hlc = last_hlc.unwrap_or_else(|| Hlc::zero(&device_id));
+        let last_hlc = if Self::can_inherit_hlc(&device_id, &last_hlc) {
+            last_hlc
+        } else {
+            tracing::warn!(
+                device_id = %device_id,
+                incoming_node_id = %last_hlc.node_id,
+                incoming_timestamp = last_hlc.timestamp,
+                "Ignoring future remote HLC watermark for local emitter"
+            );
+            Hlc::zero(&device_id)
+        };
         Self { device_id, sync_id, epoch, last_hlc }
     }
 
@@ -52,9 +63,23 @@ impl OpEmitter {
     /// Used after bootstrap/snapshot imports so locally minted HLCs never
     /// fall behind state that was seeded from an external source.
     pub fn set_last_hlc(&mut self, new_hlc: Hlc) {
+        if !Self::can_inherit_hlc(&self.device_id, &new_hlc) {
+            tracing::warn!(
+                device_id = %self.device_id,
+                incoming_node_id = %new_hlc.node_id,
+                incoming_timestamp = new_hlc.timestamp,
+                "Ignoring future remote HLC watermark for local emitter"
+            );
+            return;
+        }
+
         if new_hlc > self.last_hlc {
             self.last_hlc = new_hlc;
         }
+    }
+
+    fn can_inherit_hlc(device_id: &str, hlc: &Hlc) -> bool {
+        hlc.node_id == device_id || !hlc.is_future()
     }
 
     /// Tick the HLC once and return the new value.
@@ -327,6 +352,11 @@ mod tests {
         OpEmitter::new("a1b2c3d4e5f6".to_string(), "sync-1".to_string(), 1, None)
     }
 
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64
+    }
+
     fn make_fields() -> HashMap<String, SyncValue> {
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
@@ -396,6 +426,42 @@ mod tests {
 
         // HLC should NOT have advanced (no tick for empty update)
         assert_eq!(*emitter.last_hlc(), hlc_before);
+    }
+
+    #[test]
+    fn new_ignores_future_remote_initial_hlc() {
+        let local_device = "a1b2c3d4e5f6";
+        let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
+
+        let emitter = OpEmitter::new(
+            local_device.to_string(),
+            "sync-1".to_string(),
+            1,
+            Some(future_remote_hlc),
+        );
+
+        assert_eq!(emitter.last_hlc(), &Hlc::zero(local_device));
+    }
+
+    #[test]
+    fn set_last_hlc_ignores_future_remote_hlc() {
+        let mut emitter = make_emitter();
+        let original = emitter.last_hlc().clone();
+        let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
+
+        emitter.set_last_hlc(future_remote_hlc);
+
+        assert_eq!(*emitter.last_hlc(), original);
+    }
+
+    #[test]
+    fn set_last_hlc_accepts_past_remote_hlc() {
+        let mut emitter = make_emitter();
+        let remote_hlc = Hlc::new(1_710_500_000_000, 0, "remote-device");
+
+        emitter.set_last_hlc(remote_hlc.clone());
+
+        assert_eq!(emitter.last_hlc(), &remote_hlc);
     }
 
     #[test]

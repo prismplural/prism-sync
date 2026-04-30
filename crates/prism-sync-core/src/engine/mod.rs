@@ -392,10 +392,11 @@ impl SyncEngine {
                     sender_key_info
                 };
 
-            if let Err(e) = batch_signature::verify_batch_signature(
+            if let Err(e) = batch_signature::verify_batch_signature_for_generation(
                 envelope,
                 &sender_key_info.ed25519_pk,
                 &sender_key_info.ml_dsa_65_pk,
+                sender_key_info.ml_dsa_key_generation,
             ) {
                 tracing::warn!(
                     "Skipping batch {} with invalid signature from {}: {e}",
@@ -448,19 +449,11 @@ impl SyncEngine {
 
             // Decode ops
             let ops = CrdtChange::decode_batch(&plaintext)?;
-
-            // Clock drift check
-            for op in &ops {
-                let hlc = Hlc::from_string(&op.client_hlc)?;
-                if hlc.is_drift_exceeded(self.config.max_clock_drift_ms) {
-                    let now_hlc = Hlc::now(device_id, None);
-                    return Err(CoreError::ClockDrift {
-                        drift_ms: hlc.timestamp - now_hlc.timestamp,
-                        max_ms: self.config.max_clock_drift_ms,
-                        device_id: op.device_id.clone(),
-                    });
-                }
-            }
+            let ops = Self::filter_batch_ops(
+                ops,
+                &envelope.sender_device_id,
+                self.config.max_clock_drift_ms,
+            )?;
 
             // Merge phase
             self.set_state(SyncState::Merging);
@@ -1204,9 +1197,10 @@ impl SyncEngine {
         // ── Guard ─────────────────────────────────────────────────────────
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
-        let device_count = tokio::task::spawn_blocking(move || storage.count_devices_in_group(&sid))
-            .await
-            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        let device_count =
+            tokio::task::spawn_blocking(move || storage.count_devices_in_group(&sid))
+                .await
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
         if device_count != 1 {
             return Err(CoreError::BootstrapNotAllowed(format!(
                 "expected exactly 1 device in registry, found {device_count}"
@@ -1244,10 +1238,7 @@ impl SyncEngine {
             .await
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
         if removed > 0 {
-            tracing::info!(
-                count = removed,
-                "bootstrap_existing_state: cleared orphan pending_ops"
-            );
+            tracing::info!(count = removed, "bootstrap_existing_state: cleared orphan pending_ops");
         }
 
         let entity_count = records.len() as u64;
@@ -1322,8 +1313,7 @@ impl SyncEngine {
                 by_table.entry(rec.table.clone()).or_default().push(rec);
             }
 
-            let mut emitter =
-                OpEmitter::new(node_id_clone, sync_id_owned, current_epoch, None);
+            let mut emitter = OpEmitter::new(node_id_clone, sync_id_owned, current_epoch, None);
 
             for (_table, group) in by_table {
                 for rec in group {
@@ -1331,7 +1321,12 @@ impl SyncEngine {
                     // every entity gets a strictly greater HLC than the
                     // previous one even though they land in their own
                     // transactions.
-                    emitter.seed_fields(&*storage_clone, &rec.table, &rec.entity_id, &rec.fields)?;
+                    emitter.seed_fields(
+                        &*storage_clone,
+                        &rec.table,
+                        &rec.entity_id,
+                        &rec.fields,
+                    )?;
                 }
             }
             Ok(())
@@ -1424,10 +1419,11 @@ impl SyncEngine {
                 sender_key_info
             };
 
-        crate::batch_signature::verify_batch_signature(
+        crate::batch_signature::verify_batch_signature_for_generation(
             &envelope,
             &sender_key_info.ed25519_pk,
             &sender_key_info.ml_dsa_65_pk,
+            sender_key_info.ml_dsa_key_generation,
         )?;
 
         // Verify relay-reported metadata matches the signed envelope
@@ -1457,6 +1453,10 @@ impl SyncEngine {
         .map_err(|e| CoreError::Engine(format!("snapshot decrypt failed: {e}")))?;
         crate::batch_signature::verify_payload_hash(&envelope, &compressed)?;
 
+        let snapshot_data = Self::parse_snapshot_data(&compressed)?;
+        let trusted_device_ids = self.trusted_snapshot_device_ids(sync_id, &snapshot_data).await?;
+        Self::validate_snapshot_attribution(&snapshot_data, &trusted_device_ids)?;
+
         // 3. Import into storage (within transaction)
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
@@ -1474,25 +1474,144 @@ impl SyncEngine {
 
         // 4. Build EntityChange list from the snapshot data so the caller
         //    can emit RemoteChanges to Dart for consumer DB population.
-        let entity_changes = Self::build_entity_changes_from_snapshot(&compressed)?;
+        let entity_changes = Self::build_entity_changes_from_snapshot_data(&snapshot_data);
 
         Ok((count, entity_changes))
     }
 
-    /// Parse a decompressed snapshot blob and build `EntityChange` entries
-    /// grouped by `(table, entity_id)`, collecting all winning field values.
-    ///
-    /// This is used after bootstrap to tell the consumer which entities and
-    /// fields need to be written into the consumer database.
-    fn build_entity_changes_from_snapshot(compressed: &[u8]) -> Result<Vec<EntityChange>> {
-        // Decompress zstd
+    fn filter_batch_ops(
+        ops: Vec<CrdtChange>,
+        sender_device_id: &str,
+        max_clock_drift_ms: i64,
+    ) -> Result<Vec<CrdtChange>> {
+        let max_clock_drift_ms = max_clock_drift_ms.max(0);
+        let mut accepted = Vec::with_capacity(ops.len());
+
+        for op in ops {
+            let hlc = match Hlc::from_string(&op.client_hlc) {
+                Ok(hlc) => hlc,
+                Err(e) => {
+                    tracing::warn!(
+                        op_id = %op.op_id,
+                        device_id = %op.device_id,
+                        client_hlc = %op.client_hlc,
+                        "Dropping op with malformed HLC: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            if op.device_id != sender_device_id {
+                return Err(CoreError::Engine(format!(
+                    "CRDT op attribution mismatch for {}: op.device_id={} envelope.sender_device_id={}",
+                    op.op_id, op.device_id, sender_device_id
+                )));
+            }
+
+            if hlc.node_id != sender_device_id {
+                return Err(CoreError::Engine(format!(
+                    "CRDT op HLC attribution mismatch for {}: client_hlc.node_id={} envelope.sender_device_id={}",
+                    op.op_id, hlc.node_id, sender_device_id
+                )));
+            }
+
+            let drift_ms = hlc.future_drift_ms();
+            if drift_ms > max_clock_drift_ms {
+                tracing::warn!(
+                    op_id = %op.op_id,
+                    device_id = %op.device_id,
+                    drift_ms,
+                    max_ms = max_clock_drift_ms,
+                    "Dropping op with excessive future HLC drift"
+                );
+                continue;
+            }
+
+            accepted.push(op);
+        }
+
+        Ok(accepted)
+    }
+
+    async fn trusted_snapshot_device_ids(
+        &self,
+        sync_id: &str,
+        snapshot: &crate::storage::SnapshotData,
+    ) -> Result<HashSet<String>> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let mut trusted = tokio::task::spawn_blocking(move || {
+            let records = storage.list_device_records(&sid)?;
+            Ok::<_, CoreError>(records.into_iter().map(|r| r.device_id).collect::<HashSet<_>>())
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        trusted.extend(snapshot.device_registry.iter().map(|dr| dr.device_id.clone()));
+        Ok(trusted)
+    }
+
+    fn validate_snapshot_attribution(
+        snapshot: &crate::storage::SnapshotData,
+        trusted_device_ids: &HashSet<String>,
+    ) -> Result<()> {
+        for fv in &snapshot.field_versions {
+            if !trusted_device_ids.contains(&fv.winning_device_id) {
+                return Err(CoreError::Engine(format!(
+                    "snapshot field_versions references untrusted device for {}.{}.{}: winning_device_id={}",
+                    fv.entity_table, fv.entity_id, fv.field_name, fv.winning_device_id
+                )));
+            }
+
+            let hlc = Hlc::from_string(&fv.winning_hlc)?;
+            if hlc.node_id != fv.winning_device_id {
+                return Err(CoreError::Engine(format!(
+                    "snapshot field_versions HLC attribution mismatch for {}.{}.{}: winning_hlc.node_id={} winning_device_id={}",
+                    fv.entity_table,
+                    fv.entity_id,
+                    fv.field_name,
+                    hlc.node_id,
+                    fv.winning_device_id
+                )));
+            }
+        }
+
+        for ao in &snapshot.applied_ops {
+            if !trusted_device_ids.contains(&ao.device_id) {
+                return Err(CoreError::Engine(format!(
+                    "snapshot applied_ops references untrusted device for {}: device_id={}",
+                    ao.op_id, ao.device_id
+                )));
+            }
+
+            let hlc = Hlc::from_string(&ao.client_hlc)?;
+            if hlc.node_id != ao.device_id {
+                return Err(CoreError::Engine(format!(
+                    "snapshot applied_ops HLC attribution mismatch for {}: client_hlc.node_id={} device_id={}",
+                    ao.op_id, hlc.node_id, ao.device_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_snapshot_data(compressed: &[u8]) -> Result<crate::storage::SnapshotData> {
         let json = zstd::decode_all(std::io::Cursor::new(compressed)).map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("zstd decompress failed: {e}")))
         })?;
 
-        // Parse snapshot data
-        let snapshot: crate::storage::SnapshotData = serde_json::from_slice(&json)?;
+        serde_json::from_slice(&json).map_err(CoreError::from)
+    }
 
+    /// Build `EntityChange` entries grouped by `(table, entity_id)`, collecting
+    /// all winning field values from a parsed snapshot.
+    ///
+    /// This is used after bootstrap to tell the consumer which entities and
+    /// fields need to be written into the consumer database.
+    fn build_entity_changes_from_snapshot_data(
+        snapshot: &crate::storage::SnapshotData,
+    ) -> Vec<EntityChange> {
         // Group field_versions by (table, entity_id) into EntityChange structs
         let mut change_map: HashMap<(String, String), EntityChange> = HashMap::new();
         for fv in &snapshot.field_versions {
@@ -1525,7 +1644,7 @@ impl SyncEngine {
             }
         }
 
-        Ok(change_map.into_values().collect())
+        change_map.into_values().collect()
     }
 }
 
