@@ -17,6 +17,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+deny = [
+    { name = "serde_cbor", reason = "unmaintained; use ciborium for CBOR payloads" },
+]
 
 [sources]
 unknown-registry = "deny"

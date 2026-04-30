@@ -1,5 +1,5 @@
 use base64::Engine;
-use serde_cbor::Value;
+use ciborium::Value;
 use sha2::{Digest, Sha256};
 use simple_asn1::{from_der, ASN1Block};
 use x509_parser::oid_registry::Oid;
@@ -52,7 +52,7 @@ pub(crate) fn verify_apple_app_attest(
 
     let expected_challenge = compute_apple_attestation_challenge(sync_id, device_id, nonce);
     let attestation_bytes = decode_base64_der(attestation_object)?;
-    let cbor_value: Value = serde_cbor::from_slice(&attestation_bytes)
+    let cbor_value: Value = ciborium::de::from_reader(attestation_bytes.as_slice())
         .map_err(|e| format!("invalid apple attestation CBOR: {e}"))?;
     let attestation = parse_attestation_object(&cbor_value)?;
     if attestation.fmt != APPLE_APP_ATTESTATION_FMT {
@@ -306,7 +306,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use rcgen::{CertificateParams, CustomExtension, IsCa, KeyPair};
-    use std::collections::BTreeMap;
 
     fn make_test_root() -> (rcgen::Certificate, KeyPair) {
         let mut params = CertificateParams::new(vec!["Apple App Attest CA".into()]).unwrap();
@@ -423,21 +422,22 @@ mod tests {
         let leaf_key = KeyPair::generate().unwrap();
         let leaf_cert = leaf_params.signed_by(&leaf_key, &root_cert, &root_key).unwrap();
 
-        let attestation_object = serde_cbor::to_vec(&serde_cbor::Value::Map(BTreeMap::from([
+        let attestation_value = Value::Map(vec![
             (Value::Text("fmt".into()), Value::Text(APPLE_APP_ATTESTATION_FMT.into())),
             (Value::Text("authData".into()), Value::Bytes(auth_data)),
             (
                 Value::Text("attStmt".into()),
-                Value::Map(BTreeMap::from([(
+                Value::Map(vec![(
                     Value::Text("x5c".into()),
                     Value::Array(vec![
                         Value::Bytes(leaf_cert.der().to_vec()),
                         Value::Bytes(root_cert.der().to_vec()),
                     ]),
-                )])),
+                )]),
             ),
-        ])))
-        .unwrap();
+        ]);
+        let mut attestation_object = Vec::new();
+        ciborium::ser::into_writer(&attestation_value, &mut attestation_object).unwrap();
 
         let (key_id, attestation_object) = build_apple_app_attest(&key_id, attestation_object);
         let verified = verify_apple_app_attest(

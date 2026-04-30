@@ -15,7 +15,6 @@ use rand::RngCore;
 use reqwest::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 
 use prism_sync_relay::{
     config::Config,
@@ -122,21 +121,22 @@ fn build_apple_app_attest_proof(
     let leaf_key = KeyPair::generate().unwrap();
     let leaf_cert = leaf_params.signed_by(&leaf_key, root_cert, root_key).unwrap();
 
-    let attestation_object = serde_cbor::to_vec(&serde_cbor::Value::Map(BTreeMap::from([
-        (serde_cbor::Value::Text("fmt".into()), serde_cbor::Value::Text("apple-appattest".into())),
-        (serde_cbor::Value::Text("authData".into()), serde_cbor::Value::Bytes(auth_data)),
+    let attestation_value = ciborium::Value::Map(vec![
+        (ciborium::Value::Text("fmt".into()), ciborium::Value::Text("apple-appattest".into())),
+        (ciborium::Value::Text("authData".into()), ciborium::Value::Bytes(auth_data)),
         (
-            serde_cbor::Value::Text("attStmt".into()),
-            serde_cbor::Value::Map(BTreeMap::from([(
-                serde_cbor::Value::Text("x5c".into()),
-                serde_cbor::Value::Array(vec![
-                    serde_cbor::Value::Bytes(leaf_cert.der().to_vec()),
-                    serde_cbor::Value::Bytes(root_cert.der().to_vec()),
+            ciborium::Value::Text("attStmt".into()),
+            ciborium::Value::Map(vec![(
+                ciborium::Value::Text("x5c".into()),
+                ciborium::Value::Array(vec![
+                    ciborium::Value::Bytes(leaf_cert.der().to_vec()),
+                    ciborium::Value::Bytes(root_cert.der().to_vec()),
                 ]),
-            )])),
+            )]),
         ),
-    ])))
-    .unwrap();
+    ]);
+    let mut attestation_object = Vec::new();
+    ciborium::ser::into_writer(&attestation_value, &mut attestation_object).unwrap();
 
     serde_json::json!({
         "kind": "apple_app_attest",
