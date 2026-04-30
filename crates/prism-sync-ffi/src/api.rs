@@ -1182,41 +1182,77 @@ pub async fn restore_runtime_keys(
     let mut inner = handle.inner.lock().await;
     inner.restore_runtime_keys(&dek, &device_secret).map_err(|e| e.to_string())?;
 
-    // Restore persisted epoch keys (epoch 1+, generated during rekey).
-    // Epoch 0 is derived from the DEK by restore_from_dek, but higher epochs
-    // are generated fresh during rekey and only live in the secure store.
-    // Try sequential epoch numbers and stop at the first gap.
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    for epoch in 1u32.. {
-        let key_name = format!("epoch_key_{epoch}");
-        match inner.secure_store().get(&key_name) {
-            Ok(Some(stored_bytes)) => {
-                // The key may have been stored as base64 (client.rs path) or
-                // raw bytes (sync_service.rs path). Try base64 decode first;
-                // if that yields exactly 32 bytes use it, otherwise treat the
-                // stored value as raw key material.
-                let key_bytes = if let Ok(decoded) = STANDARD.decode(&stored_bytes) {
-                    if decoded.len() == 32 {
-                        decoded
-                    } else {
-                        stored_bytes
-                    }
-                } else {
-                    stored_bytes
-                };
+    restore_persisted_epoch_keys(&mut inner)?;
 
-                if key_bytes.len() == 32 {
-                    inner
-                        .key_hierarchy_mut()
-                        .store_epoch_key(epoch, zeroize::Zeroizing::new(key_bytes));
-                } else {
-                    // Unexpected key length — stop restoring further epochs.
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
+    Ok(())
+}
+
+fn parse_epoch_key_name(key: &str) -> Option<u32> {
+    let suffix = key.strip_prefix("epoch_key_")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    suffix.parse::<u32>().ok()
+}
+
+fn decode_persisted_epoch_key(key_name: &str, stored_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    // The key may have been stored as base64 (client/pairing paths) or raw
+    // bytes (older recovery paths). Try base64 first; if it does not decode
+    // to exactly 32 bytes, fall back to raw key material.
+    if let Ok(decoded) = BASE64.decode(&stored_bytes) {
+        if decoded.len() == 32 {
+            return Ok(decoded);
         }
+    }
+
+    if stored_bytes.len() == 32 {
+        return Ok(stored_bytes);
+    }
+
+    Err(format!("{key_name} has wrong length ({}, expected 32)", stored_bytes.len()))
+}
+
+fn restore_persisted_epoch_keys(inner: &mut PrismSync) -> Result<(), String> {
+    let secure_store = inner.secure_store().clone();
+    let mut entries: Vec<(u32, String, Vec<u8>)> = Vec::new();
+
+    if let Some(snapshot) = secure_store.snapshot().map_err(|e| e.to_string())? {
+        for (key, value) in snapshot {
+            let Some(epoch) = parse_epoch_key_name(&key) else {
+                continue;
+            };
+            entries.push((epoch, key, value));
+        }
+    } else {
+        let current_epoch = secure_store
+            .get("epoch")
+            .map_err(|e| e.to_string())?
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        for epoch in 1..=current_epoch {
+            let key = format!("epoch_key_{epoch}");
+            if let Some(value) = secure_store.get(&key).map_err(|e| e.to_string())? {
+                entries.push((epoch, key, value));
+            }
+        }
+    }
+
+    entries.sort_by_key(|(epoch, _, _)| *epoch);
+    for (epoch, key_name, stored_bytes) in entries {
+        let key_bytes = match decode_persisted_epoch_key(&key_name, stored_bytes) {
+            Ok(key_bytes) => key_bytes,
+            Err(error) => {
+                tracing::warn!(
+                    epoch,
+                    key = %key_name,
+                    error = %error,
+                    "restore_runtime_keys: skipping invalid persisted epoch key"
+                );
+                continue;
+            }
+        };
+        inner.key_hierarchy_mut().store_epoch_key(epoch, zeroize::Zeroizing::new(key_bytes));
     }
 
     Ok(())
@@ -4826,6 +4862,33 @@ mod tests {
         assert_eq!(meta.local_device_id, "joiner-device");
         assert_eq!(meta.current_epoch, 5);
         assert_eq!(meta.last_pulled_server_seq, 42);
+    }
+
+    #[tokio::test]
+    async fn restore_runtime_keys_loads_noncontiguous_epoch_keys_from_seeded_store() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let epoch_4_key = [0x44u8; 32];
+        let entries = serde_json::json!({
+            "epoch": BASE64.encode(b"4"),
+            "epoch_key_4": BASE64.encode(epoch_4_key),
+        });
+        seed_secure_store(&handle, entries.to_string()).await.expect("seed secure store");
+
+        restore_runtime_keys(&handle, vec![0xAA; 32], vec![0xBB; 32])
+            .await
+            .expect("restore runtime keys");
+
+        let inner = handle.inner.lock().await;
+        assert_eq!(inner.key_hierarchy().known_epochs(), vec![0, 4]);
+        assert_eq!(inner.key_hierarchy().epoch_key(4).unwrap(), epoch_4_key);
     }
 
     /// Seeds two sync_ids' rows into the handle's storage, then calls the FFI

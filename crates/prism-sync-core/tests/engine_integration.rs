@@ -13,11 +13,11 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
-use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope, SyncRelay, SyncTransport};
+use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope, SyncTransport};
 use prism_sync_core::schema::SyncValue;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
-use prism_sync_core::{batch_signature, sync_aad, CrdtChange, Hlc};
+use prism_sync_core::{batch_signature, sync_aad, CoreError, CrdtChange, Hlc};
 
 use common::*;
 
@@ -999,7 +999,8 @@ async fn push_uses_current_epoch_not_stored_op_epoch() {
 
 /// Degenerate case: metadata claims current_epoch = N but the KeyHierarchy
 /// has no key at N. Push must fail with a clear error, NOT silently fall
-/// back to an older epoch key.
+/// back to an older epoch key. It must bubble as `MissingEpochKey` so the
+/// higher-level sync service can recover the key and retry the push.
 #[tokio::test]
 async fn push_still_fails_when_current_epoch_key_missing() {
     let key_hierarchy = init_key_hierarchy(); // only epoch 0 available
@@ -1033,16 +1034,11 @@ async fn push_still_fails_when_current_epoch_key_missing() {
         SyncConfig::default(),
     );
 
-    let result = engine
+    let err = engine
         .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
         .await
-        .unwrap();
-    assert!(result.error.is_some(), "push must fail when current_epoch key is missing");
-    let err = result.error.unwrap();
-    assert!(
-        err.contains("Missing epoch key for push epoch 2"),
-        "error must name the missing epoch: {err}"
-    );
+        .expect_err("push must fail when current_epoch key is missing");
+    assert!(matches!(err, CoreError::MissingEpochKey { epoch: 2 }), "unexpected error: {err}");
 }
 
 /// If the stored op epoch is somehow *higher* than sync_metadata

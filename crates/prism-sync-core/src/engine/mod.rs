@@ -83,7 +83,7 @@ fn populate_result_error(result: &mut SyncResult, e: &CoreError) {
     }
 }
 
-fn should_bubble_pull_error(error: &CoreError) -> bool {
+fn should_bubble_recoverable_key_error(error: &CoreError) -> bool {
     matches!(error, CoreError::MissingEpochKey { .. } | CoreError::DecryptFailed { .. })
 }
 
@@ -197,7 +197,7 @@ impl SyncEngine {
                 }
             }
             Err(e) => {
-                if should_bubble_pull_error(&e) {
+                if should_bubble_recoverable_key_error(&e) {
                     self.set_state(SyncState::Error { message: e.to_string() });
                     return Err(e);
                 }
@@ -256,6 +256,10 @@ impl SyncEngine {
                 result.pushed = pushed;
             }
             Err(e) => {
+                if should_bubble_recoverable_key_error(&e) {
+                    self.set_state(SyncState::Error { message: e.to_string() });
+                    return Err(e);
+                }
                 populate_result_error(&mut result, &e);
                 result.duration = start.elapsed();
                 self.set_state(SyncState::Error { message: e.to_string() });
@@ -1024,7 +1028,13 @@ impl SyncEngine {
 
             // Get epoch key for encryption
             let epoch_key = key_hierarchy.epoch_key(epoch as u32).map_err(|_| {
-                CoreError::Engine(format!("Missing epoch key for push epoch {epoch}"))
+                tracing::error!(
+                    push_epoch = epoch,
+                    batch_id = %batch_id,
+                    known_epochs = ?key_hierarchy.known_epochs(),
+                    "engine: missing epoch key — cannot encrypt pending batch"
+                );
+                CoreError::MissingEpochKey { epoch: epoch as u32 }
             })?;
 
             // Build AAD and encrypt
