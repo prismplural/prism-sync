@@ -1857,8 +1857,9 @@ mod tests {
         let wrap_key =
             prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                 .unwrap();
+        let aad = crate::epoch::build_rekey_artifact_aad(epoch, device_id);
         let encrypted_epoch_key =
-            prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
+            prism_sync_crypto::aead::xchacha_encrypt_aead(&wrap_key, epoch_key, &aad).unwrap();
 
         let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
         artifact.push(0x02);

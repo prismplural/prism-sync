@@ -17,18 +17,22 @@ pub fn build_sync_aad(
 
 /// Build the Additional Authenticated Data (AAD) string for snapshot encryption.
 ///
-/// Format: `prism_snapshot|{sync_id}|{device_id}|{epoch}|{server_seq_at}`
+/// Format:
+/// `prism_snapshot|{sync_id}|{device_id}|{epoch}|{server_seq_at}|{batch_id}|{batch_kind}`
 ///
 /// This binds the snapshot metadata to the ciphertext, preventing a malicious
 /// relay from replaying valid ciphertext with forged metadata (e.g. a different
-/// epoch or server_seq_at).
+/// epoch, server_seq_at, batch ID, or batch kind).
 pub fn build_snapshot_aad(
     sync_id: &str,
     device_id: &str,
     epoch: i32,
     server_seq_at: i64,
+    batch_id: &str,
+    batch_kind: &str,
 ) -> Vec<u8> {
-    format!("prism_snapshot|{sync_id}|{device_id}|{epoch}|{server_seq_at}").into_bytes()
+    format!("prism_snapshot|{sync_id}|{device_id}|{epoch}|{server_seq_at}|{batch_id}|{batch_kind}")
+        .into_bytes()
 }
 
 #[cfg(test)]
@@ -40,13 +44,6 @@ mod tests {
         let aad = build_sync_aad("sync-123", "device-abc", 0, "batch-456", "ops");
         let aad_str = String::from_utf8(aad).unwrap();
         assert_eq!(aad_str, "prism_sync|sync-123|device-abc|0|batch-456|ops");
-    }
-
-    #[test]
-    fn aad_snapshot_kind() {
-        let aad = build_sync_aad("s1", "d1", 2, "b1", "snapshot");
-        let aad_str = String::from_utf8(aad).unwrap();
-        assert_eq!(aad_str, "prism_sync|s1|d1|2|b1|snapshot");
     }
 
     #[test]
@@ -72,36 +69,50 @@ mod tests {
 
     #[test]
     fn snapshot_aad_format() {
-        let aad = build_snapshot_aad("sync-123", "device-abc", 0, 42);
+        let aad = build_snapshot_aad("sync-123", "device-abc", 0, 42, "snapshot-456", "snapshot");
         let aad_str = String::from_utf8(aad).unwrap();
-        assert_eq!(aad_str, "prism_snapshot|sync-123|device-abc|0|42");
+        assert_eq!(aad_str, "prism_snapshot|sync-123|device-abc|0|42|snapshot-456|snapshot");
     }
 
     #[test]
     fn snapshot_aad_different_sync_ids() {
-        let aad1 = build_snapshot_aad("sync-a", "d1", 0, 10);
-        let aad2 = build_snapshot_aad("sync-b", "d1", 0, 10);
+        let aad1 = build_snapshot_aad("sync-a", "d1", 0, 10, "snapshot-1", "snapshot");
+        let aad2 = build_snapshot_aad("sync-b", "d1", 0, 10, "snapshot-1", "snapshot");
         assert_ne!(aad1, aad2);
     }
 
     #[test]
     fn snapshot_aad_different_epochs() {
-        let aad1 = build_snapshot_aad("s1", "d1", 0, 10);
-        let aad2 = build_snapshot_aad("s1", "d1", 1, 10);
+        let aad1 = build_snapshot_aad("s1", "d1", 0, 10, "snapshot-1", "snapshot");
+        let aad2 = build_snapshot_aad("s1", "d1", 1, 10, "snapshot-1", "snapshot");
         assert_ne!(aad1, aad2);
     }
 
     #[test]
     fn snapshot_aad_different_server_seqs() {
-        let aad1 = build_snapshot_aad("s1", "d1", 0, 10);
-        let aad2 = build_snapshot_aad("s1", "d1", 0, 20);
+        let aad1 = build_snapshot_aad("s1", "d1", 0, 10, "snapshot-1", "snapshot");
+        let aad2 = build_snapshot_aad("s1", "d1", 0, 20, "snapshot-1", "snapshot");
         assert_ne!(aad1, aad2);
     }
 
     #[test]
     fn snapshot_aad_different_devices() {
-        let aad1 = build_snapshot_aad("s1", "device-a", 0, 10);
-        let aad2 = build_snapshot_aad("s1", "device-b", 0, 10);
+        let aad1 = build_snapshot_aad("s1", "device-a", 0, 10, "snapshot-1", "snapshot");
+        let aad2 = build_snapshot_aad("s1", "device-b", 0, 10, "snapshot-1", "snapshot");
+        assert_ne!(aad1, aad2);
+    }
+
+    #[test]
+    fn snapshot_aad_different_batch_ids() {
+        let aad1 = build_snapshot_aad("s1", "d1", 0, 10, "snapshot-1", "snapshot");
+        let aad2 = build_snapshot_aad("s1", "d1", 0, 10, "snapshot-2", "snapshot");
+        assert_ne!(aad1, aad2);
+    }
+
+    #[test]
+    fn snapshot_aad_different_batch_kinds() {
+        let aad1 = build_snapshot_aad("s1", "d1", 0, 10, "snapshot-1", "snapshot");
+        let aad2 = build_snapshot_aad("s1", "d1", 0, 10, "snapshot-1", "ops");
         assert_ne!(aad1, aad2);
     }
 }

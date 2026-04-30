@@ -93,7 +93,14 @@ fn make_snapshot_envelope_bytes(
     let compressed = zstd::encode_all(json.as_slice(), 3).unwrap();
     let payload_hash = batch_signature::compute_payload_hash(&compressed);
     let epoch_key = key_hierarchy.epoch_key(0).unwrap();
-    let aad = sync_aad::build_snapshot_aad(SYNC_ID, sender_device_id, 0, server_seq_at);
+    let aad = sync_aad::build_snapshot_aad(
+        SYNC_ID,
+        sender_device_id,
+        0,
+        server_seq_at,
+        batch_id,
+        "snapshot",
+    );
     let (ciphertext, nonce) =
         prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &compressed, &aad).unwrap();
 

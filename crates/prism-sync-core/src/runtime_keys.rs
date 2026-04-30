@@ -12,6 +12,10 @@ use crate::storage::StorageError;
 const DEVICE_WRAP_KEY_STORAGE_KEY: &str = "device_wrap_key";
 const RUNTIME_KEYS_PREFIX: &str = "runtime_keys_";
 
+fn runtime_keys_aad(sync_id: &str) -> Vec<u8> {
+    format!("prism_runtime_keys_v1|{sync_id}").into_bytes()
+}
+
 /// Persists epoch keys from [`KeyHierarchy`] to [`SecureStore`] encrypted under
 /// a device-local wrap key.  Enables restart-safe recovery of epoch keys without
 /// requiring the user to re-enter their password.
@@ -43,8 +47,9 @@ impl SyncRuntimeKeys {
         let json =
             serde_json::to_vec(&payload).map_err(|e| CoreError::Serialization(e.to_string()))?;
 
-        // Encrypt under wrap key
-        let encrypted = aead::xchacha_encrypt(&wrap_key, &json)
+        // Encrypt under wrap key with AAD binding this blob to its sync group.
+        let aad = runtime_keys_aad(sync_id);
+        let encrypted = aead::xchacha_encrypt_aead(&wrap_key, &json, &aad)
             .map_err(|e| CoreError::Storage(StorageError::Logic(format!("encrypt failed: {e}"))))?;
 
         let storage_key = format!("{RUNTIME_KEYS_PREFIX}{sync_id}");
@@ -72,9 +77,11 @@ impl SyncRuntimeKeys {
             None => return Ok(false),
         };
 
-        let json = Zeroizing::new(aead::xchacha_decrypt(&wrap_key, &encrypted).map_err(|e| {
-            CoreError::Storage(StorageError::Logic(format!("decrypt failed: {e}")))
-        })?);
+        let aad = runtime_keys_aad(sync_id);
+        let json =
+            Zeroizing::new(aead::xchacha_decrypt_aead(&wrap_key, &encrypted, &aad).map_err(
+                |e| CoreError::Storage(StorageError::Logic(format!("decrypt failed: {e}"))),
+            )?);
 
         let payload: HashMap<String, String> =
             serde_json::from_slice(&json).map_err(|e| CoreError::Serialization(e.to_string()))?;
@@ -200,6 +207,22 @@ mod tests {
         let mut out_b = unlocked_hierarchy();
         SyncRuntimeKeys::restore(&mut out_b, "sync-bbb", &store).await.unwrap();
         assert_eq!(out_b.epoch_key(1).unwrap(), &[0xBB; 32]);
+    }
+
+    #[tokio::test]
+    async fn encrypted_blob_is_bound_to_sync_id() {
+        let store = MemStore::default();
+        let mut kh = unlocked_hierarchy();
+        kh.store_epoch_key(1, Zeroizing::new(vec![0xAA; 32]));
+
+        SyncRuntimeKeys::persist(&kh, "sync-aaa", &store).await.unwrap();
+        let encrypted = store.get("runtime_keys_sync-aaa").unwrap().unwrap();
+
+        store.set("runtime_keys_sync-bbb", &encrypted).unwrap();
+
+        let mut out = unlocked_hierarchy();
+        let result = SyncRuntimeKeys::restore(&mut out, "sync-bbb", &store).await;
+        assert!(result.is_err(), "copied runtime key blob must fail AAD-bound restore");
     }
 
     #[tokio::test]

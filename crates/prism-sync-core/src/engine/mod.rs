@@ -1131,14 +1131,16 @@ impl SyncEngine {
         let epoch_key = key_hierarchy
             .epoch_key(epoch as u32)
             .map_err(|e| CoreError::Engine(format!("no epoch key: {e}")))?;
-        let aad = crate::sync_aad::build_snapshot_aad(sync_id, device_id, epoch, server_seq);
+        let batch_id = format!("snapshot-{}", chrono::Utc::now().timestamp_millis());
+        let aad = crate::sync_aad::build_snapshot_aad(
+            sync_id, device_id, epoch, server_seq, &batch_id, "snapshot",
+        );
         let (ciphertext, nonce) =
             prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &snapshot_data, &aad)
                 .map_err(|e| CoreError::Engine(format!("snapshot encrypt failed: {e}")))?;
 
         // 4. Compute payload hash and sign the snapshot as a batch envelope
         let payload_hash = crate::batch_signature::compute_payload_hash(&snapshot_data);
-        let batch_id = format!("snapshot-{}", chrono::Utc::now().timestamp_millis());
         let envelope = crate::batch_signature::sign_batch(
             signing_key,
             ml_dsa_signing_key,
@@ -1443,6 +1445,8 @@ impl SyncEngine {
             &envelope.sender_device_id,
             snapshot.epoch,
             snapshot.server_seq_at,
+            &envelope.batch_id,
+            &envelope.batch_kind,
         );
         let compressed = prism_sync_crypto::aead::xchacha_decrypt_from_sync(
             epoch_key,
