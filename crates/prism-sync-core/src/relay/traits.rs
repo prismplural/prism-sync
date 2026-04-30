@@ -217,7 +217,7 @@ pub struct PullResponse {
 ///
 /// IMPORTANT: The relay passes through the complete SignedBatchEnvelope
 /// so that clients can verify the sender's hybrid signature (Ed25519 + ML-DSA-65) before
-/// decrypting. The relay does NOT verify signatures (zero-knowledge).
+/// decrypting. The relay does NOT verify signatures — content authenticity is checked client-side.
 #[derive(Debug, Clone)]
 pub struct ReceivedBatch {
     pub server_seq: i64,

@@ -53,4 +53,4 @@ All configuration via environment variables:
 
 ## Security
 
-The relay is zero-knowledge — it stores encrypted blobs and never reads plaintext data. Authentication uses per-device session tokens issued via Ed25519 challenge-response.
+The relay only sees ciphertext — it stores encrypted blobs and never reads plaintext data. Authentication uses per-device session tokens issued via Ed25519 challenge-response.

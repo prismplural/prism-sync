@@ -1,7 +1,7 @@
 # prism-sync
 
 ## Overview
-Plug-and-play encrypted CRDT sync library in Rust with cross-platform FFI bindings. Provides field-level Last-Write-Wins CRDT synchronization with zero-knowledge encryption -- the relay server stores only encrypted blobs and never sees plaintext content.
+Plug-and-play encrypted CRDT sync library in Rust with cross-platform FFI bindings. Provides field-level Last-Write-Wins CRDT synchronization with end-to-end encryption -- the relay server stores only encrypted blobs and never sees plaintext content.
 
 ## Tech Stack
 - **Language:** Rust 2021 edition
