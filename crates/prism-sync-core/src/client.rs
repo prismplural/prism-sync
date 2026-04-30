@@ -257,8 +257,8 @@ impl PrismSync {
 
     /// Restore the unlocked state directly from raw key material.
     ///
-    /// Bypasses Argon2id password derivation. Use when the raw DEK has been
-    /// persisted in the platform keychain (Signal-style key management).
+    /// Bypasses Argon2id password derivation. Use when the host has recovered
+    /// the DEK from a platform-protected runtime cache.
     pub fn restore_runtime_keys(
         &mut self,
         dek_bytes: &[u8],
@@ -274,7 +274,8 @@ impl PrismSync {
     }
 
     /// Only available when unlocked (after `initialize` or `unlock`).
-    /// Cache in the platform keychain for `restore_runtime_keys` on relaunch.
+    /// The host should wrap this before persistence and feed the unwrapped key
+    /// back to `restore_runtime_keys` on relaunch.
     pub fn export_dek(&self) -> Result<Vec<u8>> {
         Ok(self.key_hierarchy.dek()?.to_vec())
     }

@@ -1168,9 +1168,9 @@ pub async fn unlock(
 
 /// Restore the unlocked state directly from raw key material.
 ///
-/// Bypasses Argon2id password derivation entirely. Use when the raw DEK
-/// has been persisted in the platform keychain (Signal-style approach).
-/// This is the fast path for subsequent app launches.
+/// Bypasses Argon2id password derivation entirely. Use when the host has
+/// recovered the DEK from a platform-protected runtime cache. This is the
+/// fast path for subsequent app launches.
 ///
 /// - `dek`: The raw 32-byte Data Encryption Key.
 /// - `device_secret`: The raw 32-byte device secret.
@@ -1258,11 +1258,12 @@ fn restore_persisted_epoch_keys(inner: &mut PrismSync) -> Result<(), String> {
     Ok(())
 }
 
-/// Export the raw DEK bytes for keychain persistence.
+/// Export the raw DEK bytes for host-side runtime-cache wrapping.
 ///
 /// Returns the raw 32-byte DEK. Only works when unlocked (after
-/// `initialize` or `unlock`). Store in the platform keychain so
-/// `restore_runtime_keys` can be used on subsequent launches.
+/// `initialize` or `unlock`). The host must wrap the bytes before
+/// persistence; the unwrapped bytes can be supplied to `restore_runtime_keys`
+/// on subsequent launches.
 pub async fn export_dek(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
     let inner = handle.inner.lock().await;
     inner.export_dek().map_err(|e| e.to_string())

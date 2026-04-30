@@ -99,8 +99,8 @@ impl KeyHierarchy {
     /// Restore unlocked state directly from raw DEK bytes.
     ///
     /// Bypasses password-based key derivation (Argon2id). Use this when the
-    /// raw DEK has been persisted in a platform keychain and needs to be
-    /// restored on subsequent app launches without the user's password.
+    /// host has recovered the DEK from a platform-protected runtime cache and
+    /// needs to restore subsequent app launches without the user's password.
     pub fn restore_from_dek(&mut self, dek_bytes: &[u8]) -> Result<()> {
         if dek_bytes.len() != DEK_LEN {
             return Err(CryptoError::InvalidKeyMaterial(format!(
