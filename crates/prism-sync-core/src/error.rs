@@ -129,6 +129,13 @@ impl CoreError {
                 None,
                 Some(remote_wipe),
             ),
+            RelayError::MustBootstrapFromSnapshot { .. } => (
+                RelayErrorCategory::Protocol,
+                Some(409),
+                Some("must_bootstrap_from_snapshot".to_string()),
+                None,
+                None,
+            ),
             RelayError::Protocol { .. }
             | RelayError::EpochRotation { .. }
             | RelayError::ClockSkew { .. }
@@ -214,6 +221,26 @@ mod tests {
                 remote_wipe: Some(true),
                 ..
             } if code == "device_revoked"
+        ));
+    }
+
+    #[test]
+    fn from_relay_preserves_must_bootstrap_from_snapshot_code() {
+        let error = CoreError::from_relay(RelayError::MustBootstrapFromSnapshot {
+            since_seq: 2,
+            first_retained_seq: 5,
+            message: "bootstrap".into(),
+        });
+
+        assert!(matches!(
+            error,
+            CoreError::Relay {
+                kind: RelayErrorCategory::Protocol,
+                status: Some(409),
+                code: Some(ref code),
+                remote_wipe: None,
+                ..
+            } if code == "must_bootstrap_from_snapshot"
         ));
     }
 }

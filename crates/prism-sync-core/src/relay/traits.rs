@@ -51,6 +51,9 @@ pub enum RelayError {
     #[error("device revoked (remote_wipe={remote_wipe})")]
     DeviceRevoked { remote_wipe: bool },
 
+    #[error("must bootstrap from snapshot: since_seq={since_seq}, first_retained_seq={first_retained_seq}")]
+    MustBootstrapFromSnapshot { since_seq: i64, first_retained_seq: i64, message: String },
+
     #[error("not found")]
     NotFound,
 
@@ -76,6 +79,9 @@ impl RelayError {
             RelayError::ClockSkew { .. } => RelayErrorKind::ClockSkew,
             RelayError::KeyChanged { .. } => RelayErrorKind::KeyChanged,
             RelayError::DeviceRevoked { .. } => RelayErrorKind::DeviceRevoked,
+            RelayError::MustBootstrapFromSnapshot { .. } => {
+                RelayErrorKind::MustBootstrapFromSnapshot
+            }
             RelayError::NotFound => RelayErrorKind::NotFound,
             RelayError::Forbidden { .. } => RelayErrorKind::Forbidden,
             RelayError::Http { .. } => RelayErrorKind::Http,
@@ -105,6 +111,7 @@ pub enum RelayErrorKind {
     ClockSkew,
     KeyChanged,
     DeviceRevoked,
+    MustBootstrapFromSnapshot,
     NotFound,
     Forbidden,
     Http,

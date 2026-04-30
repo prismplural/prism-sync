@@ -1591,6 +1591,16 @@ pub fn get_batches_since(
     rows.collect()
 }
 
+/// Return the first retained batch sequence for a sync group, if any.
+pub fn get_first_retained_batch_seq(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row("SELECT MIN(id) FROM batches WHERE sync_id = ?1", params![sync_id], |row| {
+        row.get(0)
+    })
+}
+
 pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
     conn.query_row(
         "SELECT COALESCE(MAX(id), 0) FROM batches WHERE sync_id = ?1",
@@ -2674,15 +2684,15 @@ pub fn count_pending_sharing_inits(
     )
 }
 
-/// Delete expired payloads and old consumed payloads. Returns the number of rows deleted.
+/// Delete payload rows after their original replay window has expired.
+/// Consumed rows are retained until `expires_at` so their `init_id`s continue
+/// to reject replay for the full sharing-init TTL.
 pub fn cleanup_expired_sharing_init_payloads(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
-    let consumed_cutoff = now - 86400; // 24 hours
     let rows = conn.execute(
         "DELETE FROM sharing_init_payloads
-         WHERE expires_at <= ?1
-            OR (consumed_at IS NOT NULL AND consumed_at <= ?2)",
-        params![now, consumed_cutoff],
+         WHERE expires_at <= ?1",
+        params![now],
     )?;
     Ok(rows)
 }

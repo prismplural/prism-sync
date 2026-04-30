@@ -82,7 +82,7 @@ async fn run_cleanup(state: &AppState) {
             let stale_prekeys =
                 crate::db::cleanup_stale_sharing_prekeys(conn, config.prekey_serve_max_age_secs)?;
 
-            // 12. Delete expired or long-consumed sharing-init payloads.
+            // 12. Delete sharing-init payloads after their replay window expires.
             let expired_sharing_inits = crate::db::cleanup_expired_sharing_init_payloads(conn)?;
 
             // 13. Clear expired ML-DSA grace keys (post-rotation old keys).
@@ -266,6 +266,7 @@ async fn run_cleanup(state: &AppState) {
     }
 
     // Prune stale entries from in-memory rate limiters.
+    state.ws_upgrade_rate_limiter.prune_stale(state.config.ws_upgrade_rate_window_secs);
     state.nonce_rate_limiter.prune_stale(state.config.nonce_rate_window_secs);
     state.revoke_rate_limiter.prune_stale(state.config.revoke_rate_window_secs);
     state.pairing_rate_limiter.prune_stale(60);

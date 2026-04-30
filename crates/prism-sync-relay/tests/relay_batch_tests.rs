@@ -426,6 +426,61 @@ async fn test_cleanup_pruning_requires_group_wide_snapshot() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn test_pull_stale_cursor_returns_must_bootstrap_response() {
+    let (url, _server, relay_db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let mut last_seq = 0i64;
+    for i in 0..5 {
+        let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
+        let resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+        assert!(resp.status().is_success(), "push failed: {}", resp.status());
+        let json: Value = resp.json().await.unwrap();
+        last_seq = json["server_seq"].as_i64().unwrap();
+    }
+
+    relay_db
+        .with_conn(|conn| {
+            let pruned = db::prune_batches_before(conn, &sync_id, last_seq)?;
+            assert_eq!(pruned, 4);
+            assert_eq!(db::get_first_retained_batch_seq(conn, &sync_id)?, Some(last_seq));
+            Ok(())
+        })
+        .unwrap();
+
+    let stale_pull = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since=0"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_pull.status(), 409);
+    let stale_json: Value = stale_pull.json().await.unwrap();
+    assert_eq!(stale_json["error"].as_str(), Some("must_bootstrap_from_snapshot"));
+    assert_eq!(stale_json["since_seq"].as_i64(), Some(0));
+    assert_eq!(stale_json["first_retained_seq"].as_i64(), Some(last_seq));
+
+    let continuous_pull = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since={}", last_seq - 1))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(continuous_pull.status(), 200);
+    let continuous_json: Value = continuous_pull.json().await.unwrap();
+    let batches = continuous_json["batches"].as_array().unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0]["server_seq"].as_i64(), Some(last_seq));
+}
+
 // ───────────────────────────── Test 7: Epoch mismatch on push ───────────
 
 #[tokio::test]

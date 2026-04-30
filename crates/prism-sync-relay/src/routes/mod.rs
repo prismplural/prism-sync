@@ -10,15 +10,15 @@ pub mod sync;
 pub mod ws;
 
 use axum::{
-    extract::DefaultBodyLimit,
-    extract::State,
-    http::{HeaderMap, Request},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
+    http::{HeaderMap, Method, Request},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
 use base64::Engine;
+use std::net::{IpAddr, SocketAddr};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -28,7 +28,8 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::{
-    auth, db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState,
+    auth, config::Config, db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES,
+    state::AppState,
 };
 
 /// Authenticated identity injected into request extensions by auth middleware.
@@ -141,6 +142,144 @@ pub(crate) fn verify_signed_request(
     Ok(())
 }
 
+pub(crate) fn client_ip_for_rate_limit(
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    config: &Config,
+) -> String {
+    #[cfg(feature = "test-helpers")]
+    {
+        if let Some(value) = headers.get("x-test-client-ip").and_then(|v| v.to_str().ok()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    if is_trusted_proxy(peer_addr.ip(), &config.trusted_proxy_cidrs) {
+        if let Some(ip) = forwarded_client_ip(headers) {
+            return ip.to_string();
+        }
+    }
+
+    peer_addr.ip().to_string()
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    header_ip(headers, "cf-connecting-ip")
+        .or_else(|| header_ip(headers, "x-forwarded-for"))
+        .or_else(|| forwarded_header_ip(headers))
+}
+
+fn header_ip(headers: &HeaderMap, header_name: &'static str) -> Option<IpAddr> {
+    headers
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .and_then(parse_ip_candidate)
+}
+
+fn forwarded_header_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let value = headers.get("forwarded").and_then(|v| v.to_str().ok())?;
+    for element in value.split(',') {
+        for part in element.split(';') {
+            let Some((name, raw_value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("for") {
+                return parse_ip_candidate(raw_value);
+            }
+        }
+    }
+    None
+}
+
+fn parse_ip_candidate(raw: &str) -> Option<IpAddr> {
+    let candidate = raw.trim().trim_matches('"').trim();
+    if candidate.is_empty() || candidate.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+
+    if let Ok(ip) = candidate.parse::<IpAddr>() {
+        return Some(ip);
+    }
+
+    if let Some(rest) = candidate.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return rest[..end].parse::<IpAddr>().ok();
+    }
+
+    if let Some((host, _port)) = candidate.rsplit_once(':') {
+        if host.contains('.') {
+            return host.parse::<IpAddr>().ok();
+        }
+    }
+
+    None
+}
+
+fn is_trusted_proxy(peer_ip: IpAddr, trusted_proxy_cidrs: &[String]) -> bool {
+    trusted_proxy_cidrs.iter().any(|cidr| ip_in_cidr(peer_ip, cidr))
+}
+
+fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
+    let cidr = cidr.trim();
+    if cidr.is_empty() {
+        return false;
+    }
+
+    let Some((network, prefix)) = parse_cidr(cidr) else {
+        return false;
+    };
+
+    match (ip, network) {
+        (IpAddr::V4(ip), IpAddr::V4(network)) if prefix <= 32 => {
+            let mask = ipv4_prefix_mask(prefix);
+            (u32::from(ip) & mask) == (u32::from(network) & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(network)) if prefix <= 128 => {
+            let mask = ipv6_prefix_mask(prefix);
+            (u128::from(ip) & mask) == (u128::from(network) & mask)
+        }
+        _ => false,
+    }
+}
+
+fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (network, prefix) = match cidr.split_once('/') {
+        Some((network, prefix)) => {
+            let prefix = prefix.parse::<u8>().ok()?;
+            (network, prefix)
+        }
+        None => {
+            let ip = cidr.parse::<IpAddr>().ok()?;
+            let prefix = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            return Some((ip, prefix));
+        }
+    };
+    Some((network.parse::<IpAddr>().ok()?, prefix))
+}
+
+fn ipv4_prefix_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    }
+}
+
+fn ipv6_prefix_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix))
+    }
+}
+
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
     // Snapshot PUT accepts the full encrypted+base64 envelope (up to
@@ -182,6 +321,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{sync_id}/rekey/{device_id}", get(devices::get_rekey_artifact))
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
         .route("/v1/sync/{sync_id}/capabilities", get(gifs::get_capabilities))
+        .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade))
         // Registry routes (auth + signed)
         .merge(registry::routes())
         // Sharing routes (auth + signed)
@@ -198,12 +338,10 @@ pub fn router(state: AppState) -> Router {
 
     let authenticated_routes = authenticated_routes.merge(snapshot_put_route).merge(media_routes);
 
-    // Routes that do NOT require authentication
-    // (WebSocket does message-based auth after upgrade)
+    // Routes that do NOT require authentication.
     let public_routes = Router::new()
         .merge(register::routes())
         .merge(pairing::routes())
-        .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade))
         .route("/v1/gifs/trending", get(gifs::get_trending))
         .route("/v1/gifs/search", get(gifs::search_gifs))
         // Public sharing route (no auth, rate-limited by IP)
@@ -278,9 +416,25 @@ enum AuthResult {
 /// unauthenticated endpoint.
 async fn auth_middleware(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, Response> {
+    if req.method() == Method::GET
+        && req.uri().path().starts_with("/v1/sync/")
+        && req.uri().path().ends_with("/ws")
+    {
+        let client_ip = client_ip_for_rate_limit(req.headers(), peer_addr, &state.config);
+        let rate_key = format!("ws_upgrade:{client_ip}");
+        if !state.ws_upgrade_rate_limiter.check(
+            &rate_key,
+            state.config.ws_upgrade_rate_limit,
+            state.config.ws_upgrade_rate_window_secs,
+        ) {
+            return Err(AppError::TooManyRequests.into_response());
+        }
+    }
+
     let token = req
         .headers()
         .get("Authorization")

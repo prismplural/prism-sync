@@ -178,8 +178,9 @@ async fn register_first_device_with_ip(
     ip: &str,
 ) -> reqwest::Response {
     let signing_key = &test_keys.ed25519_signing_key;
+    let ml_dsa_key = test_keys.device_secret.ml_dsa_65_keypair(device_id).unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
-    let challenge_sig = sign_challenge(signing_key, sync_id, device_id, nonce);
+    let challenge_sig = sign_hybrid_challenge(signing_key, &ml_dsa_key, sync_id, device_id, nonce);
 
     let req = client
         .post(format!("{url}/v1/sync/{sync_id}/register"))
@@ -315,6 +316,9 @@ async fn test_registration_rejects_expired_nonce() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -439,6 +443,9 @@ async fn test_nonce_rate_limiting() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -562,7 +569,7 @@ async fn test_first_device_registration_rate_limiting() {
     let sync_id = generate_sync_id();
     let resp = client
         .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .header("X-Forwarded-For", ip)
+        .header("X-Test-Client-Ip", ip)
         .send()
         .await
         .unwrap();
@@ -587,6 +594,9 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -708,6 +718,9 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -880,6 +893,9 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -993,6 +1009,9 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -1344,6 +1363,9 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -1739,6 +1761,9 @@ async fn test_nonce_rate_limiting_window_expiry() {
         nonce_rate_window_secs: 1, // 1-second window
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -2808,6 +2833,9 @@ async fn test_revoke_rate_limiting() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 1,
         revoke_rate_window_secs: 3600,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -3829,6 +3857,9 @@ fn default_test_config() -> Config {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,

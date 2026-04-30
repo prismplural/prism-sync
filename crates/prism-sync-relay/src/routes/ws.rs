@@ -1,7 +1,7 @@
 use axum::{
     extract::{
-        ws::{CloseFrame, Message, WebSocket},
-        Path, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+        Extension, Path, State, WebSocketUpgrade,
     },
     response::IntoResponse,
 };
@@ -9,13 +9,11 @@ use futures::{SinkExt, StreamExt};
 
 use crate::{db, errors::AppError, state::AppState};
 
-/// Close code for failed auth.
-const CLOSE_AUTH_FAILED: u16 = 4001;
+use super::AuthIdentity;
+
 /// Close code for slow consumer.
 #[allow(dead_code)]
 const CLOSE_SLOW_CONSUMER: u16 = 4002;
-/// Auth timeout in seconds.
-const AUTH_TIMEOUT_SECS: u64 = 10;
 /// Ping interval in seconds.
 const PING_INTERVAL_SECS: u64 = 30;
 
@@ -25,58 +23,34 @@ const PING_INTERVAL_SECS: u64 = 30;
 
 pub async fn ws_upgrade(
     State(state): State<AppState>,
-    Path(sync_id): Path<String>,
+    Extension(auth): Extension<AuthIdentity>,
+    Path(path_sync_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
+    if path_sync_id != auth.sync_id {
+        return Err(AppError::Forbidden("sync_id mismatch"));
+    }
+
     tracing::debug!(
-        sync_id = %trunc(&sync_id),
+        sync_id = %trunc(&auth.sync_id),
+        device_id = %trunc(&auth.device_id),
         "WebSocket upgrade requested"
     );
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(state, sync_id, socket)))
+    Ok(ws.on_upgrade(move |socket| handle_ws(state, auth.sync_id, auth.device_id, socket)))
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket handler
 // ---------------------------------------------------------------------------
 
-async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
+async fn handle_ws(state: AppState, sync_id: String, device_id: String, socket: WebSocket) {
     let (mut ws_sink, mut ws_stream) = socket.split();
 
-    // Step 1: Wait for auth message with timeout
-    let auth_result =
-        tokio::time::timeout(std::time::Duration::from_secs(AUTH_TIMEOUT_SECS), async {
-            while let Some(Ok(msg)) = ws_stream.next().await {
-                match msg {
-                    Message::Text(text) => {
-                        return parse_and_validate_auth(&state, &sync_id, text.as_str()).await;
-                    }
-                    Message::Close(_) => return None,
-                    _ => continue,
-                }
-            }
-            None
-        })
-        .await;
-
-    let device_id = match auth_result {
-        Ok(Some(device_id)) => {
-            let ok_msg = serde_json::json!({"type": "auth_ok"}).to_string();
-            if ws_sink.send(Message::Text(ok_msg.into())).await.is_err() {
-                return;
-            }
-            device_id
-        }
-        _ => {
-            let _ = ws_sink
-                .send(Message::Close(Some(CloseFrame {
-                    code: CLOSE_AUTH_FAILED,
-                    reason: "Authentication failed".into(),
-                })))
-                .await;
-            return;
-        }
-    };
+    let ok_msg = serde_json::json!({"type": "auth_ok"}).to_string();
+    if ws_sink.send(Message::Text(ok_msg.into())).await.is_err() {
+        return;
+    }
 
     tracing::debug!(
         sync_id = %trunc(&sync_id),
@@ -84,7 +58,7 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
         "WebSocket authenticated"
     );
 
-    // Step 2: Register — last-connection-wins (old connection's channel is dropped)
+    // Step 1: Register — last-connection-wins (old connection's channel is dropped)
     let mut rx = state.register_ws(&sync_id, &device_id).await;
 
     // Ensure device receipt exists
@@ -98,7 +72,7 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
         .await;
     }
 
-    // Step 3: Forward notifications + keepalive pings to WS
+    // Step 2: Forward notifications + keepalive pings to WS
     let sid_send = sync_id.clone();
     let did_send = device_id.clone();
     let send_task = tokio::spawn(async move {
@@ -131,7 +105,7 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
         );
     });
 
-    // Step 4: Process incoming messages (ping/pong only — ack is HTTP-only)
+    // Step 3: Process incoming messages (ping/pong only — ack is HTTP-only)
     while let Some(Ok(msg)) = ws_stream.next().await {
         match msg {
             Message::Ping(_) | Message::Pong(_) => {}
@@ -140,7 +114,7 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
         }
     }
 
-    // Step 5: Cleanup
+    // Step 4: Cleanup
     state.unregister_ws(&sync_id, &device_id).await;
     send_task.abort();
 
@@ -149,66 +123,6 @@ async fn handle_ws(state: AppState, sync_id: String, socket: WebSocket) {
         device_id = %trunc(&device_id),
         "WebSocket disconnected"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Auth message parsing & validation
-// ---------------------------------------------------------------------------
-
-async fn parse_and_validate_auth(state: &AppState, sync_id: &str, text: &str) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_str(text).ok()?;
-
-    if json["type"].as_str()? != "auth" {
-        return None;
-    }
-
-    let device_id = json["device_id"].as_str()?.to_string();
-    let token = json["token"].as_str()?.to_string();
-
-    let expected_sync_id = sync_id.to_string();
-    let session_expiry = state.config.session_expiry_secs as i64;
-
-    // Phase 1 — Read (blocking): validate session + check device is active
-    let db_read = state.db.clone();
-    let expected_sid = expected_sync_id.clone();
-    let expected_did = device_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db_read.with_read_conn(|conn| {
-            let session = db::validate_session(conn, &token)?;
-            match session {
-                Some((sid, did)) if sid == expected_sid && did == expected_did => {
-                    // Also verify the device is still active (not revoked)
-                    let device = db::get_device(conn, &sid, &did)?;
-                    match device {
-                        Some(d) if d.status == "active" => Ok(Some(did)),
-                        _ => Ok(None),
-                    }
-                }
-                _ => Ok(None),
-            }
-        })
-    })
-    .await
-    .ok()?
-    .ok()?;
-
-    // Phase 2 — Write (fire-and-forget): touch session + device
-    if let Some(ref did) = result {
-        let db_write = state.db.clone();
-        let sid = expected_sync_id;
-        let did = did.clone();
-        tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                db_write.with_conn(|conn| {
-                    db::touch_session(conn, &sid, &did, session_expiry)?;
-                    db::touch_device(conn, &sid, &did)
-                })
-            })
-            .await;
-        });
-    }
-
-    result
 }
 
 // ---------------------------------------------------------------------------

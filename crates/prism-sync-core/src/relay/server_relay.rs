@@ -214,9 +214,30 @@ impl ServerRelay {
                 RelayError::Auth { message: format!("HTTP {status}: {body}") }
             }
             408 | 504 => RelayError::Timeout { message: format!("HTTP {status}: {body}") },
-            409 => RelayError::EpochRotation {
-                new_epoch: 0, // caller should parse from body
-            },
+            409 => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                    if json.get("error").and_then(|v| v.as_str())
+                        == Some("must_bootstrap_from_snapshot")
+                    {
+                        let since_seq = json.get("since_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let first_retained_seq =
+                            json.get("first_retained_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let message = json
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+                        return RelayError::MustBootstrapFromSnapshot {
+                            since_seq,
+                            first_retained_seq,
+                            message,
+                        };
+                    }
+                }
+                RelayError::EpochRotation {
+                    new_epoch: 0, // caller should parse from body
+                }
+            }
             413 => RelayError::Server {
                 status_code: status,
                 message: format!("Payload too large: {body}"),
@@ -1134,6 +1155,23 @@ mod tests {
         let err = ServerRelay::classify_error(401, r#"{"error":"something_else"}"#);
 
         assert!(matches!(err, RelayError::Auth { .. }));
+    }
+
+    #[test]
+    fn classify_error_parses_must_bootstrap_from_snapshot_response() {
+        let err = ServerRelay::classify_error(
+            409,
+            r#"{"error":"must_bootstrap_from_snapshot","message":"bootstrap","since_seq":2,"first_retained_seq":5}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::MustBootstrapFromSnapshot {
+                since_seq: 2,
+                first_retained_seq: 5,
+                ref message,
+            } if message == "bootstrap"
+        ));
     }
 
     #[test]

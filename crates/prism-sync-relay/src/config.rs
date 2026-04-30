@@ -50,6 +50,12 @@ pub struct Config {
     pub revoke_rate_limit: u32,
     /// Sliding window duration in seconds for revoke rate limiting.
     pub revoke_rate_window_secs: u64,
+    /// Max WebSocket upgrade attempts per client IP within ws_upgrade_rate_window_secs.
+    pub ws_upgrade_rate_limit: u32,
+    /// Sliding window duration in seconds for WebSocket upgrade rate limiting.
+    pub ws_upgrade_rate_window_secs: u64,
+    /// Reverse proxy CIDR ranges whose forwarded client IP headers are trusted.
+    pub trusted_proxy_cidrs: Vec<String>,
     /// Max allowed absolute clock skew for signed requests.
     pub signed_request_max_skew_secs: i64,
     /// Replay window (seconds) for signed request nonces.
@@ -164,6 +170,9 @@ impl std::fmt::Debug for Config {
             .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
             .field("registration_enabled", &self.registration_enabled)
             .field("metrics_token", &self.metrics_token.as_ref().map(|_| "[REDACTED]"))
+            .field("ws_upgrade_rate_limit", &self.ws_upgrade_rate_limit)
+            .field("ws_upgrade_rate_window_secs", &self.ws_upgrade_rate_window_secs)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .field("gif_provider_mode", &self.gif_provider_mode)
             .field("gif_public_base_url", &self.gif_public_base_url)
             .field("gif_prism_base_url", &self.gif_prism_base_url)
@@ -216,6 +225,13 @@ impl Config {
             nonce_rate_window_secs: parse_env_with(&env, "NONCE_RATE_WINDOW_SECS", 60),
             revoke_rate_limit: parse_env_with(&env, "REVOKE_RATE_LIMIT", 2),
             revoke_rate_window_secs: parse_env_with(&env, "REVOKE_RATE_WINDOW_SECS", 3600),
+            ws_upgrade_rate_limit: parse_env_with(&env, "WS_UPGRADE_RATE_LIMIT", 20),
+            ws_upgrade_rate_window_secs: parse_env_with(&env, "WS_UPGRADE_RATE_WINDOW_SECS", 60),
+            trusted_proxy_cidrs: parse_string_list_env_with(
+                &env,
+                "TRUSTED_PROXY_CIDRS",
+                Vec::new(),
+            ),
             signed_request_max_skew_secs: parse_env_with(&env, "SIGNED_REQUEST_MAX_SKEW_SECS", 60),
             signed_request_nonce_window_secs: parse_env_with(
                 &env,
@@ -474,6 +490,25 @@ where
     env(key)
         .filter(|value| !value.trim().is_empty())
         .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or(default)
+}
+
+fn parse_string_list_env_with<F>(env: &F, key: &str, default: Vec<String>) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env(key)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            serde_json::from_str::<Vec<String>>(&value).unwrap_or_else(|_| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+        })
         .unwrap_or(default)
 }
 

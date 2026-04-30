@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::HeaderMap,
     response::IntoResponse,
     routing::{get, post},
@@ -8,6 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use crate::{
     apple_attestation,
@@ -16,6 +17,8 @@ use crate::{
     errors::AppError,
     state::AppState,
 };
+
+use super::client_ip_for_rate_limit;
 
 const POW_ALGORITHM: &str = "sha256_leading_zero_bits";
 
@@ -51,6 +54,7 @@ struct PowSolution {
 async fn get_register_nonce(
     State(state): State<AppState>,
     Path(sync_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     check_registration_access(&state, &headers)?;
@@ -77,16 +81,15 @@ async fn get_register_nonce(
     }
 
     if is_first_device {
-        if let Some(client_ip) = client_ip_key(&headers) {
-            let limiter = &state.first_device_nonce_rate_limiter;
-            let keys = ["global", client_ip.as_str()];
-            if !limiter.check_many(
-                &keys,
-                state.config.first_device_nonce_rate_limit(),
-                state.config.first_device_nonce_rate_window_secs(),
-            ) {
-                return Err(AppError::TooManyRequests);
-            }
+        let client_ip = client_ip_for_rate_limit(&headers, peer_addr, &state.config);
+        let limiter = &state.first_device_nonce_rate_limiter;
+        let keys = ["global", client_ip.as_str()];
+        if !limiter.check_many(
+            &keys,
+            state.config.first_device_nonce_rate_limit(),
+            state.config.first_device_nonce_rate_window_secs(),
+        ) {
+            return Err(AppError::TooManyRequests);
         }
     }
 
@@ -195,6 +198,7 @@ struct RegisterResponse {
 async fn register_device(
     State(state): State<AppState>,
     Path(sync_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::Json(body): axum::Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -293,7 +297,7 @@ async fn register_device(
     let first_device_admission_proof = body.first_device_admission_proof.clone();
     let registry_approval = body.registry_approval.clone();
     let first_device_pow_difficulty_bits = state.config.first_device_pow_difficulty_bits;
-    let client_ip = client_ip_key(&headers);
+    let client_ip = client_ip_for_rate_limit(&headers, peer_addr, &state.config);
     let first_device_registration_rate_limit = state.config.first_device_registration_rate_limit();
     let first_device_registration_rate_window_secs =
         state.config.first_device_registration_rate_window_secs();
@@ -390,7 +394,7 @@ fn do_register(
     first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
     first_device_pow_difficulty_bits: u8,
     session_expiry: i64,
-    client_ip: Option<String>,
+    client_ip: String,
     config: &crate::config::Config,
     first_device_registration_limiter: crate::state::RateLimiter,
     first_device_registration_rate_limit: u32,
@@ -417,22 +421,20 @@ fn do_register(
         .is_none();
 
     if is_first_device {
-        if let Some(client_ip) = client_ip.as_deref() {
-            let rate_keys = ["global", client_ip];
-            if !first_device_registration_limiter.check_many(
-                &rate_keys,
-                first_device_registration_rate_limit,
-                first_device_registration_rate_window_secs,
-            ) {
-                return Err(AppError::TooManyRequests);
-            }
-            if !first_device_group_limiter.check_many(
-                &rate_keys,
-                first_device_group_rate_limit,
-                first_device_group_rate_window_secs,
-            ) {
-                return Err(AppError::TooManyRequests);
-            }
+        let rate_keys = ["global", client_ip.as_str()];
+        if !first_device_registration_limiter.check_many(
+            &rate_keys,
+            first_device_registration_rate_limit,
+            first_device_registration_rate_window_secs,
+        ) {
+            return Err(AppError::TooManyRequests);
+        }
+        if !first_device_group_limiter.check_many(
+            &rate_keys,
+            first_device_group_rate_limit,
+            first_device_group_rate_window_secs,
+        ) {
+            return Err(AppError::TooManyRequests);
         }
 
         let platform_proof_valid = match first_device_admission_proof.as_ref() {
@@ -656,31 +658,6 @@ fn has_leading_zero_bits(hash: &[u8], difficulty_bits: u8) -> bool {
 
     let mask = 0xFFu8 << (8 - remaining_bits);
     hash.get(full_zero_bytes).map(|byte| byte & mask == 0).unwrap_or(false)
-}
-
-fn client_ip_key(headers: &HeaderMap) -> Option<String> {
-    for header_name in [
-        #[cfg(feature = "test-helpers")]
-        "x-test-client-ip",
-        "cf-connecting-ip",
-        "x-forwarded-for",
-        "x-real-ip",
-        "forwarded",
-    ] {
-        if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
-            let candidate = if header_name == "forwarded" {
-                value.split(';').find_map(|part| part.trim().strip_prefix("for=")).unwrap_or(value)
-            } else {
-                value.split(',').next().unwrap_or(value)
-            };
-            let trimmed = candidate.trim().trim_matches('"');
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 #[allow(clippy::too_many_arguments)]
