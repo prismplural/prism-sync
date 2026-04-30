@@ -37,6 +37,7 @@ getrandom = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+prism-sync-crypto = { workspace = true, features = ["legacy-hybrid-v2"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 criterion = { workspace = true }
 proptest = "1"

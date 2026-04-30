@@ -155,11 +155,8 @@ pub(crate) fn xchacha_encrypt_with_nonce(
 
 /// Wrap with a specific nonce (for cross-language test vectors).
 /// In production, always use `secretbox_wrap` which generates a random nonce.
-pub fn secretbox_wrap_with_nonce(
-    mek: &[u8],
-    plaintext: &[u8],
-    nonce: &[u8; 24],
-) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn secretbox_wrap_with_nonce(mek: &[u8], plaintext: &[u8], nonce: &[u8; 24]) -> Result<Vec<u8>> {
     let cipher = XSalsa20Poly1305::new_from_slice(mek)
         .map_err(|e| CryptoError::InvalidKeyMaterial(format!("invalid MEK: {e}")))?;
     let xnonce = crypto_secretbox::Nonce::from_slice(nonce);
@@ -293,6 +290,23 @@ mod tests {
         let wrapped = secretbox_wrap(&mek, &dek).unwrap();
         let unwrapped = secretbox_unwrap(&mek, &wrapped).unwrap();
         assert_eq!(unwrapped, dek);
+    }
+
+    #[test]
+    fn secretbox_known_nonce_matches_dart_vector() {
+        let key =
+            crate::hex::decode("db84a725d43098af93af9ed0caab6816d78e717dcd0081b1f124017fa942ba1c")
+                .unwrap();
+        let nonce = [0x03u8; 24];
+        let plaintext = [0x42u8; 32];
+        let expected_ciphertext = crate::hex::decode(
+            "53364972b9eff1856cb2aa5459cc9666e8cc05a9bae7f2801434e9db9d9c76a7e00e8bc926bd1d02fba122016349627e"
+        ).unwrap();
+
+        let blob = secretbox_wrap_with_nonce(&key, &plaintext, &nonce).unwrap();
+
+        assert_eq!(&blob[..24], &nonce);
+        assert_eq!(&blob[24..], expected_ciphertext.as_slice());
     }
 
     #[test]

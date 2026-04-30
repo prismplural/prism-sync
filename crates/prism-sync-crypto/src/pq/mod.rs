@@ -27,6 +27,9 @@ const PRISM_LABEL: &[u8] = b"PrismHybridSig-v3";
 /// The context must be <= 255 bytes.
 pub fn build_hybrid_message_representative(context: &[u8], message: &[u8]) -> Result<Vec<u8>> {
     use sha2::{Digest, Sha512};
+    if context.is_empty() {
+        return Err(CryptoError::InvalidKeyMaterial("context must not be empty".into()));
+    }
     if context.len() > 255 {
         return Err(CryptoError::InvalidKeyMaterial(format!(
             "context must be <= 255 bytes, got {}",
@@ -65,6 +68,7 @@ pub struct HybridSignature {
 impl HybridSignature {
     /// Sign `message` with both an Ed25519 key and an ML-DSA-65 key.
     /// Accepts any ML-DSA-65 signer (both `SigningKey` and `ExpandedSigningKey`).
+    #[cfg(any(test, feature = "legacy-hybrid-v2"))]
     pub fn sign(
         message: &[u8],
         ed25519_sk: &ed25519_dalek::SigningKey,
@@ -85,7 +89,17 @@ impl HybridSignature {
     /// Both the Ed25519 and ML-DSA-65 signatures are checked. To avoid
     /// leaking which signature failed via timing or outward errors, both are
     /// always evaluated before returning a generic verification error.
+    #[cfg(any(test, feature = "legacy-hybrid-v2"))]
     pub fn verify(&self, message: &[u8], ed25519_pk: &[u8; 32], ml_dsa_pk: &[u8]) -> Result<()> {
+        self.verify_components(message, ed25519_pk, ml_dsa_pk)
+    }
+
+    fn verify_components(
+        &self,
+        message: &[u8],
+        ed25519_pk: &[u8; 32],
+        ml_dsa_pk: &[u8],
+    ) -> Result<()> {
         // Verify Ed25519
         let ed_result = (|| -> std::result::Result<(), ()> {
             let vk = ed25519_dalek::VerifyingKey::from_bytes(ed25519_pk).map_err(|_| ())?;
@@ -164,7 +178,7 @@ impl HybridSignature {
         ml_dsa_pk: &[u8],
     ) -> Result<()> {
         let m_prime = build_hybrid_message_representative(context, message)?;
-        self.verify(&m_prime, ed25519_pk, ml_dsa_pk)
+        self.verify_components(&m_prime, ed25519_pk, ml_dsa_pk)
     }
 
     /// Return the byte length of the hybrid signature encoded at the start of
@@ -558,11 +572,25 @@ mod tests {
     }
 
     #[test]
+    fn empty_context_returns_error() {
+        let result = build_hybrid_message_representative(b"", b"test message");
+        assert!(result.is_err(), "empty context should return Err");
+    }
+
+    #[test]
     fn sign_v3_oversize_context_returns_error() {
         let ed_sk = ed25519_keypair();
         let ml_sk = ml_dsa_keypair();
         let big_context = vec![0x42u8; 256];
         let result = HybridSignature::sign_v3(b"msg", &big_context, &ed_sk, &ml_sk);
         assert!(result.is_err(), "sign_v3 with oversize context should return Err");
+    }
+
+    #[test]
+    fn sign_v3_empty_context_returns_error() {
+        let ed_sk = ed25519_keypair();
+        let ml_sk = ml_dsa_keypair();
+        let result = HybridSignature::sign_v3(b"msg", b"", &ed_sk, &ml_sk);
+        assert!(result.is_err(), "sign_v3 with empty context should return Err");
     }
 }
