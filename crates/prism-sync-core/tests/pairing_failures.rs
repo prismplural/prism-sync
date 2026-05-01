@@ -22,7 +22,7 @@ use prism_sync_core::pairing::models::{
 use prism_sync_core::pairing::service::{cleanup_failed_setup, PairingService};
 use prism_sync_core::relay::{MockRelay, SyncRelay};
 use prism_sync_core::secure_store::SecureStore;
-use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use prism_sync_crypto::DeviceSecret;
 
 use common::MemorySecureStore;
@@ -183,9 +183,11 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         0,
         &[],
     );
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"invitation", &signing_data)
-            .expect("hardcoded invitation context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::INVITATION,
+        &signing_data,
+    )
+    .expect("hardcoded invitation context should be <= 255 bytes");
     let hybrid_invitation = HybridSignature {
         ed25519_sig: ed_signing_key_a.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: pq_signing_key_a.sign(&m_prime),
@@ -253,7 +255,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     hybrid_sig
         .verify_v3(
             &verify_signing_data,
-            b"invitation",
+            hybrid_signature_contexts::INVITATION,
             &signing_key_a.public_key_bytes(),
             &pq_signing_key_a.public_key_bytes(),
         )
@@ -347,9 +349,11 @@ async fn join_from_approval_roundtrip() {
         0,
         &[],
     );
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"invitation", &signing_data)
-            .expect("hardcoded invitation context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::INVITATION,
+        &signing_data,
+    )
+    .expect("hardcoded invitation context should be <= 255 bytes");
     let hybrid_invitation = HybridSignature {
         ed25519_sig: ed_signing_key_a.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: pq_signing_key_a.sign(&m_prime),

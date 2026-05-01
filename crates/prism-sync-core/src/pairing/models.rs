@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -578,9 +578,11 @@ impl SignedRegistrySnapshot {
         pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     ) -> Vec<u8> {
         let data = self.signing_data_v3();
-        let m_prime =
-            prism_sync_crypto::pq::build_hybrid_message_representative(b"registry_snapshot", &data)
-                .expect("hardcoded registry snapshot context should be <= 255 bytes");
+        let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            hybrid_signature_contexts::REGISTRY_SNAPSHOT,
+            &data,
+        )
+        .expect("hardcoded registry snapshot context should be <= 255 bytes");
         let hybrid_sig = HybridSignature {
             ed25519_sig: signing_key.sign(&m_prime),
             ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
@@ -659,7 +661,12 @@ impl SignedRegistrySnapshot {
         signing_data.extend_from_slice(json_bytes);
 
         signature
-            .verify_v3(&signing_data, b"registry_snapshot", expected_ed25519_pk, expected_ml_dsa_pk)
+            .verify_v3(
+                &signing_data,
+                hybrid_signature_contexts::REGISTRY_SNAPSHOT,
+                expected_ed25519_pk,
+                expected_ml_dsa_pk,
+            )
             .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
 
         #[derive(serde::Deserialize)]

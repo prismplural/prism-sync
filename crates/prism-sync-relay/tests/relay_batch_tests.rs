@@ -11,6 +11,7 @@ mod common;
 
 use base64::Engine;
 use ed25519_dalek::Signer;
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 use prism_sync_relay::db;
 use reqwest::Client;
 use serde_json::Value;
@@ -95,9 +96,11 @@ fn apply_signed_headers_with_nonce(
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
         method, path, sync_id, device_id, body, timestamp, nonce,
     );
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
-            .expect("hardcoded http request context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::HTTP_REQUEST,
+        &signing_data,
+    )
+    .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: keys.ed25519_signing_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),

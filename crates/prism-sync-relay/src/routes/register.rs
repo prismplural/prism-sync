@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use prism_sync_crypto::pq::hybrid_signature_contexts;
+
 use crate::{
     apple_attestation,
     attestation::{self, FirstDeviceAdmissionKind},
@@ -701,7 +703,12 @@ fn verify_registry_approval(
     write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
     write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
     hybrid_sig
-        .verify_v3(&approval_data, b"registry_approval", &approver_pk_bytes, &approver_ml_dsa_pk)
+        .verify_v3(
+            &approval_data,
+            hybrid_signature_contexts::REGISTRY_APPROVAL,
+            &approver_pk_bytes,
+            &approver_ml_dsa_pk,
+        )
         .map_err(|_| AppError::Unauthorized)?;
 
     let snapshot_entries = verify_registry_snapshot(
@@ -843,7 +850,12 @@ fn verify_registry_snapshot_hybrid(
         return Err(AppError::Unauthorized);
     }
     signature
-        .verify_v3(&signing_data, b"registry_snapshot", approver_ed25519_pk, approver_ml_dsa_pk)
+        .verify_v3(
+            &signing_data,
+            hybrid_signature_contexts::REGISTRY_SNAPSHOT,
+            approver_ed25519_pk,
+            approver_ml_dsa_pk,
+        )
         .map_err(|_| AppError::Unauthorized)?;
 
     // V3 wire format uses a wrapper object: { "registry_version": i64, "entries": [...] }

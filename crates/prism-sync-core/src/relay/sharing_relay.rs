@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 use rand::RngCore;
 use reqwest::Client;
 use serde::Deserialize;
@@ -168,7 +169,7 @@ impl ServerSharingRelay {
 
         // V3 hybrid signature: Ed25519 + ML-DSA-65 with labeled WNS
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"http_request",
+            hybrid_signature_contexts::HTTP_REQUEST,
             &signing_data,
         )
         .expect("hardcoded http request context should be <= 255 bytes");

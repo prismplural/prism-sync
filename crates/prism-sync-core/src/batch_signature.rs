@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use prism_sync_crypto::DevicePqSigningKey;
 
 use crate::error::{CoreError, Result};
@@ -148,7 +148,7 @@ pub fn sign_batch(
 
     let hybrid_sig = HybridSignature::sign_v3(
         &canonical,
-        b"sync_batch",
+        hybrid_signature_contexts::SYNC_BATCH,
         signing_key,
         ml_dsa_signing_key.as_signing_key(),
     )
@@ -195,9 +195,16 @@ pub fn verify_batch_signature(
     let hybrid_sig = HybridSignature::from_bytes(&envelope.signature)
         .map_err(|e| CoreError::Serialization(format!("hybrid signature: {e}")))?;
 
-    hybrid_sig.verify_v3(&canonical, b"sync_batch", sender_ed25519_pk, sender_ml_dsa_pk).map_err(
-        |_| CoreError::Storage(StorageError::Logic("Batch signature verification failed".into())),
-    )?;
+    hybrid_sig
+        .verify_v3(
+            &canonical,
+            hybrid_signature_contexts::SYNC_BATCH,
+            sender_ed25519_pk,
+            sender_ml_dsa_pk,
+        )
+        .map_err(|_| {
+            CoreError::Storage(StorageError::Logic("Batch signature verification failed".into()))
+        })?;
 
     Ok(())
 }

@@ -22,6 +22,7 @@ use crate::relay::traits::{
 };
 use crate::relay::SyncRelay;
 use crate::secure_store::SecureStore;
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 use prism_sync_crypto::{mnemonic, DeviceSecret, KeyHierarchy};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
@@ -149,7 +150,7 @@ impl PairingService {
             &[],
         );
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"invitation",
+            hybrid_signature_contexts::INVITATION,
             &signing_data,
         )
         .expect("hardcoded invitation context should be <= 255 bytes");
@@ -781,7 +782,7 @@ impl PairingService {
         let approval_data =
             build_registry_approval_signing_data_v2(&sync_id, &device_id, &signed_keyring);
         let m_prime_approval = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"registry_approval",
+            hybrid_signature_contexts::REGISTRY_APPROVAL,
             &approval_data,
         )
         .expect("hardcoded registry approval context should be <= 255 bytes");
@@ -1179,7 +1180,12 @@ fn verify_hybrid_invitation(
         .map_err(|e| CoreError::Engine(format!("invitation hybrid signature invalid: {e}")))?;
     match version {
         0x03 => hybrid_sig
-            .verify_v3(signing_data, b"invitation", inviter_ed25519_pk, inviter_ml_dsa_65_pk)
+            .verify_v3(
+                signing_data,
+                hybrid_signature_contexts::INVITATION,
+                inviter_ed25519_pk,
+                inviter_ml_dsa_65_pk,
+            )
             .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?,
         _ => {
             return Err(CoreError::Engine(format!(
@@ -1211,7 +1217,7 @@ fn build_hybrid_challenge_signature(
     write_len_prefixed(&mut challenge_data, nonce.as_bytes());
 
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"device_challenge",
+        hybrid_signature_contexts::DEVICE_CHALLENGE,
         &challenge_data,
     )
     .expect("hardcoded device challenge context should be <= 255 bytes");

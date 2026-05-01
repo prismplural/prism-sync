@@ -1,6 +1,6 @@
 #[cfg(test)]
 use ed25519_dalek::{Signature, VerifyingKey};
-use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -102,7 +102,9 @@ pub(crate) fn verify_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    signature.verify_v3(&data, b"device_challenge", &pk_bytes, ml_dsa_public_key).is_ok()
+    signature
+        .verify_v3(&data, hybrid_signature_contexts::DEVICE_CHALLENGE, &pk_bytes, ml_dsa_public_key)
+        .is_ok()
 }
 
 /// Validate that a sync ID is a 64-char hex string (32 bytes).
@@ -229,7 +231,14 @@ pub(crate) fn verify_hybrid_request_signature(
         return false;
     };
 
-    signature.verify_v3(signing_data, b"http_request", &pk_bytes, ml_dsa_public_key).is_ok()
+    signature
+        .verify_v3(
+            signing_data,
+            hybrid_signature_contexts::HTTP_REQUEST,
+            &pk_bytes,
+            ml_dsa_public_key,
+        )
+        .is_ok()
 }
 
 /// Write a length-prefixed field: `(data.len() as u32).to_be_bytes() || data`.
@@ -471,8 +480,11 @@ mod tests {
         write_len_prefixed(&mut data, device_id.as_bytes());
         write_len_prefixed(&mut data, nonce.as_bytes());
 
-        let (versioned_sig, ed_pk, ml_pk) =
-            make_versioned_hybrid_signature_v3(&data, b"device_challenge", device_id);
+        let (versioned_sig, ed_pk, ml_pk) = make_versioned_hybrid_signature_v3(
+            &data,
+            hybrid_signature_contexts::DEVICE_CHALLENGE,
+            device_id,
+        );
 
         assert!(verify_hybrid_challenge(
             &ed_pk,
@@ -505,8 +517,11 @@ mod tests {
             "nonce-1",
         );
 
-        let (versioned_sig, ed_pk, ml_pk) =
-            make_versioned_hybrid_signature_v3(&data, b"http_request", device_id);
+        let (versioned_sig, ed_pk, ml_pk) = make_versioned_hybrid_signature_v3(
+            &data,
+            hybrid_signature_contexts::HTTP_REQUEST,
+            device_id,
+        );
         assert!(verify_hybrid_request_signature(&ed_pk, &ml_pk, &data, &versioned_sig,));
     }
 

@@ -8,6 +8,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::Stream;
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 use rand::RngCore;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
@@ -130,7 +131,7 @@ impl ServerRelay {
 
         // V3 hybrid signature: Ed25519 + ML-DSA-65 with labeled WNS
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"http_request",
+            hybrid_signature_contexts::HTTP_REQUEST,
             &signing_data,
         )
         .expect("hardcoded http request context should be <= 255 bytes");

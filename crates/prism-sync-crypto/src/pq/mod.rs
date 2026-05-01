@@ -20,6 +20,55 @@ const COMPOSITE_PREFIX: &[u8] = b"CompositeAlgorithmSignatures2025";
 /// Prism-specific label (not an X.509 OID, but follows the draft pattern).
 const PRISM_LABEL: &[u8] = b"PrismHybridSig-v3";
 
+/// Registered context strings for Prism hybrid signature V3.
+///
+/// These byte strings are part of the signed wire format. Keep using the
+/// byte-slice APIs on [`HybridSignature::sign_v3`] and
+/// [`HybridSignature::verify_v3`] for compatibility, but production callers
+/// should pass these constants rather than ad hoc literals.
+pub mod hybrid_signature_contexts {
+    /// Sync batch envelope signatures.
+    pub const SYNC_BATCH: &[u8] = b"sync_batch";
+    /// Signed registry snapshot artifacts.
+    pub const REGISTRY_SNAPSHOT: &[u8] = b"registry_snapshot";
+    /// Authenticated HTTP request headers.
+    pub const HTTP_REQUEST: &[u8] = b"http_request";
+    /// Remote sharing identity bundles.
+    pub const SHARING_IDENTITY_BUNDLE: &[u8] = b"sharing_identity_bundle";
+    /// Remote sharing signed prekey bundles.
+    pub const SIGNED_PREKEY_BUNDLE: &[u8] = b"signed_prekey_bundle";
+    /// Pairing invitation signatures.
+    pub const INVITATION: &[u8] = b"invitation";
+    /// Registry approval signatures for device admission.
+    pub const REGISTRY_APPROVAL: &[u8] = b"registry_approval";
+    /// Relay registration device challenge signatures.
+    pub const DEVICE_CHALLENGE: &[u8] = b"device_challenge";
+    /// ML-DSA key rotation continuity proofs.
+    pub const ML_DSA_ROTATION: &[u8] = b"ml_dsa_rotation";
+
+    /// Legacy signed-prekey context used by `pq::models::SignedPrekey`.
+    ///
+    /// This is intentionally kept byte-for-byte because existing signed
+    /// prekeys verify under this context. It is prefix-confusing with
+    /// `SIGNED_PREKEY_BUNDLE`, so tests pin that as the only allowed legacy
+    /// exception.
+    pub const SIGNED_PREKEY: &[u8] = b"signed_prekey";
+
+    /// Registered production contexts.
+    pub const REGISTERED: &[(&str, &[u8])] = &[
+        ("sync_batch", SYNC_BATCH),
+        ("registry_snapshot", REGISTRY_SNAPSHOT),
+        ("http_request", HTTP_REQUEST),
+        ("sharing_identity_bundle", SHARING_IDENTITY_BUNDLE),
+        ("signed_prekey", SIGNED_PREKEY),
+        ("signed_prekey_bundle", SIGNED_PREKEY_BUNDLE),
+        ("invitation", INVITATION),
+        ("registry_approval", REGISTRY_APPROVAL),
+        ("device_challenge", DEVICE_CHALLENGE),
+        ("ml_dsa_rotation", ML_DSA_ROTATION),
+    ];
+}
+
 /// Build the labeled message representative per IETF composite-sigs-15 pattern.
 ///
 /// M' = Prefix || Label || u8(context.len()) || context || SHA-512(message)
@@ -592,5 +641,57 @@ mod tests {
         let ml_sk = ml_dsa_keypair();
         let result = HybridSignature::sign_v3(b"msg", b"", &ed_sk, &ml_sk);
         assert!(result.is_err(), "sign_v3 with empty context should return Err");
+    }
+
+    #[test]
+    fn registered_v3_contexts_are_non_empty_and_unique() {
+        let contexts = hybrid_signature_contexts::REGISTERED;
+
+        for (name, context) in contexts {
+            assert!(!context.is_empty(), "{name} context must not be empty");
+            assert!(context.len() <= 255, "{name} context must fit V3 u8 length prefix");
+        }
+
+        for (idx, (left_name, left)) in contexts.iter().enumerate() {
+            for (right_name, right) in contexts.iter().skip(idx + 1) {
+                assert_ne!(left, right, "{left_name} and {right_name} contexts duplicate");
+            }
+        }
+    }
+
+    #[test]
+    fn registered_v3_contexts_are_prefix_safe_except_legacy_signed_prekey() {
+        let contexts = hybrid_signature_contexts::REGISTERED;
+        let mut collisions = Vec::new();
+
+        for (idx, (left_name, left)) in contexts.iter().enumerate() {
+            for (right_name, right) in contexts.iter().skip(idx + 1) {
+                if left.starts_with(right) || right.starts_with(left) {
+                    collisions.push((*left_name, *right_name));
+                }
+            }
+        }
+
+        assert_eq!(collisions, vec![("signed_prekey", "signed_prekey_bundle")]);
+    }
+
+    #[test]
+    fn registered_v3_context_bytes_are_pinned() {
+        assert_eq!(hybrid_signature_contexts::SYNC_BATCH, b"sync_batch");
+        assert_eq!(hybrid_signature_contexts::REGISTRY_SNAPSHOT, b"registry_snapshot");
+        assert_eq!(hybrid_signature_contexts::HTTP_REQUEST, b"http_request");
+        assert_eq!(
+            hybrid_signature_contexts::SHARING_IDENTITY_BUNDLE,
+            b"sharing_identity_bundle"
+        );
+        assert_eq!(hybrid_signature_contexts::SIGNED_PREKEY, b"signed_prekey");
+        assert_eq!(
+            hybrid_signature_contexts::SIGNED_PREKEY_BUNDLE,
+            b"signed_prekey_bundle"
+        );
+        assert_eq!(hybrid_signature_contexts::INVITATION, b"invitation");
+        assert_eq!(hybrid_signature_contexts::REGISTRY_APPROVAL, b"registry_approval");
+        assert_eq!(hybrid_signature_contexts::DEVICE_CHALLENGE, b"device_challenge");
+        assert_eq!(hybrid_signature_contexts::ML_DSA_ROTATION, b"ml_dsa_rotation");
     }
 }

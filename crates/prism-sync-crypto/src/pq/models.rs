@@ -1,4 +1,4 @@
-use super::HybridSignature;
+use super::{hybrid_signature_contexts, HybridSignature};
 use crate::error::{CryptoError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,6 @@ const ML_KEM_768_EK_LEN: usize = 1184;
 
 /// Domain separator for canonical signed prekey encoding.
 const SIGNED_PREKEY_CONTEXT: &[u8] = b"PRISM_SIGNED_PREKEY_V1\0";
-const SIGNED_PREKEY_SIGNATURE_CONTEXT: &[u8] = b"signed_prekey";
 
 /// Protocol version for key bundles and bootstrap messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +125,7 @@ impl SignedPrekey {
         let message = prekey.canonical_bytes()?;
         let signature = HybridSignature::sign_v3(
             &message,
-            SIGNED_PREKEY_SIGNATURE_CONTEXT,
+            hybrid_signature_contexts::SIGNED_PREKEY,
             ed25519_sk,
             ml_dsa_sk,
         )?;
@@ -172,7 +171,12 @@ impl SignedPrekey {
         let signature_bytes = crate::hex::decode(&self.signature)?;
         let signature = HybridSignature::from_bytes(&signature_bytes)?;
         let message = self.canonical_bytes()?;
-        signature.verify_v3(&message, SIGNED_PREKEY_SIGNATURE_CONTEXT, ed25519_pk, ml_dsa_pk)
+        signature.verify_v3(
+            &message,
+            hybrid_signature_contexts::SIGNED_PREKEY,
+            ed25519_pk,
+            ml_dsa_pk,
+        )
     }
 }
 

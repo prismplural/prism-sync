@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::HybridSignature;
+use super::{hybrid_signature_contexts, HybridSignature};
 use crate::device_identity::{DevicePqSigningKey, DeviceSecret};
 use crate::error::{CryptoError, Result};
 
@@ -33,7 +33,7 @@ pub struct MlDsaContinuityProof {
     pub timestamp: i64,
     /// The new ML-DSA-65 public key (raw bytes).
     pub new_ml_dsa_pk: Vec<u8>,
-    /// HybridSignature::sign_v3(proof_message, "ml_dsa_rotation", ed25519_sk, old_ml_dsa_sk)
+    /// HybridSignature::sign_v3(proof_message, ML_DSA_ROTATION, ed25519_sk, old_ml_dsa_sk)
     pub old_signs_new: Vec<u8>,
     /// ML-DSA.sign(proof_message_reverse, new_ml_dsa_sk)
     pub new_signs_old: Vec<u8>,
@@ -99,12 +99,12 @@ impl MlDsaContinuityProof {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // Old signs new: hybrid V3 signature with context "ml_dsa_rotation"
+        // Old signs new: hybrid V3 signature with the ML-DSA rotation context.
         let msg_old_signs_new =
             Self::proof_message(device_id, old_generation, new_generation, timestamp, &new_pk);
         let hybrid_sig = HybridSignature::sign_v3(
             &msg_old_signs_new,
-            b"ml_dsa_rotation",
+            hybrid_signature_contexts::ML_DSA_ROTATION,
             &ed25519.into_signing_key(),
             old_ml_dsa.as_signing_key(),
         )?;
@@ -152,7 +152,7 @@ impl MlDsaContinuityProof {
             )));
         }
 
-        // Verify old-signs-new (hybrid V3 with context "ml_dsa_rotation")
+        // Verify old-signs-new (hybrid V3 with the ML-DSA rotation context).
         let msg_old_signs_new = Self::proof_message(
             &self.device_id,
             self.old_generation,
@@ -161,7 +161,12 @@ impl MlDsaContinuityProof {
             &self.new_ml_dsa_pk,
         );
         let hybrid_sig = HybridSignature::from_bytes(&self.old_signs_new)?;
-        hybrid_sig.verify_v3(&msg_old_signs_new, b"ml_dsa_rotation", ed25519_pk, old_ml_dsa_pk)?;
+        hybrid_sig.verify_v3(
+            &msg_old_signs_new,
+            hybrid_signature_contexts::ML_DSA_ROTATION,
+            ed25519_pk,
+            old_ml_dsa_pk,
+        )?;
 
         // Verify new-signs-old (ML-DSA only)
         let msg_new_signs_old = Self::proof_message(

@@ -15,6 +15,7 @@ use prism_sync_core::{
     pairing::models::{compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot},
     relay::traits::RegistryApproval,
 };
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 use prism_sync_crypto::{DeviceSecret, KeyHierarchy};
 use prism_sync_relay::{
     config::Config,
@@ -175,9 +176,11 @@ pub fn sign_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"device_challenge", &data)
-            .expect("hardcoded device challenge context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::DEVICE_CHALLENGE,
+        &data,
+    )
+    .expect("hardcoded device challenge context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -231,9 +234,11 @@ pub fn apply_signed_headers_hybrid(
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
         method, path, sync_id, device_id, body, &timestamp, &nonce,
     );
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
-            .expect("hardcoded http request context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::HTTP_REQUEST,
+        &signing_data,
+    )
+    .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -520,7 +525,7 @@ pub fn build_signed_registry_snapshot_hybrid_versioned(
     signing_data.extend_from_slice(&canonical_json_v3);
 
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"registry_snapshot",
+        hybrid_signature_contexts::REGISTRY_SNAPSHOT,
         &signing_data,
     )
     .expect("hardcoded registry snapshot context should be <= 255 bytes");
@@ -590,7 +595,7 @@ pub fn build_registry_approval_hybrid(
     write_len_prefixed(&mut approval_data, &signed_registry_snapshot);
 
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"registry_approval",
+        hybrid_signature_contexts::REGISTRY_APPROVAL,
         &approval_data,
     )
     .expect("hardcoded registry approval context should be <= 255 bytes");
