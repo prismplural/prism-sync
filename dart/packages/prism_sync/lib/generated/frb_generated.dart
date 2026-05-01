@@ -123,13 +123,13 @@ abstract class RustLibApi extends BaseApi {
 
   Future<String> crateApiCompleteInitiatorCeremony({
     required PrismSyncHandle handle,
-    required String password,
-    required String mnemonic,
+    required List<int> password,
+    required List<int> mnemonic,
   });
 
   Future<String> crateApiCompleteJoinerCeremony({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
   });
 
   Future<void> crateApiConfigureEngine({required PrismSyncHandle handle});
@@ -144,9 +144,9 @@ abstract class RustLibApi extends BaseApi {
 
   Future<String> crateApiCreateSyncGroup({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
     required String relayUrl,
-    String? mnemonic,
+    Uint8List? mnemonic,
   });
 
   Future<Uint8List> crateApiDatabaseKey({required PrismSyncHandle handle});
@@ -208,7 +208,7 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiInitialize({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
     required List<int> secretKey,
   });
 
@@ -227,7 +227,7 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiLock({required PrismSyncHandle handle});
 
-  Future<Uint8List> crateApiMnemonicToBytes({required String mnemonic});
+  Future<Uint8List> crateApiMnemonicToBytes({required List<int> mnemonic});
 
   Future<void> crateApiOnResume({required PrismSyncHandle handle});
 
@@ -380,7 +380,7 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiUnlock({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
     required List<int> secretKey,
   });
 
@@ -823,8 +823,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<String> crateApiCompleteInitiatorCeremony({
     required PrismSyncHandle handle,
-    required String password,
-    required String mnemonic,
+    required List<int> password,
+    required List<int> mnemonic,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -834,8 +834,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             handle,
             serializer,
           );
-          sse_encode_String(password, serializer);
-          sse_encode_String(mnemonic, serializer);
+          sse_encode_list_prim_u_8_loose(password, serializer);
+          sse_encode_list_prim_u_8_loose(mnemonic, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -863,7 +863,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<String> crateApiCompleteJoinerCeremony({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -873,7 +873,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             handle,
             serializer,
           );
-          sse_encode_String(password, serializer);
+          sse_encode_list_prim_u_8_loose(password, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -979,9 +979,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<String> crateApiCreateSyncGroup({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
     required String relayUrl,
-    String? mnemonic,
+    Uint8List? mnemonic,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -991,9 +991,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             handle,
             serializer,
           );
-          sse_encode_String(password, serializer);
+          sse_encode_list_prim_u_8_loose(password, serializer);
           sse_encode_String(relayUrl, serializer);
-          sse_encode_opt_String(mnemonic, serializer);
+          sse_encode_opt_list_prim_u_8_strict(mnemonic, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -1555,7 +1555,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<void> crateApiInitialize({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
     required List<int> secretKey,
   }) {
     return handler.executeNormal(
@@ -1566,7 +1566,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             handle,
             serializer,
           );
-          sse_encode_String(password, serializer);
+          sse_encode_list_prim_u_8_loose(password, serializer);
           sse_encode_list_prim_u_8_loose(secretKey, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
@@ -1760,12 +1760,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "lock", argNames: ["handle"]);
 
   @override
-  Future<Uint8List> crateApiMnemonicToBytes({required String mnemonic}) {
+  Future<Uint8List> crateApiMnemonicToBytes({required List<int> mnemonic}) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_String(mnemonic, serializer);
+          sse_encode_list_prim_u_8_loose(mnemonic, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -3003,7 +3003,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<void> crateApiUnlock({
     required PrismSyncHandle handle,
-    required String password,
+    required List<int> password,
     required List<int> secretKey,
   }) {
     return handler.executeNormal(
@@ -3014,7 +3014,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             handle,
             serializer,
           );
-          sse_encode_String(password, serializer);
+          sse_encode_list_prim_u_8_loose(password, serializer);
           sse_encode_list_prim_u_8_loose(secretKey, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,

@@ -93,7 +93,7 @@ impl PairingService {
         &self,
         password: &str,
         relay_url: &str,
-        mnemonic_override: Option<String>,
+        mnemonic_override: Option<&str>,
         sync_id_override: Option<String>,
         nonce_response_override: Option<RegistrationNonceResponse>,
         first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
@@ -103,9 +103,18 @@ impl PairingService {
     where
         F: FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send,
     {
-        // 1. Generate or accept mnemonic
-        let mnemonic_str = mnemonic_override.unwrap_or_else(mnemonic::generate);
-        let secret_key = mnemonic::to_bytes(&mnemonic_str).map_err(CoreError::Crypto)?;
+        // 1. Generate or accept mnemonic. Borrow caller-provided mnemonic text
+        // instead of taking ownership so FFI callers can keep their input copy
+        // inside a Zeroizing buffer.
+        let generated_mnemonic;
+        let mnemonic_str = match mnemonic_override {
+            Some(value) => value,
+            None => {
+                generated_mnemonic = mnemonic::generate();
+                generated_mnemonic.as_str()
+            }
+        };
+        let secret_key = mnemonic::to_bytes(mnemonic_str).map_err(CoreError::Crypto)?;
 
         // 2. Initialize key hierarchy — produces wrapped DEK + salt
         let mut key_hierarchy = KeyHierarchy::new();
@@ -118,7 +127,7 @@ impl PairingService {
         // 4. Build credentials
         let credentials = SyncGroupCredentials {
             sync_id: sync_id.clone(),
-            mnemonic: mnemonic_str.clone(),
+            mnemonic: mnemonic_str.to_string(),
             wrapped_dek: wrapped_dek.clone(),
             salt: salt.clone(),
         };
@@ -193,7 +202,7 @@ impl PairingService {
         let response = PairingResponse {
             relay_url: relay_url.to_string(),
             sync_id: sync_id.clone(),
-            mnemonic: mnemonic_str,
+            mnemonic: mnemonic_str.to_string(),
             wrapped_dek,
             salt,
             signed_invitation: signed_invitation_hex.clone(),
@@ -2954,7 +2963,7 @@ mod tests {
             .create_sync_group(
                 "pw",
                 "wss://relay.example.com",
-                Some(custom.clone()),
+                Some(custom.as_str()),
                 None,
                 None,
                 None,

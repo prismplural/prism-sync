@@ -631,8 +631,8 @@ fn wire__crate__api__complete_initiator_ceremony_impl(
             let api_handle = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
-            let api_mnemonic = <String>::sse_decode(&mut deserializer);
+            let api_password = <Vec<u8>>::sse_decode(&mut deserializer);
+            let api_mnemonic = <Vec<u8>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, String>(
@@ -695,7 +695,7 @@ fn wire__crate__api__complete_joiner_ceremony_impl(
             let api_handle = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
+            let api_password = <Vec<u8>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, String>(
@@ -855,9 +855,9 @@ fn wire__crate__api__create_sync_group_impl(
             let api_handle = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
+            let api_password = <Vec<u8>>::sse_decode(&mut deserializer);
             let api_relay_url = <String>::sse_decode(&mut deserializer);
-            let api_mnemonic = <Option<String>>::sse_decode(&mut deserializer);
+            let api_mnemonic = <Option<Vec<u8>>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, String>(
@@ -1737,7 +1737,7 @@ fn wire__crate__api__initialize_impl(
             let api_handle = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
+            let api_password = <Vec<u8>>::sse_decode(&mut deserializer);
             let api_secret_key = <Vec<u8>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
@@ -2091,7 +2091,7 @@ fn wire__crate__api__mnemonic_to_bytes_impl(
             };
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_mnemonic = <String>::sse_decode(&mut deserializer);
+            let api_mnemonic = <Vec<u8>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, String>((move || {
@@ -3937,7 +3937,7 @@ fn wire__crate__api__unlock_impl(
             let api_handle = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
+            let api_password = <Vec<u8>>::sse_decode(&mut deserializer);
             let api_secret_key = <Vec<u8>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {

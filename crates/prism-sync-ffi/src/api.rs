@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use zeroize::Zeroize;
 
 use prism_sync_core::bootstrap::sharing_trust::{
     compute_sharing_fingerprint, evaluate_identity_with_generation_floor,
@@ -1367,18 +1368,30 @@ pub fn create_prism_sync(
 
 // ── Key lifecycle ──
 
+fn secret_text<'a>(
+    field_name: &str,
+    secret: &'a zeroize::Zeroizing<Vec<u8>>,
+) -> Result<&'a str, String> {
+    std::str::from_utf8(secret.as_slice()).map_err(|_| format!("{field_name} must be valid UTF-8"))
+}
+
 /// Initialize (first-time setup).
 pub async fn initialize(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
     secret_key: Vec<u8>,
 ) -> Result<(), String> {
+    let password = zeroize::Zeroizing::new(password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    secret_text("password", &password)?;
+
     // Argon2id (64 MiB, 3 rounds) is CPU-heavy. Run on a spawn_blocking thread
     // so we don't stall the tokio worker. blocking_lock() acquires the tokio
     // Mutex synchronously, which is safe inside spawn_blocking.
     let inner = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
-        inner.blocking_lock().initialize(&password, &secret_key).map_err(|e| e.to_string())
+        let password = secret_text("password", &password)?;
+        inner.blocking_lock().initialize(password, secret_key.as_slice()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("task failed: {e}"))??;
@@ -1388,13 +1401,18 @@ pub async fn initialize(
 /// Unlock (subsequent launches).
 pub async fn unlock(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
     secret_key: Vec<u8>,
 ) -> Result<(), String> {
+    let password = zeroize::Zeroizing::new(password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    secret_text("password", &password)?;
+
     // Same reasoning as initialize — Argon2id must not run on a tokio worker.
     let inner = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
-        inner.blocking_lock().unlock(&password, &secret_key).map_err(|e| e.to_string())
+        let password = secret_text("password", &password)?;
+        inner.blocking_lock().unlock(password, secret_key.as_slice()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("task failed: {e}"))??;
@@ -2343,10 +2361,16 @@ fn build_relay(
 /// sync_id in the URL path.
 pub async fn create_sync_group(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
     relay_url: String,
-    mnemonic: Option<String>,
+    mnemonic: Option<Vec<u8>>,
 ) -> Result<String, String> {
+    let password = zeroize::Zeroizing::new(password);
+    let mnemonic = mnemonic.map(zeroize::Zeroizing::new);
+    let password_text = secret_text("password", &password)?;
+    let mnemonic_text =
+        mnemonic.as_ref().map(|bytes| secret_text("mnemonic", bytes)).transpose()?;
+
     ensure_handle_supports_signature_version_floor(handle).await?;
     const PENDING_SYNC_ID_KEY: &str = "pending_sync_id";
     const PENDING_NONCE_RESPONSE_KEY: &str = "pending_registration_nonce_response";
@@ -2409,9 +2433,9 @@ pub async fn create_sync_group(
     let ffi_allow_insecure = handle.allow_insecure;
     let create_result = pairing
         .create_sync_group(
-            &password,
+            password_text,
             &relay_url,
-            mnemonic,
+            mnemonic_text,
             Some(sync_id),
             pending.1.clone(),
             pending.2.clone(),
@@ -2444,7 +2468,7 @@ pub async fn create_sync_group(
         let _ = inner.secure_store().delete(key);
     }
 
-    let (creds, response) = match create_result {
+    let (mut creds, mut response) = match create_result {
         Ok(value) => value,
         Err(error) => {
             if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
@@ -2470,9 +2494,14 @@ pub async fn create_sync_group(
     // create_sync_group just produced, and restore the device_secret.
     // This ensures configureEngine can derive the signing key and
     // the epoch key matches what's in the invite for other devices.
-    let secret_key = prism_sync_crypto::mnemonic::to_bytes(&creds.mnemonic)
-        .map_err(|e| format!("mnemonic conversion failed: {e}"))?;
-    inner.unlock(&password, &secret_key).map_err(|e| format!("unlock after create failed: {e}"))?;
+    let secret_key_result = prism_sync_crypto::mnemonic::to_bytes(&creds.mnemonic)
+        .map_err(|e| format!("mnemonic conversion failed: {e}"));
+    creds.mnemonic.zeroize();
+    response.mnemonic.zeroize();
+    let secret_key = zeroize::Zeroizing::new(secret_key_result?);
+    inner
+        .unlock(password_text, secret_key.as_slice())
+        .map_err(|e| format!("unlock after create failed: {e}"))?;
 
     let device_secret_bytes = inner
         .secure_store()
@@ -2831,8 +2860,10 @@ pub async fn check_wipe_status(
 ///
 /// This is needed because `initialize()` and `unlock()` take `secret_key: Vec<u8>`,
 /// but the user sees/enters a 12-word mnemonic. This bridges the two.
-pub fn mnemonic_to_bytes(mnemonic: String) -> Result<Vec<u8>, String> {
-    prism_sync_crypto::mnemonic::to_bytes(&mnemonic).map_err(|e| e.to_string())
+pub fn mnemonic_to_bytes(mnemonic: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mnemonic = zeroize::Zeroizing::new(mnemonic);
+    let mnemonic = secret_text("mnemonic", &mnemonic)?;
+    prism_sync_crypto::mnemonic::to_bytes(mnemonic).map_err(|e| e.to_string())
 }
 
 /// Convert 16-byte entropy back to a BIP39 mnemonic string.
@@ -3787,8 +3818,11 @@ pub async fn get_joiner_sas(handle: &PrismSyncHandle) -> Result<String, String> 
 /// Must be called after [`get_joiner_sas`] and user SAS verification.
 pub async fn complete_joiner_ceremony(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
 ) -> Result<String, String> {
+    let password = zeroize::Zeroizing::new(password);
+    let password_text = secret_text("password", &password)?;
+
     ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
@@ -3824,7 +3858,7 @@ pub async fn complete_joiner_ceremony(
             &ceremony,
             &pairing_relay,
             &[],
-            &password,
+            password_text,
             |sync_id, device_id, registration_token| {
                 // Fresh-install onboarding can seed a manual token locally
                 // before pairing starts. Use it when the inviter bundle does
@@ -4054,9 +4088,14 @@ pub async fn start_initiator_ceremony(
 /// Must be called after [`start_initiator_ceremony`] and user SAS verification.
 pub async fn complete_initiator_ceremony(
     handle: &PrismSyncHandle,
-    password: String,
-    mnemonic: String,
+    password: Vec<u8>,
+    mnemonic: Vec<u8>,
 ) -> Result<String, String> {
+    let password = zeroize::Zeroizing::new(password);
+    let mnemonic = zeroize::Zeroizing::new(mnemonic);
+    let password_text = secret_text("password", &password)?;
+    let mnemonic_text = secret_text("mnemonic", &mnemonic)?;
+
     ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteInitiator)?;
     let pairing_relay = build_pairing_relay(handle)?;
@@ -4115,8 +4154,8 @@ pub async fn complete_initiator_ceremony(
         .complete_bootstrap_initiator(
             &ceremony,
             &pairing_relay,
-            &password,
-            &mnemonic,
+            password_text,
+            mnemonic_text,
             relay.as_ref(),
         )
         .await
@@ -4779,7 +4818,7 @@ mod tests {
 
         let err = create_sync_group(
             &handle,
-            "pw".to_string(),
+            b"pw".to_vec(),
             "https://relay.example.com".to_string(),
             None,
         )
@@ -5868,13 +5907,35 @@ mod tests {
         let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
         plant_joiner_slot(&handle, ceremony);
 
-        let err = complete_initiator_ceremony(&handle, "pw".into(), "phrase".into())
+        let err = complete_initiator_ceremony(&handle, b"pw".to_vec(), b"phrase".to_vec())
             .await
             .expect_err("guard must refuse complete_initiator while joiner in flight");
         assert!(
             err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
             "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_initiator_ceremony_rejects_non_utf8_secrets_before_guard() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let err = complete_initiator_ceremony(&handle, vec![0xff], b"phrase".to_vec())
+            .await
+            .expect_err("invalid password should fail before ceremony guard");
+        assert_eq!(err, "password must be valid UTF-8");
+
+        let err = complete_initiator_ceremony(&handle, b"pw".to_vec(), vec![0xff])
+            .await
+            .expect_err("invalid mnemonic should fail before ceremony guard");
+        assert_eq!(err, "mnemonic must be valid UTF-8");
     }
 
     #[tokio::test]
@@ -5891,12 +5952,29 @@ mod tests {
         let ceremony = make_real_initiator_ceremony().await;
         plant_initiator_slot(&handle, ceremony);
 
-        let err = complete_joiner_ceremony(&handle, "pw".into())
+        let err = complete_joiner_ceremony(&handle, b"pw".to_vec())
             .await
             .expect_err("guard must refuse complete_joiner while initiator in flight");
         assert!(
             err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
             "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_joiner_ceremony_rejects_non_utf8_password_before_guard() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let err = complete_joiner_ceremony(&handle, vec![0xff])
+            .await
+            .expect_err("invalid password should fail before ceremony guard");
+        assert_eq!(err, "password must be valid UTF-8");
     }
 }

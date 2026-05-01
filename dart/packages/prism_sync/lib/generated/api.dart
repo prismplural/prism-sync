@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `char_at`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `sas_display_json`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `char_at`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `sas_display_json`, `secret_text`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -38,7 +38,7 @@ Future<PrismSyncHandle> createPrismSync({
 /// Initialize (first-time setup).
 Future<void> initialize({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
   required List<int> secretKey,
 }) => RustLib.instance.api.crateApiInitialize(
   handle: handle,
@@ -49,7 +49,7 @@ Future<void> initialize({
 /// Unlock (subsequent launches).
 Future<void> unlock({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
   required List<int> secretKey,
 }) => RustLib.instance.api.crateApiUnlock(
   handle: handle,
@@ -378,9 +378,9 @@ Future<String?> pollEvent({required PrismSyncHandle handle}) =>
 /// sync_id in the URL path.
 Future<String> createSyncGroup({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
   required String relayUrl,
-  String? mnemonic,
+  Uint8List? mnemonic,
 }) => RustLib.instance.api.crateApiCreateSyncGroup(
   handle: handle,
   password: password,
@@ -481,7 +481,7 @@ Future<bool?> checkWipeStatus({
 ///
 /// This is needed because `initialize()` and `unlock()` take `secret_key: Vec<u8>`,
 /// but the user sees/enters a 12-word mnemonic. This bridges the two.
-Future<Uint8List> mnemonicToBytes({required String mnemonic}) =>
+Future<Uint8List> mnemonicToBytes({required List<int> mnemonic}) =>
     RustLib.instance.api.crateApiMnemonicToBytes(mnemonic: mnemonic);
 
 /// Convert 16-byte entropy back to a BIP39 mnemonic string.
@@ -803,7 +803,7 @@ Future<String> getJoinerSas({required PrismSyncHandle handle}) =>
 /// Must be called after [`get_joiner_sas`] and user SAS verification.
 Future<String> completeJoinerCeremony({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
 }) => RustLib.instance.api.crateApiCompleteJoinerCeremony(
   handle: handle,
   password: password,
@@ -854,8 +854,8 @@ Future<String> startInitiatorCeremony({
 /// Must be called after [`start_initiator_ceremony`] and user SAS verification.
 Future<String> completeInitiatorCeremony({
   required PrismSyncHandle handle,
-  required String password,
-  required String mnemonic,
+  required List<int> password,
+  required List<int> mnemonic,
 }) => RustLib.instance.api.crateApiCompleteInitiatorCeremony(
   handle: handle,
   password: password,

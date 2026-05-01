@@ -226,7 +226,7 @@ async fn initialize_and_unlock_with_memory_store() {
     let secret = api::generate_secret_key().unwrap();
     let secret_bytes: Vec<u8> = secret.as_bytes().to_vec();
 
-    let init = api::initialize(&handle, "password123".into(), secret_bytes.clone()).await;
+    let init = api::initialize(&handle, b"password123".to_vec(), secret_bytes.clone()).await;
     assert!(init.is_ok(), "initialize should succeed: {:?}", init.err());
 
     assert!(api::is_unlocked(&handle).await);
@@ -234,9 +234,37 @@ async fn initialize_and_unlock_with_memory_store() {
     api::lock(&handle).await;
     assert!(!api::is_unlocked(&handle).await);
 
-    let unlock = api::unlock(&handle, "password123".into(), secret_bytes).await;
+    let unlock = api::unlock(&handle, b"password123".to_vec(), secret_bytes).await;
     assert!(unlock.is_ok(), "unlock should succeed: {:?}", unlock.err());
     assert!(api::is_unlocked(&handle).await);
+}
+
+#[tokio::test]
+async fn initialize_rejects_non_utf8_password() {
+    let handle = make_handle();
+    let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
+
+    let result = api::initialize(&handle, vec![0xff], secret_bytes).await;
+
+    assert!(
+        matches!(result.as_ref().err().map(String::as_str), Some("password must be valid UTF-8")),
+        "initialize should reject invalid UTF-8 passwords before key derivation: {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn unlock_rejects_non_utf8_password() {
+    let handle = make_handle();
+    let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes.clone()).await.unwrap();
+    api::lock(&handle).await;
+
+    let result = api::unlock(&handle, vec![0xff], secret_bytes).await;
+
+    assert!(
+        matches!(result.as_ref().err().map(String::as_str), Some("password must be valid UTF-8")),
+        "unlock should reject invalid UTF-8 passwords before key derivation: {result:?}",
+    );
 }
 
 #[tokio::test]
@@ -252,9 +280,19 @@ async fn initialize_fails_without_secure_store() {
 
     // All handles now use MemorySecureStore, so initialize succeeds.
     let mnemonic = api::generate_secret_key().unwrap();
-    let secret_bytes = api::mnemonic_to_bytes(mnemonic).unwrap();
-    let result = api::initialize(&handle, "pw".into(), secret_bytes).await;
+    let secret_bytes = api::mnemonic_to_bytes(mnemonic.into_bytes()).unwrap();
+    let result = api::initialize(&handle, b"pw".to_vec(), secret_bytes).await;
     assert!(result.is_ok(), "initialize should succeed with MemorySecureStore: {:?}", result.err());
+}
+
+#[test]
+fn mnemonic_to_bytes_rejects_non_utf8_mnemonic() {
+    let result = api::mnemonic_to_bytes(vec![0xff]);
+
+    assert!(
+        matches!(result.as_ref().err().map(String::as_str), Some("mnemonic must be valid UTF-8")),
+        "mnemonic_to_bytes should reject invalid UTF-8 before parsing: {result:?}",
+    );
 }
 
 #[tokio::test]
@@ -271,7 +309,7 @@ async fn database_key_requires_unlock() {
     assert!(result.is_err(), "database_key should fail when locked");
 
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes).await.unwrap();
 
     let result = api::database_key(&handle).await;
     assert!(result.is_ok(), "database_key should succeed when unlocked");
@@ -286,7 +324,7 @@ async fn change_password_succeeds() {
     let secret = api::generate_secret_key().unwrap();
     let secret_bytes = secret.as_bytes().to_vec();
 
-    api::initialize(&handle, "old_pw".into(), secret_bytes.clone()).await.unwrap();
+    api::initialize(&handle, b"old_pw".to_vec(), secret_bytes.clone()).await.unwrap();
 
     let result =
         api::change_password(&handle, b"new_pw".to_vec(), secret_bytes.clone(), None, 0).await;
@@ -297,7 +335,7 @@ async fn change_password_succeeds() {
 
     // Lock and unlock with new password
     api::lock(&handle).await;
-    let unlock = api::unlock(&handle, "new_pw".into(), secret_bytes).await;
+    let unlock = api::unlock(&handle, b"new_pw".to_vec(), secret_bytes).await;
     assert!(unlock.is_ok(), "unlock with new password should succeed: {:?}", unlock.err());
 }
 
@@ -307,7 +345,7 @@ async fn change_password_rejects_non_utf8_new_password() {
     let secret = api::generate_secret_key().unwrap();
     let secret_bytes = secret.as_bytes().to_vec();
 
-    api::initialize(&handle, "old_pw".into(), secret_bytes.clone()).await.unwrap();
+    api::initialize(&handle, b"old_pw".to_vec(), secret_bytes.clone()).await.unwrap();
 
     let result = api::change_password(&handle, vec![0xff], secret_bytes, None, 0).await;
     assert!(
@@ -617,7 +655,7 @@ async fn local_storage_key_requires_unlock() {
 async fn local_storage_key_succeeds_after_initialize() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes).await.unwrap();
 
     let result = api::local_storage_key(&handle).await;
     assert!(
@@ -633,7 +671,7 @@ async fn local_storage_key_succeeds_after_initialize() {
 async fn local_storage_key_differs_from_database_key() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes).await.unwrap();
 
     let local_key = api::local_storage_key(&handle).await.unwrap();
     let db_key = api::database_key(&handle).await.unwrap();
@@ -644,7 +682,7 @@ async fn local_storage_key_differs_from_database_key() {
 async fn rekey_db_rejects_wrong_key_length() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes).await.unwrap();
 
     // 16 bytes — wrong length
     let result = api::rekey_db(&handle, vec![0u8; 16]).await;
@@ -656,7 +694,7 @@ async fn rekey_db_rejects_wrong_key_length() {
 async fn rekey_db_succeeds_with_32_byte_key() {
     let handle = make_handle();
     let secret_bytes = api::generate_secret_key().unwrap().into_bytes();
-    api::initialize(&handle, "pw".into(), secret_bytes).await.unwrap();
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes).await.unwrap();
 
     let result = api::rekey_db(&handle, vec![0xbbu8; 32]).await;
     assert!(result.is_ok(), "rekey_db should succeed on in-memory storage: {:?}", result.err());

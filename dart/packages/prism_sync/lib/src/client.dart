@@ -6,19 +6,18 @@ import 'types.dart';
 /// `prism_sync/lib/generated/`. This stub exists for the package's public API
 /// surface and is not used at runtime.
 class PrismSyncClient {
-
   /// Initialize the sync engine for first-time setup.
   ///
   /// Derives the master encryption key from [password] and [secretKey],
   /// generates the DEK, and stores wrapped keys in secure storage.
-  Future<void> initialize(String password, List<int> secretKey) async {
+  Future<void> initialize(List<int> password, List<int> secretKey) async {
     throw UnimplementedError('Requires flutter_rust_bridge codegen');
   }
 
   /// Unlock the sync engine on subsequent launches.
   ///
   /// Derives the master encryption key and unwraps the stored DEK.
-  Future<void> unlock(String password, List<int> secretKey) async {
+  Future<void> unlock(List<int> password, List<int> secretKey) async {
     throw UnimplementedError('Requires flutter_rust_bridge codegen');
   }
 
