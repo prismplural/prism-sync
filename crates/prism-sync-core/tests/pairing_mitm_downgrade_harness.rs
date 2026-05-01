@@ -118,7 +118,7 @@ async fn pairing_init_from_another_slot_cannot_drive_joiner_sas() {
         .process_pairing_init(&replayed_init)
         .expect("same-slot PairingInit should still be valid for its intended joiner");
     assert_eq!(intended_sas.words, initiator_sas.words);
-    assert_eq!(intended_sas.decimal, initiator_sas.decimal);
+    assert_eq!(intended_sas.word_list, initiator_sas.word_list);
 
     let intended_mac = intended_joiner.confirmation_mac().expect("valid joiner confirmation");
     initiator
