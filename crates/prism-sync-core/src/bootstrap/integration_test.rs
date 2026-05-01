@@ -92,7 +92,7 @@ mod tests {
             ConfirmationCode::new(profile, version, &responder_ks, responder_hash);
 
         assert_eq!(initiator_confirm.sas_words(), responder_confirm.sas_words());
-        assert_eq!(initiator_confirm.sas_decimal(), responder_confirm.sas_decimal(),);
+        assert_eq!(initiator_confirm.sas_word_list(), responder_confirm.sas_word_list(),);
         assert_eq!(
             initiator_confirm.session_fingerprint(),
             responder_confirm.session_fingerprint(),

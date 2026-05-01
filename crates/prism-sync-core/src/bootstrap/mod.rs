@@ -47,6 +47,10 @@ pub use sharing_sender::{SharingInitResult, SharingSender};
 pub use sharing_transcript::build_sharing_transcript;
 pub use transcript::BootstrapTranscript;
 
+/// Pairing SAS/protocol version bound into `PairingInit`, the sync-pairing
+/// transcript, and the human-compared SAS renderer.
+pub const PAIRING_SAS_VERSION: u8 = 2;
+
 /// Protocol version for the bootstrap handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

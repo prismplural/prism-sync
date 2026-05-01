@@ -24,6 +24,14 @@ fn csprng() -> getrandom::rand_core::UnwrapErr<getrandom::SysRng> {
     getrandom::rand_core::UnwrapErr(getrandom::SysRng)
 }
 
+fn sas_display_from_confirmation(confirmation: &ConfirmationCode) -> SasDisplay {
+    SasDisplay {
+        version: PAIRING_SAS_VERSION,
+        words: confirmation.sas_words(),
+        word_list: confirmation.sas_word_list(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // JoinerCeremony
 // ---------------------------------------------------------------------------
@@ -147,6 +155,7 @@ impl JoinerCeremony {
         let transcript_hash = build_sync_pairing_transcript(
             &self.rendezvous_id,
             &self.commitment,
+            init.sas_version,
             &initiator_keys,
             &self.bootstrap_record,
             &init.kem_ciphertext,
@@ -173,8 +182,7 @@ impl JoinerCeremony {
         confirmation.verify_confirmation(&init.confirmation_mac, BootstrapRole::Initiator)?;
 
         // 8. Store state
-        let sas =
-            SasDisplay { words: confirmation.sas_words(), decimal: confirmation.sas_decimal() };
+        let sas = sas_display_from_confirmation(&confirmation);
         self.transcript_hash = Some(transcript_hash);
         self.key_schedule = Some(key_schedule);
         self.confirmation = Some(confirmation);
@@ -356,6 +364,7 @@ impl InitiatorCeremony {
         let transcript_hash = build_sync_pairing_transcript(
             &token.rendezvous_id,
             &commitment,
+            PAIRING_SAS_VERSION,
             &local_keys,
             &record,
             &kem_ciphertext,
@@ -382,6 +391,7 @@ impl InitiatorCeremony {
         let init_mac = confirmation.confirmation_mac(BootstrapRole::Initiator);
         let init = PairingInit {
             version: BootstrapVersion::V1,
+            sas_version: PAIRING_SAS_VERSION,
             device_id: device_id.to_string(),
             ed25519_public_key: local_keys.ed25519_pk,
             x25519_public_key: local_keys.x25519_pk,
@@ -399,8 +409,7 @@ impl InitiatorCeremony {
             .await
             .map_err(|e| CoreError::Engine(format!("failed to post PairingInit: {e}")))?;
 
-        let sas =
-            SasDisplay { words: confirmation.sas_words(), decimal: confirmation.sas_decimal() };
+        let sas = sas_display_from_confirmation(&confirmation);
 
         Ok((
             Self {
@@ -544,7 +553,8 @@ mod tests {
 
         // SAS codes match
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
+        assert_eq!(joiner_sas.version, PAIRING_SAS_VERSION);
 
         // Joiner sends confirmation MAC
         let joiner_mac = joiner.confirmation_mac().unwrap();
@@ -628,6 +638,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tampered_pairing_init_sas_version_fails_closed() {
+        let relay = MockPairingRelay::new();
+        let relay_url = "https://relay.example.com";
+
+        let (mut joiner, token) = JoinerCeremony::start(&relay, relay_url).await.unwrap();
+        let initiator_secret = DeviceSecret::generate();
+        let initiator_device_id = crate::node_id::generate_node_id();
+        let (_initiator, _initiator_sas) =
+            InitiatorCeremony::start(token, &relay, &initiator_secret, &initiator_device_id)
+                .await
+                .unwrap();
+
+        let mut init_bytes = relay
+            .get_slot(&joiner.rendezvous_id_hex(), PairingSlot::Init)
+            .await
+            .unwrap()
+            .expect("init slot should be populated");
+        init_bytes[1] = PAIRING_SAS_VERSION.saturating_add(1);
+
+        let err = joiner
+            .process_pairing_init(&init_bytes)
+            .expect_err("unsupported SAS version must fail before SAS display");
+        assert!(
+            err.to_string().contains("failed to parse PairingInit"),
+            "expected parse rejection, got: {err}"
+        );
+        assert!(
+            joiner.confirmation_mac().is_err(),
+            "tampered version must not arm confirmation state"
+        );
+    }
+
+    #[tokio::test]
     async fn credential_encryption_requires_joiner_confirmation() {
         let relay = MockPairingRelay::new();
         let (joiner, initiator, _, _) = run_ceremony_to_sas(&relay).await;
@@ -679,9 +722,10 @@ mod tests {
         let (_joiner, _initiator, joiner_sas, initiator_sas) = run_ceremony_to_sas(&relay).await;
 
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
         assert!(!joiner_sas.words.is_empty());
-        assert_eq!(joiner_sas.decimal.len(), 6);
+        assert_eq!(joiner_sas.word_list.len(), 5);
+        assert_eq!(joiner_sas.words.split_whitespace().count(), 5);
     }
 
     #[tokio::test]

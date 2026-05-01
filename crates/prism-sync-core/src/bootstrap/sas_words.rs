@@ -3,9 +3,12 @@
 //! Kept inside the bootstrap module so Phase 2 does not depend on the legacy
 //! classical pairing SAS implementation.
 
-/// A compact 256-word list used to render SAS display codes.
-/// Each byte of the transcript hash indexes into this list, giving 3 words
-/// from the first 3 bytes.
+/// A compact 256-word in-repo vocabulary used to render pairing SAS phrases.
+///
+/// Each byte of the versioned SAS HMAC indexes one word. Production pairing
+/// displays five words, yielding exactly 40 bits from the first five bytes.
+/// The list is deliberately lowercase ASCII with no punctuation so it can be
+/// displayed consistently across Rust FFI and app UI layers.
 pub(crate) const SAS_WORDS: [&str; 256] = [
     "acorn",
     "alpine",

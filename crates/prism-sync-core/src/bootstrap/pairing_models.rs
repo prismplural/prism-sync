@@ -10,7 +10,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::BootstrapVersion;
+use super::{BootstrapVersion, PAIRING_SAS_VERSION};
 
 const ED25519_PK_LEN: usize = 32;
 const X25519_PK_LEN: usize = 32;
@@ -244,6 +244,8 @@ impl RendezvousToken {
 #[derive(Debug, Clone)]
 pub struct PairingInit {
     pub version: BootstrapVersion,
+    /// Version of the human SAS renderer/protocol binding for this ceremony.
+    pub sas_version: u8,
     pub device_id: String,
     pub ed25519_public_key: [u8; 32],
     pub x25519_public_key: [u8; 32],
@@ -261,7 +263,8 @@ impl PairingInit {
     /// Binary encoding with 2B BE length prefixes for variable fields.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            1 + 2
+            1 + 1
+                + 2
                 + self.device_id.len()
                 + ED25519_PK_LEN
                 + X25519_PK_LEN
@@ -276,6 +279,7 @@ impl PairingInit {
                 + self.relay_origin.len(),
         );
         buf.push(self.version.as_byte());
+        buf.push(self.sas_version);
         write_len16(&mut buf, self.device_id.as_bytes());
         buf.extend_from_slice(&self.ed25519_public_key);
         buf.extend_from_slice(&self.x25519_public_key);
@@ -292,6 +296,12 @@ impl PairingInit {
         let mut pos = 0;
 
         let version = BootstrapVersion::from_byte(*data.get(pos)?)?;
+        pos += 1;
+
+        let sas_version = *data.get(pos)?;
+        if sas_version != PAIRING_SAS_VERSION {
+            return None;
+        }
         pos += 1;
 
         let device_id = read_len16_str(data, &mut pos)?;
@@ -318,6 +328,7 @@ impl PairingInit {
 
         Some(Self {
             version,
+            sas_version,
             device_id,
             ed25519_public_key,
             x25519_public_key,
@@ -393,10 +404,11 @@ pub struct JoinerBundle {
 // ── SasDisplay ──────────────────────────────────────────────────────────────
 
 /// Human-readable SAS display codes for the pairing ceremony.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SasDisplay {
+    pub version: u8,
     pub words: String,
-    pub decimal: String,
+    pub word_list: Vec<String>,
 }
 
 // ── Binary helpers ──────────────────────────────────────────────────────────
@@ -457,6 +469,7 @@ mod tests {
     fn sample_pairing_init() -> PairingInit {
         PairingInit {
             version: BootstrapVersion::V1,
+            sas_version: PAIRING_SAS_VERSION,
             device_id: "init-device-42".to_string(),
             ed25519_public_key: [0x11; 32],
             x25519_public_key: [0x22; 32],
@@ -466,6 +479,33 @@ mod tests {
             confirmation_mac: vec![0x66; 32],
             relay_origin: "https://relay.example.com".to_string(),
         }
+    }
+
+    fn legacy_pairing_init_parse_without_sas_version(data: &[u8]) -> Option<()> {
+        let mut pos = 0;
+
+        let _version = BootstrapVersion::from_byte(*data.get(pos)?)?;
+        pos += 1;
+
+        let _device_id = read_len16_str(data, &mut pos)?;
+        let _ed25519_public_key = read_fixed::<ED25519_PK_LEN>(data, &mut pos)?;
+        let _x25519_public_key = read_fixed::<X25519_PK_LEN>(data, &mut pos)?;
+        let ml_dsa_65_public_key = read_len16_bytes(data, &mut pos)?;
+        if ml_dsa_65_public_key.len() != ML_DSA_65_PK_LEN {
+            return None;
+        }
+        let xwing_ek = read_len16_bytes(data, &mut pos)?;
+        if xwing_ek.len() != XWING_EK_LEN {
+            return None;
+        }
+        let kem_ciphertext = read_len16_bytes(data, &mut pos)?;
+        if kem_ciphertext.len() != KEM_CIPHERTEXT_LEN {
+            return None;
+        }
+        let _confirmation_mac = read_fixed::<CONFIRMATION_MAC_LEN>(data, &mut pos)?;
+        let _relay_origin = read_len16_str(data, &mut pos)?;
+
+        (pos == data.len()).then_some(())
     }
 
     // ── JoinerBootstrapRecord tests ─────────────────────────────────────
@@ -607,6 +647,7 @@ mod tests {
         let parsed = PairingInit::from_bytes(&bytes).unwrap();
 
         assert_eq!(parsed.version, init.version);
+        assert_eq!(parsed.sas_version, init.sas_version);
         assert_eq!(parsed.device_id, init.device_id);
         assert_eq!(parsed.ed25519_public_key, init.ed25519_public_key);
         assert_eq!(parsed.x25519_public_key, init.x25519_public_key);
@@ -623,6 +664,43 @@ mod tests {
         init.confirmation_mac = vec![0x66; 31];
         let bytes = init.to_bytes();
         assert!(PairingInit::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn pairing_init_rejects_missing_legacy_sas_version_byte() {
+        let init = sample_pairing_init();
+        let mut legacy = Vec::new();
+        legacy.push(init.version.as_byte());
+        write_len16(&mut legacy, init.device_id.as_bytes());
+        legacy.extend_from_slice(&init.ed25519_public_key);
+        legacy.extend_from_slice(&init.x25519_public_key);
+        write_len16(&mut legacy, &init.ml_dsa_65_public_key);
+        write_len16(&mut legacy, &init.xwing_ek);
+        write_len16(&mut legacy, &init.kem_ciphertext);
+        legacy.extend_from_slice(&init.confirmation_mac);
+        write_len16(&mut legacy, init.relay_origin.as_bytes());
+
+        assert!(
+            PairingInit::from_bytes(&legacy).is_none(),
+            "new parser must reject pre-SAS-version PairingInit bytes"
+        );
+    }
+
+    #[test]
+    fn pairing_init_rejects_unsupported_sas_version() {
+        let init = sample_pairing_init();
+        let mut bytes = init.to_bytes();
+        bytes[1] = PAIRING_SAS_VERSION.saturating_add(1);
+        assert!(PairingInit::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn legacy_pairing_init_parser_rejects_new_versioned_layout() {
+        let bytes = sample_pairing_init().to_bytes();
+        assert!(
+            legacy_pairing_init_parse_without_sas_version(&bytes).is_none(),
+            "old PairingInit parser must not accept the v2 SAS-versioned layout"
+        );
     }
 
     #[test]

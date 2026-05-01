@@ -16,15 +16,16 @@ use crate::error::{CoreError, Result};
 
 use super::key_schedule::BootstrapKeySchedule;
 use super::sas_words::SAS_WORDS;
-use super::{BootstrapProfile, BootstrapRole, BootstrapVersion};
+use super::{BootstrapProfile, BootstrapRole, BootstrapVersion, PAIRING_SAS_VERSION};
 
 type HmacSha256 = Hmac<Sha256>;
 
 // ── Domain separators ────────────────────────────────────────────────────────
 
-const SAS_DOMAIN: &[u8] = b"PRISM_BOOTSTRAP_SAS";
+const SAS_DOMAIN: &[u8] = b"PRISM_BOOTSTRAP_SAS_V2";
 const CONFIRM_DOMAIN: &[u8] = b"PRISM_BOOTSTRAP_CONFIRM_V1";
 const FINGERPRINT_DOMAIN: &[u8] = b"PRISM_FINGERPRINT";
+const SAS_WORD_COUNT: usize = 5;
 
 // ── ConfirmationCode ─────────────────────────────────────────────────────────
 
@@ -55,29 +56,28 @@ impl ConfirmationCode {
         }
     }
 
-    /// Compute the SAS input HMAC (used for words, decimal, and fingerprint).
+    /// Compute the SAS input HMAC for the version-2 human comparison phrase.
     fn sas_input(&self) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.verification_key)
             .expect("HMAC accepts any key length");
         mac.update(SAS_DOMAIN);
         mac.update(&[0x00]);
+        mac.update(&[PAIRING_SAS_VERSION]);
         mac.update(&[self.profile.as_byte()]);
         mac.update(&[self.version.as_byte()]);
+        mac.update(&self.transcript_hash);
         mac.finalize().into_bytes().into()
     }
 
-    /// 3-word SAS display code (e.g. "amber-canyon-frost").
-    pub fn sas_words(&self) -> String {
+    /// Five SAS words derived from five bytes of HMAC output.
+    pub fn sas_word_list(&self) -> Vec<String> {
         let hash = self.sas_input();
-        let words: Vec<&str> = hash[..3].iter().map(|b| SAS_WORDS[*b as usize]).collect();
-        words.join("-")
+        hash[..SAS_WORD_COUNT].iter().map(|b| SAS_WORDS[*b as usize].to_string()).collect()
     }
 
-    /// 6-digit decimal SAS (e.g. "472916").
-    pub fn sas_decimal(&self) -> String {
-        let hash = self.sas_input();
-        let val = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
-        format!("{:06}", val % 1_000_000)
+    /// 5-word SAS display phrase (e.g. "amber canyon frost harbor velvet").
+    pub fn sas_words(&self) -> String {
+        self.sas_word_list().join(" ")
     }
 
     /// 32-byte session fingerprint for logs.
@@ -259,28 +259,28 @@ mod tests {
     }
 
     #[test]
-    fn sas_decimal_deterministic() {
+    fn sas_word_list_deterministic() {
         let (c1, c2) = make_confirmation_pair(42);
-        assert_eq!(c1.sas_decimal(), c2.sas_decimal());
+        assert_eq!(c1.sas_word_list(), c2.sas_word_list());
     }
 
     #[test]
     fn sas_words_format() {
         let code = make_confirmation(7);
         let words_str = code.sas_words();
-        let words: Vec<&str> = words_str.split('-').collect();
-        assert_eq!(words.len(), 3, "expected 3 words, got: {words_str}");
+        let words: Vec<&str> = words_str.split_whitespace().collect();
+        assert_eq!(words.len(), SAS_WORD_COUNT, "expected 5 words, got: {words_str}");
         for word in &words {
             assert!(SAS_WORDS.contains(word), "word '{word}' not in SAS_WORDS list");
         }
     }
 
     #[test]
-    fn sas_decimal_format() {
+    fn sas_words_are_space_separated() {
         let code = make_confirmation(7);
-        let decimal = code.sas_decimal();
-        assert_eq!(decimal.len(), 6, "expected 6 digits, got: {decimal}");
-        assert!(decimal.chars().all(|c| c.is_ascii_digit()), "expected all digits, got: {decimal}");
+        let words = code.sas_words();
+        assert!(!words.contains('-'), "SAS phrase must not be dash-delimited: {words}");
+        assert_eq!(words.matches(' ').count(), SAS_WORD_COUNT - 1);
     }
 
     #[test]
@@ -289,6 +289,30 @@ mod tests {
         let c2 = make_confirmation(2);
         // Different seeds -> different verification keys -> different SAS
         assert_ne!(c1.sas_words(), c2.sas_words());
+    }
+
+    #[test]
+    fn sas_changes_with_different_transcript_hash() {
+        let (ks, transcript_hash) = test_key_schedule(11);
+        let mut changed_transcript_hash = transcript_hash;
+        changed_transcript_hash[0] ^= 0xFF;
+        let c1 = ConfirmationCode::new(
+            BootstrapProfile::SyncPairing,
+            BootstrapVersion::V1,
+            &ks,
+            transcript_hash,
+        );
+        let c2 = ConfirmationCode::new(
+            BootstrapProfile::SyncPairing,
+            BootstrapVersion::V1,
+            &ks,
+            changed_transcript_hash,
+        );
+        assert_ne!(
+            c1.sas_words(),
+            c2.sas_words(),
+            "SAS phrase must be explicitly transcript-bound"
+        );
     }
 
     // ── Confirmation MAC tests ───────────────────────────────────────────
@@ -395,5 +419,17 @@ mod tests {
         let unique_count =
             SAS_WORDS.iter().copied().collect::<std::collections::BTreeSet<_>>().len();
         assert_eq!(unique_count, SAS_WORDS.len(), "bootstrap SAS word list must be unique");
+    }
+
+    #[test]
+    fn sas_words_list_has_basic_display_format() {
+        for word in SAS_WORDS {
+            assert!(
+                word.chars().all(|c| c.is_ascii_lowercase()),
+                "SAS word must be lowercase ASCII: {word}"
+            );
+            assert!(word.len() >= 3, "SAS word too short for display: {word}");
+            assert!(word.len() <= 12, "SAS word too long for compact display: {word}");
+        }
     }
 }

@@ -12,6 +12,7 @@ const HYBRID_SIGNATURE_VERSION_V2: u8 = 0x02;
 
 /// Hybrid signature version byte for Phase 6 V3 labeled WNS wire formats.
 const HYBRID_SIGNATURE_VERSION_V3: u8 = 0x03;
+const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = HYBRID_SIGNATURE_VERSION_V3;
 
 /// Sent by the joining device (Device B → Device A) to initiate pairing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,6 +643,7 @@ impl SignedRegistrySnapshot {
         let Some((&version, remaining)) = signed_bytes.split_first() else {
             return Err("signed snapshot too short".into());
         };
+        enforce_wire_signature_floor(version, SIGNATURE_VERSION_SOURCE_FLOOR)?;
         if version != HYBRID_SIGNATURE_VERSION_V3 {
             return Err("signed snapshot missing V3 hybrid signature version".into());
         }
@@ -736,6 +738,19 @@ impl SignedRegistrySnapshot {
             })
             .collect()
     }
+}
+
+fn enforce_wire_signature_floor(
+    wire_signature_version: u8,
+    stored_floor: u8,
+) -> std::result::Result<(), String> {
+    let required = stored_floor.max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    if wire_signature_version < required {
+        return Err(format!(
+            "wire signature version 0x{wire_signature_version:02x} is below required floor 0x{required:02x}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -981,6 +996,24 @@ mod tests {
         assert_eq!(decoded.entries.len(), 2);
         assert_eq!(decoded.entries[0].device_id, "dev-a");
         assert_eq!(decoded.entries[1].device_id, "dev-b");
+    }
+
+    #[test]
+    fn registry_v2_hybrid_wire_rejected_by_source_floor() {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let ed_pk = signing_key.public_key_bytes();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pq_pk = pq_signing_key.public_key_bytes();
+        let snapshot = sample_snapshot();
+
+        let mut signed = snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        signed[0] = HYBRID_SIGNATURE_VERSION_V2;
+
+        let err =
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &ed_pk, &pq_pk).unwrap_err();
+
+        assert!(err.contains("below required floor"), "unexpected error: {err}");
     }
 
     #[test]

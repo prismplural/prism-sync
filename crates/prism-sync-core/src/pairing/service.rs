@@ -28,6 +28,9 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
+const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
+#[cfg(test)]
+const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 
 /// Orchestrates sync group creation and joining.
 ///
@@ -44,13 +47,8 @@ impl PairingService {
         Self { secure_store }
     }
 
-    fn ratchet_min_signature_version(&self, observed: Option<u8>) -> Result<()> {
-        let Some(observed) = observed else {
-            return Ok(());
-        };
-
-        let current = self
-            .secure_store
+    fn stored_min_signature_version_floor(&self) -> Result<Option<u8>> {
+        self.secure_store
             .get(MIN_SIGNATURE_VERSION_FLOOR_KEY)?
             .map(|bytes| {
                 let value = String::from_utf8(bytes).map_err(|e| {
@@ -64,12 +62,16 @@ impl PairingService {
                     ))
                 })
             })
-            .transpose()?
-            .unwrap_or(0);
+            .transpose()
+    }
 
-        if observed > current {
+    fn ratchet_min_signature_version(&self, observed: Option<u8>) -> Result<()> {
+        let required =
+            observed.unwrap_or(SIGNATURE_VERSION_SOURCE_FLOOR).max(SIGNATURE_VERSION_SOURCE_FLOOR);
+        let current = self.stored_min_signature_version_floor()?.unwrap_or(0);
+        if required > current {
             self.secure_store
-                .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, observed.to_string().as_bytes())?;
+                .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, required.to_string().as_bytes())?;
         }
 
         Ok(())
@@ -1176,10 +1178,11 @@ fn verify_hybrid_invitation(
     let Some((&version, sig_rest)) = sig_bytes.split_first() else {
         return Err(CoreError::Engine("invitation signature too short".into()));
     };
+    enforce_wire_signature_floor(version, SIGNATURE_VERSION_SOURCE_FLOOR)?;
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature::from_bytes(sig_rest)
         .map_err(|e| CoreError::Engine(format!("invitation hybrid signature invalid: {e}")))?;
     match version {
-        0x03 => hybrid_sig
+        SUPPORTED_SIGNATURE_VERSION => hybrid_sig
             .verify_v3(
                 signing_data,
                 hybrid_signature_contexts::INVITATION,
@@ -1192,6 +1195,17 @@ fn verify_hybrid_invitation(
                 "unsupported invitation signature version: 0x{version:02x}"
             )))
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn enforce_wire_signature_floor(wire_signature_version: u8, stored_floor: u8) -> Result<()> {
+    let required = stored_floor.max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    if wire_signature_version < required {
+        return Err(CoreError::Engine(format!(
+            "wire signature version 0x{wire_signature_version:02x} is below required floor 0x{required:02x}"
+        )));
     }
     Ok(())
 }
@@ -2242,7 +2256,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
 
         let joiner_mailbox = mailbox.clone();
         let joiner_relay = registry_relay.clone();
@@ -2449,7 +2463,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
 
         let joiner_mailbox = mailbox.clone();
         let joiner_relay = registry_relay.clone();
@@ -2599,7 +2613,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
         let confirmation = joiner.confirmation_mac().unwrap();
         mailbox
             .put_slot(&joiner_rendezvous_id, PairingSlot::Confirmation, &confirmation)
@@ -2727,7 +2741,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
 
         let joiner_mailbox = mailbox.clone();
         let joiner_relay = registry_relay.clone();
@@ -3035,7 +3049,36 @@ mod tests {
         let err =
             verify_hybrid_invitation(&signing_data, &legacy_wire, &inviter_pk, &inviter_ml_dsa_pk)
                 .unwrap_err();
-        assert!(err.to_string().contains("unsupported invitation signature version"));
+        assert!(err.to_string().contains("below required floor"));
+    }
+
+    #[test]
+    fn min_signature_version_omitted_relay_floor_ratchets_to_source_floor() {
+        let store = Arc::new(MemStore::default());
+        let service = PairingService::new(store.clone());
+
+        service.ratchet_min_signature_version(None).unwrap();
+
+        assert_eq!(
+            String::from_utf8(store.get(MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap().unwrap())
+                .unwrap(),
+            SIGNATURE_VERSION_SOURCE_FLOOR.to_string()
+        );
+    }
+
+    #[test]
+    fn min_signature_version_omitted_relay_floor_does_not_lower_stored_floor() {
+        let store = Arc::new(MemStore::default());
+        store.set(MIN_SIGNATURE_VERSION_FLOOR_KEY, b"4").unwrap();
+        let service = PairingService::new(store.clone());
+
+        service.ratchet_min_signature_version(None).unwrap();
+
+        assert_eq!(
+            String::from_utf8(store.get(MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap().unwrap())
+                .unwrap(),
+            "4"
+        );
     }
 
     #[tokio::test]

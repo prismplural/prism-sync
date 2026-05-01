@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `char_at`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `char_at`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `sas_display_json`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -762,13 +762,28 @@ Future<Uint8List> hexDecode({required String hexStr}) =>
 Future<String> startJoinerCeremony({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiStartJoinerCeremony(handle: handle);
 
+/// Cancel any in-progress relay-based PQ pairing ceremony.
+///
+/// This clears both in-memory ceremony slots, removes any pending joiner
+/// bootstrap identity material, and never sends credentials. If a rendezvous id
+/// was already allocated, the relay session is deleted on a best-effort basis
+/// after local state is cleared. Relay cleanup errors are intentionally logged
+/// and ignored so cancellation remains idempotent and can recover from
+/// partially connected/offline states.
+Future<void> cancelPairingCeremony({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiCancelPairingCeremony(handle: handle);
+
 /// Wait for the initiator's PairingInit and return the SAS display codes.
 ///
 /// Polls the relay for the PairingInit slot until it arrives, then derives
-/// the shared secret and SAS codes. Returns JSON:
+/// the shared secret and SAS phrase. Returns JSON:
 ///
 /// ```json
-/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// {
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"]
+/// }
 /// ```
 ///
 /// Must be called after [`start_joiner_ceremony`].
@@ -802,8 +817,9 @@ Future<String> completeJoinerCeremony({
 ///
 /// ```json
 /// {
-///   "sas_words": "apple banana cherry",
-///   "sas_decimal": "123456",
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"],
 ///   "joiner_device_id": "c3d4..."
 /// }
 /// ```

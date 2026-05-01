@@ -12,8 +12,8 @@ use prism_sync_core::bootstrap::sharing_trust::{
     GenerationAwareTrustDecision,
 };
 use prism_sync_core::bootstrap::{
-    InitiatorCeremony, JoinerCeremony, PrekeyStore, RendezvousToken, SharingIdentityBundle,
-    SharingRecipient, SharingSender,
+    InitiatorCeremony, JoinerCeremony, PrekeyStore, RendezvousToken, SasDisplay,
+    SharingIdentityBundle, SharingRecipient, SharingSender,
 };
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::service::PairingService;
@@ -21,6 +21,7 @@ use prism_sync_core::pairing::{
     compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
 };
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
+use prism_sync_core::relay::PairingRelay as _;
 use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
@@ -626,7 +627,7 @@ async fn encode_handle_core_error(
     error: prism_sync_core::CoreError,
 ) -> String {
     if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
-        let _ = ratchet_handle_min_signature_version(handle, *min_signature_version).await;
+        let _ = ratchet_handle_min_signature_version_floor(handle, *min_signature_version).await;
     }
     encode_core_error(operation, error)
 }
@@ -641,7 +642,8 @@ async fn format_handle_relay_error(
         ..
     } = &error
     {
-        let _ = ratchet_handle_min_signature_version(handle, Some(*min_signature_version)).await;
+        let _ =
+            ratchet_handle_min_signature_version_floor(handle, Some(*min_signature_version)).await;
     }
     format!("{operation} failed: {}", redact_display(&error))
 }
@@ -744,6 +746,7 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
 
 const SHARING_ID_CACHE_KEY: &str = "sharing_id_cache";
 const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
+const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 const SHARING_ID_LEN_BYTES: usize = 16;
 const PAIRWISE_SECRET_LEN_BYTES: usize = 32;
@@ -855,29 +858,47 @@ fn decode_optional_u8(store: &dyn PrismSecureStore, key: &str) -> Result<Option<
         .transpose()
 }
 
-fn ratchet_min_signature_version(
+fn stored_min_signature_version_floor(store: &dyn PrismSecureStore) -> Result<Option<u8>, String> {
+    decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)
+}
+
+fn ratchet_min_signature_version_floor(
     store: &dyn PrismSecureStore,
     observed: Option<u8>,
 ) -> Result<(), String> {
-    let Some(observed) = observed else {
-        return Ok(());
-    };
-    let current = decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)?.unwrap_or(0);
-    if observed > current {
+    let required =
+        observed.unwrap_or(SIGNATURE_VERSION_SOURCE_FLOOR).max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    let current = stored_min_signature_version_floor(store)?.unwrap_or(0);
+    if required > current {
         store
-            .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, observed.to_string().as_bytes())
+            .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, required.to_string().as_bytes())
             .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-fn enforce_supported_signature_version_floor(store: &dyn PrismSecureStore) -> Result<(), String> {
-    if let Some(required) = decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)? {
+fn ensure_app_supports_stored_floor(store: &dyn PrismSecureStore) -> Result<(), String> {
+    if let Some(required) = stored_min_signature_version_floor(store)? {
         if required > SUPPORTED_SIGNATURE_VERSION {
             return Err(format!(
                 "relay requires signature version {required}, but this app supports up to {SUPPORTED_SIGNATURE_VERSION}. Please update."
             ));
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn enforce_wire_signature_floor(
+    store: &dyn PrismSecureStore,
+    wire_signature_version: u8,
+) -> Result<(), String> {
+    let required =
+        stored_min_signature_version_floor(store)?.unwrap_or(0).max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    if wire_signature_version < required {
+        return Err(format!(
+            "wire signature version {wire_signature_version} is below required floor {required}"
+        ));
     }
     Ok(())
 }
@@ -1044,7 +1065,8 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
         )
     };
 
-    enforce_supported_signature_version_floor(secure_store.as_ref())?;
+    ratchet_min_signature_version_floor(secure_store.as_ref(), None)?;
+    ensure_app_supports_stored_floor(secure_store.as_ref())?;
 
     let relay_url = decode_optional_utf8(secure_store.as_ref(), "relay_url")?
         .or(fallback_relay_url)
@@ -1095,15 +1117,18 @@ async fn load_device_ml_dsa_generation(
     Ok(record.ml_dsa_key_generation)
 }
 
-async fn enforce_handle_signature_version_floor(handle: &PrismSyncHandle) -> Result<(), String> {
+async fn ensure_handle_supports_signature_version_floor(
+    handle: &PrismSyncHandle,
+) -> Result<(), String> {
     let secure_store = {
         let inner = handle.inner.lock().await;
         inner.secure_store().clone()
     };
-    enforce_supported_signature_version_floor(secure_store.as_ref())
+    ratchet_min_signature_version_floor(secure_store.as_ref(), None)?;
+    ensure_app_supports_stored_floor(secure_store.as_ref())
 }
 
-async fn ratchet_handle_min_signature_version(
+async fn ratchet_handle_min_signature_version_floor(
     handle: &PrismSyncHandle,
     observed: Option<u8>,
 ) -> Result<(), String> {
@@ -1111,7 +1136,7 @@ async fn ratchet_handle_min_signature_version(
         Ok(inner) => inner.secure_store().clone(),
         Err(_) => return Ok(()),
     };
-    ratchet_min_signature_version(secure_store.as_ref(), observed)
+    ratchet_min_signature_version_floor(secure_store.as_ref(), observed)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1356,7 +1381,8 @@ pub async fn initialize(
         inner.blocking_lock().initialize(&password, &secret_key).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("task failed: {e}"))?
+    .map_err(|e| format!("task failed: {e}"))??;
+    ratchet_handle_min_signature_version_floor(handle, None).await
 }
 
 /// Unlock (subsequent launches).
@@ -1371,7 +1397,8 @@ pub async fn unlock(
         inner.blocking_lock().unlock(&password, &secret_key).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("task failed: {e}"))?
+    .map_err(|e| format!("task failed: {e}"))??;
+    ratchet_handle_min_signature_version_floor(handle, None).await
 }
 
 /// Restore the unlocked state directly from raw key material.
@@ -1391,6 +1418,7 @@ pub async fn restore_runtime_keys(
     inner.restore_runtime_keys(&dek, &device_secret).map_err(|e| e.to_string())?;
 
     restore_persisted_epoch_keys(&mut inner)?;
+    ratchet_min_signature_version_floor(inner.secure_store().as_ref(), None)?;
 
     Ok(())
 }
@@ -1528,7 +1556,8 @@ pub async fn rekey_db(handle: &PrismSyncHandle, new_key: Vec<u8>) -> Result<(), 
 /// If the secure store contains an `epoch` key, that value is used instead.
 pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    enforce_supported_signature_version_floor(inner.secure_store().as_ref())?;
+    ratchet_min_signature_version_floor(inner.secure_store().as_ref(), None)?;
+    ensure_app_supports_stored_floor(inner.secure_store().as_ref())?;
 
     // Read credentials from secure store
     let sync_id = inner
@@ -2030,8 +2059,10 @@ pub async fn sync_now(handle: &PrismSyncHandle) -> Result<String, String> {
         Ok(result) => result,
         Err(error) => {
             if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
-                let _ =
-                    ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
+                let _ = ratchet_min_signature_version_floor(
+                    secure_store.as_ref(),
+                    *min_signature_version,
+                );
             }
             return Err(encode_core_error("sync_now", error));
         }
@@ -2316,7 +2347,7 @@ pub async fn create_sync_group(
     relay_url: String,
     mnemonic: Option<String>,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     const PENDING_SYNC_ID_KEY: &str = "pending_sync_id";
     const PENDING_NONCE_RESPONSE_KEY: &str = "pending_registration_nonce_response";
     const PENDING_ADMISSION_PROOF_KEY: &str = "pending_first_device_admission_proof";
@@ -2417,8 +2448,10 @@ pub async fn create_sync_group(
         Ok(value) => value,
         Err(error) => {
             if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
-                let _ =
-                    ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
+                let _ = ratchet_min_signature_version_floor(
+                    secure_store.as_ref(),
+                    *min_signature_version,
+                );
             }
             return Err(encode_core_error("create_sync_group", error));
         }
@@ -2595,7 +2628,7 @@ pub async fn list_devices(
     device_id: String,
     session_token: String,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2628,7 +2661,7 @@ pub async fn list_devices(
 /// Fetch the relay-advertised GIF service configuration for the current sync
 /// server. Returns JSON: `{"enabled": bool, "api_base_url": "...", "media_proxy_enabled": bool}`.
 pub async fn fetch_gif_service_config(handle: &PrismSyncHandle) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (sync_id, device_id, session_token, relay_url, storage, device_secret) = {
         let inner = handle.inner.lock().await;
         let secure_store = inner.secure_store();
@@ -2695,7 +2728,7 @@ pub async fn revoke_device(
     session_token: String,
     target_device_id: String,
 ) -> Result<(), String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2748,7 +2781,7 @@ pub async fn revoke_and_rekey(
     target_device_id: String,
     remote_wipe: bool,
 ) -> Result<u32, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2819,7 +2852,7 @@ pub async fn deregister_device(
     device_id: String,
     session_token: String,
 ) -> Result<(), String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2855,7 +2888,7 @@ pub async fn delete_sync_group(
     device_id: String,
     session_token: String,
 ) -> Result<(), String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2976,6 +3009,7 @@ pub async fn seed_secure_store(
     for (key, bytes) in entries {
         store.set(&key, &bytes).map_err(|e| e.to_string())?;
     }
+    ratchet_min_signature_version_floor(store.as_ref(), None)?;
     Ok(())
 }
 
@@ -3551,6 +3585,14 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
         .map_err(|e| format!("Failed to create PairingRelay: {e}"))
 }
 
+fn sas_display_json(sas: &SasDisplay) -> serde_json::Value {
+    serde_json::json!({
+        "sas_version": sas.version,
+        "sas_words": sas.words,
+        "sas_word_list": sas.word_list,
+    })
+}
+
 /// Start the joiner side of the relay-based PQ pairing ceremony.
 ///
 /// Generates bootstrap keys, uploads them to the relay, and returns
@@ -3567,7 +3609,7 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
 /// The `JoinerCeremony` state is stored in the handle for subsequent calls
 /// to [`get_joiner_sas`] and [`complete_joiner_ceremony`].
 pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::StartJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
@@ -3602,13 +3644,94 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
     Ok(result.to_string())
 }
 
+/// Cancel any in-progress relay-based PQ pairing ceremony.
+///
+/// This clears both in-memory ceremony slots, removes any pending joiner
+/// bootstrap identity material, and never sends credentials. If a rendezvous id
+/// was already allocated, the relay session is deleted on a best-effort basis
+/// after local state is cleared. Relay cleanup errors are intentionally logged
+/// and ignored so cancellation remains idempotent and can recover from
+/// partially connected/offline states.
+pub async fn cancel_pairing_ceremony(handle: &PrismSyncHandle) -> Result<(), String> {
+    let mut rendezvous_ids = Vec::new();
+
+    if let Some(ceremony) = handle
+        .joiner_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
+        .take()
+    {
+        rendezvous_ids.push(ceremony.rendezvous_id_hex());
+    }
+
+    if let Some(ceremony) = handle
+        .initiator_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
+        .take()
+    {
+        rendezvous_ids.push(ceremony.rendezvous_id_hex());
+    }
+
+    rendezvous_ids.sort();
+    rendezvous_ids.dedup();
+
+    {
+        let inner = handle.inner.lock().await;
+        let secure_store = inner.secure_store();
+        if let Err(error) = secure_store.delete("pending_device_secret") {
+            tracing::debug!(
+                "[prism_sync_ffi] pairing cancel could not delete pending_device_secret: {error}"
+            );
+        }
+        if let Err(error) = secure_store.delete("pending_device_id") {
+            tracing::debug!(
+                "[prism_sync_ffi] pairing cancel could not delete pending_device_id: {error}"
+            );
+        }
+    }
+
+    if rendezvous_ids.is_empty() {
+        return Ok(());
+    }
+
+    let pairing_relay = match build_pairing_relay(handle) {
+        Ok(pairing_relay) => pairing_relay,
+        Err(error) => {
+            tracing::debug!(
+                "[prism_sync_ffi] skipping best-effort pairing cancel relay cleanup: {error}"
+            );
+            return Ok(());
+        }
+    };
+
+    for rendezvous_id in rendezvous_ids {
+        let cleanup = pairing_relay.delete_session(&rendezvous_id);
+        match tokio::time::timeout(std::time::Duration::from_secs(2), cleanup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::debug!(
+                "[prism_sync_ffi] best-effort pairing cancel relay cleanup failed for {rendezvous_id}: {error}"
+            ),
+            Err(_) => tracing::debug!(
+                "[prism_sync_ffi] best-effort pairing cancel relay cleanup timed out for {rendezvous_id}"
+            ),
+        }
+    }
+
+    Ok(())
+}
+
 /// Wait for the initiator's PairingInit and return the SAS display codes.
 ///
 /// Polls the relay for the PairingInit slot until it arrives, then derives
-/// the shared secret and SAS codes. Returns JSON:
+/// the shared secret and SAS phrase. Returns JSON:
 ///
 /// ```json
-/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// {
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"]
+/// }
 /// ```
 ///
 /// Must be called after [`start_joiner_ceremony`].
@@ -3647,10 +3770,7 @@ pub async fn get_joiner_sas(handle: &PrismSyncHandle) -> Result<String, String> 
         .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
         .replace(ceremony);
 
-    let result = serde_json::json!({
-        "sas_words": sas.words,
-        "sas_decimal": sas.decimal,
-    });
+    let result = sas_display_json(&sas);
     Ok(result.to_string())
 }
 
@@ -3669,7 +3789,7 @@ pub async fn complete_joiner_ceremony(
     handle: &PrismSyncHandle,
     password: String,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
@@ -3868,8 +3988,9 @@ fn ensure_local_sync_metadata(
 ///
 /// ```json
 /// {
-///   "sas_words": "apple banana cherry",
-///   "sas_decimal": "123456",
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"],
 ///   "joiner_device_id": "c3d4..."
 /// }
 /// ```
@@ -3886,7 +4007,7 @@ pub async fn start_initiator_ceremony(
     handle: &PrismSyncHandle,
     token_bytes: Vec<u8>,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::StartInitiator)?;
     let token = RendezvousToken::from_bytes(&token_bytes)
         .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
@@ -3914,11 +4035,8 @@ pub async fn start_initiator_ceremony(
         .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
         .replace(ceremony);
 
-    let result = serde_json::json!({
-        "sas_words": sas.words,
-        "sas_decimal": sas.decimal,
-        "joiner_device_id": joiner_device_id,
-    });
+    let mut result = sas_display_json(&sas);
+    result["joiner_device_id"] = serde_json::Value::String(joiner_device_id);
     Ok(result.to_string())
 }
 
@@ -3939,7 +4057,7 @@ pub async fn complete_initiator_ceremony(
     password: String,
     mnemonic: String,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteInitiator)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
@@ -4608,6 +4726,104 @@ mod tests {
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
     use std::sync::Arc;
+
+    #[test]
+    fn min_signature_version_omitted_response_ratchets_to_source_floor() {
+        let store = MemorySecureStore::new();
+
+        ratchet_min_signature_version_floor(&store, None).unwrap();
+
+        assert_eq!(
+            decode_optional_u8(&store, MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap(),
+            Some(SIGNATURE_VERSION_SOURCE_FLOOR)
+        );
+    }
+
+    #[test]
+    fn min_signature_version_omission_does_not_lower_existing_floor() {
+        let store = MemorySecureStore::new();
+        store.set(MIN_SIGNATURE_VERSION_FLOOR_KEY, b"4").unwrap();
+
+        ratchet_min_signature_version_floor(&store, None).unwrap();
+
+        assert_eq!(decode_optional_u8(&store, MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn min_signature_version_above_app_support_fails_update_required() {
+        let store = MemorySecureStore::new();
+        store.set(MIN_SIGNATURE_VERSION_FLOOR_KEY, b"4").unwrap();
+
+        let err = ensure_app_supports_stored_floor(&store).unwrap_err();
+
+        assert!(err.contains("supports up to 3"), "unexpected error: {err}");
+        assert!(err.contains("Please update"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn min_signature_version_above_app_support_blocks_create_sync_group() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+        seed_secure_store(
+            &handle,
+            HashMap::from([(MIN_SIGNATURE_VERSION_FLOOR_KEY.to_string(), b"4".to_vec())]),
+        )
+        .await
+        .expect("seed secure store");
+
+        let err = create_sync_group(
+            &handle,
+            "pw".to_string(),
+            "https://relay.example.com".to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("supports up to 3"), "unexpected error: {err}");
+        assert!(err.contains("Please update"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn min_signature_version_wire_floor_rejects_v2_without_stored_floor() {
+        let store = MemorySecureStore::new();
+
+        let err = enforce_wire_signature_floor(&store, 0x02).unwrap_err();
+
+        assert!(err.contains("below required floor 3"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn min_signature_version_seed_secure_store_ratchets_low_floor() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        seed_secure_store(
+            &handle,
+            HashMap::from([(MIN_SIGNATURE_VERSION_FLOOR_KEY.to_string(), b"2".to_vec())]),
+        )
+        .await
+        .expect("seed secure store");
+
+        let inner = handle.inner.lock().await;
+        assert_eq!(
+            decode_optional_u8(inner.secure_store().as_ref(), MIN_SIGNATURE_VERSION_FLOOR_KEY)
+                .unwrap(),
+            Some(SIGNATURE_VERSION_SOURCE_FLOOR)
+        );
+    }
 
     #[test]
     fn parse_schema_json_accepts_real_type() {
@@ -5330,6 +5546,109 @@ mod tests {
     fn ceremony_guard_emits_stable_error_prefix() {
         // Dart-side error matching keys off this prefix.
         assert_eq!(CEREMONY_IN_PROGRESS_PREFIX, "CEREMONY_IN_PROGRESS");
+    }
+
+    #[test]
+    fn sas_display_json_has_v2_five_words_and_no_decimal() {
+        let sas = SasDisplay {
+            version: 2,
+            words: "atlas garden signal harbor velvet".to_string(),
+            word_list: vec![
+                "atlas".to_string(),
+                "garden".to_string(),
+                "signal".to_string(),
+                "harbor".to_string(),
+                "velvet".to_string(),
+            ],
+        };
+
+        let json = sas_display_json(&sas);
+        assert_eq!(json["sas_version"], 2);
+        assert_eq!(json["sas_words"], "atlas garden signal harbor velvet");
+        assert_eq!(json["sas_word_list"].as_array().unwrap().len(), 5);
+        assert!(
+            json.get("sas_decimal").is_none(),
+            "production FFI SAS JSON must not expose a decimal fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_pairing_ceremony_is_idempotent_with_no_slots() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        {
+            let inner = handle.inner.lock().await;
+            inner
+                .secure_store()
+                .set("pending_device_secret", b"orphan-pending-secret")
+                .expect("seed orphan pending secret");
+            inner
+                .secure_store()
+                .set("pending_device_id", b"orphan-pending-device")
+                .expect("seed orphan pending id");
+        }
+
+        cancel_pairing_ceremony(&handle).await.expect("empty cancel should succeed");
+        {
+            let inner = handle.inner.lock().await;
+            assert!(inner.secure_store().get("pending_device_secret").unwrap().is_none());
+            assert!(inner.secure_store().get("pending_device_id").unwrap().is_none());
+        }
+        cancel_pairing_ceremony(&handle).await.expect("second empty cancel should succeed");
+    }
+
+    #[tokio::test]
+    async fn cancel_pairing_ceremony_clears_slots_and_allows_fresh_start_guard() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+        {
+            let inner = handle.inner.lock().await;
+            inner
+                .secure_store()
+                .set("pending_device_secret", b"stale-pending-secret")
+                .expect("seed pending secret");
+            inner
+                .secure_store()
+                .set("pending_device_id", b"stale-pending-device")
+                .expect("seed pending id");
+        }
+        assert!(lock_or_recover(&handle.joiner_ceremony).is_some());
+
+        cancel_pairing_ceremony(&handle).await.expect("cancel should clear local state");
+
+        assert!(lock_or_recover(&handle.joiner_ceremony).is_none());
+        assert!(lock_or_recover(&handle.initiator_ceremony).is_none());
+        {
+            let inner = handle.inner.lock().await;
+            assert!(
+                inner.secure_store().get("pending_device_secret").unwrap().is_none(),
+                "cancel should delete stale pending device secret"
+            );
+            assert!(
+                inner.secure_store().get("pending_device_id").unwrap().is_none(),
+                "cancel should delete stale pending device id"
+            );
+        }
+        guard_ceremony_in_progress(&handle, CeremonyGuardKind::StartJoiner)
+            .expect("fresh joiner ceremony should no longer be blocked");
+        guard_ceremony_in_progress(&handle, CeremonyGuardKind::StartInitiator)
+            .expect("fresh initiator ceremony should no longer be blocked");
     }
 
     #[test]

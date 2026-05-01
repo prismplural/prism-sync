@@ -16,6 +16,7 @@ use super::{BootstrapProfile, BootstrapRole, BootstrapVersion};
 pub fn build_sync_pairing_transcript(
     rendezvous_id: &[u8; 16],
     commitment: &[u8; 32],
+    sas_version: u8,
     initiator: &PairingPublicKeys,
     responder: &JoinerBootstrapRecord,
     kem_ciphertext: &[u8],
@@ -25,6 +26,7 @@ pub fn build_sync_pairing_transcript(
 
     // Field order per Phase 3 plan section 3.2
     t.append_session_id(rendezvous_id);
+    t.append_fixed(b"pairing_sas_version", &[sas_version]);
     t.append_role_bytes(BootstrapRole::Initiator, b"device_id", initiator.device_id.as_bytes());
     t.append_role_bytes(BootstrapRole::Responder, b"device_id", responder.device_id.as_bytes());
     t.append_role_fixed(BootstrapRole::Initiator, b"ed25519_pk", &initiator.ed25519_pk);
@@ -45,7 +47,7 @@ pub fn build_sync_pairing_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::BootstrapVersion;
+    use crate::bootstrap::{BootstrapVersion, PAIRING_SAS_VERSION};
 
     const ML_DSA_65_PK_LEN: usize = 1952;
     const XWING_EK_LEN: usize = 1216;
@@ -84,6 +86,7 @@ mod tests {
         build_sync_pairing_transcript(
             rendezvous_id,
             commitment,
+            PAIRING_SAS_VERSION,
             initiator,
             responder,
             kem_ciphertext,
@@ -125,6 +128,35 @@ mod tests {
 
         let h1 = build_hash(&rid, &[0xAA; 32], &init, &resp, &ct, "https://relay.example.com");
         let h2 = build_hash(&rid, &[0xBB; 32], &init, &resp, &ct, "https://relay.example.com");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn transcript_changes_with_different_sas_version() {
+        let rid = [0x42; 16];
+        let commit = [0xAB; 32];
+        let init = sample_initiator();
+        let resp = sample_responder();
+        let ct = vec![0x99; 1120];
+
+        let h1 = build_sync_pairing_transcript(
+            &rid,
+            &commit,
+            PAIRING_SAS_VERSION,
+            &init,
+            &resp,
+            &ct,
+            "https://relay.example.com",
+        );
+        let h2 = build_sync_pairing_transcript(
+            &rid,
+            &commit,
+            PAIRING_SAS_VERSION.saturating_add(1),
+            &init,
+            &resp,
+            &ct,
+            "https://relay.example.com",
+        );
         assert_ne!(h1, h2);
     }
 
