@@ -33,6 +33,27 @@ async fn fetch_nonce(client: &Client, url: &str, sync_id: &str) -> String {
     nonce_json["nonce"].as_str().unwrap().to_string()
 }
 
+#[tokio::test]
+async fn relay_routes_are_mounted_under_v1_not_v2() {
+    let (url, _handle, _db) = start_test_relay().await;
+    let sync_id = generate_sync_id();
+    let client = Client::new();
+
+    let v1 = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(v1.status(), 200);
+
+    let v2 = client
+        .get(format!("{url}/v2/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(v2.status(), 404);
+}
+
 fn is_first_device_pow_valid(
     sync_id: &str,
     device_id: &str,

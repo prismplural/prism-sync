@@ -56,7 +56,7 @@ prism-sync-relay   (standalone, no dependency on other crates)
 - Storage traits are object-safe (no generic methods on `SyncStorage`)
 - `SyncStorageTx` for transactional writes, `SyncStorage` for reads + `begin_tx()`
 - `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` for SQLite transactions
-- All relay paths use `/v2/sync/{sync_id}/...`
+- All relay paths use `/v1/sync/{sync_id}/...`
 - Batch signatures use hybrid Ed25519 + ML-DSA-65 over deterministic binary canonical format (protocol V3)
 - Pull phase skips unverifiable batches (unknown/deleted sender, bad signature) instead of aborting
 - SyncEngine uses `Arc<dyn SyncStorage>` and `Arc<dyn SyncRelay>` (trait objects, not generics)
