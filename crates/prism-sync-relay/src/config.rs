@@ -6,6 +6,10 @@ const GENERATED_REGISTRATION_TOKEN_LOG_MESSAGE: &str =
 pub enum ConfigError {
     #[error("MIN_SIGNATURE_VERSION={configured} is below source floor {floor}; refusing to start")]
     MinSignatureVersionBelowSourceFloor { configured: u8, floor: u8 },
+    #[error(
+        "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED=true requires FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM"
+    )]
+    AppleAttestationEnabledWithoutTrustRoots,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +208,21 @@ impl Config {
             "MIN_SIGNATURE_VERSION",
             MIN_SIGNATURE_VERSION_SOURCE_FLOOR,
         )?;
+        let first_device_apple_attestation_enabled = parse_bool_env_with(
+            &env,
+            "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED",
+            false,
+        );
+        let first_device_apple_attestation_trust_roots_pem = parse_json_vec_env_with(
+            &env,
+            "FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM",
+            Vec::new(),
+        );
+        if first_device_apple_attestation_enabled
+            && first_device_apple_attestation_trust_roots_pem.is_empty()
+        {
+            return Err(ConfigError::AppleAttestationEnabledWithoutTrustRoots);
+        }
 
         Ok(Self {
             port: parse_env_with(&env, "PORT", 8080),
@@ -246,16 +265,8 @@ impl Config {
             ),
             reader_pool_size: parse_env_with(&env, "READER_POOL_SIZE", 4),
             node_exporter_url: env("NODE_EXPORTER_URL").filter(|s| !s.is_empty()),
-            first_device_apple_attestation_enabled: parse_bool_env_with(
-                &env,
-                "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED",
-                false,
-            ),
-            first_device_apple_attestation_trust_roots_pem: parse_json_vec_env_with(
-                &env,
-                "FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM",
-                Vec::new(),
-            ),
+            first_device_apple_attestation_enabled,
+            first_device_apple_attestation_trust_roots_pem,
             first_device_apple_attestation_allowed_app_ids: parse_json_vec_env_with(
                 &env,
                 "FIRST_DEVICE_APPLE_ATTESTATION_ALLOWED_APP_IDS",
@@ -599,6 +610,27 @@ mod tests {
         let config = config_from_env_pairs(&[]).unwrap();
 
         assert_eq!(config.min_signature_version, MIN_SIGNATURE_VERSION_SOURCE_FLOOR);
+    }
+
+    #[test]
+    fn rejects_apple_attestation_enabled_without_trust_roots() {
+        let err =
+            config_from_env_pairs(&[("FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", "true")])
+                .unwrap_err();
+
+        assert_eq!(err, ConfigError::AppleAttestationEnabledWithoutTrustRoots);
+    }
+
+    #[test]
+    fn accepts_apple_attestation_enabled_with_trust_roots() {
+        let config = config_from_env_pairs(&[
+            ("FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", "true"),
+            ("FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM", r#"["test-root"]"#),
+        ])
+        .unwrap();
+
+        assert!(config.first_device_apple_attestation_enabled);
+        assert_eq!(config.first_device_apple_attestation_trust_roots_pem, vec!["test-root"]);
     }
 
     #[cfg(unix)]
