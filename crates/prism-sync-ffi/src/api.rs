@@ -332,7 +332,7 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
         "pushed": result.pushed,
         "pruned": result.pruned,
         "duration_ms": result.duration.as_millis() as u64,
-        "error": result.error,
+        "error": result.error.as_deref().map(redact_sensitive_message),
         "error_kind": result.error_kind.as_ref().map(|k| format!("{k:?}")),
         "error_code": result.error_code,
         "remote_wipe": result.remote_wipe,
@@ -340,6 +340,213 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
 }
 
 const STRUCTURED_ERROR_PREFIX: &str = "PRISM_SYNC_ERROR_JSON:";
+const REDACTED_ID: &str = "[redacted-id]";
+const REDACTED_HEX: &str = "[redacted-hex]";
+const REDACTED_TOKEN: &str = "[redacted-token]";
+const REDACTED_VALUE: &str = "[redacted]";
+const SENSITIVE_MESSAGE_KEYS: &[&str] = &[
+    "content_hash",
+    "dek",
+    "device",
+    "device_id",
+    "deviceid",
+    "identity",
+    "init_id",
+    "media_id",
+    "mnemonic",
+    "pairwise_secret",
+    "password",
+    "recipient_sharing_id",
+    "recipientsharingid",
+    "relay",
+    "sender_id",
+    "sender_sharing_id",
+    "sendersharingid",
+    "session_token",
+    "sessiontoken",
+    "sharing_id",
+    "sharingid",
+    "signed",
+    "sync_id",
+    "syncid",
+    "target_device_id",
+    "targetdeviceid",
+    "token",
+    "wrapped_dek",
+];
+
+fn redact_sensitive_message(message: &str) -> String {
+    let keyed = redact_keyed_values(message);
+    redact_unkeyed_fragments(&keyed)
+}
+
+fn redact_display(error: &impl std::fmt::Display) -> String {
+    redact_sensitive_message(&error.to_string())
+}
+
+fn redacted_identifier_for_log(_identifier: &str) -> &'static str {
+    REDACTED_ID
+}
+
+fn redact_keyed_values(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut last = 0;
+    let mut index = 0;
+
+    while index < input.len() {
+        let Some((_, ch)) = input[index..].char_indices().next() else {
+            break;
+        };
+
+        if let Some((value_start, value_end)) =
+            SENSITIVE_MESSAGE_KEYS.iter().find_map(|key| keyed_value_range(input, index, key))
+        {
+            output.push_str(&input[last..value_start]);
+            output.push_str(REDACTED_VALUE);
+            last = value_end;
+            index = value_end;
+            continue;
+        }
+
+        index += ch.len_utf8();
+    }
+
+    output.push_str(&input[last..]);
+    output
+}
+
+fn keyed_value_range(input: &str, key_start: usize, key: &str) -> Option<(usize, usize)> {
+    if !is_sensitive_key_at(input, key_start, key) {
+        return None;
+    }
+
+    let mut index = key_start + key.len();
+    index = skip_ascii_whitespace(input, index);
+    if matches!(char_at(input, index), Some('"') | Some('\'')) {
+        index += 1;
+        index = skip_ascii_whitespace(input, index);
+    }
+    if !matches!(char_at(input, index), Some(':') | Some('=')) {
+        return None;
+    }
+    index += 1;
+    index = skip_ascii_whitespace(input, index);
+
+    let quote = match char_at(input, index) {
+        Some('"') | Some('\'') => {
+            let quote = char_at(input, index);
+            index += 1;
+            quote
+        }
+        _ => None,
+    };
+
+    let value_start = index;
+    let value_end = if let Some(quote) = quote {
+        input[index..]
+            .char_indices()
+            .find_map(|(offset, ch)| (ch == quote).then_some(index + offset))
+            .unwrap_or(input.len())
+    } else {
+        input[index..]
+            .char_indices()
+            .find_map(|(offset, ch)| is_unquoted_value_delimiter(ch).then_some(index + offset))
+            .unwrap_or(input.len())
+    };
+
+    (value_start < value_end).then_some((value_start, value_end))
+}
+
+fn is_sensitive_key_at(input: &str, key_start: usize, key: &str) -> bool {
+    input
+        .get(key_start..key_start + key.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(key))
+        && input
+            .get(..key_start)
+            .and_then(|prefix| prefix.chars().next_back())
+            .is_none_or(|ch| !is_key_char(ch))
+        && input
+            .get(key_start + key.len()..)
+            .and_then(|suffix| suffix.chars().next())
+            .is_none_or(|ch| !is_key_char(ch))
+}
+
+fn is_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn skip_ascii_whitespace(input: &str, mut index: usize) -> usize {
+    while matches!(char_at(input, index), Some(ch) if ch.is_ascii_whitespace()) {
+        index += 1;
+    }
+    index
+}
+
+fn char_at(input: &str, index: usize) -> Option<char> {
+    input.get(index..)?.chars().next()
+}
+
+fn is_unquoted_value_delimiter(ch: char) -> bool {
+    ch.is_ascii_whitespace() || matches!(ch, ',' | ')' | ']' | '}' | ';')
+}
+
+fn redact_unkeyed_fragments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut token = String::new();
+
+    for ch in input.chars() {
+        if is_fragment_char(ch) {
+            token.push(ch);
+        } else {
+            push_redacted_fragment(&mut output, &token);
+            token.clear();
+            output.push(ch);
+        }
+    }
+    push_redacted_fragment(&mut output, &token);
+
+    output
+}
+
+fn push_redacted_fragment(output: &mut String, token: &str) {
+    if token.is_empty() {
+        return;
+    }
+
+    if is_uuid_like(token) || is_short_hex_identifier(token) {
+        output.push_str(REDACTED_HEX);
+    } else if is_long_token_like(token) {
+        output.push_str(REDACTED_TOKEN);
+    } else {
+        output.push_str(token);
+    }
+}
+
+fn is_fragment_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-')
+}
+
+fn is_uuid_like(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() == 36
+        && matches!(bytes.get(8), Some(b'-'))
+        && matches!(bytes.get(13), Some(b'-'))
+        && matches!(bytes.get(18), Some(b'-'))
+        && matches!(bytes.get(23), Some(b'-'))
+        && token.chars().filter(|ch| *ch != '-').all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn is_short_hex_identifier(token: &str) -> bool {
+    token.len() >= 12
+        && token.chars().all(|ch| ch.is_ascii_hexdigit())
+        && token.chars().any(|ch| matches!(ch, 'a'..='f' | 'A'..='F'))
+}
+
+fn is_long_token_like(token: &str) -> bool {
+    token.len() >= 32
+        && token.chars().all(is_fragment_char)
+        && token.chars().any(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+}
 
 fn relay_error_category_to_json(kind: prism_sync_core::RelayErrorCategory) -> &'static str {
     match kind {
@@ -355,7 +562,7 @@ fn relay_error_category_to_json(kind: prism_sync_core::RelayErrorCategory) -> &'
 fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> String {
     let mut payload = serde_json::json!({
         "operation": operation,
-        "message": error.to_string(),
+        "message": redact_display(&error),
     });
 
     if let prism_sync_core::CoreError::Relay {
@@ -435,7 +642,7 @@ async fn format_handle_relay_error(
     {
         let _ = ratchet_handle_min_signature_version(handle, Some(*min_signature_version)).await;
     }
-    format!("{operation} failed: {error}")
+    format!("{operation} failed: {}", redact_display(&error))
 }
 
 fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json::Value {
@@ -454,7 +661,7 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
         SyncEvent::Error(err) => serde_json::json!({
             "type": "Error",
             "kind": format!("{:?}", err.kind),
-            "message": err.message,
+            "message": redact_sensitive_message(&err.message),
             "retryable": err.retryable,
             "code": err.code,
             "remote_wipe": err.remote_wipe,
@@ -519,7 +726,7 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
         SyncEvent::SnapshotUploadFailed { sync_id, reason } => serde_json::json!({
             "type": "SnapshotUploadFailed",
             "sync_id": sync_id,
-            "reason": reason,
+            "reason": redact_sensitive_message(reason),
         }),
     }
 }
@@ -1246,7 +1453,7 @@ fn restore_persisted_epoch_keys(inner: &mut PrismSync) -> Result<(), String> {
                 tracing::warn!(
                     epoch,
                     key = %key_name,
-                    error = %error,
+                    error = %redact_display(&error),
                     "restore_runtime_keys: skipping invalid persisted epoch key"
                 );
                 continue;
@@ -1395,7 +1602,10 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     // connect() spawns a background reconnect loop and never blocks).
     if let Err(e) = relay.connect_websocket().await {
         // Non-fatal: WebSocket will reconnect automatically with backoff.
-        tracing::warn!("[prism_sync_ffi] WebSocket connect failed (non-fatal): {e}");
+        tracing::warn!(
+            error = %redact_display(&e),
+            "[prism_sync_ffi] WebSocket connect failed (non-fatal)"
+        );
     }
 
     // Store relay so set_auto_sync can wire up the notification handler.
@@ -2460,7 +2670,7 @@ pub async fn revoke_device(
         .await
     {
         Ok(_) => Ok(()),
-        Err(error) => Err(format!("revoke_device failed: {error}")),
+        Err(error) => Err(format!("revoke_device failed: {}", redact_display(&error))),
     }
 }
 
@@ -2513,7 +2723,7 @@ pub async fn revoke_and_rekey(
         .await
     {
         Ok(epoch) => Ok(epoch),
-        Err(error) => Err(format!("revoke_and_rekey failed: {error}")),
+        Err(error) => Err(format!("revoke_and_rekey failed: {}", redact_display(&error))),
     }
 }
 
@@ -3032,10 +3242,10 @@ pub async fn sharing_process_pending(
                         sender_identity_hex: None,
                         fingerprint: None,
                         trust_decision: None,
-                        error: Some(format!(
+                        error: Some(redact_sensitive_message(&format!(
                             "relay sender_id does not match signed sender identity: relay={}, signed={}",
                             pending_init.sender_id, processed.sender_identity.sharing_id
-                        )),
+                        ))),
                     }
                 } else {
                     let pinned_identity = inputs
@@ -3132,7 +3342,7 @@ pub async fn sharing_process_pending(
                 sender_identity_hex: None,
                 fingerprint: None,
                 trust_decision: None,
-                error: Some(error.to_string()),
+                error: Some(redact_display(&error)),
             },
         };
 
@@ -4080,7 +4290,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
                 .await
             {
                 tracing::info!(
-                    device_id = %device_id,
+                    device_id = %redacted_identifier_for_log(&device_id),
                     generation = new_gen,
                     "rotate_ml_dsa_key: reconciled ambiguous relay failure after remote commit"
                 );
@@ -4186,13 +4396,14 @@ async fn reconcile_ml_dsa_rotation_commit(
     expected_new_gen: u32,
     expected_new_pk: &[u8],
 ) -> bool {
+    let redacted_device_id = redacted_identifier_for_log(device_id);
     let relay_devices = match relay.list_devices().await {
         Ok(devices) => devices,
         Err(error) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation failed to list relay devices"
             );
             return false;
@@ -4201,7 +4412,7 @@ async fn reconcile_ml_dsa_rotation_commit(
 
     let Some(relay_self) = relay_devices.iter().find(|device| device.device_id == device_id) else {
         tracing::warn!(
-            device_id = %device_id,
+            device_id = %redacted_device_id,
             generation = expected_new_gen,
             "rotate_ml_dsa_key: reconciliation could not find local device on relay"
         );
@@ -4210,7 +4421,7 @@ async fn reconcile_ml_dsa_rotation_commit(
 
     if relay_self.ml_dsa_key_generation != expected_new_gen {
         tracing::info!(
-            device_id = %device_id,
+            device_id = %redacted_device_id,
             expected_generation = expected_new_gen,
             relay_generation = relay_self.ml_dsa_key_generation,
             "rotate_ml_dsa_key: reconciliation did not prove relay advanced to target generation"
@@ -4222,7 +4433,7 @@ async fn reconcile_ml_dsa_rotation_commit(
         Ok(Some(response)) => response,
         Ok(None) => {
             tracing::info!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
                 "rotate_ml_dsa_key: reconciliation found no signed registry artifact"
             );
@@ -4230,9 +4441,9 @@ async fn reconcile_ml_dsa_rotation_commit(
         }
         Err(error) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation failed to fetch signed registry"
             );
             return false;
@@ -4243,9 +4454,9 @@ async fn reconcile_ml_dsa_rotation_commit(
         import_signed_registry(storage.clone(), sync_id, signed_registry.artifact_blob).await
     {
         tracing::warn!(
-            device_id = %device_id,
+            device_id = %redacted_device_id,
             generation = expected_new_gen,
-            error = %error,
+            error = %redact_sensitive_message(&error),
             "rotate_ml_dsa_key: reconciliation failed to import signed registry"
         );
         return false;
@@ -4261,7 +4472,7 @@ async fn reconcile_ml_dsa_rotation_commit(
                 true
             } else {
                 tracing::info!(
-                    device_id = %device_id,
+                    device_id = %redacted_device_id,
                     expected_generation = expected_new_gen,
                     local_generation = record.ml_dsa_key_generation,
                     "rotate_ml_dsa_key: reconciliation imported registry but local record did not match expected key state"
@@ -4271,7 +4482,7 @@ async fn reconcile_ml_dsa_rotation_commit(
         }
         Ok(Ok(None)) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
                 "rotate_ml_dsa_key: reconciliation could not find local device after registry import"
             );
@@ -4279,18 +4490,18 @@ async fn reconcile_ml_dsa_rotation_commit(
         }
         Ok(Err(error)) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation failed to load local device after registry import"
             );
             false
         }
         Err(error) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation device lookup task failed"
             );
             false
@@ -5080,6 +5291,57 @@ mod tests {
     }
 
     #[test]
+    fn redact_sensitive_message_masks_keyed_values_and_fragments() {
+        let message = concat!(
+            "device a1b2c3d4e5f6 rejected sync_id=feedfacefeedface ",
+            "session_token=\"abcdefghijklmnopqrstuvwxyzABCDEF012345\" ",
+            "fingerprint deadbeefdeadbeefdeadbeefdeadbeef"
+        );
+
+        let redacted = redact_sensitive_message(message);
+
+        assert!(!redacted.contains("a1b2c3d4e5f6"));
+        assert!(!redacted.contains("feedfacefeedface"));
+        assert!(!redacted.contains("abcdefghijklmnopqrstuvwxyzABCDEF012345"));
+        assert!(!redacted.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(redacted.contains(REDACTED_HEX));
+        assert!(redacted.contains(REDACTED_VALUE));
+    }
+
+    #[test]
+    fn sync_result_to_json_redacts_error_message() {
+        let mut result = prism_sync_core::engine::SyncResult::default();
+        result.error =
+            Some("device_id=a1b2c3d4e5f6 failed with key deadbeefdeadbeefdeadbeefdeadbeef".into());
+
+        let json = sync_result_to_json(&result);
+        let error = json["error"].as_str().unwrap();
+
+        assert!(!error.contains("a1b2c3d4e5f6"));
+        assert!(!error.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(error.contains(REDACTED_VALUE));
+        assert!(error.contains(REDACTED_HEX));
+    }
+
+    #[test]
+    fn sync_event_to_json_redacts_error_message() {
+        let event = prism_sync_core::events::SyncEvent::Error(prism_sync_core::events::SyncError {
+            kind: prism_sync_core::events::SyncErrorKind::DeviceIdentityMismatch,
+            message: "device a1b2c3d4e5f6 mismatched sync_id=feedfacefeedface".into(),
+            retryable: false,
+            code: Some("device_identity_mismatch".into()),
+            remote_wipe: None,
+        });
+
+        let json = sync_event_to_json(&event);
+        let message = json["message"].as_str().unwrap();
+
+        assert!(!message.contains("a1b2c3d4e5f6"));
+        assert!(!message.contains("feedfacefeedface"));
+        assert_eq!(json["code"], "device_identity_mismatch");
+    }
+
+    #[test]
     fn encode_core_error_surfaces_epoch_mismatch_code_and_epochs() {
         let encoded = encode_core_error(
             "complete_bootstrap_join",
@@ -5095,6 +5357,27 @@ mod tests {
         assert_eq!(payload["code"], "epoch_mismatch");
         assert_eq!(payload["local_epoch"], 2);
         assert_eq!(payload["relay_epoch"], 4);
+    }
+
+    #[test]
+    fn encode_core_error_redacts_relay_message_but_keeps_code() {
+        let encoded = encode_core_error(
+            "sync_now",
+            prism_sync_core::CoreError::from_relay(
+                prism_sync_core::relay::traits::RelayError::DeviceIdentityMismatch {
+                    message: "device_id=a1b2c3d4e5f6 key deadbeefdeadbeefdeadbeefdeadbeef".into(),
+                },
+            ),
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(encoded.strip_prefix(STRUCTURED_ERROR_PREFIX).unwrap()).unwrap();
+        let message = payload["message"].as_str().unwrap();
+        assert_eq!(payload["code"], "device_identity_mismatch");
+        assert!(!message.contains("a1b2c3d4e5f6"));
+        assert!(!message.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(message.contains(REDACTED_VALUE));
+        assert!(message.contains(REDACTED_HEX));
     }
 
     #[test]
