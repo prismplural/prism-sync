@@ -114,10 +114,9 @@ impl DeviceRegistryManager {
     /// Merge a relay-provided device record without allowing silent key
     /// replacement for a known device.
     ///
-    /// Current behavior still allows inserting unknown devices from the relay
-    /// so existing pair flows continue to work until signed registry updates are
-    /// fully wired. Known devices may only receive status/timestamp updates if
-    /// their keys are unchanged.
+    /// Unknown devices are rejected. New group members must arrive through a
+    /// locally verified signed registry import or pairing artifact, not through
+    /// the relay's unauthenticated device list.
     pub fn merge_relay_device(
         storage: &dyn SyncStorage,
         sync_id: &str,
@@ -126,7 +125,12 @@ impl DeviceRegistryManager {
         let _ = sync_id; // sync_id is part of the DeviceRecord
         let existing = storage.get_device_record(sync_id, &device.device_id)?;
         let merged = match existing {
-            None => device.clone(),
+            None => {
+                return Err(CoreError::Storage(StorageError::Logic(format!(
+                    "unknown device {} cannot be merged from relay device list without verified registry",
+                    device.device_id
+                ))));
+            }
             Some(existing) if !Self::keys_match(&existing, device) => {
                 // Check if this is an ML-DSA rotation (only ML-DSA key differs, generation increased)
                 if device.ml_dsa_key_generation > existing.ml_dsa_key_generation
