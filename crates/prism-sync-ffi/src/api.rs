@@ -2910,20 +2910,15 @@ pub async fn get_node_id(handle: &PrismSyncHandle) -> Result<Option<String>, Str
 /// Seed the in-memory secure store with values from the platform keychain.
 /// Call this after `create_prism_sync`, before `initialize`/`unlock`/`configure_engine`.
 ///
-/// `entries_json` is a JSON object: `{"key": "base64value", ...}`
+/// Entries are transferred as per-key byte buffers so secret material does not
+/// need to be assembled into a JSON string at the FFI boundary.
 pub async fn seed_secure_store(
     handle: &PrismSyncHandle,
-    entries_json: String,
+    entries: std::collections::HashMap<String, Vec<u8>>,
 ) -> Result<(), String> {
-    let entries: std::collections::HashMap<String, String> =
-        serde_json::from_str(&entries_json).map_err(|e| format!("Invalid entries JSON: {e}"))?;
     let inner = handle.inner.lock().await;
     let store = inner.secure_store();
-    for (key, b64_value) in entries {
-        use base64::Engine;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&b64_value)
-            .map_err(|e| format!("Invalid base64 for key '{key}': {e}"))?;
+    for (key, bytes) in entries {
         store.set(&key, &bytes).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -2932,7 +2927,7 @@ pub async fn seed_secure_store(
 /// Drain all values from the secure store so Dart can persist them
 /// back to the platform keychain.
 ///
-/// Returns a JSON object: `{"key": "base64value", ...}`
+/// Returns per-key byte buffers for the app to persist to its keychain.
 /// Call this after state-changing operations (initialize, change_password,
 /// create_sync_group, join_*).
 ///
@@ -2945,7 +2940,9 @@ pub async fn seed_secure_store(
 /// **Fallback:** if enumeration is unavailable (keychain-backed impls),
 /// drain falls back to the historical fixed `known_keys` list plus
 /// `epoch_key_1..=current_epoch`.
-pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, String> {
+pub async fn drain_secure_store(
+    handle: &PrismSyncHandle,
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
     let (store, storage, sync_id, cached_epoch) = {
         let inner = handle.inner.lock().await;
         let cached_epoch = inner
@@ -2966,13 +2963,7 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
 
     // Fast path: snapshot the entire store.
     if let Some(map) = store.snapshot().map_err(|e| e.to_string())? {
-        use base64::Engine;
-        let mut entries = serde_json::Map::with_capacity(map.len());
-        for (key, value) in map {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
-            entries.insert(key, serde_json::Value::String(b64));
-        }
-        return Ok(serde_json::Value::Object(entries).to_string());
+        return Ok(map);
     }
 
     // Fallback path: keychain-backed store without enumeration. Use the
@@ -3009,23 +3000,19 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         "sharing_id_cache",
         "min_signature_version_floor",
     ];
-    let mut entries = serde_json::Map::new();
+    let mut entries = std::collections::HashMap::new();
     for key in known_keys {
         if let Ok(Some(value)) = store.get(key) {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
-            entries.insert(key.to_string(), serde_json::Value::String(b64));
+            entries.insert(key.to_string(), value);
         }
     }
     for epoch in 1..=current_epoch {
         let key = format!("epoch_key_{epoch}");
         if let Ok(Some(value)) = store.get(&key) {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
-            entries.insert(key, serde_json::Value::String(b64));
+            entries.insert(key, value);
         }
     }
-    Ok(serde_json::Value::Object(entries).to_string())
+    Ok(entries)
 }
 
 // ── Phase 4 sharing bootstrap ──
@@ -5094,11 +5081,11 @@ mod tests {
         .expect("create_prism_sync");
 
         let epoch_4_key = [0x44u8; 32];
-        let entries = serde_json::json!({
-            "epoch": BASE64.encode(b"4"),
-            "epoch_key_4": BASE64.encode(epoch_4_key),
-        });
-        seed_secure_store(&handle, entries.to_string()).await.expect("seed secure store");
+        let entries = HashMap::from([
+            ("epoch".to_string(), b"4".to_vec()),
+            ("epoch_key_4".to_string(), epoch_4_key.to_vec()),
+        ]);
+        seed_secure_store(&handle, entries).await.expect("seed secure store");
 
         restore_runtime_keys(&handle, vec![0xAA; 32], vec![0xBB; 32])
             .await

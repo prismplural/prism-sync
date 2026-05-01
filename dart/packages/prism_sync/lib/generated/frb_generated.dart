@@ -173,7 +173,9 @@ abstract class RustLibApi extends BaseApi {
     required String mediaId,
   });
 
-  Future<String> crateApiDrainSecureStore({required PrismSyncHandle handle});
+  Future<Map<String, Uint8List>> crateApiDrainSecureStore({
+    required PrismSyncHandle handle,
+  });
 
   Future<Uint8List> crateApiEncryptXchacha({
     required List<int> key,
@@ -296,7 +298,7 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiSeedSecureStore({
     required PrismSyncHandle handle,
-    required String entriesJson,
+    required Map<String, Uint8List> entries,
   });
 
   Future<void> crateApiSetAutoSync({
@@ -1162,7 +1164,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
-  Future<String> crateApiDrainSecureStore({required PrismSyncHandle handle}) {
+  Future<Map<String, Uint8List>> crateApiDrainSecureStore({
+    required PrismSyncHandle handle,
+  }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
@@ -1179,7 +1183,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
+          decodeSuccessData: sse_decode_Map_String_list_prim_u_8_strict_None,
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiDrainSecureStoreConstMeta,
@@ -2313,7 +2317,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<void> crateApiSeedSecureStore({
     required PrismSyncHandle handle,
-    required String entriesJson,
+    required Map<String, Uint8List> entries,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -2323,7 +2327,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             handle,
             serializer,
           );
-          sse_encode_String(entriesJson, serializer);
+          sse_encode_Map_String_list_prim_u_8_strict_None(entries, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -2336,7 +2340,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiSeedSecureStoreConstMeta,
-        argValues: [handle, entriesJson],
+        argValues: [handle, entries],
         apiImpl: this,
       ),
     );
@@ -2344,7 +2348,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiSeedSecureStoreConstMeta => const TaskConstMeta(
     debugName: "seed_secure_store",
-    argNames: ["handle", "entriesJson"],
+    argNames: ["handle", "entries"],
   );
 
   @override

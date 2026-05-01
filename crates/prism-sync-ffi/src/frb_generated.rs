@@ -2959,7 +2959,8 @@ fn wire__crate__api__seed_secure_store_impl(
             let api_handle = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
-            let api_entries_json = <String>::sse_decode(&mut deserializer);
+            let api_entries =
+                <std::collections::HashMap<String, Vec<u8>>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, String>(
@@ -2984,8 +2985,7 @@ fn wire__crate__api__seed_secure_store_impl(
                         }
                         let api_handle_guard = api_handle_guard.unwrap();
                         let output_ok =
-                            crate::api::seed_secure_store(&*api_handle_guard, api_entries_json)
-                                .await?;
+                            crate::api::seed_secure_store(&*api_handle_guard, api_entries).await?;
                         Ok(output_ok)
                     })()
                     .await,
