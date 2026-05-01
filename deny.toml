@@ -1,5 +1,7 @@
 [advisories]
-# Vulnerability advisories are denied by default in cargo-deny 0.19+.
+# cargo-deny 0.19+ removed the vulnerability lint key; all vulnerability
+# advisories are errors unless explicitly listed in ignore.
+ignore = []
 unmaintained = "workspace"
 yanked = "deny"
 
