@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2513,6 +2514,34 @@ pub async fn create_sync_group(
 pub async fn prepare_pending_device_identity(handle: &PrismSyncHandle) -> Result<String, String> {
     let device_secret = prism_sync_crypto::DeviceSecret::generate();
     let device_id = prism_sync_core::node_id::generate_node_id();
+    let signing_key = device_secret
+        .ed25519_keypair(&device_id)
+        .map_err(|e| format!("ed25519 derive failed: {e}"))?;
+    let x25519_key = device_secret
+        .x25519_keypair(&device_id)
+        .map_err(|e| format!("x25519 derive failed: {e}"))?;
+    let ml_dsa_key = device_secret
+        .ml_dsa_65_keypair(&device_id)
+        .map_err(|e| format!("ml-dsa derive failed: {e}"))?;
+    let ml_kem_key = device_secret
+        .ml_kem_768_keypair(&device_id)
+        .map_err(|e| format!("ml-kem derive failed: {e}"))?;
+    let xwing_key = device_secret
+        .xwing_keypair(&device_id)
+        .map_err(|e| format!("x-wing derive failed: {e}"))?;
+
+    let signing_pk = signing_key.public_key_bytes();
+    let x25519_pk = x25519_key.public_key_bytes();
+    let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+    let ml_kem_pk = ml_kem_key.public_key_bytes();
+    let xwing_pk = xwing_key.encapsulation_key_bytes();
+    let registration_key_bundle_hash = compute_registration_key_bundle_hash(
+        &signing_pk,
+        &x25519_pk,
+        &ml_dsa_pk,
+        &ml_kem_pk,
+        &xwing_pk,
+    );
 
     let handle_inner = handle.inner.lock().await;
     let store = handle_inner.secure_store();
@@ -2523,7 +2552,33 @@ pub async fn prepare_pending_device_identity(handle: &PrismSyncHandle) -> Result
         .set("pending_device_id", device_id.as_bytes())
         .map_err(|e| format!("Failed to persist pending device id: {e}"))?;
 
-    Ok(device_id)
+    Ok(serde_json::json!({
+        "device_id": device_id,
+        "registration_key_bundle_hash": hex::encode(registration_key_bundle_hash),
+    })
+    .to_string())
+}
+
+fn compute_registration_key_bundle_hash(
+    signing_pk: &[u8],
+    x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
+) -> [u8; 32] {
+    fn write_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"PRISM_SYNC_REGISTRATION_KEY_BUNDLE_V1\x00");
+    write_len_prefixed(&mut hasher, signing_pk);
+    write_len_prefixed(&mut hasher, x25519_pk);
+    write_len_prefixed(&mut hasher, ml_dsa_pk);
+    write_len_prefixed(&mut hasher, ml_kem_pk);
+    write_len_prefixed(&mut hasher, xwing_pk);
+    hasher.finalize().into()
 }
 
 // ── Device management ──

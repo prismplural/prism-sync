@@ -17,6 +17,7 @@ use crate::{
     attestation::{self, FirstDeviceAdmissionKind},
     auth, db,
     errors::AppError,
+    registration_binding,
     state::AppState,
 };
 
@@ -440,10 +441,11 @@ fn do_register(
         }
 
         let platform_proof_valid = match first_device_admission_proof.as_ref() {
-            Some(proof) => {
-                verify_first_device_admission_proof(sync_id, device_id, nonce, proof, config)
-                    .is_ok()
-            }
+            Some(proof) => verify_first_device_admission_proof(
+                sync_id, device_id, nonce, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
+                proof, config,
+            )
+            .is_ok(),
             None => false,
         };
 
@@ -592,15 +594,25 @@ fn verify_first_device_admission_proof(
     sync_id: &str,
     device_id: &str,
     nonce: &str,
+    signing_pk: &[u8],
+    x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
     proof: &FirstDeviceAdmissionProof,
     config: &crate::config::Config,
 ) -> Result<(), AppError> {
+    let registration_key_bundle_hash = registration_binding::compute_registration_key_bundle_hash(
+        signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
+    );
+
     match proof {
         FirstDeviceAdmissionProof::AndroidKeyAttestation { certificate_chain } => {
             let verification = attestation::verify_android_key_attestation(
                 sync_id,
                 device_id,
                 nonce,
+                &registration_key_bundle_hash,
                 certificate_chain,
                 config,
             )
@@ -622,6 +634,7 @@ fn verify_first_device_admission_proof(
                 sync_id,
                 device_id,
                 nonce,
+                &registration_key_bundle_hash,
                 key_id,
                 attestation_object,
                 config,

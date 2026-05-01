@@ -18,7 +18,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
 base64 = { workspace = true }
+hex = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+sha2 = { workspace = true }
 zeroize = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }

@@ -6,9 +6,10 @@ use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
 use crate::config::Config;
+use crate::registration_binding;
 
 const APPLE_APP_ATTESTATION_EXTENSION_OID: &[u64] = &[1, 2, 840, 113635, 100, 8, 2];
-const APPLE_APP_ATTESTATION_CONTEXT: &[u8] = b"PRISM_SYNC_APPLE_APP_ATTEST_V1\x00";
+const APPLE_APP_ATTESTATION_CONTEXT: &[u8] = b"PRISM_SYNC_APPLE_APP_ATTEST_V2\x00";
 const APPLE_APP_ATTESTATION_FMT: &str = "apple-appattest";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,21 +28,22 @@ pub(crate) fn compute_apple_attestation_challenge(
     sync_id: &str,
     device_id: &str,
     nonce: &str,
+    registration_key_bundle_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(APPLE_APP_ATTESTATION_CONTEXT);
-    hasher.update(sync_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(device_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(nonce.as_bytes());
-    hasher.finalize().into()
+    registration_binding::compute_attestation_challenge(
+        APPLE_APP_ATTESTATION_CONTEXT,
+        sync_id,
+        device_id,
+        nonce,
+        registration_key_bundle_hash,
+    )
 }
 
 pub(crate) fn verify_apple_app_attest(
     sync_id: &str,
     device_id: &str,
     nonce: &str,
+    registration_key_bundle_hash: &[u8; 32],
     key_id: &str,
     attestation_object: &str,
     config: &Config,
@@ -50,7 +52,12 @@ pub(crate) fn verify_apple_app_attest(
         return Err("apple attestation disabled".into());
     }
 
-    let expected_challenge = compute_apple_attestation_challenge(sync_id, device_id, nonce);
+    let expected_challenge = compute_apple_attestation_challenge(
+        sync_id,
+        device_id,
+        nonce,
+        registration_key_bundle_hash,
+    );
     let attestation_bytes = decode_base64_der(attestation_object)?;
     let cbor_value: Value = ciborium::de::from_reader(attestation_bytes.as_slice())
         .map_err(|e| format!("invalid apple attestation CBOR: {e}"))?;
@@ -405,7 +412,9 @@ mod tests {
     fn verify_apple_app_attest_accepts_valid_attestation() {
         let app_id = "TEAMID.com.prism.prism_plurality";
         let key_id = [0xAB; 16];
-        let challenge = compute_apple_attestation_challenge("sync", "device", "nonce");
+        let key_bundle_hash = [0x5A; 32];
+        let challenge =
+            compute_apple_attestation_challenge("sync", "device", "nonce", &key_bundle_hash);
         let auth_data = build_auth_data(app_id, &key_id);
         let nonce = apple_certificate_nonce(&auth_data, &challenge);
         let (root_cert, root_key) = make_test_root();
@@ -444,6 +453,7 @@ mod tests {
             "sync",
             "device",
             "nonce",
+            &key_bundle_hash,
             &key_id,
             &attestation_object,
             &test_config(root_cert.pem(), vec![app_id.to_string()]),

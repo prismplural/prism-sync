@@ -106,14 +106,43 @@ fn is_first_device_pow_valid(
     hash.get(full_zero_bytes).is_some_and(|byte| byte & mask == 0)
 }
 
-fn apple_attestation_challenge(sync_id: &str, device_id: &str, nonce: &str) -> [u8; 32] {
+fn registration_key_bundle_hash(
+    signing_pk: &[u8],
+    x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
+) -> [u8; 32] {
+    fn write_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(b"PRISM_SYNC_APPLE_APP_ATTEST_V1\x00");
+    hasher.update(b"PRISM_SYNC_REGISTRATION_KEY_BUNDLE_V1\x00");
+    write_len_prefixed(&mut hasher, signing_pk);
+    write_len_prefixed(&mut hasher, x25519_pk);
+    write_len_prefixed(&mut hasher, ml_dsa_pk);
+    write_len_prefixed(&mut hasher, ml_kem_pk);
+    write_len_prefixed(&mut hasher, xwing_pk);
+    hasher.finalize().into()
+}
+
+fn apple_attestation_challenge(
+    sync_id: &str,
+    device_id: &str,
+    nonce: &str,
+    registration_key_bundle_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"PRISM_SYNC_APPLE_APP_ATTEST_V2\x00");
     hasher.update(sync_id.as_bytes());
     hasher.update([0]);
     hasher.update(device_id.as_bytes());
     hasher.update([0]);
     hasher.update(nonce.as_bytes());
+    hasher.update([0]);
+    hasher.update(registration_key_bundle_hash);
     hasher.finalize().into()
 }
 
@@ -145,6 +174,7 @@ fn build_apple_app_attest_proof(
     sync_id: &str,
     device_id: &str,
     nonce: &str,
+    registration_key_bundle_hash: &[u8; 32],
     app_id: &str,
     key_id: &[u8],
     root_cert: &rcgen::Certificate,
@@ -152,7 +182,8 @@ fn build_apple_app_attest_proof(
 ) -> Value {
     use rcgen::{CertificateParams, CustomExtension, KeyPair};
 
-    let client_data_hash = apple_attestation_challenge(sync_id, device_id, nonce);
+    let client_data_hash =
+        apple_attestation_challenge(sync_id, device_id, nonce, registration_key_bundle_hash);
     let auth_data = build_apple_auth_data(app_id, key_id);
     let attestation_nonce = build_apple_certificate_nonce(&auth_data, &client_data_hash);
 
@@ -995,6 +1026,13 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
     let device_id = generate_device_id();
     let test_keys = TestDeviceKeys::generate(&device_id);
     let signing_key = &test_keys.ed25519_signing_key;
+    let key_bundle_hash = registration_key_bundle_hash(
+        signing_key.verifying_key().as_bytes(),
+        &test_keys.x25519_pk,
+        &test_keys.ml_dsa_pk,
+        &test_keys.ml_kem_pk,
+        &[],
+    );
 
     let nonce_resp =
         client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
@@ -1010,6 +1048,44 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         &sync_id,
         &device_id,
         nonce,
+        &key_bundle_hash,
+        app_id,
+        &[0x42; 16],
+        &root_cert,
+        &root_key,
+    );
+
+    let substituted_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode([0x99u8; 32]),
+            "ml_dsa_65_public_key": hex::encode(&test_keys.ml_dsa_pk),
+            "ml_kem_768_public_key": hex::encode(&test_keys.ml_kem_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "first_device_admission_proof": proof,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(substituted_resp.status(), 403);
+    let substituted_body: Value = substituted_resp.json().await.unwrap();
+    assert_eq!(substituted_body["error"].as_str(), Some("first_device_admission_required"));
+
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
+    assert_eq!(nonce_resp.status(), 200);
+    let nonce_json: Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+    let challenge_sig =
+        sign_hybrid_challenge(signing_key, &challenge_sig_ml_dsa_kp, &sync_id, &device_id, nonce);
+    let proof = build_apple_app_attest_proof(
+        &sync_id,
+        &device_id,
+        nonce,
+        &key_bundle_hash,
         app_id,
         &[0x42; 16],
         &root_cert,
