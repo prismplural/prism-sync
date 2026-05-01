@@ -181,10 +181,8 @@ impl KeyHierarchy {
         let mut epochs: Vec<u32> = self.epoch_keys.keys().copied().collect();
         epochs.sort_unstable();
         for epoch in epochs {
-            let key_vec = self
-                .epoch_keys
-                .get(&epoch)
-                .expect("epoch key just enumerated should exist");
+            let key_vec =
+                self.epoch_keys.get(&epoch).expect("epoch key just enumerated should exist");
             let key_arr: &[u8; 32] = key_vec.as_slice().try_into().map_err(|_| {
                 CryptoError::InvalidKeyMaterial(format!(
                     "epoch {epoch} key has unexpected length {}",

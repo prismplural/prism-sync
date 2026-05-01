@@ -40,18 +40,10 @@ async fn relay_routes_are_mounted_under_v1_not_v2() {
     let sync_id = generate_sync_id();
     let client = Client::new();
 
-    let v1 = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let v1 = client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(v1.status(), 200);
 
-    let v2 = client
-        .get(format!("{url}/v2/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let v2 = client.get(format!("{url}/v2/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(v2.status(), 404);
 }
 
@@ -61,11 +53,7 @@ async fn test_first_device_nonce_omits_pow_challenge_when_difficulty_zero() {
     let client = Client::new();
     let sync_id = generate_sync_id();
 
-    let resp = client
-        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
     let nonce_json: Value = resp.json().await.unwrap();

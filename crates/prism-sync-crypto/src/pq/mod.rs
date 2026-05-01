@@ -680,15 +680,9 @@ mod tests {
         assert_eq!(hybrid_signature_contexts::SYNC_BATCH, b"sync_batch");
         assert_eq!(hybrid_signature_contexts::REGISTRY_SNAPSHOT, b"registry_snapshot");
         assert_eq!(hybrid_signature_contexts::HTTP_REQUEST, b"http_request");
-        assert_eq!(
-            hybrid_signature_contexts::SHARING_IDENTITY_BUNDLE,
-            b"sharing_identity_bundle"
-        );
+        assert_eq!(hybrid_signature_contexts::SHARING_IDENTITY_BUNDLE, b"sharing_identity_bundle");
         assert_eq!(hybrid_signature_contexts::SIGNED_PREKEY, b"signed_prekey");
-        assert_eq!(
-            hybrid_signature_contexts::SIGNED_PREKEY_BUNDLE,
-            b"signed_prekey_bundle"
-        );
+        assert_eq!(hybrid_signature_contexts::SIGNED_PREKEY_BUNDLE, b"signed_prekey_bundle");
         assert_eq!(hybrid_signature_contexts::INVITATION, b"invitation");
         assert_eq!(hybrid_signature_contexts::REGISTRY_APPROVAL, b"registry_approval");
         assert_eq!(hybrid_signature_contexts::DEVICE_CHALLENGE, b"device_challenge");
