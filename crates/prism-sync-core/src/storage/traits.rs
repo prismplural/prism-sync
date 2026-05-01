@@ -149,7 +149,7 @@ pub trait SyncStorageTx {
     // ── Pending ops ──
     fn insert_pending_op(&mut self, op: &PendingOp) -> Result<()>;
     fn mark_batch_pushed(&mut self, batch_id: &str) -> Result<()>;
-    fn delete_pushed_ops(&mut self, sync_id: &str) -> Result<()>;
+    fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()>;
 
     // ── Applied ops ──
     fn insert_applied_op(&mut self, op: &AppliedOp) -> Result<()>;

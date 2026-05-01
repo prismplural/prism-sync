@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::hlc::Hlc;
 use crate::schema::{encode_value, SyncValue};
 use crate::storage::{FieldVersion, PendingOp, SyncStorage};
@@ -17,9 +17,9 @@ pub const DELETED_FIELD: &str = "is_deleted";
 /// - Creating a `local_batch_id` (UUID v4) shared by all ops in one transaction
 /// - Invoking `emit_create`, `emit_update`, or `emit_delete`
 ///
-/// The OpEmitter ticks the HLC once per call and stamps every op in that
-/// invocation with the same HLC value, ensuring causal consistency within
-/// a batch.
+/// The OpEmitter ticks the HLC once per op-emitting call and stamps every op
+/// in that invocation with the same HLC value, ensuring causal consistency
+/// within a batch.
 ///
 /// Ported from Dart `lib/core/sync/op_emitter.dart`.
 pub struct OpEmitter {
@@ -83,9 +83,11 @@ impl OpEmitter {
     }
 
     /// Tick the HLC once and return the new value.
-    fn tick(&mut self) -> Hlc {
-        self.last_hlc = Hlc::now(&self.device_id, Some(&self.last_hlc));
-        self.last_hlc.clone()
+    fn tick(&mut self) -> Result<Hlc> {
+        let next_hlc = Hlc::try_now(&self.device_id, Some(&self.last_hlc))
+            .map_err(|e| CoreError::Engine(e.to_string()))?;
+        self.last_hlc = next_hlc.clone();
+        Ok(next_hlc)
     }
 
     /// Emit ops for a newly created entity.
@@ -100,7 +102,11 @@ impl OpEmitter {
         fields: &HashMap<String, SyncValue>,
         local_batch_id: &str,
     ) -> Result<()> {
-        let hlc = self.tick();
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
 
@@ -168,7 +174,7 @@ impl OpEmitter {
             return Ok(());
         }
 
-        let hlc = self.tick();
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
 
@@ -245,7 +251,7 @@ impl OpEmitter {
             return Ok(());
         }
 
-        let hlc = self.tick();
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
 
@@ -291,7 +297,7 @@ impl OpEmitter {
         entity_id: &str,
         local_batch_id: &str,
     ) -> Result<()> {
-        let hlc = self.tick();
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
         let op_id = Uuid::new_v4().to_string();
@@ -426,6 +432,40 @@ mod tests {
 
         // HLC should NOT have advanced (no tick for empty update)
         assert_eq!(*emitter.last_hlc(), hlc_before);
+    }
+
+    #[test]
+    fn emit_create_skips_empty_fields() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        let hlc_before = emitter.last_hlc().clone();
+
+        let empty: HashMap<String, SyncValue> = HashMap::new();
+        emitter.emit_create(&storage, "members", "ent-1", &empty, "batch-empty-create").unwrap();
+
+        let ops = storage.load_batch_ops("batch-empty-create").unwrap();
+        assert!(ops.is_empty());
+        assert_eq!(*emitter.last_hlc(), hlc_before);
+    }
+
+    #[test]
+    fn emit_update_returns_error_without_writing_when_hlc_counter_overflows() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        let saturated = Hlc::new(now_ms() + 100_000, u32::MAX, "a1b2c3d4e5f6");
+        emitter.set_last_hlc(saturated.clone());
+
+        let mut changed = HashMap::new();
+        changed.insert("name".to_string(), SyncValue::String("Bob".to_string()));
+
+        let err = emitter
+            .emit_update(&storage, "members", "ent-1", &changed, "batch-overflow")
+            .unwrap_err();
+        assert!(err.to_string().contains("HLC counter overflow"));
+        assert_eq!(*emitter.last_hlc(), saturated);
+
+        let ops = storage.load_batch_ops("batch-overflow").unwrap();
+        assert!(ops.is_empty());
     }
 
     #[test]

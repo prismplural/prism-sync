@@ -1065,7 +1065,7 @@ impl SyncEngine {
             tokio::task::spawn_blocking(move || {
                 let mut tx = storage.begin_tx()?;
                 tx.mark_batch_pushed(&bid)?;
-                tx.delete_pushed_ops(&sid)?;
+                tx.delete_pushed_ops(&sid, &bid)?;
                 tx.commit()?;
                 Ok::<_, CoreError>(())
             })

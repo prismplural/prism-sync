@@ -395,12 +395,12 @@ fn delete_pushed_ops_when_none_exist_is_noop() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.delete_pushed_ops("sync-1").unwrap();
+    tx.delete_pushed_ops("sync-1", "batch-1").unwrap();
     tx.commit().unwrap();
 }
 
 #[test]
-fn delete_pushed_ops_only_removes_pushed() {
+fn delete_pushed_ops_only_removes_target_pushed_batch() {
     let storage = make_storage();
 
     let mut tx = storage.begin_tx().unwrap();
@@ -414,13 +414,43 @@ fn delete_pushed_ops_only_removes_pushed() {
     tx.commit().unwrap();
 
     let mut tx = storage.begin_tx().unwrap();
-    tx.delete_pushed_ops("sync-1").unwrap();
+    tx.delete_pushed_ops("sync-1", "batch-2").unwrap();
     tx.commit().unwrap();
 
     // op-1 (unpushed) should remain, op-2 (pushed) should be gone
     let batches = storage.get_unpushed_batch_ids("sync-1").unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0], "batch-1");
+}
+
+#[test]
+fn delete_pushed_ops_leaves_other_pushed_batches() {
+    let storage = make_storage();
+
+    let mut tx = storage.begin_tx().unwrap();
+    tx.insert_pending_op(&{
+        let mut op = sample_pending_op("op-1", "batch-1");
+        op.pushed_at = Some(Utc::now());
+        op
+    })
+    .unwrap();
+    tx.insert_pending_op(&{
+        let mut op = sample_pending_op("op-2", "batch-2");
+        op.pushed_at = Some(Utc::now());
+        op
+    })
+    .unwrap();
+    tx.commit().unwrap();
+
+    let mut tx = storage.begin_tx().unwrap();
+    tx.delete_pushed_ops("sync-1", "batch-1").unwrap();
+    tx.commit().unwrap();
+
+    assert!(storage.load_batch_ops("batch-1").unwrap().is_empty());
+
+    let batch_2_ops = storage.load_batch_ops("batch-2").unwrap();
+    assert_eq!(batch_2_ops.len(), 1);
+    assert!(batch_2_ops[0].pushed_at.is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

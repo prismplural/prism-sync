@@ -25,6 +25,12 @@ pub struct Hlc {
     pub node_id: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum HlcOverflowError {
+    #[error("HLC counter overflow while advancing timestamp {timestamp} for node {node_id}")]
+    Counter { timestamp: i64, node_id: String },
+}
+
 impl Hlc {
     /// Create an HLC with explicit values.
     pub fn new(timestamp: i64, counter: u32, node_id: impl Into<String>) -> Self {
@@ -87,18 +93,27 @@ impl Hlc {
     /// If `last_known` is provided and its timestamp >= wall clock,
     /// the counter is incremented instead of resetting to 0.
     pub fn now(node_id: &str, last_known: Option<&Hlc>) -> Self {
+        Self::try_now(node_id, last_known).expect("HLC counter overflow")
+    }
+
+    /// Checked variant of `now` that returns a typed error instead of
+    /// panicking or wrapping when the same-timestamp counter is exhausted.
+    pub fn try_now(
+        node_id: &str,
+        last_known: Option<&Hlc>,
+    ) -> std::result::Result<Self, HlcOverflowError> {
         let now = Self::now_ms();
 
         match last_known {
-            None => Self { timestamp: now, counter: 0, node_id: node_id.to_string() },
+            None => Ok(Self { timestamp: now, counter: 0, node_id: node_id.to_string() }),
             Some(last) if now > last.timestamp => {
-                Self { timestamp: now, counter: 0, node_id: node_id.to_string() }
+                Ok(Self { timestamp: now, counter: 0, node_id: node_id.to_string() })
             }
-            Some(last) => Self {
+            Some(last) => Ok(Self {
                 timestamp: last.timestamp,
-                counter: last.counter + 1,
+                counter: increment_counter(last.counter, last.timestamp, node_id)?,
                 node_id: node_id.to_string(),
-            },
+            }),
         }
     }
 
@@ -116,20 +131,30 @@ impl Hlc {
     /// 5. Else (max_ts == now, wall clock advanced):
     ///    counter = 0
     pub fn merge(&self, remote: &Hlc, local_node_id: &str) -> Self {
+        self.try_merge(remote, local_node_id).expect("HLC counter overflow")
+    }
+
+    /// Checked variant of `merge` that returns a typed error instead of
+    /// panicking or wrapping when the resulting counter is exhausted.
+    pub fn try_merge(
+        &self,
+        remote: &Hlc,
+        local_node_id: &str,
+    ) -> std::result::Result<Self, HlcOverflowError> {
         let now = Self::now_ms();
         let max_ts = now.max(self.timestamp).max(remote.timestamp);
 
         let new_counter = if max_ts == self.timestamp && max_ts == remote.timestamp {
-            self.counter.max(remote.counter) + 1
+            increment_counter(self.counter.max(remote.counter), max_ts, local_node_id)?
         } else if max_ts == self.timestamp {
-            self.counter + 1
+            increment_counter(self.counter, max_ts, local_node_id)?
         } else if max_ts == remote.timestamp {
-            remote.counter + 1
+            increment_counter(remote.counter, max_ts, local_node_id)?
         } else {
             0
         };
 
-        Self { timestamp: max_ts, counter: new_counter, node_id: local_node_id.to_string() }
+        Ok(Self { timestamp: max_ts, counter: new_counter, node_id: local_node_id.to_string() })
     }
 
     /// Parse a slice of HLC strings and return the max per `Hlc::Ord`.
@@ -173,6 +198,16 @@ impl Hlc {
     pub fn is_future(&self) -> bool {
         self.future_drift_ms() > 0
     }
+}
+
+fn increment_counter(
+    counter: u32,
+    timestamp: i64,
+    node_id: &str,
+) -> std::result::Result<u32, HlcOverflowError> {
+    counter
+        .checked_add(1)
+        .ok_or_else(|| HlcOverflowError::Counter { timestamp, node_id: node_id.to_string() })
 }
 
 impl Ord for Hlc {
@@ -288,6 +323,17 @@ mod tests {
     }
 
     #[test]
+    fn try_now_errors_when_counter_overflows() {
+        let future_ts = Hlc::now_ms() + 100_000;
+        let last = Hlc::new(future_ts, u32::MAX, "testnode");
+        let err = Hlc::try_now("testnode", Some(&last)).unwrap_err();
+        assert_eq!(
+            err,
+            HlcOverflowError::Counter { timestamp: future_ts, node_id: "testnode".to_string() }
+        );
+    }
+
+    #[test]
     fn now_resets_counter_when_clock_advances() {
         // Create a "last known" HLC in the distant past
         let last = Hlc::new(1000, 99, "testnode");
@@ -318,6 +364,18 @@ mod tests {
         assert_eq!(merged.timestamp, future_ts);
         assert_eq!(merged.counter, 8); // max(3, 7) + 1
         assert_eq!(merged.node_id, "local");
+    }
+
+    #[test]
+    fn try_merge_errors_when_counter_overflows() {
+        let future_ts = Hlc::now_ms() + 100_000;
+        let local = Hlc::new(future_ts, u32::MAX, "local");
+        let remote = Hlc::new(future_ts, 7, "remote");
+        let err = local.try_merge(&remote, "local").unwrap_err();
+        assert_eq!(
+            err,
+            HlcOverflowError::Counter { timestamp: future_ts, node_id: "local".to_string() }
+        );
     }
 
     #[test]

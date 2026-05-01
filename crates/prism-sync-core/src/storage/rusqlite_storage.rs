@@ -358,10 +358,11 @@ fn exec_mark_batch_pushed(conn: &Connection, batch_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn exec_delete_pushed_ops(conn: &Connection, sync_id: &str) -> Result<()> {
+fn exec_delete_pushed_ops(conn: &Connection, sync_id: &str, batch_id: &str) -> Result<()> {
     conn.execute(
-        "DELETE FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NOT NULL",
-        params![sync_id],
+        "DELETE FROM pending_ops \
+         WHERE sync_id = ?1 AND local_batch_id = ?2 AND pushed_at IS NOT NULL",
+        params![sync_id, batch_id],
     )?;
     Ok(())
 }
@@ -987,8 +988,8 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_mark_batch_pushed(&self.conn, batch_id)
     }
 
-    fn delete_pushed_ops(&mut self, sync_id: &str) -> Result<()> {
-        exec_delete_pushed_ops(&self.conn, sync_id)
+    fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()> {
+        exec_delete_pushed_ops(&self.conn, sync_id, batch_id)
     }
 
     // ── Applied ops ──
@@ -1391,28 +1392,29 @@ mod tests {
     }
 
     #[test]
-    fn delete_pushed_ops_removes_only_pushed() {
+    fn delete_pushed_ops_removes_only_target_pushed_batch() {
         let storage = make_storage();
 
         // Insert two ops in different batches
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_pending_op(&sample_pending_op("op-1", "sync-1", "batch-1")).unwrap();
         tx.insert_pending_op(&sample_pending_op("op-2", "sync-1", "batch-2")).unwrap();
-        // Mark only batch-1 as pushed
         tx.mark_batch_pushed("batch-1").unwrap();
+        tx.mark_batch_pushed("batch-2").unwrap();
         tx.commit().unwrap();
 
-        // Delete pushed ops
+        // Delete only the just-pushed batch.
         let mut tx = storage.begin_tx().unwrap();
-        tx.delete_pushed_ops("sync-1").unwrap();
+        tx.delete_pushed_ops("sync-1", "batch-1").unwrap();
         tx.commit().unwrap();
 
-        // batch-1 op should be gone, batch-2 op should remain
+        // batch-1 op should be gone, batch-2 op should remain even though it is also pushed.
         let ops1 = storage.load_batch_ops("batch-1").unwrap();
         assert!(ops1.is_empty());
 
         let ops2 = storage.load_batch_ops("batch-2").unwrap();
         assert_eq!(ops2.len(), 1);
+        assert!(ops2[0].pushed_at.is_some());
     }
 
     #[test]
