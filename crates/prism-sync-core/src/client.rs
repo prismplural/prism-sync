@@ -1477,16 +1477,16 @@ fn validate_sync_value_type(
         return Ok(());
     }
 
-    let matches = match (expected, value) {
-        (SyncType::String, SyncValue::String(_)) => true,
-        (SyncType::Int, SyncValue::Int(_)) => true,
-        (SyncType::Real, SyncValue::Real(_)) => true,
-        (SyncType::Real, SyncValue::Int(_)) => true,
-        (SyncType::Bool, SyncValue::Bool(_)) => true,
-        (SyncType::DateTime, SyncValue::DateTime(_)) => true,
-        (SyncType::Blob, SyncValue::Blob(_)) => true,
-        _ => false,
-    };
+    let matches = matches!(
+        (expected, value),
+        (SyncType::String, SyncValue::String(_))
+            | (SyncType::Int, SyncValue::Int(_))
+            | (SyncType::Real, SyncValue::Real(_))
+            | (SyncType::Real, SyncValue::Int(_))
+            | (SyncType::Bool, SyncValue::Bool(_))
+            | (SyncType::DateTime, SyncValue::DateTime(_))
+            | (SyncType::Blob, SyncValue::Blob(_))
+    );
 
     if matches {
         Ok(())
@@ -1843,11 +1843,11 @@ mod tests {
         ) -> std::result::Result<i64, RelayError> {
             let mut state = self.state.lock().unwrap();
             state.signed_registry = Some(SignedRegistryResponse {
-                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
                 artifact_blob: signed_registry_snapshot.to_vec(),
                 artifact_kind: "signed_registry_snapshot".to_string(),
             });
-            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64)
+            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
         }
     }
 

@@ -506,7 +506,7 @@ impl PairingService {
                     registration_relay.as_ref(),
                     &mut key_hierarchy,
                     self.secure_store.as_ref(),
-                    &device_secret,
+                    device_secret,
                     &device_id,
                     bundle.current_epoch,
                     latest_registry_snapshot.current_epoch,
@@ -1647,7 +1647,7 @@ mod tests {
             if state.signed_registry.is_none() {
                 if let Some(approval) = &req.registry_approval {
                     state.signed_registry = Some(SignedRegistryResponse {
-                        registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                        registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
                         artifact_blob: approval.signed_registry_snapshot.clone(),
                         artifact_kind: "signed_registry_snapshot".to_string(),
                     });
@@ -1706,11 +1706,11 @@ mod tests {
         ) -> std::result::Result<i64, RelayError> {
             let mut state = self.state.lock().unwrap();
             state.signed_registry = Some(SignedRegistryResponse {
-                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
                 artifact_blob: signed_registry_snapshot.to_vec(),
                 artifact_kind: "signed_registry_snapshot".to_string(),
             });
-            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64)
+            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
         }
     }
     #[async_trait]
@@ -1746,7 +1746,7 @@ mod tests {
             }
             if let Some(snapshot) = signed_registry_snapshot {
                 state.signed_registry = Some(SignedRegistryResponse {
-                    registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                    registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
                     artifact_blob: snapshot.to_vec(),
                     artifact_kind: "signed_registry_snapshot".to_string(),
                 });
@@ -2018,7 +2018,7 @@ mod tests {
             latest_hashes,
         );
         registry_relay.set_signed_registry(SignedRegistryResponse {
-            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             artifact_blob: latest_snapshot
                 .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
             artifact_kind: "signed_registry_snapshot".to_string(),
@@ -2157,7 +2157,7 @@ mod tests {
             latest_hashes,
         );
         registry_relay.set_signed_registry(SignedRegistryResponse {
-            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             artifact_blob: latest_snapshot
                 .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
             artifact_kind: "signed_registry_snapshot".to_string(),
@@ -2508,13 +2508,15 @@ mod tests {
         assert!(initiator_store.get("epoch_key_2").unwrap().is_some());
         assert_eq!(initiator_store.get("epoch").unwrap().unwrap(), b"3");
 
-        let state = registry_relay.state.lock().unwrap();
-        let (next_epoch, wrapped_keys) = state.rekey_posts.as_ref().unwrap();
-        assert_eq!(*next_epoch, 3);
-        assert!(wrapped_keys.contains_key(&device_id));
-        let post_rekey_registry = state.signed_registry.as_ref().unwrap();
+        let post_rekey_registry_blob = {
+            let state = registry_relay.state.lock().unwrap();
+            let (next_epoch, wrapped_keys) = state.rekey_posts.as_ref().unwrap();
+            assert_eq!(*next_epoch, 3);
+            assert!(wrapped_keys.contains_key(&device_id));
+            state.signed_registry.as_ref().unwrap().artifact_blob.clone()
+        };
         let post_rekey_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
-            &post_rekey_registry.artifact_blob,
+            &post_rekey_registry_blob,
             &inviter_signing_key.public_key_bytes(),
             &inviter_pq_signing_key.public_key_bytes(),
         )

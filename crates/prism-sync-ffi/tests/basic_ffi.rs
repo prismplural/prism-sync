@@ -496,7 +496,7 @@ async fn drain_secure_store_includes_epoch_keys() {
 
     let drained = api::drain_secure_store(&handle).await.expect("drain secure store");
     assert!(
-        drained.get("epoch_key_1").is_some(),
+        drained.contains_key("epoch_key_1"),
         "epoch_key_1 should be present in drained secure-store entries"
     );
 }
@@ -532,7 +532,7 @@ async fn drain_exports_all_memorysecurestore_entries() {
         "unknown_future_key",
     ] {
         assert!(
-            drained.get(expected).is_some(),
+            drained.contains_key(expected),
             "drain must export `{expected}` via snapshot(): got {drained:?}"
         );
     }
@@ -561,7 +561,7 @@ async fn seed_then_drain_round_trip() {
     assert_eq!(drained1, drained2, "drain output must be stable across reseed");
     // And every originally-seeded entry must have survived.
     for key in ["sync_id", "epoch_key_3", "runtime_keys_xyz"] {
-        assert!(drained1.get(key).is_some(), "missing `{key}` after round-trip");
+        assert!(drained1.contains_key(key), "missing `{key}` after round-trip");
     }
 }
 
@@ -613,7 +613,7 @@ async fn cold_start_recovers_epoch_key_via_drain_seed_round_trip() {
     let drained1 = api::drain_secure_store(&handle1).await.expect("session1 drain");
 
     // Invariant 1: epoch_key_1 is in the drained map.
-    assert!(drained1.get("epoch_key_1").is_some(), "session1 drain must export epoch_key_1");
+    assert!(drained1.contains_key("epoch_key_1"), "session1 drain must export epoch_key_1");
     // Invariant 2: every static key we seeded is in the drained map.
     for (k, _) in static_keys {
         assert!(drained1.contains_key(*k), "session1 drain missing static key `{k}`: {drained1:?}");

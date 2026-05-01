@@ -29,6 +29,9 @@ use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{batch_signature, sync_aad, CrdtChange, Hlc, SyncMetadata};
 use prism_sync_crypto::KeyHierarchy;
 
+type CapturingEntityByTable = HashMap<String, Arc<CapturingEntity>>;
+type CapturingEntitySet = (Vec<Arc<dyn SyncableEntity>>, CapturingEntityByTable);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // MockTaskEntity — in-memory SyncableEntity for testing
 // ═══════════════════════════════════════════════════════════════════════════
@@ -733,17 +736,16 @@ async fn e2e_app_schema_declared_types_round_trip_through_real_relay() {
         })
         .collect();
 
-    let make_entities =
-        || -> (Vec<Arc<dyn SyncableEntity>>, HashMap<String, Arc<CapturingEntity>>) {
-            let mut trait_objects = Vec::<Arc<dyn SyncableEntity>>::new();
-            let mut by_table = HashMap::<String, Arc<CapturingEntity>>::new();
-            for (table, fields) in &tables {
-                let entity = Arc::new(CapturingEntity::new(table.clone(), fields.clone()));
-                trait_objects.push(entity.clone() as Arc<dyn SyncableEntity>);
-                by_table.insert(table.clone(), entity);
-            }
-            (trait_objects, by_table)
-        };
+    let make_entities = || -> CapturingEntitySet {
+        let mut trait_objects = Vec::<Arc<dyn SyncableEntity>>::new();
+        let mut by_table = HashMap::<String, Arc<CapturingEntity>>::new();
+        for (table, fields) in &tables {
+            let entity = Arc::new(CapturingEntity::new(table.clone(), fields.clone()));
+            trait_objects.push(entity.clone() as Arc<dyn SyncableEntity>);
+            by_table.insert(table.clone(), entity);
+        }
+        (trait_objects, by_table)
+    };
 
     let kh = shared_key_hierarchy();
 

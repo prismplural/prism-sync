@@ -5710,9 +5710,12 @@ mod tests {
 
     #[test]
     fn sync_result_to_json_redacts_error_message() {
-        let mut result = prism_sync_core::engine::SyncResult::default();
-        result.error =
-            Some("device_id=a1b2c3d4e5f6 failed with key deadbeefdeadbeefdeadbeefdeadbeef".into());
+        let result = prism_sync_core::engine::SyncResult {
+            error: Some(
+                "device_id=a1b2c3d4e5f6 failed with key deadbeefdeadbeefdeadbeefdeadbeef".into(),
+            ),
+            ..Default::default()
+        };
 
         let json = sync_result_to_json(&result);
         let error = json["error"].as_str().unwrap();

@@ -1528,7 +1528,7 @@ impl SyncEngine {
             .first()
             .ok_or_else(|| CoreError::Engine("no device record found for seed".into()))?;
         let node_id = first_device.device_id.clone();
-        let registered_at = Some(first_device.registered_at.clone());
+        let registered_at = Some(first_device.registered_at);
 
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
@@ -1537,7 +1537,9 @@ impl SyncEngine {
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
         let current_epoch = metadata.as_ref().map(|m| m.current_epoch).unwrap_or(0);
 
-        if metadata.as_ref().map_or(true, |m| m.local_device_id.is_empty()) {
+        let metadata_needs_local_device = metadata.as_ref().is_none()
+            || metadata.as_ref().is_some_and(|m| m.local_device_id.is_empty());
+        if metadata_needs_local_device {
             let storage = self.storage.clone();
             let sid = sync_id.to_string();
             let node_id_for_metadata = node_id.clone();
