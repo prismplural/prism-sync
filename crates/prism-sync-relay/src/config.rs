@@ -10,6 +10,10 @@ pub enum ConfigError {
         "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED=true requires FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM"
     )]
     AppleAttestationEnabledWithoutTrustRoots,
+    #[error(
+        "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED=true requires FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM"
+    )]
+    AndroidAttestationEnabledWithoutTrustRoots,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,11 +212,8 @@ impl Config {
             "MIN_SIGNATURE_VERSION",
             MIN_SIGNATURE_VERSION_SOURCE_FLOOR,
         )?;
-        let first_device_apple_attestation_enabled = parse_bool_env_with(
-            &env,
-            "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED",
-            false,
-        );
+        let first_device_apple_attestation_enabled =
+            parse_bool_env_with(&env, "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", false);
         let first_device_apple_attestation_trust_roots_pem = parse_json_vec_env_with(
             &env,
             "FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM",
@@ -222,6 +223,18 @@ impl Config {
             && first_device_apple_attestation_trust_roots_pem.is_empty()
         {
             return Err(ConfigError::AppleAttestationEnabledWithoutTrustRoots);
+        }
+        let first_device_android_attestation_enabled =
+            parse_bool_env_with(&env, "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED", true);
+        let first_device_android_attestation_trust_roots_pem = parse_json_vec_env_with(
+            &env,
+            "FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM",
+            default_android_attestation_roots(),
+        );
+        if first_device_android_attestation_enabled
+            && first_device_android_attestation_trust_roots_pem.is_empty()
+        {
+            return Err(ConfigError::AndroidAttestationEnabledWithoutTrustRoots);
         }
 
         Ok(Self {
@@ -272,16 +285,8 @@ impl Config {
                 "FIRST_DEVICE_APPLE_ATTESTATION_ALLOWED_APP_IDS",
                 Vec::new(),
             ),
-            first_device_android_attestation_enabled: parse_bool_env_with(
-                &env,
-                "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED",
-                true,
-            ),
-            first_device_android_attestation_trust_roots_pem: parse_json_vec_env_with(
-                &env,
-                "FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM",
-                default_android_attestation_roots(),
-            ),
+            first_device_android_attestation_enabled,
+            first_device_android_attestation_trust_roots_pem,
             grapheneos_verified_boot_key_allowlist: parse_json_vec_env_with(
                 &env,
                 "GRAPHENEOS_VERIFIED_BOOT_KEY_ALLOWLIST",
@@ -614,9 +619,8 @@ mod tests {
 
     #[test]
     fn rejects_apple_attestation_enabled_without_trust_roots() {
-        let err =
-            config_from_env_pairs(&[("FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", "true")])
-                .unwrap_err();
+        let err = config_from_env_pairs(&[("FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", "true")])
+            .unwrap_err();
 
         assert_eq!(err, ConfigError::AppleAttestationEnabledWithoutTrustRoots);
     }
@@ -631,6 +635,35 @@ mod tests {
 
         assert!(config.first_device_apple_attestation_enabled);
         assert_eq!(config.first_device_apple_attestation_trust_roots_pem, vec!["test-root"]);
+    }
+
+    #[test]
+    fn rejects_android_attestation_enabled_without_trust_roots() {
+        let err =
+            config_from_env_pairs(&[("FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM", "[]")])
+                .unwrap_err();
+
+        assert_eq!(err, ConfigError::AndroidAttestationEnabledWithoutTrustRoots);
+    }
+
+    #[test]
+    fn accepts_android_attestation_disabled_without_trust_roots() {
+        let config = config_from_env_pairs(&[
+            ("FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED", "false"),
+            ("FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM", "[]"),
+        ])
+        .unwrap();
+
+        assert!(!config.first_device_android_attestation_enabled);
+        assert!(config.first_device_android_attestation_trust_roots_pem.is_empty());
+    }
+
+    #[test]
+    fn default_android_attestation_enabled_uses_default_trust_roots() {
+        let config = config_from_env_pairs(&[]).unwrap();
+
+        assert!(config.first_device_android_attestation_enabled);
+        assert!(!config.first_device_android_attestation_trust_roots_pem.is_empty());
     }
 
     #[cfg(unix)]

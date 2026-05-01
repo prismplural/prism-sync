@@ -2,6 +2,8 @@ use base64::Engine;
 use ciborium::Value;
 use sha2::{Digest, Sha256};
 use simple_asn1::{from_der, ASN1Block};
+use std::collections::HashSet;
+use std::io::Cursor;
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
@@ -59,8 +61,7 @@ pub(crate) fn verify_apple_app_attest(
         registration_key_bundle_hash,
     );
     let attestation_bytes = decode_base64_der(attestation_object)?;
-    let cbor_value: Value = ciborium::de::from_reader(attestation_bytes.as_slice())
-        .map_err(|e| format!("invalid apple attestation CBOR: {e}"))?;
+    let cbor_value = decode_attestation_cbor(&attestation_bytes)?;
     let attestation = parse_attestation_object(&cbor_value)?;
     if attestation.fmt != APPLE_APP_ATTESTATION_FMT {
         return Err("apple attestation fmt is not apple-appattest".into());
@@ -144,11 +145,18 @@ struct ParsedAttestationObject {
     certificate_chain: Vec<String>,
 }
 
+fn decode_attestation_cbor(bytes: &[u8]) -> Result<Value, String> {
+    let mut cursor = Cursor::new(bytes);
+    let value: Value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|e| format!("invalid apple attestation CBOR: {e}"))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err("invalid apple attestation CBOR: trailing data".into());
+    }
+    Ok(value)
+}
+
 fn parse_attestation_object(value: &Value) -> Result<ParsedAttestationObject, String> {
-    let map = match value {
-        Value::Map(entries) => entries,
-        _ => return Err("apple attestation object is not a CBOR map".into()),
-    };
+    let map = checked_text_key_map(value, "apple attestation object")?;
 
     let fmt = map
         .iter()
@@ -167,10 +175,11 @@ fn parse_attestation_object(value: &Value) -> Result<ParsedAttestationObject, St
     let att_stmt = map
         .iter()
         .find_map(|(key, value)| match (key, value) {
-            (Value::Text(name), Value::Map(entries)) if name == "attStmt" => Some(entries),
+            (Value::Text(name), value) if name == "attStmt" => Some(value),
             _ => None,
         })
         .ok_or_else(|| "apple attestation attStmt missing".to_string())?;
+    let att_stmt = checked_text_key_map(att_stmt, "apple attestation attStmt")?;
     let certificate_chain = att_stmt
         .iter()
         .find_map(|(key, value)| match (key, value) {
@@ -186,6 +195,28 @@ fn parse_attestation_object(value: &Value) -> Result<ParsedAttestationObject, St
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ParsedAttestationObject { fmt, auth_data, certificate_chain })
+}
+
+fn checked_text_key_map<'a>(
+    value: &'a Value,
+    context: &str,
+) -> Result<&'a Vec<(Value, Value)>, String> {
+    let entries = match value {
+        Value::Map(entries) => entries,
+        _ => return Err(format!("{context} is not a CBOR map")),
+    };
+
+    let mut seen = HashSet::new();
+    for (key, _) in entries {
+        let Value::Text(name) = key else {
+            return Err(format!("{context} contains non-text key"));
+        };
+        if !seen.insert(name.as_str()) {
+            return Err(format!("{context} contains duplicate key {name}"));
+        }
+    }
+
+    Ok(entries)
 }
 
 fn apple_certificate_nonce(auth_data: &[u8], client_data_hash: &[u8; 32]) -> [u8; 32] {
@@ -341,6 +372,23 @@ mod tests {
         )
     }
 
+    fn minimal_attestation_value() -> Value {
+        Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text(APPLE_APP_ATTESTATION_FMT.into())),
+            (Value::Text("authData".into()), Value::Bytes(vec![0; 37])),
+            (
+                Value::Text("attStmt".into()),
+                Value::Map(vec![(Value::Text("x5c".into()), Value::Array(vec![]))]),
+            ),
+        ])
+    }
+
+    fn encode_cbor(value: &Value) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(value, &mut encoded).unwrap();
+        encoded
+    }
+
     fn test_config(root_pem: String, allowed_app_ids: Vec<String>) -> Config {
         Config {
             port: 0,
@@ -462,5 +510,51 @@ mod tests {
 
         assert_eq!(verified.kind, FirstDeviceAdmissionKind::AppleAppAttest);
         assert_eq!(verified.matched_app_id.as_deref(), Some(app_id));
+    }
+
+    #[test]
+    fn parse_attestation_object_rejects_duplicate_top_level_fmt() {
+        let value = Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text(APPLE_APP_ATTESTATION_FMT.into())),
+            (Value::Text("fmt".into()), Value::Text("none".into())),
+            (Value::Text("authData".into()), Value::Bytes(vec![0; 37])),
+            (
+                Value::Text("attStmt".into()),
+                Value::Map(vec![(Value::Text("x5c".into()), Value::Array(vec![]))]),
+            ),
+        ]);
+
+        let err = parse_attestation_object(&value).unwrap_err();
+
+        assert!(err.contains("duplicate key fmt"), "{err}");
+    }
+
+    #[test]
+    fn parse_attestation_object_rejects_duplicate_nested_x5c() {
+        let value = Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text(APPLE_APP_ATTESTATION_FMT.into())),
+            (Value::Text("authData".into()), Value::Bytes(vec![0; 37])),
+            (
+                Value::Text("attStmt".into()),
+                Value::Map(vec![
+                    (Value::Text("x5c".into()), Value::Array(vec![])),
+                    (Value::Text("x5c".into()), Value::Array(vec![])),
+                ]),
+            ),
+        ]);
+
+        let err = parse_attestation_object(&value).unwrap_err();
+
+        assert!(err.contains("duplicate key x5c"), "{err}");
+    }
+
+    #[test]
+    fn decode_attestation_cbor_rejects_trailing_bytes() {
+        let mut encoded = encode_cbor(&minimal_attestation_value());
+        encoded.push(0);
+
+        let err = decode_attestation_cbor(&encoded).unwrap_err();
+
+        assert!(err.contains("trailing data"), "{err}");
     }
 }
