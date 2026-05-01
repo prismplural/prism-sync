@@ -19,7 +19,9 @@ use prism_sync_core::events::SyncEvent;
 use prism_sync_core::relay::traits::{SnapshotExchange, SnapshotResponse};
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::secure_store::SecureStore;
-use prism_sync_core::storage::{RusqliteSyncStorage, SnapshotData, SyncStorage};
+use prism_sync_core::storage::{
+    FieldVersion, FieldVersionEntry, RusqliteSyncStorage, SnapshotData, SyncStorage,
+};
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{CrdtChange, Hlc, PrismSync};
 
@@ -352,6 +354,54 @@ fn signed_snapshot_with_mutated_plaintext(
     }
 }
 
+fn snapshot_field_version(
+    source: &SnapshotFixture,
+    table: &str,
+    entity_id: &str,
+    field_name: &str,
+) -> FieldVersionEntry {
+    let compressed = source.source_storage.export_snapshot(SYNC_ID).unwrap();
+    let json = zstd::decode_all(compressed.as_slice()).unwrap();
+    let snapshot_data: SnapshotData = serde_json::from_slice(&json).unwrap();
+    snapshot_data
+        .field_versions
+        .into_iter()
+        .find(|fv| {
+            fv.entity_table == table && fv.entity_id == entity_id && fv.field_name == field_name
+        })
+        .expect("snapshot field version exists")
+}
+
+fn newer_hlc_for_device(snapshot_hlc: &str, device_id: &str) -> String {
+    let mut hlc = Hlc::from_string(snapshot_hlc).unwrap();
+    hlc.timestamp += 1;
+    hlc.counter = 0;
+    hlc.node_id = device_id.to_string();
+    hlc.to_string()
+}
+
+fn seed_joiner_field_version(
+    storage: &RusqliteSyncStorage,
+    snapshot_fv: &FieldVersionEntry,
+    winning_hlc: &str,
+    encoded_value: &str,
+) {
+    let mut tx = storage.begin_tx().unwrap();
+    tx.upsert_field_version(&FieldVersion {
+        sync_id: SYNC_ID.to_string(),
+        entity_table: snapshot_fv.entity_table.clone(),
+        entity_id: snapshot_fv.entity_id.clone(),
+        field_name: snapshot_fv.field_name.clone(),
+        winning_op_id: format!("local-newer-{}", snapshot_fv.field_name),
+        winning_device_id: DEVICE_C.to_string(),
+        winning_hlc: winning_hlc.to_string(),
+        winning_encoded_value: Some(encoded_value.to_string()),
+        updated_at: chrono::Utc::now(),
+    })
+    .unwrap();
+    tx.commit().unwrap();
+}
+
 async fn assert_snapshot_still_available(relay: &MockRelay) {
     assert!(
         relay.get_snapshot().await.unwrap().is_some(),
@@ -365,6 +415,50 @@ async fn assert_ack_deletes_snapshot(sync: &PrismSync, relay: &MockRelay) {
         relay.get_snapshot().await.unwrap().is_none(),
         "ACK after successful import should delete the relay snapshot"
     );
+}
+
+#[tokio::test]
+async fn stale_snapshot_does_not_regress_field_version_hlc() {
+    let source = create_snapshot_fixture(1).await;
+    let joiner = create_joiner_fixture(&source);
+    let snapshot_title = snapshot_field_version(&source, "tasks", "task-0", "title");
+    let newer_hlc = newer_hlc_for_device(&snapshot_title.winning_hlc, DEVICE_C);
+    seed_joiner_field_version(&joiner.storage, &snapshot_title, &newer_hlc, "\"Local newer\"");
+
+    store_snapshot(&source.relay, &source.valid_snapshot).await;
+
+    let mut sync = build_joiner_sync(&source, &joiner);
+    let (_restored, changes) = sync.bootstrap_from_snapshot().await.unwrap();
+
+    let title_fv =
+        joiner.storage.get_field_version(SYNC_ID, "tasks", "task-0", "title").unwrap().unwrap();
+    assert_eq!(title_fv.winning_hlc, newer_hlc);
+    assert_eq!(title_fv.winning_encoded_value, Some("\"Local newer\"".to_string()));
+    assert!(
+        changes.iter().all(|change| !change.fields.contains_key("title")),
+        "stale title field must not be emitted as a snapshot EntityChange: {changes:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_snapshot_does_not_emit_stale_entity_change() {
+    let source = create_snapshot_fixture(1).await;
+    let joiner = create_joiner_fixture(&source);
+    for field in ["title", "done"] {
+        let snapshot_fv = snapshot_field_version(&source, "tasks", "task-0", field);
+        let newer_hlc = newer_hlc_for_device(&snapshot_fv.winning_hlc, DEVICE_C);
+        seed_joiner_field_version(&joiner.storage, &snapshot_fv, &newer_hlc, "local-newer");
+    }
+
+    store_snapshot(&source.relay, &source.valid_snapshot).await;
+
+    let mut sync = build_joiner_sync(&source, &joiner);
+    let mut rx = sync.events();
+    let (restored, changes) = sync.bootstrap_from_snapshot().await.unwrap();
+
+    assert_eq!(restored, 0);
+    assert!(changes.is_empty(), "all-stale snapshot must not emit changes: {changes:?}");
+    assert_no_remote_changes_event(&mut rx);
 }
 
 #[tokio::test]

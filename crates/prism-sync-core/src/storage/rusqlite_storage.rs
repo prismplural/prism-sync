@@ -11,6 +11,7 @@ use super::snapshot_format::*;
 use super::traits::*;
 use super::types::*;
 use crate::error::{CoreError, Result};
+use crate::hlc::Hlc;
 
 // ── Row-mapping helpers ──
 
@@ -687,6 +688,42 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
     Ok(compressed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotFieldImportDecision {
+    InsertOrUpdate,
+    KeepExistingEqual,
+    SkipStale,
+}
+
+fn snapshot_field_import_decision(
+    conn: &Connection,
+    sync_id: &str,
+    fv: &FieldVersionEntry,
+) -> Result<SnapshotFieldImportDecision> {
+    let snapshot_hlc = Hlc::from_string(&fv.winning_hlc)?;
+    let existing_hlc: Option<String> = conn
+        .query_row(
+            "SELECT winning_hlc FROM field_versions \
+             WHERE sync_id = ?1 AND entity_table = ?2 AND entity_id = ?3 AND field_name = ?4",
+            params![sync_id, fv.entity_table, fv.entity_id, fv.field_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let Some(existing_hlc) = existing_hlc else {
+        return Ok(SnapshotFieldImportDecision::InsertOrUpdate);
+    };
+
+    let existing_hlc = Hlc::from_string(&existing_hlc)?;
+    if snapshot_hlc > existing_hlc {
+        Ok(SnapshotFieldImportDecision::InsertOrUpdate)
+    } else if snapshot_hlc == existing_hlc {
+        Ok(SnapshotFieldImportDecision::KeepExistingEqual)
+    } else {
+        Ok(SnapshotFieldImportDecision::SkipStale)
+    }
+}
+
 fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result<u64> {
     // 1. Decompress zstd
     let json = zstd::decode_all(data).map_err(|e| {
@@ -708,26 +745,36 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
     let existing_local_device_id =
         query_sync_metadata(conn, sync_id)?.map(|meta| meta.local_device_id);
 
-    // 3. Insert field_versions (INSERT OR REPLACE)
+    // 3. Insert field_versions only when the snapshot row is newer than the
+    //    existing local winner. HLC ordering must stay typed; SQL string
+    //    comparisons are wrong for counters such as ":9" vs ":10".
     for fv in &snapshot.field_versions {
-        conn.execute(
-            "INSERT OR REPLACE INTO field_versions \
-             (sync_id, entity_table, entity_id, field_name, winning_op_id, \
-              winning_device_id, winning_hlc, winning_encoded_value, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                sync_id,
-                fv.entity_table,
-                fv.entity_id,
-                fv.field_name,
-                fv.winning_op_id,
-                fv.winning_device_id,
-                fv.winning_hlc,
-                fv.winning_encoded_value,
-                fv.updated_at,
-            ],
-        )?;
-        entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
+        match snapshot_field_import_decision(conn, sync_id, fv)? {
+            SnapshotFieldImportDecision::InsertOrUpdate => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO field_versions \
+                     (sync_id, entity_table, entity_id, field_name, winning_op_id, \
+                      winning_device_id, winning_hlc, winning_encoded_value, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        sync_id,
+                        fv.entity_table,
+                        fv.entity_id,
+                        fv.field_name,
+                        fv.winning_op_id,
+                        fv.winning_device_id,
+                        fv.winning_hlc,
+                        fv.winning_encoded_value,
+                        fv.updated_at,
+                    ],
+                )?;
+                entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
+            }
+            SnapshotFieldImportDecision::KeepExistingEqual => {
+                entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
+            }
+            SnapshotFieldImportDecision::SkipStale => {}
+        }
     }
 
     // 4. Insert device_registry (INSERT OR REPLACE)
@@ -822,10 +869,21 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
 /// Acceptable because lost ops will be re-pulled from the relay on next sync.
 pub struct RusqliteSyncStorage {
     conn: Mutex<Connection>,
+    rekey_mode: RekeyMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RekeyMode {
+    Noop,
+    SqlCipher,
 }
 
 impl RusqliteSyncStorage {
     pub fn new(conn: Connection) -> Result<Self> {
+        Self::new_with_rekey_mode(conn, RekeyMode::SqlCipher)
+    }
+
+    fn new_with_rekey_mode(mut conn: Connection, rekey_mode: RekeyMode) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
@@ -833,12 +891,11 @@ impl RusqliteSyncStorage {
              PRAGMA foreign_keys = ON;",
         )?;
 
-        let mut conn = conn;
         migrations::apply(&mut conn).map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("Migration failed: {e}")))
         })?;
 
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), rekey_mode })
     }
 
     /// Create a new encrypted storage backed by an existing connection.
@@ -852,12 +909,12 @@ impl RusqliteSyncStorage {
         })?;
 
         // Now proceed with normal setup
-        Self::new(conn)
+        Self::new_with_rekey_mode(conn, RekeyMode::SqlCipher)
     }
 
     /// Create an in-memory storage instance for testing.
     pub fn in_memory() -> Result<Self> {
-        Self::new(Connection::open_in_memory()?)
+        Self::new_with_rekey_mode(Connection::open_in_memory()?, RekeyMode::Noop)
     }
 }
 
@@ -935,6 +992,10 @@ impl SyncStorage for RusqliteSyncStorage {
     }
 
     fn rekey(&self, new_key: &[u8; 32]) -> Result<()> {
+        if self.rekey_mode == RekeyMode::Noop {
+            return Ok(());
+        }
+
         let hex = new_key.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let conn = self
             .conn
@@ -1186,7 +1247,7 @@ mod tests {
             field_name: "name".to_string(),
             encoded_value: "\"Alice\"".to_string(),
             is_delete: false,
-            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            client_hlc: "1767225600000:0:dev1".to_string(),
             created_at: Utc::now(),
             pushed_at: None,
         }
@@ -1198,7 +1259,7 @@ mod tests {
             sync_id: sync_id.to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            client_hlc: "1767225600000:0:dev1".to_string(),
             server_seq: 10,
             applied_at: Utc::now(),
         }
@@ -1212,7 +1273,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            winning_hlc: "1767225600000:0:dev1".to_string(),
             winning_encoded_value: None,
             updated_at: Utc::now(),
         }
@@ -1600,7 +1661,7 @@ mod tests {
                 sync_id: "sync-1".to_string(),
                 epoch: 1,
                 device_id: "dev1".to_string(),
-                client_hlc: format!("2026-01-01T00:00:00.000Z:{i:04}:dev1"),
+                client_hlc: format!("1767225600000:{i}:dev1"),
                 server_seq: i * 10,
                 applied_at: Utc::now(),
             })
@@ -1624,7 +1685,7 @@ mod tests {
                 sync_id: "sync-1".to_string(),
                 epoch: 1,
                 device_id: "dev1".to_string(),
-                client_hlc: format!("2026-01-01T00:00:00.000Z:{i:04}:dev1"),
+                client_hlc: format!("1767225600000:{i}:dev1"),
                 server_seq: i * 10,
                 applied_at: Utc::now(),
             })
@@ -1657,7 +1718,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
             winning_encoded_value: Some("\"Alice\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1669,7 +1730,7 @@ mod tests {
             field_name: "is_deleted".to_string(),
             winning_op_id: "op-2".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            winning_hlc: "1767225600000:2:dev1".to_string(),
             winning_encoded_value: Some("true".to_string()),
             updated_at: Utc::now(),
         })
@@ -1682,7 +1743,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-3".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0003:dev1".to_string(),
+            winning_hlc: "1767225600000:3:dev1".to_string(),
             winning_encoded_value: None,
             updated_at: Utc::now(),
         })
@@ -1717,7 +1778,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
             winning_encoded_value: Some("\"Alice\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1729,7 +1790,7 @@ mod tests {
             field_name: "is_deleted".to_string(),
             winning_op_id: "op-2".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            winning_hlc: "1767225600000:2:dev1".to_string(),
             winning_encoded_value: Some("true".to_string()),
             updated_at: Utc::now(),
         })
@@ -1741,7 +1802,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-3".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0003:dev1".to_string(),
+            winning_hlc: "1767225600000:3:dev1".to_string(),
             winning_encoded_value: Some("\"Bob\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1774,7 +1835,7 @@ mod tests {
             sync_id: "sync-1".to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            client_hlc: "1767225600000:1:dev1".to_string(),
             server_seq: 5,
             applied_at: Utc::now(),
         })
@@ -1787,7 +1848,7 @@ mod tests {
             field_name: "is_deleted".to_string(),
             winning_op_id: "delete-op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
             winning_encoded_value: Some("true".to_string()),
             updated_at: Utc::now(),
         })
@@ -1818,7 +1879,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
             winning_encoded_value: Some("\"Alice\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1830,7 +1891,7 @@ mod tests {
             field_name: "pronouns".to_string(),
             winning_op_id: "op-2".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            winning_hlc: "1767225600000:2:dev1".to_string(),
             winning_encoded_value: Some("\"she/her\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1842,7 +1903,7 @@ mod tests {
             field_name: "started_at".to_string(),
             winning_op_id: "op-3".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0003:dev1".to_string(),
+            winning_hlc: "1767225600000:3:dev1".to_string(),
             winning_encoded_value: Some("\"2026-01-01T00:00:00Z\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1854,7 +1915,7 @@ mod tests {
             sync_id: "sync-1".to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            client_hlc: "1767225600000:1:dev1".to_string(),
             server_seq: 10,
             applied_at: Utc::now(),
         })
@@ -1864,7 +1925,7 @@ mod tests {
             sync_id: "sync-1".to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            client_hlc: "1767225600000:2:dev1".to_string(),
             server_seq: 20,
             applied_at: Utc::now(),
         })

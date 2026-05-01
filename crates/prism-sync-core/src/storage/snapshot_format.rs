@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub const SNAPSHOT_VERSION: u32 = 1;
 
 /// Top-level snapshot container. Serialized to JSON, then zstd-compressed.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotData {
     pub version: u32,
     pub field_versions: Vec<FieldVersionEntry>,
@@ -14,7 +14,7 @@ pub struct SnapshotData {
 }
 
 /// Snapshot representation of a field_versions row.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldVersionEntry {
     pub entity_table: String,
     pub entity_id: String,
@@ -27,7 +27,7 @@ pub struct FieldVersionEntry {
 }
 
 /// Snapshot representation of a device_registry row.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRegistryEntry {
     pub device_id: String,
     pub ed25519_public_key: String,    // hex-encoded
@@ -44,7 +44,7 @@ pub struct DeviceRegistryEntry {
 }
 
 /// Snapshot representation of an applied_ops row.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppliedOpEntry {
     pub op_id: String,
     pub sync_id: String,
@@ -56,7 +56,7 @@ pub struct AppliedOpEntry {
 }
 
 /// Snapshot representation of sync_metadata.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncMetadataEntry {
     pub sync_id: String,
     pub local_device_id: String,

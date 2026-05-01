@@ -24,7 +24,8 @@ use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::snapshot_limits;
 use crate::storage::StorageError;
 use crate::storage::{
-    AppliedOp, DeviceRecord, FieldVersion, QuarantinedOp, SyncMetadata, SyncStorage,
+    AppliedOp, DeviceRecord, FieldVersion, FieldVersionEntry, QuarantinedOp, SyncMetadata,
+    SyncStorage,
 };
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
@@ -88,6 +89,23 @@ fn populate_result_error(result: &mut SyncResult, e: &CoreError) {
 fn should_bubble_recoverable_key_error(error: &CoreError) -> bool {
     matches!(error, CoreError::MissingEpochKey { .. } | CoreError::DecryptFailed { .. })
 }
+
+#[cfg(debug_assertions)]
+fn debug_assert_remote_op_matches_sender(op: &CrdtChange, trusted_sender_device_id: &str) {
+    debug_assert_eq!(
+        op.device_id, trusted_sender_device_id,
+        "remote op.device_id must match trusted envelope sender at persistence"
+    );
+    let hlc = Hlc::from_string(&op.client_hlc)
+        .expect("validated remote op HLC should parse at persistence");
+    debug_assert_eq!(
+        hlc.node_id, trusted_sender_device_id,
+        "remote op.client_hlc node id must match trusted envelope sender at persistence"
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_remote_op_matches_sender(_op: &CrdtChange, _trusted_sender_device_id: &str) {}
 
 /// Result of the pull phase, bundling counts with relay-reported metadata.
 struct PullPhaseResult {
@@ -476,8 +494,9 @@ impl SyncEngine {
 
             // Merge phase
             self.set_state(SyncState::Merging);
-            let (merged, batch_changes) =
-                self.apply_remote_batch(sync_id, &ops, batch.server_seq).await?;
+            let (merged, batch_changes) = self
+                .apply_remote_batch(sync_id, &ops, batch.server_seq, &envelope.sender_device_id)
+                .await?;
             total_merged += merged;
             all_entity_changes.extend(batch_changes);
             total_pulled += 1;
@@ -895,6 +914,10 @@ impl SyncEngine {
             let mut tx = storage.begin_tx()?;
 
             for (op, was_already_applied, server_seq) in &all_ops_checked {
+                // Replayed quarantined ops were admitted only after envelope
+                // attribution validation. The persisted op device is the
+                // trusted sender identity available on replay.
+                debug_assert_remote_op_matches_sender(op, &op.device_id);
                 if !was_already_applied {
                     tx.insert_applied_op(&AppliedOp {
                         op_id: op.op_id.clone(),
@@ -909,6 +932,7 @@ impl SyncEngine {
             }
 
             for op in &winning_ops {
+                debug_assert_remote_op_matches_sender(op, &op.device_id);
                 tx.upsert_field_version(&FieldVersion {
                     sync_id: sid.clone(),
                     entity_table: op.entity_table.clone(),
@@ -950,6 +974,7 @@ impl SyncEngine {
         sync_id: &str,
         ops: &[CrdtChange],
         server_seq: i64,
+        envelope_sender_device_id: &str,
     ) -> Result<(u64, Vec<EntityChange>)> {
         // Phase A: Determine winners (READ-ONLY -- no sync state persisted yet)
         let storage = self.storage.clone();
@@ -1109,10 +1134,12 @@ impl SyncEngine {
             let ops_checked = all_ops_checked;
             let winners = winning_ops;
             let quarantined = quarantined_ops;
+            let trusted_sender = envelope_sender_device_id.to_string();
             tokio::task::spawn_blocking(move || {
                 let mut tx = storage.begin_tx()?;
 
                 for quarantined in &quarantined {
+                    debug_assert_remote_op_matches_sender(&quarantined.op, &trusted_sender);
                     tx.insert_quarantined_op(&QuarantinedOp {
                         sync_id: sid.clone(),
                         op_id: quarantined.op.op_id.clone(),
@@ -1125,6 +1152,7 @@ impl SyncEngine {
 
                 // Record all valid ops as applied (for idempotency on replay)
                 for (op, was_already_applied) in &ops_checked {
+                    debug_assert_remote_op_matches_sender(op, &trusted_sender);
                     if !was_already_applied {
                         tx.insert_applied_op(&AppliedOp {
                             op_id: op.op_id.clone(),
@@ -1140,6 +1168,7 @@ impl SyncEngine {
 
                 // Update field_versions for winning ops only
                 for op in &winners {
+                    debug_assert_remote_op_matches_sender(op, &trusted_sender);
                     tx.upsert_field_version(&FieldVersion {
                         sync_id: sid.clone(),
                         entity_table: op.entity_table.clone(),
@@ -1706,19 +1735,32 @@ impl SyncEngine {
         let sid = sync_id.to_string();
         let seq = snapshot.server_seq_at;
         let data = compressed.clone();
-        let count = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut tx = storage.begin_tx()?;
-            let count = tx.import_snapshot(&sid, &data)?;
+            tx.import_snapshot(&sid, &data)?;
             tx.update_last_pulled_seq(&sid, seq)?;
             tx.commit()?;
-            Ok::<_, CoreError>(count)
+            Ok::<_, CoreError>(())
         })
         .await
         .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
-        // 4. Build EntityChange list from the snapshot data so the caller
-        //    can emit RemoteChanges to Dart for consumer DB population.
-        let entity_changes = Self::build_entity_changes_from_snapshot_data(&snapshot_data);
+        // 4. Build EntityChange list only from snapshot rows that storage
+        //    actually retained. A stale snapshot field skipped during import
+        //    must not be emitted to Dart/Drift as a remote change.
+        let accepted_field_versions = Self::accepted_snapshot_field_versions_after_import(
+            self.storage.clone(),
+            sync_id,
+            &snapshot_data,
+        )
+        .await?;
+        let count = accepted_field_versions
+            .iter()
+            .map(|fv| (fv.entity_table.clone(), fv.entity_id.clone()))
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        let entity_changes =
+            Self::build_entity_changes_from_snapshot_field_versions(&accepted_field_versions);
 
         Ok((count, entity_changes))
     }
@@ -1848,17 +1890,49 @@ impl SyncEngine {
         serde_json::from_slice(&json).map_err(CoreError::from)
     }
 
-    /// Build `EntityChange` entries grouped by `(table, entity_id)`, collecting
-    /// all winning field values from a parsed snapshot.
-    ///
-    /// This is used after bootstrap to tell the consumer which entities and
-    /// fields need to be written into the consumer database.
-    fn build_entity_changes_from_snapshot_data(
+    async fn accepted_snapshot_field_versions_after_import(
+        storage: Arc<dyn SyncStorage>,
+        sync_id: &str,
         snapshot: &crate::storage::SnapshotData,
+    ) -> Result<Vec<FieldVersionEntry>> {
+        let sid = sync_id.to_string();
+        let snapshot_field_versions = snapshot.field_versions.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut accepted = Vec::new();
+            for fv in snapshot_field_versions {
+                let current = storage.get_field_version(
+                    &sid,
+                    &fv.entity_table,
+                    &fv.entity_id,
+                    &fv.field_name,
+                )?;
+
+                let Some(current) = current else {
+                    continue;
+                };
+
+                if current.winning_op_id == fv.winning_op_id
+                    && current.winning_device_id == fv.winning_device_id
+                    && current.winning_hlc == fv.winning_hlc
+                    && current.winning_encoded_value == fv.winning_encoded_value
+                {
+                    accepted.push(fv);
+                }
+            }
+
+            Ok::<_, CoreError>(accepted)
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
+    }
+
+    fn build_entity_changes_from_snapshot_field_versions(
+        field_versions: &[FieldVersionEntry],
     ) -> Vec<EntityChange> {
         // Group field_versions by (table, entity_id) into EntityChange structs
         let mut change_map: HashMap<(String, String), EntityChange> = HashMap::new();
-        for fv in &snapshot.field_versions {
+        for fv in field_versions {
             let key = (fv.entity_table.clone(), fv.entity_id.clone());
             let entry = change_map.entry(key).or_insert_with(|| EntityChange {
                 table: fv.entity_table.clone(),
