@@ -398,8 +398,7 @@ fn wire__crate__api__change_password_impl(
             let api_handle = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
             >>::sse_decode(&mut deserializer);
-            let api__old_password = <String>::sse_decode(&mut deserializer);
-            let api_new_password = <String>::sse_decode(&mut deserializer);
+            let api_new_password = <Vec<u8>>::sse_decode(&mut deserializer);
             let api_secret_key = <Vec<u8>>::sse_decode(&mut deserializer);
             let api_sharing_id = <Option<String>>::sse_decode(&mut deserializer);
             let api_current_identity_generation = <u32>::sse_decode(&mut deserializer);
@@ -428,7 +427,6 @@ fn wire__crate__api__change_password_impl(
                         let api_handle_guard = api_handle_guard.unwrap();
                         let output_ok = crate::api::change_password(
                             &*api_handle_guard,
-                            api__old_password,
                             api_new_password,
                             api_secret_key,
                             api_sharing_id,

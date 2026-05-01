@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -59,9 +59,9 @@ Future<void> unlock({
 
 /// Restore the unlocked state directly from raw key material.
 ///
-/// Bypasses Argon2id password derivation entirely. Use when the raw DEK
-/// has been persisted in the platform keychain (Signal-style approach).
-/// This is the fast path for subsequent app launches.
+/// Bypasses Argon2id password derivation entirely. Use when the host has
+/// recovered the DEK from a platform-protected runtime cache. This is the
+/// fast path for subsequent app launches.
 ///
 /// - `dek`: The raw 32-byte Data Encryption Key.
 /// - `device_secret`: The raw 32-byte device secret.
@@ -75,11 +75,12 @@ Future<void> restoreRuntimeKeys({
   deviceSecret: deviceSecret,
 );
 
-/// Export the raw DEK bytes for keychain persistence.
+/// Export the raw DEK bytes for host-side runtime-cache wrapping.
 ///
 /// Returns the raw 32-byte DEK. Only works when unlocked (after
-/// `initialize` or `unlock`). Store in the platform keychain so
-/// `restore_runtime_keys` can be used on subsequent launches.
+/// `initialize` or `unlock`). The host must wrap the bytes before
+/// persistence; the unwrapped bytes can be supplied to `restore_runtime_keys`
+/// on subsequent launches.
 Future<Uint8List> exportDek({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiExportDek(handle: handle);
 
@@ -124,9 +125,9 @@ Future<void> configureEngine({required PrismSyncHandle handle}) =>
 
 /// Change password (re-wraps DEK, no data re-encryption).
 ///
-/// The `old_password` parameter is accepted for API symmetry but is not
-/// used — `change_password` operates on the already-unlocked key hierarchy.
-/// The secret key is required to derive the new wrapping key.
+/// Operates on the already-unlocked key hierarchy. The new password and
+/// secret key are wrapped for zeroization immediately on FFI entry; the new
+/// password bytes must be valid UTF-8 for the current crypto API.
 ///
 /// Returns the next `identity_generation` value that the app should persist
 /// to synced settings. If local sharing is currently active, this also
@@ -134,14 +135,12 @@ Future<void> configureEngine({required PrismSyncHandle handle}) =>
 /// incremented generation before re-wrapping the DEK.
 Future<int> changePassword({
   required PrismSyncHandle handle,
-  required String oldPassword,
-  required String newPassword,
+  required List<int> newPassword,
   required List<int> secretKey,
   String? sharingId,
   required int currentIdentityGeneration,
 }) => RustLib.instance.api.crateApiChangePassword(
   handle: handle,
-  oldPassword: oldPassword,
   newPassword: newPassword,
   secretKey: secretKey,
   sharingId: sharingId,

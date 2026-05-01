@@ -1411,9 +1411,9 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 
 /// Change password (re-wraps DEK, no data re-encryption).
 ///
-/// The `old_password` parameter is accepted for API symmetry but is not
-/// used — `change_password` operates on the already-unlocked key hierarchy.
-/// The secret key is required to derive the new wrapping key.
+/// Operates on the already-unlocked key hierarchy. The new password and
+/// secret key are wrapped for zeroization immediately on FFI entry; the new
+/// password bytes must be valid UTF-8 for the current crypto API.
 ///
 /// Returns the next `identity_generation` value that the app should persist
 /// to synced settings. If local sharing is currently active, this also
@@ -1421,12 +1421,16 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 /// incremented generation before re-wrapping the DEK.
 pub async fn change_password(
     handle: &PrismSyncHandle,
-    _old_password: String,
-    new_password: String,
+    new_password: Vec<u8>,
     secret_key: Vec<u8>,
     sharing_id: Option<String>,
     current_identity_generation: u32,
 ) -> Result<u32, String> {
+    let new_password = zeroize::Zeroizing::new(new_password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    std::str::from_utf8(new_password.as_slice())
+        .map_err(|_| "new_password must be valid UTF-8".to_string())?;
+
     let next_identity_generation = current_identity_generation
         .checked_add(1)
         .ok_or_else(|| "identity_generation overflow".to_string())?;
@@ -1457,9 +1461,11 @@ pub async fn change_password(
     let inner_arc = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
         let inner = inner_arc.blocking_lock();
+        let new_password = std::str::from_utf8(new_password.as_slice())
+            .map_err(|_| "new_password must be valid UTF-8".to_string())?;
         let (new_wrapped_dek, new_salt) = inner
             .key_hierarchy()
-            .change_password(&new_password, &secret_key)
+            .change_password(new_password, secret_key.as_slice())
             .map_err(|e| format!("change_password failed: {e}"))?;
         inner
             .secure_store()

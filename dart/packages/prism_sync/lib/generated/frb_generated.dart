@@ -101,8 +101,7 @@ abstract class RustLibApi extends BaseApi {
 
   Future<int> crateApiChangePassword({
     required PrismSyncHandle handle,
-    required String oldPassword,
-    required String newPassword,
+    required List<int> newPassword,
     required List<int> secretKey,
     String? sharingId,
     required int currentIdentityGeneration,
@@ -654,8 +653,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<int> crateApiChangePassword({
     required PrismSyncHandle handle,
-    required String oldPassword,
-    required String newPassword,
+    required List<int> newPassword,
     required List<int> secretKey,
     String? sharingId,
     required int currentIdentityGeneration,
@@ -668,8 +666,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             handle,
             serializer,
           );
-          sse_encode_String(oldPassword, serializer);
-          sse_encode_String(newPassword, serializer);
+          sse_encode_list_prim_u_8_loose(newPassword, serializer);
           sse_encode_list_prim_u_8_loose(secretKey, serializer);
           sse_encode_opt_String(sharingId, serializer);
           sse_encode_u_32(currentIdentityGeneration, serializer);
@@ -687,7 +684,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         constMeta: kCrateApiChangePasswordConstMeta,
         argValues: [
           handle,
-          oldPassword,
           newPassword,
           secretKey,
           sharingId,
@@ -702,7 +698,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     debugName: "change_password",
     argNames: [
       "handle",
-      "oldPassword",
       "newPassword",
       "secretKey",
       "sharingId",

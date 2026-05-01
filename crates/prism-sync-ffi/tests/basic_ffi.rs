@@ -287,15 +287,8 @@ async fn change_password_succeeds() {
 
     api::initialize(&handle, "old_pw".into(), secret_bytes.clone()).await.unwrap();
 
-    let result = api::change_password(
-        &handle,
-        "old_pw".into(),
-        "new_pw".into(),
-        secret_bytes.clone(),
-        None,
-        0,
-    )
-    .await;
+    let result =
+        api::change_password(&handle, b"new_pw".to_vec(), secret_bytes.clone(), None, 0).await;
     assert!(
         matches!(result, Ok(1)),
         "change_password should return next identity_generation: {result:?}",
@@ -305,6 +298,24 @@ async fn change_password_succeeds() {
     api::lock(&handle).await;
     let unlock = api::unlock(&handle, "new_pw".into(), secret_bytes).await;
     assert!(unlock.is_ok(), "unlock with new password should succeed: {:?}", unlock.err());
+}
+
+#[tokio::test]
+async fn change_password_rejects_non_utf8_new_password() {
+    let handle = make_handle();
+    let secret = api::generate_secret_key().unwrap();
+    let secret_bytes = secret.as_bytes().to_vec();
+
+    api::initialize(&handle, "old_pw".into(), secret_bytes.clone()).await.unwrap();
+
+    let result = api::change_password(&handle, vec![0xff], secret_bytes, None, 0).await;
+    assert!(
+        matches!(
+            result.as_ref().err().map(String::as_str),
+            Some("new_password must be valid UTF-8")
+        ),
+        "change_password should reject invalid UTF-8 before rewrap: {result:?}",
+    );
 }
 
 // ── Mutation recording (requires configure_engine, tested via status) ──
