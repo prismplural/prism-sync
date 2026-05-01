@@ -54,6 +54,27 @@ async fn relay_routes_are_mounted_under_v1_not_v2() {
     assert_eq!(v2.status(), 404);
 }
 
+#[tokio::test]
+async fn test_first_device_nonce_omits_pow_challenge_when_difficulty_zero() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/register-nonce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let nonce_json: Value = resp.json().await.unwrap();
+    assert!(nonce_json.get("nonce").and_then(Value::as_str).is_some());
+    assert!(
+        nonce_json.get("pow_challenge").is_none(),
+        "zero difficulty should disable PoW instead of advertising a trivially satisfied challenge"
+    );
+}
+
 fn is_first_device_pow_valid(
     sync_id: &str,
     device_id: &str,

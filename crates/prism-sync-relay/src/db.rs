@@ -431,6 +431,8 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             joiner_confirmation BLOB,
             credential_bundle   BLOB,
             joiner_bundle       BLOB,
+            credential_bundle_consumed_at INTEGER,
+            joiner_bundle_consumed_at     INTEGER,
             created_at          INTEGER NOT NULL,
             expires_at          INTEGER NOT NULL
         );
@@ -527,6 +529,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_sharing_identity_generation_floors(conn)?;
     migrate_sync_groups_password_version(conn)?;
     migrate_devices_ml_dsa_rotation(conn)?;
+    migrate_pairing_session_consumed_columns(conn)?;
 
     Ok(())
 }
@@ -649,6 +652,17 @@ fn sharing_identity_generation_floor_has_column(
     column: &str,
 ) -> Result<bool, rusqlite::Error> {
     let mut stmt = conn.prepare("PRAGMA table_info(sharing_identity_generation_floors)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn pairing_session_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(pairing_sessions)")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     for row in rows {
         if row? == column {
@@ -785,6 +799,25 @@ fn migrate_sharing_identity_generation_floors(conn: &Connection) -> Result<(), r
                     updated_at = MAX(updated_at, ?4)
               WHERE sharing_id = ?1",
             params![sharing_id, identity_generation, hash_bytes(&identity_bundle), updated_at],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn migrate_pairing_session_consumed_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_credentials_consumed =
+        pairing_session_has_column(conn, "credential_bundle_consumed_at")?;
+    let has_joiner_consumed = pairing_session_has_column(conn, "joiner_bundle_consumed_at")?;
+
+    if !has_credentials_consumed {
+        conn.execute_batch(
+            "ALTER TABLE pairing_sessions ADD COLUMN credential_bundle_consumed_at INTEGER;",
+        )?;
+    }
+    if !has_joiner_consumed {
+        conn.execute_batch(
+            "ALTER TABLE pairing_sessions ADD COLUMN joiner_bundle_consumed_at INTEGER;",
         )?;
     }
 
@@ -2143,11 +2176,17 @@ pub fn set_pairing_slot(
         }
         "credential_bundle" => {
             "UPDATE pairing_sessions SET credential_bundle = ?1
-             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND credential_bundle IS NULL"
+             WHERE rendezvous_id = ?2
+               AND expires_at > ?3
+               AND credential_bundle IS NULL
+               AND credential_bundle_consumed_at IS NULL"
         }
         "joiner_bundle" => {
             "UPDATE pairing_sessions SET joiner_bundle = ?1
-             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND joiner_bundle IS NULL"
+             WHERE rendezvous_id = ?2
+               AND expires_at > ?3
+               AND joiner_bundle IS NULL
+               AND joiner_bundle_consumed_at IS NULL"
         }
         _ => unreachable!(),
     };
@@ -2188,6 +2227,80 @@ pub fn get_pairing_slot(
     conn.query_row(sql, params![rendezvous_id, now], |row| row.get::<_, Option<Vec<u8>>>(0))
         .optional()
         .map(|opt| opt.flatten())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingSlotRead {
+    NotSet,
+    Consumed,
+    Present(Vec<u8>),
+}
+
+/// Atomically read and consume a terminal pairing slot for a non-expired session.
+///
+/// Only `credential_bundle` and `joiner_bundle` are terminal payloads. Earlier
+/// ceremony slots remain pollable because the peer may retry while waiting for
+/// the next ceremony step.
+pub fn take_pairing_slot(
+    conn: &Connection,
+    rendezvous_id: &str,
+    slot: &str,
+) -> Result<PairingSlotRead, rusqlite::Error> {
+    let col = validate_pairing_slot(slot)?;
+    let consumed_col = match col {
+        "credential_bundle" => "credential_bundle_consumed_at",
+        "joiner_bundle" => "joiner_bundle_consumed_at",
+        _ => {
+            return get_pairing_slot(conn, rendezvous_id, col).map(|value| match value {
+                Some(data) => PairingSlotRead::Present(data),
+                None => PairingSlotRead::NotSet,
+            });
+        }
+    };
+
+    let tx = conn.unchecked_transaction()?;
+    let now = now_secs();
+    let sql = format!(
+        "SELECT {col}, {consumed_col} FROM pairing_sessions
+         WHERE rendezvous_id = ?1 AND expires_at > ?2"
+    );
+    let current = tx
+        .query_row(&sql, params![rendezvous_id, now], |row| {
+            Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .optional()?;
+
+    let Some((value, consumed_at)) = current else {
+        tx.commit()?;
+        return Ok(PairingSlotRead::NotSet);
+    };
+
+    if consumed_at.is_some() {
+        tx.commit()?;
+        return Ok(PairingSlotRead::Consumed);
+    }
+
+    let Some(data) = value else {
+        tx.commit()?;
+        return Ok(PairingSlotRead::NotSet);
+    };
+
+    let sql = format!(
+        "UPDATE pairing_sessions
+            SET {col} = NULL, {consumed_col} = ?1
+          WHERE rendezvous_id = ?2
+            AND expires_at > ?3
+            AND {col} IS NOT NULL
+            AND {consumed_col} IS NULL"
+    );
+    let changed = tx.execute(&sql, params![now, rendezvous_id, now])?;
+    tx.commit()?;
+
+    if changed == 0 {
+        Ok(PairingSlotRead::Consumed)
+    } else {
+        Ok(PairingSlotRead::Present(data))
+    }
 }
 
 /// Delete a pairing session. Returns `true` if a row was deleted.
