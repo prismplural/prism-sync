@@ -1065,10 +1065,9 @@ impl PrismSync {
     /// [`configure_engine`](Self::configure_engine) again as part of a fresh
     /// pairing flow before any sync operation will succeed.
     ///
-    /// Note on `sync_quarantine`: that table lives in the host's Drift schema
-    /// (Dart side), not in the Rust sync engine, so it is *not* touched here.
-    /// Hosts that maintain such a table must clear it themselves alongside
-    /// this call.
+    /// This also clears Rust's `quarantined_ops` table. Host-side quarantine
+    /// tables, if any, still live outside the Rust sync engine and must be
+    /// cleared by the host alongside this call.
     ///
     /// Returns `Err(CoreError::Engine)` if no sync group is currently
     /// configured (i.e. `configure_engine` has not been called).
@@ -1083,8 +1082,8 @@ impl PrismSync {
     /// id, the epoch, and the `SyncService` engine + auto-sync task. Without
     /// this, a host that re-seeded credentials from its own keychain on next
     /// launch could re-attach to the OLD sync group with the in-memory
-    /// state still pointing at it. The sync_quarantine table on the host
-    /// side is NOT touched by this call (see method-level note above).
+    /// state still pointing at it. Host-side quarantine tables are NOT
+    /// touched by this call (see method-level note above).
     pub async fn reset_sync_state(&mut self) -> Result<()> {
         let sync_id = self
             .sync_service

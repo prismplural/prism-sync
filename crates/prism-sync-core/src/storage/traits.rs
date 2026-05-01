@@ -39,6 +39,12 @@ pub trait SyncStorage: Send + Sync {
         field: &str,
     ) -> Result<Option<FieldVersion>>;
 
+    /// List remote ops quarantined because they targeted schema unknown to
+    /// this client at pull time.
+    fn list_quarantined_ops(&self, _sync_id: &str) -> Result<Vec<QuarantinedOp>> {
+        Ok(vec![])
+    }
+
     /// Get a device record by sync_id and device_id.
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>>;
 
@@ -156,6 +162,14 @@ pub trait SyncStorageTx {
 
     // ── Field versions ──
     fn upsert_field_version(&mut self, fv: &FieldVersion) -> Result<()>;
+
+    // ── Quarantined remote ops ──
+    fn insert_quarantined_op(&mut self, _op: &QuarantinedOp) -> Result<()> {
+        Ok(())
+    }
+    fn delete_quarantined_op(&mut self, _sync_id: &str, _op_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     // ── Device registry ──
     fn upsert_device_record(&mut self, device: &DeviceRecord) -> Result<()>;

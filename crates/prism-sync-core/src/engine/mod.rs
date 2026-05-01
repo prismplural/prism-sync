@@ -1,7 +1,7 @@
 pub mod merge;
 pub mod state;
 
-pub use merge::{MergeEngine, WinningOp};
+pub use merge::{MergeEngine, QuarantinedChange, SchemaQuarantineReason, WinningOp};
 pub use state::{SyncConfig, SyncResult, SyncState};
 
 use std::collections::{HashMap, HashSet};
@@ -23,7 +23,9 @@ use crate::relay::{OutgoingBatch, SyncRelay};
 use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::snapshot_limits;
 use crate::storage::StorageError;
-use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, SyncMetadata, SyncStorage};
+use crate::storage::{
+    AppliedOp, DeviceRecord, FieldVersion, QuarantinedOp, SyncMetadata, SyncStorage,
+};
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
 
@@ -174,6 +176,23 @@ impl SyncEngine {
         let start = Instant::now();
         let mut result = SyncResult::default();
 
+        // Phase 0: replay remote ops that were quarantined because this
+        // client did not yet know their schema. A newly configured schema can
+        // make those ops valid without needing the relay to resend old history.
+        self.set_state(SyncState::Merging);
+        match self.replay_quarantined_ops(sync_id).await {
+            Ok((merged, changes)) => {
+                result.merged += merged;
+                result.entity_changes.extend(changes);
+            }
+            Err(e) => {
+                populate_result_error(&mut result, &e);
+                result.duration = start.elapsed();
+                self.set_state(SyncState::Error { message: e.to_string() });
+                return Ok(result);
+            }
+        }
+
         // Phase 1: Pull
         self.set_state(SyncState::Pulling);
         let pull_result = self.pull_phase(sync_id, key_hierarchy, device_id).await;
@@ -181,8 +200,8 @@ impl SyncEngine {
         match pull_result {
             Ok(pr) => {
                 result.pulled = pr.pulled;
-                result.merged = pr.merged;
-                result.entity_changes = pr.entity_changes;
+                result.merged += pr.merged;
+                result.entity_changes.extend(pr.entity_changes);
                 min_acked_seq = pr.min_acked_seq;
 
                 // Acknowledge processed ops so relay can prune its batches (fire-and-forget)
@@ -706,6 +725,215 @@ impl SyncEngine {
         }
     }
 
+    fn entity_changes_from_winning_ops(winning_ops: &[CrdtChange]) -> Vec<EntityChange> {
+        let mut change_map: HashMap<(String, String), EntityChange> = HashMap::new();
+        for op in winning_ops {
+            let key = (op.entity_table.clone(), op.entity_id.clone());
+            let entry = change_map.entry(key).or_insert_with(|| EntityChange {
+                table: op.entity_table.clone(),
+                entity_id: op.entity_id.clone(),
+                is_delete: false,
+                fields: HashMap::new(),
+            });
+            if op.is_delete {
+                entry.is_delete = true;
+                entry.fields.clear();
+            } else {
+                entry.fields.insert(op.field_name.clone(), op.encoded_value.clone());
+            }
+        }
+        change_map.into_values().collect()
+    }
+
+    async fn write_winning_ops_to_entities(&self, winning_ops: &[CrdtChange]) -> Result<()> {
+        if winning_ops.is_empty() {
+            return Ok(());
+        }
+
+        let mut tables_touched: HashSet<String> = HashSet::new();
+        for op in winning_ops {
+            tables_touched.insert(op.entity_table.clone());
+        }
+
+        for entity in &self.entities {
+            if tables_touched.contains(entity.table_name()) {
+                entity.begin_batch().await?;
+            }
+        }
+
+        let write_result: Result<()> = async {
+            for op in winning_ops {
+                if let Some(entity) =
+                    self.entities.iter().find(|e| e.table_name() == op.entity_table)
+                {
+                    if op.is_delete {
+                        entity.soft_delete(&op.entity_id, &op.client_hlc).await?;
+                    } else {
+                        let sync_type = self
+                            .schema
+                            .entity(&op.entity_table)
+                            .and_then(|e| e.field_by_name(&op.field_name))
+                            .map(|f| f.sync_type)
+                            .unwrap_or(SyncType::String);
+                        let decoded =
+                            match crate::schema::decode_value(&op.encoded_value, sync_type) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        table = %op.entity_table,
+                                        entity_id = %op.entity_id,
+                                        field = %op.field_name,
+                                        encoded_value = %op.encoded_value,
+                                        "Skipping field op with type mismatch: {e}. \
+                                         Dart-side quarantine will record the bad value."
+                                    );
+                                    continue;
+                                }
+                            };
+                        let mut fields = HashMap::new();
+                        fields.insert(op.field_name.clone(), decoded);
+                        entity.write_fields(&op.entity_id, &fields, &op.client_hlc, false).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        match write_result {
+            Ok(()) => {
+                for entity in &self.entities {
+                    if tables_touched.contains(entity.table_name()) {
+                        entity.commit_batch().await?;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                for entity in &self.entities {
+                    if tables_touched.contains(entity.table_name()) {
+                        let _ = entity.rollback_batch().await;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Replay quarantined ops that are now known to the configured schema.
+    async fn replay_quarantined_ops(&self, sync_id: &str) -> Result<(u64, Vec<EntityChange>)> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let quarantined = tokio::task::spawn_blocking(move || storage.list_quarantined_ops(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        let replayable: Vec<QuarantinedOp> = quarantined
+            .into_iter()
+            .filter(|q| self.merge_engine.schema_quarantine_reason(&q.op).is_none())
+            .collect();
+
+        if replayable.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let ops: Vec<CrdtChange> = replayable.iter().map(|q| q.op.clone()).collect();
+        let seq_by_op: HashMap<String, i64> =
+            replayable.iter().map(|q| (q.op_id.clone(), q.server_seq)).collect();
+
+        // Phase A: determine which now-schema-known ops win against current state.
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let ops_vec = ops.clone();
+        let merge_engine = self.merge_engine.clone();
+        let seq_by_op_for_check = seq_by_op.clone();
+
+        let (all_ops_checked, winning_ops) = tokio::task::spawn_blocking(move || {
+            let mut checked: Vec<(CrdtChange, bool, i64)> = Vec::new();
+            let get_fv = |sync_id: &str, table: &str, entity_id: &str, field: &str| {
+                storage.get_field_version(sync_id, table, entity_id, field)
+            };
+            let is_applied = |op_id: &str| storage.is_op_applied(op_id);
+
+            let outcome = merge_engine.determine_winners_with_quarantine(
+                &ops_vec,
+                &get_fv,
+                &is_applied,
+                &sid,
+            )?;
+
+            for op in &ops_vec {
+                if merge_engine.schema_quarantine_reason(op).is_some() {
+                    continue;
+                }
+                let already_applied = is_applied(&op.op_id)?;
+                let server_seq = seq_by_op_for_check.get(&op.op_id).copied().unwrap_or_default();
+                checked.push((op.clone(), already_applied, server_seq));
+            }
+
+            let winning_ops: Vec<CrdtChange> =
+                outcome.winners.into_values().filter(|w| !w.is_bulk_reset).map(|w| w.op).collect();
+
+            Ok::<_, CoreError>((checked, winning_ops))
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        let merged_count = winning_ops.len() as u64;
+        let entity_changes = Self::entity_changes_from_winning_ops(&winning_ops);
+
+        // Phase B: write now-winning entity changes before sync bookkeeping.
+        if !winning_ops.is_empty() {
+            self.write_winning_ops_to_entities(&winning_ops).await?;
+        }
+
+        // Phase C: mark replayed known ops applied and remove them from quarantine.
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let replayed_op_ids: Vec<String> = replayable.into_iter().map(|q| q.op_id).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = storage.begin_tx()?;
+
+            for (op, was_already_applied, server_seq) in &all_ops_checked {
+                if !was_already_applied {
+                    tx.insert_applied_op(&AppliedOp {
+                        op_id: op.op_id.clone(),
+                        sync_id: sid.clone(),
+                        epoch: op.epoch,
+                        device_id: op.device_id.clone(),
+                        client_hlc: op.client_hlc.clone(),
+                        server_seq: *server_seq,
+                        applied_at: chrono::Utc::now(),
+                    })?;
+                }
+            }
+
+            for op in &winning_ops {
+                tx.upsert_field_version(&FieldVersion {
+                    sync_id: sid.clone(),
+                    entity_table: op.entity_table.clone(),
+                    entity_id: op.entity_id.clone(),
+                    field_name: op.field_name.clone(),
+                    winning_op_id: op.op_id.clone(),
+                    winning_device_id: op.device_id.clone(),
+                    winning_hlc: op.client_hlc.clone(),
+                    winning_encoded_value: Some(op.encoded_value.clone()),
+                    updated_at: chrono::Utc::now(),
+                })?;
+            }
+
+            for op_id in &replayed_op_ids {
+                tx.delete_quarantined_op(&sid, op_id)?;
+            }
+
+            tx.commit()
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        Ok((merged_count, entity_changes))
+    }
+
     /// Apply a single remote batch: determine winners, write consumer data, then persist sync state.
     ///
     /// Returns `(merged_count, entity_changes)` where `entity_changes` contains the
@@ -727,48 +955,48 @@ impl SyncEngine {
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         let ops_vec = ops.to_vec();
-        let schema = self.schema.clone();
         let merge_engine = self.merge_engine.clone();
 
-        let (all_ops_checked, winning_ops) = tokio::task::spawn_blocking(move || {
-            // Track which ops were already applied (for Phase C bookkeeping)
-            let mut checked: Vec<(CrdtChange, bool)> = Vec::new();
+        let (all_ops_checked, winning_ops, quarantined_ops) =
+            tokio::task::spawn_blocking(move || {
+                // Track which ops were already applied (for Phase C bookkeeping)
+                let mut checked: Vec<(CrdtChange, bool)> = Vec::new();
 
-            // Use non-transactional reads for winner determination
-            let get_fv = |sync_id: &str, table: &str, entity_id: &str, field: &str| {
-                storage.get_field_version(sync_id, table, entity_id, field)
-            };
-            let is_applied = |op_id: &str| storage.is_op_applied(op_id);
+                // Use non-transactional reads for winner determination
+                let get_fv = |sync_id: &str, table: &str, entity_id: &str, field: &str| {
+                    storage.get_field_version(sync_id, table, entity_id, field)
+                };
+                let is_applied = |op_id: &str| storage.is_op_applied(op_id);
 
-            // Determine winners via MergeEngine
-            let winners = merge_engine.determine_winners(&ops_vec, &get_fv, &is_applied, &sid)?;
+                // Determine winners via MergeEngine
+                let outcome = merge_engine.determine_winners_with_quarantine(
+                    &ops_vec,
+                    &get_fv,
+                    &is_applied,
+                    &sid,
+                )?;
 
-            // Build the checked ops list for bookkeeping
-            for op in &ops_vec {
-                if !schema.has_table(&op.entity_table) {
-                    continue;
+                // Build the checked ops list for bookkeeping
+                for op in &ops_vec {
+                    if merge_engine.schema_quarantine_reason(op).is_some() {
+                        continue;
+                    }
+                    let already_applied = is_applied(&op.op_id)?;
+                    checked.push((op.clone(), already_applied));
                 }
-                if op.field_name != "is_deleted"
-                    && !op.is_bulk_reset()
-                    && schema
-                        .entity(&op.entity_table)
-                        .and_then(|e| e.field_by_name(&op.field_name))
-                        .is_none()
-                {
-                    continue;
-                }
-                let already_applied = is_applied(&op.op_id)?;
-                checked.push((op.clone(), already_applied));
-            }
 
-            // Collect winning ops as a Vec
-            let winning_ops: Vec<CrdtChange> =
-                winners.into_values().filter(|w| !w.is_bulk_reset).map(|w| w.op).collect();
+                // Collect winning ops as a Vec
+                let winning_ops: Vec<CrdtChange> = outcome
+                    .winners
+                    .into_values()
+                    .filter(|w| !w.is_bulk_reset)
+                    .map(|w| w.op)
+                    .collect();
 
-            Ok::<_, CoreError>((checked, winning_ops))
-        })
-        .await
-        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+                Ok::<_, CoreError>((checked, winning_ops, outcome.quarantined))
+            })
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         let merged_count = winning_ops.len() as u64;
 
@@ -880,8 +1108,20 @@ impl SyncEngine {
             let sid = sync_id.to_string();
             let ops_checked = all_ops_checked;
             let winners = winning_ops;
+            let quarantined = quarantined_ops;
             tokio::task::spawn_blocking(move || {
                 let mut tx = storage.begin_tx()?;
+
+                for quarantined in &quarantined {
+                    tx.insert_quarantined_op(&QuarantinedOp {
+                        sync_id: sid.clone(),
+                        op_id: quarantined.op.op_id.clone(),
+                        op: quarantined.op.clone(),
+                        reason: quarantined.reason.as_str().to_string(),
+                        server_seq,
+                        quarantined_at: chrono::Utc::now(),
+                    })?;
+                }
 
                 // Record all valid ops as applied (for idempotency on replay)
                 for (op, was_already_applied) in &ops_checked {

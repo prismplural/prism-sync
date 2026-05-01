@@ -14,7 +14,7 @@ use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine, SyncResult};
 use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope, SnapshotExchange, SyncTransport};
-use prism_sync_core::schema::SyncValue;
+use prism_sync_core::schema::{SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{
     AppliedOpEntry, DeviceRegistryEntry, FieldVersionEntry, RusqliteSyncStorage, SnapshotData,
     SyncMetadataEntry, SyncStorage, SNAPSHOT_VERSION,
@@ -139,6 +139,16 @@ fn task_title_op(op_id: &str, device_id: &str, hlc_node_id: &str) -> CrdtChange 
     }
 }
 
+fn schema_with_future_field() -> SyncSchema {
+    SyncSchema::builder()
+        .entity("tasks", |e| {
+            e.field("title", SyncType::String)
+                .field("done", SyncType::Bool)
+                .field("future_note", SyncType::String)
+        })
+        .build()
+}
+
 async fn pull_injected_sender_batch(
     ops: Vec<CrdtChange>,
 ) -> (SyncResult, Arc<RusqliteSyncStorage>, Arc<MockTaskEntity>) {
@@ -258,6 +268,91 @@ async fn rejects_batch_when_op_hlc_node_differs_from_envelope_sender() {
         0,
         "bad-attribution batch must not advance the pull cursor"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Schema quarantine regressions
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn unknown_field_op_is_quarantined_without_advancing_applied_ops() {
+    let sender_id = "device-sender";
+    let op = CrdtChange {
+        op_id: "op-future-field".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-quarantine".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "future_note".to_string(),
+        encoded_value: "\"Backfill me\"".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_000, 0, sender_id).to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (result, storage, entity) = pull_injected_sender_batch(vec![op]).await;
+
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.merged, 0);
+    assert_eq!(entity.get_field("task-quarantine", "future_note"), None);
+    assert!(!storage.is_op_applied("op-future-field").unwrap());
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        1,
+        "quarantined batches still advance the pull cursor"
+    );
+
+    let quarantined = storage.list_quarantined_ops(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].op_id, "op-future-field");
+    assert_eq!(quarantined[0].reason, "unknown_field");
+    assert_eq!(quarantined[0].server_seq, 1);
+}
+
+#[tokio::test]
+async fn quarantined_op_replays_when_schema_adds_field() {
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let op = CrdtChange {
+        op_id: "op-future-field".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-quarantine".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "future_note".to_string(),
+        encoded_value: "\"Backfill me\"".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_000, 0, sender_id).to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (_result, storage, entity) = pull_injected_sender_batch(vec![op]).await;
+    assert_eq!(storage.list_quarantined_ops(SYNC_ID).unwrap().len(), 1);
+
+    let relay = Arc::new(MockRelay::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay,
+        vec![entity_ref],
+        schema_with_future_field(),
+        SyncConfig::default(),
+    );
+    let result = engine
+        .sync(SYNC_ID, &init_key_hierarchy(), &make_signing_key(), None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.merged, 1);
+    assert_eq!(
+        entity.get_field("task-quarantine", "future_note"),
+        Some(SyncValue::String("Backfill me".to_string()))
+    );
+    assert!(storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty());
+    assert!(storage.is_op_applied("op-future-field").unwrap());
 }
 
 #[tokio::test]

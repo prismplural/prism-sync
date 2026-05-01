@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use tracing::warn;
 
 use super::error::StorageError;
@@ -97,6 +97,24 @@ fn row_to_field_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<FieldVersio
     })
 }
 
+fn row_to_quarantined_op(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuarantinedOp> {
+    let quarantined_at: String = row.get("quarantined_at")?;
+    let op_json: String = row.get("op_json")?;
+    let op = serde_json::from_str(&op_json)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?;
+
+    Ok(QuarantinedOp {
+        sync_id: row.get("sync_id")?,
+        op_id: row.get("op_id")?,
+        op,
+        reason: row.get("reason")?,
+        server_seq: row.get("server_seq")?,
+        quarantined_at: DateTime::parse_from_rfc3339(&quarantined_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
 fn row_to_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
     let registered_str: String = row.get("registered_at")?;
     let revoked_str: Option<String> = row.get("revoked_at")?;
@@ -181,6 +199,20 @@ fn query_field_version(
     )
     .optional()
     .map_err(CoreError::from)
+}
+
+fn query_quarantined_ops(conn: &Connection, sync_id: &str) -> Result<Vec<QuarantinedOp>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM quarantined_ops \
+         WHERE sync_id = ?1 \
+         ORDER BY server_seq ASC, quarantined_at ASC, op_id ASC",
+    )?;
+    let rows = stmt.query_map(params![sync_id], row_to_quarantined_op)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn query_device_record(
@@ -406,6 +438,35 @@ fn exec_upsert_field_version(conn: &Connection, fv: &FieldVersion) -> Result<()>
     Ok(())
 }
 
+fn exec_insert_quarantined_op(conn: &Connection, op: &QuarantinedOp) -> Result<()> {
+    let op_json = serde_json::to_string(&op.op)
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO quarantined_ops \
+         (sync_id, op_id, server_seq, entity_table, field_name, reason, op_json, quarantined_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            op.sync_id,
+            op.op_id,
+            op.server_seq,
+            op.op.entity_table,
+            op.op.field_name,
+            op.reason,
+            op_json,
+            op.quarantined_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_delete_quarantined_op(conn: &Connection, sync_id: &str, op_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM quarantined_ops WHERE sync_id = ?1 AND op_id = ?2",
+        params![sync_id, op_id],
+    )?;
+    Ok(())
+}
+
 fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO device_registry \
@@ -442,6 +503,7 @@ fn exec_clear_sync_state(conn: &Connection, sync_id: &str) -> Result<()> {
     conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM applied_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM field_versions WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM quarantined_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM device_registry WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM sync_metadata WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
@@ -837,6 +899,11 @@ impl SyncStorage for RusqliteSyncStorage {
         query_field_version(&conn, sync_id, table, entity_id, field)
     }
 
+    fn list_quarantined_ops(&self, sync_id: &str) -> Result<Vec<QuarantinedOp>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_quarantined_ops(&conn, sync_id)
+    }
+
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_device_record(&conn, sync_id, device_id)
@@ -1002,6 +1069,16 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn upsert_field_version(&mut self, fv: &FieldVersion) -> Result<()> {
         exec_upsert_field_version(&self.conn, fv)
+    }
+
+    // ── Quarantined remote ops ──
+
+    fn insert_quarantined_op(&mut self, op: &QuarantinedOp) -> Result<()> {
+        exec_insert_quarantined_op(&self.conn, op)
+    }
+
+    fn delete_quarantined_op(&mut self, sync_id: &str, op_id: &str) -> Result<()> {
+        exec_delete_quarantined_op(&self.conn, sync_id, op_id)
     }
 
     // ── Device registry ──
@@ -2060,6 +2137,49 @@ mod tests {
 
         // Different sync group: still false
         assert!(!storage.has_any_applied_ops("sync-other").unwrap());
+    }
+
+    #[test]
+    fn quarantined_ops_round_trip_and_clear_with_sync_state() {
+        let storage = make_storage();
+        let op = crate::crdt_change::CrdtChange::new(
+            Some("op-quarantined".to_string()),
+            Some("batch-quarantined".to_string()),
+            "task-1".to_string(),
+            "tasks".to_string(),
+            "future_field".to_string(),
+            Some("\"value\"".to_string()),
+            Some("1000:0:device-a".to_string()),
+            false,
+            Some("device-a".to_string()),
+            Some(0),
+            None,
+        );
+        let quarantined = QuarantinedOp {
+            sync_id: "sync-1".to_string(),
+            op_id: op.op_id.clone(),
+            op,
+            reason: "unknown_field".to_string(),
+            server_seq: 7,
+            quarantined_at: Utc::now(),
+        };
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_op(&quarantined).unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_quarantined_ops("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].op_id, "op-quarantined");
+        assert_eq!(rows[0].op.field_name, "future_field");
+        assert_eq!(rows[0].reason, "unknown_field");
+        assert_eq!(rows[0].server_seq, 7);
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_sync_state("sync-1").unwrap();
+        tx.commit().unwrap();
+
+        assert!(storage.list_quarantined_ops("sync-1").unwrap().is_empty());
     }
 
     #[test]

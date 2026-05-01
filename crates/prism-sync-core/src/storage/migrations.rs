@@ -91,6 +91,22 @@ const MIGRATIONS: &[&str] = &[
     "-- V4: Add x_wing_public_key to device_registry
     ALTER TABLE device_registry ADD COLUMN x_wing_public_key BLOB NOT NULL DEFAULT X'';
     ",
+    "-- V5: Persist remote ops that target schema unknown to this client
+    CREATE TABLE IF NOT EXISTS quarantined_ops (
+        sync_id TEXT NOT NULL,
+        op_id TEXT NOT NULL,
+        server_seq INTEGER NOT NULL,
+        entity_table TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        op_json TEXT NOT NULL,
+        quarantined_at TEXT NOT NULL,
+        PRIMARY KEY (sync_id, op_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_quarantined_ops_sync_seq
+        ON quarantined_ops(sync_id, server_seq, quarantined_at);
+    ",
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), String> {
@@ -141,6 +157,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(x_wing_column_count, 1);
+
+        let quarantine_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'quarantined_ops'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantine_table_count, 1);
     }
 
     #[test]

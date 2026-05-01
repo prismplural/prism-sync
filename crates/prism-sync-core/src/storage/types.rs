@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 
+use crate::crdt_change::CrdtChange;
+
 /// Metadata for a sync group stored locally.
 #[derive(Debug, Clone)]
 pub struct SyncMetadata {
@@ -61,6 +63,18 @@ pub struct FieldVersion {
     /// (e.g. `is_deleted = "true"` vs `"false"` for un-deletes).
     pub winning_encoded_value: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A received remote op that could not be applied because the local schema
+/// does not yet know its table or field.
+#[derive(Debug, Clone)]
+pub struct QuarantinedOp {
+    pub sync_id: String,
+    pub op_id: String,
+    pub op: CrdtChange,
+    pub reason: String,
+    pub server_seq: i64,
+    pub quarantined_at: DateTime<Utc>,
 }
 
 /// Local device registry record for signature verification on pull.
