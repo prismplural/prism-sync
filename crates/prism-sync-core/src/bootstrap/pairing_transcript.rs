@@ -35,8 +35,9 @@ pub fn build_sync_pairing_transcript(
     t.append_role_fixed(BootstrapRole::Responder, b"x25519_pk", &responder.x25519_public_key);
     t.append_role_bytes(BootstrapRole::Initiator, b"ml_dsa_65_pk", &initiator.ml_dsa_65_pk);
     t.append_role_bytes(BootstrapRole::Responder, b"ml_dsa_65_pk", &responder.ml_dsa_65_public_key);
-    t.append_role_bytes(BootstrapRole::Initiator, b"ml_kem_768_ek", initiator.ml_kem_768_ek());
-    t.append_role_bytes(BootstrapRole::Responder, b"ml_kem_768_ek", responder.ml_kem_768_ek());
+    // SAS v3 binds the full atomic X-Wing EK, not only its ML-KEM prefix.
+    t.append_role_bytes(BootstrapRole::Initiator, b"xwing_ek", &initiator.xwing_ek);
+    t.append_role_bytes(BootstrapRole::Responder, b"xwing_ek", &responder.xwing_ek);
     t.append_bytes(b"kem_ciphertext", kem_ciphertext);
     t.append_bytes(b"relay_origin", relay_origin.as_bytes());
     t.append_fixed(b"bootstrap_commitment", commitment);
@@ -50,6 +51,7 @@ mod tests {
     use crate::bootstrap::{BootstrapVersion, PAIRING_SAS_VERSION};
 
     const ML_DSA_65_PK_LEN: usize = 1952;
+    const ML_KEM_768_EK_LEN: usize = 1184;
     const XWING_EK_LEN: usize = 1216;
 
     fn sample_initiator() -> PairingPublicKeys {
@@ -173,6 +175,38 @@ mod tests {
 
         let h1 = build_hash(&rid, &commit, &init1, &resp, &ct, "https://relay.example.com");
         let h2 = build_hash(&rid, &commit, &init2, &resp, &ct, "https://relay.example.com");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn transcript_changes_with_different_initiator_xwing_suffix() {
+        let rid = [0x42; 16];
+        let commit = [0xAB; 32];
+        let resp = sample_responder();
+        let ct = vec![0x99; 1120];
+
+        let init1 = sample_initiator();
+        let mut init2 = sample_initiator();
+        init2.xwing_ek[ML_KEM_768_EK_LEN] ^= 0xFF;
+
+        let h1 = build_hash(&rid, &commit, &init1, &resp, &ct, "https://relay.example.com");
+        let h2 = build_hash(&rid, &commit, &init2, &resp, &ct, "https://relay.example.com");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn transcript_changes_with_different_responder_xwing_suffix() {
+        let rid = [0x42; 16];
+        let commit = [0xAB; 32];
+        let init = sample_initiator();
+        let ct = vec![0x99; 1120];
+
+        let resp1 = sample_responder();
+        let mut resp2 = sample_responder();
+        resp2.xwing_ek[ML_KEM_768_EK_LEN] ^= 0xFF;
+
+        let h1 = build_hash(&rid, &commit, &init, &resp1, &ct, "https://relay.example.com");
+        let h2 = build_hash(&rid, &commit, &init, &resp2, &ct, "https://relay.example.com");
         assert_ne!(h1, h2);
     }
 

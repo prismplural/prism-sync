@@ -135,8 +135,10 @@ impl JoinerCeremony {
     /// display codes for user verification.
     pub fn process_pairing_init(&mut self, pairing_init_bytes: &[u8]) -> Result<SasDisplay> {
         // 1. Parse
-        let init = PairingInit::from_bytes(pairing_init_bytes)
-            .ok_or_else(|| CoreError::Engine("failed to parse PairingInit".into()))?;
+        let init = PairingInit::from_bytes(pairing_init_bytes).ok_or_else(|| {
+            pairing_init_parse_error(pairing_init_bytes)
+                .unwrap_or_else(|| CoreError::Engine("failed to parse PairingInit".into()))
+        })?;
 
         // 2. Reconstruct dk from seed and decapsulate
         let dk = XWingKem::decapsulation_key_from_bytes(&self.xwing_dk_seed);
@@ -279,6 +281,22 @@ impl JoinerCeremony {
     pub fn rendezvous_id_hex(&self) -> String {
         hex::encode(self.rendezvous_id)
     }
+}
+
+fn pairing_init_parse_error(pairing_init_bytes: &[u8]) -> Option<CoreError> {
+    let version = *pairing_init_bytes.first()?;
+    if BootstrapVersion::from_byte(version).is_none() {
+        return Some(CoreError::Engine(format!(
+            "unsupported PairingInit bootstrap version: {version}"
+        )));
+    }
+
+    let sas_version = *pairing_init_bytes.get(1)?;
+    (sas_version != PAIRING_SAS_VERSION).then(|| {
+        CoreError::Engine(format!(
+            "unsupported pairing SAS version: {sas_version}; expected {PAIRING_SAS_VERSION}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tampered_pairing_init_sas_version_fails_closed() {
+    async fn stale_pairing_init_sas_version_fails_closed() {
         let relay = MockPairingRelay::new();
         let relay_url = "https://relay.example.com";
 
@@ -655,13 +673,13 @@ mod tests {
             .await
             .unwrap()
             .expect("init slot should be populated");
-        init_bytes[1] = PAIRING_SAS_VERSION.saturating_add(1);
+        init_bytes[1] = PAIRING_SAS_VERSION - 1;
 
         let err = joiner
             .process_pairing_init(&init_bytes)
             .expect_err("unsupported SAS version must fail before SAS display");
         assert!(
-            err.to_string().contains("failed to parse PairingInit"),
+            err.to_string().contains("unsupported pairing SAS version: 2; expected 3"),
             "expected parse rejection, got: {err}"
         );
         assert!(

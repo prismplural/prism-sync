@@ -641,6 +641,11 @@ mod tests {
     // ── PairingInit tests ───────────────────────────────────────────────
 
     #[test]
+    fn pairing_sas_version_is_v3() {
+        assert_eq!(PAIRING_SAS_VERSION, 3);
+    }
+
+    #[test]
     fn pairing_init_round_trip() {
         let init = sample_pairing_init();
         let bytes = init.to_bytes();
@@ -695,11 +700,19 @@ mod tests {
     }
 
     #[test]
+    fn pairing_init_rejects_stale_sas_v2() {
+        let init = sample_pairing_init();
+        let mut bytes = init.to_bytes();
+        bytes[1] = 2;
+        assert!(PairingInit::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
     fn legacy_pairing_init_parser_rejects_new_versioned_layout() {
         let bytes = sample_pairing_init().to_bytes();
         assert!(
             legacy_pairing_init_parse_without_sas_version(&bytes).is_none(),
-            "old PairingInit parser must not accept the v2 SAS-versioned layout"
+            "old PairingInit parser must not accept the SAS-versioned layout"
         );
     }
 

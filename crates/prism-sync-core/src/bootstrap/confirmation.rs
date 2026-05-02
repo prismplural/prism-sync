@@ -22,7 +22,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 // ── Domain separators ────────────────────────────────────────────────────────
 
-const SAS_DOMAIN: &[u8] = b"PRISM_BOOTSTRAP_SAS_V2";
+const SAS_DOMAIN: &[u8] = b"PRISM_BOOTSTRAP_SAS_V3";
 const CONFIRM_DOMAIN: &[u8] = b"PRISM_BOOTSTRAP_CONFIRM_V1";
 const FINGERPRINT_DOMAIN: &[u8] = b"PRISM_FINGERPRINT";
 const SAS_WORD_COUNT: usize = 5;
@@ -56,7 +56,7 @@ impl ConfirmationCode {
         }
     }
 
-    /// Compute the SAS input HMAC for the version-2 human comparison phrase.
+    /// Compute the SAS input HMAC for the current human comparison phrase.
     fn sas_input(&self) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.verification_key)
             .expect("HMAC accepts any key length");
