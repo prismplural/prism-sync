@@ -90,6 +90,16 @@ fn should_bubble_recoverable_key_error(error: &CoreError) -> bool {
     matches!(error, CoreError::MissingEpochKey { .. } | CoreError::DecryptFailed { .. })
 }
 
+fn is_must_bootstrap_from_snapshot(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Relay {
+            code: Some(code),
+            ..
+        } if code == "must_bootstrap_from_snapshot"
+    )
+}
+
 #[cfg(debug_assertions)]
 fn debug_assert_remote_op_matches_sender(op: &CrdtChange, trusted_sender_device_id: &str) {
     debug_assert_eq!(
@@ -214,6 +224,32 @@ impl SyncEngine {
         // Phase 1: Pull
         self.set_state(SyncState::Pulling);
         let pull_result = self.pull_phase(sync_id, key_hierarchy, device_id).await;
+        let pull_result = match pull_result {
+            Ok(pr) => Ok(pr),
+            Err(e) if is_must_bootstrap_from_snapshot(&e) => {
+                tracing::warn!(
+                    "pull cursor predates retained relay history; attempting snapshot bootstrap"
+                );
+                match self.bootstrap_from_snapshot(sync_id, key_hierarchy).await {
+                    // The relay rejected our cursor and no snapshot is
+                    // available to recover from — retrying the pull would just
+                    // hit the same `MustBootstrapFromSnapshot` again, so
+                    // surface a real error instead of looping silently.
+                    Ok((0, _)) => Err(CoreError::Engine(
+                        "relay required snapshot bootstrap but no snapshot is available; \
+                         another paired device must upload a fresh snapshot before this device \
+                         can sync"
+                            .to_string(),
+                    )),
+                    Ok((_snapshot_entities, snapshot_changes)) => {
+                        result.entity_changes.extend(snapshot_changes);
+                        self.pull_phase(sync_id, key_hierarchy, device_id).await
+                    }
+                    Err(bootstrap_err) => Err(bootstrap_err),
+                }
+            }
+            Err(e) => Err(e),
+        };
         let min_acked_seq;
         match pull_result {
             Ok(pr) => {

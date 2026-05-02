@@ -13,7 +13,9 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine, SyncResult};
-use prism_sync_core::relay::{MockRelay, SignedBatchEnvelope, SnapshotExchange, SyncTransport};
+use prism_sync_core::relay::{
+    InjectedPullError, MockRelay, SignedBatchEnvelope, SnapshotExchange, SyncTransport,
+};
 use prism_sync_core::schema::{SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{
     AppliedOpEntry, DeviceRegistryEntry, FieldVersionEntry, RusqliteSyncStorage, SnapshotData,
@@ -461,6 +463,105 @@ async fn snapshot_import_accepts_rows_from_trusted_non_uploader_device() {
     assert!(storage.is_op_applied("op-source-snapshot").unwrap());
     assert_eq!(entity_changes.len(), 1);
     assert_eq!(entity_changes[0].fields.get("title"), Some(&"\"Source snapshot row\"".to_string()));
+}
+
+#[tokio::test]
+async fn sync_bootstraps_from_snapshot_when_relay_history_was_pruned() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 77;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let snapshot_hlc = Hlc::new(1_710_500_000_000, 0, sender_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-bootstrap".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: snapshot_hlc.clone(),
+            winning_device_id: sender_id.to_string(),
+            winning_op_id: "op-bootstrap-snapshot".to_string(),
+            winning_encoded_value: Some("\"Snapshot row\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: vec![snapshot_device_entry(
+            sender_id,
+            &signing_key_sender.verifying_key(),
+            &ml_dsa_key_sender.public_key_bytes(),
+        )],
+        applied_ops: vec![AppliedOpEntry {
+            op_id: "op-bootstrap-snapshot".to_string(),
+            sync_id: SYNC_ID.to_string(),
+            epoch: 0,
+            device_id: sender_id.to_string(),
+            client_hlc: snapshot_hlc,
+            server_seq: server_seq_at,
+            applied_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-pruned-history",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+    relay.fail_next_pulls_with(
+        1,
+        InjectedPullError::MustBootstrapFromSnapshot { first_retained_seq: server_seq_at },
+    );
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "sync should recover via snapshot: {:?}", result.error);
+    assert_eq!(relay.pull_call_count(), 2, "sync should retry pull once after snapshot import");
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        server_seq_at
+    );
+    assert_eq!(result.entity_changes.len(), 1);
+    assert_eq!(result.entity_changes[0].fields.get("title"), Some(&"\"Snapshot row\"".to_string()));
 }
 
 #[tokio::test]
