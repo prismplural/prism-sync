@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `clear_sharing_id_cache`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `enforce_handle_signature_version_floor`, `enforce_supported_signature_version_floor`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `ratchet_handle_min_signature_version`, `ratchet_min_signature_version`, `reconcile_ml_dsa_rotation_commit`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `char_at`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `sas_display_json`, `secret_text`, `set_local_device_ml_dsa_state`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -38,7 +38,7 @@ Future<PrismSyncHandle> createPrismSync({
 /// Initialize (first-time setup).
 Future<void> initialize({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
   required List<int> secretKey,
 }) => RustLib.instance.api.crateApiInitialize(
   handle: handle,
@@ -49,7 +49,7 @@ Future<void> initialize({
 /// Unlock (subsequent launches).
 Future<void> unlock({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
   required List<int> secretKey,
 }) => RustLib.instance.api.crateApiUnlock(
   handle: handle,
@@ -59,9 +59,9 @@ Future<void> unlock({
 
 /// Restore the unlocked state directly from raw key material.
 ///
-/// Bypasses Argon2id password derivation entirely. Use when the raw DEK
-/// has been persisted in the platform keychain (Signal-style approach).
-/// This is the fast path for subsequent app launches.
+/// Bypasses Argon2id password derivation entirely. Use when the host has
+/// recovered the DEK from a platform-protected runtime cache. This is the
+/// fast path for subsequent app launches.
 ///
 /// - `dek`: The raw 32-byte Data Encryption Key.
 /// - `device_secret`: The raw 32-byte device secret.
@@ -75,11 +75,12 @@ Future<void> restoreRuntimeKeys({
   deviceSecret: deviceSecret,
 );
 
-/// Export the raw DEK bytes for keychain persistence.
+/// Export the raw DEK bytes for host-side runtime-cache wrapping.
 ///
 /// Returns the raw 32-byte DEK. Only works when unlocked (after
-/// `initialize` or `unlock`). Store in the platform keychain so
-/// `restore_runtime_keys` can be used on subsequent launches.
+/// `initialize` or `unlock`). The host must wrap the bytes before
+/// persistence; the unwrapped bytes can be supplied to `restore_runtime_keys`
+/// on subsequent launches.
 Future<Uint8List> exportDek({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiExportDek(handle: handle);
 
@@ -124,9 +125,9 @@ Future<void> configureEngine({required PrismSyncHandle handle}) =>
 
 /// Change password (re-wraps DEK, no data re-encryption).
 ///
-/// The `old_password` parameter is accepted for API symmetry but is not
-/// used — `change_password` operates on the already-unlocked key hierarchy.
-/// The secret key is required to derive the new wrapping key.
+/// Operates on the already-unlocked key hierarchy. The new password and
+/// secret key are wrapped for zeroization immediately on FFI entry; the new
+/// password bytes must be valid UTF-8 for the current crypto API.
 ///
 /// Returns the next `identity_generation` value that the app should persist
 /// to synced settings. If local sharing is currently active, this also
@@ -134,14 +135,12 @@ Future<void> configureEngine({required PrismSyncHandle handle}) =>
 /// incremented generation before re-wrapping the DEK.
 Future<int> changePassword({
   required PrismSyncHandle handle,
-  required String oldPassword,
-  required String newPassword,
+  required List<int> newPassword,
   required List<int> secretKey,
   String? sharingId,
   required int currentIdentityGeneration,
 }) => RustLib.instance.api.crateApiChangePassword(
   handle: handle,
-  oldPassword: oldPassword,
   newPassword: newPassword,
   secretKey: secretKey,
   sharingId: sharingId,
@@ -379,9 +378,9 @@ Future<String?> pollEvent({required PrismSyncHandle handle}) =>
 /// sync_id in the URL path.
 Future<String> createSyncGroup({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
   required String relayUrl,
-  String? mnemonic,
+  Uint8List? mnemonic,
 }) => RustLib.instance.api.crateApiCreateSyncGroup(
   handle: handle,
   password: password,
@@ -482,7 +481,7 @@ Future<bool?> checkWipeStatus({
 ///
 /// This is needed because `initialize()` and `unlock()` take `secret_key: Vec<u8>`,
 /// but the user sees/enters a 12-word mnemonic. This bridges the two.
-Future<Uint8List> mnemonicToBytes({required String mnemonic}) =>
+Future<Uint8List> mnemonicToBytes({required List<int> mnemonic}) =>
     RustLib.instance.api.crateApiMnemonicToBytes(mnemonic: mnemonic);
 
 /// Convert 16-byte entropy back to a BIP39 mnemonic string.
@@ -521,12 +520,34 @@ Future<void> deleteSyncGroup({
   sessionToken: sessionToken,
 );
 
+/// Atomically wipe all local sync engine state for the configured sync group.
+///
+/// Clears `pending_ops`, `applied_ops`, `field_versions`, `sync_metadata`, and
+/// the paired-devices list (`device_registry`) inside a single
+/// `BEGIN IMMEDIATE` transaction. After this returns successfully the device
+/// is unpaired from its sync group and must re-pair before any further sync
+/// operation will succeed.
+///
+/// The host's Drift-side `sync_quarantine` table (if any) is *not* touched —
+/// that lives outside the Rust engine and must be cleared by the host
+/// alongside this call.
+///
+/// Used as the "Approach A" cutover hook by the per-member fronting migration
+/// (see `docs/plans/fronting-per-member-sessions.md` §4.2). Performs no relay
+/// I/O — purely local. Requires a configured engine (`configure_engine` must
+/// have been called) — for the cleanup-resume path that runs without a
+/// configured engine, use [`clear_sync_state`] instead.
+Future<void> resetSyncState({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiResetSyncState(handle: handle);
+
 /// Clear all sync-DB rows for the given `sync_id`.
 ///
 /// Wipes `pending_ops`, `applied_ops`, `field_versions`, `device_registry`,
 /// and `sync_metadata` rows scoped to `sync_id`. Used by the reset-data path
 /// (Phase 2B) as belt-and-suspenders before deleting the sync DB file, and
-/// by any future cleanup of orphaned/abandoned sync_ids.
+/// by any future cleanup of orphaned/abandoned sync_ids — including the
+/// fronting-migration cleanup-resume path, which has no live engine to call
+/// [`reset_sync_state`] against.
 ///
 /// **Safety guard:** by default, refuses to clear the *currently active*
 /// `sync_id` (the one configured on the live engine). Callers that
@@ -554,19 +575,20 @@ Future<String?> getNodeId({required PrismSyncHandle handle}) =>
 /// Seed the in-memory secure store with values from the platform keychain.
 /// Call this after `create_prism_sync`, before `initialize`/`unlock`/`configure_engine`.
 ///
-/// `entries_json` is a JSON object: `{"key": "base64value", ...}`
+/// Entries are transferred as per-key byte buffers so secret material does not
+/// need to be assembled into a JSON string at the FFI boundary.
 Future<void> seedSecureStore({
   required PrismSyncHandle handle,
-  required String entriesJson,
+  required Map<String, Uint8List> entries,
 }) => RustLib.instance.api.crateApiSeedSecureStore(
   handle: handle,
-  entriesJson: entriesJson,
+  entries: entries,
 );
 
 /// Drain all values from the secure store so Dart can persist them
 /// back to the platform keychain.
 ///
-/// Returns a JSON object: `{"key": "base64value", ...}`
+/// Returns per-key byte buffers for the app to persist to its keychain.
 /// Call this after state-changing operations (initialize, change_password,
 /// create_sync_group, join_*).
 ///
@@ -579,8 +601,9 @@ Future<void> seedSecureStore({
 /// **Fallback:** if enumeration is unavailable (keychain-backed impls),
 /// drain falls back to the historical fixed `known_keys` list plus
 /// `epoch_key_1..=current_epoch`.
-Future<String> drainSecureStore({required PrismSyncHandle handle}) =>
-    RustLib.instance.api.crateApiDrainSecureStore(handle: handle);
+Future<Map<String, Uint8List>> drainSecureStore({
+  required PrismSyncHandle handle,
+}) => RustLib.instance.api.crateApiDrainSecureStore(handle: handle);
 
 /// Ensure a local sharing identity exists for the provided synced sharing_id.
 ///
@@ -739,13 +762,28 @@ Future<Uint8List> hexDecode({required String hexStr}) =>
 Future<String> startJoinerCeremony({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiStartJoinerCeremony(handle: handle);
 
+/// Cancel any in-progress relay-based PQ pairing ceremony.
+///
+/// This clears both in-memory ceremony slots, removes any pending joiner
+/// bootstrap identity material, and never sends credentials. If a rendezvous id
+/// was already allocated, the relay session is deleted on a best-effort basis
+/// after local state is cleared. Relay cleanup errors are intentionally logged
+/// and ignored so cancellation remains idempotent and can recover from
+/// partially connected/offline states.
+Future<void> cancelPairingCeremony({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiCancelPairingCeremony(handle: handle);
+
 /// Wait for the initiator's PairingInit and return the SAS display codes.
 ///
 /// Polls the relay for the PairingInit slot until it arrives, then derives
-/// the shared secret and SAS codes. Returns JSON:
+/// the shared secret and SAS phrase. Returns JSON:
 ///
 /// ```json
-/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// {
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"]
+/// }
 /// ```
 ///
 /// Must be called after [`start_joiner_ceremony`].
@@ -765,7 +803,7 @@ Future<String> getJoinerSas({required PrismSyncHandle handle}) =>
 /// Must be called after [`get_joiner_sas`] and user SAS verification.
 Future<String> completeJoinerCeremony({
   required PrismSyncHandle handle,
-  required String password,
+  required List<int> password,
 }) => RustLib.instance.api.crateApiCompleteJoinerCeremony(
   handle: handle,
   password: password,
@@ -779,8 +817,9 @@ Future<String> completeJoinerCeremony({
 ///
 /// ```json
 /// {
-///   "sas_words": "apple banana cherry",
-///   "sas_decimal": "123456",
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"],
 ///   "joiner_device_id": "c3d4..."
 /// }
 /// ```
@@ -815,8 +854,8 @@ Future<String> startInitiatorCeremony({
 /// Must be called after [`start_initiator_ceremony`] and user SAS verification.
 Future<String> completeInitiatorCeremony({
   required PrismSyncHandle handle,
-  required String password,
-  required String mnemonic,
+  required List<int> password,
+  required List<int> mnemonic,
 }) => RustLib.instance.api.crateApiCompleteInitiatorCeremony(
   handle: handle,
   password: password,

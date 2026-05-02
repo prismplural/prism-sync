@@ -1,10 +1,33 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::hlc::Hlc;
 
 /// Sentinel field name used for bulk reset operations.
 pub const BULK_RESET_FIELD: &str = "_bulk_reset";
+
+/// XChaCha20-Poly1305 authentication tag bytes appended to sync ciphertexts.
+pub const OP_BATCH_AEAD_TAG_BYTES: usize = 16;
+
+/// Ciphertext+tag size buckets for newly encoded encrypted op batches.
+///
+/// `CrdtChange::encode_batch` pads plaintext so the ciphertext returned by
+/// `xchacha_encrypt_for_sync` lands exactly on one of these sizes for batches
+/// at or below the largest bucket. Larger batches are left unpadded to avoid
+/// inflating already-large relay uploads.
+pub const PADDED_OP_BATCH_CIPHERTEXT_BUCKETS: &[usize] = &[
+    512,
+    1024,
+    2 * 1024,
+    4 * 1024,
+    8 * 1024,
+    16 * 1024,
+    32 * 1024,
+    64 * 1024,
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+];
 
 /// Field-level sync operation used by the V2 sync engine.
 ///
@@ -36,6 +59,31 @@ pub struct CrdtChange {
     /// Server-assigned sequence number. Only included in JSON if present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_seq: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct EncodedCrdtBatch<'a> {
+    ops: &'a [CrdtChange],
+    padding: &'a str,
+}
+
+#[derive(Deserialize)]
+struct DecodedCrdtBatch {
+    ops: Vec<CrdtChange>,
+    #[serde(default = "ignored_padding")]
+    #[allow(dead_code)]
+    padding: IgnoredAny,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CrdtBatchWire {
+    Padded(DecodedCrdtBatch),
+    Legacy(Vec<CrdtChange>),
+}
+
+fn ignored_padding() -> IgnoredAny {
+    IgnoredAny
 }
 
 impl CrdtChange {
@@ -85,6 +133,27 @@ impl CrdtChange {
         self.field_name == BULK_RESET_FIELD
     }
 
+    /// Validate that this op's embedded attribution matches the verified
+    /// sender identity from its signed relay envelope.
+    pub fn validate_attribution(&self, sender_device_id: &str) -> Result<()> {
+        if self.device_id != sender_device_id {
+            return Err(CoreError::Engine(format!(
+                "CRDT op attribution mismatch for {}: op.device_id={} envelope.sender_device_id={}",
+                self.op_id, self.device_id, sender_device_id
+            )));
+        }
+
+        let hlc = Hlc::from_string(&self.client_hlc)?;
+        if hlc.node_id != sender_device_id {
+            return Err(CoreError::Engine(format!(
+                "CRDT op HLC attribution mismatch for {}: client_hlc.node_id={} envelope.sender_device_id={}",
+                self.op_id, hlc.node_id, sender_device_id
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Field-level Last-Write-Wins comparison.
     ///
     /// Three-level tiebreaker (matching Dart implementation):
@@ -108,16 +177,59 @@ impl CrdtChange {
         Ok(self.op_id > other.op_id)
     }
 
-    /// Encode a list of CrdtChange ops to a JSON array as UTF-8 bytes.
+    /// Encode a list of CrdtChange ops to padded JSON UTF-8 bytes.
     ///
-    /// This is the wire format for sync batches.
+    /// New batches use an object wrapper with an ignored `padding` field so
+    /// encrypted op batch ciphertext sizes fall into coarse buckets. Receivers
+    /// remain backward-compatible with the historical bare JSON array.
     pub fn encode_batch(ops: &[CrdtChange]) -> Result<Vec<u8>> {
-        serde_json::to_vec(ops).map_err(|e| CoreError::Serialization(e.to_string()))
+        let empty_padding = Self::encode_batch_envelope(ops, "")?;
+        let Some(ciphertext_bucket) =
+            Self::ciphertext_bucket_for_plaintext_len(empty_padding.len())
+        else {
+            return Ok(empty_padding);
+        };
+
+        let target_plaintext_len = ciphertext_bucket - OP_BATCH_AEAD_TAG_BYTES;
+        let padding_len = target_plaintext_len.saturating_sub(empty_padding.len());
+        if padding_len == 0 {
+            return Ok(empty_padding);
+        }
+
+        let padding = "A".repeat(padding_len);
+        let padded = Self::encode_batch_envelope(ops, &padding)?;
+        if padded.len() != target_plaintext_len {
+            return Err(CoreError::Serialization(format!(
+                "padded op batch length {} did not match target {}",
+                padded.len(),
+                target_plaintext_len
+            )));
+        }
+
+        Ok(padded)
     }
 
-    /// Decode a JSON array of CrdtChange ops from UTF-8 bytes.
+    /// Decode CrdtChange ops from UTF-8 bytes.
+    ///
+    /// Accepts both the padded object wrapper and the historical bare JSON
+    /// array. The `padding` field is intentionally ignored.
     pub fn decode_batch(bytes: &[u8]) -> Result<Vec<CrdtChange>> {
-        serde_json::from_slice(bytes).map_err(|e| CoreError::Serialization(e.to_string()))
+        let batch: CrdtBatchWire =
+            serde_json::from_slice(bytes).map_err(|e| CoreError::Serialization(e.to_string()))?;
+        Ok(match batch {
+            CrdtBatchWire::Padded(batch) => batch.ops,
+            CrdtBatchWire::Legacy(ops) => ops,
+        })
+    }
+
+    fn encode_batch_envelope(ops: &[CrdtChange], padding: &str) -> Result<Vec<u8>> {
+        serde_json::to_vec(&EncodedCrdtBatch { ops, padding })
+            .map_err(|e| CoreError::Serialization(e.to_string()))
+    }
+
+    fn ciphertext_bucket_for_plaintext_len(plaintext_len: usize) -> Option<usize> {
+        let ciphertext_len = plaintext_len.checked_add(OP_BATCH_AEAD_TAG_BYTES)?;
+        PADDED_OP_BATCH_CIPHERTEXT_BUCKETS.iter().copied().find(|bucket| *bucket >= ciphertext_len)
     }
 
     /// Generate the default op_id from the composite key.
@@ -197,6 +309,28 @@ mod tests {
         assert!(!change.is_bulk_reset());
         change.field_name = BULK_RESET_FIELD.to_string();
         assert!(change.is_bulk_reset());
+    }
+
+    #[test]
+    fn validate_attribution_accepts_matching_sender() {
+        let change = make_change("op1", "1000:0:device1", "device1");
+        change.validate_attribution("device1").unwrap();
+    }
+
+    #[test]
+    fn validate_attribution_rejects_mismatched_device_id() {
+        let change = make_change("op1", "1000:0:device1", "device2");
+        let err = change.validate_attribution("device1").unwrap_err().to_string();
+        assert!(err.contains("op.device_id=device2"), "{err}");
+        assert!(err.contains("envelope.sender_device_id=device1"), "{err}");
+    }
+
+    #[test]
+    fn validate_attribution_rejects_mismatched_hlc_node_id() {
+        let change = make_change("op1", "1000:0:device2", "device1");
+        let err = change.validate_attribution("device1").unwrap_err().to_string();
+        assert!(err.contains("client_hlc.node_id=device2"), "{err}");
+        assert!(err.contains("envelope.sender_device_id=device1"), "{err}");
     }
 
     #[test]
@@ -307,6 +441,58 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].op_id, "op1");
         assert_eq!(decoded[1].op_id, "op2");
+    }
+
+    #[test]
+    fn decode_batch_accepts_legacy_array() {
+        let ops = vec![
+            make_change("op1", "1000:0:node", "dev1"),
+            make_change("op2", "1001:0:node", "dev1"),
+        ];
+
+        let legacy_bytes = serde_json::to_vec(&ops).unwrap();
+        let decoded = CrdtChange::decode_batch(&legacy_bytes).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].op_id, "op1");
+        assert_eq!(decoded[1].op_id, "op2");
+    }
+
+    #[test]
+    fn decode_batch_ignores_padding_field() {
+        let ops = vec![make_change("op1", "1000:0:node", "dev1")];
+        let padded = serde_json::json!({
+            "ops": ops,
+            "padding": "ignored encrypted filler"
+        });
+        let padded_bytes = serde_json::to_vec(&padded).unwrap();
+
+        let decoded = CrdtChange::decode_batch(&padded_bytes).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].op_id, "op1");
+    }
+
+    #[test]
+    fn encode_batch_pads_encrypted_ciphertext_to_documented_bucket() {
+        let key = [7u8; 32];
+
+        for value_len in [0usize, 600, 1800] {
+            let mut change = make_change("op1", "1000:0:node", "dev1");
+            change.encoded_value = format!("\"{}\"", "x".repeat(value_len));
+
+            let plaintext = CrdtChange::encode_batch(&[change]).unwrap();
+            let (ciphertext, _nonce) =
+                prism_sync_crypto::aead::xchacha_encrypt_for_sync(&key, &plaintext, b"aad")
+                    .unwrap();
+
+            assert!(
+                PADDED_OP_BATCH_CIPHERTEXT_BUCKETS.contains(&ciphertext.len()),
+                "ciphertext length {} was not in {:?}",
+                ciphertext.len(),
+                PADDED_OP_BATCH_CIPHERTEXT_BUCKETS
+            );
+        }
     }
 
     #[test]

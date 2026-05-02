@@ -51,6 +51,9 @@ pub enum RelayError {
     #[error("device revoked (remote_wipe={remote_wipe})")]
     DeviceRevoked { remote_wipe: bool },
 
+    #[error("must bootstrap from snapshot: since_seq={since_seq}, first_retained_seq={first_retained_seq}")]
+    MustBootstrapFromSnapshot { since_seq: i64, first_retained_seq: i64, message: String },
+
     #[error("not found")]
     NotFound,
 
@@ -76,6 +79,9 @@ impl RelayError {
             RelayError::ClockSkew { .. } => RelayErrorKind::ClockSkew,
             RelayError::KeyChanged { .. } => RelayErrorKind::KeyChanged,
             RelayError::DeviceRevoked { .. } => RelayErrorKind::DeviceRevoked,
+            RelayError::MustBootstrapFromSnapshot { .. } => {
+                RelayErrorKind::MustBootstrapFromSnapshot
+            }
             RelayError::NotFound => RelayErrorKind::NotFound,
             RelayError::Forbidden { .. } => RelayErrorKind::Forbidden,
             RelayError::Http { .. } => RelayErrorKind::Http,
@@ -105,6 +111,7 @@ pub enum RelayErrorKind {
     ClockSkew,
     KeyChanged,
     DeviceRevoked,
+    MustBootstrapFromSnapshot,
     NotFound,
     Forbidden,
     Http,
@@ -217,7 +224,7 @@ pub struct PullResponse {
 ///
 /// IMPORTANT: The relay passes through the complete SignedBatchEnvelope
 /// so that clients can verify the sender's hybrid signature (Ed25519 + ML-DSA-65) before
-/// decrypting. The relay does NOT verify signatures (zero-knowledge).
+/// decrypting. The relay does NOT verify signatures — content authenticity is checked client-side.
 #[derive(Debug, Clone)]
 pub struct ReceivedBatch {
     pub server_seq: i64,
@@ -512,6 +519,15 @@ pub trait DeviceRegistry: Send + Sync {
     async fn get_signed_registry(
         &self,
     ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError>;
+
+    /// Publish a signed registry snapshot for this sync group.
+    ///
+    /// The relay stores the opaque artifact; peers verify its signature and
+    /// epoch bindings locally before trusting it.
+    async fn put_signed_registry(
+        &self,
+        signed_registry_snapshot: &[u8],
+    ) -> std::result::Result<i64, RelayError>;
 }
 
 /// Epoch key rotation: posting and retrieving per-device wrapped epoch keys.
@@ -524,6 +540,7 @@ pub trait EpochManagement: Send + Sync {
         &self,
         epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> std::result::Result<i32, RelayError>;
 
     /// Fetch this device's wrapped epoch key for a given epoch.

@@ -65,6 +65,9 @@ pub enum InjectedPullError {
     Network,
     Auth,
     Server,
+    MustBootstrapFromSnapshot {
+        first_retained_seq: i64,
+    },
     /// Relay responded with `device_revoked` (optionally requesting a
     /// remote wipe). Used to verify that the engine -> sync_service ->
     /// FFI chain propagates the `code` / `remote_wipe` metadata all the
@@ -232,6 +235,15 @@ impl SyncTransport for MockRelay {
                     InjectedPullError::Server => {
                         RelayError::Server { status_code: 503, message: "mock injected 503".into() }
                     }
+                    InjectedPullError::MustBootstrapFromSnapshot { first_retained_seq } => {
+                        RelayError::MustBootstrapFromSnapshot {
+                            since_seq: since,
+                            first_retained_seq,
+                            message: format!(
+                                "must bootstrap from snapshot: since_seq={since}, first_retained_seq={first_retained_seq}"
+                            ),
+                        }
+                    }
                     InjectedPullError::DeviceRevoked { remote_wipe } => {
                         RelayError::DeviceRevoked { remote_wipe }
                     }
@@ -360,6 +372,19 @@ impl DeviceRegistry for MockRelay {
     async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
         Ok(self.state.lock().unwrap().signed_registry.clone())
     }
+
+    async fn put_signed_registry(
+        &self,
+        signed_registry_snapshot: &[u8],
+    ) -> Result<i64, RelayError> {
+        let mut state = self.state.lock().unwrap();
+        state.signed_registry = Some(SignedRegistryResponse {
+            registry_version: 1,
+            artifact_blob: signed_registry_snapshot.to_vec(),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+        Ok(1)
+    }
 }
 
 #[async_trait]
@@ -368,6 +393,7 @@ impl EpochManagement for MockRelay {
         &self,
         epoch: i32,
         _wrapped_keys: HashMap<String, Vec<u8>>,
+        _signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<i32, RelayError> {
         Ok(epoch)
     }

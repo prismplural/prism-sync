@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::HeaderMap,
     response::IntoResponse,
     routing::{get, post},
@@ -8,14 +8,20 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::SocketAddr;
+
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 
 use crate::{
     apple_attestation,
     attestation::{self, FirstDeviceAdmissionKind},
     auth, db,
     errors::AppError,
+    registration_binding,
     state::AppState,
 };
+
+use super::client_ip_for_rate_limit;
 
 const POW_ALGORITHM: &str = "sha256_leading_zero_bits";
 
@@ -51,6 +57,7 @@ struct PowSolution {
 async fn get_register_nonce(
     State(state): State<AppState>,
     Path(sync_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     check_registration_access(&state, &headers)?;
@@ -77,16 +84,15 @@ async fn get_register_nonce(
     }
 
     if is_first_device {
-        if let Some(client_ip) = client_ip_key(&headers) {
-            let limiter = &state.first_device_nonce_rate_limiter;
-            let keys = ["global", client_ip.as_str()];
-            if !limiter.check_many(
-                &keys,
-                state.config.first_device_nonce_rate_limit(),
-                state.config.first_device_nonce_rate_window_secs(),
-            ) {
-                return Err(AppError::TooManyRequests);
-            }
+        let client_ip = client_ip_for_rate_limit(&headers, peer_addr, &state.config);
+        let limiter = &state.first_device_nonce_rate_limiter;
+        let keys = ["global", client_ip.as_str()];
+        if !limiter.check_many(
+            &keys,
+            state.config.first_device_nonce_rate_limit(),
+            state.config.first_device_nonce_rate_window_secs(),
+        ) {
+            return Err(AppError::TooManyRequests);
         }
     }
 
@@ -195,6 +201,7 @@ struct RegisterResponse {
 async fn register_device(
     State(state): State<AppState>,
     Path(sync_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::Json(body): axum::Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -293,7 +300,7 @@ async fn register_device(
     let first_device_admission_proof = body.first_device_admission_proof.clone();
     let registry_approval = body.registry_approval.clone();
     let first_device_pow_difficulty_bits = state.config.first_device_pow_difficulty_bits;
-    let client_ip = client_ip_key(&headers);
+    let client_ip = client_ip_for_rate_limit(&headers, peer_addr, &state.config);
     let first_device_registration_rate_limit = state.config.first_device_registration_rate_limit();
     let first_device_registration_rate_window_secs =
         state.config.first_device_registration_rate_window_secs();
@@ -390,7 +397,7 @@ fn do_register(
     first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
     first_device_pow_difficulty_bits: u8,
     session_expiry: i64,
-    client_ip: Option<String>,
+    client_ip: String,
     config: &crate::config::Config,
     first_device_registration_limiter: crate::state::RateLimiter,
     first_device_registration_rate_limit: u32,
@@ -417,29 +424,28 @@ fn do_register(
         .is_none();
 
     if is_first_device {
-        if let Some(client_ip) = client_ip.as_deref() {
-            let rate_keys = ["global", client_ip];
-            if !first_device_registration_limiter.check_many(
-                &rate_keys,
-                first_device_registration_rate_limit,
-                first_device_registration_rate_window_secs,
-            ) {
-                return Err(AppError::TooManyRequests);
-            }
-            if !first_device_group_limiter.check_many(
-                &rate_keys,
-                first_device_group_rate_limit,
-                first_device_group_rate_window_secs,
-            ) {
-                return Err(AppError::TooManyRequests);
-            }
+        let rate_keys = ["global", client_ip.as_str()];
+        if !first_device_registration_limiter.check_many(
+            &rate_keys,
+            first_device_registration_rate_limit,
+            first_device_registration_rate_window_secs,
+        ) {
+            return Err(AppError::TooManyRequests);
+        }
+        if !first_device_group_limiter.check_many(
+            &rate_keys,
+            first_device_group_rate_limit,
+            first_device_group_rate_window_secs,
+        ) {
+            return Err(AppError::TooManyRequests);
         }
 
         let platform_proof_valid = match first_device_admission_proof.as_ref() {
-            Some(proof) => {
-                verify_first_device_admission_proof(sync_id, device_id, nonce, proof, config)
-                    .is_ok()
-            }
+            Some(proof) => verify_first_device_admission_proof(
+                sync_id, device_id, nonce, signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
+                proof, config,
+            )
+            .is_ok(),
             None => false,
         };
 
@@ -588,15 +594,25 @@ fn verify_first_device_admission_proof(
     sync_id: &str,
     device_id: &str,
     nonce: &str,
+    signing_pk: &[u8],
+    x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
     proof: &FirstDeviceAdmissionProof,
     config: &crate::config::Config,
 ) -> Result<(), AppError> {
+    let registration_key_bundle_hash = registration_binding::compute_registration_key_bundle_hash(
+        signing_pk, x25519_pk, ml_dsa_pk, ml_kem_pk, xwing_pk,
+    );
+
     match proof {
         FirstDeviceAdmissionProof::AndroidKeyAttestation { certificate_chain } => {
             let verification = attestation::verify_android_key_attestation(
                 sync_id,
                 device_id,
                 nonce,
+                &registration_key_bundle_hash,
                 certificate_chain,
                 config,
             )
@@ -618,6 +634,7 @@ fn verify_first_device_admission_proof(
                 sync_id,
                 device_id,
                 nonce,
+                &registration_key_bundle_hash,
                 key_id,
                 attestation_object,
                 config,
@@ -656,31 +673,6 @@ fn has_leading_zero_bits(hash: &[u8], difficulty_bits: u8) -> bool {
 
     let mask = 0xFFu8 << (8 - remaining_bits);
     hash.get(full_zero_bytes).map(|byte| byte & mask == 0).unwrap_or(false)
-}
-
-fn client_ip_key(headers: &HeaderMap) -> Option<String> {
-    for header_name in [
-        #[cfg(feature = "test-helpers")]
-        "x-test-client-ip",
-        "cf-connecting-ip",
-        "x-forwarded-for",
-        "x-real-ip",
-        "forwarded",
-    ] {
-        if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
-            let candidate = if header_name == "forwarded" {
-                value.split(';').find_map(|part| part.trim().strip_prefix("for=")).unwrap_or(value)
-            } else {
-                value.split(',').next().unwrap_or(value)
-            };
-            let trimmed = candidate.trim().trim_matches('"');
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -724,7 +716,12 @@ fn verify_registry_approval(
     write_len_prefixed(&mut approval_data, approval.approver_device_id.as_bytes());
     write_len_prefixed(&mut approval_data, &approval.signed_registry_snapshot);
     hybrid_sig
-        .verify_v3(&approval_data, b"registry_approval", &approver_pk_bytes, &approver_ml_dsa_pk)
+        .verify_v3(
+            &approval_data,
+            hybrid_signature_contexts::REGISTRY_APPROVAL,
+            &approver_pk_bytes,
+            &approver_ml_dsa_pk,
+        )
         .map_err(|_| AppError::Unauthorized)?;
 
     let snapshot_entries = verify_registry_snapshot(
@@ -866,7 +863,12 @@ fn verify_registry_snapshot_hybrid(
         return Err(AppError::Unauthorized);
     }
     signature
-        .verify_v3(&signing_data, b"registry_snapshot", approver_ed25519_pk, approver_ml_dsa_pk)
+        .verify_v3(
+            &signing_data,
+            hybrid_signature_contexts::REGISTRY_SNAPSHOT,
+            approver_ed25519_pk,
+            approver_ml_dsa_pk,
+        )
         .map_err(|_| AppError::Unauthorized)?;
 
     // V3 wire format uses a wrapper object: { "registry_version": i64, "entries": [...] }

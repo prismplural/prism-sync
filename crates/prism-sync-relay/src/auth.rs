@@ -1,23 +1,10 @@
 #[cfg(test)]
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use prism_sync_crypto::pq::HybridSignature;
-use rand::RngCore;
+use ed25519_dalek::{Signature, VerifyingKey};
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use sha2::{Digest, Sha256};
 
+const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
-
-/// Generate a secure session token (32 random bytes, hex encoded = 64 chars).
-pub(crate) fn generate_session_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
-/// SHA-256 hash of a token string, returned as lowercase hex.
-pub(crate) fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    hex::encode(digest)
-}
 
 /// Constant-time comparison for fixed-length values (SHA-256 hex digests).
 ///
@@ -66,7 +53,7 @@ pub fn verify_ed25519_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    verifying_key.verify(&data, &sig).is_ok()
+    verifying_key.verify_strict(&data, &sig).is_ok()
 }
 
 /// Verify a hybrid registration challenge signature.
@@ -88,6 +75,9 @@ pub(crate) fn verify_hybrid_challenge(
         return false;
     };
 
+    if !enforce_wire_signature_floor(version, SIGNATURE_VERSION_SOURCE_FLOOR) {
+        return false;
+    }
     if version != SUPPORTED_SIGNATURE_VERSION {
         return false;
     }
@@ -102,7 +92,9 @@ pub(crate) fn verify_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    signature.verify_v3(&data, b"device_challenge", &pk_bytes, ml_dsa_public_key).is_ok()
+    signature
+        .verify_v3(&data, hybrid_signature_contexts::DEVICE_CHALLENGE, &pk_bytes, ml_dsa_public_key)
+        .is_ok()
 }
 
 /// Validate that a sync ID is a 64-char hex string (32 bytes).
@@ -201,7 +193,7 @@ pub fn verify_request_signature(
     let Ok(sig) = Signature::from_slice(signature) else {
         return false;
     };
-    verifying_key.verify(signing_data, &sig).is_ok()
+    verifying_key.verify_strict(signing_data, &sig).is_ok()
 }
 
 /// Verify a hybrid signature over canonical request signing data.
@@ -221,6 +213,9 @@ pub(crate) fn verify_hybrid_request_signature(
         return false;
     };
 
+    if !enforce_wire_signature_floor(version, SIGNATURE_VERSION_SOURCE_FLOOR) {
+        return false;
+    }
     if version != SUPPORTED_SIGNATURE_VERSION {
         return false;
     }
@@ -229,7 +224,21 @@ pub(crate) fn verify_hybrid_request_signature(
         return false;
     };
 
-    signature.verify_v3(signing_data, b"http_request", &pk_bytes, ml_dsa_public_key).is_ok()
+    signature
+        .verify_v3(
+            signing_data,
+            hybrid_signature_contexts::HTTP_REQUEST,
+            &pk_bytes,
+            ml_dsa_public_key,
+        )
+        .is_ok()
+}
+
+fn enforce_wire_signature_floor(
+    wire_signature_version: u8,
+    stored_or_configured_floor: u8,
+) -> bool {
+    wire_signature_version >= stored_or_configured_floor.max(SIGNATURE_VERSION_SOURCE_FLOOR)
 }
 
 /// Write a length-prefixed field: `(data.len() as u32).to_be_bytes() || data`.
@@ -264,28 +273,6 @@ mod tests {
         let mut versioned = vec![0x02]; // V2 (now rejected)
         versioned.extend_from_slice(&hybrid_sig.to_bytes());
         (versioned, ed_public_key, pq_public_key)
-    }
-
-    #[test]
-    fn test_generate_session_token() {
-        let token = generate_session_token();
-        assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-
-        // Two tokens should differ
-        let token2 = generate_session_token();
-        assert_ne!(token, token2);
-    }
-
-    #[test]
-    fn test_hash_token() {
-        let hash = hash_token("hello");
-        assert_eq!(hash.len(), 64);
-        // SHA-256 of "hello" is deterministic
-        let hash2 = hash_token("hello");
-        assert_eq!(hash, hash2);
-        // Different input => different hash
-        assert_ne!(hash_token("hello"), hash_token("world"));
     }
 
     #[test]
@@ -433,6 +420,12 @@ mod tests {
         assert!(!verify_hybrid_request_signature(&ed_pk, &ml_pk, &data, &versioned_sig,));
     }
 
+    #[test]
+    fn test_signed_request_wire_floor_rejects_v2_without_config_floor() {
+        assert!(!enforce_wire_signature_floor(0x02, 0));
+        assert!(enforce_wire_signature_floor(0x03, 0));
+    }
+
     fn make_versioned_hybrid_signature_v3(
         message: &[u8],
         context: &[u8],
@@ -471,8 +464,11 @@ mod tests {
         write_len_prefixed(&mut data, device_id.as_bytes());
         write_len_prefixed(&mut data, nonce.as_bytes());
 
-        let (versioned_sig, ed_pk, ml_pk) =
-            make_versioned_hybrid_signature_v3(&data, b"device_challenge", device_id);
+        let (versioned_sig, ed_pk, ml_pk) = make_versioned_hybrid_signature_v3(
+            &data,
+            hybrid_signature_contexts::DEVICE_CHALLENGE,
+            device_id,
+        );
 
         assert!(verify_hybrid_challenge(
             &ed_pk,
@@ -505,8 +501,11 @@ mod tests {
             "nonce-1",
         );
 
-        let (versioned_sig, ed_pk, ml_pk) =
-            make_versioned_hybrid_signature_v3(&data, b"http_request", device_id);
+        let (versioned_sig, ed_pk, ml_pk) = make_versioned_hybrid_signature_v3(
+            &data,
+            hybrid_signature_contexts::HTTP_REQUEST,
+            device_id,
+        );
         assert!(verify_hybrid_request_signature(&ed_pk, &ml_pk, &data, &versioned_sig,));
     }
 

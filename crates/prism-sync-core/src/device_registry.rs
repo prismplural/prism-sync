@@ -3,14 +3,17 @@
 //! When a device is first seen during pairing or pull, its hybrid identity
 //! keys are "pinned" in local storage. Each device record includes its full
 //! hybrid identity: Ed25519 (classical signing), ML-DSA-65 (post-quantum
-//! signing), X25519 (classical key exchange), and ML-KEM-768 (post-quantum
-//! key exchange). Subsequent operations verify that the claimed keys match
-//! the pinned keys, raising an error on mismatch (TOFU model).
+//! signing), X25519 (classical key exchange), ML-KEM-768 (post-quantum
+//! key exchange), and X-Wing (hybrid key exchange). Subsequent operations
+//! verify that the claimed keys match the pinned keys, raising an error on
+//! mismatch (TOFU model).
 
 use crate::error::{CoreError, Result};
 use crate::pairing::{SignedRegistrySnapshot, SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING};
 use crate::storage::{DeviceRecord, StorageError, SyncStorage};
 use prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof;
+
+const SUPPORTED_REGISTRY_ARTIFACT_VERSION: u8 = 0x03;
 
 /// Stateless helper for device registry operations.
 ///
@@ -24,6 +27,7 @@ impl DeviceRegistryManager {
             && existing.x25519_public_key == candidate.x25519_public_key
             && existing.ml_dsa_65_public_key == candidate.ml_dsa_65_public_key
             && existing.ml_kem_768_public_key == candidate.ml_kem_768_public_key
+            && existing.x_wing_public_key == candidate.x_wing_public_key
     }
 
     fn write_device_record(storage: &dyn SyncStorage, device: &DeviceRecord) -> Result<()> {
@@ -51,12 +55,13 @@ impl DeviceRegistryManager {
                 if device.ml_dsa_key_generation > existing.ml_dsa_key_generation
                     && device.ed25519_public_key == existing.ed25519_public_key
                     && device.x25519_public_key == existing.x25519_public_key
-                    && device.ml_kem_768_public_key == existing.ml_kem_768_public_key =>
+                    && device.ml_kem_768_public_key == existing.ml_kem_768_public_key
+                    && device.x_wing_public_key == existing.x_wing_public_key =>
             {
                 // ML-DSA key rotation: a peer device rotated its PQ signing key
                 // (which is allowed) without changing its permanent Ed25519/X25519/
-                // ML-KEM keys. We learn about this through the signed device registry
-                // gossip. Accept if generation strictly increases (prevents rollback).
+                // ML-KEM/X-Wing keys. We learn about this through the signed device
+                // registry gossip. Accept if generation strictly increases (prevents rollback).
                 Self::write_device_record(storage, device)
             }
             Some(_) => Err(CoreError::DeviceKeyChanged { device_id: device.device_id.clone() }),
@@ -109,10 +114,9 @@ impl DeviceRegistryManager {
     /// Merge a relay-provided device record without allowing silent key
     /// replacement for a known device.
     ///
-    /// Current behavior still allows inserting unknown devices from the relay
-    /// so existing pair flows continue to work until signed registry updates are
-    /// fully wired. Known devices may only receive status/timestamp updates if
-    /// their keys are unchanged.
+    /// Unknown devices are rejected. New group members must arrive through a
+    /// locally verified signed registry import or pairing artifact, not through
+    /// the relay's unauthenticated device list.
     pub fn merge_relay_device(
         storage: &dyn SyncStorage,
         sync_id: &str,
@@ -121,13 +125,19 @@ impl DeviceRegistryManager {
         let _ = sync_id; // sync_id is part of the DeviceRecord
         let existing = storage.get_device_record(sync_id, &device.device_id)?;
         let merged = match existing {
-            None => device.clone(),
+            None => {
+                return Err(CoreError::Storage(StorageError::Logic(format!(
+                    "unknown device {} cannot be merged from relay device list without verified registry",
+                    device.device_id
+                ))));
+            }
             Some(existing) if !Self::keys_match(&existing, device) => {
                 // Check if this is an ML-DSA rotation (only ML-DSA key differs, generation increased)
                 if device.ml_dsa_key_generation > existing.ml_dsa_key_generation
                     && device.ed25519_public_key == existing.ed25519_public_key
                     && device.x25519_public_key == existing.x25519_public_key
                     && device.ml_kem_768_public_key == existing.ml_kem_768_public_key
+                    && device.x_wing_public_key == existing.x_wing_public_key
                 {
                     // Reject unverified ML-DSA rotation from relay device list.
                     //
@@ -336,6 +346,20 @@ impl DeviceRegistryManager {
         sync_id: &str,
         artifact_blob: &[u8],
     ) -> Result<SignedRegistrySnapshot> {
+        match artifact_blob.first().copied() {
+            Some(SUPPORTED_REGISTRY_ARTIFACT_VERSION) => {}
+            Some(version) => {
+                return Err(CoreError::Engine(format!(
+                    "unsupported registry artifact version 0x{version:02x}; expected 0x{SUPPORTED_REGISTRY_ARTIFACT_VERSION:02x}"
+                )));
+            }
+            None => {
+                return Err(CoreError::Engine(
+                    "unsupported registry artifact version: missing version byte".into(),
+                ));
+            }
+        }
+
         let local_devices = storage.list_device_records(sync_id)?;
         let mut last_error: Option<String> = None;
 
@@ -346,7 +370,17 @@ impl DeviceRegistryManager {
             if device.ed25519_public_key.len() != 32 || device.ml_dsa_65_public_key.is_empty() {
                 continue;
             }
-            let ed_pk: [u8; 32] = device.ed25519_public_key.clone().try_into().unwrap();
+            let ed_pk: [u8; 32] = match <[u8; 32]>::try_from(device.ed25519_public_key.as_slice()) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    last_error = Some(format!(
+                        "device {} has invalid Ed25519 public key length {}",
+                        device.device_id,
+                        device.ed25519_public_key.len()
+                    ));
+                    continue;
+                }
+            };
             match SignedRegistrySnapshot::verify_and_decode_hybrid(
                 artifact_blob,
                 &ed_pk,
@@ -397,6 +431,8 @@ mod tests {
     use crate::storage::rusqlite_storage::RusqliteSyncStorage;
     use chrono::Utc;
 
+    const X_WING_PUBLIC_KEY_LEN: usize = 1216;
+
     fn make_storage() -> RusqliteSyncStorage {
         RusqliteSyncStorage::in_memory().expect("in-memory storage")
     }
@@ -415,6 +451,11 @@ mod tests {
             revoked_at: None,
             ml_dsa_key_generation: 0,
         }
+    }
+
+    fn with_x_wing_public_key(mut device: DeviceRecord, value: u8) -> DeviceRecord {
+        device.x_wing_public_key = vec![value; X_WING_PUBLIC_KEY_LEN];
+        device
     }
 
     #[test]
@@ -515,6 +556,52 @@ mod tests {
     }
 
     #[test]
+    fn keys_match_rejects_x_wing_key_change() {
+        let original = with_x_wing_public_key(make_device("sync-1", "dev-a", &[1u8; 32]), 1);
+        let mut changed = original.clone();
+        changed.x_wing_public_key = vec![2u8; X_WING_PUBLIC_KEY_LEN];
+
+        assert!(!DeviceRegistryManager::keys_match(&original, &changed));
+    }
+
+    #[test]
+    fn pin_device_rejects_x_wing_key_change() {
+        let storage = make_storage();
+        let original = with_x_wing_public_key(make_device("sync-1", "dev-a", &[1u8; 32]), 1);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &original).unwrap();
+
+        let mut changed = original.clone();
+        changed.x_wing_public_key = vec![2u8; X_WING_PUBLIC_KEY_LEN];
+
+        let result = DeviceRegistryManager::pin_device(&storage, "sync-1", &changed);
+        assert!(matches!(
+            result,
+            Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-a"
+        ));
+
+        let stored = storage.get_device_record("sync-1", "dev-a").unwrap().unwrap();
+        assert_eq!(stored.x_wing_public_key, original.x_wing_public_key);
+    }
+
+    #[test]
+    fn pin_device_rejects_x_wing_change_during_ml_dsa_rotation() {
+        let storage = make_storage();
+        let original = with_x_wing_public_key(make_device("sync-1", "dev-a", &[1u8; 32]), 1);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &original).unwrap();
+
+        let mut changed = original.clone();
+        changed.ml_dsa_65_public_key = vec![9u8; 1952];
+        changed.ml_dsa_key_generation = 1;
+        changed.x_wing_public_key = vec![2u8; X_WING_PUBLIC_KEY_LEN];
+
+        let result = DeviceRegistryManager::pin_device(&storage, "sync-1", &changed);
+        assert!(matches!(
+            result,
+            Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-a"
+        ));
+    }
+
+    #[test]
     fn merge_relay_device_updates_status_without_repinning() {
         let storage = make_storage();
         let original = make_device("sync-1", "dev-a", &[1u8; 32]);
@@ -539,6 +626,43 @@ mod tests {
         DeviceRegistryManager::pin_device(&storage, "sync-1", &original).unwrap();
 
         let changed = make_device("sync-1", "dev-a", &[9u8; 32]);
+        let result = DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &changed);
+        assert!(matches!(
+            result,
+            Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-a"
+        ));
+    }
+
+    #[test]
+    fn merge_relay_device_rejects_x_wing_key_change() {
+        let storage = make_storage();
+        let original = with_x_wing_public_key(make_device("sync-1", "dev-a", &[1u8; 32]), 1);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &original).unwrap();
+
+        let mut changed = original.clone();
+        changed.x_wing_public_key = vec![2u8; X_WING_PUBLIC_KEY_LEN];
+
+        let result = DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &changed);
+        assert!(matches!(
+            result,
+            Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-a"
+        ));
+
+        let stored = storage.get_device_record("sync-1", "dev-a").unwrap().unwrap();
+        assert_eq!(stored.x_wing_public_key, original.x_wing_public_key);
+    }
+
+    #[test]
+    fn merge_relay_device_rejects_x_wing_change_during_ml_dsa_rotation() {
+        let storage = make_storage();
+        let original = with_x_wing_public_key(make_device("sync-1", "dev-a", &[1u8; 32]), 1);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &original).unwrap();
+
+        let mut changed = original.clone();
+        changed.ml_dsa_65_public_key = vec![9u8; 1952];
+        changed.ml_dsa_key_generation = 1;
+        changed.x_wing_public_key = vec![2u8; X_WING_PUBLIC_KEY_LEN];
+
         let result = DeviceRegistryManager::merge_relay_device(&storage, "sync-1", &changed);
         assert!(matches!(
             result,

@@ -15,6 +15,7 @@ Dart bindings for the [prism-sync](../../) encrypted CRDT sync library. Generate
 ## Quick Start
 
 ```dart
+import 'dart:convert';
 import 'package:prism_sync/generated/api.dart';
 
 // 1. Create a sync instance
@@ -40,11 +41,21 @@ final handle = await createPrismSync(
 
 // 2. Initialize (first-time) or unlock (subsequent launches)
 final secretKey = await generateSecretKey();  // BIP39 mnemonic
-await initialize(
-  handle: handle,
-  password: 'user_password',
-  secretKey: secretKeyBytes,  // mnemonic converted to bytes
-);
+final mnemonicBytes = utf8.encoder.convert(secretKey);
+final secretKeyBytes = await mnemonicToBytes(mnemonic: mnemonicBytes);
+mnemonicBytes.fillRange(0, mnemonicBytes.length, 0);
+
+final passwordBytes = utf8.encoder.convert('user_password');
+try {
+  await initialize(
+    handle: handle,
+    password: passwordBytes,
+    secretKey: secretKeyBytes,
+  );
+} finally {
+  passwordBytes.fillRange(0, passwordBytes.length, 0);
+  secretKeyBytes.fillRange(0, secretKeyBytes.length, 0);
+}
 
 // 3. Record mutations
 await recordCreate(
@@ -73,11 +84,17 @@ Pairing uses a relay-based ceremony with SAS (Short Authentication String) verif
 
 ```dart
 // Device A (existing): Create sync group
-final inviteJson = await createSyncGroup(
-  handle: handle,
-  password: 'shared_password',
-  relayUrl: 'https://relay.example.com',
-);
+final setupPasswordBytes = utf8.encoder.convert('shared_password');
+late final String inviteJson;
+try {
+  inviteJson = await createSyncGroup(
+    handle: handle,
+    password: setupPasswordBytes,
+    relayUrl: 'https://relay.example.com',
+  );
+} finally {
+  setupPasswordBytes.fillRange(0, setupPasswordBytes.length, 0);
+}
 
 // Device B (joiner): Start pairing ceremony
 final tokenJson = await startJoinerCeremony(handle: handle);
@@ -93,8 +110,28 @@ final initResult = await startInitiatorCeremony(handle: handle, ...);
 // Both devices display SAS codes for user to compare
 
 // After user confirms SAS codes match:
-await completeJoinerCeremony(handle: handle, password: 'shared_password');
-await completeInitiatorCeremony(handle: handle);
+final joinerPasswordBytes = utf8.encoder.convert('shared_password');
+try {
+  await completeJoinerCeremony(
+    handle: handle,
+    password: joinerPasswordBytes,
+  );
+} finally {
+  joinerPasswordBytes.fillRange(0, joinerPasswordBytes.length, 0);
+}
+
+final initiatorPasswordBytes = utf8.encoder.convert('shared_password');
+final initiatorMnemonicBytes = utf8.encoder.convert('twelve word backup ...');
+try {
+  await completeInitiatorCeremony(
+    handle: handle,
+    password: initiatorPasswordBytes,
+    mnemonic: initiatorMnemonicBytes,
+  );
+} finally {
+  initiatorPasswordBytes.fillRange(0, initiatorPasswordBytes.length, 0);
+  initiatorMnemonicBytes.fillRange(0, initiatorMnemonicBytes.length, 0);
+}
 ```
 
 > **Note:** The previous compact QR/URL pairing APIs (`joinFromQr`, `joinFromUrl`, `joinFromResponseJson`) have been removed in favor of this relay-based ceremony.

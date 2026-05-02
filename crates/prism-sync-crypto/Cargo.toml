@@ -34,6 +34,13 @@ ml-kem = { workspace = true }
 ml-dsa = { workspace = true }
 x-wing = { workspace = true }
 
+[features]
+default = []
+# Enables legacy bare hybrid signatures for regression tests that prove V2
+# signatures do not verify under V3 contexts. Production crates should not
+# enable this feature.
+legacy-hybrid-v2 = []
+
 [lints]
 workspace = true
 

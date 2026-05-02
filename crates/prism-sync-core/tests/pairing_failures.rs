@@ -11,20 +11,41 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ed25519_dalek::Signer as _;
 use prism_sync_core::pairing::models::{
-    build_invitation_signing_data_v2, PairingRequest, PairingResponse, RegistrySnapshotEntry,
-    SignedRegistrySnapshot,
+    build_invitation_signing_data_v2, compute_epoch_key_hash, PairingRequest, PairingResponse,
+    RegistrySnapshotEntry, SignedRegistrySnapshot, SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
 };
 use prism_sync_core::pairing::service::{cleanup_failed_setup, PairingService};
 use prism_sync_core::relay::{MockRelay, SyncRelay};
 use prism_sync_core::secure_store::SecureStore;
-use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use prism_sync_crypto::DeviceSecret;
 
 use common::MemorySecureStore;
+
+fn epoch_zero_hashes(
+    password: &str,
+    mnemonic: &str,
+    wrapped_dek: &[u8],
+    salt: &[u8],
+) -> BTreeMap<u32, [u8; 32]> {
+    let secret_key = prism_sync_crypto::mnemonic::to_bytes(mnemonic).expect("valid mnemonic");
+    let mut key_hierarchy = prism_sync_crypto::KeyHierarchy::new();
+    key_hierarchy
+        .unlock(password, &secret_key, wrapped_dek, salt)
+        .expect("unlock test key hierarchy");
+    let epoch_zero_key: [u8; 32] = key_hierarchy
+        .epoch_key(0)
+        .expect("epoch 0 key")
+        .try_into()
+        .expect("epoch 0 key is 32 bytes");
+
+    BTreeMap::from([(0, compute_epoch_key_hash(&epoch_zero_key))])
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // Tests
@@ -162,9 +183,11 @@ async fn approve_flow_produces_verifiable_pairing_response() {
         0,
         &[],
     );
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"invitation", &signing_data)
-            .expect("hardcoded invitation context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::INVITATION,
+        &signing_data,
+    )
+    .expect("hardcoded invitation context should be <= 255 bytes");
     let hybrid_invitation = HybridSignature {
         ed25519_sig: ed_signing_key_a.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: pq_signing_key_a.sign(&m_prime),
@@ -172,7 +195,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     let mut signature = vec![0x03];
     signature.extend_from_slice(&hybrid_invitation.to_bytes());
 
-    let registry_snapshot = SignedRegistrySnapshot::new(
+    let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
         vec![RegistrySnapshotEntry {
             sync_id: sync_id.clone(),
             device_id: device_id_a.clone(),
@@ -184,7 +207,9 @@ async fn approve_flow_produces_verifiable_pairing_response() {
             ml_dsa_key_generation: 0,
             status: "active".into(),
         }],
+        SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
         0,
+        epoch_zero_hashes(password, &mnemonic, &wrapped_dek, &salt),
     );
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 
@@ -230,7 +255,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
     hybrid_sig
         .verify_v3(
             &verify_signing_data,
-            b"invitation",
+            hybrid_signature_contexts::INVITATION,
             &signing_key_a.public_key_bytes(),
             &pq_signing_key_a.public_key_bytes(),
         )
@@ -324,9 +349,11 @@ async fn join_from_approval_roundtrip() {
         0,
         &[],
     );
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"invitation", &signing_data)
-            .expect("hardcoded invitation context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::INVITATION,
+        &signing_data,
+    )
+    .expect("hardcoded invitation context should be <= 255 bytes");
     let hybrid_invitation = HybridSignature {
         ed25519_sig: ed_signing_key_a.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: pq_signing_key_a.sign(&m_prime),
@@ -334,7 +361,7 @@ async fn join_from_approval_roundtrip() {
     let mut signature = vec![0x03];
     signature.extend_from_slice(&hybrid_invitation.to_bytes());
 
-    let registry_snapshot = SignedRegistrySnapshot::new(
+    let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
         vec![
             RegistrySnapshotEntry {
                 sync_id: sync_id.clone(),
@@ -359,7 +386,9 @@ async fn join_from_approval_roundtrip() {
                 status: "active".into(),
             },
         ],
-        1,
+        SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+        0,
+        epoch_zero_hashes(password, &mnemonic, &wrapped_dek, &salt),
     );
     let signed_keyring = registry_snapshot.sign_hybrid(&signing_key_a, &pq_signing_key_a);
 

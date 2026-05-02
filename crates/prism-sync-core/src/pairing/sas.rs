@@ -251,7 +251,7 @@ const SAS_WORDS: [&str; 256] = [
     "dahlia",
     "dune",
     "egret",
-    "ember",
+    "elder",
     "fennel",
     "fig",
     "garland",
@@ -352,6 +352,10 @@ fn write_len_prefixed(hasher: &mut Sha256, data: &[u8]) {
 ///
 /// Each byte selects a word from the 256-word `SAS_WORDS` list, yielding
 /// 24 bits of entropy (~16.7 million combinations).
+#[deprecated(
+    since = "0.1.0",
+    note = "legacy 24-bit SAS; do not use for production pairing. Use bootstrap SasDisplay instead"
+)]
 pub fn sas_display_code(transcript_hash: &[u8; 32]) -> String {
     let words: Vec<&str> = transcript_hash[..3].iter().map(|b| SAS_WORDS[*b as usize]).collect();
     words.join("-")
@@ -381,7 +385,12 @@ impl SasVerification {
         Self { transcript_hash, initiator_ed25519_pk, responder_ed25519_pk }
     }
 
-    /// The human-readable SAS display code (3 dash-separated words).
+    /// The legacy human-readable SAS display code (3 dash-separated words).
+    #[deprecated(
+        since = "0.1.0",
+        note = "legacy 24-bit SAS; do not use for production pairing. Use bootstrap SasDisplay instead"
+    )]
+    #[allow(deprecated)]
     pub fn display_code(&self) -> String {
         sas_display_code(&self.transcript_hash)
     }
@@ -404,6 +413,7 @@ impl SasVerification {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use prism_sync_crypto::DeviceSecret;
@@ -483,6 +493,14 @@ mod tests {
         // Each word should be from the word list
         for word in &words {
             assert!(SAS_WORDS.contains(word), "word '{word}' not in SAS_WORDS list");
+        }
+    }
+
+    #[test]
+    fn word_list_entries_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for word in SAS_WORDS {
+            assert!(seen.insert(word), "duplicate SAS word: {word}");
         }
     }
 

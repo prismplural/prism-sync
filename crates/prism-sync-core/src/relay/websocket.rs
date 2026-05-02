@@ -22,7 +22,7 @@ const PING_INTERVAL_SECS: u64 = 30;
 /// WebSocket client for real-time sync notifications.
 ///
 /// Features:
-/// - Message-based auth (credentials sent as first message, not in URL)
+/// - Bearer auth during the HTTP upgrade (credentials are not placed in the URL)
 /// - Auto-reconnect with exponential backoff (1s, 2s, 4s, 8s, 16s, cap 30s)
 /// - Ping/pong keepalive every 30 seconds
 /// - Parse notification messages: new_data, device_revoked, epoch_rotated
@@ -195,13 +195,14 @@ impl WebSocketClient {
     /// Run a single WebSocket connection until it closes or errors.
     async fn run_connection(
         ws_url: &str,
-        device_id: &str,
+        _device_id: &str,
         auth_token: &str,
         notification_tx: &broadcast::Sender<SyncNotification>,
         intentional_close: &AtomicBool,
         connected: &AtomicBool,
     ) -> Result<(), String> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 
         // Do NOT set Sec-WebSocket-Protocol. If the client sends this header,
         // tungstenite requires the server to echo it in the 101 response. The
@@ -209,7 +210,11 @@ impl WebSocketClient {
         // it omits the header, causing tungstenite to reject the handshake with
         // SubProtocolError::NoSubProtocol. Omitting the header entirely avoids
         // this and matches the relay's behavior.
-        let request = ws_url.into_client_request().map_err(|e| format!("invalid WS URL: {e}"))?;
+        let mut request =
+            ws_url.into_client_request().map_err(|e| format!("invalid WS URL: {e}"))?;
+        let auth_header = HeaderValue::from_str(&format!("Bearer {auth_token}"))
+            .map_err(|e| format!("invalid WS auth header: {e}"))?;
+        request.headers_mut().insert(AUTHORIZATION, auth_header);
 
         let safe_url = redact_url(ws_url);
         info!("[prism_ws] TCP/TLS connecting to {safe_url}");
@@ -224,19 +229,7 @@ impl WebSocketClient {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Send auth frame.
-        let auth_msg = serde_json::json!({
-            "type": "auth",
-            "device_id": device_id,
-            "token": auth_token,
-        });
-        write.send(Message::Text(auth_msg.to_string())).await.map_err(|e| {
-            warn!("[prism_ws] Auth send FAILED: {e}");
-            format!("WS auth send failed: {e}")
-        })?;
-
-        debug!("[prism_ws] Auth frame sent, waiting for messages");
-        debug!("WebSocket auth frame sent");
+        debug!("[prism_ws] WebSocket upgraded, waiting for messages");
 
         // Ping timer.
         let mut ping_interval = time::interval(Duration::from_secs(PING_INTERVAL_SECS));

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -12,6 +12,7 @@ const HYBRID_SIGNATURE_VERSION_V2: u8 = 0x02;
 
 /// Hybrid signature version byte for Phase 6 V3 labeled WNS wire formats.
 const HYBRID_SIGNATURE_VERSION_V3: u8 = 0x03;
+const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = HYBRID_SIGNATURE_VERSION_V3;
 
 /// Sent by the joining device (Device B → Device A) to initiate pairing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,20 +167,10 @@ impl PairingResponse {
             || first_byte == Some(HYBRID_SIGNATURE_VERSION_V3)
         {
             // V2/V3 hybrid format: [version][HybridSignature][JSON]
-            // Parse length-prefixed hybrid sig to find JSON start
             let remaining = &self.signed_keyring[1..];
-            if remaining.len() < 8 {
+            let Ok(signature_len) = HybridSignature::encoded_len(remaining) else {
                 return "existing_group";
-            }
-            let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap_or([0; 4])) as usize;
-            if remaining.len() < 4 + ed_len + 4 {
-                return "existing_group";
-            }
-            let ml_len_offset = 4 + ed_len;
-            let ml_len = u32::from_le_bytes(
-                remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap_or([0; 4]),
-            ) as usize;
-            let signature_len = ml_len_offset + 4 + ml_len;
+            };
             if remaining.len() <= signature_len {
                 return "existing_group";
             }
@@ -588,9 +579,11 @@ impl SignedRegistrySnapshot {
         pq_signing_key: &prism_sync_crypto::DevicePqSigningKey,
     ) -> Vec<u8> {
         let data = self.signing_data_v3();
-        let m_prime =
-            prism_sync_crypto::pq::build_hybrid_message_representative(b"registry_snapshot", &data)
-                .expect("hardcoded registry snapshot context should be <= 255 bytes");
+        let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            hybrid_signature_contexts::REGISTRY_SNAPSHOT,
+            &data,
+        )
+        .expect("hardcoded registry snapshot context should be <= 255 bytes");
         let hybrid_sig = HybridSignature {
             ed25519_sig: signing_key.sign(&m_prime),
             ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
@@ -650,22 +643,13 @@ impl SignedRegistrySnapshot {
         let Some((&version, remaining)) = signed_bytes.split_first() else {
             return Err("signed snapshot too short".into());
         };
+        enforce_wire_signature_floor(version, SIGNATURE_VERSION_SOURCE_FLOOR)?;
         if version != HYBRID_SIGNATURE_VERSION_V3 {
             return Err("signed snapshot missing V3 hybrid signature version".into());
         }
 
-        if remaining.len() < 8 {
-            return Err("registry snapshot signature invalid: hybrid signature too short".into());
-        }
-        let ed_len = u32::from_le_bytes(remaining[0..4].try_into().unwrap()) as usize;
-        if remaining.len() < 4 + ed_len + 4 {
-            return Err("registry snapshot signature invalid: hybrid signature truncated".into());
-        }
-        let ml_len_offset = 4 + ed_len;
-        let ml_len =
-            u32::from_le_bytes(remaining[ml_len_offset..ml_len_offset + 4].try_into().unwrap())
-                as usize;
-        let signature_len = ml_len_offset + 4 + ml_len;
+        let signature_len = HybridSignature::encoded_len(remaining)
+            .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
         if remaining.len() <= signature_len {
             return Err("signed snapshot missing JSON payload".into());
         }
@@ -679,7 +663,12 @@ impl SignedRegistrySnapshot {
         signing_data.extend_from_slice(json_bytes);
 
         signature
-            .verify_v3(&signing_data, b"registry_snapshot", expected_ed25519_pk, expected_ml_dsa_pk)
+            .verify_v3(
+                &signing_data,
+                hybrid_signature_contexts::REGISTRY_SNAPSHOT,
+                expected_ed25519_pk,
+                expected_ml_dsa_pk,
+            )
             .map_err(|e| format!("registry snapshot signature invalid: {e}"))?;
 
         #[derive(serde::Deserialize)]
@@ -749,6 +738,19 @@ impl SignedRegistrySnapshot {
             })
             .collect()
     }
+}
+
+fn enforce_wire_signature_floor(
+    wire_signature_version: u8,
+    stored_floor: u8,
+) -> std::result::Result<(), String> {
+    let required = stored_floor.max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    if wire_signature_version < required {
+        return Err(format!(
+            "wire signature version 0x{wire_signature_version:02x} is below required floor 0x{required:02x}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -909,6 +911,17 @@ mod tests {
         assert_eq!(resp.admission_context(), "existing_group");
     }
 
+    #[test]
+    fn admission_context_oversized_hybrid_signature_len_returns_existing_group() {
+        let mut resp = sample_response();
+        resp.signed_keyring = vec![HYBRID_SIGNATURE_VERSION_V3];
+        resp.signed_keyring.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let result = std::panic::catch_unwind(|| resp.admission_context());
+        assert!(result.is_ok(), "oversized hybrid signature length should not panic");
+        assert_eq!(result.unwrap(), "existing_group");
+    }
+
     // ── SignedRegistrySnapshot tests ──
 
     fn make_signing_key() -> (prism_sync_crypto::DeviceSigningKey, [u8; 32]) {
@@ -983,6 +996,24 @@ mod tests {
         assert_eq!(decoded.entries.len(), 2);
         assert_eq!(decoded.entries[0].device_id, "dev-a");
         assert_eq!(decoded.entries[1].device_id, "dev-b");
+    }
+
+    #[test]
+    fn registry_v2_hybrid_wire_rejected_by_source_floor() {
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let ed_pk = signing_key.public_key_bytes();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pq_pk = pq_signing_key.public_key_bytes();
+        let snapshot = sample_snapshot();
+
+        let mut signed = snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        signed[0] = HYBRID_SIGNATURE_VERSION_V2;
+
+        let err =
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &ed_pk, &pq_pk).unwrap_err();
+
+        assert!(err.contains("below required floor"), "unexpected error: {err}");
     }
 
     #[test]
@@ -1161,6 +1192,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("signature invalid"));
+    }
+
+    #[test]
+    fn snapshot_hybrid_rejects_oversized_signature_len_without_panic() {
+        let mut signed = vec![HYBRID_SIGNATURE_VERSION_V3];
+        signed.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let result = std::panic::catch_unwind(|| {
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &[0u8; 32], &[0u8; 1952])
+        });
+
+        assert!(result.is_ok(), "oversized hybrid signature length should not panic");
+        let err = result.unwrap().unwrap_err();
+        assert!(err.contains("registry snapshot signature invalid"), "unexpected error: {err}");
     }
 
     #[test]

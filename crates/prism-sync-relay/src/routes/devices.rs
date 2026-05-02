@@ -347,6 +347,7 @@ pub async fn post_rekey(
 
     let epoch = body_json["epoch"].as_i64().ok_or(AppError::BadRequest("Missing epoch"))?;
     let wrapped_keys = parse_wrapped_keys(&body_json)?;
+    let signed_registry_snapshot = decode_optional_signed_registry_snapshot(&body_json)?;
 
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();
@@ -356,7 +357,16 @@ pub async fn post_rekey(
     let did = device_id.clone();
 
     let new_epoch = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| Ok(do_rekey(conn, &sid, &did, epoch, &wrapped_keys)))
+        db.with_conn(|conn| {
+            Ok(do_rekey(
+                conn,
+                &sid,
+                &did,
+                epoch,
+                &wrapped_keys,
+                signed_registry_snapshot.as_deref(),
+            ))
+        })
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
@@ -383,6 +393,7 @@ fn do_rekey(
     device_id: &str,
     epoch: i64,
     wrapped_keys: &[(String, Vec<u8>)],
+    signed_registry_snapshot: Option<&[u8]>,
 ) -> Result<i64, AppError> {
     let tx = conn.unchecked_transaction().map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -415,6 +426,14 @@ fn do_rekey(
     for (dev_id, key_bytes) in wrapped_keys {
         db::store_rekey_artifact(&tx, sync_id, epoch, dev_id, key_bytes)
             .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+    if let Some(snapshot) = signed_registry_snapshot {
+        sync_registry_state_with_current_devices(
+            &tx,
+            sync_id,
+            Some("signed_registry_snapshot"),
+            Some(snapshot),
+        )?;
     }
     db::insert_rekey_event(&tx, sync_id, device_id, epoch)
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -503,6 +522,26 @@ fn parse_wrapped_keys(body: &serde_json::Value) -> Result<Vec<(String, Vec<u8>)>
     Err(AppError::BadRequest("Missing wrapped_keys or artifacts"))
 }
 
+fn decode_optional_signed_registry_snapshot(
+    body: &serde_json::Value,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let Some(value) = body.get("signed_registry_snapshot") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let encoded =
+        value.as_str().ok_or(AppError::BadRequest("signed_registry_snapshot must be a string"))?;
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| AppError::BadRequest("Invalid base64 in signed_registry_snapshot"))?;
+    if blob.len() > 512 * 1024 {
+        return Err(AppError::BadRequest("signed_registry_snapshot too large (max 512KB)"));
+    }
+    Ok(Some(blob))
+}
+
 // ---------------------------------------------------------------------------
 // get_rekey_artifact — GET /v1/sync/{sync_id}/rekey/{device_id}
 // ---------------------------------------------------------------------------
@@ -576,24 +615,31 @@ pub async fn post_ack(
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
     let server_seq =
         body_json["server_seq"].as_i64().ok_or(AppError::BadRequest("Missing server_seq"))?;
+    if server_seq < 0 {
+        return Err(AppError::BadRequest("server_seq must be non-negative"));
+    }
 
     let db = state.db.clone();
     let sid = auth.sync_id;
     let did = auth.device_id;
-    let stale_threshold = state.config.stale_device_secs as i64;
 
-    tokio::task::spawn_blocking(move || {
+    let accepted = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            db::upsert_device_receipt(conn, &sid, &did, server_seq)?;
-            match db::get_safe_prune_seq(conn, &sid, stale_threshold)? {
-                Some(safe_seq) => db::prune_batches_before(conn, &sid, safe_seq),
-                None => Ok(0),
+            let latest_seq = db::get_latest_seq(conn, &sid)?;
+            if server_seq > latest_seq {
+                return Ok(false);
             }
+            db::upsert_device_receipt(conn, &sid, &did, server_seq)?;
+            Ok(true)
         })
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if !accepted {
+        return Err(AppError::BadRequest("server_seq exceeds latest server sequence"));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

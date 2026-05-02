@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -8,6 +8,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::Stream;
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 use rand::RngCore;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
@@ -25,7 +26,7 @@ pub struct ServerRelay {
     base_url: String,
     sync_id: String,
     device_id: String,
-    device_session_token: String,
+    device_session_token: RwLock<String>,
     request_signing_key: SigningKey,
     request_ml_dsa_signing_key: prism_sync_crypto::DevicePqSigningKey,
     registration_token: Option<String>,
@@ -80,7 +81,7 @@ impl ServerRelay {
             base_url,
             sync_id,
             device_id,
-            device_session_token,
+            device_session_token: RwLock::new(device_session_token),
             request_signing_key,
             request_ml_dsa_signing_key,
             registration_token,
@@ -102,8 +103,16 @@ impl ServerRelay {
 
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder
-            .header("Authorization", format!("Bearer {}", self.device_session_token))
+            .header("Authorization", format!("Bearer {}", self.current_session_token()))
             .header("X-Device-Id", &self.device_id)
+    }
+
+    fn current_session_token(&self) -> String {
+        self.device_session_token.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    fn update_session_token(&self, token: String) {
+        *self.device_session_token.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
     }
 
     fn apply_signed_auth(
@@ -122,7 +131,7 @@ impl ServerRelay {
 
         // V3 hybrid signature: Ed25519 + ML-DSA-65 with labeled WNS
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"http_request",
+            hybrid_signature_contexts::HTTP_REQUEST,
             &signing_data,
         )
         .expect("hardcoded http request context should be <= 255 bytes");
@@ -206,9 +215,30 @@ impl ServerRelay {
                 RelayError::Auth { message: format!("HTTP {status}: {body}") }
             }
             408 | 504 => RelayError::Timeout { message: format!("HTTP {status}: {body}") },
-            409 => RelayError::EpochRotation {
-                new_epoch: 0, // caller should parse from body
-            },
+            409 => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                    if json.get("error").and_then(|v| v.as_str())
+                        == Some("must_bootstrap_from_snapshot")
+                    {
+                        let since_seq = json.get("since_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let first_retained_seq =
+                            json.get("first_retained_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let message = json
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+                        return RelayError::MustBootstrapFromSnapshot {
+                            since_seq,
+                            first_retained_seq,
+                            message,
+                        };
+                    }
+                }
+                RelayError::EpochRotation {
+                    new_epoch: 0, // caller should parse from body
+                }
+            }
             413 => RelayError::Server {
                 status_code: status,
                 message: format!("Payload too large: {body}"),
@@ -305,8 +335,7 @@ impl SyncTransport for ServerRelay {
         // the same classifier as the original send error so it lands as Network
         // (transient, retryable) instead of Protocol (hard error). The next sync
         // cycle re-pulls cleanly and the user never sees a spurious failure.
-        let json: serde_json::Value =
-            resp.json().await.map_err(Self::classify_reqwest_error)?;
+        let json: serde_json::Value = resp.json().await.map_err(Self::classify_reqwest_error)?;
 
         let max_server_seq = json["max_server_seq"].as_i64().unwrap_or(0);
         let min_acked_seq = json["min_acked_seq"].as_i64();
@@ -438,9 +467,16 @@ impl DeviceRegistry for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        resp.json::<RegisterResponse>().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse register response: {e}"),
-        })
+        let register_response = resp.json::<RegisterResponse>().await.map_err(|e| {
+            RelayError::Protocol { message: format!("Failed to parse register response: {e}") }
+        })?;
+
+        // Pairing creates this relay before a session token exists, then
+        // reuses it for authenticated registry/snapshot calls after
+        // registration succeeds.
+        self.update_session_token(register_response.device_session_token.clone());
+
+        Ok(register_response)
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>, RelayError> {
@@ -613,6 +649,43 @@ impl DeviceRegistry for ServerRelay {
 
         Ok(Some(response))
     }
+
+    async fn put_signed_registry(
+        &self,
+        signed_registry_snapshot: &[u8],
+    ) -> Result<i64, RelayError> {
+        let path = self.canonical_path("/registry");
+        let url = format!("{}{}", self.base_url, path);
+        debug!("put_signed_registry bytes={}", signed_registry_snapshot.len());
+
+        let body = serde_json::json!({
+            "signed_registry_snapshot": BASE64.encode(signed_registry_snapshot),
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to encode registry request: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.put(&url), "PUT", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
+            message: format!("Failed to parse registry response: {e}"),
+        })?;
+
+        Ok(json["registry_version"].as_i64().unwrap_or(0))
+    }
 }
 
 #[async_trait]
@@ -621,6 +694,7 @@ impl EpochManagement for ServerRelay {
         &self,
         epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<i32, RelayError> {
         let path = self.canonical_path("/rekey");
         let url = format!("{}{}", self.base_url, path);
@@ -633,6 +707,7 @@ impl EpochManagement for ServerRelay {
         let body = serde_json::json!({
             "epoch": epoch,
             "wrapped_keys": encoded_keys,
+            "signed_registry_snapshot": signed_registry_snapshot.map(|s| BASE64.encode(s)),
         });
         let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
             message: format!("Failed to encode rekey request: {e}"),
@@ -741,10 +816,7 @@ impl SnapshotExchange for ServerRelay {
     ) -> Result<(), RelayError> {
         let url = format!("{}/snapshot", self.base_path());
         let path = self.canonical_path("/snapshot");
-        debug!(
-            "put_snapshot server_seq_at={server_seq_at} bytes={}",
-            envelope_bytes.len()
-        );
+        debug!("put_snapshot server_seq_at={server_seq_at} bytes={}", envelope_bytes.len());
 
         let total: u64 = envelope_bytes.len() as u64;
 
@@ -945,7 +1017,7 @@ impl SyncRelay for ServerRelay {
         let ws = WebSocketClient::new(
             ws_url,
             self.device_id.clone(),
-            self.device_session_token.clone(),
+            self.current_session_token(),
             self.notification_tx.clone(),
         );
         ws.connect().await;
@@ -1013,12 +1085,56 @@ mod tests {
     use super::ServerRelay;
     use crate::relay::traits::{RegisterRequest, RegistryApproval, RelayError};
 
+    fn test_relay(initial_session_token: &str) -> ServerRelay {
+        let device_id = "test-device";
+        let device_secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key =
+            device_secret.ed25519_keypair(device_id).expect("test ed25519 key").into_signing_key();
+        let ml_dsa_key = device_secret.ml_dsa_65_keypair(device_id).expect("test ml-dsa key");
+
+        ServerRelay::new(
+            "http://localhost".to_string(),
+            "00".repeat(32),
+            device_id.to_string(),
+            initial_session_token.to_string(),
+            signing_key,
+            ml_dsa_key,
+            None,
+        )
+        .expect("test relay")
+    }
+
     #[test]
     fn classify_error_keeps_device_revoked_response_structured() {
         let err =
             ServerRelay::classify_error(401, r#"{"error":"device_revoked","remote_wipe":true}"#);
 
         assert!(matches!(err, RelayError::DeviceRevoked { remote_wipe: true }));
+    }
+
+    #[test]
+    fn updated_session_token_is_used_for_auth_headers() {
+        let relay = test_relay("");
+
+        let before = relay
+            .apply_auth(relay.client.get("http://localhost/test"))
+            .build()
+            .expect("request before update");
+        assert_eq!(
+            before.headers().get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer ")
+        );
+
+        relay.update_session_token("registered-session-token".to_string());
+
+        let after = relay
+            .apply_auth(relay.client.get("http://localhost/test"))
+            .build()
+            .expect("request after update");
+        assert_eq!(
+            after.headers().get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer registered-session-token")
+        );
     }
 
     #[test]
@@ -1040,6 +1156,23 @@ mod tests {
         let err = ServerRelay::classify_error(401, r#"{"error":"something_else"}"#);
 
         assert!(matches!(err, RelayError::Auth { .. }));
+    }
+
+    #[test]
+    fn classify_error_parses_must_bootstrap_from_snapshot_response() {
+        let err = ServerRelay::classify_error(
+            409,
+            r#"{"error":"must_bootstrap_from_snapshot","message":"bootstrap","since_seq":2,"first_retained_seq":5}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::MustBootstrapFromSnapshot {
+                since_seq: 2,
+                first_retained_seq: 5,
+                ref message,
+            } if message == "bootstrap"
+        ));
     }
 
     #[test]

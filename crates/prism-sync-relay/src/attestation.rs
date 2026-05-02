@@ -1,12 +1,12 @@
 use base64::Engine;
-use sha2::{Digest, Sha256};
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
 use crate::config::Config;
+use crate::registration_binding;
 
 const ANDROID_KEY_ATTESTATION_EXTENSION_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17];
-const ANDROID_ATTESTATION_CONTEXT: &[u8] = b"PRISM_SYNC_ANDROID_ATTEST_V1\x00";
+const ANDROID_ATTESTATION_CONTEXT: &[u8] = b"PRISM_SYNC_ANDROID_ATTEST_V2\x00";
 const SECURITY_LEVEL_TRUSTED_ENVIRONMENT: i64 = 1;
 const SECURITY_LEVEL_STRONGBOX: i64 = 2;
 const VERIFIED_BOOT_STATE_VERIFIED: i64 = 0;
@@ -29,21 +29,22 @@ pub(crate) fn compute_android_attestation_challenge(
     sync_id: &str,
     device_id: &str,
     nonce: &str,
+    registration_key_bundle_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(ANDROID_ATTESTATION_CONTEXT);
-    hasher.update(sync_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(device_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(nonce.as_bytes());
-    hasher.finalize().into()
+    registration_binding::compute_attestation_challenge(
+        ANDROID_ATTESTATION_CONTEXT,
+        sync_id,
+        device_id,
+        nonce,
+        registration_key_bundle_hash,
+    )
 }
 
 pub(crate) fn verify_android_key_attestation(
     sync_id: &str,
     device_id: &str,
     nonce: &str,
+    registration_key_bundle_hash: &[u8; 32],
     certificate_chain: &[String],
     config: &Config,
 ) -> Result<VerifiedAndroidAttestation, String> {
@@ -87,7 +88,12 @@ pub(crate) fn verify_android_key_attestation(
         .verify_signature(None)
         .map_err(|e| format!("invalid attestation root signature: {e}"))?;
 
-    let expected_challenge = compute_android_attestation_challenge(sync_id, device_id, nonce);
+    let expected_challenge = compute_android_attestation_challenge(
+        sync_id,
+        device_id,
+        nonce,
+        registration_key_bundle_hash,
+    );
     let extension_oid = Oid::from(ANDROID_KEY_ATTESTATION_EXTENSION_OID)
         .expect("android key attestation extension OID is valid");
 
@@ -481,6 +487,9 @@ mod tests {
             nonce_rate_window_secs: 60,
             revoke_rate_limit: 100,
             revoke_rate_window_secs: 60,
+            ws_upgrade_rate_limit: 20,
+            ws_upgrade_rate_window_secs: 60,
+            trusted_proxy_cidrs: vec![],
             signed_request_max_skew_secs: 60,
             signed_request_nonce_window_secs: 120,
             snapshot_default_ttl_secs: 86400,
@@ -532,7 +541,9 @@ mod tests {
 
     #[test]
     fn parse_android_key_description_extracts_root_of_trust() {
-        let challenge = compute_android_attestation_challenge("sync", "device", "nonce");
+        let key_bundle_hash = [0x5A; 32];
+        let challenge =
+            compute_android_attestation_challenge("sync", "device", "nonce", &key_bundle_hash);
         let description = parse_android_key_description(&build_attestation_extension(
             challenge,
             &[0x42; 32],
@@ -548,7 +559,9 @@ mod tests {
 
     #[test]
     fn verify_android_key_attestation_accepts_graphene_allowlisted_boot_key() {
-        let challenge = compute_android_attestation_challenge("sync", "device", "nonce");
+        let key_bundle_hash = [0x5A; 32];
+        let challenge =
+            compute_android_attestation_challenge("sync", "device", "nonce", &key_bundle_hash);
         let verified_boot_key = vec![0xAA; 32];
         let (root_cert, root_key) = make_test_root();
 
@@ -568,6 +581,7 @@ mod tests {
             "sync",
             "device",
             "nonce",
+            &key_bundle_hash,
             &[encode_der(leaf_cert.der()), encode_der(root_cert.der())],
             &test_config(root_cert.pem(), vec![hex::encode(&verified_boot_key)]),
         )
@@ -591,6 +605,7 @@ mod tests {
             "sync",
             "device",
             "nonce",
+            &[0x5A; 32],
             &[encode_der(leaf_cert.der()), encode_der(root_cert.der())],
             &test_config(root_cert.pem(), vec![]),
         )
@@ -601,7 +616,9 @@ mod tests {
 
     #[test]
     fn verify_android_key_attestation_rejects_extension_in_root_certificate() {
-        let challenge = compute_android_attestation_challenge("sync", "device", "nonce");
+        let key_bundle_hash = [0x5A; 32];
+        let challenge =
+            compute_android_attestation_challenge("sync", "device", "nonce", &key_bundle_hash);
         let verified_boot_key = vec![0xBB; 32];
         let mut root_params = CertificateParams::new(vec!["Key Attestation CA".into()]).unwrap();
         root_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -624,6 +641,7 @@ mod tests {
             "sync",
             "device",
             "nonce",
+            &key_bundle_hash,
             &[encode_der(leaf_cert.der()), encode_der(root_cert.der())],
             &test_config(root_cert.pem(), vec![]),
         )

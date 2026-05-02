@@ -244,6 +244,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             current_epoch     INTEGER NOT NULL DEFAULT 0,
             needs_rekey       INTEGER NOT NULL DEFAULT 0,
             password_version  INTEGER NOT NULL DEFAULT 0,
+            pruned_floor_seq  INTEGER NOT NULL DEFAULT 0,
             created_at        INTEGER NOT NULL,
             updated_at        INTEGER NOT NULL
         );
@@ -325,6 +326,16 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS idx_nonces_expires
             ON registration_nonces(expires_at);
+
+        -- Signed request replay cache
+        CREATE TABLE IF NOT EXISTS signed_request_nonces (
+            device_id   TEXT NOT NULL,
+            nonce       TEXT NOT NULL,
+            expires_at  INTEGER NOT NULL,
+            PRIMARY KEY (device_id, nonce)
+        );
+        CREATE INDEX IF NOT EXISTS idx_signed_request_nonces_expires
+            ON signed_request_nonces(expires_at);
 
         -- Device receipts (tracks each device's last acknowledged server_seq)
         CREATE TABLE IF NOT EXISTS device_receipts (
@@ -421,6 +432,8 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             joiner_confirmation BLOB,
             credential_bundle   BLOB,
             joiner_bundle       BLOB,
+            credential_bundle_consumed_at INTEGER,
+            joiner_bundle_consumed_at     INTEGER,
             created_at          INTEGER NOT NULL,
             expires_at          INTEGER NOT NULL
         );
@@ -516,7 +529,9 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_sharing_identity_generation(conn)?;
     migrate_sharing_identity_generation_floors(conn)?;
     migrate_sync_groups_password_version(conn)?;
+    migrate_sync_groups_pruned_floor_seq(conn)?;
     migrate_devices_ml_dsa_rotation(conn)?;
+    migrate_pairing_session_consumed_columns(conn)?;
 
     Ok(())
 }
@@ -648,6 +663,17 @@ fn sharing_identity_generation_floor_has_column(
     Ok(false)
 }
 
+fn pairing_session_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(pairing_sessions)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Add password_version column to an existing `sync_groups` table.
 /// Safe to call repeatedly — checks for column existence first.
 fn migrate_sync_groups_password_version(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -655,6 +681,16 @@ fn migrate_sync_groups_password_version(conn: &Connection) -> Result<(), rusqlit
     if !has_password_version {
         conn.execute_batch(
             "ALTER TABLE sync_groups ADD COLUMN password_version INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_sync_groups_pruned_floor_seq(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_col = sync_group_has_column(conn, "pruned_floor_seq")?;
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE sync_groups ADD COLUMN pruned_floor_seq INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     Ok(())
@@ -775,6 +811,25 @@ fn migrate_sharing_identity_generation_floors(conn: &Connection) -> Result<(), r
                     updated_at = MAX(updated_at, ?4)
               WHERE sharing_id = ?1",
             params![sharing_id, identity_generation, hash_bytes(&identity_bundle), updated_at],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn migrate_pairing_session_consumed_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_credentials_consumed =
+        pairing_session_has_column(conn, "credential_bundle_consumed_at")?;
+    let has_joiner_consumed = pairing_session_has_column(conn, "joiner_bundle_consumed_at")?;
+
+    if !has_credentials_consumed {
+        conn.execute_batch(
+            "ALTER TABLE pairing_sessions ADD COLUMN credential_bundle_consumed_at INTEGER;",
+        )?;
+    }
+    if !has_joiner_consumed {
+        conn.execute_batch(
+            "ALTER TABLE pairing_sessions ADD COLUMN joiner_bundle_consumed_at INTEGER;",
         )?;
     }
 
@@ -1483,6 +1538,36 @@ pub fn cleanup_expired_nonces(conn: &Connection) -> Result<usize, rusqlite::Erro
     conn.execute("DELETE FROM registration_nonces WHERE expires_at <= ?1", params![now])
 }
 
+/// Record a signed request nonce if it has not already been seen for this
+/// device within the replay window. Returns true when the nonce was accepted.
+pub fn record_signed_request_nonce(
+    conn: &Connection,
+    device_id: &str,
+    nonce: &str,
+    expires_at: i64,
+    now: i64,
+) -> Result<bool, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM signed_request_nonces
+         WHERE device_id = ?1 AND nonce = ?2 AND expires_at <= ?3",
+        params![device_id, nonce, now],
+    )?;
+
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO signed_request_nonces (device_id, nonce, expires_at)
+         VALUES (?1, ?2, ?3)",
+        params![device_id, nonce, expires_at],
+    )?;
+
+    Ok(inserted > 0)
+}
+
+/// Remove expired signed request replay nonces. Returns the number removed.
+pub fn cleanup_expired_signed_request_nonces(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    conn.execute("DELETE FROM signed_request_nonces WHERE expires_at <= ?1", params![now])
+}
+
 /// Remove expired revoked-session markers.
 pub fn cleanup_expired_revoked_sessions(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
@@ -1549,6 +1634,40 @@ pub fn get_batches_since(
         })
     })?;
     rows.collect()
+}
+
+/// Return the first retained batch sequence for a sync group, if any.
+///
+/// "Retained" means the relay has guaranteed this sync group's history from
+/// `Some(seq)` onward — anything below that seq has been pruned and is no
+/// longer recoverable from the op log. A `None` result means no pruning has
+/// occurred for this sync group, so a client at any `since` value is allowed
+/// to pull the tail (including a fresh `since=0` cursor on a brand-new group).
+///
+/// The value is derived from `sync_groups.pruned_floor_seq`, which tracks the
+/// highest seq this relay has ever pruned for this sync group. The returned
+/// "first retained" is `pruned_floor_seq + 1` — the lowest seq the relay still
+/// has, equivalent to the historical `MIN(id) FROM batches`. Reading the floor
+/// from `sync_groups` instead of `batches.id` avoids tying the bootstrap rule
+/// to the global SQLite auto-increment, which would falsely trip the rule for
+/// any new sync group whose first push is assigned a high global id.
+pub fn get_first_retained_batch_seq(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<i64>, rusqlite::Error> {
+    let pruned_floor: i64 = conn
+        .query_row(
+            "SELECT pruned_floor_seq FROM sync_groups WHERE sync_id = ?1",
+            params![sync_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if pruned_floor > 0 {
+        Ok(Some(pruned_floor + 1))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
@@ -1680,9 +1799,10 @@ pub fn get_min_acked_seq(
     )
 }
 
-/// Get the safe pruning sequence: min of (snapshot seq, min acked seq excluding stale).
-/// If no snapshot exists (or it has expired), uses min_acked_seq alone so that
-/// pruning is not blocked at steady state when no snapshot is at rest.
+/// Get the safe pruning sequence: min of (group-wide snapshot seq, min acked
+/// seq excluding stale). Returns `None` when no unexpired group-wide snapshot
+/// exists; batch pruning must never rely on ACKs alone or on snapshots that
+/// only one target device can read.
 pub fn get_safe_prune_seq(
     conn: &Connection,
     sync_id: &str,
@@ -1691,6 +1811,7 @@ pub fn get_safe_prune_seq(
     let snapshot_seq: Option<i64> = conn
         .query_row(
             "SELECT server_seq_at FROM snapshots WHERE sync_id = ?1
+               AND target_device_id IS NULL
                AND (expires_at IS NULL OR expires_at >= unixepoch())",
             params![sync_id],
             |row| row.get(0),
@@ -1702,8 +1823,7 @@ pub fn get_safe_prune_seq(
     match (snapshot_seq, min_acked) {
         (Some(snap), Some(acked)) => Ok(Some(snap.min(acked))),
         (Some(snap), None) => Ok(Some(snap)),
-        (None, Some(acked)) => Ok(Some(acked)),
-        (None, None) => Ok(None),
+        (None, _) => Ok(None),
     }
 }
 
@@ -1713,7 +1833,47 @@ pub fn prune_batches_before(
     sync_id: &str,
     before_seq: i64,
 ) -> Result<usize, rusqlite::Error> {
-    conn.execute("DELETE FROM batches WHERE sync_id = ?1 AND id < ?2", params![sync_id, before_seq])
+    let n =
+        conn.execute("DELETE FROM batches WHERE sync_id = ?1 AND id < ?2", params![
+            sync_id, before_seq
+        ])?;
+    if n > 0 && before_seq > 1 {
+        // The highest seq we just pruned is `before_seq - 1`; advance the
+        // floor monotonically so concurrent prune calls can't roll it back.
+        conn.execute(
+            "UPDATE sync_groups
+             SET pruned_floor_seq = MAX(pruned_floor_seq, ?2)
+             WHERE sync_id = ?1",
+            params![sync_id, before_seq - 1],
+        )?;
+    }
+    Ok(n)
+}
+
+/// Prune acknowledged batch history only for sync groups that currently have
+/// an unexpired group-wide snapshot. Returns the total number of batch rows
+/// deleted.
+pub fn prune_batches_with_unexpired_snapshots(
+    conn: &Connection,
+    stale_threshold_secs: i64,
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT sync_id
+         FROM snapshots
+         WHERE target_device_id IS NULL
+           AND (expires_at IS NULL OR expires_at >= unixepoch())",
+    )?;
+    let sync_ids =
+        stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+
+    let mut pruned = 0usize;
+    for sync_id in sync_ids {
+        if let Some(safe_seq) = get_safe_prune_seq(conn, &sync_id, stale_threshold_secs)? {
+            pruned += prune_batches_before(conn, &sync_id, safe_seq)?;
+        }
+    }
+
+    Ok(pruned)
 }
 
 // ---------------------------------------------------------------------------
@@ -2066,11 +2226,17 @@ pub fn set_pairing_slot(
         }
         "credential_bundle" => {
             "UPDATE pairing_sessions SET credential_bundle = ?1
-             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND credential_bundle IS NULL"
+             WHERE rendezvous_id = ?2
+               AND expires_at > ?3
+               AND credential_bundle IS NULL
+               AND credential_bundle_consumed_at IS NULL"
         }
         "joiner_bundle" => {
             "UPDATE pairing_sessions SET joiner_bundle = ?1
-             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND joiner_bundle IS NULL"
+             WHERE rendezvous_id = ?2
+               AND expires_at > ?3
+               AND joiner_bundle IS NULL
+               AND joiner_bundle_consumed_at IS NULL"
         }
         _ => unreachable!(),
     };
@@ -2111,6 +2277,80 @@ pub fn get_pairing_slot(
     conn.query_row(sql, params![rendezvous_id, now], |row| row.get::<_, Option<Vec<u8>>>(0))
         .optional()
         .map(|opt| opt.flatten())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingSlotRead {
+    NotSet,
+    Consumed,
+    Present(Vec<u8>),
+}
+
+/// Atomically read and consume a terminal pairing slot for a non-expired session.
+///
+/// Only `credential_bundle` and `joiner_bundle` are terminal payloads. Earlier
+/// ceremony slots remain pollable because the peer may retry while waiting for
+/// the next ceremony step.
+pub fn take_pairing_slot(
+    conn: &Connection,
+    rendezvous_id: &str,
+    slot: &str,
+) -> Result<PairingSlotRead, rusqlite::Error> {
+    let col = validate_pairing_slot(slot)?;
+    let consumed_col = match col {
+        "credential_bundle" => "credential_bundle_consumed_at",
+        "joiner_bundle" => "joiner_bundle_consumed_at",
+        _ => {
+            return get_pairing_slot(conn, rendezvous_id, col).map(|value| match value {
+                Some(data) => PairingSlotRead::Present(data),
+                None => PairingSlotRead::NotSet,
+            });
+        }
+    };
+
+    let tx = conn.unchecked_transaction()?;
+    let now = now_secs();
+    let sql = format!(
+        "SELECT {col}, {consumed_col} FROM pairing_sessions
+         WHERE rendezvous_id = ?1 AND expires_at > ?2"
+    );
+    let current = tx
+        .query_row(&sql, params![rendezvous_id, now], |row| {
+            Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .optional()?;
+
+    let Some((value, consumed_at)) = current else {
+        tx.commit()?;
+        return Ok(PairingSlotRead::NotSet);
+    };
+
+    if consumed_at.is_some() {
+        tx.commit()?;
+        return Ok(PairingSlotRead::Consumed);
+    }
+
+    let Some(data) = value else {
+        tx.commit()?;
+        return Ok(PairingSlotRead::NotSet);
+    };
+
+    let sql = format!(
+        "UPDATE pairing_sessions
+            SET {col} = NULL, {consumed_col} = ?1
+          WHERE rendezvous_id = ?2
+            AND expires_at > ?3
+            AND {col} IS NOT NULL
+            AND {consumed_col} IS NULL"
+    );
+    let changed = tx.execute(&sql, params![now, rendezvous_id, now])?;
+    tx.commit()?;
+
+    if changed == 0 {
+        Ok(PairingSlotRead::Consumed)
+    } else {
+        Ok(PairingSlotRead::Present(data))
+    }
 }
 
 /// Delete a pairing session. Returns `true` if a row was deleted.
@@ -2607,15 +2847,15 @@ pub fn count_pending_sharing_inits(
     )
 }
 
-/// Delete expired payloads and old consumed payloads. Returns the number of rows deleted.
+/// Delete payload rows after their original replay window has expired.
+/// Consumed rows are retained until `expires_at` so their `init_id`s continue
+/// to reject replay for the full sharing-init TTL.
 pub fn cleanup_expired_sharing_init_payloads(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
-    let consumed_cutoff = now - 86400; // 24 hours
     let rows = conn.execute(
         "DELETE FROM sharing_init_payloads
-         WHERE expires_at <= ?1
-            OR (consumed_at IS NOT NULL AND consumed_at <= ?2)",
-        params![now, consumed_cutoff],
+         WHERE expires_at <= ?1",
+        params![now],
     )?;
     Ok(rows)
 }
@@ -2837,6 +3077,45 @@ mod tests {
             // Cleanup expired nonces
             let cleaned = cleanup_expired_nonces(conn)?;
             assert!(cleaned >= 1);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_signed_request_nonce_replay_and_cleanup() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let now = now_secs();
+
+            assert!(record_signed_request_nonce(conn, "dev1", "nonce-1", now + 60, now)?);
+            assert!(!record_signed_request_nonce(conn, "dev1", "nonce-1", now + 60, now)?);
+
+            assert!(record_signed_request_nonce(conn, "dev1", "nonce-2", now + 60, now)?);
+            assert!(record_signed_request_nonce(conn, "dev2", "nonce-1", now + 60, now)?);
+
+            conn.execute(
+                "INSERT INTO signed_request_nonces (device_id, nonce, expires_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["dev1", "reusable", now - 1],
+            )?;
+            assert!(record_signed_request_nonce(conn, "dev1", "reusable", now + 60, now)?);
+
+            conn.execute(
+                "INSERT INTO signed_request_nonces (device_id, nonce, expires_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["dev1", "expired", now - 1],
+            )?;
+            let cleaned = cleanup_expired_signed_request_nonces(conn)?;
+            assert_eq!(cleaned, 1);
+
+            let expired_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM signed_request_nonces WHERE nonce = 'expired'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(expired_count, 0);
 
             Ok(())
         })
@@ -3236,15 +3515,15 @@ mod tests {
             touch_device(conn, "sg1", "dev1")?;
             touch_device(conn, "sg1", "dev2")?;
 
-            // No snapshot, no receipts => min_acked is 0 (COALESCE), so prune seq is 0
+            // No snapshot, no receipts => no prune point.
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(0));
+            assert_eq!(seq, None);
 
-            // No snapshot, with receipts => uses min_acked_seq alone
+            // No snapshot, with receipts => still no prune point.
             upsert_device_receipt(conn, "sg1", "dev1", 5)?;
             upsert_device_receipt(conn, "sg1", "dev2", 8)?;
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(5));
+            assert_eq!(seq, None);
 
             // Add snapshot at seq 10 — now min(snapshot=10, min_acked=5) => 5
             upsert_snapshot(conn, "sg1", 0, 10, b"snap", None, None, None)?;
@@ -3257,10 +3536,10 @@ mod tests {
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
             assert_eq!(seq, Some(10));
 
-            // Delete snapshot => falls back to min_acked_seq alone (15)
+            // Delete snapshot => no prune point even with ACKs.
             delete_snapshot(conn, "sg1")?;
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(15));
+            assert_eq!(seq, None);
 
             Ok(())
         })
@@ -3280,9 +3559,9 @@ mod tests {
             let past = now_secs() - 100;
             upsert_snapshot(conn, "sg1", 0, 5, b"snap", Some(past), None, None)?;
 
-            // Expired snapshot should be ignored; falls back to min_acked_seq (20)
+            // Expired snapshot should be ignored; ACKs alone do not permit pruning.
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(seq, Some(20));
+            assert_eq!(seq, None);
 
             // Non-expired snapshot should be respected
             let future = now_secs() + 3600;
@@ -3480,10 +3759,10 @@ mod tests {
         .unwrap();
     }
 
-    /// Test 2: Pruning works without snapshot — push batches, ACK all from
-    /// all devices, verify get_safe_prune_seq returns min_acked_seq.
+    /// Test 2: Cleanup pruning requires an unexpired snapshot even when all
+    /// devices have ACKed retained history.
     #[test]
-    fn test_pruning_works_without_snapshot() {
+    fn test_no_snapshot_cleanup_prunes_nothing() {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
@@ -3503,30 +3782,28 @@ mod tests {
             upsert_device_receipt(conn, "sg1", "dev1", seq3)?;
             upsert_device_receipt(conn, "sg1", "dev2", seq3)?;
 
-            // Safe prune seq should be seq3 (min of all acked)
+            // Safe prune seq should not exist without an unexpired snapshot.
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(safe, Some(seq3));
+            assert_eq!(safe, None);
 
-            // Prune everything before seq3
-            let pruned = prune_batches_before(conn, "sg1", seq3)?;
-            assert_eq!(pruned, 2, "should prune seq1 and seq2");
+            // Periodic cleanup pruning must leave all batches intact.
+            let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 0, "cleanup must not prune without a snapshot");
 
-            // Only 3 batches remain
+            // All 5 batches remain.
             let remaining = get_batches_since(conn, "sg1", 0, 100)?;
-            assert_eq!(remaining.len(), 3);
-            assert_eq!(remaining[0].server_seq, seq3);
+            assert_eq!(remaining.len(), 5);
 
             // Advance both devices to seq5
             upsert_device_receipt(conn, "sg1", "dev1", seq5)?;
             upsert_device_receipt(conn, "sg1", "dev2", seq5)?;
 
-            // Safe prune seq should now be seq5
+            // Still no safe prune point without a snapshot.
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(safe, Some(seq5));
+            assert_eq!(safe, None);
 
-            // Prune before seq5
-            let pruned = prune_batches_before(conn, "sg1", seq5)?;
-            assert_eq!(pruned, 2, "should prune seq3 and seq4");
+            let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 0, "cleanup must still not prune without a snapshot");
 
             Ok(())
         })
@@ -3715,20 +3992,19 @@ mod tests {
             let seq_10 = batches[9].server_seq;
             upsert_device_receipt(conn, "sg1", "dev1", seq_10)?;
 
-            // No snapshot, so safe prune is just min_acked (seq_10)
+            // No snapshot, so ACKs alone do not create a safe prune point.
             let safe = get_safe_prune_seq(conn, "sg1", 3600)?;
-            assert_eq!(safe, Some(seq_10));
+            assert_eq!(safe, None);
 
-            // Prune up to acked point
-            let pruned = prune_batches_before(conn, "sg1", seq_10)?;
-            assert_eq!(pruned, 9, "should prune 9 batches (seq < seq_10)");
+            let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 0, "cleanup must not prune without a snapshot");
 
             // Can still push more
             let new_seq = insert_batch(conn, "sg1", 0, "dev1", "b_new", b"new_data")?;
-            assert!(new_seq > 0, "should successfully push after pruning");
+            assert!(new_seq > 0, "should successfully push without pruning");
 
             let batches = get_batches_since(conn, "sg1", 0, 100)?;
-            assert_eq!(batches.len(), 12, "11 remaining + 1 new");
+            assert_eq!(batches.len(), 21, "20 existing + 1 new");
 
             Ok(())
         })

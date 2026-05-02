@@ -39,6 +39,12 @@ pub trait SyncStorage: Send + Sync {
         field: &str,
     ) -> Result<Option<FieldVersion>>;
 
+    /// List remote ops quarantined because they targeted schema unknown to
+    /// this client at pull time.
+    fn list_quarantined_ops(&self, _sync_id: &str) -> Result<Vec<QuarantinedOp>> {
+        Ok(vec![])
+    }
+
     /// Get a device record by sync_id and device_id.
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>>;
 
@@ -149,13 +155,21 @@ pub trait SyncStorageTx {
     // ── Pending ops ──
     fn insert_pending_op(&mut self, op: &PendingOp) -> Result<()>;
     fn mark_batch_pushed(&mut self, batch_id: &str) -> Result<()>;
-    fn delete_pushed_ops(&mut self, sync_id: &str) -> Result<()>;
+    fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()>;
 
     // ── Applied ops ──
     fn insert_applied_op(&mut self, op: &AppliedOp) -> Result<()>;
 
     // ── Field versions ──
     fn upsert_field_version(&mut self, fv: &FieldVersion) -> Result<()>;
+
+    // ── Quarantined remote ops ──
+    fn insert_quarantined_op(&mut self, _op: &QuarantinedOp) -> Result<()> {
+        Ok(())
+    }
+    fn delete_quarantined_op(&mut self, _sync_id: &str, _op_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     // ── Device registry ──
     fn upsert_device_record(&mut self, device: &DeviceRecord) -> Result<()>;
@@ -186,6 +200,19 @@ pub trait SyncStorageTx {
         _entity_id: &str,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// Delete non-tombstone field_versions rows for a specific entity.
+    /// Used when hard-deleting a tombstoned entity while preserving the
+    /// `is_deleted` row that prevents stale ops from resurrecting it.
+    /// Returns the number of rows deleted. Default: 0 (no-op).
+    fn delete_non_tombstone_field_versions_for_entity(
+        &mut self,
+        _sync_id: &str,
+        _table: &str,
+        _entity_id: &str,
+    ) -> Result<usize> {
+        Ok(0)
     }
 
     /// Import sync state from a snapshot blob (zstd-compressed JSON).

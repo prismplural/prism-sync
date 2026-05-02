@@ -9,6 +9,51 @@ use crate::kdf;
 
 const SALT_LEN: usize = 16;
 const DEK_LEN: usize = 32;
+const WRAPPED_DEK_V2_PREFIX: &[u8] = b"PRISM_DEK_WRAP\x02";
+const WRAPPED_DEK_AAD_DOMAIN: &[u8] = b"PRISM_SYNC_WRAPPED_DEK";
+const WRAPPED_DEK_AAD_PURPOSE: &[u8] = b"mek-to-dek";
+const WRAPPED_DEK_AAD_ALGORITHM: &[u8] = b"xchacha20poly1305";
+const WRAPPED_DEK_AAD_KDF: &[u8] = b"argon2id-mek-v1";
+
+fn push_len_prefixed_field(out: &mut Vec<u8>, field: &[u8]) -> Result<()> {
+    let len: u16 = field.len().try_into().map_err(|_| {
+        CryptoError::InvalidInput(format!("AAD field is too long: {} bytes", field.len()))
+    })?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(field);
+    Ok(())
+}
+
+fn build_wrapped_dek_v2_aad(salt: &[u8]) -> Result<Vec<u8>> {
+    let mut aad = Vec::new();
+    push_len_prefixed_field(&mut aad, WRAPPED_DEK_AAD_DOMAIN)?;
+    aad.push(2);
+    push_len_prefixed_field(&mut aad, WRAPPED_DEK_AAD_PURPOSE)?;
+    push_len_prefixed_field(&mut aad, WRAPPED_DEK_AAD_ALGORITHM)?;
+    push_len_prefixed_field(&mut aad, WRAPPED_DEK_AAD_KDF)?;
+    aad.extend_from_slice(&(DEK_LEN as u16).to_be_bytes());
+    push_len_prefixed_field(&mut aad, salt)?;
+    Ok(aad)
+}
+
+fn wrap_dek_v2(mek: &[u8], dek: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
+    let aad = build_wrapped_dek_v2_aad(salt)?;
+    let ciphertext = aead::xchacha_encrypt_aead(mek, dek, &aad)?;
+    let mut wrapped = Vec::with_capacity(WRAPPED_DEK_V2_PREFIX.len() + ciphertext.len());
+    wrapped.extend_from_slice(WRAPPED_DEK_V2_PREFIX);
+    wrapped.extend_from_slice(&ciphertext);
+    Ok(wrapped)
+}
+
+fn unwrap_dek_v2(mek: &[u8], wrapped: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
+    let ciphertext = wrapped.strip_prefix(WRAPPED_DEK_V2_PREFIX).ok_or_else(|| {
+        CryptoError::InvalidKeyMaterial(
+            "unsupported wrapped DEK format; beta reset requires v2 wrapped DEK".into(),
+        )
+    })?;
+    let aad = build_wrapped_dek_v2_aad(salt)?;
+    aead::xchacha_decrypt_aead(mek, ciphertext, &aad)
+}
 
 /// Manages the password-based key hierarchy for prism-sync.
 ///
@@ -55,8 +100,8 @@ impl KeyHierarchy {
         // Derive MEK (Zeroizing — auto-cleaned on drop)
         let mek = kdf::derive_mek(password.as_bytes(), secret_key, &salt)?;
 
-        // Wrap DEK under MEK
-        let wrapped_dek = aead::secretbox_wrap(&mek, &dek_bytes)?;
+        // Wrap DEK under MEK with a versioned AEAD envelope.
+        let wrapped_dek = wrap_dek_v2(&mek, &dek_bytes, &salt)?;
 
         // Store DEK
         self.dek = dek_bytes;
@@ -77,8 +122,14 @@ impl KeyHierarchy {
         wrapped_dek: &[u8],
         salt: &[u8],
     ) -> Result<()> {
+        if !wrapped_dek.starts_with(WRAPPED_DEK_V2_PREFIX) {
+            return Err(CryptoError::InvalidKeyMaterial(
+                "unsupported wrapped DEK format; beta reset requires v2 wrapped DEK".into(),
+            ));
+        }
+
         let mek = kdf::derive_mek(password.as_bytes(), secret_key, salt)?;
-        let dek = aead::secretbox_unwrap(&mek, wrapped_dek)?;
+        let dek = unwrap_dek_v2(&mek, wrapped_dek, salt)?;
 
         if dek.len() != DEK_LEN {
             return Err(CryptoError::InvalidKeyMaterial(format!(
@@ -99,8 +150,8 @@ impl KeyHierarchy {
     /// Restore unlocked state directly from raw DEK bytes.
     ///
     /// Bypasses password-based key derivation (Argon2id). Use this when the
-    /// raw DEK has been persisted in a platform keychain and needs to be
-    /// restored on subsequent app launches without the user's password.
+    /// host has recovered the DEK from a platform-protected runtime cache and
+    /// needs to restore subsequent app launches without the user's password.
     pub fn restore_from_dek(&mut self, dek_bytes: &[u8]) -> Result<()> {
         if dek_bytes.len() != DEK_LEN {
             return Err(CryptoError::InvalidKeyMaterial(format!(
@@ -130,7 +181,7 @@ impl KeyHierarchy {
         rand::rngs::OsRng.fill_bytes(&mut salt);
 
         let mek = kdf::derive_mek(new_password.as_bytes(), secret_key, &salt)?;
-        let wrapped_dek = aead::secretbox_wrap(&mek, &self.dek)?;
+        let wrapped_dek = wrap_dek_v2(&mek, &self.dek, &salt)?;
 
         Ok((wrapped_dek, salt))
     }
@@ -181,10 +232,8 @@ impl KeyHierarchy {
         let mut epochs: Vec<u32> = self.epoch_keys.keys().copied().collect();
         epochs.sort_unstable();
         for epoch in epochs {
-            let key_vec = self
-                .epoch_keys
-                .get(&epoch)
-                .expect("epoch key just enumerated should exist");
+            let key_vec =
+                self.epoch_keys.get(&epoch).expect("epoch key just enumerated should exist");
             let key_arr: &[u8; 32] = key_vec.as_slice().try_into().map_err(|_| {
                 CryptoError::InvalidKeyMaterial(format!(
                     "epoch {epoch} key has unexpected length {}",
@@ -282,7 +331,7 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         let (wrapped, salt) = kh.initialize("password", &test_secret_key()).unwrap();
         assert!(kh.is_unlocked());
-        assert!(!wrapped.is_empty());
+        assert!(wrapped.starts_with(WRAPPED_DEK_V2_PREFIX));
         assert_eq!(salt.len(), 16);
     }
 
@@ -315,6 +364,70 @@ mod tests {
         let (wrapped, salt) = kh.initialize("password", &secret).unwrap();
         kh.lock();
         assert!(kh.unlock("wrong_password", &secret, &wrapped, &salt).is_err());
+    }
+
+    #[test]
+    fn wrapped_dek_v2_roundtrip_preserves_dek() {
+        let mut kh = KeyHierarchy::new();
+        let secret = test_secret_key();
+        let (wrapped, salt) = kh.initialize("password", &secret).unwrap();
+        let dek = kh.dek().unwrap().to_vec();
+        assert!(wrapped.starts_with(WRAPPED_DEK_V2_PREFIX));
+
+        kh.lock();
+        kh.unlock("password", &secret, &wrapped, &salt).unwrap();
+        assert_eq!(kh.dek().unwrap(), dek);
+    }
+
+    #[test]
+    fn wrapped_dek_v2_ciphertext_tampering_fails() {
+        let mut kh = KeyHierarchy::new();
+        let secret = test_secret_key();
+        let (mut wrapped, salt) = kh.initialize("password", &secret).unwrap();
+        let last = wrapped.len() - 1;
+        wrapped[last] ^= 0xff;
+
+        kh.lock();
+        assert!(kh.unlock("password", &secret, &wrapped, &salt).is_err());
+    }
+
+    #[test]
+    fn wrapped_dek_v2_salt_aad_tampering_fails() {
+        let mut kh = KeyHierarchy::new();
+        let secret = test_secret_key();
+        let (wrapped, mut salt) = kh.initialize("password", &secret).unwrap();
+        salt[0] ^= 0xff;
+
+        kh.lock();
+        assert!(kh.unlock("password", &secret, &wrapped, &salt).is_err());
+    }
+
+    #[test]
+    fn wrapped_dek_v2_aad_binds_salt_independent_of_mek() {
+        let secret = test_secret_key();
+        let mut salt = vec![0u8; SALT_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let mek = kdf::derive_mek(b"password", &secret, &salt).unwrap();
+        let dek = vec![7u8; DEK_LEN];
+        let wrapped = wrap_dek_v2(&mek, &dek, &salt).unwrap();
+
+        let mut aad_salt = salt.clone();
+        aad_salt[0] ^= 0xff;
+        assert!(unwrap_dek_v2(&mek, &wrapped, &aad_salt).is_err());
+    }
+
+    #[test]
+    fn legacy_wrapped_dek_format_is_rejected() {
+        let mut kh = KeyHierarchy::new();
+        let secret = test_secret_key();
+        let (_, salt) = kh.initialize("password", &secret).unwrap();
+        kh.lock();
+
+        let legacy_wrapped_dek = vec![0u8; 24 + DEK_LEN + 16];
+        let err = kh
+            .unlock("password", &secret, &legacy_wrapped_dek, &salt)
+            .expect_err("legacy wrapped DEK must not unlock");
+        assert!(err.to_string().contains("unsupported wrapped DEK format"));
     }
 
     #[test]
@@ -360,6 +473,7 @@ mod tests {
         let db_key = kh.database_key().unwrap().to_vec();
 
         let (new_wrapped, new_salt) = kh.change_password("new_password", &secret).unwrap();
+        assert!(new_wrapped.starts_with(WRAPPED_DEK_V2_PREFIX));
         kh.lock();
         kh.unlock("new_password", &secret, &new_wrapped, &new_salt).unwrap();
         assert_eq!(kh.epoch_key(0).unwrap(), epoch0);

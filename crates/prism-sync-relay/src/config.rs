@@ -1,3 +1,21 @@
+pub const MIN_SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 3;
+const GENERATED_REGISTRATION_TOKEN_LOG_MESSAGE: &str =
+    "Generated registration token. Read it from the token file; the full token is not printed in logs.";
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("MIN_SIGNATURE_VERSION={configured} is below source floor {floor}; refusing to start")]
+    MinSignatureVersionBelowSourceFloor { configured: u8, floor: u8 },
+    #[error(
+        "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED=true requires FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM"
+    )]
+    AppleAttestationEnabledWithoutTrustRoots,
+    #[error(
+        "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED=true requires FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM"
+    )]
+    AndroidAttestationEnabledWithoutTrustRoots,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GifProviderMode {
     Disabled,
@@ -40,6 +58,12 @@ pub struct Config {
     pub revoke_rate_limit: u32,
     /// Sliding window duration in seconds for revoke rate limiting.
     pub revoke_rate_window_secs: u64,
+    /// Max WebSocket upgrade attempts per client IP within ws_upgrade_rate_window_secs.
+    pub ws_upgrade_rate_limit: u32,
+    /// Sliding window duration in seconds for WebSocket upgrade rate limiting.
+    pub ws_upgrade_rate_window_secs: u64,
+    /// Reverse proxy CIDR ranges whose forwarded client IP headers are trusted.
+    pub trusted_proxy_cidrs: Vec<String>,
     /// Max allowed absolute clock skew for signed requests.
     pub signed_request_max_skew_secs: i64,
     /// Replay window (seconds) for signed request nonces.
@@ -71,7 +95,7 @@ pub struct Config {
     /// Resolution order (handled by [`resolve_registration_token`]):
     /// 1. `REGISTRATION_TOKEN` env var (explicit config, highest priority)
     /// 2. `{db_dir}/.registration-token` file (auto-generated on first boot)
-    /// 3. Neither → generate a random token, write it to the file, log it
+    /// 3. Neither → generate a random token, write it to the file, log the file path
     ///
     /// To explicitly run open registration, set `REGISTRATION_TOKEN=OPEN`.
     pub registration_token: Option<String>,
@@ -107,7 +131,7 @@ pub struct Config {
     /// Maximum clock skew (in seconds) allowed for prekey timestamps in the
     /// future. Default: 300 (5 minutes).
     pub prekey_max_future_skew_secs: i64,
-    /// Minimum accepted signature version byte (default: 3).
+    /// Minimum accepted signature version byte.
     /// Signatures with a version below this are rejected with 403.
     pub min_signature_version: u8,
     /// Directory where uploaded media blobs are stored on disk.
@@ -154,6 +178,9 @@ impl std::fmt::Debug for Config {
             .field("registration_token", &self.registration_token.as_ref().map(|_| "[REDACTED]"))
             .field("registration_enabled", &self.registration_enabled)
             .field("metrics_token", &self.metrics_token.as_ref().map(|_| "[REDACTED]"))
+            .field("ws_upgrade_rate_limit", &self.ws_upgrade_rate_limit)
+            .field("ws_upgrade_rate_window_secs", &self.ws_upgrade_rate_window_secs)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .field("gif_provider_mode", &self.gif_provider_mode)
             .field("gif_public_base_url", &self.gif_public_base_url)
             .field("gif_prism_base_url", &self.gif_prism_base_url)
@@ -166,102 +193,160 @@ impl std::fmt::Debug for Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        Self {
-            port: parse_env("PORT", 8080),
-            db_path: std::env::var("DB_PATH").unwrap_or_else(|_| "data/relay.db".into()),
-            invite_ttl_secs: parse_env("INVITE_TTL_SECS", 86400),
-            sync_inactive_ttl_secs: parse_env("SYNC_INACTIVE_TTL_SECS", 7_776_000),
-            stale_device_secs: parse_env("STALE_DEVICE_SECS", 2_592_000),
-            cleanup_interval_secs: parse_env("CLEANUP_INTERVAL_SECS", 3600),
-            max_unpruned_batches: parse_env("MAX_UNPRUNED_BATCHES", 10_000),
-            metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|s| !s.is_empty()),
-            session_expiry_secs: parse_env("SESSION_EXPIRY_SECS", 2_592_000),
-            nonce_expiry_secs: parse_env("NONCE_EXPIRY_SECS", 60),
-            first_device_pow_difficulty_bits: parse_env("FIRST_DEVICE_POW_DIFFICULTY_BITS", 18),
-            nonce_rate_limit: parse_env("NONCE_RATE_LIMIT", 10),
-            nonce_rate_window_secs: parse_env("NONCE_RATE_WINDOW_SECS", 60),
-            revoke_rate_limit: parse_env("REVOKE_RATE_LIMIT", 2),
-            revoke_rate_window_secs: parse_env("REVOKE_RATE_WINDOW_SECS", 3600),
-            signed_request_max_skew_secs: parse_env("SIGNED_REQUEST_MAX_SKEW_SECS", 60),
-            signed_request_nonce_window_secs: parse_env("SIGNED_REQUEST_NONCE_WINDOW_SECS", 120),
-            snapshot_default_ttl_secs: parse_env("SNAPSHOT_DEFAULT_TTL_SECS", 86400),
-            revoked_tombstone_retention_secs: parse_env(
+        match Self::try_from_env() {
+            Ok(config) => config,
+            Err(error) => panic!("invalid relay configuration: {error}"),
+        }
+    }
+
+    pub fn try_from_env() -> Result<Self, ConfigError> {
+        Self::from_env_values(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_values<F>(env: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let min_signature_version = parse_min_signature_version_env(
+            &env,
+            "MIN_SIGNATURE_VERSION",
+            MIN_SIGNATURE_VERSION_SOURCE_FLOOR,
+        )?;
+        let first_device_apple_attestation_enabled =
+            parse_bool_env_with(&env, "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", false);
+        let first_device_apple_attestation_trust_roots_pem = parse_json_vec_env_with(
+            &env,
+            "FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM",
+            Vec::new(),
+        );
+        if first_device_apple_attestation_enabled
+            && first_device_apple_attestation_trust_roots_pem.is_empty()
+        {
+            return Err(ConfigError::AppleAttestationEnabledWithoutTrustRoots);
+        }
+        let first_device_android_attestation_enabled =
+            parse_bool_env_with(&env, "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED", true);
+        let first_device_android_attestation_trust_roots_pem = parse_json_vec_env_with(
+            &env,
+            "FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM",
+            default_android_attestation_roots(),
+        );
+        if first_device_android_attestation_enabled
+            && first_device_android_attestation_trust_roots_pem.is_empty()
+        {
+            return Err(ConfigError::AndroidAttestationEnabledWithoutTrustRoots);
+        }
+
+        Ok(Self {
+            port: parse_env_with(&env, "PORT", 8080),
+            db_path: env("DB_PATH").unwrap_or_else(|| "data/relay.db".into()),
+            invite_ttl_secs: parse_env_with(&env, "INVITE_TTL_SECS", 86400),
+            sync_inactive_ttl_secs: parse_env_with(&env, "SYNC_INACTIVE_TTL_SECS", 7_776_000),
+            stale_device_secs: parse_env_with(&env, "STALE_DEVICE_SECS", 2_592_000),
+            cleanup_interval_secs: parse_env_with(&env, "CLEANUP_INTERVAL_SECS", 3600),
+            max_unpruned_batches: parse_env_with(&env, "MAX_UNPRUNED_BATCHES", 10_000),
+            metrics_token: env("METRICS_TOKEN").filter(|s| !s.is_empty()),
+            session_expiry_secs: parse_env_with(&env, "SESSION_EXPIRY_SECS", 2_592_000),
+            nonce_expiry_secs: parse_env_with(&env, "NONCE_EXPIRY_SECS", 60),
+            first_device_pow_difficulty_bits: parse_env_with(
+                &env,
+                "FIRST_DEVICE_POW_DIFFICULTY_BITS",
+                18,
+            ),
+            nonce_rate_limit: parse_env_with(&env, "NONCE_RATE_LIMIT", 10),
+            nonce_rate_window_secs: parse_env_with(&env, "NONCE_RATE_WINDOW_SECS", 60),
+            revoke_rate_limit: parse_env_with(&env, "REVOKE_RATE_LIMIT", 2),
+            revoke_rate_window_secs: parse_env_with(&env, "REVOKE_RATE_WINDOW_SECS", 3600),
+            ws_upgrade_rate_limit: parse_env_with(&env, "WS_UPGRADE_RATE_LIMIT", 20),
+            ws_upgrade_rate_window_secs: parse_env_with(&env, "WS_UPGRADE_RATE_WINDOW_SECS", 60),
+            trusted_proxy_cidrs: parse_string_list_env_with(
+                &env,
+                "TRUSTED_PROXY_CIDRS",
+                Vec::new(),
+            ),
+            signed_request_max_skew_secs: parse_env_with(&env, "SIGNED_REQUEST_MAX_SKEW_SECS", 60),
+            signed_request_nonce_window_secs: parse_env_with(
+                &env,
+                "SIGNED_REQUEST_NONCE_WINDOW_SECS",
+                120,
+            ),
+            snapshot_default_ttl_secs: parse_env_with(&env, "SNAPSHOT_DEFAULT_TTL_SECS", 86400),
+            revoked_tombstone_retention_secs: parse_env_with(
+                &env,
                 "REVOKED_TOMBSTONE_RETENTION_SECS",
                 2_592_000,
             ),
-            reader_pool_size: parse_env("READER_POOL_SIZE", 4),
-            node_exporter_url: std::env::var("NODE_EXPORTER_URL").ok().filter(|s| !s.is_empty()),
-            first_device_apple_attestation_enabled: parse_bool_env(
-                "FIRST_DEVICE_APPLE_ATTESTATION_ENABLED",
-                false,
-            ),
-            first_device_apple_attestation_trust_roots_pem: parse_json_vec_env(
-                "FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM",
-                Vec::new(),
-            ),
-            first_device_apple_attestation_allowed_app_ids: parse_json_vec_env(
+            reader_pool_size: parse_env_with(&env, "READER_POOL_SIZE", 4),
+            node_exporter_url: env("NODE_EXPORTER_URL").filter(|s| !s.is_empty()),
+            first_device_apple_attestation_enabled,
+            first_device_apple_attestation_trust_roots_pem,
+            first_device_apple_attestation_allowed_app_ids: parse_json_vec_env_with(
+                &env,
                 "FIRST_DEVICE_APPLE_ATTESTATION_ALLOWED_APP_IDS",
                 Vec::new(),
             ),
-            first_device_android_attestation_enabled: parse_bool_env(
-                "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED",
-                true,
-            ),
-            first_device_android_attestation_trust_roots_pem: parse_json_vec_env(
-                "FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM",
-                default_android_attestation_roots(),
-            ),
-            grapheneos_verified_boot_key_allowlist: parse_json_vec_env(
+            first_device_android_attestation_enabled,
+            first_device_android_attestation_trust_roots_pem,
+            grapheneos_verified_boot_key_allowlist: parse_json_vec_env_with(
+                &env,
                 "GRAPHENEOS_VERIFIED_BOOT_KEY_ALLOWLIST",
                 Vec::new(),
             ),
-            registration_token: std::env::var("REGISTRATION_TOKEN").ok().filter(|s| !s.is_empty()),
-            registration_enabled: parse_bool_env("REGISTRATION_ENABLED", true),
-            pairing_session_ttl_secs: parse_env("PAIRING_SESSION_TTL_SECS", 300),
-            pairing_session_rate_limit: parse_env("PAIRING_SESSION_RATE_LIMIT", 5),
-            pairing_session_max_payload_bytes: parse_env(
+            registration_token: env("REGISTRATION_TOKEN").filter(|s| !s.is_empty()),
+            registration_enabled: parse_bool_env_with(&env, "REGISTRATION_ENABLED", true),
+            pairing_session_ttl_secs: parse_env_with(&env, "PAIRING_SESSION_TTL_SECS", 300),
+            pairing_session_rate_limit: parse_env_with(&env, "PAIRING_SESSION_RATE_LIMIT", 5),
+            pairing_session_max_payload_bytes: parse_env_with(
+                &env,
                 "PAIRING_SESSION_MAX_PAYLOAD_BYTES",
                 262144, // 256 KB — PQ credential bundles with ML-DSA/ML-KEM/X-Wing keys
             ),
-            sharing_init_ttl_secs: parse_env("SHARING_INIT_TTL_SECS", 604800),
-            sharing_init_max_payload_bytes: parse_env("SHARING_INIT_MAX_PAYLOAD_BYTES", 65536),
-            sharing_identity_max_bytes: parse_env("SHARING_IDENTITY_MAX_BYTES", 8192),
-            sharing_prekey_max_bytes: parse_env("SHARING_PREKEY_MAX_BYTES", 4096),
-            sharing_fetch_rate_limit: parse_env("SHARING_FETCH_RATE_LIMIT", 20),
-            sharing_init_rate_limit: parse_env("SHARING_INIT_RATE_LIMIT", 10),
-            sharing_init_max_pending: parse_env("SHARING_INIT_MAX_PENDING", 50),
-            prekey_upload_max_age_secs: parse_env("PREKEY_UPLOAD_MAX_AGE_SECS", 604800),
-            prekey_serve_max_age_secs: parse_env("PREKEY_SERVE_MAX_AGE_SECS", 2_592_000),
-            prekey_max_future_skew_secs: parse_env("PREKEY_MAX_FUTURE_SKEW_SECS", 300),
-            min_signature_version: parse_env("MIN_SIGNATURE_VERSION", 3),
-            media_storage_path: std::env::var("MEDIA_STORAGE_PATH")
-                .unwrap_or_else(|_| "data/media".into()),
-            media_max_file_bytes: parse_env("MEDIA_MAX_FILE_BYTES", 10_485_760),
-            media_quota_bytes_per_group: parse_env("MEDIA_QUOTA_BYTES_PER_GROUP", 1_073_741_824),
-            media_retention_days: parse_env("MEDIA_RETENTION_DAYS", 90),
-            media_upload_rate_limit: parse_env("MEDIA_UPLOAD_RATE_LIMIT", 10),
-            media_upload_rate_window_secs: parse_env("MEDIA_UPLOAD_RATE_WINDOW_SECS", 60),
-            media_orphan_cleanup_secs: parse_env("MEDIA_ORPHAN_CLEANUP_SECS", 86400),
-            gif_provider_mode: parse_gif_provider_mode_env(
+            sharing_init_ttl_secs: parse_env_with(&env, "SHARING_INIT_TTL_SECS", 604800),
+            sharing_init_max_payload_bytes: parse_env_with(
+                &env,
+                "SHARING_INIT_MAX_PAYLOAD_BYTES",
+                65536,
+            ),
+            sharing_identity_max_bytes: parse_env_with(&env, "SHARING_IDENTITY_MAX_BYTES", 8192),
+            sharing_prekey_max_bytes: parse_env_with(&env, "SHARING_PREKEY_MAX_BYTES", 4096),
+            sharing_fetch_rate_limit: parse_env_with(&env, "SHARING_FETCH_RATE_LIMIT", 20),
+            sharing_init_rate_limit: parse_env_with(&env, "SHARING_INIT_RATE_LIMIT", 10),
+            sharing_init_max_pending: parse_env_with(&env, "SHARING_INIT_MAX_PENDING", 50),
+            prekey_upload_max_age_secs: parse_env_with(&env, "PREKEY_UPLOAD_MAX_AGE_SECS", 604800),
+            prekey_serve_max_age_secs: parse_env_with(&env, "PREKEY_SERVE_MAX_AGE_SECS", 2_592_000),
+            prekey_max_future_skew_secs: parse_env_with(&env, "PREKEY_MAX_FUTURE_SKEW_SECS", 300),
+            min_signature_version,
+            media_storage_path: env("MEDIA_STORAGE_PATH").unwrap_or_else(|| "data/media".into()),
+            media_max_file_bytes: parse_env_with(&env, "MEDIA_MAX_FILE_BYTES", 10_485_760),
+            media_quota_bytes_per_group: parse_env_with(
+                &env,
+                "MEDIA_QUOTA_BYTES_PER_GROUP",
+                1_073_741_824,
+            ),
+            media_retention_days: parse_env_with(&env, "MEDIA_RETENTION_DAYS", 90),
+            media_upload_rate_limit: parse_env_with(&env, "MEDIA_UPLOAD_RATE_LIMIT", 10),
+            media_upload_rate_window_secs: parse_env_with(
+                &env,
+                "MEDIA_UPLOAD_RATE_WINDOW_SECS",
+                60,
+            ),
+            media_orphan_cleanup_secs: parse_env_with(&env, "MEDIA_ORPHAN_CLEANUP_SECS", 86400),
+            gif_provider_mode: parse_gif_provider_mode_env_with(
+                &env,
                 "GIF_PROVIDER_MODE",
                 GifProviderMode::Disabled,
             ),
-            gif_public_base_url: std::env::var("GIF_PUBLIC_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-            gif_prism_base_url: std::env::var("GIF_PRISM_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-            gif_api_base_url: std::env::var("GIF_API_BASE_URL")
-                .ok()
+            gif_public_base_url: env("GIF_PUBLIC_BASE_URL").filter(|s| !s.trim().is_empty()),
+            gif_prism_base_url: env("GIF_PRISM_BASE_URL").filter(|s| !s.trim().is_empty()),
+            gif_api_base_url: env("GIF_API_BASE_URL")
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "https://api.klipy.com".into()),
-            gif_api_key: std::env::var("GIF_API_KEY").ok().filter(|s| !s.trim().is_empty()),
-            gif_http_timeout_secs: parse_env("GIF_HTTP_TIMEOUT_SECS", 15),
-            gif_request_rate_limit: parse_env("GIF_REQUEST_RATE_LIMIT", 20),
-            gif_request_rate_window_secs: parse_env("GIF_REQUEST_RATE_WINDOW_SECS", 60),
-            gif_query_max_len: parse_env("GIF_QUERY_MAX_LEN", 200),
-        }
+            gif_api_key: env("GIF_API_KEY").filter(|s| !s.trim().is_empty()),
+            gif_http_timeout_secs: parse_env_with(&env, "GIF_HTTP_TIMEOUT_SECS", 15),
+            gif_request_rate_limit: parse_env_with(&env, "GIF_REQUEST_RATE_LIMIT", 20),
+            gif_request_rate_window_secs: parse_env_with(&env, "GIF_REQUEST_RATE_WINDOW_SECS", 60),
+            gif_query_max_len: parse_env_with(&env, "GIF_QUERY_MAX_LEN", 200),
+        })
     }
 
     /// Maximum first-device nonce requests permitted per window.
@@ -313,7 +398,7 @@ impl Config {
     /// Resolve the registration token using the priority chain:
     /// 1. `REGISTRATION_TOKEN` env var — if "OPEN", clears the token (open mode)
     /// 2. `{db_dir}/.registration-token` file
-    /// 3. Generate a random token, write it to the file, log it
+    /// 3. Generate a random token, write it to the file, log the file path
     pub fn resolve_registration_token(&mut self) {
         // If env var was set, it's already in self.registration_token from from_env().
         if let Some(ref token) = self.registration_token {
@@ -351,7 +436,7 @@ impl Config {
         if let Some(parent) = token_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::write(&token_path, &token) {
+        match write_registration_token_file(&token_path, &token) {
             Ok(()) => {
                 tracing::info!(
                     path = %token_path.display(),
@@ -367,28 +452,45 @@ impl Config {
             }
         }
         tracing::warn!(
-            "\n\n\
-             ╔══════════════════════════════════════════════════════════════╗\n\
-             ║  AUTO-GENERATED REGISTRATION TOKEN                         ║\n\
-             ║                                                            ║\n\
-             ║  {token:<52}  ║\n\
-             ║                                                            ║\n\
-             ║  Enter this token in the Prism app when connecting.        ║\n\
-             ║  To use your own token, set the REGISTRATION_TOKEN         ║\n\
-             ║  environment variable.                                     ║\n\
-             ╚══════════════════════════════════════════════════════════════╝\n"
+            path = %token_path.display(),
+            "{}",
+            GENERATED_REGISTRATION_TOKEN_LOG_MESSAGE
         );
         self.registration_token = Some(token);
     }
+}
+
+fn parse_min_signature_version_env<F>(env: &F, key: &str, default: u8) -> Result<u8, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let configured = parse_env_with(env, key, default);
+    if configured < MIN_SIGNATURE_VERSION_SOURCE_FLOOR {
+        return Err(ConfigError::MinSignatureVersionBelowSourceFloor {
+            configured,
+            floor: MIN_SIGNATURE_VERSION_SOURCE_FLOOR,
+        });
+    }
+    Ok(configured)
+}
+
+fn parse_env_with<T, F>(env: &F, key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+    F: Fn(&str) -> Option<String>,
+{
+    env(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn parse_bool_env(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
+fn parse_bool_env_with<F>(env: &F, key: &str, default: bool) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env(key)
         .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Some(true),
             "0" | "false" | "no" | "off" => Some(false),
@@ -397,16 +499,44 @@ fn parse_bool_env(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn parse_json_vec_env(key: &str, default: Vec<String>) -> Vec<String> {
-    std::env::var(key)
-        .ok()
+fn parse_json_vec_env_with<F>(env: &F, key: &str, default: Vec<String>) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env(key)
         .filter(|value| !value.trim().is_empty())
         .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
         .unwrap_or(default)
 }
 
-fn parse_gif_provider_mode_env(key: &str, default: GifProviderMode) -> GifProviderMode {
-    std::env::var(key).ok().as_deref().and_then(GifProviderMode::parse).unwrap_or(default)
+fn parse_string_list_env_with<F>(env: &F, key: &str, default: Vec<String>) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env(key)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            serde_json::from_str::<Vec<String>>(&value).unwrap_or_else(|_| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+        })
+        .unwrap_or(default)
+}
+
+fn parse_gif_provider_mode_env_with<F>(
+    env: &F,
+    key: &str,
+    default: GifProviderMode,
+) -> GifProviderMode
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env(key).as_deref().and_then(GifProviderMode::parse).unwrap_or(default)
 }
 
 fn generate_random_token() -> String {
@@ -416,9 +546,160 @@ fn generate_random_token() -> String {
     hex::encode(bytes)
 }
 
+fn write_registration_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    file.write_all(token.as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
+}
+
 fn default_android_attestation_roots() -> Vec<String> {
     vec![
         include_str!("android_attestation_roots/root_rsa.pem").to_string(),
         include_str!("android_attestation_roots/root_p384.pem").to_string(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_from_env_pairs(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        Config::from_env_values(|key| {
+            pairs
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == key).then(|| (*value).to_string()))
+        })
+    }
+
+    fn default_test_config(db_path: &std::path::Path) -> Config {
+        let mut config = config_from_env_pairs(&[]).unwrap();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        config
+    }
+
+    #[test]
+    fn rejects_env_min_signature_version_below_source_floor() {
+        let low_floor = (MIN_SIGNATURE_VERSION_SOURCE_FLOOR - 1).to_string();
+        let err =
+            config_from_env_pairs(&[("MIN_SIGNATURE_VERSION", low_floor.as_str())]).unwrap_err();
+
+        assert_eq!(
+            err,
+            ConfigError::MinSignatureVersionBelowSourceFloor {
+                configured: MIN_SIGNATURE_VERSION_SOURCE_FLOOR - 1,
+                floor: MIN_SIGNATURE_VERSION_SOURCE_FLOOR,
+            }
+        );
+    }
+
+    #[test]
+    fn default_min_signature_version_uses_source_floor() {
+        let config = config_from_env_pairs(&[]).unwrap();
+
+        assert_eq!(config.min_signature_version, MIN_SIGNATURE_VERSION_SOURCE_FLOOR);
+    }
+
+    #[test]
+    fn rejects_apple_attestation_enabled_without_trust_roots() {
+        let err = config_from_env_pairs(&[("FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", "true")])
+            .unwrap_err();
+
+        assert_eq!(err, ConfigError::AppleAttestationEnabledWithoutTrustRoots);
+    }
+
+    #[test]
+    fn accepts_apple_attestation_enabled_with_trust_roots() {
+        let config = config_from_env_pairs(&[
+            ("FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", "true"),
+            ("FIRST_DEVICE_APPLE_ATTESTATION_TRUST_ROOTS_PEM", r#"["test-root"]"#),
+        ])
+        .unwrap();
+
+        assert!(config.first_device_apple_attestation_enabled);
+        assert_eq!(config.first_device_apple_attestation_trust_roots_pem, vec!["test-root"]);
+    }
+
+    #[test]
+    fn rejects_android_attestation_enabled_without_trust_roots() {
+        let err =
+            config_from_env_pairs(&[("FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM", "[]")])
+                .unwrap_err();
+
+        assert_eq!(err, ConfigError::AndroidAttestationEnabledWithoutTrustRoots);
+    }
+
+    #[test]
+    fn accepts_android_attestation_disabled_without_trust_roots() {
+        let config = config_from_env_pairs(&[
+            ("FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED", "false"),
+            ("FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM", "[]"),
+        ])
+        .unwrap();
+
+        assert!(!config.first_device_android_attestation_enabled);
+        assert!(config.first_device_android_attestation_trust_roots_pem.is_empty());
+    }
+
+    #[test]
+    fn default_android_attestation_enabled_uses_default_trust_roots() {
+        let config = config_from_env_pairs(&[]).unwrap();
+
+        assert!(config.first_device_android_attestation_enabled);
+        assert!(!config.first_device_android_attestation_trust_roots_pem.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_registration_token_file_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("relay.db");
+        let mut config = default_test_config(&db_path);
+
+        config.resolve_registration_token();
+
+        let token_path = tmp.path().join(".registration-token");
+        let mode = std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let token = config.registration_token.as_deref().unwrap();
+        let token_file = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(token_file, token);
+    }
+
+    #[test]
+    fn generated_registration_token_log_message_does_not_contain_full_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("relay.db");
+        let mut config = default_test_config(&db_path);
+        config.resolve_registration_token();
+
+        let token = config.registration_token.as_deref().unwrap();
+
+        assert!(
+            !GENERATED_REGISTRATION_TOKEN_LOG_MESSAGE.contains(token),
+            "generated-token log message leaked token"
+        );
+        assert!(GENERATED_REGISTRATION_TOKEN_LOG_MESSAGE
+            .contains("the full token is not printed in logs"));
+    }
 }

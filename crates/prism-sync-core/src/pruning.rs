@@ -70,21 +70,24 @@ impl TombstonePruner {
             }
         }
 
-        // Phase 1b: Batch-delete field_versions in a single transaction
+        // Phase 1b: Batch-delete non-tombstone field_versions in a single
+        // transaction. Preserve `is_deleted = true` so stale pre-delete ops
+        // cannot resurrect a hard-deleted entity after pruning.
         if !deleted_tombstones.is_empty() {
             let storage_clone = storage.clone();
             let sid = sync_id.to_string();
-            let count = deleted_tombstones.len();
-            tokio::task::spawn_blocking(move || {
+            let pruned = tokio::task::spawn_blocking(move || {
                 let mut tx = storage_clone.begin_tx()?;
+                let mut pruned = 0usize;
                 for (tbl, eid) in &deleted_tombstones {
-                    tx.delete_field_versions_for_entity(&sid, tbl, eid)?;
+                    pruned += tx.delete_non_tombstone_field_versions_for_entity(&sid, tbl, eid)?;
                 }
-                tx.commit()
+                tx.commit()?;
+                Ok::<_, crate::error::CoreError>(pruned)
             })
             .await
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
-            result.field_versions_pruned = count;
+            result.field_versions_pruned = pruned;
         }
 
         // Phase 2: Prune old applied_ops (server_seq < min_acked_seq, up to max_rows).

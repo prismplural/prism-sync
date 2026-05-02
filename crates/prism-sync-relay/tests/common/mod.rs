@@ -9,12 +9,14 @@ use rand::RngCore;
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use prism_sync_core::{
-    pairing::models::{RegistrySnapshotEntry, SignedRegistrySnapshot},
+    pairing::models::{compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot},
     relay::traits::RegistryApproval,
 };
-use prism_sync_crypto::DeviceSecret;
+use prism_sync_crypto::pq::hybrid_signature_contexts;
+use prism_sync_crypto::{DeviceSecret, KeyHierarchy};
 use prism_sync_relay::{
     config::Config,
     db::{self, Database},
@@ -22,10 +24,8 @@ use prism_sync_relay::{
     state::AppState,
 };
 
-/// Start the relay server in-process on a random port with an in-memory DB.
-/// Returns `(base_url, server_handle, db)`.
-pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
-    let config = Config {
+pub fn test_config() -> Config {
+    Config {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
@@ -41,6 +41,9 @@ pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sy
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 100,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -89,15 +92,24 @@ pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sy
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
-    };
+    }
+}
 
+/// Start the relay server in-process on a random port with an in-memory DB.
+/// Returns `(base_url, server_handle, db)`.
+pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
+    let config = test_config();
     start_test_relay_with_config(config).await
 }
 
 pub async fn start_test_relay_with_config(
     config: Config,
 ) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
-    let db = Database::in_memory().expect("in-memory db");
+    let db = if config.db_path == ":memory:" {
+        Database::in_memory().expect("in-memory db")
+    } else {
+        Database::open(&config.db_path, config.reader_pool_size).expect("test db")
+    };
     let state = AppState::new(db, config);
     let db = state.db.clone();
     let app = routes::router(state);
@@ -164,9 +176,11 @@ pub fn sign_hybrid_challenge(
     write_len_prefixed(&mut data, device_id.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"device_challenge", &data)
-            .expect("hardcoded device challenge context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::DEVICE_CHALLENGE,
+        &data,
+    )
+    .expect("hardcoded device challenge context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -220,9 +234,11 @@ pub fn apply_signed_headers_hybrid(
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
         method, path, sync_id, device_id, body, &timestamp, &nonce,
     );
-    let m_prime =
-        prism_sync_crypto::pq::build_hybrid_message_representative(b"http_request", &signing_data)
-            .expect("hardcoded http request context should be <= 255 bytes");
+    let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+        hybrid_signature_contexts::HTTP_REQUEST,
+        &signing_data,
+    )
+    .expect("hardcoded http request context should be <= 255 bytes");
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature {
         ed25519_sig: ed25519_key.sign(&m_prime).to_bytes().to_vec(),
         ml_dsa_65_sig: ml_dsa_key.sign(&m_prime),
@@ -495,7 +511,12 @@ pub fn build_signed_registry_snapshot_hybrid_versioned(
     ml_dsa_key: &prism_sync_crypto::DevicePqSigningKey,
     registry_version: i64,
 ) -> Vec<u8> {
-    let snapshot = SignedRegistrySnapshot::new(entries, registry_version);
+    let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+        entries,
+        registry_version,
+        0,
+        test_epoch_key_hashes(),
+    );
     let canonical_json_v3 = snapshot.canonical_json_v3();
 
     let mut signing_data =
@@ -504,7 +525,7 @@ pub fn build_signed_registry_snapshot_hybrid_versioned(
     signing_data.extend_from_slice(&canonical_json_v3);
 
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"registry_snapshot",
+        hybrid_signature_contexts::REGISTRY_SNAPSHOT,
         &signing_data,
     )
     .expect("hardcoded registry snapshot context should be <= 255 bytes");
@@ -518,6 +539,18 @@ pub fn build_signed_registry_snapshot_hybrid_versioned(
     wire.extend_from_slice(&sig_bytes);
     wire.extend_from_slice(&canonical_json_v3);
     wire
+}
+
+fn test_epoch_key_hashes() -> BTreeMap<u32, [u8; 32]> {
+    let mut key_hierarchy = KeyHierarchy::new();
+    key_hierarchy.initialize("test-password", &[0u8; 16]).unwrap();
+    let epoch_0_key: [u8; 32] = key_hierarchy
+        .epoch_key(0)
+        .expect("test key hierarchy should have epoch 0")
+        .try_into()
+        .expect("epoch 0 key should be 32 bytes");
+
+    BTreeMap::from([(0, compute_epoch_key_hash(&epoch_0_key))])
 }
 
 /// Deterministic hash for a signed registry snapshot wire payload.
@@ -562,7 +595,7 @@ pub fn build_registry_approval_hybrid(
     write_len_prefixed(&mut approval_data, &signed_registry_snapshot);
 
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"registry_approval",
+        hybrid_signature_contexts::REGISTRY_APPROVAL,
         &approval_data,
     )
     .expect("hardcoded registry approval context should be <= 255 bytes");

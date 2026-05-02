@@ -3,6 +3,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CoreError, Result};
 
+/// Maximum accepted HLC node id length in bytes.
+///
+/// Local node ids are documented as 12-char hex strings. This bound is
+/// intentionally more generous to avoid rejecting legacy/test ids while still
+/// preventing unbounded remote input from amplifying storage and comparisons.
+pub const MAX_NODE_ID_LEN: usize = 64;
+
 /// Hybrid Logical Clock for CRDT sync.
 ///
 /// Format: `timestamp:counter:nodeId`
@@ -16,6 +23,12 @@ pub struct Hlc {
     pub timestamp: i64,
     pub counter: u32,
     pub node_id: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum HlcOverflowError {
+    #[error("HLC counter overflow while advancing timestamp {timestamp} for node {node_id}")]
+    Counter { timestamp: i64, node_id: String },
 }
 
 impl Hlc {
@@ -48,16 +61,27 @@ impl Hlc {
         let timestamp = parts[0]
             .parse::<i64>()
             .map_err(|e| CoreError::HlcParse(format!("Invalid timestamp '{}': {e}", parts[0])))?;
+        if timestamp < 0 {
+            return Err(CoreError::HlcParse(format!("Invalid timestamp '{}': negative", parts[0])));
+        }
+
         let counter = parts[1]
             .parse::<u32>()
             .map_err(|e| CoreError::HlcParse(format!("Invalid counter '{}': {e}", parts[1])))?;
+
+        if parts[2].len() > MAX_NODE_ID_LEN {
+            return Err(CoreError::HlcParse(format!(
+                "Invalid node_id length {} (max {MAX_NODE_ID_LEN})",
+                parts[2].len()
+            )));
+        }
         let node_id = parts[2].to_string();
 
         Ok(Self { timestamp, counter, node_id })
     }
 
     /// Get current wall-clock time in milliseconds since Unix epoch.
-    fn now_ms() -> i64 {
+    pub(crate) fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before Unix epoch")
@@ -69,18 +93,27 @@ impl Hlc {
     /// If `last_known` is provided and its timestamp >= wall clock,
     /// the counter is incremented instead of resetting to 0.
     pub fn now(node_id: &str, last_known: Option<&Hlc>) -> Self {
+        Self::try_now(node_id, last_known).expect("HLC counter overflow")
+    }
+
+    /// Checked variant of `now` that returns a typed error instead of
+    /// panicking or wrapping when the same-timestamp counter is exhausted.
+    pub fn try_now(
+        node_id: &str,
+        last_known: Option<&Hlc>,
+    ) -> std::result::Result<Self, HlcOverflowError> {
         let now = Self::now_ms();
 
         match last_known {
-            None => Self { timestamp: now, counter: 0, node_id: node_id.to_string() },
+            None => Ok(Self { timestamp: now, counter: 0, node_id: node_id.to_string() }),
             Some(last) if now > last.timestamp => {
-                Self { timestamp: now, counter: 0, node_id: node_id.to_string() }
+                Ok(Self { timestamp: now, counter: 0, node_id: node_id.to_string() })
             }
-            Some(last) => Self {
+            Some(last) => Ok(Self {
                 timestamp: last.timestamp,
-                counter: last.counter + 1,
+                counter: increment_counter(last.counter, last.timestamp, node_id)?,
                 node_id: node_id.to_string(),
-            },
+            }),
         }
     }
 
@@ -98,20 +131,30 @@ impl Hlc {
     /// 5. Else (max_ts == now, wall clock advanced):
     ///    counter = 0
     pub fn merge(&self, remote: &Hlc, local_node_id: &str) -> Self {
+        self.try_merge(remote, local_node_id).expect("HLC counter overflow")
+    }
+
+    /// Checked variant of `merge` that returns a typed error instead of
+    /// panicking or wrapping when the resulting counter is exhausted.
+    pub fn try_merge(
+        &self,
+        remote: &Hlc,
+        local_node_id: &str,
+    ) -> std::result::Result<Self, HlcOverflowError> {
         let now = Self::now_ms();
         let max_ts = now.max(self.timestamp).max(remote.timestamp);
 
         let new_counter = if max_ts == self.timestamp && max_ts == remote.timestamp {
-            self.counter.max(remote.counter) + 1
+            increment_counter(self.counter.max(remote.counter), max_ts, local_node_id)?
         } else if max_ts == self.timestamp {
-            self.counter + 1
+            increment_counter(self.counter, max_ts, local_node_id)?
         } else if max_ts == remote.timestamp {
-            remote.counter + 1
+            increment_counter(remote.counter, max_ts, local_node_id)?
         } else {
             0
         };
 
-        Self { timestamp: max_ts, counter: new_counter, node_id: local_node_id.to_string() }
+        Ok(Self { timestamp: max_ts, counter: new_counter, node_id: local_node_id.to_string() })
     }
 
     /// Parse a slice of HLC strings and return the max per `Hlc::Ord`.
@@ -141,9 +184,30 @@ impl Hlc {
     /// Only rejects timestamps from the FUTURE beyond the tolerance.
     /// Past timestamps are always accepted — old data is normal in a CRDT.
     pub fn is_drift_exceeded(&self, max_drift_ms: i64) -> bool {
-        let now = Self::now_ms();
-        self.timestamp - now > max_drift_ms
+        self.future_drift_ms() > max_drift_ms.max(0)
     }
+
+    /// Return how far this HLC is ahead of local wall-clock time.
+    ///
+    /// Past or current timestamps return 0.
+    pub fn future_drift_ms(&self) -> i64 {
+        self.timestamp.saturating_sub(Self::now_ms()).max(0)
+    }
+
+    /// Return true when this HLC is ahead of local wall-clock time.
+    pub fn is_future(&self) -> bool {
+        self.future_drift_ms() > 0
+    }
+}
+
+fn increment_counter(
+    counter: u32,
+    timestamp: i64,
+    node_id: &str,
+) -> std::result::Result<u32, HlcOverflowError> {
+    counter
+        .checked_add(1)
+        .ok_or_else(|| HlcOverflowError::Counter { timestamp, node_id: node_id.to_string() })
 }
 
 impl Ord for Hlc {
@@ -203,8 +267,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_negative_timestamp() {
+        assert!(Hlc::from_string("-1:0:node").is_err());
+    }
+
+    #[test]
     fn parse_invalid_counter() {
         assert!(Hlc::from_string("1000:notanumber:node").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_overlong_node_id() {
+        let overlong = "a".repeat(MAX_NODE_ID_LEN + 1);
+        assert!(Hlc::from_string(&format!("1000:0:{overlong}")).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_max_length_node_id() {
+        let max_node = "a".repeat(MAX_NODE_ID_LEN);
+        let hlc = Hlc::from_string(&format!("1000:0:{max_node}")).unwrap();
+        assert_eq!(hlc.node_id, max_node);
     }
 
     #[test]
@@ -241,6 +323,17 @@ mod tests {
     }
 
     #[test]
+    fn try_now_errors_when_counter_overflows() {
+        let future_ts = Hlc::now_ms() + 100_000;
+        let last = Hlc::new(future_ts, u32::MAX, "testnode");
+        let err = Hlc::try_now("testnode", Some(&last)).unwrap_err();
+        assert_eq!(
+            err,
+            HlcOverflowError::Counter { timestamp: future_ts, node_id: "testnode".to_string() }
+        );
+    }
+
+    #[test]
     fn now_resets_counter_when_clock_advances() {
         // Create a "last known" HLC in the distant past
         let last = Hlc::new(1000, 99, "testnode");
@@ -271,6 +364,18 @@ mod tests {
         assert_eq!(merged.timestamp, future_ts);
         assert_eq!(merged.counter, 8); // max(3, 7) + 1
         assert_eq!(merged.node_id, "local");
+    }
+
+    #[test]
+    fn try_merge_errors_when_counter_overflows() {
+        let future_ts = Hlc::now_ms() + 100_000;
+        let local = Hlc::new(future_ts, u32::MAX, "local");
+        let remote = Hlc::new(future_ts, 7, "remote");
+        let err = local.try_merge(&remote, "local").unwrap_err();
+        assert_eq!(
+            err,
+            HlcOverflowError::Counter { timestamp: future_ts, node_id: "local".to_string() }
+        );
     }
 
     #[test]
@@ -365,10 +470,7 @@ mod tests {
         // Regression for the `:9` vs `:10` bug: a SQL MAX would return
         // `1700000000:9:nodeA` (because `'9' > '1'` lexicographically).
         // parse_many_and_max must return the true HLC max.
-        let values = vec![
-            "1700000000:9:nodeA".to_string(),
-            "1700000000:10:nodeA".to_string(),
-        ];
+        let values = vec!["1700000000:9:nodeA".to_string(), "1700000000:10:nodeA".to_string()];
         let max = Hlc::parse_many_and_max(&values).unwrap().expect("non-empty input");
         assert_eq!(max.counter, 10);
         assert_eq!(max.timestamp, 1700000000);
@@ -383,10 +485,7 @@ mod tests {
 
     #[test]
     fn parse_many_and_max_prefers_higher_timestamp() {
-        let values = vec![
-            "1700000000:99:nodeA".to_string(),
-            "1700000001:0:nodeA".to_string(),
-        ];
+        let values = vec!["1700000000:99:nodeA".to_string(), "1700000001:0:nodeA".to_string()];
         let max = Hlc::parse_many_and_max(&values).unwrap().unwrap();
         assert_eq!(max.timestamp, 1700000001);
         assert_eq!(max.counter, 0);
@@ -394,10 +493,7 @@ mod tests {
 
     #[test]
     fn parse_many_and_max_breaks_ties_by_node_id() {
-        let values = vec![
-            "1700000000:5:aaa".to_string(),
-            "1700000000:5:zzz".to_string(),
-        ];
+        let values = vec!["1700000000:5:aaa".to_string(), "1700000000:5:zzz".to_string()];
         let max = Hlc::parse_many_and_max(&values).unwrap().unwrap();
         assert_eq!(max.node_id, "zzz");
     }

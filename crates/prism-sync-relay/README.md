@@ -28,24 +28,24 @@ All configuration via environment variables:
 ## API Endpoints
 
 ### Registration
-- `GET /v2/sync/{sync_id}/register-nonce` — Get one-time registration nonce
-- `POST /v2/sync/{sync_id}/register` — Register device (challenge-response)
+- `GET /v1/sync/{sync_id}/register-nonce` — Get one-time registration nonce
+- `POST /v1/sync/{sync_id}/register` — Register device (challenge-response)
 
 ### Sync
-- `PUT /v2/sync/{sync_id}/changes` — Push signed batch envelope
-- `GET /v2/sync/{sync_id}/changes?since=N&limit=100` — Pull batches (paginated)
-- `GET /v2/sync/{sync_id}/snapshot` — Download snapshot
-- `PUT /v2/sync/{sync_id}/snapshot` — Upload snapshot
+- `PUT /v1/sync/{sync_id}/changes` — Push signed batch envelope
+- `GET /v1/sync/{sync_id}/changes?since=N&limit=100` — Pull batches (paginated)
+- `GET /v1/sync/{sync_id}/snapshot` — Download snapshot
+- `PUT /v1/sync/{sync_id}/snapshot` — Upload snapshot
 
 ### Devices
-- `GET /v2/sync/{sync_id}/devices` — List devices with public keys
-- `DELETE /v2/sync/{sync_id}/devices/{device_id}` — Revoke or deregister
-- `POST /v2/sync/{sync_id}/rekey` — Post epoch rotation artifacts
-- `GET /v2/sync/{sync_id}/rekey/{device_id}` — Get wrapped epoch key
-- `POST /v2/sync/{sync_id}/ack` — Acknowledge receipt
+- `GET /v1/sync/{sync_id}/devices` — List devices with public keys
+- `DELETE /v1/sync/{sync_id}/devices/{device_id}` — Revoke or deregister
+- `POST /v1/sync/{sync_id}/rekey` — Post epoch rotation artifacts
+- `GET /v1/sync/{sync_id}/rekey/{device_id}` — Get wrapped epoch key
+- `POST /v1/sync/{sync_id}/ack` — Acknowledge receipt
 
 ### WebSocket
-- `GET /v2/sync/{sync_id}/ws` — WebSocket (message-based auth after connect)
+- `GET /v1/sync/{sync_id}/ws` — WebSocket (authenticated before upgrade)
 
 ### Operations
 - `GET /health` — Health check
@@ -53,4 +53,4 @@ All configuration via environment variables:
 
 ## Security
 
-The relay is zero-knowledge — it stores encrypted blobs and never reads plaintext data. Authentication uses per-device session tokens issued via Ed25519 challenge-response.
+The relay only sees ciphertext — it stores encrypted blobs and never reads plaintext data. Authentication uses per-device session tokens issued via Ed25519 challenge-response.

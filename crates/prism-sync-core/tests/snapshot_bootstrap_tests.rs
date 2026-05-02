@@ -20,7 +20,7 @@ use ed25519_dalek::SigningKey;
 
 use prism_sync_core::batch_signature;
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
-use prism_sync_core::relay::traits::{SignedBatchEnvelope, SnapshotExchange, SyncRelay};
+use prism_sync_core::relay::traits::{SignedBatchEnvelope, SnapshotExchange};
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
@@ -907,6 +907,80 @@ async fn test_bootstrap_rejects_aad_mismatch() {
     let result = engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await;
 
     assert!(result.is_err(), "bootstrap with mismatched server_seq_at (AAD mismatch) should fail");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("decrypt")
+            || err_msg.contains("Decrypt")
+            || err_msg.contains("crypto")
+            || err_msg.contains("aead"),
+        "error should mention decryption failure, got: {err_msg}"
+    );
+}
+
+/// Re-sign the same snapshot ciphertext under a different signed batch ID.
+/// Signature verification should pass, but decryption must fail because the
+/// snapshot AAD now includes the signed batch ID.
+#[tokio::test]
+async fn test_bootstrap_rejects_snapshot_batch_id_aad_mismatch() {
+    let (relay, key_hierarchy, _sk_a, sk_b, _ml_a, ml_b, _storage_b) =
+        push_and_create_snapshot(vec![("task-1", "AAD batch task", false, "batch-1")]).await;
+
+    let snapshot = relay.get_snapshot().await.unwrap().unwrap();
+    let envelope: SignedBatchEnvelope =
+        serde_json::from_slice(&snapshot.data).expect("deserialize envelope");
+
+    let rebound_envelope = batch_signature::sign_batch(
+        &sk_b,
+        &ml_b,
+        &envelope.sync_id,
+        envelope.epoch,
+        "snapshot-rebound-batch-id",
+        &envelope.batch_kind,
+        &envelope.sender_device_id,
+        envelope.sender_ml_dsa_key_generation,
+        &envelope.payload_hash,
+        envelope.nonce,
+        envelope.ciphertext.clone(),
+    )
+    .expect("re-sign envelope with different batch id");
+
+    relay
+        .put_snapshot(
+            snapshot.epoch,
+            snapshot.server_seq_at,
+            serde_json::to_vec(&rebound_envelope).expect("serialize rebound envelope"),
+            None,
+            None,
+            snapshot.sender_device_id.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let key_hierarchy_c = shared_key_hierarchy(&key_hierarchy);
+    let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+    setup_sync_metadata(&storage_c, "device-ccc");
+
+    register_device_with_pq(
+        &relay,
+        &storage_c,
+        &snapshot.sender_device_id,
+        &sk_b.verifying_key(),
+        &ml_b.public_key_bytes(),
+    );
+
+    let engine_c = SyncEngine::new(
+        storage_c,
+        relay.clone(),
+        vec![entity_c],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await;
+
+    assert!(result.is_err(), "bootstrap with mismatched snapshot batch_id AAD should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("decrypt")

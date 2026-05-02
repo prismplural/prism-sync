@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use tracing::warn;
 
 use super::error::StorageError;
@@ -11,6 +11,7 @@ use super::snapshot_format::*;
 use super::traits::*;
 use super::types::*;
 use crate::error::{CoreError, Result};
+use crate::hlc::Hlc;
 
 // ── Row-mapping helpers ──
 
@@ -92,6 +93,24 @@ fn row_to_field_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<FieldVersio
         winning_hlc: row.get("winning_hlc")?,
         winning_encoded_value: row.get("winning_encoded_value")?,
         updated_at: DateTime::parse_from_rfc3339(&updated_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+fn row_to_quarantined_op(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuarantinedOp> {
+    let quarantined_at: String = row.get("quarantined_at")?;
+    let op_json: String = row.get("op_json")?;
+    let op = serde_json::from_str(&op_json)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?;
+
+    Ok(QuarantinedOp {
+        sync_id: row.get("sync_id")?,
+        op_id: row.get("op_id")?,
+        op,
+        reason: row.get("reason")?,
+        server_seq: row.get("server_seq")?,
+        quarantined_at: DateTime::parse_from_rfc3339(&quarantined_at)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
     })
@@ -181,6 +200,20 @@ fn query_field_version(
     )
     .optional()
     .map_err(CoreError::from)
+}
+
+fn query_quarantined_ops(conn: &Connection, sync_id: &str) -> Result<Vec<QuarantinedOp>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM quarantined_ops \
+         WHERE sync_id = ?1 \
+         ORDER BY server_seq ASC, quarantined_at ASC, op_id ASC",
+    )?;
+    let rows = stmt.query_map(params![sync_id], row_to_quarantined_op)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn query_device_record(
@@ -358,10 +391,11 @@ fn exec_mark_batch_pushed(conn: &Connection, batch_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn exec_delete_pushed_ops(conn: &Connection, sync_id: &str) -> Result<()> {
+fn exec_delete_pushed_ops(conn: &Connection, sync_id: &str, batch_id: &str) -> Result<()> {
     conn.execute(
-        "DELETE FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NOT NULL",
-        params![sync_id],
+        "DELETE FROM pending_ops \
+         WHERE sync_id = ?1 AND local_batch_id = ?2 AND pushed_at IS NOT NULL",
+        params![sync_id, batch_id],
     )?;
     Ok(())
 }
@@ -405,6 +439,35 @@ fn exec_upsert_field_version(conn: &Connection, fv: &FieldVersion) -> Result<()>
     Ok(())
 }
 
+fn exec_insert_quarantined_op(conn: &Connection, op: &QuarantinedOp) -> Result<()> {
+    let op_json = serde_json::to_string(&op.op)
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO quarantined_ops \
+         (sync_id, op_id, server_seq, entity_table, field_name, reason, op_json, quarantined_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            op.sync_id,
+            op.op_id,
+            op.server_seq,
+            op.op.entity_table,
+            op.op.field_name,
+            op.reason,
+            op_json,
+            op.quarantined_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_delete_quarantined_op(conn: &Connection, sync_id: &str, op_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM quarantined_ops WHERE sync_id = ?1 AND op_id = ?2",
+        params![sync_id, op_id],
+    )?;
+    Ok(())
+}
+
 fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO device_registry \
@@ -441,6 +504,7 @@ fn exec_clear_sync_state(conn: &Connection, sync_id: &str) -> Result<()> {
     conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM applied_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM field_versions WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM quarantined_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM device_registry WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM sync_metadata WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
@@ -478,9 +542,25 @@ fn exec_delete_field_versions_for_entity(
     Ok(())
 }
 
+fn exec_delete_non_tombstone_field_versions_for_entity(
+    conn: &Connection,
+    sync_id: &str,
+    table: &str,
+    entity_id: &str,
+) -> Result<usize> {
+    let affected = conn.execute(
+        "DELETE FROM field_versions \
+         WHERE sync_id = ?1 \
+           AND entity_table = ?2 \
+           AND entity_id = ?3 \
+           AND field_name <> 'is_deleted'",
+        params![sync_id, table, entity_id],
+    )?;
+    Ok(affected)
+}
+
 fn query_list_all_field_version_hlcs(conn: &Connection, sync_id: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT winning_hlc FROM field_versions WHERE sync_id = ?1")?;
+    let mut stmt = conn.prepare("SELECT winning_hlc FROM field_versions WHERE sync_id = ?1")?;
     let rows = stmt.query_map(params![sync_id], |row| row.get::<_, String>(0))?;
     let mut result = Vec::new();
     for r in rows {
@@ -490,8 +570,7 @@ fn query_list_all_field_version_hlcs(conn: &Connection, sync_id: &str) -> Result
 }
 
 fn exec_delete_all_pending_ops(conn: &Connection, sync_id: &str) -> Result<usize> {
-    let affected =
-        conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
+    let affected = conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
     Ok(affected)
 }
 
@@ -609,6 +688,42 @@ fn query_export_snapshot(conn: &Connection, sync_id: &str) -> Result<Vec<u8>> {
     Ok(compressed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotFieldImportDecision {
+    InsertOrUpdate,
+    KeepExistingEqual,
+    SkipStale,
+}
+
+fn snapshot_field_import_decision(
+    conn: &Connection,
+    sync_id: &str,
+    fv: &FieldVersionEntry,
+) -> Result<SnapshotFieldImportDecision> {
+    let snapshot_hlc = Hlc::from_string(&fv.winning_hlc)?;
+    let existing_hlc: Option<String> = conn
+        .query_row(
+            "SELECT winning_hlc FROM field_versions \
+             WHERE sync_id = ?1 AND entity_table = ?2 AND entity_id = ?3 AND field_name = ?4",
+            params![sync_id, fv.entity_table, fv.entity_id, fv.field_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let Some(existing_hlc) = existing_hlc else {
+        return Ok(SnapshotFieldImportDecision::InsertOrUpdate);
+    };
+
+    let existing_hlc = Hlc::from_string(&existing_hlc)?;
+    if snapshot_hlc > existing_hlc {
+        Ok(SnapshotFieldImportDecision::InsertOrUpdate)
+    } else if snapshot_hlc == existing_hlc {
+        Ok(SnapshotFieldImportDecision::KeepExistingEqual)
+    } else {
+        Ok(SnapshotFieldImportDecision::SkipStale)
+    }
+}
+
 fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result<u64> {
     // 1. Decompress zstd
     let json = zstd::decode_all(data).map_err(|e| {
@@ -630,26 +745,36 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
     let existing_local_device_id =
         query_sync_metadata(conn, sync_id)?.map(|meta| meta.local_device_id);
 
-    // 3. Insert field_versions (INSERT OR REPLACE)
+    // 3. Insert field_versions only when the snapshot row is newer than the
+    //    existing local winner. HLC ordering must stay typed; SQL string
+    //    comparisons are wrong for counters such as ":9" vs ":10".
     for fv in &snapshot.field_versions {
-        conn.execute(
-            "INSERT OR REPLACE INTO field_versions \
-             (sync_id, entity_table, entity_id, field_name, winning_op_id, \
-              winning_device_id, winning_hlc, winning_encoded_value, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                sync_id,
-                fv.entity_table,
-                fv.entity_id,
-                fv.field_name,
-                fv.winning_op_id,
-                fv.winning_device_id,
-                fv.winning_hlc,
-                fv.winning_encoded_value,
-                fv.updated_at,
-            ],
-        )?;
-        entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
+        match snapshot_field_import_decision(conn, sync_id, fv)? {
+            SnapshotFieldImportDecision::InsertOrUpdate => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO field_versions \
+                     (sync_id, entity_table, entity_id, field_name, winning_op_id, \
+                      winning_device_id, winning_hlc, winning_encoded_value, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        sync_id,
+                        fv.entity_table,
+                        fv.entity_id,
+                        fv.field_name,
+                        fv.winning_op_id,
+                        fv.winning_device_id,
+                        fv.winning_hlc,
+                        fv.winning_encoded_value,
+                        fv.updated_at,
+                    ],
+                )?;
+                entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
+            }
+            SnapshotFieldImportDecision::KeepExistingEqual => {
+                entities.insert((fv.entity_table.clone(), fv.entity_id.clone()));
+            }
+            SnapshotFieldImportDecision::SkipStale => {}
+        }
     }
 
     // 4. Insert device_registry (INSERT OR REPLACE)
@@ -744,10 +869,21 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
 /// Acceptable because lost ops will be re-pulled from the relay on next sync.
 pub struct RusqliteSyncStorage {
     conn: Mutex<Connection>,
+    rekey_mode: RekeyMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RekeyMode {
+    Noop,
+    SqlCipher,
 }
 
 impl RusqliteSyncStorage {
     pub fn new(conn: Connection) -> Result<Self> {
+        Self::new_with_rekey_mode(conn, RekeyMode::SqlCipher)
+    }
+
+    fn new_with_rekey_mode(mut conn: Connection, rekey_mode: RekeyMode) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
@@ -755,12 +891,11 @@ impl RusqliteSyncStorage {
              PRAGMA foreign_keys = ON;",
         )?;
 
-        let mut conn = conn;
-        migrations::migrations().to_latest(&mut conn).map_err(|e| {
+        migrations::apply(&mut conn).map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("Migration failed: {e}")))
         })?;
 
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), rekey_mode })
     }
 
     /// Create a new encrypted storage backed by an existing connection.
@@ -774,12 +909,12 @@ impl RusqliteSyncStorage {
         })?;
 
         // Now proceed with normal setup
-        Self::new(conn)
+        Self::new_with_rekey_mode(conn, RekeyMode::SqlCipher)
     }
 
     /// Create an in-memory storage instance for testing.
     pub fn in_memory() -> Result<Self> {
-        Self::new(Connection::open_in_memory()?)
+        Self::new_with_rekey_mode(Connection::open_in_memory()?, RekeyMode::Noop)
     }
 }
 
@@ -821,6 +956,11 @@ impl SyncStorage for RusqliteSyncStorage {
         query_field_version(&conn, sync_id, table, entity_id, field)
     }
 
+    fn list_quarantined_ops(&self, sync_id: &str) -> Result<Vec<QuarantinedOp>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_quarantined_ops(&conn, sync_id)
+    }
+
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_device_record(&conn, sync_id, device_id)
@@ -852,6 +992,10 @@ impl SyncStorage for RusqliteSyncStorage {
     }
 
     fn rekey(&self, new_key: &[u8; 32]) -> Result<()> {
+        if self.rekey_mode == RekeyMode::Noop {
+            return Ok(());
+        }
+
         let hex = new_key.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let conn = self
             .conn
@@ -972,8 +1116,8 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_mark_batch_pushed(&self.conn, batch_id)
     }
 
-    fn delete_pushed_ops(&mut self, sync_id: &str) -> Result<()> {
-        exec_delete_pushed_ops(&self.conn, sync_id)
+    fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()> {
+        exec_delete_pushed_ops(&self.conn, sync_id, batch_id)
     }
 
     // ── Applied ops ──
@@ -986,6 +1130,16 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn upsert_field_version(&mut self, fv: &FieldVersion) -> Result<()> {
         exec_upsert_field_version(&self.conn, fv)
+    }
+
+    // ── Quarantined remote ops ──
+
+    fn insert_quarantined_op(&mut self, op: &QuarantinedOp) -> Result<()> {
+        exec_insert_quarantined_op(&self.conn, op)
+    }
+
+    fn delete_quarantined_op(&mut self, sync_id: &str, op_id: &str) -> Result<()> {
+        exec_delete_quarantined_op(&self.conn, sync_id, op_id)
     }
 
     // ── Device registry ──
@@ -1022,6 +1176,15 @@ impl SyncStorageTx for RusqliteTx<'_> {
         entity_id: &str,
     ) -> Result<()> {
         exec_delete_field_versions_for_entity(&self.conn, sync_id, table, entity_id)
+    }
+
+    fn delete_non_tombstone_field_versions_for_entity(
+        &mut self,
+        sync_id: &str,
+        table: &str,
+        entity_id: &str,
+    ) -> Result<usize> {
+        exec_delete_non_tombstone_field_versions_for_entity(&self.conn, sync_id, table, entity_id)
     }
 
     fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64> {
@@ -1084,7 +1247,7 @@ mod tests {
             field_name: "name".to_string(),
             encoded_value: "\"Alice\"".to_string(),
             is_delete: false,
-            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            client_hlc: "1767225600000:0:dev1".to_string(),
             created_at: Utc::now(),
             pushed_at: None,
         }
@@ -1096,7 +1259,7 @@ mod tests {
             sync_id: sync_id.to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            client_hlc: "1767225600000:0:dev1".to_string(),
             server_seq: 10,
             applied_at: Utc::now(),
         }
@@ -1110,7 +1273,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            winning_hlc: "1767225600000:0:dev1".to_string(),
             winning_encoded_value: None,
             updated_at: Utc::now(),
         }
@@ -1367,28 +1530,29 @@ mod tests {
     }
 
     #[test]
-    fn delete_pushed_ops_removes_only_pushed() {
+    fn delete_pushed_ops_removes_only_target_pushed_batch() {
         let storage = make_storage();
 
         // Insert two ops in different batches
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_pending_op(&sample_pending_op("op-1", "sync-1", "batch-1")).unwrap();
         tx.insert_pending_op(&sample_pending_op("op-2", "sync-1", "batch-2")).unwrap();
-        // Mark only batch-1 as pushed
         tx.mark_batch_pushed("batch-1").unwrap();
+        tx.mark_batch_pushed("batch-2").unwrap();
         tx.commit().unwrap();
 
-        // Delete pushed ops
+        // Delete only the just-pushed batch.
         let mut tx = storage.begin_tx().unwrap();
-        tx.delete_pushed_ops("sync-1").unwrap();
+        tx.delete_pushed_ops("sync-1", "batch-1").unwrap();
         tx.commit().unwrap();
 
-        // batch-1 op should be gone, batch-2 op should remain
+        // batch-1 op should be gone, batch-2 op should remain even though it is also pushed.
         let ops1 = storage.load_batch_ops("batch-1").unwrap();
         assert!(ops1.is_empty());
 
         let ops2 = storage.load_batch_ops("batch-2").unwrap();
         assert_eq!(ops2.len(), 1);
+        assert!(ops2[0].pushed_at.is_some());
     }
 
     #[test]
@@ -1497,7 +1661,7 @@ mod tests {
                 sync_id: "sync-1".to_string(),
                 epoch: 1,
                 device_id: "dev1".to_string(),
-                client_hlc: format!("2026-01-01T00:00:00.000Z:{i:04}:dev1"),
+                client_hlc: format!("1767225600000:{i}:dev1"),
                 server_seq: i * 10,
                 applied_at: Utc::now(),
             })
@@ -1521,7 +1685,7 @@ mod tests {
                 sync_id: "sync-1".to_string(),
                 epoch: 1,
                 device_id: "dev1".to_string(),
-                client_hlc: format!("2026-01-01T00:00:00.000Z:{i:04}:dev1"),
+                client_hlc: format!("1767225600000:{i}:dev1"),
                 server_seq: i * 10,
                 applied_at: Utc::now(),
             })
@@ -1554,7 +1718,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
             winning_encoded_value: Some("\"Alice\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1566,7 +1730,7 @@ mod tests {
             field_name: "is_deleted".to_string(),
             winning_op_id: "op-2".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            winning_hlc: "1767225600000:2:dev1".to_string(),
             winning_encoded_value: Some("true".to_string()),
             updated_at: Utc::now(),
         })
@@ -1579,7 +1743,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-3".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0003:dev1".to_string(),
+            winning_hlc: "1767225600000:3:dev1".to_string(),
             winning_encoded_value: None,
             updated_at: Utc::now(),
         })
@@ -1603,6 +1767,64 @@ mod tests {
     }
 
     #[test]
+    fn pruning_delete_non_tombstone_field_versions_preserves_is_deleted() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-1".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
+            winning_encoded_value: Some("\"Alice\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "is_deleted".to_string(),
+            winning_op_id: "op-2".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "1767225600000:2:dev1".to_string(),
+            winning_encoded_value: Some("true".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-2".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-3".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "1767225600000:3:dev1".to_string(),
+            winning_encoded_value: Some("\"Bob\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        let deleted = tx
+            .delete_non_tombstone_field_versions_for_entity("sync-1", "members", "ent-1")
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().is_none());
+        assert!(storage
+            .get_field_version("sync-1", "members", "ent-1", "is_deleted")
+            .unwrap()
+            .is_some());
+        assert!(storage.get_field_version("sync-1", "members", "ent-2", "name").unwrap().is_some());
+    }
+
+    #[test]
     fn pruning_list_prunable_tombstones() {
         let storage = make_storage();
 
@@ -1613,7 +1835,7 @@ mod tests {
             sync_id: "sync-1".to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            client_hlc: "1767225600000:1:dev1".to_string(),
             server_seq: 5,
             applied_at: Utc::now(),
         })
@@ -1626,7 +1848,7 @@ mod tests {
             field_name: "is_deleted".to_string(),
             winning_op_id: "delete-op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
             winning_encoded_value: Some("true".to_string()),
             updated_at: Utc::now(),
         })
@@ -1657,7 +1879,7 @@ mod tests {
             field_name: "name".to_string(),
             winning_op_id: "op-1".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            winning_hlc: "1767225600000:1:dev1".to_string(),
             winning_encoded_value: Some("\"Alice\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1669,7 +1891,7 @@ mod tests {
             field_name: "pronouns".to_string(),
             winning_op_id: "op-2".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            winning_hlc: "1767225600000:2:dev1".to_string(),
             winning_encoded_value: Some("\"she/her\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1681,7 +1903,7 @@ mod tests {
             field_name: "started_at".to_string(),
             winning_op_id: "op-3".to_string(),
             winning_device_id: "dev1".to_string(),
-            winning_hlc: "2026-01-01T00:00:00.000Z:0003:dev1".to_string(),
+            winning_hlc: "1767225600000:3:dev1".to_string(),
             winning_encoded_value: Some("\"2026-01-01T00:00:00Z\"".to_string()),
             updated_at: Utc::now(),
         })
@@ -1693,7 +1915,7 @@ mod tests {
             sync_id: "sync-1".to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0001:dev1".to_string(),
+            client_hlc: "1767225600000:1:dev1".to_string(),
             server_seq: 10,
             applied_at: Utc::now(),
         })
@@ -1703,7 +1925,7 @@ mod tests {
             sync_id: "sync-1".to_string(),
             epoch: 1,
             device_id: "dev1".to_string(),
-            client_hlc: "2026-01-01T00:00:00.000Z:0002:dev1".to_string(),
+            client_hlc: "1767225600000:2:dev1".to_string(),
             server_seq: 20,
             applied_at: Utc::now(),
         })
@@ -1976,6 +2198,49 @@ mod tests {
 
         // Different sync group: still false
         assert!(!storage.has_any_applied_ops("sync-other").unwrap());
+    }
+
+    #[test]
+    fn quarantined_ops_round_trip_and_clear_with_sync_state() {
+        let storage = make_storage();
+        let op = crate::crdt_change::CrdtChange::new(
+            Some("op-quarantined".to_string()),
+            Some("batch-quarantined".to_string()),
+            "task-1".to_string(),
+            "tasks".to_string(),
+            "future_field".to_string(),
+            Some("\"value\"".to_string()),
+            Some("1000:0:device-a".to_string()),
+            false,
+            Some("device-a".to_string()),
+            Some(0),
+            None,
+        );
+        let quarantined = QuarantinedOp {
+            sync_id: "sync-1".to_string(),
+            op_id: op.op_id.clone(),
+            op,
+            reason: "unknown_field".to_string(),
+            server_seq: 7,
+            quarantined_at: Utc::now(),
+        };
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_op(&quarantined).unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_quarantined_ops("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].op_id, "op-quarantined");
+        assert_eq!(rows[0].op.field_name, "future_field");
+        assert_eq!(rows[0].reason, "unknown_field");
+        assert_eq!(rows[0].server_seq, 7);
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_sync_state("sync-1").unwrap();
+        tx.commit().unwrap();
+
+        assert!(storage.list_quarantined_ops("sync-1").unwrap().is_empty());
     }
 
     #[test]

@@ -22,11 +22,15 @@ use crate::relay::traits::{
 };
 use crate::relay::SyncRelay;
 use crate::secure_store::SecureStore;
+use prism_sync_crypto::pq::hybrid_signature_contexts;
 use prism_sync_crypto::{mnemonic, DeviceSecret, KeyHierarchy};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
+const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
+#[cfg(test)]
+const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 
 /// Orchestrates sync group creation and joining.
 ///
@@ -43,13 +47,8 @@ impl PairingService {
         Self { secure_store }
     }
 
-    fn ratchet_min_signature_version(&self, observed: Option<u8>) -> Result<()> {
-        let Some(observed) = observed else {
-            return Ok(());
-        };
-
-        let current = self
-            .secure_store
+    fn stored_min_signature_version_floor(&self) -> Result<Option<u8>> {
+        self.secure_store
             .get(MIN_SIGNATURE_VERSION_FLOOR_KEY)?
             .map(|bytes| {
                 let value = String::from_utf8(bytes).map_err(|e| {
@@ -63,12 +62,16 @@ impl PairingService {
                     ))
                 })
             })
-            .transpose()?
-            .unwrap_or(0);
+            .transpose()
+    }
 
-        if observed > current {
+    fn ratchet_min_signature_version(&self, observed: Option<u8>) -> Result<()> {
+        let required =
+            observed.unwrap_or(SIGNATURE_VERSION_SOURCE_FLOOR).max(SIGNATURE_VERSION_SOURCE_FLOOR);
+        let current = self.stored_min_signature_version_floor()?.unwrap_or(0);
+        if required > current {
             self.secure_store
-                .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, observed.to_string().as_bytes())?;
+                .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, required.to_string().as_bytes())?;
         }
 
         Ok(())
@@ -90,7 +93,7 @@ impl PairingService {
         &self,
         password: &str,
         relay_url: &str,
-        mnemonic_override: Option<String>,
+        mnemonic_override: Option<&str>,
         sync_id_override: Option<String>,
         nonce_response_override: Option<RegistrationNonceResponse>,
         first_device_admission_proof: Option<FirstDeviceAdmissionProof>,
@@ -100,9 +103,18 @@ impl PairingService {
     where
         F: FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send,
     {
-        // 1. Generate or accept mnemonic
-        let mnemonic_str = mnemonic_override.unwrap_or_else(mnemonic::generate);
-        let secret_key = mnemonic::to_bytes(&mnemonic_str).map_err(CoreError::Crypto)?;
+        // 1. Generate or accept mnemonic. Borrow caller-provided mnemonic text
+        // instead of taking ownership so FFI callers can keep their input copy
+        // inside a Zeroizing buffer.
+        let generated_mnemonic;
+        let mnemonic_str = match mnemonic_override {
+            Some(value) => value,
+            None => {
+                generated_mnemonic = mnemonic::generate();
+                generated_mnemonic.as_str()
+            }
+        };
+        let secret_key = mnemonic::to_bytes(mnemonic_str).map_err(CoreError::Crypto)?;
 
         // 2. Initialize key hierarchy — produces wrapped DEK + salt
         let mut key_hierarchy = KeyHierarchy::new();
@@ -115,7 +127,7 @@ impl PairingService {
         // 4. Build credentials
         let credentials = SyncGroupCredentials {
             sync_id: sync_id.clone(),
-            mnemonic: mnemonic_str.clone(),
+            mnemonic: mnemonic_str.to_string(),
             wrapped_dek: wrapped_dek.clone(),
             salt: salt.clone(),
         };
@@ -149,7 +161,7 @@ impl PairingService {
             &[],
         );
         let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"invitation",
+            hybrid_signature_contexts::INVITATION,
             &signing_data,
         )
         .expect("hardcoded invitation context should be <= 255 bytes");
@@ -190,7 +202,7 @@ impl PairingService {
         let response = PairingResponse {
             relay_url: relay_url.to_string(),
             sync_id: sync_id.clone(),
-            mnemonic: mnemonic_str,
+            mnemonic: mnemonic_str.to_string(),
             wrapped_dek,
             salt,
             signed_invitation: signed_invitation_hex.clone(),
@@ -494,7 +506,7 @@ impl PairingService {
                     registration_relay.as_ref(),
                     &mut key_hierarchy,
                     self.secure_store.as_ref(),
-                    &device_secret,
+                    device_secret,
                     &device_id,
                     bundle.current_epoch,
                     latest_registry_snapshot.current_epoch,
@@ -596,6 +608,15 @@ impl PairingService {
             .load_secure_string("epoch")?
             .parse::<u32>()
             .map_err(|e| CoreError::Engine(format!("invalid stored epoch value: {e}")))?;
+
+        // After a successful `revoke_and_rekey`, post_rekey, or epoch
+        // recovery, the new epoch key is persisted to secure_store as
+        // `epoch_key_{N}` (see commit_recovered_epoch_material) but
+        // `KeyHierarchy::unlock` only seeds epoch 0. Without restoring
+        // the higher-epoch keys here, `build_epoch_key_hashes` below
+        // would only commit to epoch 0, and the joiner would reject the
+        // bundle with "epoch_key_hashes missing entry for current_epoch".
+        self.restore_persisted_epoch_keys(&mut key_hierarchy, current_epoch)?;
 
         let bootstrap_bytes = pairing_relay
             .get_bootstrap(&ceremony.rendezvous_id_hex())
@@ -749,6 +770,17 @@ impl PairingService {
         // monotonic counter.
         let registry_version = SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
         let epoch_key_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        // Belt-and-suspenders: catch the bug where the inviter ships a
+        // snapshot with current_epoch > 0 but no epoch_key_hash for it.
+        // The joiner's deserializer rejects the same shape, but failing
+        // here gives a clearer error tied to the inviter's own state
+        // (and avoids posting a malformed bundle to the relay at all).
+        if !epoch_key_hashes.contains_key(&current_epoch) {
+            return Err(CoreError::Engine(format!(
+                "inviter key_hierarchy is missing epoch {current_epoch} — \
+                 cannot sign registry snapshot whose current_epoch is {current_epoch}",
+            )));
+        }
         let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
             snapshot_entries,
             registry_version,
@@ -761,7 +793,7 @@ impl PairingService {
         let approval_data =
             build_registry_approval_signing_data_v2(&sync_id, &device_id, &signed_keyring);
         let m_prime_approval = prism_sync_crypto::pq::build_hybrid_message_representative(
-            b"registry_approval",
+            hybrid_signature_contexts::REGISTRY_APPROVAL,
             &approval_data,
         )
         .expect("hardcoded registry approval context should be <= 255 bytes");
@@ -805,9 +837,34 @@ impl PairingService {
         let _joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
 
         let next_epoch = current_epoch.saturating_add(1);
-        let epoch_key =
-            EpochManager::post_rekey(sync_relay, &mut key_hierarchy, &device_id, next_epoch)
-                .await?;
+        let (next_epoch_key, wrapped_keys) =
+            EpochManager::prepare_wrapped_keys(sync_relay, next_epoch, None).await?;
+        let next_epoch_key_array: [u8; 32] =
+            next_epoch_key.as_slice().try_into().map_err(|_| {
+                CoreError::Engine(format!(
+                    "generated epoch key for epoch {next_epoch} has invalid length"
+                ))
+            })?;
+        let mut next_epoch_hashes = build_epoch_key_hashes(&key_hierarchy)?;
+        next_epoch_hashes.insert(next_epoch, compute_epoch_key_hash(&next_epoch_key_array));
+        let post_rekey_registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            registry_snapshot.entries.clone(),
+            registry_snapshot.registry_version,
+            next_epoch,
+            next_epoch_hashes,
+        );
+        let signed_post_rekey_registry =
+            post_rekey_registry_snapshot.sign_hybrid(&signing_key, &pq_signing_key);
+        let epoch_key = EpochManager::post_prepared_rekey(
+            sync_relay,
+            &mut key_hierarchy,
+            &device_id,
+            next_epoch,
+            next_epoch_key,
+            wrapped_keys,
+            Some(&signed_post_rekey_registry),
+        )
+        .await?;
 
         self.secure_store.set("epoch", next_epoch.to_string().as_bytes())?;
         use base64::{engine::general_purpose::STANDARD, Engine};
@@ -865,26 +922,63 @@ impl PairingService {
 
         let key_name = format!("epoch_key_{epoch}");
         if let Some(stored) = self.secure_store.get(&key_name)? {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            // Tolerant decode: sync_service.rs historically wrote raw bytes while
-            // the bootstrap/rekey paths write base64. Try base64 first; if the
-            // result is exactly 32 bytes it's the real key. Otherwise fall back to
-            // treating the stored bytes as raw key material.
-            if let Ok(decoded) = STANDARD.decode(&stored) {
-                if decoded.len() == 32 {
-                    return Ok(decoded);
-                }
-            }
-            if stored.len() == 32 {
-                return Ok(stored);
-            }
-            return Err(CoreError::Engine(format!(
-                "invalid {key_name} in secure store: expected 32-byte key, got {} bytes",
-                stored.len()
-            )));
+            return Self::decode_persisted_epoch_key(&key_name, stored);
         }
 
         Ok(key_hierarchy.epoch_key(epoch).map_err(CoreError::Crypto)?.to_vec())
+    }
+
+    /// Restore every persisted `epoch_key_{N}` (1..=current_epoch) from the
+    /// secure store into the in-memory [`KeyHierarchy`].
+    ///
+    /// `KeyHierarchy::unlock` only seeds epoch 0 from the DEK. Higher-epoch
+    /// keys live in the secure store after each `revoke_and_rekey`,
+    /// `post_rekey`, or epoch-recovery commit (see
+    /// `commit_recovered_epoch_material`). This restore is required before
+    /// any path that needs to expose `epoch_key_hashes` for epochs > 0 —
+    /// notably [`Self::complete_bootstrap_initiator`], which signs a
+    /// snapshot whose `epoch_key_hashes` must include the bundle's
+    /// `current_epoch` or the joiner rejects the bundle.
+    ///
+    /// Missing keys are silently skipped — an epoch may legitimately have
+    /// no persisted entry on a device that joined after that epoch's
+    /// rekey but caught up at a higher epoch in one step. Malformed keys
+    /// are an error: a corrupt persisted entry shouldn't be silently
+    /// dropped.
+    fn restore_persisted_epoch_keys(
+        &self,
+        key_hierarchy: &mut KeyHierarchy,
+        current_epoch: u32,
+    ) -> Result<()> {
+        for epoch in 1..=current_epoch {
+            let key_name = format!("epoch_key_{epoch}");
+            let Some(stored) = self.secure_store.get(&key_name)? else {
+                continue;
+            };
+            let decoded = Self::decode_persisted_epoch_key(&key_name, stored)?;
+            key_hierarchy.store_epoch_key(epoch, zeroize::Zeroizing::new(decoded));
+        }
+        Ok(())
+    }
+
+    /// Tolerant decode shared by [`Self::load_epoch_key`] and
+    /// [`Self::restore_persisted_epoch_keys`]: try base64 first, then fall
+    /// back to raw bytes. `sync_service.rs` historically wrote raw bytes
+    /// while the bootstrap/rekey paths write base64, so we accept both.
+    fn decode_persisted_epoch_key(key_name: &str, stored: Vec<u8>) -> Result<Vec<u8>> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if let Ok(decoded) = STANDARD.decode(&stored) {
+            if decoded.len() == 32 {
+                return Ok(decoded);
+            }
+        }
+        if stored.len() == 32 {
+            return Ok(stored);
+        }
+        Err(CoreError::Engine(format!(
+            "invalid {key_name} in secure store: expected 32-byte key, got {} bytes",
+            stored.len()
+        )))
     }
 
     fn load_optional_secure_string(&self, key: &str) -> Result<Option<String>> {
@@ -1093,17 +1187,34 @@ fn verify_hybrid_invitation(
     let Some((&version, sig_rest)) = sig_bytes.split_first() else {
         return Err(CoreError::Engine("invitation signature too short".into()));
     };
+    enforce_wire_signature_floor(version, SIGNATURE_VERSION_SOURCE_FLOOR)?;
     let hybrid_sig = prism_sync_crypto::pq::HybridSignature::from_bytes(sig_rest)
         .map_err(|e| CoreError::Engine(format!("invitation hybrid signature invalid: {e}")))?;
     match version {
-        0x03 => hybrid_sig
-            .verify_v3(signing_data, b"invitation", inviter_ed25519_pk, inviter_ml_dsa_65_pk)
+        SUPPORTED_SIGNATURE_VERSION => hybrid_sig
+            .verify_v3(
+                signing_data,
+                hybrid_signature_contexts::INVITATION,
+                inviter_ed25519_pk,
+                inviter_ml_dsa_65_pk,
+            )
             .map_err(|e| CoreError::Engine(format!("invitation signature invalid: {e}")))?,
         _ => {
             return Err(CoreError::Engine(format!(
                 "unsupported invitation signature version: 0x{version:02x}"
             )))
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn enforce_wire_signature_floor(wire_signature_version: u8, stored_floor: u8) -> Result<()> {
+    let required = stored_floor.max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    if wire_signature_version < required {
+        return Err(CoreError::Engine(format!(
+            "wire signature version 0x{wire_signature_version:02x} is below required floor 0x{required:02x}"
+        )));
     }
     Ok(())
 }
@@ -1129,7 +1240,7 @@ fn build_hybrid_challenge_signature(
     write_len_prefixed(&mut challenge_data, nonce.as_bytes());
 
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
-        b"device_challenge",
+        hybrid_signature_contexts::DEVICE_CHALLENGE,
         &challenge_data,
     )
     .expect("hardcoded device challenge context should be <= 255 bytes");
@@ -1372,6 +1483,9 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(None)
         }
+        async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+            Ok(0)
+        }
     }
     #[async_trait]
     impl EpochManagement for MockRelay {
@@ -1379,6 +1493,7 @@ mod tests {
             &self,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -1532,7 +1647,7 @@ mod tests {
             if state.signed_registry.is_none() {
                 if let Some(approval) = &req.registry_approval {
                     state.signed_registry = Some(SignedRegistryResponse {
-                        registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+                        registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
                         artifact_blob: approval.signed_registry_snapshot.clone(),
                         artifact_kind: "signed_registry_snapshot".to_string(),
                     });
@@ -1585,6 +1700,18 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(self.state.lock().unwrap().signed_registry.clone())
         }
+        async fn put_signed_registry(
+            &self,
+            signed_registry_snapshot: &[u8],
+        ) -> std::result::Result<i64, RelayError> {
+            let mut state = self.state.lock().unwrap();
+            state.signed_registry = Some(SignedRegistryResponse {
+                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+                artifact_blob: signed_registry_snapshot.to_vec(),
+                artifact_kind: "signed_registry_snapshot".to_string(),
+            });
+            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+        }
     }
     #[async_trait]
     impl EpochManagement for BootstrapRegistryRelay {
@@ -1592,6 +1719,7 @@ mod tests {
             &self,
             epoch: i32,
             keys: HashMap<String, Vec<u8>>,
+            signed_registry_snapshot: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             let mut state = self.state.lock().unwrap();
             let current_epoch = state
@@ -1615,6 +1743,13 @@ mod tests {
             }
             for (device_id, artifact) in &keys {
                 state.rekey_artifacts.insert((epoch, device_id.clone()), artifact.clone());
+            }
+            if let Some(snapshot) = signed_registry_snapshot {
+                state.signed_registry = Some(SignedRegistryResponse {
+                    registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+                    artifact_blob: snapshot.to_vec(),
+                    artifact_kind: "signed_registry_snapshot".to_string(),
+                });
             }
             state.rekey_posts = Some((epoch, keys));
             Ok(epoch)
@@ -1751,8 +1886,9 @@ mod tests {
         let wrap_key =
             prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                 .unwrap();
+        let aad = crate::epoch::build_rekey_artifact_aad(epoch, device_id);
         let encrypted_epoch_key =
-            prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
+            prism_sync_crypto::aead::xchacha_encrypt_aead(&wrap_key, epoch_key, &aad).unwrap();
 
         let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
         artifact.push(0x02);
@@ -1882,7 +2018,7 @@ mod tests {
             latest_hashes,
         );
         registry_relay.set_signed_registry(SignedRegistryResponse {
-            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             artifact_blob: latest_snapshot
                 .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
             artifact_kind: "signed_registry_snapshot".to_string(),
@@ -2021,7 +2157,7 @@ mod tests {
             latest_hashes,
         );
         registry_relay.set_signed_registry(SignedRegistryResponse {
-            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING as i64,
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             artifact_blob: latest_snapshot
                 .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
             artifact_kind: "signed_registry_snapshot".to_string(),
@@ -2129,7 +2265,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
 
         let joiner_mailbox = mailbox.clone();
         let joiner_relay = registry_relay.clone();
@@ -2336,7 +2472,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
 
         let joiner_mailbox = mailbox.clone();
         let joiner_relay = registry_relay.clone();
@@ -2372,10 +2508,21 @@ mod tests {
         assert!(initiator_store.get("epoch_key_2").unwrap().is_some());
         assert_eq!(initiator_store.get("epoch").unwrap().unwrap(), b"3");
 
-        let state = registry_relay.state.lock().unwrap();
-        let (next_epoch, wrapped_keys) = state.rekey_posts.as_ref().unwrap();
-        assert_eq!(*next_epoch, 3);
-        assert!(wrapped_keys.contains_key(&device_id));
+        let post_rekey_registry_blob = {
+            let state = registry_relay.state.lock().unwrap();
+            let (next_epoch, wrapped_keys) = state.rekey_posts.as_ref().unwrap();
+            assert_eq!(*next_epoch, 3);
+            assert!(wrapped_keys.contains_key(&device_id));
+            state.signed_registry.as_ref().unwrap().artifact_blob.clone()
+        };
+        let post_rekey_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &post_rekey_registry_blob,
+            &inviter_signing_key.public_key_bytes(),
+            &inviter_pq_signing_key.public_key_bytes(),
+        )
+        .unwrap();
+        assert_eq!(post_rekey_snapshot.current_epoch, 3);
+        assert!(post_rekey_snapshot.epoch_key_hashes.contains_key(&3));
 
         let err = mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap_err();
         assert!(err.to_string().contains("session not found"));
@@ -2477,7 +2624,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
         let confirmation = joiner.confirmation_mac().unwrap();
         mailbox
             .put_slot(&joiner_rendezvous_id, PairingSlot::Confirmation, &confirmation)
@@ -2605,7 +2752,7 @@ mod tests {
             wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
         let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
         assert_eq!(joiner_sas.words, initiator_sas.words);
-        assert_eq!(joiner_sas.decimal, initiator_sas.decimal);
+        assert_eq!(joiner_sas.word_list, initiator_sas.word_list);
 
         let joiner_mailbox = mailbox.clone();
         let joiner_relay = registry_relay.clone();
@@ -2818,7 +2965,7 @@ mod tests {
             .create_sync_group(
                 "pw",
                 "wss://relay.example.com",
-                Some(custom.clone()),
+                Some(custom.as_str()),
                 None,
                 None,
                 None,
@@ -2913,7 +3060,36 @@ mod tests {
         let err =
             verify_hybrid_invitation(&signing_data, &legacy_wire, &inviter_pk, &inviter_ml_dsa_pk)
                 .unwrap_err();
-        assert!(err.to_string().contains("unsupported invitation signature version"));
+        assert!(err.to_string().contains("below required floor"));
+    }
+
+    #[test]
+    fn min_signature_version_omitted_relay_floor_ratchets_to_source_floor() {
+        let store = Arc::new(MemStore::default());
+        let service = PairingService::new(store.clone());
+
+        service.ratchet_min_signature_version(None).unwrap();
+
+        assert_eq!(
+            String::from_utf8(store.get(MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap().unwrap())
+                .unwrap(),
+            SIGNATURE_VERSION_SOURCE_FLOOR.to_string()
+        );
+    }
+
+    #[test]
+    fn min_signature_version_omitted_relay_floor_does_not_lower_stored_floor() {
+        let store = Arc::new(MemStore::default());
+        store.set(MIN_SIGNATURE_VERSION_FLOOR_KEY, b"4").unwrap();
+        let service = PairingService::new(store.clone());
+
+        service.ratchet_min_signature_version(None).unwrap();
+
+        assert_eq!(
+            String::from_utf8(store.get(MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap().unwrap())
+                .unwrap(),
+            "4"
+        );
     }
 
     #[tokio::test]
@@ -3135,6 +3311,9 @@ mod tests {
             ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
                 Ok(None)
             }
+            async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+                Ok(0)
+            }
         }
         #[async_trait]
         impl EpochManagement for CapturingRelay {
@@ -3142,6 +3321,7 @@ mod tests {
                 &self,
                 _: i32,
                 _: HashMap<String, Vec<u8>>,
+                _: Option<&[u8]>,
             ) -> std::result::Result<i32, RelayError> {
                 unimplemented!()
             }
@@ -3248,4 +3428,182 @@ mod tests {
     // External integration tests in `tests/consumer_api.rs` and
     // `tests/pairing_failures.rs` also exercise the legacy flow for
     // backwards compatibility and are kept intact.
+
+    /// Unit test for the helper itself: post-revoke / post-rekey flows
+    /// persist `epoch_key_{N}` to the secure store, but a freshly-unlocked
+    /// `KeyHierarchy` only has epoch 0. The helper must restore each
+    /// persisted epoch key into the hierarchy so downstream consumers
+    /// (`build_epoch_key_hashes`, etc.) see the full set.
+    #[test]
+    fn restore_persisted_epoch_keys_loads_secure_store_entries() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let store = Arc::new(MemStore::default());
+        // Mix base64 and raw to exercise the tolerant decode (the bootstrap
+        // path writes base64; sync_service.rs historically wrote raw).
+        let key1 = [0xAAu8; 32];
+        let key2 = [0xBBu8; 32];
+        let key3 = [0xCCu8; 32];
+        store.set("epoch_key_1", STANDARD.encode(key1).as_bytes()).unwrap();
+        store.set("epoch_key_2", &key2).unwrap();
+        store.set("epoch_key_3", STANDARD.encode(key3).as_bytes()).unwrap();
+
+        let service = PairingService::new(store.clone());
+        let mut hierarchy = KeyHierarchy::new();
+        // Unlock so epoch 0 is present and the hierarchy accepts writes.
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        hierarchy.initialize("pw", &secret_key).unwrap();
+
+        service.restore_persisted_epoch_keys(&mut hierarchy, 3).unwrap();
+
+        let restored: std::collections::BTreeMap<u32, [u8; 32]> = hierarchy
+            .epoch_keys_iter()
+            .unwrap()
+            .into_iter()
+            .map(|(epoch, key)| (epoch, *key))
+            .collect();
+        // Expect epoch 0 (from initialize) plus 1/2/3 from secure store.
+        assert!(restored.contains_key(&0));
+        assert_eq!(restored.get(&1), Some(&key1));
+        assert_eq!(restored.get(&2), Some(&key2));
+        assert_eq!(restored.get(&3), Some(&key3));
+    }
+
+    /// Regression test for the silent post-revoke pairing failure: the
+    /// inviter's `complete_bootstrap_initiator` used to build a fresh
+    /// `KeyHierarchy` containing only epoch 0, then sign a snapshot with
+    /// `current_epoch` taken from the secure store (e.g. 1 after a
+    /// `revoke_and_rekey`). The resulting bundle's `epoch_key_hashes` map
+    /// only had an entry for epoch 0, so the joiner rejected it with
+    /// "registry epoch_key_hashes missing entry for current_epoch 1".
+    ///
+    /// Mirrors `bootstrap_pairing_round_trip_and_rekey` but seeds the
+    /// initiator at epoch=1 with a persisted `epoch_key_1`, simulating
+    /// the state after a successful `revoke_and_rekey`.
+    #[tokio::test]
+    async fn bootstrap_initiator_includes_post_revoke_epoch_in_snapshot() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        // Relay reports the inviter at epoch 1 (matches local) — no
+        // catch-up branch will run, so the bug fires if it's still there.
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+        }]));
+
+        // Seed initiator store at epoch=1 with persisted epoch_key_1, the
+        // shape `revoke_and_rekey` leaves behind.
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("epoch", b"1").unwrap();
+        let epoch_1_key = [0x77u8; 32];
+        {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            initiator_store.set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes()).unwrap();
+        }
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
+
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service_task
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+                .unwrap()
+        });
+
+        initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+            )
+            .await
+            .expect("post-revoke initiator must produce a valid bundle");
+
+        // The joiner accepts the bundle iff the inviter's snapshot
+        // includes `epoch_key_hashes[current_epoch]`. Pre-fix, this would
+        // have panicked with "registry epoch_key_hashes missing entry for
+        // current_epoch 1".
+        let (_joiner_key_hierarchy, joiner_snapshot) = joiner_handle.await.unwrap();
+        // Bundle's current_epoch reflects the post-rekey advance (initiator
+        // bumps to next_epoch after registering the joiner).
+        assert!(joiner_snapshot.current_epoch >= 1);
+        assert!(
+            joiner_snapshot.epoch_key_hashes.contains_key(&joiner_snapshot.current_epoch),
+            "joiner snapshot missing epoch_key_hash for its own current_epoch {}",
+            joiner_snapshot.current_epoch
+        );
+        // The pre-revoke epoch (1) must also be retained in the hash map
+        // — the inviter committed to BOTH epoch 0 and epoch 1, even though
+        // only epoch 1 is "current".
+        assert!(
+            joiner_snapshot.epoch_key_hashes.contains_key(&1),
+            "joiner snapshot missing epoch_key_hash for the pre-rekey epoch 1"
+        );
+        assert_eq!(
+            joiner_snapshot.epoch_key_hashes.get(&1),
+            Some(&compute_epoch_key_hash(&epoch_1_key)),
+            "epoch_key_hash for epoch 1 must hash the persisted post-revoke key"
+        );
+    }
 }

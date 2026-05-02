@@ -10,7 +10,7 @@
 //! ```text
 //! byte 0:       version = 0x02
 //! bytes 1-1120: X-Wing ciphertext (1120 bytes)
-//! bytes 1121+:  XChaCha20-Poly1305(epoch_key) (~72 bytes)
+//! bytes 1121+:  XChaCha20-Poly1305(epoch_key, AAD = v2|epoch|device_id) (~72 bytes)
 //! Total: ~1193 bytes
 //! ```
 
@@ -33,6 +33,10 @@ const ARTIFACT_VERSION: u8 = 0x02;
 const MIN_ARTIFACT_LEN: usize = 1 + XWING_CT_LEN;
 /// Defensive upper bound for v2 artifacts.
 const MAX_ARTIFACT_LEN: usize = 1536;
+
+pub(crate) fn build_rekey_artifact_aad(epoch: u32, device_id: &str) -> Vec<u8> {
+    format!("prism_epoch_rekey_v2|{epoch}|{device_id}").into_bytes()
+}
 
 /// Decapsulate and decrypt a v2 rekey artifact into a raw epoch key.
 pub(crate) fn decapsulate_and_decrypt_artifact(
@@ -81,9 +85,10 @@ pub(crate) fn decapsulate_and_decrypt_artifact(
         prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
             .map_err(CoreError::Crypto)?;
 
-    // 6. Decrypt epoch key
+    // 6. Decrypt epoch key with AAD binding the inner AEAD to epoch + device.
+    let aad = build_rekey_artifact_aad(epoch, device_id);
     let epoch_key_bytes =
-        prism_sync_crypto::aead::xchacha_decrypt(&unwrap_key, encrypted_epoch_key)
+        prism_sync_crypto::aead::xchacha_decrypt_aead(&unwrap_key, encrypted_epoch_key, &aad)
             .map_err(CoreError::Crypto)?;
 
     Ok(Zeroizing::new(epoch_key_bytes))
@@ -198,10 +203,15 @@ impl EpochManager {
             )
             .map_err(CoreError::Crypto)?;
 
-            // Encrypt epoch key for this device
-            let encrypted_epoch_key =
-                prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key_bytes.as_ref())
-                    .map_err(CoreError::Crypto)?;
+            // Encrypt epoch key for this device; AAD binds the inner AEAD to
+            // the same epoch + device context as the HKDF salt.
+            let aad = build_rekey_artifact_aad(new_epoch, &device.device_id);
+            let encrypted_epoch_key = prism_sync_crypto::aead::xchacha_encrypt_aead(
+                &wrap_key,
+                epoch_key_bytes.as_ref(),
+                &aad,
+            )
+            .map_err(CoreError::Crypto)?;
 
             // Build v2 artifact: 0x02 || ciphertext || encrypted_epoch_key
             let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
@@ -224,8 +234,30 @@ impl EpochManager {
         new_epoch: u32,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let (epoch_key, wrapped_keys) = Self::prepare_wrapped_keys(relay, new_epoch, None).await?;
+        Self::post_prepared_rekey(
+            relay,
+            key_hierarchy,
+            device_id,
+            new_epoch,
+            epoch_key,
+            wrapped_keys,
+            None,
+        )
+        .await
+    }
 
-        let committed_epoch = match relay.post_rekey_artifacts(new_epoch as i32, wrapped_keys).await
+    pub async fn post_prepared_rekey(
+        relay: &dyn SyncRelay,
+        key_hierarchy: &mut KeyHierarchy,
+        device_id: &str,
+        new_epoch: u32,
+        epoch_key: Zeroizing<Vec<u8>>,
+        wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let committed_epoch = match relay
+            .post_rekey_artifacts(new_epoch as i32, wrapped_keys, signed_registry_snapshot)
+            .await
         {
             Ok(epoch) if epoch == new_epoch as i32 => new_epoch,
             Ok(epoch) => {
@@ -582,6 +614,9 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(None)
         }
+        async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+            Ok(0)
+        }
     }
 
     #[async_trait]
@@ -590,6 +625,7 @@ mod tests {
             &self,
             epoch: i32,
             keys: HashMap<String, Vec<u8>>,
+            _signed_registry_snapshot: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             *self.posted_artifacts.lock().unwrap() = Some((epoch, keys.clone()));
             match self.post_rekey_behavior {
@@ -705,6 +741,37 @@ mod tests {
         let wrap_key =
             prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                 .unwrap();
+        let aad = build_rekey_artifact_aad(epoch, device_id);
+        let encrypted_epoch_key =
+            prism_sync_crypto::aead::xchacha_encrypt_aead(&wrap_key, epoch_key, &aad).unwrap();
+
+        let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
+        artifact.push(ARTIFACT_VERSION);
+        artifact.extend_from_slice(&ciphertext);
+        artifact.extend_from_slice(&encrypted_epoch_key);
+        artifact
+    }
+
+    fn build_legacy_v2_artifact_without_aad(
+        receiver_xwing: &DeviceXWingKey,
+        epoch_key: &[u8],
+        epoch: u32,
+        device_id: &str,
+    ) -> Vec<u8> {
+        use prism_sync_crypto::pq::hybrid_kem::XWingKem;
+
+        let ek_bytes = receiver_xwing.encapsulation_key_bytes();
+        let ek = XWingKem::encapsulation_key_from_bytes(&ek_bytes).unwrap();
+        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+        let (ciphertext, shared_secret_raw) = XWingKem::encapsulate(&ek, &mut rng);
+        let shared_secret = Zeroizing::new(shared_secret_raw);
+
+        let mut salt = Vec::with_capacity(4 + device_id.len());
+        salt.extend_from_slice(&epoch.to_le_bytes());
+        salt.extend_from_slice(device_id.as_bytes());
+        let wrap_key =
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+                .unwrap();
         let encrypted_epoch_key =
             prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
 
@@ -787,6 +854,26 @@ mod tests {
 
         assert!(kh.has_epoch_key(5));
         assert_eq!(kh.epoch_key(5).unwrap(), &epoch_key);
+    }
+
+    #[test]
+    fn decapsulate_rejects_legacy_rekey_artifact_without_inner_aad() {
+        let receiver_secret = DeviceSecret::generate();
+        let receiver_xwing = receiver_secret.xwing_keypair("receiver").unwrap();
+        let epoch_key = vec![0xABu8; 32];
+        let artifact =
+            build_legacy_v2_artifact_without_aad(&receiver_xwing, &epoch_key, 5, "receiver");
+
+        let result = decapsulate_and_decrypt_artifact(&artifact, &receiver_xwing, 5, "receiver");
+
+        assert!(result.is_err(), "legacy no-AAD artifact must not decrypt under v2 AAD");
+    }
+
+    #[test]
+    fn rekey_artifact_aad_binds_epoch_and_device() {
+        let aad = build_rekey_artifact_aad(5, "receiver");
+        assert_ne!(aad, build_rekey_artifact_aad(6, "receiver"));
+        assert_ne!(aad, build_rekey_artifact_aad(5, "other-device"));
     }
 
     #[tokio::test]
@@ -879,8 +966,10 @@ mod tests {
         let unwrap_key =
             prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                 .unwrap();
+        let aad = build_rekey_artifact_aad(2, "receiver");
         let decrypted =
-            prism_sync_crypto::aead::xchacha_decrypt(&unwrap_key, encrypted_epoch_key).unwrap();
+            prism_sync_crypto::aead::xchacha_decrypt_aead(&unwrap_key, encrypted_epoch_key, &aad)
+                .unwrap();
         assert_eq!(decrypted.len(), 32);
 
         // Verify decrypted epoch key matches what was stored in the hierarchy

@@ -31,6 +31,10 @@ pub enum AppError {
     TooManyRequests,
     #[error("StorageFull({0})")]
     StorageFull(&'static str),
+    #[error(
+        "MustBootstrapFromSnapshot(since_seq={since_seq}, first_retained_seq={first_retained_seq})"
+    )]
+    MustBootstrapFromSnapshot { since_seq: i64, first_retained_seq: i64 },
     #[error("Internal({0})")]
     Internal(String),
 }
@@ -51,6 +55,7 @@ impl IntoResponse for AppError {
             AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             AppError::StorageFull(_) => StatusCode::INSUFFICIENT_STORAGE,
+            AppError::MustBootstrapFromSnapshot { .. } => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let response = match &self {
@@ -63,6 +68,8 @@ impl IntoResponse for AppError {
                     message: Some("Registered device identity does not match stored keys"),
                     min_signature_version: None,
                     remote_wipe: None,
+                    since_seq: None,
+                    first_retained_seq: None,
                 }),
             )
                 .into_response(),
@@ -73,6 +80,8 @@ impl IntoResponse for AppError {
                     message: Some("Device has been revoked"),
                     min_signature_version: None,
                     remote_wipe: Some(*remote_wipe),
+                    since_seq: None,
+                    first_retained_seq: None,
                 }),
             )
                 .into_response(),
@@ -83,6 +92,8 @@ impl IntoResponse for AppError {
                     message: Some("First-device admission proof is required"),
                     min_signature_version: None,
                     remote_wipe: None,
+                    since_seq: None,
+                    first_retained_seq: None,
                 }),
             )
                 .into_response(),
@@ -93,6 +104,8 @@ impl IntoResponse for AppError {
                     message: Some("First-device admission proof is invalid"),
                     min_signature_version: None,
                     remote_wipe: None,
+                    since_seq: None,
+                    first_retained_seq: None,
                 }),
             )
                 .into_response(),
@@ -105,6 +118,8 @@ impl IntoResponse for AppError {
                     ),
                     min_signature_version: Some(*min_signature_version),
                     remote_wipe: None,
+                    since_seq: None,
+                    first_retained_seq: None,
                 }),
             )
                 .into_response(),
@@ -114,6 +129,18 @@ impl IntoResponse for AppError {
             AppError::PayloadTooLarge(msg) => (status, msg.to_string()).into_response(),
             AppError::TooManyRequests => (status, "Too Many Requests".to_string()).into_response(),
             AppError::StorageFull(msg) => (status, msg.to_string()).into_response(),
+            AppError::MustBootstrapFromSnapshot { since_seq, first_retained_seq } => (
+                status,
+                Json(ErrorBody {
+                    error: "must_bootstrap_from_snapshot",
+                    message: Some("Batch history is no longer complete; bootstrap from snapshot"),
+                    min_signature_version: None,
+                    remote_wipe: None,
+                    since_seq: Some(*since_seq),
+                    first_retained_seq: Some(*first_retained_seq),
+                }),
+            )
+                .into_response(),
             AppError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);
                 (status, "Internal Server Error".to_string()).into_response()
@@ -133,6 +160,10 @@ struct ErrorBody {
     min_signature_version: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_wipe: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_retained_seq: Option<i64>,
 }
 
 impl From<rusqlite::Error> for AppError {

@@ -95,6 +95,70 @@ async fn test_pairing_put_get_slots() {
 }
 
 #[tokio::test]
+async fn test_pairing_terminal_slots_are_single_consume() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+
+    let (rid, _) = create_pairing_session(&client, &url, b"bootstrap").await;
+
+    for (slot_name, slot_data) in
+        [("credentials", b"cred-data" as &[u8]), ("joiner", b"joiner-data" as &[u8])]
+    {
+        let put_resp = client
+            .put(format!("{url}/v1/pairing/{rid}/{slot_name}"))
+            .body(slot_data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 204);
+
+        let first_get =
+            client.get(format!("{url}/v1/pairing/{rid}/{slot_name}")).send().await.unwrap();
+        assert_eq!(first_get.status(), 200);
+        assert_eq!(first_get.bytes().await.unwrap().as_ref(), slot_data);
+
+        let second_get =
+            client.get(format!("{url}/v1/pairing/{rid}/{slot_name}")).send().await.unwrap();
+        assert_eq!(second_get.status(), 404);
+
+        let replace_resp = client
+            .put(format!("{url}/v1/pairing/{rid}/{slot_name}"))
+            .body(b"replacement".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replace_resp.status(), 409);
+    }
+}
+
+#[tokio::test]
+async fn test_pairing_polling_slots_remain_readable() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+
+    let (rid, _) = create_pairing_session(&client, &url, b"bootstrap").await;
+
+    for (slot_name, slot_data) in
+        [("init", b"init-data" as &[u8]), ("confirmation", b"confirm-data" as &[u8])]
+    {
+        let put_resp = client
+            .put(format!("{url}/v1/pairing/{rid}/{slot_name}"))
+            .body(slot_data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 204);
+
+        for _ in 0..2 {
+            let get_resp =
+                client.get(format!("{url}/v1/pairing/{rid}/{slot_name}")).send().await.unwrap();
+            assert_eq!(get_resp.status(), 200);
+            assert_eq!(get_resp.bytes().await.unwrap().as_ref(), slot_data);
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_pairing_put_slot_twice_returns_409() {
     let (url, _server, _db) = start_test_relay().await;
     let client = Client::new();
@@ -180,6 +244,9 @@ async fn test_pairing_expired_session_returns_404() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -308,6 +375,9 @@ async fn test_pairing_rate_limiting_ignores_spoofed_forwarded_headers() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -398,6 +468,9 @@ async fn test_pairing_payload_too_large_returns_413() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -481,6 +554,9 @@ async fn test_pairing_put_slot_payload_too_large() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,

@@ -5,6 +5,7 @@ pub mod cleanup;
 pub mod config;
 pub mod db;
 pub(crate) mod errors;
+pub(crate) mod registration_binding;
 pub mod routes;
 pub mod snapshot_limits;
 pub mod state;

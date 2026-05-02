@@ -8,9 +8,7 @@ use axum::{
 use base64::Engine;
 use serde::Deserialize;
 
-use crate::{
-    db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState,
-};
+use crate::{db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState};
 
 use super::{verify_signed_request, AuthIdentity};
 
@@ -198,17 +196,39 @@ pub async fn pull_changes(
     let db = state.db.clone();
     let sid = sync_id.clone();
 
-    let (batches, min_acked_seq, password_version) = tokio::task::spawn_blocking(move || {
-        db.with_read_conn(|conn| {
-            let batches = db::get_batches_since(conn, &sid, since, limit)?;
-            let min_acked = db::get_min_acked_seq(conn, &sid, stale_threshold)?;
-            let pw_version = db::get_password_version(conn, &sid)?.unwrap_or(0);
-            Ok((batches, min_acked, pw_version))
+    let (first_retained_seq, batches, min_acked_seq, password_version) =
+        tokio::task::spawn_blocking(move || {
+            db.with_read_conn(|conn| {
+                let first_retained = db::get_first_retained_batch_seq(conn, &sid)?;
+                let batches = db::get_batches_since(conn, &sid, since, limit)?;
+                let min_acked = db::get_min_acked_seq(conn, &sid, stale_threshold)?;
+                let pw_version = db::get_password_version(conn, &sid)?.unwrap_or(0);
+                Ok((first_retained, batches, min_acked, pw_version))
+            })
         })
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if let Some(first_retained_seq) = first_retained_seq {
+        // `since` is the last sequence the client says it has applied. The
+        // history is incomplete only when the next expected sequence is already
+        // below the retained floor; `since == first_retained_seq - 1` can still
+        // pull a complete tail starting at the first retained batch.
+        if since.saturating_add(1) < first_retained_seq {
+            tracing::warn!(
+                sync_id = %trunc(&sync_id),
+                device_id = %trunc(&device_id),
+                since,
+                first_retained_seq,
+                "Pull cursor predates retained batch history"
+            );
+            return Err(AppError::MustBootstrapFromSnapshot {
+                since_seq: since,
+                first_retained_seq,
+            });
+        }
+    }
 
     let max_server_seq = batches.iter().map(|b| b.server_seq).max().unwrap_or(since);
 
@@ -339,12 +359,11 @@ pub async fn delete_snapshot(
         None => return Err(AppError::Forbidden("Snapshot has no target device to ACK")),
     }
 
-    let deleted = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| db::delete_snapshot(conn, &sid))
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let deleted =
+        tokio::task::spawn_blocking(move || db.with_conn(|conn| db::delete_snapshot(conn, &sid)))
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if !deleted {
         // Race: TTL cleanup removed the row between our lookup and delete.

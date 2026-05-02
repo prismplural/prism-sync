@@ -12,6 +12,37 @@ pub struct WinningOp {
     pub is_bulk_reset: bool,
 }
 
+/// Reason an op could not be merged with the client's current schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaQuarantineReason {
+    UnknownTable(String),
+    UnknownField { table: String, field: String },
+}
+
+impl SchemaQuarantineReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownTable(_) => "unknown_table",
+            Self::UnknownField { .. } => "unknown_field",
+        }
+    }
+}
+
+/// An op that must be retried after the host upgrades its schema.
+#[derive(Debug, Clone)]
+pub struct QuarantinedChange {
+    pub op: CrdtChange,
+    pub reason: SchemaQuarantineReason,
+}
+
+/// Result of merge winner selection, including schema-unknown ops that should
+/// be persisted for later replay.
+#[derive(Debug, Clone)]
+pub struct MergeOutcome {
+    pub winners: HashMap<String, WinningOp>,
+    pub quarantined: Vec<QuarantinedChange>,
+}
+
 /// Handles per-field LWW merge for incoming remote operations.
 ///
 /// Merge algorithm (faithful port of Dart `DatabaseSyncBridge.applyRemoteChanges`):
@@ -45,6 +76,24 @@ impl MergeEngine {
         Self { schema }
     }
 
+    pub fn schema_quarantine_reason(&self, op: &CrdtChange) -> Option<SchemaQuarantineReason> {
+        let Some(entity_def) = self.schema.entity(&op.entity_table) else {
+            return Some(SchemaQuarantineReason::UnknownTable(op.entity_table.clone()));
+        };
+
+        if op.field_name != "is_deleted"
+            && !op.is_bulk_reset()
+            && entity_def.field_by_name(&op.field_name).is_none()
+        {
+            return Some(SchemaQuarantineReason::UnknownField {
+                table: op.entity_table.clone(),
+                field: op.field_name.clone(),
+            });
+        }
+
+        None
+    }
+
     /// Determine which ops in a batch win the per-field LWW merge.
     ///
     /// Returns a map of op_id -> WinningOp for ops that beat the current field_versions.
@@ -65,7 +114,21 @@ impl MergeEngine {
         is_op_applied: &dyn Fn(&str) -> Result<bool>,
         sync_id: &str,
     ) -> Result<HashMap<String, WinningOp>> {
+        Ok(self
+            .determine_winners_with_quarantine(ops, get_field_version, is_op_applied, sync_id)?
+            .winners)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn determine_winners_with_quarantine(
+        &self,
+        ops: &[CrdtChange],
+        get_field_version: &dyn Fn(&str, &str, &str, &str) -> Result<Option<FieldVersion>>,
+        is_op_applied: &dyn Fn(&str) -> Result<bool>,
+        sync_id: &str,
+    ) -> Result<MergeOutcome> {
         let mut winners: HashMap<String, WinningOp> = HashMap::new();
+        let mut quarantined = Vec::new();
 
         // Track in-batch winners per (entity_table, entity_id, field_name)
         // so that when multiple ops in the same batch target the same field,
@@ -73,25 +136,17 @@ impl MergeEngine {
         let mut batch_winners: HashMap<String, CrdtChange> = HashMap::new();
 
         for op in ops {
-            // Skip unknown tables
-            if !self.schema.has_table(&op.entity_table) {
-                tracing::warn!("Skipping op for unknown table: {}", op.entity_table);
-                continue;
-            }
-
-            // Validate field exists in schema (skip unknown fields with warning),
-            // except "is_deleted" and bulk_reset which are always allowed
-            if op.field_name != "is_deleted" && !op.is_bulk_reset() {
-                if let Some(entity_def) = self.schema.entity(&op.entity_table) {
-                    if entity_def.field_by_name(&op.field_name).is_none() {
-                        tracing::warn!(
-                            "Skipping op for unknown field: {}.{}",
-                            op.entity_table,
-                            op.field_name
-                        );
-                        continue;
+            if let Some(reason) = self.schema_quarantine_reason(op) {
+                match &reason {
+                    SchemaQuarantineReason::UnknownTable(table) => {
+                        tracing::warn!("Quarantining op for unknown table: {table}");
+                    }
+                    SchemaQuarantineReason::UnknownField { table, field } => {
+                        tracing::warn!("Quarantining op for unknown field: {table}.{field}");
                     }
                 }
+                quarantined.push(QuarantinedChange { op: op.clone(), reason });
+                continue;
             }
 
             // Idempotency check: skip already-applied ops
@@ -177,6 +232,6 @@ impl MergeEngine {
             batch_winners.insert(field_key, op.clone());
         }
 
-        Ok(winners)
+        Ok(MergeOutcome { winners, quarantined })
     }
 }

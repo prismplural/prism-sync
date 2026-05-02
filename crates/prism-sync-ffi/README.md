@@ -36,7 +36,7 @@ Never edit files in `dart/packages/prism_sync/lib/generated/` manually -- they a
 | `is_unlocked(handle)` | Check if keys are available |
 | `generate_secret_key()` | Generate new BIP39 12-word mnemonic |
 | `database_key(handle)` | Derive database encryption key |
-| `change_password(handle, old_password, new_password, secret_key)` | Re-wrap DEK under new password |
+| `change_password(handle, new_password, secret_key)` | Re-wrap DEK under new password bytes |
 
 ### Mutation Recording
 | Function | Description |

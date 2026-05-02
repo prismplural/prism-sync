@@ -651,10 +651,10 @@ fn test_already_applied_ops_skipped() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 11. Unknown table/field ops are skipped
+// 11. Unknown table/field ops do not produce winners
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Ops targeting unknown tables should be silently skipped.
+/// Ops targeting unknown tables should not be merged immediately.
 #[test]
 fn test_unknown_table_ops_skipped() {
     let schema = test_schema();
@@ -670,7 +670,7 @@ fn test_unknown_table_ops_skipped() {
     assert!(winners.is_empty(), "op for unknown table should be skipped");
 }
 
-/// Ops targeting unknown fields should be silently skipped.
+/// Ops targeting unknown fields should not be merged immediately.
 #[test]
 fn test_unknown_field_ops_skipped() {
     let schema = test_schema();
@@ -683,6 +683,37 @@ fn test_unknown_field_ops_skipped() {
         merge.determine_winners(&[op], &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
 
     assert!(winners.is_empty(), "op for unknown field should be skipped");
+}
+
+#[test]
+fn unknown_schema_ops_are_reported_for_quarantine() {
+    let schema = test_schema();
+    let merge = MergeEngine::new(schema);
+
+    let hlc = Hlc::new(5000, 0, "dev-a");
+    let mut unknown_table = make_op("t1", "title", "\"Hello\"", &hlc, "dev-a", None);
+    unknown_table.entity_table = "future_table".to_string();
+    let unknown_field = make_op("t1", "future_field", "\"Hello\"", &hlc, "dev-a", None);
+
+    let outcome = merge
+        .determine_winners_with_quarantine(
+            &[unknown_table, unknown_field],
+            &no_field_versions,
+            &no_ops_applied,
+            SYNC_ID,
+        )
+        .unwrap();
+
+    assert!(outcome.winners.is_empty());
+    assert_eq!(outcome.quarantined.len(), 2);
+    assert!(matches!(
+        outcome.quarantined[0].reason,
+        prism_sync_core::engine::SchemaQuarantineReason::UnknownTable(_)
+    ));
+    assert!(matches!(
+        outcome.quarantined[1].reason,
+        prism_sync_core::engine::SchemaQuarantineReason::UnknownField { .. }
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

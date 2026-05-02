@@ -140,6 +140,66 @@ async fn publish_prekey(
     builder.send().await.unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn post_sharing_init(
+    client: &Client,
+    url: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    sync_id: &str,
+    device_id: &str,
+    init_id: &str,
+    recipient_id: &str,
+    sender_id: &str,
+    payload: &[u8],
+) -> reqwest::Response {
+    let body = serde_json::json!({
+        "init_id": init_id,
+        "recipient_id": recipient_id,
+        "sender_id": sender_id,
+        "payload": b64_encode(payload),
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let builder = client
+        .post(format!("{url}/v1/sharing/init"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(body_bytes.clone());
+    let builder = apply_signed_headers(
+        builder,
+        keys,
+        "POST",
+        "/v1/sharing/init",
+        sync_id,
+        device_id,
+        &body_bytes,
+    );
+    builder.send().await.unwrap()
+}
+
+async fn fetch_pending_sharing_inits(
+    client: &Client,
+    url: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    sync_id: &str,
+    device_id: &str,
+) -> reqwest::Response {
+    let builder = client
+        .get(format!("{url}/v1/sharing/init/pending"))
+        .header("Authorization", format!("Bearer {token}"));
+    let builder = apply_signed_headers(
+        builder,
+        keys,
+        "GET",
+        "/v1/sharing/init/pending",
+        sync_id,
+        device_id,
+        &[],
+    );
+    builder.send().await.unwrap()
+}
+
 #[tokio::test]
 async fn test_publish_identity_and_fetch_bundle() {
     let (url, _handle, _db) = start_test_relay().await;
@@ -699,6 +759,139 @@ async fn test_duplicate_init_id_returns_409() {
 }
 
 #[tokio::test]
+async fn test_consumed_init_id_replay_rejected_after_restart_and_cleanup() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config();
+    config.db_path = temp_dir.path().join("relay.db").to_string_lossy().to_string();
+    config.media_storage_path = temp_dir.path().join("media").to_string_lossy().to_string();
+    config.sharing_init_ttl_secs = 7 * 86400;
+
+    let (url, handle, db) = start_test_relay_with_config(config.clone()).await;
+    let client = Client::new();
+
+    let sender_sync_id = generate_sync_id();
+    let sender_device_id = generate_device_id();
+    let sender_keys = TestDeviceKeys::generate(&sender_device_id);
+    let sender_token =
+        register_device(&client, &url, &sender_sync_id, &sender_device_id, &sender_keys).await;
+    let sender_sharing_id = generate_sharing_id();
+    let resp = publish_identity(
+        &client,
+        &url,
+        &sender_token,
+        &sender_keys,
+        &sender_sync_id,
+        &sender_device_id,
+        &sender_sharing_id,
+        b"sender-identity",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let recipient_sync_id = generate_sync_id();
+    let recipient_device_id = generate_device_id();
+    let recipient_keys = TestDeviceKeys::generate(&recipient_device_id);
+    let recipient_token =
+        register_device(&client, &url, &recipient_sync_id, &recipient_device_id, &recipient_keys)
+            .await;
+    let recipient_sharing_id = generate_sharing_id();
+    let resp = publish_identity(
+        &client,
+        &url,
+        &recipient_token,
+        &recipient_keys,
+        &recipient_sync_id,
+        &recipient_device_id,
+        &recipient_sharing_id,
+        b"recipient-identity",
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    let init_id = generate_sharing_id();
+    let resp = post_sharing_init(
+        &client,
+        &url,
+        &sender_token,
+        &sender_keys,
+        &sender_sync_id,
+        &sender_device_id,
+        &init_id,
+        &recipient_sharing_id,
+        &sender_sharing_id,
+        b"encrypted-init",
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+
+    let resp = fetch_pending_sharing_inits(
+        &client,
+        &url,
+        &recipient_token,
+        &recipient_keys,
+        &recipient_sync_id,
+        &recipient_device_id,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["payloads"].as_array().unwrap().len(), 1);
+
+    handle.abort();
+    let _ = handle.await;
+    drop(db);
+
+    let (restarted_url, restarted_handle, restarted_db) =
+        start_test_relay_with_config(config).await;
+    restarted_db
+        .with_conn(|conn| {
+            let now = db::now_secs();
+            let updated = conn.execute(
+                "UPDATE sharing_init_payloads
+                 SET consumed_at = ?1, expires_at = ?2
+                 WHERE init_id = ?3",
+                params![now - 86401, now + 3600, &init_id],
+            )?;
+            assert_eq!(updated, 1, "consumed sharing-init row should exist after restart");
+
+            let cleaned = db::cleanup_expired_sharing_init_payloads(conn)?;
+            assert_eq!(cleaned, 0, "consumed rows inside their TTL must remain as tombstones");
+
+            let retained: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sharing_init_payloads WHERE init_id = ?1",
+                params![&init_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(retained, 1, "cleanup must retain consumed init_id until expiry");
+
+            Ok(())
+        })
+        .unwrap();
+
+    let replay = post_sharing_init(
+        &client,
+        &restarted_url,
+        &sender_token,
+        &sender_keys,
+        &sender_sync_id,
+        &sender_device_id,
+        &init_id,
+        &recipient_sharing_id,
+        &sender_sharing_id,
+        b"replayed-init",
+    )
+    .await;
+    assert_eq!(
+        replay.status(),
+        409,
+        "consumed init_id must reject replay after restart and cleanup while TTL is active"
+    );
+
+    restarted_handle.abort();
+    let _ = restarted_handle.await;
+}
+
+#[tokio::test]
 async fn test_max_pending_limit_enforced() {
     let config = Config {
         port: 0,
@@ -716,6 +909,9 @@ async fn test_max_pending_limit_enforced() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -982,7 +1178,7 @@ async fn test_delete_identity_preserves_generation_floor_for_identical_republish
 }
 
 #[tokio::test]
-async fn test_cleanup_removes_expired_and_consumed_sharing_inits() {
+async fn test_cleanup_removes_expired_sharing_inits_and_keeps_consumed_tombstones() {
     let db = Database::in_memory().expect("in-memory db");
     db.with_conn(|conn| {
         let now = db::now_secs();
@@ -995,7 +1191,7 @@ async fn test_cleanup_removes_expired_and_consumed_sharing_inits() {
             rusqlite::params![now - 100, now - 1],
         )?;
 
-        // Create a consumed payload older than 24h
+        // Create a consumed payload older than 24h, but still inside its original TTL.
         conn.execute(
             "INSERT INTO sharing_init_payloads
              (init_id, recipient_id, sender_id, payload, created_at, consumed_at, expires_at)
@@ -1019,13 +1215,26 @@ async fn test_cleanup_removes_expired_and_consumed_sharing_inits() {
             rusqlite::params![now - 100, now - 100, now + 86400],
         )?;
 
+        let pending_before = db::count_pending_sharing_inits(conn, "r1")?;
+        assert_eq!(pending_before, 1, "expired and consumed rows must not count as pending");
+
         let cleaned = db::cleanup_expired_sharing_init_payloads(conn)?;
-        assert_eq!(cleaned, 2, "should clean expired + old consumed");
+        assert_eq!(cleaned, 1, "cleanup should remove only expired rows");
 
         // Verify remaining
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM sharing_init_payloads", [], |row| row.get(0))?;
-        assert_eq!(count, 2, "valid + recently consumed should remain");
+        assert_eq!(count, 3, "valid + consumed tombstones should remain until expiry");
+
+        let expired_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sharing_init_payloads WHERE init_id = 'expired1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(expired_count, 0, "expired init should be cleaned up");
+
+        let pending_after = db::count_pending_sharing_inits(conn, "r1")?;
+        assert_eq!(pending_after, 1, "cleanup must not leave expired rows pending");
 
         Ok(())
     })
@@ -1098,6 +1307,9 @@ async fn test_bundle_fetch_rate_limiting_ignores_spoofed_forwarded_headers() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,
@@ -1225,6 +1437,9 @@ async fn test_sharing_init_upload_rate_limiting() {
         nonce_rate_window_secs: 60,
         revoke_rate_limit: 100,
         revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 20,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
         signed_request_max_skew_secs: 60,
         signed_request_nonce_window_secs: 120,
         snapshot_default_ttl_secs: 86400,

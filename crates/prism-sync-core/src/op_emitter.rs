@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::hlc::Hlc;
 use crate::schema::{encode_value, SyncValue};
 use crate::storage::{FieldVersion, PendingOp, SyncStorage};
@@ -17,9 +17,9 @@ pub const DELETED_FIELD: &str = "is_deleted";
 /// - Creating a `local_batch_id` (UUID v4) shared by all ops in one transaction
 /// - Invoking `emit_create`, `emit_update`, or `emit_delete`
 ///
-/// The OpEmitter ticks the HLC once per call and stamps every op in that
-/// invocation with the same HLC value, ensuring causal consistency within
-/// a batch.
+/// The OpEmitter ticks the HLC once per op-emitting call and stamps every op
+/// in that invocation with the same HLC value, ensuring causal consistency
+/// within a batch.
 ///
 /// Ported from Dart `lib/core/sync/op_emitter.dart`.
 pub struct OpEmitter {
@@ -32,6 +32,17 @@ pub struct OpEmitter {
 impl OpEmitter {
     pub fn new(device_id: String, sync_id: String, epoch: i32, last_hlc: Option<Hlc>) -> Self {
         let last_hlc = last_hlc.unwrap_or_else(|| Hlc::zero(&device_id));
+        let last_hlc = if Self::can_inherit_hlc(&device_id, &last_hlc) {
+            last_hlc
+        } else {
+            tracing::warn!(
+                device_id = %device_id,
+                incoming_node_id = %last_hlc.node_id,
+                incoming_timestamp = last_hlc.timestamp,
+                "Ignoring future remote HLC watermark for local emitter"
+            );
+            Hlc::zero(&device_id)
+        };
         Self { device_id, sync_id, epoch, last_hlc }
     }
 
@@ -52,15 +63,31 @@ impl OpEmitter {
     /// Used after bootstrap/snapshot imports so locally minted HLCs never
     /// fall behind state that was seeded from an external source.
     pub fn set_last_hlc(&mut self, new_hlc: Hlc) {
+        if !Self::can_inherit_hlc(&self.device_id, &new_hlc) {
+            tracing::warn!(
+                device_id = %self.device_id,
+                incoming_node_id = %new_hlc.node_id,
+                incoming_timestamp = new_hlc.timestamp,
+                "Ignoring future remote HLC watermark for local emitter"
+            );
+            return;
+        }
+
         if new_hlc > self.last_hlc {
             self.last_hlc = new_hlc;
         }
     }
 
+    fn can_inherit_hlc(device_id: &str, hlc: &Hlc) -> bool {
+        hlc.node_id == device_id || !hlc.is_future()
+    }
+
     /// Tick the HLC once and return the new value.
-    fn tick(&mut self) -> Hlc {
-        self.last_hlc = Hlc::now(&self.device_id, Some(&self.last_hlc));
-        self.last_hlc.clone()
+    fn tick(&mut self) -> Result<Hlc> {
+        let next_hlc = Hlc::try_now(&self.device_id, Some(&self.last_hlc))
+            .map_err(|e| CoreError::Engine(e.to_string()))?;
+        self.last_hlc = next_hlc.clone();
+        Ok(next_hlc)
     }
 
     /// Emit ops for a newly created entity.
@@ -75,7 +102,11 @@ impl OpEmitter {
         fields: &HashMap<String, SyncValue>,
         local_batch_id: &str,
     ) -> Result<()> {
-        let hlc = self.tick();
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
 
@@ -143,7 +174,7 @@ impl OpEmitter {
             return Ok(());
         }
 
-        let hlc = self.tick();
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
 
@@ -220,7 +251,7 @@ impl OpEmitter {
             return Ok(());
         }
 
-        let hlc = self.tick();
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
 
@@ -266,7 +297,7 @@ impl OpEmitter {
         entity_id: &str,
         local_batch_id: &str,
     ) -> Result<()> {
-        let hlc = self.tick();
+        let hlc = self.tick()?;
         let hlc_string = hlc.to_string();
         let now = Utc::now();
         let op_id = Uuid::new_v4().to_string();
@@ -325,6 +356,11 @@ mod tests {
 
     fn make_emitter() -> OpEmitter {
         OpEmitter::new("a1b2c3d4e5f6".to_string(), "sync-1".to_string(), 1, None)
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64
     }
 
     fn make_fields() -> HashMap<String, SyncValue> {
@@ -396,6 +432,76 @@ mod tests {
 
         // HLC should NOT have advanced (no tick for empty update)
         assert_eq!(*emitter.last_hlc(), hlc_before);
+    }
+
+    #[test]
+    fn emit_create_skips_empty_fields() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        let hlc_before = emitter.last_hlc().clone();
+
+        let empty: HashMap<String, SyncValue> = HashMap::new();
+        emitter.emit_create(&storage, "members", "ent-1", &empty, "batch-empty-create").unwrap();
+
+        let ops = storage.load_batch_ops("batch-empty-create").unwrap();
+        assert!(ops.is_empty());
+        assert_eq!(*emitter.last_hlc(), hlc_before);
+    }
+
+    #[test]
+    fn emit_update_returns_error_without_writing_when_hlc_counter_overflows() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        let saturated = Hlc::new(now_ms() + 100_000, u32::MAX, "a1b2c3d4e5f6");
+        emitter.set_last_hlc(saturated.clone());
+
+        let mut changed = HashMap::new();
+        changed.insert("name".to_string(), SyncValue::String("Bob".to_string()));
+
+        let err = emitter
+            .emit_update(&storage, "members", "ent-1", &changed, "batch-overflow")
+            .unwrap_err();
+        assert!(err.to_string().contains("HLC counter overflow"));
+        assert_eq!(*emitter.last_hlc(), saturated);
+
+        let ops = storage.load_batch_ops("batch-overflow").unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn new_ignores_future_remote_initial_hlc() {
+        let local_device = "a1b2c3d4e5f6";
+        let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
+
+        let emitter = OpEmitter::new(
+            local_device.to_string(),
+            "sync-1".to_string(),
+            1,
+            Some(future_remote_hlc),
+        );
+
+        assert_eq!(emitter.last_hlc(), &Hlc::zero(local_device));
+    }
+
+    #[test]
+    fn set_last_hlc_ignores_future_remote_hlc() {
+        let mut emitter = make_emitter();
+        let original = emitter.last_hlc().clone();
+        let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
+
+        emitter.set_last_hlc(future_remote_hlc);
+
+        assert_eq!(*emitter.last_hlc(), original);
+    }
+
+    #[test]
+    fn set_last_hlc_accepts_past_remote_hlc() {
+        let mut emitter = make_emitter();
+        let remote_hlc = Hlc::new(1_710_500_000_000, 0, "remote-device");
+
+        emitter.set_last_hlc(remote_hlc.clone());
+
+        assert_eq!(emitter.last_hlc(), &remote_hlc);
     }
 
     #[test]

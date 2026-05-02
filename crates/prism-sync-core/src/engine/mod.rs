@@ -1,7 +1,7 @@
 pub mod merge;
 pub mod state;
 
-pub use merge::{MergeEngine, WinningOp};
+pub use merge::{MergeEngine, QuarantinedChange, SchemaQuarantineReason, WinningOp};
 pub use state::{SyncConfig, SyncResult, SyncState};
 
 use std::collections::{HashMap, HashSet};
@@ -23,7 +23,10 @@ use crate::relay::{OutgoingBatch, SyncRelay};
 use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::snapshot_limits;
 use crate::storage::StorageError;
-use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, SyncStorage};
+use crate::storage::{
+    AppliedOp, DeviceRecord, FieldVersion, FieldVersionEntry, QuarantinedOp, SyncMetadata,
+    SyncStorage,
+};
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
 
@@ -83,9 +86,36 @@ fn populate_result_error(result: &mut SyncResult, e: &CoreError) {
     }
 }
 
-fn should_bubble_pull_error(error: &CoreError) -> bool {
+fn should_bubble_recoverable_key_error(error: &CoreError) -> bool {
     matches!(error, CoreError::MissingEpochKey { .. } | CoreError::DecryptFailed { .. })
 }
+
+fn is_must_bootstrap_from_snapshot(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Relay {
+            code: Some(code),
+            ..
+        } if code == "must_bootstrap_from_snapshot"
+    )
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_remote_op_matches_sender(op: &CrdtChange, trusted_sender_device_id: &str) {
+    debug_assert_eq!(
+        op.device_id, trusted_sender_device_id,
+        "remote op.device_id must match trusted envelope sender at persistence"
+    );
+    let hlc = Hlc::from_string(&op.client_hlc)
+        .expect("validated remote op HLC should parse at persistence");
+    debug_assert_eq!(
+        hlc.node_id, trusted_sender_device_id,
+        "remote op.client_hlc node id must match trusted envelope sender at persistence"
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_remote_op_matches_sender(_op: &CrdtChange, _trusted_sender_device_id: &str) {}
 
 /// Result of the pull phase, bundling counts with relay-reported metadata.
 struct PullPhaseResult {
@@ -174,15 +204,58 @@ impl SyncEngine {
         let start = Instant::now();
         let mut result = SyncResult::default();
 
+        // Phase 0: replay remote ops that were quarantined because this
+        // client did not yet know their schema. A newly configured schema can
+        // make those ops valid without needing the relay to resend old history.
+        self.set_state(SyncState::Merging);
+        match self.replay_quarantined_ops(sync_id).await {
+            Ok((merged, changes)) => {
+                result.merged += merged;
+                result.entity_changes.extend(changes);
+            }
+            Err(e) => {
+                populate_result_error(&mut result, &e);
+                result.duration = start.elapsed();
+                self.set_state(SyncState::Error { message: e.to_string() });
+                return Ok(result);
+            }
+        }
+
         // Phase 1: Pull
         self.set_state(SyncState::Pulling);
         let pull_result = self.pull_phase(sync_id, key_hierarchy, device_id).await;
+        let pull_result = match pull_result {
+            Ok(pr) => Ok(pr),
+            Err(e) if is_must_bootstrap_from_snapshot(&e) => {
+                tracing::warn!(
+                    "pull cursor predates retained relay history; attempting snapshot bootstrap"
+                );
+                match self.bootstrap_from_snapshot(sync_id, key_hierarchy).await {
+                    // The relay rejected our cursor and no snapshot is
+                    // available to recover from — retrying the pull would just
+                    // hit the same `MustBootstrapFromSnapshot` again, so
+                    // surface a real error instead of looping silently.
+                    Ok((0, _)) => Err(CoreError::Engine(
+                        "relay required snapshot bootstrap but no snapshot is available; \
+                         another paired device must upload a fresh snapshot before this device \
+                         can sync"
+                            .to_string(),
+                    )),
+                    Ok((_snapshot_entities, snapshot_changes)) => {
+                        result.entity_changes.extend(snapshot_changes);
+                        self.pull_phase(sync_id, key_hierarchy, device_id).await
+                    }
+                    Err(bootstrap_err) => Err(bootstrap_err),
+                }
+            }
+            Err(e) => Err(e),
+        };
         let min_acked_seq;
         match pull_result {
             Ok(pr) => {
                 result.pulled = pr.pulled;
-                result.merged = pr.merged;
-                result.entity_changes = pr.entity_changes;
+                result.merged += pr.merged;
+                result.entity_changes.extend(pr.entity_changes);
                 min_acked_seq = pr.min_acked_seq;
 
                 // Acknowledge processed ops so relay can prune its batches (fire-and-forget)
@@ -197,7 +270,7 @@ impl SyncEngine {
                 }
             }
             Err(e) => {
-                if should_bubble_pull_error(&e) {
+                if should_bubble_recoverable_key_error(&e) {
                     self.set_state(SyncState::Error { message: e.to_string() });
                     return Err(e);
                 }
@@ -256,6 +329,10 @@ impl SyncEngine {
                 result.pushed = pushed;
             }
             Err(e) => {
+                if should_bubble_recoverable_key_error(&e) {
+                    self.set_state(SyncState::Error { message: e.to_string() });
+                    return Err(e);
+                }
                 populate_result_error(&mut result, &e);
                 result.duration = start.elapsed();
                 self.set_state(SyncState::Error { message: e.to_string() });
@@ -388,10 +465,11 @@ impl SyncEngine {
                     sender_key_info
                 };
 
-            if let Err(e) = batch_signature::verify_batch_signature(
+            if let Err(e) = batch_signature::verify_batch_signature_for_generation(
                 envelope,
                 &sender_key_info.ed25519_pk,
                 &sender_key_info.ml_dsa_65_pk,
+                sender_key_info.ml_dsa_key_generation,
             ) {
                 tracing::warn!(
                     "Skipping batch {} with invalid signature from {}: {e}",
@@ -444,24 +522,17 @@ impl SyncEngine {
 
             // Decode ops
             let ops = CrdtChange::decode_batch(&plaintext)?;
-
-            // Clock drift check
-            for op in &ops {
-                let hlc = Hlc::from_string(&op.client_hlc)?;
-                if hlc.is_drift_exceeded(self.config.max_clock_drift_ms) {
-                    let now_hlc = Hlc::now(device_id, None);
-                    return Err(CoreError::ClockDrift {
-                        drift_ms: hlc.timestamp - now_hlc.timestamp,
-                        max_ms: self.config.max_clock_drift_ms,
-                        device_id: op.device_id.clone(),
-                    });
-                }
-            }
+            let ops = Self::filter_batch_ops(
+                ops,
+                &envelope.sender_device_id,
+                self.config.max_clock_drift_ms,
+            )?;
 
             // Merge phase
             self.set_state(SyncState::Merging);
-            let (merged, batch_changes) =
-                self.apply_remote_batch(sync_id, &ops, batch.server_seq).await?;
+            let (merged, batch_changes) = self
+                .apply_remote_batch(sync_id, &ops, batch.server_seq, &envelope.sender_device_id)
+                .await?;
             total_merged += merged;
             all_entity_changes.extend(batch_changes);
             total_pulled += 1;
@@ -709,6 +780,220 @@ impl SyncEngine {
         }
     }
 
+    fn entity_changes_from_winning_ops(winning_ops: &[CrdtChange]) -> Vec<EntityChange> {
+        let mut change_map: HashMap<(String, String), EntityChange> = HashMap::new();
+        for op in winning_ops {
+            let key = (op.entity_table.clone(), op.entity_id.clone());
+            let entry = change_map.entry(key).or_insert_with(|| EntityChange {
+                table: op.entity_table.clone(),
+                entity_id: op.entity_id.clone(),
+                is_delete: false,
+                fields: HashMap::new(),
+            });
+            if op.is_delete {
+                entry.is_delete = true;
+                entry.fields.clear();
+            } else {
+                entry.fields.insert(op.field_name.clone(), op.encoded_value.clone());
+            }
+        }
+        change_map.into_values().collect()
+    }
+
+    async fn write_winning_ops_to_entities(&self, winning_ops: &[CrdtChange]) -> Result<()> {
+        if winning_ops.is_empty() {
+            return Ok(());
+        }
+
+        let mut tables_touched: HashSet<String> = HashSet::new();
+        for op in winning_ops {
+            tables_touched.insert(op.entity_table.clone());
+        }
+
+        for entity in &self.entities {
+            if tables_touched.contains(entity.table_name()) {
+                entity.begin_batch().await?;
+            }
+        }
+
+        let write_result: Result<()> = async {
+            for op in winning_ops {
+                if let Some(entity) =
+                    self.entities.iter().find(|e| e.table_name() == op.entity_table)
+                {
+                    if op.is_delete {
+                        entity.soft_delete(&op.entity_id, &op.client_hlc).await?;
+                    } else {
+                        let sync_type = self
+                            .schema
+                            .entity(&op.entity_table)
+                            .and_then(|e| e.field_by_name(&op.field_name))
+                            .map(|f| f.sync_type)
+                            .unwrap_or(SyncType::String);
+                        let decoded =
+                            match crate::schema::decode_value(&op.encoded_value, sync_type) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        table = %op.entity_table,
+                                        entity_id = %op.entity_id,
+                                        field = %op.field_name,
+                                        encoded_value = %op.encoded_value,
+                                        "Skipping field op with type mismatch: {e}. \
+                                         Dart-side quarantine will record the bad value."
+                                    );
+                                    continue;
+                                }
+                            };
+                        let mut fields = HashMap::new();
+                        fields.insert(op.field_name.clone(), decoded);
+                        entity.write_fields(&op.entity_id, &fields, &op.client_hlc, false).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        match write_result {
+            Ok(()) => {
+                for entity in &self.entities {
+                    if tables_touched.contains(entity.table_name()) {
+                        entity.commit_batch().await?;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                for entity in &self.entities {
+                    if tables_touched.contains(entity.table_name()) {
+                        let _ = entity.rollback_batch().await;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Replay quarantined ops that are now known to the configured schema.
+    async fn replay_quarantined_ops(&self, sync_id: &str) -> Result<(u64, Vec<EntityChange>)> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let quarantined = tokio::task::spawn_blocking(move || storage.list_quarantined_ops(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        let replayable: Vec<QuarantinedOp> = quarantined
+            .into_iter()
+            .filter(|q| self.merge_engine.schema_quarantine_reason(&q.op).is_none())
+            .collect();
+
+        if replayable.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let ops: Vec<CrdtChange> = replayable.iter().map(|q| q.op.clone()).collect();
+        let seq_by_op: HashMap<String, i64> =
+            replayable.iter().map(|q| (q.op_id.clone(), q.server_seq)).collect();
+
+        // Phase A: determine which now-schema-known ops win against current state.
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let ops_vec = ops.clone();
+        let merge_engine = self.merge_engine.clone();
+        let seq_by_op_for_check = seq_by_op.clone();
+
+        let (all_ops_checked, winning_ops) = tokio::task::spawn_blocking(move || {
+            let mut checked: Vec<(CrdtChange, bool, i64)> = Vec::new();
+            let get_fv = |sync_id: &str, table: &str, entity_id: &str, field: &str| {
+                storage.get_field_version(sync_id, table, entity_id, field)
+            };
+            let is_applied = |op_id: &str| storage.is_op_applied(op_id);
+
+            let outcome = merge_engine.determine_winners_with_quarantine(
+                &ops_vec,
+                &get_fv,
+                &is_applied,
+                &sid,
+            )?;
+
+            for op in &ops_vec {
+                if merge_engine.schema_quarantine_reason(op).is_some() {
+                    continue;
+                }
+                let already_applied = is_applied(&op.op_id)?;
+                let server_seq = seq_by_op_for_check.get(&op.op_id).copied().unwrap_or_default();
+                checked.push((op.clone(), already_applied, server_seq));
+            }
+
+            let winning_ops: Vec<CrdtChange> =
+                outcome.winners.into_values().filter(|w| !w.is_bulk_reset).map(|w| w.op).collect();
+
+            Ok::<_, CoreError>((checked, winning_ops))
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        let merged_count = winning_ops.len() as u64;
+        let entity_changes = Self::entity_changes_from_winning_ops(&winning_ops);
+
+        // Phase B: write now-winning entity changes before sync bookkeeping.
+        if !winning_ops.is_empty() {
+            self.write_winning_ops_to_entities(&winning_ops).await?;
+        }
+
+        // Phase C: mark replayed known ops applied and remove them from quarantine.
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let replayed_op_ids: Vec<String> = replayable.into_iter().map(|q| q.op_id).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = storage.begin_tx()?;
+
+            for (op, was_already_applied, server_seq) in &all_ops_checked {
+                // Replayed quarantined ops were admitted only after envelope
+                // attribution validation. The persisted op device is the
+                // trusted sender identity available on replay.
+                debug_assert_remote_op_matches_sender(op, &op.device_id);
+                if !was_already_applied {
+                    tx.insert_applied_op(&AppliedOp {
+                        op_id: op.op_id.clone(),
+                        sync_id: sid.clone(),
+                        epoch: op.epoch,
+                        device_id: op.device_id.clone(),
+                        client_hlc: op.client_hlc.clone(),
+                        server_seq: *server_seq,
+                        applied_at: chrono::Utc::now(),
+                    })?;
+                }
+            }
+
+            for op in &winning_ops {
+                debug_assert_remote_op_matches_sender(op, &op.device_id);
+                tx.upsert_field_version(&FieldVersion {
+                    sync_id: sid.clone(),
+                    entity_table: op.entity_table.clone(),
+                    entity_id: op.entity_id.clone(),
+                    field_name: op.field_name.clone(),
+                    winning_op_id: op.op_id.clone(),
+                    winning_device_id: op.device_id.clone(),
+                    winning_hlc: op.client_hlc.clone(),
+                    winning_encoded_value: Some(op.encoded_value.clone()),
+                    updated_at: chrono::Utc::now(),
+                })?;
+            }
+
+            for op_id in &replayed_op_ids {
+                tx.delete_quarantined_op(&sid, op_id)?;
+            }
+
+            tx.commit()
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        Ok((merged_count, entity_changes))
+    }
+
     /// Apply a single remote batch: determine winners, write consumer data, then persist sync state.
     ///
     /// Returns `(merged_count, entity_changes)` where `entity_changes` contains the
@@ -725,53 +1010,54 @@ impl SyncEngine {
         sync_id: &str,
         ops: &[CrdtChange],
         server_seq: i64,
+        envelope_sender_device_id: &str,
     ) -> Result<(u64, Vec<EntityChange>)> {
         // Phase A: Determine winners (READ-ONLY -- no sync state persisted yet)
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         let ops_vec = ops.to_vec();
-        let schema = self.schema.clone();
         let merge_engine = self.merge_engine.clone();
 
-        let (all_ops_checked, winning_ops) = tokio::task::spawn_blocking(move || {
-            // Track which ops were already applied (for Phase C bookkeeping)
-            let mut checked: Vec<(CrdtChange, bool)> = Vec::new();
+        let (all_ops_checked, winning_ops, quarantined_ops) =
+            tokio::task::spawn_blocking(move || {
+                // Track which ops were already applied (for Phase C bookkeeping)
+                let mut checked: Vec<(CrdtChange, bool)> = Vec::new();
 
-            // Use non-transactional reads for winner determination
-            let get_fv = |sync_id: &str, table: &str, entity_id: &str, field: &str| {
-                storage.get_field_version(sync_id, table, entity_id, field)
-            };
-            let is_applied = |op_id: &str| storage.is_op_applied(op_id);
+                // Use non-transactional reads for winner determination
+                let get_fv = |sync_id: &str, table: &str, entity_id: &str, field: &str| {
+                    storage.get_field_version(sync_id, table, entity_id, field)
+                };
+                let is_applied = |op_id: &str| storage.is_op_applied(op_id);
 
-            // Determine winners via MergeEngine
-            let winners = merge_engine.determine_winners(&ops_vec, &get_fv, &is_applied, &sid)?;
+                // Determine winners via MergeEngine
+                let outcome = merge_engine.determine_winners_with_quarantine(
+                    &ops_vec,
+                    &get_fv,
+                    &is_applied,
+                    &sid,
+                )?;
 
-            // Build the checked ops list for bookkeeping
-            for op in &ops_vec {
-                if !schema.has_table(&op.entity_table) {
-                    continue;
+                // Build the checked ops list for bookkeeping
+                for op in &ops_vec {
+                    if merge_engine.schema_quarantine_reason(op).is_some() {
+                        continue;
+                    }
+                    let already_applied = is_applied(&op.op_id)?;
+                    checked.push((op.clone(), already_applied));
                 }
-                if op.field_name != "is_deleted"
-                    && !op.is_bulk_reset()
-                    && schema
-                        .entity(&op.entity_table)
-                        .and_then(|e| e.field_by_name(&op.field_name))
-                        .is_none()
-                {
-                    continue;
-                }
-                let already_applied = is_applied(&op.op_id)?;
-                checked.push((op.clone(), already_applied));
-            }
 
-            // Collect winning ops as a Vec
-            let winning_ops: Vec<CrdtChange> =
-                winners.into_values().filter(|w| !w.is_bulk_reset).map(|w| w.op).collect();
+                // Collect winning ops as a Vec
+                let winning_ops: Vec<CrdtChange> = outcome
+                    .winners
+                    .into_values()
+                    .filter(|w| !w.is_bulk_reset)
+                    .map(|w| w.op)
+                    .collect();
 
-            Ok::<_, CoreError>((checked, winning_ops))
-        })
-        .await
-        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+                Ok::<_, CoreError>((checked, winning_ops, outcome.quarantined))
+            })
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         let merged_count = winning_ops.len() as u64;
 
@@ -883,11 +1169,26 @@ impl SyncEngine {
             let sid = sync_id.to_string();
             let ops_checked = all_ops_checked;
             let winners = winning_ops;
+            let quarantined = quarantined_ops;
+            let trusted_sender = envelope_sender_device_id.to_string();
             tokio::task::spawn_blocking(move || {
                 let mut tx = storage.begin_tx()?;
 
+                for quarantined in &quarantined {
+                    debug_assert_remote_op_matches_sender(&quarantined.op, &trusted_sender);
+                    tx.insert_quarantined_op(&QuarantinedOp {
+                        sync_id: sid.clone(),
+                        op_id: quarantined.op.op_id.clone(),
+                        op: quarantined.op.clone(),
+                        reason: quarantined.reason.as_str().to_string(),
+                        server_seq,
+                        quarantined_at: chrono::Utc::now(),
+                    })?;
+                }
+
                 // Record all valid ops as applied (for idempotency on replay)
                 for (op, was_already_applied) in &ops_checked {
+                    debug_assert_remote_op_matches_sender(op, &trusted_sender);
                     if !was_already_applied {
                         tx.insert_applied_op(&AppliedOp {
                             op_id: op.op_id.clone(),
@@ -903,6 +1204,7 @@ impl SyncEngine {
 
                 // Update field_versions for winning ops only
                 for op in &winners {
+                    debug_assert_remote_op_matches_sender(op, &trusted_sender);
                     tx.upsert_field_version(&FieldVersion {
                         sync_id: sid.clone(),
                         entity_table: op.entity_table.clone(),
@@ -1024,7 +1326,13 @@ impl SyncEngine {
 
             // Get epoch key for encryption
             let epoch_key = key_hierarchy.epoch_key(epoch as u32).map_err(|_| {
-                CoreError::Engine(format!("Missing epoch key for push epoch {epoch}"))
+                tracing::error!(
+                    push_epoch = epoch,
+                    batch_id = %batch_id,
+                    known_epochs = ?key_hierarchy.known_epochs(),
+                    "engine: missing epoch key — cannot encrypt pending batch"
+                );
+                CoreError::MissingEpochKey { epoch: epoch as u32 }
             })?;
 
             // Build AAD and encrypt
@@ -1062,7 +1370,7 @@ impl SyncEngine {
             tokio::task::spawn_blocking(move || {
                 let mut tx = storage.begin_tx()?;
                 tx.mark_batch_pushed(&bid)?;
-                tx.delete_pushed_ops(&sid)?;
+                tx.delete_pushed_ops(&sid, &bid)?;
                 tx.commit()?;
                 Ok::<_, CoreError>(())
             })
@@ -1128,14 +1436,16 @@ impl SyncEngine {
         let epoch_key = key_hierarchy
             .epoch_key(epoch as u32)
             .map_err(|e| CoreError::Engine(format!("no epoch key: {e}")))?;
-        let aad = crate::sync_aad::build_snapshot_aad(sync_id, device_id, epoch, server_seq);
+        let batch_id = format!("snapshot-{}", chrono::Utc::now().timestamp_millis());
+        let aad = crate::sync_aad::build_snapshot_aad(
+            sync_id, device_id, epoch, server_seq, &batch_id, "snapshot",
+        );
         let (ciphertext, nonce) =
             prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &snapshot_data, &aad)
                 .map_err(|e| CoreError::Engine(format!("snapshot encrypt failed: {e}")))?;
 
         // 4. Compute payload hash and sign the snapshot as a batch envelope
         let payload_hash = crate::batch_signature::compute_payload_hash(&snapshot_data);
-        let batch_id = format!("snapshot-{}", chrono::Utc::now().timestamp_millis());
         let envelope = crate::batch_signature::sign_batch(
             signing_key,
             ml_dsa_signing_key,
@@ -1194,9 +1504,10 @@ impl SyncEngine {
         // ── Guard ─────────────────────────────────────────────────────────
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
-        let device_count = tokio::task::spawn_blocking(move || storage.count_devices_in_group(&sid))
-            .await
-            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        let device_count =
+            tokio::task::spawn_blocking(move || storage.count_devices_in_group(&sid))
+                .await
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
         if device_count != 1 {
             return Err(CoreError::BootstrapNotAllowed(format!(
                 "expected exactly 1 device in registry, found {device_count}"
@@ -1234,10 +1545,7 @@ impl SyncEngine {
             .await
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
         if removed > 0 {
-            tracing::info!(
-                count = removed,
-                "bootstrap_existing_state: cleared orphan pending_ops"
-            );
+            tracing::info!(count = removed, "bootstrap_existing_state: cleared orphan pending_ops");
         }
 
         let entity_count = records.len() as u64;
@@ -1252,18 +1560,54 @@ impl SyncEngine {
         let devices = tokio::task::spawn_blocking(move || storage.list_device_records(&sid))
             .await
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
-        let node_id = devices
+        let first_device = devices
             .first()
-            .map(|d| d.device_id.clone())
             .ok_or_else(|| CoreError::Engine("no device record found for seed".into()))?;
+        let node_id = first_device.device_id.clone();
+        let registered_at = Some(first_device.registered_at);
 
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
-        let current_epoch = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+        let metadata = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
             .await
-            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??
-            .map(|m| m.current_epoch)
-            .unwrap_or(0);
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        let current_epoch = metadata.as_ref().map(|m| m.current_epoch).unwrap_or(0);
+
+        let metadata_needs_local_device = metadata.as_ref().is_none()
+            || metadata.as_ref().is_some_and(|m| m.local_device_id.is_empty());
+        if metadata_needs_local_device {
+            let storage = self.storage.clone();
+            let sid = sync_id.to_string();
+            let node_id_for_metadata = node_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let now = chrono::Utc::now();
+                let metadata = match metadata {
+                    Some(mut metadata) => {
+                        metadata.local_device_id = node_id_for_metadata;
+                        metadata.updated_at = now;
+                        metadata
+                    }
+                    None => SyncMetadata {
+                        sync_id: sid,
+                        local_device_id: node_id_for_metadata,
+                        current_epoch,
+                        last_pulled_server_seq: 0,
+                        last_pushed_at: None,
+                        last_successful_sync_at: None,
+                        registered_at,
+                        needs_rekey: false,
+                        last_imported_registry_version: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                };
+                let mut tx = storage.begin_tx()?;
+                tx.upsert_sync_metadata(&metadata)?;
+                tx.commit()
+            })
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        }
 
         // Seed inside spawn_blocking so each table-scoped tx stays inside
         // the blocking pool and we don't reach for a tokio reactor.
@@ -1278,8 +1622,7 @@ impl SyncEngine {
                 by_table.entry(rec.table.clone()).or_default().push(rec);
             }
 
-            let mut emitter =
-                OpEmitter::new(node_id_clone, sync_id_owned, current_epoch, None);
+            let mut emitter = OpEmitter::new(node_id_clone, sync_id_owned, current_epoch, None);
 
             for (_table, group) in by_table {
                 for rec in group {
@@ -1287,7 +1630,12 @@ impl SyncEngine {
                     // every entity gets a strictly greater HLC than the
                     // previous one even though they land in their own
                     // transactions.
-                    emitter.seed_fields(&*storage_clone, &rec.table, &rec.entity_id, &rec.fields)?;
+                    emitter.seed_fields(
+                        &*storage_clone,
+                        &rec.table,
+                        &rec.entity_id,
+                        &rec.fields,
+                    )?;
                 }
             }
             Ok(())
@@ -1380,10 +1728,11 @@ impl SyncEngine {
                 sender_key_info
             };
 
-        crate::batch_signature::verify_batch_signature(
+        crate::batch_signature::verify_batch_signature_for_generation(
             &envelope,
             &sender_key_info.ed25519_pk,
             &sender_key_info.ml_dsa_65_pk,
+            sender_key_info.ml_dsa_key_generation,
         )?;
 
         // Verify relay-reported metadata matches the signed envelope
@@ -1403,6 +1752,8 @@ impl SyncEngine {
             &envelope.sender_device_id,
             snapshot.epoch,
             snapshot.server_seq_at,
+            &envelope.batch_id,
+            &envelope.batch_kind,
         );
         let compressed = prism_sync_crypto::aead::xchacha_decrypt_from_sync(
             epoch_key,
@@ -1413,45 +1764,213 @@ impl SyncEngine {
         .map_err(|e| CoreError::Engine(format!("snapshot decrypt failed: {e}")))?;
         crate::batch_signature::verify_payload_hash(&envelope, &compressed)?;
 
+        let snapshot_data = Self::parse_snapshot_data(&compressed)?;
+        let trusted_device_ids = self.trusted_snapshot_device_ids(sync_id, &snapshot_data).await?;
+        Self::validate_snapshot_attribution(&snapshot_data, &trusted_device_ids)?;
+
         // 3. Import into storage (within transaction)
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         let seq = snapshot.server_seq_at;
         let data = compressed.clone();
-        let count = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut tx = storage.begin_tx()?;
-            let count = tx.import_snapshot(&sid, &data)?;
+            tx.import_snapshot(&sid, &data)?;
             tx.update_last_pulled_seq(&sid, seq)?;
             tx.commit()?;
-            Ok::<_, CoreError>(count)
+            Ok::<_, CoreError>(())
         })
         .await
         .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
-        // 4. Build EntityChange list from the snapshot data so the caller
-        //    can emit RemoteChanges to Dart for consumer DB population.
-        let entity_changes = Self::build_entity_changes_from_snapshot(&compressed)?;
+        // 4. Build EntityChange list only from snapshot rows that storage
+        //    actually retained. A stale snapshot field skipped during import
+        //    must not be emitted to Dart/Drift as a remote change.
+        let accepted_field_versions = Self::accepted_snapshot_field_versions_after_import(
+            self.storage.clone(),
+            sync_id,
+            &snapshot_data,
+        )
+        .await?;
+        let count = accepted_field_versions
+            .iter()
+            .map(|fv| (fv.entity_table.clone(), fv.entity_id.clone()))
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        let entity_changes =
+            Self::build_entity_changes_from_snapshot_field_versions(&accepted_field_versions);
 
         Ok((count, entity_changes))
     }
 
-    /// Parse a decompressed snapshot blob and build `EntityChange` entries
-    /// grouped by `(table, entity_id)`, collecting all winning field values.
-    ///
-    /// This is used after bootstrap to tell the consumer which entities and
-    /// fields need to be written into the consumer database.
-    fn build_entity_changes_from_snapshot(compressed: &[u8]) -> Result<Vec<EntityChange>> {
-        // Decompress zstd
+    fn filter_batch_ops(
+        ops: Vec<CrdtChange>,
+        sender_device_id: &str,
+        max_clock_drift_ms: i64,
+    ) -> Result<Vec<CrdtChange>> {
+        let max_clock_drift_ms = max_clock_drift_ms.max(0);
+        let mut accepted = Vec::with_capacity(ops.len());
+
+        for op in ops {
+            let hlc = match Hlc::from_string(&op.client_hlc) {
+                Ok(hlc) => hlc,
+                Err(e) => {
+                    tracing::warn!(
+                        op_id = %op.op_id,
+                        device_id = %op.device_id,
+                        client_hlc = %op.client_hlc,
+                        "Dropping op with malformed HLC: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            if op.device_id != sender_device_id {
+                return Err(CoreError::Engine(format!(
+                    "CRDT op attribution mismatch for {}: op.device_id={} envelope.sender_device_id={}",
+                    op.op_id, op.device_id, sender_device_id
+                )));
+            }
+
+            if hlc.node_id != sender_device_id {
+                return Err(CoreError::Engine(format!(
+                    "CRDT op HLC attribution mismatch for {}: client_hlc.node_id={} envelope.sender_device_id={}",
+                    op.op_id, hlc.node_id, sender_device_id
+                )));
+            }
+
+            let drift_ms = hlc.future_drift_ms();
+            if drift_ms > max_clock_drift_ms {
+                tracing::warn!(
+                    op_id = %op.op_id,
+                    device_id = %op.device_id,
+                    drift_ms,
+                    max_ms = max_clock_drift_ms,
+                    "Dropping op with excessive future HLC drift"
+                );
+                continue;
+            }
+
+            accepted.push(op);
+        }
+
+        Ok(accepted)
+    }
+
+    async fn trusted_snapshot_device_ids(
+        &self,
+        sync_id: &str,
+        snapshot: &crate::storage::SnapshotData,
+    ) -> Result<HashSet<String>> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let mut trusted = tokio::task::spawn_blocking(move || {
+            let records = storage.list_device_records(&sid)?;
+            Ok::<_, CoreError>(records.into_iter().map(|r| r.device_id).collect::<HashSet<_>>())
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        trusted.extend(snapshot.device_registry.iter().map(|dr| dr.device_id.clone()));
+        Ok(trusted)
+    }
+
+    fn validate_snapshot_attribution(
+        snapshot: &crate::storage::SnapshotData,
+        trusted_device_ids: &HashSet<String>,
+    ) -> Result<()> {
+        for fv in &snapshot.field_versions {
+            if !trusted_device_ids.contains(&fv.winning_device_id) {
+                return Err(CoreError::Engine(format!(
+                    "snapshot field_versions references untrusted device for {}.{}.{}: winning_device_id={}",
+                    fv.entity_table, fv.entity_id, fv.field_name, fv.winning_device_id
+                )));
+            }
+
+            let hlc = Hlc::from_string(&fv.winning_hlc)?;
+            if hlc.node_id != fv.winning_device_id {
+                return Err(CoreError::Engine(format!(
+                    "snapshot field_versions HLC attribution mismatch for {}.{}.{}: winning_hlc.node_id={} winning_device_id={}",
+                    fv.entity_table,
+                    fv.entity_id,
+                    fv.field_name,
+                    hlc.node_id,
+                    fv.winning_device_id
+                )));
+            }
+        }
+
+        for ao in &snapshot.applied_ops {
+            if !trusted_device_ids.contains(&ao.device_id) {
+                return Err(CoreError::Engine(format!(
+                    "snapshot applied_ops references untrusted device for {}: device_id={}",
+                    ao.op_id, ao.device_id
+                )));
+            }
+
+            let hlc = Hlc::from_string(&ao.client_hlc)?;
+            if hlc.node_id != ao.device_id {
+                return Err(CoreError::Engine(format!(
+                    "snapshot applied_ops HLC attribution mismatch for {}: client_hlc.node_id={} device_id={}",
+                    ao.op_id, hlc.node_id, ao.device_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_snapshot_data(compressed: &[u8]) -> Result<crate::storage::SnapshotData> {
         let json = zstd::decode_all(std::io::Cursor::new(compressed)).map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("zstd decompress failed: {e}")))
         })?;
 
-        // Parse snapshot data
-        let snapshot: crate::storage::SnapshotData = serde_json::from_slice(&json)?;
+        serde_json::from_slice(&json).map_err(CoreError::from)
+    }
 
+    async fn accepted_snapshot_field_versions_after_import(
+        storage: Arc<dyn SyncStorage>,
+        sync_id: &str,
+        snapshot: &crate::storage::SnapshotData,
+    ) -> Result<Vec<FieldVersionEntry>> {
+        let sid = sync_id.to_string();
+        let snapshot_field_versions = snapshot.field_versions.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut accepted = Vec::new();
+            for fv in snapshot_field_versions {
+                let current = storage.get_field_version(
+                    &sid,
+                    &fv.entity_table,
+                    &fv.entity_id,
+                    &fv.field_name,
+                )?;
+
+                let Some(current) = current else {
+                    continue;
+                };
+
+                if current.winning_op_id == fv.winning_op_id
+                    && current.winning_device_id == fv.winning_device_id
+                    && current.winning_hlc == fv.winning_hlc
+                    && current.winning_encoded_value == fv.winning_encoded_value
+                {
+                    accepted.push(fv);
+                }
+            }
+
+            Ok::<_, CoreError>(accepted)
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
+    }
+
+    fn build_entity_changes_from_snapshot_field_versions(
+        field_versions: &[FieldVersionEntry],
+    ) -> Vec<EntityChange> {
         // Group field_versions by (table, entity_id) into EntityChange structs
         let mut change_map: HashMap<(String, String), EntityChange> = HashMap::new();
-        for fv in &snapshot.field_versions {
+        for fv in field_versions {
             let key = (fv.entity_table.clone(), fv.entity_id.clone());
             let entry = change_map.entry(key).or_insert_with(|| EntityChange {
                 table: fv.entity_table.clone(),
@@ -1481,7 +2000,7 @@ impl SyncEngine {
             }
         }
 
-        Ok(change_map.into_values().collect())
+        change_map.into_values().collect()
     }
 }
 

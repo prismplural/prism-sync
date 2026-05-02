@@ -84,19 +84,10 @@ fn secretbox_matches_dart() {
         "53364972b9eff1856cb2aa5459cc9666e8cc05a9bae7f2801434e9db9d9c76a7e00e8bc926bd1d02fba122016349627e"
     ).unwrap();
 
-    // Encrypt with known nonce (test-only helper)
-    let blob =
-        prism_sync_crypto::aead::secretbox_wrap_with_nonce(&key, &plaintext, &nonce).unwrap();
+    let mut blob = Vec::with_capacity(nonce.len() + expected_ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&expected_ciphertext);
 
-    // blob = nonce || ciphertext+MAC, so strip the nonce to compare just the ciphertext
-    let ciphertext = &blob[24..];
-    assert_eq!(
-        prism_sync_crypto::hex::encode(ciphertext),
-        prism_sync_crypto::hex::encode(&expected_ciphertext),
-        "XSalsa20-Poly1305 ciphertext must match Dart libsodium output"
-    );
-
-    // Also verify decryption works
     let decrypted = prism_sync_crypto::aead::secretbox_unwrap(&key, &blob).unwrap();
     assert_eq!(decrypted, plaintext);
 }

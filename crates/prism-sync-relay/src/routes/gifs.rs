@@ -179,12 +179,12 @@ async fn proxy_gif_request(
         .await
         .map_err(|_| AppError::Internal("Failed to read GIF provider response".into()))?;
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
         .header(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=60"))
         .body(Body::from(body))
-        .map_err(|e| AppError::Internal(e.to_string()))?)
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 #[cfg(test)]

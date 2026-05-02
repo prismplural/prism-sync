@@ -13,7 +13,7 @@
 //!     .build()?;
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -25,7 +25,10 @@ use crate::error::{CoreError, Result};
 use crate::events::{event_channel, EntityChange, SyncEvent};
 use crate::hlc::Hlc;
 use crate::op_emitter::OpEmitter;
-use crate::pairing::SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+use crate::pairing::{
+    compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
+    SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+};
 use crate::recovery::{commit_recovered_epoch_material, KeyHierarchyRecoverer};
 use crate::relay::SyncRelay;
 use crate::schema::{SyncSchema, SyncType, SyncValue};
@@ -254,8 +257,8 @@ impl PrismSync {
 
     /// Restore the unlocked state directly from raw key material.
     ///
-    /// Bypasses Argon2id password derivation. Use when the raw DEK has been
-    /// persisted in the platform keychain (Signal-style key management).
+    /// Bypasses Argon2id password derivation. Use when the host has recovered
+    /// the DEK from a platform-protected runtime cache.
     pub fn restore_runtime_keys(
         &mut self,
         dek_bytes: &[u8],
@@ -271,7 +274,8 @@ impl PrismSync {
     }
 
     /// Only available when unlocked (after `initialize` or `unlock`).
-    /// Cache in the platform keychain for `restore_runtime_keys` on relaunch.
+    /// The host should wrap this before persistence and feed the unwrapped key
+    /// back to `restore_runtime_keys` on relaunch.
     pub fn export_dek(&self) -> Result<Vec<u8>> {
         Ok(self.key_hierarchy.dek()?.to_vec())
     }
@@ -352,26 +356,25 @@ impl PrismSync {
         // produce a smaller HLC than rows imported from a snapshot or
         // seeded via `bootstrap_existing_state` — the first local mutation
         // then races the seeded row and loses on the HLC tiebreaker.
-        let max_hlc =
-            match self.storage.list_all_field_version_hlcs(&sync_id) {
-                Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
-                    Ok(max) => max,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "configure_engine: failed to parse stored HLCs — starting emitter at zero"
-                        );
-                        None
-                    }
-                },
+        let max_hlc = match self.storage.list_all_field_version_hlcs(&sync_id) {
+            Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
+                Ok(max) => max,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "configure_engine: failed to list field_version HLCs — starting emitter at zero"
+                        "configure_engine: failed to parse stored HLCs — starting emitter at zero"
                     );
                     None
                 }
-            };
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "configure_engine: failed to list field_version HLCs — starting emitter at zero"
+                );
+                None
+            }
+        };
         self.op_emitter = Some(OpEmitter::new(node_id.clone(), sync_id.clone(), epoch, max_hlc));
 
         // Derive and store the device signing keys if a DeviceSecret is available.
@@ -531,6 +534,25 @@ impl PrismSync {
             return Ok(());
         }
         let relay_epoch = current_device.epoch.max(0) as u32;
+        if relay_epoch == local_epoch {
+            if let Err(error) = self
+                .repair_signed_registry_epoch_if_needed(
+                    relay.as_ref(),
+                    &sync_id,
+                    &device_id,
+                    relay_epoch,
+                    &devices,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    relay_epoch,
+                    local_epoch,
+                    "catch_up_epoch_keys: signed registry epoch repair failed"
+                );
+            }
+        }
         if relay_epoch <= local_epoch {
             tracing::debug!(
                 local_epoch,
@@ -698,6 +720,107 @@ impl PrismSync {
         }
 
         Ok(())
+    }
+
+    async fn repair_signed_registry_epoch_if_needed(
+        &self,
+        relay: &dyn SyncRelay,
+        sync_id: &str,
+        device_id: &str,
+        target_epoch: u32,
+        devices: &[crate::relay::traits::DeviceInfo],
+    ) -> Result<()> {
+        if !self.key_hierarchy.has_epoch_key(target_epoch) {
+            return Ok(());
+        }
+
+        let device_secret = self.device_secret.as_ref().ok_or_else(|| {
+            CoreError::Engine("device secret not set — call configure_engine first".into())
+        })?;
+        let signing_key = device_secret.ed25519_keypair(device_id).map_err(CoreError::Crypto)?;
+        let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
+            CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
+        })?;
+
+        let registry_version = match relay.get_signed_registry().await {
+            Ok(Some(response)) => {
+                let current_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+                    &response.artifact_blob,
+                    &signing_key.public_key_bytes(),
+                    &pq_signing_key.public_key_bytes(),
+                )
+                .map_err(|e| {
+                    CoreError::Engine(format!(
+                        "signed registry verification failed before epoch repair: {e}"
+                    ))
+                })?;
+                if current_snapshot.current_epoch >= target_epoch {
+                    return Ok(());
+                }
+                current_snapshot
+                    .registry_version
+                    .max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+            }
+            Ok(None) => SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            Err(error) => return Err(CoreError::from_relay(error)),
+        };
+
+        let epoch_key_hashes = Self::build_epoch_key_hashes_for_registry(&self.key_hierarchy)?;
+        if !epoch_key_hashes.contains_key(&target_epoch) {
+            return Ok(());
+        }
+
+        let entries: Vec<RegistrySnapshotEntry> = devices
+            .iter()
+            .filter(|device| device.status == "active")
+            .map(|device| RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device.device_id.clone(),
+                ed25519_public_key: device.ed25519_public_key.clone(),
+                x25519_public_key: device.x25519_public_key.clone(),
+                ml_dsa_65_public_key: device.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: device.ml_kem_768_public_key.clone(),
+                x_wing_public_key: device.x_wing_public_key.clone(),
+                status: device.status.clone(),
+                ml_dsa_key_generation: device.ml_dsa_key_generation,
+            })
+            .collect();
+
+        if !entries.iter().any(|entry| entry.device_id == device_id) {
+            return Err(CoreError::Engine(
+                "cannot repair signed registry: current device missing from active relay list"
+                    .into(),
+            ));
+        }
+
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            registry_version,
+            target_epoch,
+            epoch_key_hashes,
+        );
+        let signed = snapshot.sign_hybrid(&signing_key, pq_signing_key);
+        let _ = relay.put_signed_registry(&signed).await.map_err(CoreError::from_relay)?;
+
+        tracing::info!(
+            epoch = target_epoch,
+            sync_id = %sync_id,
+            device_id = %device_id,
+            "catch_up_epoch_keys: repaired signed registry epoch binding"
+        );
+
+        Ok(())
+    }
+
+    fn build_epoch_key_hashes_for_registry(
+        key_hierarchy: &KeyHierarchy,
+    ) -> Result<BTreeMap<u32, [u8; 32]>> {
+        let entries = key_hierarchy.epoch_keys_iter().map_err(CoreError::Crypto)?;
+        let mut out = BTreeMap::new();
+        for (epoch, key) in entries {
+            out.insert(epoch, compute_epoch_key_hash(key));
+        }
+        Ok(out)
     }
 
     /// App lifecycle hook: catch up sync if stale (>5 s since last sync).
@@ -923,6 +1046,77 @@ impl PrismSync {
             }
         }
         result
+    }
+
+    // ── Sync state reset ──
+
+    /// Atomically wipe all local sync engine state for the configured sync
+    /// group, leaving the device unpaired and ready to re-pair from scratch.
+    ///
+    /// Clears, in a single `BEGIN IMMEDIATE` transaction:
+    /// - `pending_ops` (unpushed local mutations)
+    /// - `applied_ops` (history of remote ops we've merged)
+    /// - `field_versions` (per-field LWW winners — CRDT merge state)
+    /// - `sync_metadata` (HLC bookkeeping, last-sync timestamps, epoch, etc.)
+    /// - `device_registry` (the paired-devices list)
+    ///
+    /// The transaction is all-or-nothing: a failure rolls back leaving the
+    /// engine state intact. After a successful wipe the device must call
+    /// [`configure_engine`](Self::configure_engine) again as part of a fresh
+    /// pairing flow before any sync operation will succeed.
+    ///
+    /// This also clears Rust's `quarantined_ops` table. Host-side quarantine
+    /// tables, if any, still live outside the Rust sync engine and must be
+    /// cleared by the host alongside this call.
+    ///
+    /// Returns `Err(CoreError::Engine)` if no sync group is currently
+    /// configured (i.e. `configure_engine` has not been called).
+    ///
+    /// Used as the "Approach A" cutover hook by app-layer migrations that need
+    /// to reshape synced entities incompatibly — the device is severed from
+    /// its old sync group and re-pairs against the migrated peer.
+    ///
+    /// In addition to wiping the persistent engine tables, this nulls out the
+    /// in-memory runtime state that `configure_engine` populated: the
+    /// `OpEmitter`, the device signing keys (Ed25519 + ML-DSA), the device
+    /// id, the epoch, and the `SyncService` engine + auto-sync task. Without
+    /// this, a host that re-seeded credentials from its own keychain on next
+    /// launch could re-attach to the OLD sync group with the in-memory
+    /// state still pointing at it. Host-side quarantine tables are NOT
+    /// touched by this call (see method-level note above).
+    pub async fn reset_sync_state(&mut self) -> Result<()> {
+        let sync_id = self
+            .sync_service
+            .sync_id()
+            .ok_or_else(|| {
+                CoreError::Engine("sync_id not set — call configure_engine first".into())
+            })?
+            .to_string();
+
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut tx = storage.begin_tx()?;
+            tx.clear_sync_state(&sync_id)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        // Tear down in-memory runtime state. Order matters only insofar as
+        // `clear_engine` aborts the auto-sync task before we drop key
+        // material — any in-flight sync cycle will fail cleanly with
+        // "sync not configured" rather than racing against half-cleared
+        // state.
+        self.sync_service.clear_engine();
+        self.op_emitter = None;
+        self.device_signing_key = None;
+        self.device_ml_dsa_signing_key = None;
+        self.ml_dsa_key_generation = None;
+        self.device_id = None;
+        self.epoch = None;
+
+        Ok(())
     }
 
     fn validate_mutation_fields(
@@ -1283,16 +1477,16 @@ fn validate_sync_value_type(
         return Ok(());
     }
 
-    let matches = match (expected, value) {
-        (SyncType::String, SyncValue::String(_)) => true,
-        (SyncType::Int, SyncValue::Int(_)) => true,
-        (SyncType::Real, SyncValue::Real(_)) => true,
-        (SyncType::Real, SyncValue::Int(_)) => true,
-        (SyncType::Bool, SyncValue::Bool(_)) => true,
-        (SyncType::DateTime, SyncValue::DateTime(_)) => true,
-        (SyncType::Blob, SyncValue::Blob(_)) => true,
-        _ => false,
-    };
+    let matches = matches!(
+        (expected, value),
+        (SyncType::String, SyncValue::String(_))
+            | (SyncType::Int, SyncValue::Int(_))
+            | (SyncType::Real, SyncValue::Real(_))
+            | (SyncType::Real, SyncValue::Int(_))
+            | (SyncType::Bool, SyncValue::Bool(_))
+            | (SyncType::DateTime, SyncValue::DateTime(_))
+            | (SyncType::Blob, SyncValue::Blob(_))
+    );
 
     if matches {
         Ok(())
@@ -1415,6 +1609,9 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(None)
         }
+        async fn put_signed_registry(&self, _: &[u8]) -> std::result::Result<i64, RelayError> {
+            Ok(0)
+        }
     }
 
     #[async_trait]
@@ -1423,6 +1620,7 @@ mod tests {
             &self,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -1639,6 +1837,18 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             Ok(self.state.lock().unwrap().signed_registry.clone())
         }
+        async fn put_signed_registry(
+            &self,
+            signed_registry_snapshot: &[u8],
+        ) -> std::result::Result<i64, RelayError> {
+            let mut state = self.state.lock().unwrap();
+            state.signed_registry = Some(SignedRegistryResponse {
+                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+                artifact_blob: signed_registry_snapshot.to_vec(),
+                artifact_kind: "signed_registry_snapshot".to_string(),
+            });
+            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+        }
     }
 
     #[async_trait]
@@ -1647,6 +1857,7 @@ mod tests {
             &self,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -1802,8 +2013,9 @@ mod tests {
         let wrap_key =
             prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
                 .unwrap();
+        let aad = crate::epoch::build_rekey_artifact_aad(epoch, device_id);
         let encrypted_epoch_key =
-            prism_sync_crypto::aead::xchacha_encrypt(&wrap_key, epoch_key).unwrap();
+            prism_sync_crypto::aead::xchacha_encrypt_aead(&wrap_key, epoch_key, &aad).unwrap();
 
         let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
         artifact.push(0x02);
@@ -1934,6 +2146,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_preflight_repairs_lagging_signed_registry_when_local_epoch_is_current() {
+        let (mut sync, relay, device_id, epoch_1_key, _epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+
+        sync.catch_up_epoch_keys().await.unwrap();
+        assert_eq!(sync.epoch(), Some(2));
+
+        let device_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let device_info = relay.state.lock().unwrap().devices[0].clone();
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        relay.set_signed_registry(signed_registry_response(
+            "sync-1",
+            &device_secret,
+            &device_id,
+            &device_info,
+            1,
+            &[(0, epoch_0_key), (1, epoch_1_key)],
+        ));
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        let repaired = relay.state.lock().unwrap().signed_registry.clone().unwrap();
+        let signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let pq_signing_key = device_secret.ml_dsa_65_keypair(&device_id).unwrap();
+        let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &repaired.artifact_blob,
+            &signing_key.public_key_bytes(),
+            &pq_signing_key.public_key_bytes(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.current_epoch, 2);
+        assert!(snapshot.epoch_key_hashes.contains_key(&2));
+    }
+
+    #[tokio::test]
     async fn sync_preflight_advances_only_verified_prefix_when_artifact_missing() {
         let (mut sync, _relay, _device_id, epoch_1_key, _epoch_2_key) =
             prepare_verified_epoch_catch_up(false);
@@ -1968,9 +2216,8 @@ mod tests {
         use crate::hlc::Hlc;
         use crate::storage::FieldVersion;
 
-        let schema = SyncSchema::builder()
-            .entity("members", |e| e.field("name", SyncType::String))
-            .build();
+        let schema =
+            SyncSchema::builder().entity("members", |e| e.field("name", SyncType::String)).build();
         let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
 
         // Pre-populate field_versions with a high-counter HLC to make the
@@ -2016,11 +2263,8 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), SyncValue::String("Post".to_string()));
         sync.record_create("members", "post-1", &fields).unwrap();
-        let fv = sync
-            .storage
-            .get_field_version("sync-1", "members", "post-1", "name")
-            .unwrap()
-            .unwrap();
+        let fv =
+            sync.storage.get_field_version("sync-1", "members", "post-1", "name").unwrap().unwrap();
         let post_hlc = Hlc::from_string(&fv.winning_hlc).unwrap();
         assert!(
             post_hlc > pre_parsed,
@@ -2341,5 +2585,236 @@ mod tests {
         assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
         assert!(sync.secure_store().get("epoch").unwrap().is_none());
         assert!(sync.secure_store().get("epoch_key_1").unwrap().is_none());
+    }
+
+    // ── reset_sync_state ──
+
+    fn seed_all_tables(storage: &Arc<dyn SyncStorage>, sync_id: &str) {
+        use crate::storage::{AppliedOp, DeviceRecord, FieldVersion, PendingOp, SyncMetadata};
+        use chrono::Utc;
+
+        let now = Utc::now();
+        // Op ids are PRIMARY KEY across the whole table (not per sync_id), so
+        // include sync_id in derived ids to keep multi-group seeding from
+        // colliding.
+        let pending_op_id = format!("op-pending-{sync_id}");
+        let applied_op_id = format!("op-applied-{sync_id}");
+        let batch_id = format!("batch-{sync_id}");
+        let metadata = SyncMetadata {
+            sync_id: sync_id.to_string(),
+            local_device_id: "device-abc".to_string(),
+            current_epoch: 1,
+            last_pulled_server_seq: 42,
+            last_pushed_at: Some(now),
+            last_successful_sync_at: Some(now),
+            registered_at: Some(now),
+            needs_rekey: false,
+            last_imported_registry_version: Some(7),
+            created_at: now,
+            updated_at: now,
+        };
+        let pending = PendingOp {
+            op_id: pending_op_id,
+            sync_id: sync_id.to_string(),
+            epoch: 1,
+            device_id: "dev1".to_string(),
+            local_batch_id: batch_id,
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            encoded_value: "\"Alice\"".to_string(),
+            is_delete: false,
+            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            created_at: now,
+            pushed_at: None,
+        };
+        let applied = AppliedOp {
+            op_id: applied_op_id.clone(),
+            sync_id: sync_id.to_string(),
+            epoch: 1,
+            device_id: "dev1".to_string(),
+            client_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            server_seq: 10,
+            applied_at: now,
+        };
+        let fv = FieldVersion {
+            sync_id: sync_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: applied_op_id,
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: "2026-01-01T00:00:00.000Z:0000:dev1".to_string(),
+            winning_encoded_value: Some("\"Alice\"".to_string()),
+            updated_at: now,
+        };
+        let device = DeviceRecord {
+            sync_id: sync_id.to_string(),
+            device_id: "dev1".to_string(),
+            ed25519_public_key: vec![1, 2, 3, 4],
+            x25519_public_key: vec![5, 6, 7, 8],
+            ml_dsa_65_public_key: vec![9u8; 1952],
+            ml_kem_768_public_key: vec![10u8; 1184],
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            registered_at: now,
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&metadata).unwrap();
+        tx.insert_pending_op(&pending).unwrap();
+        tx.insert_applied_op(&applied).unwrap();
+        tx.upsert_field_version(&fv).unwrap();
+        tx.upsert_device_record(&device).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_sync_state_wipes_all_engine_tables() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        seed_all_tables(sync.storage(), "sync-1");
+
+        // Sanity: every table has data before the wipe.
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_some());
+        assert!(!sync.storage().get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+        assert!(sync.storage().is_op_applied("op-applied-sync-1").unwrap());
+        assert!(sync
+            .storage()
+            .get_field_version("sync-1", "members", "ent-1", "name")
+            .unwrap()
+            .is_some());
+        assert!(!sync.storage().list_device_records("sync-1").unwrap().is_empty());
+
+        sync.reset_sync_state().await.unwrap();
+
+        // Every table is empty after the wipe.
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
+        assert!(sync.storage().get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+        assert!(!sync.storage().is_op_applied("op-applied-sync-1").unwrap());
+        assert!(sync
+            .storage()
+            .get_field_version("sync-1", "members", "ent-1", "name")
+            .unwrap()
+            .is_none());
+        assert!(sync.storage().list_device_records("sync-1").unwrap().is_empty());
+    }
+
+    /// `reset_sync_state` must also tear down the in-memory runtime state
+    /// that `configure_engine` populated. Previously it only wiped the
+    /// engine's persistent tables, leaving `op_emitter`, the device id,
+    /// epoch, and the `SyncService` engine intact — so a host that
+    /// re-seeded credentials from its own keychain on next launch could
+    /// silently re-attach to the OLD sync group with the in-memory state
+    /// still pointing at it. Codex P1 #5.
+    #[tokio::test]
+    async fn reset_sync_state_clears_runtime_engine_and_keys() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        seed_all_tables(sync.storage(), "sync-1");
+
+        // Pre-conditions established by `configure_engine`.
+        assert!(sync.op_emitter.is_some(), "op_emitter set by configure");
+        assert!(sync.device_id.is_some(), "device_id set by configure");
+        assert!(sync.epoch.is_some(), "epoch set by configure");
+        assert!(sync.sync_service.has_engine(), "engine set by configure");
+        assert_eq!(sync.sync_service.sync_id(), Some("sync-1"));
+
+        sync.reset_sync_state().await.unwrap();
+
+        // In-memory runtime state torn down — device is in the same shape
+        // as immediately after `PrismSync::builder().build()`.
+        assert!(sync.op_emitter.is_none(), "op_emitter cleared");
+        assert!(sync.device_signing_key.is_none(), "Ed25519 signing key cleared");
+        assert!(sync.device_ml_dsa_signing_key.is_none(), "ML-DSA signing key cleared");
+        assert!(sync.ml_dsa_key_generation.is_none(), "ML-DSA generation cleared");
+        assert!(sync.device_id.is_none(), "device_id cleared");
+        assert!(sync.epoch.is_none(), "epoch cleared");
+        assert!(!sync.sync_service.has_engine(), "engine cleared");
+        assert!(sync.sync_service.sync_id().is_none(), "sync_id cleared");
+    }
+
+    /// After reset, the standard mutation entry points must fail closed
+    /// rather than silently accepting writes that would never sync.
+    #[tokio::test]
+    async fn record_create_after_reset_returns_engine_error() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // Sanity: writes succeed pre-reset.
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        sync.record_create("members", "ent-pre", &fields).unwrap();
+
+        sync.reset_sync_state().await.unwrap();
+
+        let err = sync
+            .record_create("members", "ent-post", &fields)
+            .expect_err("record_create must fail after reset");
+        assert!(
+            err.to_string().to_lowercase().contains("not configured"),
+            "expected 'sync not configured' style error, got: {err}"
+        );
+    }
+
+    /// With auto-sync enabled, reset must abort the debounce task and
+    /// drop the mutation sender so no further sync cycles fire against
+    /// the (now-cleared) old sync group.
+    #[tokio::test]
+    async fn reset_sync_state_disables_auto_sync() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // Enable auto-sync; verify the sender is live before reset.
+        let _trigger_rx = sync.sync_service.set_auto_sync(crate::sync_service::AutoSyncConfig {
+            enabled: true,
+            debounce: std::time::Duration::from_millis(50),
+            ..Default::default()
+        });
+        assert!(
+            sync.sync_service.auto_sync_sender().is_some(),
+            "auto-sync sender should be live after set_auto_sync(enabled=true)"
+        );
+
+        sync.reset_sync_state().await.unwrap();
+
+        assert!(
+            sync.sync_service.auto_sync_sender().is_none(),
+            "auto-sync sender must be None after reset"
+        );
+        assert!(
+            sync.sync_service.notification_trigger_sender().is_none(),
+            "notification trigger sender must be None after reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_sync_state_errors_when_sync_not_configured() {
+        let mut sync = make_sync();
+        let err = sync.reset_sync_state().await.unwrap_err();
+        assert!(
+            err.to_string().contains("sync_id not set"),
+            "expected 'sync_id not set' error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_sync_state_only_clears_configured_sync_group() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        // Seed both the configured group ("sync-1") and a foreign group.
+        seed_all_tables(sync.storage(), "sync-1");
+        seed_all_tables(sync.storage(), "sync-other");
+
+        sync.reset_sync_state().await.unwrap();
+
+        // Configured group is gone; foreign group is untouched.
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
+        assert!(sync.storage().list_device_records("sync-1").unwrap().is_empty());
+
+        assert!(sync.storage().get_sync_metadata("sync-other").unwrap().is_some());
+        assert!(!sync.storage().list_device_records("sync-other").unwrap().is_empty());
     }
 }

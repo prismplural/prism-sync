@@ -8,7 +8,6 @@ description = "CRDT primitives, sync storage, and op emission for prism-sync"
 [dependencies]
 prism-sync-crypto = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
-rusqlite_migration = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,6 +37,7 @@ getrandom = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+prism-sync-crypto = { workspace = true, features = ["legacy-hybrid-v2"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 criterion = { workspace = true }
 proptest = "1"

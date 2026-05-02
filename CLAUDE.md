@@ -1,7 +1,7 @@
 # prism-sync
 
 ## Overview
-Plug-and-play encrypted CRDT sync library in Rust with cross-platform FFI bindings. Provides field-level Last-Write-Wins CRDT synchronization with zero-knowledge encryption -- the relay server stores only encrypted blobs and never sees plaintext content.
+Plug-and-play encrypted CRDT sync library in Rust with cross-platform FFI bindings. Provides field-level Last-Write-Wins CRDT synchronization with end-to-end encryption -- the relay server stores only encrypted blobs and never sees plaintext content.
 
 ## Tech Stack
 - **Language:** Rust 2021 edition
@@ -56,7 +56,7 @@ prism-sync-relay   (standalone, no dependency on other crates)
 - Storage traits are object-safe (no generic methods on `SyncStorage`)
 - `SyncStorageTx` for transactional writes, `SyncStorage` for reads + `begin_tx()`
 - `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` for SQLite transactions
-- All relay paths use `/v2/sync/{sync_id}/...`
+- All relay paths use `/v1/sync/{sync_id}/...`
 - Batch signatures use hybrid Ed25519 + ML-DSA-65 over deterministic binary canonical format (protocol V3)
 - Pull phase skips unverifiable batches (unknown/deleted sender, bad signature) instead of aborting
 - SyncEngine uses `Arc<dyn SyncStorage>` and `Arc<dyn SyncRelay>` (trait objects, not generics)
@@ -80,6 +80,18 @@ cargo test -p prism-sync-core                   # Core only
 cargo test -p prism-sync-relay                  # Relay only
 just test-crate prism-sync-core                 # Via justfile
 ```
+
+## Dependency Watchlist
+- **Supply-chain gate owner:** sync release owner. Keep `.github/workflows/sync-supply-chain.yml` blocking on `cargo audit -D warnings` and `cargo deny --locked check`.
+- **SQLite lane owner:** sync storage owner. Track `rusqlite`, `rusqlite_migration`, and `libsqlite3-sys`; bundled SQLite must stay on a version with current security fixes, and SQLCipher builds must keep `bundled-sqlcipher-vendored-openssl` working.
+- **OpenSSL lane owner:** sync release owner. Track `openssl-src` advisories/releases because the SQLCipher feature vendors OpenSSL.
+- **RustCrypto PQ owner:** sync crypto owner. Track `RustCrypto/signatures` (`ml-dsa`), `RustCrypto/KEMs` (`ml-kem`), and `x-wing`; pre-1.0 PQ crates need explicit review before updates and cross-language/vector tests after updates.
+- **Relay TLS/WebSocket owner:** relay owner. Track `rustls`, `ring`, `webpki-roots`, `tungstenite`, and `tokio-tungstenite`; keep relay/client WS tests and `cargo deny` duplicate-version warnings visible during upgrades.
+
+## Side-Channel Residual Risk
+- Apple M1/M2 GoFetch/DMP exposure remains a documented residual risk for userspace lattice math; there is no local code-only mitigation for those devices in the current threat model.
+- Apple M3 and later DIT support is a tracked follow-up. Do not enable a DIT toggle without a measured platform check, failure behavior, and release note.
+- Keep Ed25519 strict verification and hybrid-signature context/domain tests in the regression set; these are defense-in-depth against primitive or implementation regressions.
 
 ## Deployment
 - Relay deploys via Docker (self-hosted)

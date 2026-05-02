@@ -132,7 +132,7 @@ The merge engine implements field-level Last-Write-Wins (LWW) with deterministic
 
 ## Security Model
 
-### What is encrypted (zero-knowledge)
+### What is encrypted (end-to-end)
 - All field-level data content (XChaCha20-Poly1305 with epoch key)
 - Each batch has its own random 24-byte nonce
 - AAD binds ciphertext to: sync_id, sender_device_id, epoch, batch_id, batch_kind

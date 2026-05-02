@@ -13,9 +13,7 @@ use prism_sync_core::engine::SeedRecord;
 use prism_sync_core::hlc::Hlc;
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::schema::{SyncSchema, SyncType, SyncValue};
-use prism_sync_core::storage::{
-    DeviceRecord, RusqliteSyncStorage, SyncMetadata, SyncStorage,
-};
+use prism_sync_core::storage::{DeviceRecord, RusqliteSyncStorage, SyncMetadata, SyncStorage};
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{CoreError, PrismSync};
 
@@ -134,8 +132,47 @@ fn setup_sole_device(
     sync.initialize("pw", &[7u8; 16]).unwrap();
 
     let relay = Arc::new(MockRelay::new());
+    sync.configure_engine(relay, SYNC_ID.to_string(), "device-a".to_string(), 0, 0);
+
+    (sync, storage)
+}
+
+fn setup_sole_device_without_metadata() -> (PrismSync, Arc<RusqliteSyncStorage>) {
+    let schema = bootstrap_schema();
+    let storage: Arc<RusqliteSyncStorage> = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_device_record(&DeviceRecord {
+            sync_id: SYNC_ID.to_string(),
+            device_id: "device-a".to_string(),
+            ed25519_public_key: vec![1u8; 32],
+            x25519_public_key: vec![2u8; 32],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    let mut sync = PrismSync::builder()
+        .schema(schema)
+        .storage(storage.clone())
+        .secure_store(Arc::new(MemorySecureStore::new()))
+        .entity(entity)
+        .build()
+        .unwrap();
+
+    sync.initialize("pw", &[7u8; 16]).unwrap();
     sync.configure_engine(
-        relay,
+        Arc::new(MockRelay::new()),
         SYNC_ID.to_string(),
         "device-a".to_string(),
         0,
@@ -153,11 +190,29 @@ fn task_record(id: &str, title: &str, done: bool) -> SeedRecord {
 }
 
 #[tokio::test]
+async fn bootstrap_initializes_missing_sync_metadata_for_new_group() {
+    let (mut sync, storage) = setup_sole_device_without_metadata();
+    assert!(storage.get_sync_metadata(SYNC_ID).unwrap().is_none());
+
+    let report =
+        sync.bootstrap_existing_state(vec![task_record("t-1", "first", false)]).await.unwrap();
+    assert!(report.snapshot_bytes > 0);
+
+    let metadata = storage
+        .get_sync_metadata(SYNC_ID)
+        .unwrap()
+        .expect("bootstrap should create sync_metadata before snapshot export");
+    assert_eq!(metadata.local_device_id, "device-a");
+    assert_eq!(metadata.current_epoch, 0);
+    assert_eq!(metadata.last_pulled_server_seq, 0);
+    assert!(!storage.export_snapshot(SYNC_ID).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn bootstrap_seeds_field_versions_without_pending_ops() {
     let (mut sync, storage) = setup_sole_device(0, 0, false, 0);
 
-    let records =
-        vec![task_record("t-1", "first", false), task_record("t-2", "second", true)];
+    let records = vec![task_record("t-1", "first", false), task_record("t-2", "second", true)];
     let report = sync.bootstrap_existing_state(records).await.unwrap();
     assert_eq!(report.entity_count, 2);
     assert!(report.snapshot_bytes > 0);
@@ -182,10 +237,8 @@ async fn bootstrap_seeds_field_versions_without_pending_ops() {
 #[tokio::test]
 async fn bootstrap_rejects_when_peer_device_exists() {
     let (mut sync, _storage) = setup_sole_device(1, 0, false, 0);
-    let err = sync
-        .bootstrap_existing_state(vec![task_record("t-1", "x", false)])
-        .await
-        .unwrap_err();
+    let err =
+        sync.bootstrap_existing_state(vec![task_record("t-1", "x", false)]).await.unwrap_err();
     assert!(
         matches!(err, CoreError::BootstrapNotAllowed(ref msg) if msg.contains("device")),
         "expected BootstrapNotAllowed mentioning device, got: {err:?}"
@@ -195,10 +248,8 @@ async fn bootstrap_rejects_when_peer_device_exists() {
 #[tokio::test]
 async fn bootstrap_rejects_when_last_pulled_nonzero() {
     let (mut sync, _storage) = setup_sole_device(0, 5, false, 0);
-    let err = sync
-        .bootstrap_existing_state(vec![task_record("t-1", "x", false)])
-        .await
-        .unwrap_err();
+    let err =
+        sync.bootstrap_existing_state(vec![task_record("t-1", "x", false)]).await.unwrap_err();
     assert!(
         matches!(err, CoreError::BootstrapNotAllowed(ref msg) if msg.contains("last_pulled_server_seq")),
         "expected BootstrapNotAllowed mentioning last_pulled_server_seq, got: {err:?}"
@@ -208,10 +259,8 @@ async fn bootstrap_rejects_when_last_pulled_nonzero() {
 #[tokio::test]
 async fn bootstrap_rejects_when_applied_ops_exist() {
     let (mut sync, _storage) = setup_sole_device(0, 0, true, 0);
-    let err = sync
-        .bootstrap_existing_state(vec![task_record("t-1", "x", false)])
-        .await
-        .unwrap_err();
+    let err =
+        sync.bootstrap_existing_state(vec![task_record("t-1", "x", false)]).await.unwrap_err();
     assert!(
         matches!(err, CoreError::BootstrapNotAllowed(ref msg) if msg.contains("applied_ops")),
         "expected BootstrapNotAllowed mentioning applied_ops, got: {err:?}"
@@ -249,8 +298,7 @@ async fn bootstrap_advances_hlc_watermark() {
 
     // Find the max seeded HLC across all field_versions.
     let hlcs = storage.list_all_field_version_hlcs(SYNC_ID).unwrap();
-    let max_seeded =
-        Hlc::parse_many_and_max(&hlcs).unwrap().expect("seeded HLCs should exist");
+    let max_seeded = Hlc::parse_many_and_max(&hlcs).unwrap().expect("seeded HLCs should exist");
 
     // Now record_create on a new entity post-bootstrap; the new op's HLC
     // must be strictly greater than every seeded HLC (including the :10
@@ -323,11 +371,8 @@ async fn bootstrap_tombstone_roundtrip() {
     let mut fields = HashMap::new();
     fields.insert("title".to_string(), SyncValue::String("doomed".into()));
     fields.insert("is_deleted".to_string(), SyncValue::Bool(true));
-    let records = vec![SeedRecord {
-        table: "tasks".to_string(),
-        entity_id: "t-dead".to_string(),
-        fields,
-    }];
+    let records =
+        vec![SeedRecord { table: "tasks".to_string(), entity_id: "t-dead".to_string(), fields }];
     sync.bootstrap_existing_state(records).await.unwrap();
 
     let blob = storage.export_snapshot(SYNC_ID).unwrap();
@@ -371,10 +416,8 @@ async fn bootstrap_returns_snapshot_too_large_for_oversized_blob() {
         for i in 0..260u32 {
             let mut blob = vec![0u8; 512 * 1024];
             rand::thread_rng().fill_bytes(&mut blob);
-            let encoded = format!(
-                "\"{}\"",
-                base64::engine::general_purpose::STANDARD.encode(&blob)
-            );
+            let encoded =
+                format!("\"{}\"", base64::engine::general_purpose::STANDARD.encode(&blob));
             tx.upsert_field_version(&FieldVersion {
                 sync_id: SYNC_ID.to_string(),
                 entity_table: "tasks".to_string(),
@@ -394,10 +437,7 @@ async fn bootstrap_returns_snapshot_too_large_for_oversized_blob() {
     let err = sync.bootstrap_existing_state(Vec::new()).await.unwrap_err();
     match err {
         CoreError::SnapshotTooLarge { bytes } => {
-            assert!(
-                bytes > 100 * 1024 * 1024,
-                "expected bytes > 100 MiB, got {bytes}"
-            );
+            assert!(bytes > 100 * 1024 * 1024, "expected bytes > 100 MiB, got {bytes}");
         }
         other => panic!("expected SnapshotTooLarge, got: {other:?}"),
     }

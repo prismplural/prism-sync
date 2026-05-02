@@ -4,7 +4,7 @@
 //! init messages, and relationships. All binary formats use big-endian
 //! length prefixes consistent with the pairing models in Phase 3.
 
-use prism_sync_crypto::pq::HybridSignature;
+use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use serde::{Deserialize, Serialize};
 
 use super::BootstrapVersion;
@@ -14,8 +14,6 @@ const ML_DSA_65_PK_LEN: usize = 1952;
 const XWING_EK_LEN: usize = 1216;
 const KEM_CIPHERTEXT_LEN: usize = 1120;
 const CONFIRMATION_MAC_LEN: usize = 32;
-const SHARING_IDENTITY_SIGNATURE_CONTEXT: &[u8] = b"sharing_identity_bundle";
-const SIGNED_PREKEY_SIGNATURE_CONTEXT: &[u8] = b"signed_prekey_bundle";
 
 /// 30 days in seconds.
 const PREKEY_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -143,7 +141,7 @@ impl SharingIdentityBundle {
         let message = bundle.signed_content_bytes();
         let hybrid_sig = HybridSignature::sign_v3(
             &message,
-            SHARING_IDENTITY_SIGNATURE_CONTEXT,
+            hybrid_signature_contexts::SHARING_IDENTITY_BUNDLE,
             ed25519_sk,
             ml_dsa_sk,
         )
@@ -158,7 +156,7 @@ impl SharingIdentityBundle {
         let hybrid_sig = HybridSignature::from_bytes(&self.signature)?;
         hybrid_sig.verify_v3(
             &message,
-            SHARING_IDENTITY_SIGNATURE_CONTEXT,
+            hybrid_signature_contexts::SHARING_IDENTITY_BUNDLE,
             &self.ed25519_public_key,
             &self.ml_dsa_65_public_key,
         )
@@ -249,7 +247,7 @@ impl SignedPrekey {
         let message = prekey.signed_content_bytes();
         let hybrid_sig = HybridSignature::sign_v3(
             &message,
-            SIGNED_PREKEY_SIGNATURE_CONTEXT,
+            hybrid_signature_contexts::SIGNED_PREKEY_BUNDLE,
             ed25519_sk,
             ml_dsa_sk,
         )
@@ -267,7 +265,7 @@ impl SignedPrekey {
         let hybrid_sig = HybridSignature::from_bytes(&self.signature)?;
         hybrid_sig.verify_v3(
             &message,
-            SIGNED_PREKEY_SIGNATURE_CONTEXT,
+            hybrid_signature_contexts::SIGNED_PREKEY_BUNDLE,
             &identity.ed25519_public_key,
             &identity.ml_dsa_65_public_key,
         )

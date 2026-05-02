@@ -1,18 +1,20 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use zeroize::Zeroize;
 
 use prism_sync_core::bootstrap::sharing_trust::{
     compute_sharing_fingerprint, evaluate_identity_with_generation_floor,
     GenerationAwareTrustDecision,
 };
 use prism_sync_core::bootstrap::{
-    InitiatorCeremony, JoinerCeremony, PrekeyStore, RendezvousToken, SharingIdentityBundle,
-    SharingRecipient, SharingSender,
+    InitiatorCeremony, JoinerCeremony, PrekeyStore, RendezvousToken, SasDisplay,
+    SharingIdentityBundle, SharingRecipient, SharingSender,
 };
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::service::PairingService;
@@ -20,13 +22,14 @@ use prism_sync_core::pairing::{
     compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
 };
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
+use prism_sync_core::relay::PairingRelay as _;
 use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
 use prism_sync_core::schema::{parse_datetime_utc, SyncSchema, SyncType, SyncValue};
-use prism_sync_core::storage::{RusqliteSyncStorage, SyncStorage};
+use prism_sync_core::storage::{RusqliteSyncStorage, SyncMetadata, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
     background_runtime, spawn_notification_handler, DeviceRegistryManager,
@@ -332,7 +335,7 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
         "pushed": result.pushed,
         "pruned": result.pruned,
         "duration_ms": result.duration.as_millis() as u64,
-        "error": result.error,
+        "error": result.error.as_deref().map(redact_sensitive_message),
         "error_kind": result.error_kind.as_ref().map(|k| format!("{k:?}")),
         "error_code": result.error_code,
         "remote_wipe": result.remote_wipe,
@@ -340,6 +343,213 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
 }
 
 const STRUCTURED_ERROR_PREFIX: &str = "PRISM_SYNC_ERROR_JSON:";
+const REDACTED_ID: &str = "[redacted-id]";
+const REDACTED_HEX: &str = "[redacted-hex]";
+const REDACTED_TOKEN: &str = "[redacted-token]";
+const REDACTED_VALUE: &str = "[redacted]";
+const SENSITIVE_MESSAGE_KEYS: &[&str] = &[
+    "content_hash",
+    "dek",
+    "device",
+    "device_id",
+    "deviceid",
+    "identity",
+    "init_id",
+    "media_id",
+    "mnemonic",
+    "pairwise_secret",
+    "password",
+    "recipient_sharing_id",
+    "recipientsharingid",
+    "relay",
+    "sender_id",
+    "sender_sharing_id",
+    "sendersharingid",
+    "session_token",
+    "sessiontoken",
+    "sharing_id",
+    "sharingid",
+    "signed",
+    "sync_id",
+    "syncid",
+    "target_device_id",
+    "targetdeviceid",
+    "token",
+    "wrapped_dek",
+];
+
+fn redact_sensitive_message(message: &str) -> String {
+    let keyed = redact_keyed_values(message);
+    redact_unkeyed_fragments(&keyed)
+}
+
+fn redact_display(error: &impl std::fmt::Display) -> String {
+    redact_sensitive_message(&error.to_string())
+}
+
+fn redacted_identifier_for_log(_identifier: &str) -> &'static str {
+    REDACTED_ID
+}
+
+fn redact_keyed_values(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut last = 0;
+    let mut index = 0;
+
+    while index < input.len() {
+        let Some((_, ch)) = input[index..].char_indices().next() else {
+            break;
+        };
+
+        if let Some((value_start, value_end)) =
+            SENSITIVE_MESSAGE_KEYS.iter().find_map(|key| keyed_value_range(input, index, key))
+        {
+            output.push_str(&input[last..value_start]);
+            output.push_str(REDACTED_VALUE);
+            last = value_end;
+            index = value_end;
+            continue;
+        }
+
+        index += ch.len_utf8();
+    }
+
+    output.push_str(&input[last..]);
+    output
+}
+
+fn keyed_value_range(input: &str, key_start: usize, key: &str) -> Option<(usize, usize)> {
+    if !is_sensitive_key_at(input, key_start, key) {
+        return None;
+    }
+
+    let mut index = key_start + key.len();
+    index = skip_ascii_whitespace(input, index);
+    if matches!(char_at(input, index), Some('"') | Some('\'')) {
+        index += 1;
+        index = skip_ascii_whitespace(input, index);
+    }
+    if !matches!(char_at(input, index), Some(':') | Some('=')) {
+        return None;
+    }
+    index += 1;
+    index = skip_ascii_whitespace(input, index);
+
+    let quote = match char_at(input, index) {
+        Some('"') | Some('\'') => {
+            let quote = char_at(input, index);
+            index += 1;
+            quote
+        }
+        _ => None,
+    };
+
+    let value_start = index;
+    let value_end = if let Some(quote) = quote {
+        input[index..]
+            .char_indices()
+            .find_map(|(offset, ch)| (ch == quote).then_some(index + offset))
+            .unwrap_or(input.len())
+    } else {
+        input[index..]
+            .char_indices()
+            .find_map(|(offset, ch)| is_unquoted_value_delimiter(ch).then_some(index + offset))
+            .unwrap_or(input.len())
+    };
+
+    (value_start < value_end).then_some((value_start, value_end))
+}
+
+fn is_sensitive_key_at(input: &str, key_start: usize, key: &str) -> bool {
+    input
+        .get(key_start..key_start + key.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(key))
+        && input
+            .get(..key_start)
+            .and_then(|prefix| prefix.chars().next_back())
+            .is_none_or(|ch| !is_key_char(ch))
+        && input
+            .get(key_start + key.len()..)
+            .and_then(|suffix| suffix.chars().next())
+            .is_none_or(|ch| !is_key_char(ch))
+}
+
+fn is_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn skip_ascii_whitespace(input: &str, mut index: usize) -> usize {
+    while matches!(char_at(input, index), Some(ch) if ch.is_ascii_whitespace()) {
+        index += 1;
+    }
+    index
+}
+
+fn char_at(input: &str, index: usize) -> Option<char> {
+    input.get(index..)?.chars().next()
+}
+
+fn is_unquoted_value_delimiter(ch: char) -> bool {
+    ch.is_ascii_whitespace() || matches!(ch, ',' | ')' | ']' | '}' | ';')
+}
+
+fn redact_unkeyed_fragments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut token = String::new();
+
+    for ch in input.chars() {
+        if is_fragment_char(ch) {
+            token.push(ch);
+        } else {
+            push_redacted_fragment(&mut output, &token);
+            token.clear();
+            output.push(ch);
+        }
+    }
+    push_redacted_fragment(&mut output, &token);
+
+    output
+}
+
+fn push_redacted_fragment(output: &mut String, token: &str) {
+    if token.is_empty() {
+        return;
+    }
+
+    if is_uuid_like(token) || is_short_hex_identifier(token) {
+        output.push_str(REDACTED_HEX);
+    } else if is_long_token_like(token) {
+        output.push_str(REDACTED_TOKEN);
+    } else {
+        output.push_str(token);
+    }
+}
+
+fn is_fragment_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-')
+}
+
+fn is_uuid_like(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() == 36
+        && matches!(bytes.get(8), Some(b'-'))
+        && matches!(bytes.get(13), Some(b'-'))
+        && matches!(bytes.get(18), Some(b'-'))
+        && matches!(bytes.get(23), Some(b'-'))
+        && token.chars().filter(|ch| *ch != '-').all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn is_short_hex_identifier(token: &str) -> bool {
+    token.len() >= 12
+        && token.chars().all(|ch| ch.is_ascii_hexdigit())
+        && token.chars().any(|ch| matches!(ch, 'a'..='f' | 'A'..='F'))
+}
+
+fn is_long_token_like(token: &str) -> bool {
+    token.len() >= 32
+        && token.chars().all(is_fragment_char)
+        && token.chars().any(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+}
 
 fn relay_error_category_to_json(kind: prism_sync_core::RelayErrorCategory) -> &'static str {
     match kind {
@@ -355,7 +565,7 @@ fn relay_error_category_to_json(kind: prism_sync_core::RelayErrorCategory) -> &'
 fn encode_core_error(operation: &str, error: prism_sync_core::CoreError) -> String {
     let mut payload = serde_json::json!({
         "operation": operation,
-        "message": error.to_string(),
+        "message": redact_display(&error),
     });
 
     if let prism_sync_core::CoreError::Relay {
@@ -418,7 +628,7 @@ async fn encode_handle_core_error(
     error: prism_sync_core::CoreError,
 ) -> String {
     if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
-        let _ = ratchet_handle_min_signature_version(handle, *min_signature_version).await;
+        let _ = ratchet_handle_min_signature_version_floor(handle, *min_signature_version).await;
     }
     encode_core_error(operation, error)
 }
@@ -433,9 +643,10 @@ async fn format_handle_relay_error(
         ..
     } = &error
     {
-        let _ = ratchet_handle_min_signature_version(handle, Some(*min_signature_version)).await;
+        let _ =
+            ratchet_handle_min_signature_version_floor(handle, Some(*min_signature_version)).await;
     }
-    format!("{operation} failed: {error}")
+    format!("{operation} failed: {}", redact_display(&error))
 }
 
 fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json::Value {
@@ -454,7 +665,7 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
         SyncEvent::Error(err) => serde_json::json!({
             "type": "Error",
             "kind": format!("{:?}", err.kind),
-            "message": err.message,
+            "message": redact_sensitive_message(&err.message),
             "retryable": err.retryable,
             "code": err.code,
             "remote_wipe": err.remote_wipe,
@@ -519,7 +730,7 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
         SyncEvent::SnapshotUploadFailed { sync_id, reason } => serde_json::json!({
             "type": "SnapshotUploadFailed",
             "sync_id": sync_id,
-            "reason": reason,
+            "reason": redact_sensitive_message(reason),
         }),
     }
 }
@@ -536,6 +747,7 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
 
 const SHARING_ID_CACHE_KEY: &str = "sharing_id_cache";
 const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
+const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 const SHARING_ID_LEN_BYTES: usize = 16;
 const PAIRWISE_SECRET_LEN_BYTES: usize = 32;
@@ -647,29 +859,47 @@ fn decode_optional_u8(store: &dyn PrismSecureStore, key: &str) -> Result<Option<
         .transpose()
 }
 
-fn ratchet_min_signature_version(
+fn stored_min_signature_version_floor(store: &dyn PrismSecureStore) -> Result<Option<u8>, String> {
+    decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)
+}
+
+fn ratchet_min_signature_version_floor(
     store: &dyn PrismSecureStore,
     observed: Option<u8>,
 ) -> Result<(), String> {
-    let Some(observed) = observed else {
-        return Ok(());
-    };
-    let current = decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)?.unwrap_or(0);
-    if observed > current {
+    let required =
+        observed.unwrap_or(SIGNATURE_VERSION_SOURCE_FLOOR).max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    let current = stored_min_signature_version_floor(store)?.unwrap_or(0);
+    if required > current {
         store
-            .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, observed.to_string().as_bytes())
+            .set(MIN_SIGNATURE_VERSION_FLOOR_KEY, required.to_string().as_bytes())
             .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-fn enforce_supported_signature_version_floor(store: &dyn PrismSecureStore) -> Result<(), String> {
-    if let Some(required) = decode_optional_u8(store, MIN_SIGNATURE_VERSION_FLOOR_KEY)? {
+fn ensure_app_supports_stored_floor(store: &dyn PrismSecureStore) -> Result<(), String> {
+    if let Some(required) = stored_min_signature_version_floor(store)? {
         if required > SUPPORTED_SIGNATURE_VERSION {
             return Err(format!(
                 "relay requires signature version {required}, but this app supports up to {SUPPORTED_SIGNATURE_VERSION}. Please update."
             ));
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn enforce_wire_signature_floor(
+    store: &dyn PrismSecureStore,
+    wire_signature_version: u8,
+) -> Result<(), String> {
+    let required =
+        stored_min_signature_version_floor(store)?.unwrap_or(0).max(SIGNATURE_VERSION_SOURCE_FLOOR);
+    if wire_signature_version < required {
+        return Err(format!(
+            "wire signature version {wire_signature_version} is below required floor {required}"
+        ));
     }
     Ok(())
 }
@@ -836,7 +1066,8 @@ async fn build_sharing_context(handle: &PrismSyncHandle) -> Result<SharingHandle
         )
     };
 
-    enforce_supported_signature_version_floor(secure_store.as_ref())?;
+    ratchet_min_signature_version_floor(secure_store.as_ref(), None)?;
+    ensure_app_supports_stored_floor(secure_store.as_ref())?;
 
     let relay_url = decode_optional_utf8(secure_store.as_ref(), "relay_url")?
         .or(fallback_relay_url)
@@ -887,15 +1118,18 @@ async fn load_device_ml_dsa_generation(
     Ok(record.ml_dsa_key_generation)
 }
 
-async fn enforce_handle_signature_version_floor(handle: &PrismSyncHandle) -> Result<(), String> {
+async fn ensure_handle_supports_signature_version_floor(
+    handle: &PrismSyncHandle,
+) -> Result<(), String> {
     let secure_store = {
         let inner = handle.inner.lock().await;
         inner.secure_store().clone()
     };
-    enforce_supported_signature_version_floor(secure_store.as_ref())
+    ratchet_min_signature_version_floor(secure_store.as_ref(), None)?;
+    ensure_app_supports_stored_floor(secure_store.as_ref())
 }
 
-async fn ratchet_handle_min_signature_version(
+async fn ratchet_handle_min_signature_version_floor(
     handle: &PrismSyncHandle,
     observed: Option<u8>,
 ) -> Result<(), String> {
@@ -903,7 +1137,7 @@ async fn ratchet_handle_min_signature_version(
         Ok(inner) => inner.secure_store().clone(),
         Err(_) => return Ok(()),
     };
-    ratchet_min_signature_version(secure_store.as_ref(), observed)
+    ratchet_min_signature_version_floor(secure_store.as_ref(), observed)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1134,43 +1368,62 @@ pub fn create_prism_sync(
 
 // ── Key lifecycle ──
 
+fn secret_text<'a>(
+    field_name: &str,
+    secret: &'a zeroize::Zeroizing<Vec<u8>>,
+) -> Result<&'a str, String> {
+    std::str::from_utf8(secret.as_slice()).map_err(|_| format!("{field_name} must be valid UTF-8"))
+}
+
 /// Initialize (first-time setup).
 pub async fn initialize(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
     secret_key: Vec<u8>,
 ) -> Result<(), String> {
+    let password = zeroize::Zeroizing::new(password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    secret_text("password", &password)?;
+
     // Argon2id (64 MiB, 3 rounds) is CPU-heavy. Run on a spawn_blocking thread
     // so we don't stall the tokio worker. blocking_lock() acquires the tokio
     // Mutex synchronously, which is safe inside spawn_blocking.
     let inner = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
-        inner.blocking_lock().initialize(&password, &secret_key).map_err(|e| e.to_string())
+        let password = secret_text("password", &password)?;
+        inner.blocking_lock().initialize(password, secret_key.as_slice()).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("task failed: {e}"))?
+    .map_err(|e| format!("task failed: {e}"))??;
+    ratchet_handle_min_signature_version_floor(handle, None).await
 }
 
 /// Unlock (subsequent launches).
 pub async fn unlock(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
     secret_key: Vec<u8>,
 ) -> Result<(), String> {
+    let password = zeroize::Zeroizing::new(password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    secret_text("password", &password)?;
+
     // Same reasoning as initialize — Argon2id must not run on a tokio worker.
     let inner = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
-        inner.blocking_lock().unlock(&password, &secret_key).map_err(|e| e.to_string())
+        let password = secret_text("password", &password)?;
+        inner.blocking_lock().unlock(password, secret_key.as_slice()).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("task failed: {e}"))?
+    .map_err(|e| format!("task failed: {e}"))??;
+    ratchet_handle_min_signature_version_floor(handle, None).await
 }
 
 /// Restore the unlocked state directly from raw key material.
 ///
-/// Bypasses Argon2id password derivation entirely. Use when the raw DEK
-/// has been persisted in the platform keychain (Signal-style approach).
-/// This is the fast path for subsequent app launches.
+/// Bypasses Argon2id password derivation entirely. Use when the host has
+/// recovered the DEK from a platform-protected runtime cache. This is the
+/// fast path for subsequent app launches.
 ///
 /// - `dek`: The raw 32-byte Data Encryption Key.
 /// - `device_secret`: The raw 32-byte device secret.
@@ -1182,51 +1435,89 @@ pub async fn restore_runtime_keys(
     let mut inner = handle.inner.lock().await;
     inner.restore_runtime_keys(&dek, &device_secret).map_err(|e| e.to_string())?;
 
-    // Restore persisted epoch keys (epoch 1+, generated during rekey).
-    // Epoch 0 is derived from the DEK by restore_from_dek, but higher epochs
-    // are generated fresh during rekey and only live in the secure store.
-    // Try sequential epoch numbers and stop at the first gap.
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    for epoch in 1u32.. {
-        let key_name = format!("epoch_key_{epoch}");
-        match inner.secure_store().get(&key_name) {
-            Ok(Some(stored_bytes)) => {
-                // The key may have been stored as base64 (client.rs path) or
-                // raw bytes (sync_service.rs path). Try base64 decode first;
-                // if that yields exactly 32 bytes use it, otherwise treat the
-                // stored value as raw key material.
-                let key_bytes = if let Ok(decoded) = STANDARD.decode(&stored_bytes) {
-                    if decoded.len() == 32 {
-                        decoded
-                    } else {
-                        stored_bytes
-                    }
-                } else {
-                    stored_bytes
-                };
+    restore_persisted_epoch_keys(&mut inner)?;
+    ratchet_min_signature_version_floor(inner.secure_store().as_ref(), None)?;
 
-                if key_bytes.len() == 32 {
-                    inner
-                        .key_hierarchy_mut()
-                        .store_epoch_key(epoch, zeroize::Zeroizing::new(key_bytes));
-                } else {
-                    // Unexpected key length — stop restoring further epochs.
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
+    Ok(())
+}
+
+fn parse_epoch_key_name(key: &str) -> Option<u32> {
+    let suffix = key.strip_prefix("epoch_key_")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    suffix.parse::<u32>().ok()
+}
+
+fn decode_persisted_epoch_key(key_name: &str, stored_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    // The key may have been stored as base64 (client/pairing paths) or raw
+    // bytes (older recovery paths). Try base64 first; if it does not decode
+    // to exactly 32 bytes, fall back to raw key material.
+    if let Ok(decoded) = BASE64.decode(&stored_bytes) {
+        if decoded.len() == 32 {
+            return Ok(decoded);
         }
+    }
+
+    if stored_bytes.len() == 32 {
+        return Ok(stored_bytes);
+    }
+
+    Err(format!("{key_name} has wrong length ({}, expected 32)", stored_bytes.len()))
+}
+
+fn restore_persisted_epoch_keys(inner: &mut PrismSync) -> Result<(), String> {
+    let secure_store = inner.secure_store().clone();
+    let mut entries: Vec<(u32, String, Vec<u8>)> = Vec::new();
+
+    if let Some(snapshot) = secure_store.snapshot().map_err(|e| e.to_string())? {
+        for (key, value) in snapshot {
+            let Some(epoch) = parse_epoch_key_name(&key) else {
+                continue;
+            };
+            entries.push((epoch, key, value));
+        }
+    } else {
+        let current_epoch = secure_store
+            .get("epoch")
+            .map_err(|e| e.to_string())?
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        for epoch in 1..=current_epoch {
+            let key = format!("epoch_key_{epoch}");
+            if let Some(value) = secure_store.get(&key).map_err(|e| e.to_string())? {
+                entries.push((epoch, key, value));
+            }
+        }
+    }
+
+    entries.sort_by_key(|(epoch, _, _)| *epoch);
+    for (epoch, key_name, stored_bytes) in entries {
+        let key_bytes = match decode_persisted_epoch_key(&key_name, stored_bytes) {
+            Ok(key_bytes) => key_bytes,
+            Err(error) => {
+                tracing::warn!(
+                    epoch,
+                    key = %key_name,
+                    error = %redact_display(&error),
+                    "restore_runtime_keys: skipping invalid persisted epoch key"
+                );
+                continue;
+            }
+        };
+        inner.key_hierarchy_mut().store_epoch_key(epoch, zeroize::Zeroizing::new(key_bytes));
     }
 
     Ok(())
 }
 
-/// Export the raw DEK bytes for keychain persistence.
+/// Export the raw DEK bytes for host-side runtime-cache wrapping.
 ///
 /// Returns the raw 32-byte DEK. Only works when unlocked (after
-/// `initialize` or `unlock`). Store in the platform keychain so
-/// `restore_runtime_keys` can be used on subsequent launches.
+/// `initialize` or `unlock`). The host must wrap the bytes before
+/// persistence; the unwrapped bytes can be supplied to `restore_runtime_keys`
+/// on subsequent launches.
 pub async fn export_dek(handle: &PrismSyncHandle) -> Result<Vec<u8>, String> {
     let inner = handle.inner.lock().await;
     inner.export_dek().map_err(|e| e.to_string())
@@ -1283,7 +1574,8 @@ pub async fn rekey_db(handle: &PrismSyncHandle, new_key: Vec<u8>) -> Result<(), 
 /// If the secure store contains an `epoch` key, that value is used instead.
 pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     let mut inner = handle.inner.lock().await;
-    enforce_supported_signature_version_floor(inner.secure_store().as_ref())?;
+    ratchet_min_signature_version_floor(inner.secure_store().as_ref(), None)?;
+    ensure_app_supports_stored_floor(inner.secure_store().as_ref())?;
 
     // Read credentials from secure store
     let sync_id = inner
@@ -1358,7 +1650,10 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
     // connect() spawns a background reconnect loop and never blocks).
     if let Err(e) = relay.connect_websocket().await {
         // Non-fatal: WebSocket will reconnect automatically with backoff.
-        tracing::warn!("[prism_sync_ffi] WebSocket connect failed (non-fatal): {e}");
+        tracing::warn!(
+            error = %redact_display(&e),
+            "[prism_sync_ffi] WebSocket connect failed (non-fatal)"
+        );
     }
 
     // Store relay so set_auto_sync can wire up the notification handler.
@@ -1374,9 +1669,9 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 
 /// Change password (re-wraps DEK, no data re-encryption).
 ///
-/// The `old_password` parameter is accepted for API symmetry but is not
-/// used — `change_password` operates on the already-unlocked key hierarchy.
-/// The secret key is required to derive the new wrapping key.
+/// Operates on the already-unlocked key hierarchy. The new password and
+/// secret key are wrapped for zeroization immediately on FFI entry; the new
+/// password bytes must be valid UTF-8 for the current crypto API.
 ///
 /// Returns the next `identity_generation` value that the app should persist
 /// to synced settings. If local sharing is currently active, this also
@@ -1384,12 +1679,16 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 /// incremented generation before re-wrapping the DEK.
 pub async fn change_password(
     handle: &PrismSyncHandle,
-    _old_password: String,
-    new_password: String,
+    new_password: Vec<u8>,
     secret_key: Vec<u8>,
     sharing_id: Option<String>,
     current_identity_generation: u32,
 ) -> Result<u32, String> {
+    let new_password = zeroize::Zeroizing::new(new_password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    std::str::from_utf8(new_password.as_slice())
+        .map_err(|_| "new_password must be valid UTF-8".to_string())?;
+
     let next_identity_generation = current_identity_generation
         .checked_add(1)
         .ok_or_else(|| "identity_generation overflow".to_string())?;
@@ -1420,9 +1719,11 @@ pub async fn change_password(
     let inner_arc = handle.inner.clone();
     tokio::task::spawn_blocking(move || {
         let inner = inner_arc.blocking_lock();
+        let new_password = std::str::from_utf8(new_password.as_slice())
+            .map_err(|_| "new_password must be valid UTF-8".to_string())?;
         let (new_wrapped_dek, new_salt) = inner
             .key_hierarchy()
-            .change_password(&new_password, &secret_key)
+            .change_password(new_password, secret_key.as_slice())
             .map_err(|e| format!("change_password failed: {e}"))?;
         inner
             .secure_store()
@@ -1776,8 +2077,10 @@ pub async fn sync_now(handle: &PrismSyncHandle) -> Result<String, String> {
         Ok(result) => result,
         Err(error) => {
             if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
-                let _ =
-                    ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
+                let _ = ratchet_min_signature_version_floor(
+                    secure_store.as_ref(),
+                    *min_signature_version,
+                );
             }
             return Err(encode_core_error("sync_now", error));
         }
@@ -2058,11 +2361,17 @@ fn build_relay(
 /// sync_id in the URL path.
 pub async fn create_sync_group(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
     relay_url: String,
-    mnemonic: Option<String>,
+    mnemonic: Option<Vec<u8>>,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    let password = zeroize::Zeroizing::new(password);
+    let mnemonic = mnemonic.map(zeroize::Zeroizing::new);
+    let password_text = secret_text("password", &password)?;
+    let mnemonic_text =
+        mnemonic.as_ref().map(|bytes| secret_text("mnemonic", bytes)).transpose()?;
+
+    ensure_handle_supports_signature_version_floor(handle).await?;
     const PENDING_SYNC_ID_KEY: &str = "pending_sync_id";
     const PENDING_NONCE_RESPONSE_KEY: &str = "pending_registration_nonce_response";
     const PENDING_ADMISSION_PROOF_KEY: &str = "pending_first_device_admission_proof";
@@ -2124,9 +2433,9 @@ pub async fn create_sync_group(
     let ffi_allow_insecure = handle.allow_insecure;
     let create_result = pairing
         .create_sync_group(
-            &password,
+            password_text,
             &relay_url,
-            mnemonic,
+            mnemonic_text,
             Some(sync_id),
             pending.1.clone(),
             pending.2.clone(),
@@ -2159,12 +2468,14 @@ pub async fn create_sync_group(
         let _ = inner.secure_store().delete(key);
     }
 
-    let (creds, response) = match create_result {
+    let (mut creds, mut response) = match create_result {
         Ok(value) => value,
         Err(error) => {
             if let prism_sync_core::CoreError::Relay { min_signature_version, .. } = &error {
-                let _ =
-                    ratchet_min_signature_version(secure_store.as_ref(), *min_signature_version);
+                let _ = ratchet_min_signature_version_floor(
+                    secure_store.as_ref(),
+                    *min_signature_version,
+                );
             }
             return Err(encode_core_error("create_sync_group", error));
         }
@@ -2183,9 +2494,14 @@ pub async fn create_sync_group(
     // create_sync_group just produced, and restore the device_secret.
     // This ensures configureEngine can derive the signing key and
     // the epoch key matches what's in the invite for other devices.
-    let secret_key = prism_sync_crypto::mnemonic::to_bytes(&creds.mnemonic)
-        .map_err(|e| format!("mnemonic conversion failed: {e}"))?;
-    inner.unlock(&password, &secret_key).map_err(|e| format!("unlock after create failed: {e}"))?;
+    let secret_key_result = prism_sync_crypto::mnemonic::to_bytes(&creds.mnemonic)
+        .map_err(|e| format!("mnemonic conversion failed: {e}"));
+    creds.mnemonic.zeroize();
+    response.mnemonic.zeroize();
+    let secret_key = zeroize::Zeroizing::new(secret_key_result?);
+    inner
+        .unlock(password_text, secret_key.as_slice())
+        .map_err(|e| format!("unlock after create failed: {e}"))?;
 
     let device_secret_bytes = inner
         .secure_store()
@@ -2241,6 +2557,8 @@ pub async fn create_sync_group(
         &[self_record],
     )
     .map_err(|e| format!("failed to seed local device registry: {e}"))?;
+    ensure_local_sync_metadata(inner.storage().as_ref(), &response.sync_id, &device_id, 0)
+        .map_err(|e| format!("failed to seed local sync metadata: {e}"))?;
 
     let result = serde_json::json!({
         "sync_id": response.sync_id,
@@ -2258,6 +2576,34 @@ pub async fn create_sync_group(
 pub async fn prepare_pending_device_identity(handle: &PrismSyncHandle) -> Result<String, String> {
     let device_secret = prism_sync_crypto::DeviceSecret::generate();
     let device_id = prism_sync_core::node_id::generate_node_id();
+    let signing_key = device_secret
+        .ed25519_keypair(&device_id)
+        .map_err(|e| format!("ed25519 derive failed: {e}"))?;
+    let x25519_key = device_secret
+        .x25519_keypair(&device_id)
+        .map_err(|e| format!("x25519 derive failed: {e}"))?;
+    let ml_dsa_key = device_secret
+        .ml_dsa_65_keypair(&device_id)
+        .map_err(|e| format!("ml-dsa derive failed: {e}"))?;
+    let ml_kem_key = device_secret
+        .ml_kem_768_keypair(&device_id)
+        .map_err(|e| format!("ml-kem derive failed: {e}"))?;
+    let xwing_key = device_secret
+        .xwing_keypair(&device_id)
+        .map_err(|e| format!("x-wing derive failed: {e}"))?;
+
+    let signing_pk = signing_key.public_key_bytes();
+    let x25519_pk = x25519_key.public_key_bytes();
+    let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+    let ml_kem_pk = ml_kem_key.public_key_bytes();
+    let xwing_pk = xwing_key.encapsulation_key_bytes();
+    let registration_key_bundle_hash = compute_registration_key_bundle_hash(
+        &signing_pk,
+        &x25519_pk,
+        &ml_dsa_pk,
+        &ml_kem_pk,
+        &xwing_pk,
+    );
 
     let handle_inner = handle.inner.lock().await;
     let store = handle_inner.secure_store();
@@ -2268,7 +2614,33 @@ pub async fn prepare_pending_device_identity(handle: &PrismSyncHandle) -> Result
         .set("pending_device_id", device_id.as_bytes())
         .map_err(|e| format!("Failed to persist pending device id: {e}"))?;
 
-    Ok(device_id)
+    Ok(serde_json::json!({
+        "device_id": device_id,
+        "registration_key_bundle_hash": hex::encode(registration_key_bundle_hash),
+    })
+    .to_string())
+}
+
+fn compute_registration_key_bundle_hash(
+    signing_pk: &[u8],
+    x25519_pk: &[u8],
+    ml_dsa_pk: &[u8],
+    ml_kem_pk: &[u8],
+    xwing_pk: &[u8],
+) -> [u8; 32] {
+    fn write_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"PRISM_SYNC_REGISTRATION_KEY_BUNDLE_V1\x00");
+    write_len_prefixed(&mut hasher, signing_pk);
+    write_len_prefixed(&mut hasher, x25519_pk);
+    write_len_prefixed(&mut hasher, ml_dsa_pk);
+    write_len_prefixed(&mut hasher, ml_kem_pk);
+    write_len_prefixed(&mut hasher, xwing_pk);
+    hasher.finalize().into()
 }
 
 // ── Device management ──
@@ -2285,7 +2657,7 @@ pub async fn list_devices(
     device_id: String,
     session_token: String,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2318,7 +2690,7 @@ pub async fn list_devices(
 /// Fetch the relay-advertised GIF service configuration for the current sync
 /// server. Returns JSON: `{"enabled": bool, "api_base_url": "...", "media_proxy_enabled": bool}`.
 pub async fn fetch_gif_service_config(handle: &PrismSyncHandle) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (sync_id, device_id, session_token, relay_url, storage, device_secret) = {
         let inner = handle.inner.lock().await;
         let secure_store = inner.secure_store();
@@ -2385,7 +2757,7 @@ pub async fn revoke_device(
     session_token: String,
     target_device_id: String,
 ) -> Result<(), String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2415,7 +2787,7 @@ pub async fn revoke_device(
         .await
     {
         Ok(_) => Ok(()),
-        Err(error) => Err(format!("revoke_device failed: {error}")),
+        Err(error) => Err(format!("revoke_device failed: {}", redact_display(&error))),
     }
 }
 
@@ -2438,7 +2810,7 @@ pub async fn revoke_and_rekey(
     target_device_id: String,
     remote_wipe: bool,
 ) -> Result<u32, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2468,7 +2840,7 @@ pub async fn revoke_and_rekey(
         .await
     {
         Ok(epoch) => Ok(epoch),
-        Err(error) => Err(format!("revoke_and_rekey failed: {error}")),
+        Err(error) => Err(format!("revoke_and_rekey failed: {}", redact_display(&error))),
     }
 }
 
@@ -2488,8 +2860,10 @@ pub async fn check_wipe_status(
 ///
 /// This is needed because `initialize()` and `unlock()` take `secret_key: Vec<u8>`,
 /// but the user sees/enters a 12-word mnemonic. This bridges the two.
-pub fn mnemonic_to_bytes(mnemonic: String) -> Result<Vec<u8>, String> {
-    prism_sync_crypto::mnemonic::to_bytes(&mnemonic).map_err(|e| e.to_string())
+pub fn mnemonic_to_bytes(mnemonic: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mnemonic = zeroize::Zeroizing::new(mnemonic);
+    let mnemonic = secret_text("mnemonic", &mnemonic)?;
+    prism_sync_crypto::mnemonic::to_bytes(mnemonic).map_err(|e| e.to_string())
 }
 
 /// Convert 16-byte entropy back to a BIP39 mnemonic string.
@@ -2509,7 +2883,7 @@ pub async fn deregister_device(
     device_id: String,
     session_token: String,
 ) -> Result<(), String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2545,7 +2919,7 @@ pub async fn delete_sync_group(
     device_id: String,
     session_token: String,
 ) -> Result<(), String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     let (storage, device_secret) = {
         let inner = handle.inner.lock().await;
         (
@@ -2571,12 +2945,36 @@ pub async fn delete_sync_group(
     }
 }
 
+/// Atomically wipe all local sync engine state for the configured sync group.
+///
+/// Clears `pending_ops`, `applied_ops`, `field_versions`, `sync_metadata`, and
+/// the paired-devices list (`device_registry`) inside a single
+/// `BEGIN IMMEDIATE` transaction. After this returns successfully the device
+/// is unpaired from its sync group and must re-pair before any further sync
+/// operation will succeed.
+///
+/// The host's Drift-side `sync_quarantine` table (if any) is *not* touched —
+/// that lives outside the Rust engine and must be cleared by the host
+/// alongside this call.
+///
+/// Used as the "Approach A" cutover hook by the per-member fronting migration
+/// (see `docs/plans/fronting-per-member-sessions.md` §4.2). Performs no relay
+/// I/O — purely local. Requires a configured engine (`configure_engine` must
+/// have been called) — for the cleanup-resume path that runs without a
+/// configured engine, use [`clear_sync_state`] instead.
+pub async fn reset_sync_state(handle: &PrismSyncHandle) -> Result<(), String> {
+    let mut inner = handle.inner.lock().await;
+    inner.reset_sync_state().await.map_err(|e| e.to_string())
+}
+
 /// Clear all sync-DB rows for the given `sync_id`.
 ///
 /// Wipes `pending_ops`, `applied_ops`, `field_versions`, `device_registry`,
 /// and `sync_metadata` rows scoped to `sync_id`. Used by the reset-data path
 /// (Phase 2B) as belt-and-suspenders before deleting the sync DB file, and
-/// by any future cleanup of orphaned/abandoned sync_ids.
+/// by any future cleanup of orphaned/abandoned sync_ids — including the
+/// fronting-migration cleanup-resume path, which has no live engine to call
+/// [`reset_sync_state`] against.
 ///
 /// **Safety guard:** by default, refuses to clear the *currently active*
 /// `sync_id` (the one configured on the live engine). Callers that
@@ -2631,29 +3029,25 @@ pub async fn get_node_id(handle: &PrismSyncHandle) -> Result<Option<String>, Str
 /// Seed the in-memory secure store with values from the platform keychain.
 /// Call this after `create_prism_sync`, before `initialize`/`unlock`/`configure_engine`.
 ///
-/// `entries_json` is a JSON object: `{"key": "base64value", ...}`
+/// Entries are transferred as per-key byte buffers so secret material does not
+/// need to be assembled into a JSON string at the FFI boundary.
 pub async fn seed_secure_store(
     handle: &PrismSyncHandle,
-    entries_json: String,
+    entries: std::collections::HashMap<String, Vec<u8>>,
 ) -> Result<(), String> {
-    let entries: std::collections::HashMap<String, String> =
-        serde_json::from_str(&entries_json).map_err(|e| format!("Invalid entries JSON: {e}"))?;
     let inner = handle.inner.lock().await;
     let store = inner.secure_store();
-    for (key, b64_value) in entries {
-        use base64::Engine;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&b64_value)
-            .map_err(|e| format!("Invalid base64 for key '{key}': {e}"))?;
+    for (key, bytes) in entries {
         store.set(&key, &bytes).map_err(|e| e.to_string())?;
     }
+    ratchet_min_signature_version_floor(store.as_ref(), None)?;
     Ok(())
 }
 
 /// Drain all values from the secure store so Dart can persist them
 /// back to the platform keychain.
 ///
-/// Returns a JSON object: `{"key": "base64value", ...}`
+/// Returns per-key byte buffers for the app to persist to its keychain.
 /// Call this after state-changing operations (initialize, change_password,
 /// create_sync_group, join_*).
 ///
@@ -2666,7 +3060,9 @@ pub async fn seed_secure_store(
 /// **Fallback:** if enumeration is unavailable (keychain-backed impls),
 /// drain falls back to the historical fixed `known_keys` list plus
 /// `epoch_key_1..=current_epoch`.
-pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, String> {
+pub async fn drain_secure_store(
+    handle: &PrismSyncHandle,
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
     let (store, storage, sync_id, cached_epoch) = {
         let inner = handle.inner.lock().await;
         let cached_epoch = inner
@@ -2687,13 +3083,7 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
 
     // Fast path: snapshot the entire store.
     if let Some(map) = store.snapshot().map_err(|e| e.to_string())? {
-        use base64::Engine;
-        let mut entries = serde_json::Map::with_capacity(map.len());
-        for (key, value) in map {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
-            entries.insert(key, serde_json::Value::String(b64));
-        }
-        return Ok(serde_json::Value::Object(entries).to_string());
+        return Ok(map);
     }
 
     // Fallback path: keychain-backed store without enumeration. Use the
@@ -2730,23 +3120,19 @@ pub async fn drain_secure_store(handle: &PrismSyncHandle) -> Result<String, Stri
         "sharing_id_cache",
         "min_signature_version_floor",
     ];
-    let mut entries = serde_json::Map::new();
+    let mut entries = std::collections::HashMap::new();
     for key in known_keys {
         if let Ok(Some(value)) = store.get(key) {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
-            entries.insert(key.to_string(), serde_json::Value::String(b64));
+            entries.insert(key.to_string(), value);
         }
     }
     for epoch in 1..=current_epoch {
         let key = format!("epoch_key_{epoch}");
         if let Ok(Some(value)) = store.get(&key) {
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
-            entries.insert(key, serde_json::Value::String(b64));
+            entries.insert(key, value);
         }
     }
-    Ok(serde_json::Value::Object(entries).to_string())
+    Ok(entries)
 }
 
 // ── Phase 4 sharing bootstrap ──
@@ -2963,10 +3349,10 @@ pub async fn sharing_process_pending(
                         sender_identity_hex: None,
                         fingerprint: None,
                         trust_decision: None,
-                        error: Some(format!(
+                        error: Some(redact_sensitive_message(&format!(
                             "relay sender_id does not match signed sender identity: relay={}, signed={}",
                             pending_init.sender_id, processed.sender_identity.sharing_id
-                        )),
+                        ))),
                     }
                 } else {
                     let pinned_identity = inputs
@@ -3063,7 +3449,7 @@ pub async fn sharing_process_pending(
                 sender_identity_hex: None,
                 fingerprint: None,
                 trust_decision: None,
-                error: Some(error.to_string()),
+                error: Some(redact_display(&error)),
             },
         };
 
@@ -3230,6 +3616,14 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
         .map_err(|e| format!("Failed to create PairingRelay: {e}"))
 }
 
+fn sas_display_json(sas: &SasDisplay) -> serde_json::Value {
+    serde_json::json!({
+        "sas_version": sas.version,
+        "sas_words": sas.words,
+        "sas_word_list": sas.word_list,
+    })
+}
+
 /// Start the joiner side of the relay-based PQ pairing ceremony.
 ///
 /// Generates bootstrap keys, uploads them to the relay, and returns
@@ -3246,7 +3640,7 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
 /// The `JoinerCeremony` state is stored in the handle for subsequent calls
 /// to [`get_joiner_sas`] and [`complete_joiner_ceremony`].
 pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::StartJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
@@ -3281,13 +3675,94 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
     Ok(result.to_string())
 }
 
+/// Cancel any in-progress relay-based PQ pairing ceremony.
+///
+/// This clears both in-memory ceremony slots, removes any pending joiner
+/// bootstrap identity material, and never sends credentials. If a rendezvous id
+/// was already allocated, the relay session is deleted on a best-effort basis
+/// after local state is cleared. Relay cleanup errors are intentionally logged
+/// and ignored so cancellation remains idempotent and can recover from
+/// partially connected/offline states.
+pub async fn cancel_pairing_ceremony(handle: &PrismSyncHandle) -> Result<(), String> {
+    let mut rendezvous_ids = Vec::new();
+
+    if let Some(ceremony) = handle
+        .joiner_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
+        .take()
+    {
+        rendezvous_ids.push(ceremony.rendezvous_id_hex());
+    }
+
+    if let Some(ceremony) = handle
+        .initiator_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
+        .take()
+    {
+        rendezvous_ids.push(ceremony.rendezvous_id_hex());
+    }
+
+    rendezvous_ids.sort();
+    rendezvous_ids.dedup();
+
+    {
+        let inner = handle.inner.lock().await;
+        let secure_store = inner.secure_store();
+        if let Err(error) = secure_store.delete("pending_device_secret") {
+            tracing::debug!(
+                "[prism_sync_ffi] pairing cancel could not delete pending_device_secret: {error}"
+            );
+        }
+        if let Err(error) = secure_store.delete("pending_device_id") {
+            tracing::debug!(
+                "[prism_sync_ffi] pairing cancel could not delete pending_device_id: {error}"
+            );
+        }
+    }
+
+    if rendezvous_ids.is_empty() {
+        return Ok(());
+    }
+
+    let pairing_relay = match build_pairing_relay(handle) {
+        Ok(pairing_relay) => pairing_relay,
+        Err(error) => {
+            tracing::debug!(
+                "[prism_sync_ffi] skipping best-effort pairing cancel relay cleanup: {error}"
+            );
+            return Ok(());
+        }
+    };
+
+    for rendezvous_id in rendezvous_ids {
+        let cleanup = pairing_relay.delete_session(&rendezvous_id);
+        match tokio::time::timeout(std::time::Duration::from_secs(2), cleanup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::debug!(
+                "[prism_sync_ffi] best-effort pairing cancel relay cleanup failed for {rendezvous_id}: {error}"
+            ),
+            Err(_) => tracing::debug!(
+                "[prism_sync_ffi] best-effort pairing cancel relay cleanup timed out for {rendezvous_id}"
+            ),
+        }
+    }
+
+    Ok(())
+}
+
 /// Wait for the initiator's PairingInit and return the SAS display codes.
 ///
 /// Polls the relay for the PairingInit slot until it arrives, then derives
-/// the shared secret and SAS codes. Returns JSON:
+/// the shared secret and SAS phrase. Returns JSON:
 ///
 /// ```json
-/// { "sas_words": "apple banana cherry", "sas_decimal": "123456" }
+/// {
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"]
+/// }
 /// ```
 ///
 /// Must be called after [`start_joiner_ceremony`].
@@ -3326,10 +3801,7 @@ pub async fn get_joiner_sas(handle: &PrismSyncHandle) -> Result<String, String> 
         .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
         .replace(ceremony);
 
-    let result = serde_json::json!({
-        "sas_words": sas.words,
-        "sas_decimal": sas.decimal,
-    });
+    let result = sas_display_json(&sas);
     Ok(result.to_string())
 }
 
@@ -3346,9 +3818,12 @@ pub async fn get_joiner_sas(handle: &PrismSyncHandle) -> Result<String, String> 
 /// Must be called after [`get_joiner_sas`] and user SAS verification.
 pub async fn complete_joiner_ceremony(
     handle: &PrismSyncHandle,
-    password: String,
+    password: Vec<u8>,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    let password = zeroize::Zeroizing::new(password);
+    let password_text = secret_text("password", &password)?;
+
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteJoiner)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
@@ -3383,7 +3858,7 @@ pub async fn complete_joiner_ceremony(
             &ceremony,
             &pairing_relay,
             &[],
-            &password,
+            password_text,
             |sync_id, device_id, registration_token| {
                 // Fresh-install onboarding can seed a manual token locally
                 // before pairing starts. Use it when the inviter bundle does
@@ -3430,6 +3905,24 @@ pub async fn complete_joiner_ceremony(
         &registry_snapshot.to_device_records(),
     )
     .map_err(|e| e.to_string())?;
+
+    // Seed local metadata before the snapshot import runs. `import_snapshot`
+    // preserves an existing `local_device_id`, but falls back to the snapshot's
+    // metadata when no row exists. For a joiner that fallback is the inviter's
+    // device id, so create/repair the row here with this device's identity.
+    let device_id = inner
+        .secure_store()
+        .get("device_id")
+        .map_err(|e| e.to_string())?
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or("device_id not found after bootstrap join")?;
+    let current_epoch = i32::try_from(registry_snapshot.current_epoch).map_err(|_| {
+        format!(
+            "registry current_epoch {} exceeds local storage range",
+            registry_snapshot.current_epoch
+        )
+    })?;
+    ensure_local_sync_metadata(inner.storage().as_ref(), &sync_id, &device_id, current_epoch)?;
 
     // Restore runtime keys so configureEngine etc. work
     let dek = key_hierarchy.dek().map_err(|e| e.to_string())?;
@@ -3487,6 +3980,40 @@ pub async fn complete_joiner_ceremony(
     Ok(result.to_string())
 }
 
+fn ensure_local_sync_metadata(
+    storage: &dyn SyncStorage,
+    sync_id: &str,
+    device_id: &str,
+    current_epoch: i32,
+) -> Result<(), String> {
+    let now = chrono::Utc::now();
+    let metadata = match storage.get_sync_metadata(sync_id).map_err(|e| e.to_string())? {
+        Some(mut metadata) => {
+            metadata.local_device_id = device_id.to_string();
+            metadata.current_epoch = metadata.current_epoch.max(current_epoch);
+            metadata.updated_at = now;
+            metadata
+        }
+        None => SyncMetadata {
+            sync_id: sync_id.to_string(),
+            local_device_id: device_id.to_string(),
+            current_epoch,
+            last_pulled_server_seq: 0,
+            last_pushed_at: None,
+            last_successful_sync_at: None,
+            registered_at: Some(now),
+            needs_rekey: false,
+            last_imported_registry_version: None,
+            created_at: now,
+            updated_at: now,
+        },
+    };
+    let mut tx = storage.begin_tx().map_err(|e| e.to_string())?;
+    tx.upsert_sync_metadata(&metadata).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Start the initiator side of the relay-based PQ pairing ceremony.
 ///
 /// Parses the rendezvous token from QR/deep-link bytes, fetches the joiner's
@@ -3495,8 +4022,9 @@ pub async fn complete_joiner_ceremony(
 ///
 /// ```json
 /// {
-///   "sas_words": "apple banana cherry",
-///   "sas_decimal": "123456",
+///   "sas_version": 2,
+///   "sas_words": "apple banana cherry delta ember",
+///   "sas_word_list": ["apple", "banana", "cherry", "delta", "ember"],
 ///   "joiner_device_id": "c3d4..."
 /// }
 /// ```
@@ -3513,7 +4041,7 @@ pub async fn start_initiator_ceremony(
     handle: &PrismSyncHandle,
     token_bytes: Vec<u8>,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::StartInitiator)?;
     let token = RendezvousToken::from_bytes(&token_bytes)
         .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
@@ -3541,11 +4069,8 @@ pub async fn start_initiator_ceremony(
         .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
         .replace(ceremony);
 
-    let result = serde_json::json!({
-        "sas_words": sas.words,
-        "sas_decimal": sas.decimal,
-        "joiner_device_id": joiner_device_id,
-    });
+    let mut result = sas_display_json(&sas);
+    result["joiner_device_id"] = serde_json::Value::String(joiner_device_id);
     Ok(result.to_string())
 }
 
@@ -3563,10 +4088,15 @@ pub async fn start_initiator_ceremony(
 /// Must be called after [`start_initiator_ceremony`] and user SAS verification.
 pub async fn complete_initiator_ceremony(
     handle: &PrismSyncHandle,
-    password: String,
-    mnemonic: String,
+    password: Vec<u8>,
+    mnemonic: Vec<u8>,
 ) -> Result<String, String> {
-    enforce_handle_signature_version_floor(handle).await?;
+    let password = zeroize::Zeroizing::new(password);
+    let mnemonic = zeroize::Zeroizing::new(mnemonic);
+    let password_text = secret_text("password", &password)?;
+    let mnemonic_text = secret_text("mnemonic", &mnemonic)?;
+
+    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteInitiator)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
@@ -3624,8 +4154,8 @@ pub async fn complete_initiator_ceremony(
         .complete_bootstrap_initiator(
             &ceremony,
             &pairing_relay,
-            &password,
-            &mnemonic,
+            password_text,
+            mnemonic_text,
             relay.as_ref(),
         )
         .await
@@ -3692,17 +4222,9 @@ pub async fn complete_initiator_ceremony(
             // next launch reads the same epoch we're advancing to. Without
             // this, restart drops self.epoch back to the pre-rekey value
             // (configure_engine prefers sync_metadata over secure_store).
-            let storage = inner.storage().clone();
-            let sid_for_meta = sync_id.clone();
             let ne = new_epoch as i32;
-            tokio::task::spawn_blocking(move || {
-                let mut tx = storage.begin_tx()?;
-                tx.update_current_epoch(&sid_for_meta, ne)?;
-                tx.commit()
-            })
-            .await
-            .map_err(|e| format!("join sync_metadata update task: {e}"))?
-            .map_err(|e| format!("update sync_metadata.current_epoch: {e}"))?;
+            ensure_local_sync_metadata(inner.storage().as_ref(), &sync_id, &device_id, ne)
+                .map_err(|e| format!("update sync_metadata.current_epoch: {e}"))?;
 
             inner.advance_epoch(new_epoch as i32);
         }
@@ -3967,7 +4489,7 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
                 .await
             {
                 tracing::info!(
-                    device_id = %device_id,
+                    device_id = %redacted_identifier_for_log(&device_id),
                     generation = new_gen,
                     "rotate_ml_dsa_key: reconciled ambiguous relay failure after remote commit"
                 );
@@ -4073,13 +4595,14 @@ async fn reconcile_ml_dsa_rotation_commit(
     expected_new_gen: u32,
     expected_new_pk: &[u8],
 ) -> bool {
+    let redacted_device_id = redacted_identifier_for_log(device_id);
     let relay_devices = match relay.list_devices().await {
         Ok(devices) => devices,
         Err(error) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation failed to list relay devices"
             );
             return false;
@@ -4088,7 +4611,7 @@ async fn reconcile_ml_dsa_rotation_commit(
 
     let Some(relay_self) = relay_devices.iter().find(|device| device.device_id == device_id) else {
         tracing::warn!(
-            device_id = %device_id,
+            device_id = %redacted_device_id,
             generation = expected_new_gen,
             "rotate_ml_dsa_key: reconciliation could not find local device on relay"
         );
@@ -4097,7 +4620,7 @@ async fn reconcile_ml_dsa_rotation_commit(
 
     if relay_self.ml_dsa_key_generation != expected_new_gen {
         tracing::info!(
-            device_id = %device_id,
+            device_id = %redacted_device_id,
             expected_generation = expected_new_gen,
             relay_generation = relay_self.ml_dsa_key_generation,
             "rotate_ml_dsa_key: reconciliation did not prove relay advanced to target generation"
@@ -4109,7 +4632,7 @@ async fn reconcile_ml_dsa_rotation_commit(
         Ok(Some(response)) => response,
         Ok(None) => {
             tracing::info!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
                 "rotate_ml_dsa_key: reconciliation found no signed registry artifact"
             );
@@ -4117,9 +4640,9 @@ async fn reconcile_ml_dsa_rotation_commit(
         }
         Err(error) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation failed to fetch signed registry"
             );
             return false;
@@ -4130,9 +4653,9 @@ async fn reconcile_ml_dsa_rotation_commit(
         import_signed_registry(storage.clone(), sync_id, signed_registry.artifact_blob).await
     {
         tracing::warn!(
-            device_id = %device_id,
+            device_id = %redacted_device_id,
             generation = expected_new_gen,
-            error = %error,
+            error = %redact_sensitive_message(&error),
             "rotate_ml_dsa_key: reconciliation failed to import signed registry"
         );
         return false;
@@ -4148,7 +4671,7 @@ async fn reconcile_ml_dsa_rotation_commit(
                 true
             } else {
                 tracing::info!(
-                    device_id = %device_id,
+                    device_id = %redacted_device_id,
                     expected_generation = expected_new_gen,
                     local_generation = record.ml_dsa_key_generation,
                     "rotate_ml_dsa_key: reconciliation imported registry but local record did not match expected key state"
@@ -4158,7 +4681,7 @@ async fn reconcile_ml_dsa_rotation_commit(
         }
         Ok(Ok(None)) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
                 "rotate_ml_dsa_key: reconciliation could not find local device after registry import"
             );
@@ -4166,18 +4689,18 @@ async fn reconcile_ml_dsa_rotation_commit(
         }
         Ok(Err(error)) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation failed to load local device after registry import"
             );
             false
         }
         Err(error) => {
             tracing::warn!(
-                device_id = %device_id,
+                device_id = %redacted_device_id,
                 generation = expected_new_gen,
-                error = %error,
+                error = %redact_display(&error),
                 "rotate_ml_dsa_key: reconciliation device lookup task failed"
             );
             false
@@ -4242,6 +4765,104 @@ mod tests {
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
     use std::sync::Arc;
+
+    #[test]
+    fn min_signature_version_omitted_response_ratchets_to_source_floor() {
+        let store = MemorySecureStore::new();
+
+        ratchet_min_signature_version_floor(&store, None).unwrap();
+
+        assert_eq!(
+            decode_optional_u8(&store, MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap(),
+            Some(SIGNATURE_VERSION_SOURCE_FLOOR)
+        );
+    }
+
+    #[test]
+    fn min_signature_version_omission_does_not_lower_existing_floor() {
+        let store = MemorySecureStore::new();
+        store.set(MIN_SIGNATURE_VERSION_FLOOR_KEY, b"4").unwrap();
+
+        ratchet_min_signature_version_floor(&store, None).unwrap();
+
+        assert_eq!(decode_optional_u8(&store, MIN_SIGNATURE_VERSION_FLOOR_KEY).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn min_signature_version_above_app_support_fails_update_required() {
+        let store = MemorySecureStore::new();
+        store.set(MIN_SIGNATURE_VERSION_FLOOR_KEY, b"4").unwrap();
+
+        let err = ensure_app_supports_stored_floor(&store).unwrap_err();
+
+        assert!(err.contains("supports up to 3"), "unexpected error: {err}");
+        assert!(err.contains("Please update"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn min_signature_version_above_app_support_blocks_create_sync_group() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+        seed_secure_store(
+            &handle,
+            HashMap::from([(MIN_SIGNATURE_VERSION_FLOOR_KEY.to_string(), b"4".to_vec())]),
+        )
+        .await
+        .expect("seed secure store");
+
+        let err = create_sync_group(
+            &handle,
+            b"pw".to_vec(),
+            "https://relay.example.com".to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("supports up to 3"), "unexpected error: {err}");
+        assert!(err.contains("Please update"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn min_signature_version_wire_floor_rejects_v2_without_stored_floor() {
+        let store = MemorySecureStore::new();
+
+        let err = enforce_wire_signature_floor(&store, 0x02).unwrap_err();
+
+        assert!(err.contains("below required floor 3"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn min_signature_version_seed_secure_store_ratchets_low_floor() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        seed_secure_store(
+            &handle,
+            HashMap::from([(MIN_SIGNATURE_VERSION_FLOOR_KEY.to_string(), b"2".to_vec())]),
+        )
+        .await
+        .expect("seed secure store");
+
+        let inner = handle.inner.lock().await;
+        assert_eq!(
+            decode_optional_u8(inner.secure_store().as_ref(), MIN_SIGNATURE_VERSION_FLOOR_KEY)
+                .unwrap(),
+            Some(SIGNATURE_VERSION_SOURCE_FLOOR)
+        );
+    }
 
     #[test]
     fn parse_schema_json_accepts_real_type() {
@@ -4725,6 +5346,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ensure_local_sync_metadata_creates_missing_row() {
+        let storage = RusqliteSyncStorage::in_memory().unwrap();
+
+        ensure_local_sync_metadata(&storage, "sync-join", "joiner-device", 3).unwrap();
+
+        let meta = storage.get_sync_metadata("sync-join").unwrap().unwrap();
+        assert_eq!(meta.local_device_id, "joiner-device");
+        assert_eq!(meta.current_epoch, 3);
+        assert_eq!(meta.last_pulled_server_seq, 0);
+    }
+
+    #[test]
+    fn ensure_local_sync_metadata_repairs_local_device_id_without_regressing_progress() {
+        let storage = RusqliteSyncStorage::in_memory().unwrap();
+        let mut metadata = make_metadata("sync-join");
+        metadata.local_device_id = "inviter-device".to_string();
+        metadata.current_epoch = 5;
+        metadata.last_pulled_server_seq = 42;
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&metadata).unwrap();
+            tx.commit().unwrap();
+        }
+
+        ensure_local_sync_metadata(&storage, "sync-join", "joiner-device", 3).unwrap();
+
+        let meta = storage.get_sync_metadata("sync-join").unwrap().unwrap();
+        assert_eq!(meta.local_device_id, "joiner-device");
+        assert_eq!(meta.current_epoch, 5);
+        assert_eq!(meta.last_pulled_server_seq, 42);
+    }
+
+    #[tokio::test]
+    async fn restore_runtime_keys_loads_noncontiguous_epoch_keys_from_seeded_store() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let epoch_4_key = [0x44u8; 32];
+        let entries = HashMap::from([
+            ("epoch".to_string(), b"4".to_vec()),
+            ("epoch_key_4".to_string(), epoch_4_key.to_vec()),
+        ]);
+        seed_secure_store(&handle, entries).await.expect("seed secure store");
+
+        restore_runtime_keys(&handle, vec![0xAA; 32], vec![0xBB; 32])
+            .await
+            .expect("restore runtime keys");
+
+        let inner = handle.inner.lock().await;
+        assert_eq!(inner.key_hierarchy().known_epochs(), vec![0, 4]);
+        assert_eq!(inner.key_hierarchy().epoch_key(4).unwrap(), epoch_4_key);
+    }
+
     /// Seeds two sync_ids' rows into the handle's storage, then calls the FFI
     /// `clear_sync_state(sid_a, force_active=false)` and asserts only sid_a's
     /// rows are removed.
@@ -4907,6 +5588,163 @@ mod tests {
     }
 
     #[test]
+    fn sas_display_json_has_v2_five_words_and_no_decimal() {
+        let sas = SasDisplay {
+            version: 2,
+            words: "atlas garden signal harbor velvet".to_string(),
+            word_list: vec![
+                "atlas".to_string(),
+                "garden".to_string(),
+                "signal".to_string(),
+                "harbor".to_string(),
+                "velvet".to_string(),
+            ],
+        };
+
+        let json = sas_display_json(&sas);
+        assert_eq!(json["sas_version"], 2);
+        assert_eq!(json["sas_words"], "atlas garden signal harbor velvet");
+        assert_eq!(json["sas_word_list"].as_array().unwrap().len(), 5);
+        assert!(
+            json.get("sas_decimal").is_none(),
+            "production FFI SAS JSON must not expose a decimal fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_pairing_ceremony_is_idempotent_with_no_slots() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        {
+            let inner = handle.inner.lock().await;
+            inner
+                .secure_store()
+                .set("pending_device_secret", b"orphan-pending-secret")
+                .expect("seed orphan pending secret");
+            inner
+                .secure_store()
+                .set("pending_device_id", b"orphan-pending-device")
+                .expect("seed orphan pending id");
+        }
+
+        cancel_pairing_ceremony(&handle).await.expect("empty cancel should succeed");
+        {
+            let inner = handle.inner.lock().await;
+            assert!(inner.secure_store().get("pending_device_secret").unwrap().is_none());
+            assert!(inner.secure_store().get("pending_device_id").unwrap().is_none());
+        }
+        cancel_pairing_ceremony(&handle).await.expect("second empty cancel should succeed");
+    }
+
+    #[tokio::test]
+    async fn cancel_pairing_ceremony_clears_slots_and_allows_fresh_start_guard() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
+        plant_joiner_slot(&handle, ceremony);
+        {
+            let inner = handle.inner.lock().await;
+            inner
+                .secure_store()
+                .set("pending_device_secret", b"stale-pending-secret")
+                .expect("seed pending secret");
+            inner
+                .secure_store()
+                .set("pending_device_id", b"stale-pending-device")
+                .expect("seed pending id");
+        }
+        assert!(lock_or_recover(&handle.joiner_ceremony).is_some());
+
+        cancel_pairing_ceremony(&handle).await.expect("cancel should clear local state");
+
+        assert!(lock_or_recover(&handle.joiner_ceremony).is_none());
+        assert!(lock_or_recover(&handle.initiator_ceremony).is_none());
+        {
+            let inner = handle.inner.lock().await;
+            assert!(
+                inner.secure_store().get("pending_device_secret").unwrap().is_none(),
+                "cancel should delete stale pending device secret"
+            );
+            assert!(
+                inner.secure_store().get("pending_device_id").unwrap().is_none(),
+                "cancel should delete stale pending device id"
+            );
+        }
+        guard_ceremony_in_progress(&handle, CeremonyGuardKind::StartJoiner)
+            .expect("fresh joiner ceremony should no longer be blocked");
+        guard_ceremony_in_progress(&handle, CeremonyGuardKind::StartInitiator)
+            .expect("fresh initiator ceremony should no longer be blocked");
+    }
+
+    #[test]
+    fn redact_sensitive_message_masks_keyed_values_and_fragments() {
+        let message = concat!(
+            "device a1b2c3d4e5f6 rejected sync_id=feedfacefeedface ",
+            "session_token=\"abcdefghijklmnopqrstuvwxyzABCDEF012345\" ",
+            "fingerprint deadbeefdeadbeefdeadbeefdeadbeef"
+        );
+
+        let redacted = redact_sensitive_message(message);
+
+        assert!(!redacted.contains("a1b2c3d4e5f6"));
+        assert!(!redacted.contains("feedfacefeedface"));
+        assert!(!redacted.contains("abcdefghijklmnopqrstuvwxyzABCDEF012345"));
+        assert!(!redacted.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(redacted.contains(REDACTED_HEX));
+        assert!(redacted.contains(REDACTED_VALUE));
+    }
+
+    #[test]
+    fn sync_result_to_json_redacts_error_message() {
+        let result = prism_sync_core::engine::SyncResult {
+            error: Some(
+                "device_id=a1b2c3d4e5f6 failed with key deadbeefdeadbeefdeadbeefdeadbeef".into(),
+            ),
+            ..Default::default()
+        };
+
+        let json = sync_result_to_json(&result);
+        let error = json["error"].as_str().unwrap();
+
+        assert!(!error.contains("a1b2c3d4e5f6"));
+        assert!(!error.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(error.contains(REDACTED_VALUE));
+        assert!(error.contains(REDACTED_HEX));
+    }
+
+    #[test]
+    fn sync_event_to_json_redacts_error_message() {
+        let event = prism_sync_core::events::SyncEvent::Error(prism_sync_core::events::SyncError {
+            kind: prism_sync_core::events::SyncErrorKind::DeviceIdentityMismatch,
+            message: "device a1b2c3d4e5f6 mismatched sync_id=feedfacefeedface".into(),
+            retryable: false,
+            code: Some("device_identity_mismatch".into()),
+            remote_wipe: None,
+        });
+
+        let json = sync_event_to_json(&event);
+        let message = json["message"].as_str().unwrap();
+
+        assert!(!message.contains("a1b2c3d4e5f6"));
+        assert!(!message.contains("feedfacefeedface"));
+        assert_eq!(json["code"], "device_identity_mismatch");
+    }
+
+    #[test]
     fn encode_core_error_surfaces_epoch_mismatch_code_and_epochs() {
         let encoded = encode_core_error(
             "complete_bootstrap_join",
@@ -4922,6 +5760,27 @@ mod tests {
         assert_eq!(payload["code"], "epoch_mismatch");
         assert_eq!(payload["local_epoch"], 2);
         assert_eq!(payload["relay_epoch"], 4);
+    }
+
+    #[test]
+    fn encode_core_error_redacts_relay_message_but_keeps_code() {
+        let encoded = encode_core_error(
+            "sync_now",
+            prism_sync_core::CoreError::from_relay(
+                prism_sync_core::relay::traits::RelayError::DeviceIdentityMismatch {
+                    message: "device_id=a1b2c3d4e5f6 key deadbeefdeadbeefdeadbeefdeadbeef".into(),
+                },
+            ),
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(encoded.strip_prefix(STRUCTURED_ERROR_PREFIX).unwrap()).unwrap();
+        let message = payload["message"].as_str().unwrap();
+        assert_eq!(payload["code"], "device_identity_mismatch");
+        assert!(!message.contains("a1b2c3d4e5f6"));
+        assert!(!message.contains("deadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(message.contains(REDACTED_VALUE));
+        assert!(message.contains(REDACTED_HEX));
     }
 
     #[test]
@@ -5051,13 +5910,35 @@ mod tests {
         let (ceremony, _token, _relay) = make_real_joiner_ceremony().await;
         plant_joiner_slot(&handle, ceremony);
 
-        let err = complete_initiator_ceremony(&handle, "pw".into(), "phrase".into())
+        let err = complete_initiator_ceremony(&handle, b"pw".to_vec(), b"phrase".to_vec())
             .await
             .expect_err("guard must refuse complete_initiator while joiner in flight");
         assert!(
             err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
             "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_initiator_ceremony_rejects_non_utf8_secrets_before_guard() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let err = complete_initiator_ceremony(&handle, vec![0xff], b"phrase".to_vec())
+            .await
+            .expect_err("invalid password should fail before ceremony guard");
+        assert_eq!(err, "password must be valid UTF-8");
+
+        let err = complete_initiator_ceremony(&handle, b"pw".to_vec(), vec![0xff])
+            .await
+            .expect_err("invalid mnemonic should fail before ceremony guard");
+        assert_eq!(err, "mnemonic must be valid UTF-8");
     }
 
     #[tokio::test]
@@ -5074,12 +5955,29 @@ mod tests {
         let ceremony = make_real_initiator_ceremony().await;
         plant_initiator_slot(&handle, ceremony);
 
-        let err = complete_joiner_ceremony(&handle, "pw".into())
+        let err = complete_joiner_ceremony(&handle, b"pw".to_vec())
             .await
             .expect_err("guard must refuse complete_joiner while initiator in flight");
         assert!(
             err.starts_with(CEREMONY_IN_PROGRESS_PREFIX),
             "expected CEREMONY_IN_PROGRESS prefix, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_joiner_ceremony_rejects_non_utf8_password_before_guard() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let err = complete_joiner_ceremony(&handle, vec![0xff])
+            .await
+            .expect_err("invalid password should fail before ceremony guard");
+        assert_eq!(err, "password must be valid UTF-8");
     }
 }

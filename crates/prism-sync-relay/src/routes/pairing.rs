@@ -10,7 +10,11 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use crate::{db, errors::AppError, state::AppState};
+use crate::{
+    db::{self, PairingSlotRead},
+    errors::AppError,
+    state::AppState,
+};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -192,16 +196,30 @@ async fn get_slot(
     }
 
     let value = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| db::get_pairing_slot(conn, &rid, slot))
+        db.with_conn(|conn| {
+            if is_terminal_pairing_slot(slot) {
+                db::take_pairing_slot(conn, &rid, slot)
+            } else {
+                db::get_pairing_slot(conn, &rid, slot).map(|value| match value {
+                    Some(data) => PairingSlotRead::Present(data),
+                    None => PairingSlotRead::NotSet,
+                })
+            }
+        })
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
     match value {
-        Some(data) => Ok((StatusCode::OK, data).into_response()),
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        PairingSlotRead::Present(data) => Ok((StatusCode::OK, data).into_response()),
+        PairingSlotRead::NotSet => Ok(StatusCode::NO_CONTENT.into_response()),
+        PairingSlotRead::Consumed => Err(AppError::NotFound),
     }
+}
+
+fn is_terminal_pairing_slot(slot: &str) -> bool {
+    matches!(slot, "credential_bundle" | "joiner_bundle")
 }
 
 // ---------------------------------------------------------------------------

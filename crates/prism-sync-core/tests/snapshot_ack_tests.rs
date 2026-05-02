@@ -14,9 +14,7 @@ use prism_sync_core::relay::MockRelay;
 use prism_sync_core::schema::{SyncSchema, SyncType};
 use prism_sync_core::storage::{DeviceRecord, RusqliteSyncStorage, SyncMetadata, SyncStorage};
 use prism_sync_core::syncable_entity::SyncableEntity;
-use prism_sync_core::{
-    engine::SyncConfig, CoreError, PrismSync, SyncEvent,
-};
+use prism_sync_core::{engine::SyncConfig, CoreError, PrismSync, SyncEvent};
 
 fn ack_schema() -> SyncSchema {
     SyncSchema::builder()
@@ -78,17 +76,10 @@ fn setup_sync_for_upload() -> (PrismSync, Arc<MockRelay>) {
     // Seed epoch 0 key so upload_pairing_snapshot has something to
     // encrypt with. `KeyHierarchy::store_epoch_key` is pub so we can
     // dig in through the accessor.
-    sync.key_hierarchy_mut()
-        .store_epoch_key(0, zeroize::Zeroizing::new(vec![0xAB; 32]));
+    sync.key_hierarchy_mut().store_epoch_key(0, zeroize::Zeroizing::new(vec![0xAB; 32]));
 
     let relay = Arc::new(MockRelay::new());
-    sync.configure_engine(
-        relay.clone(),
-        SYNC_ID.to_string(),
-        "device-a".to_string(),
-        0,
-        0,
-    );
+    sync.configure_engine(relay.clone(), SYNC_ID.to_string(), "device-a".to_string(), 0, 0);
 
     (sync, relay)
 }
@@ -98,16 +89,10 @@ async fn acknowledge_snapshot_applied_calls_delete() {
     let (sync, relay) = setup_sync_for_upload();
 
     sync.upload_pairing_snapshot(None, None).await.unwrap();
-    assert!(
-        relay.get_snapshot().await.unwrap().is_some(),
-        "snapshot should exist pre-ACK"
-    );
+    assert!(relay.get_snapshot().await.unwrap().is_some(), "snapshot should exist pre-ACK");
 
     sync.acknowledge_snapshot_applied().await.unwrap();
-    assert!(
-        relay.get_snapshot().await.unwrap().is_none(),
-        "snapshot should be gone after ACK"
-    );
+    assert!(relay.get_snapshot().await.unwrap().is_none(), "snapshot should be gone after ACK");
 }
 
 #[tokio::test]
@@ -225,10 +210,8 @@ async fn upload_pairing_snapshot_rejects_oversized() {
         for i in 0..260u32 {
             let mut blob = vec![0u8; 512 * 1024];
             rand::thread_rng().fill_bytes(&mut blob);
-            let encoded = format!(
-                "\"{}\"",
-                base64::engine::general_purpose::STANDARD.encode(&blob)
-            );
+            let encoded =
+                format!("\"{}\"", base64::engine::general_purpose::STANDARD.encode(&blob));
             tx.upsert_field_version(&FieldVersion {
                 sync_id: SYNC_ID.to_string(),
                 entity_table: "tasks".to_string(),
