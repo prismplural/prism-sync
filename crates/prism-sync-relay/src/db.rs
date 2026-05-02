@@ -244,6 +244,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             current_epoch     INTEGER NOT NULL DEFAULT 0,
             needs_rekey       INTEGER NOT NULL DEFAULT 0,
             password_version  INTEGER NOT NULL DEFAULT 0,
+            pruned_floor_seq  INTEGER NOT NULL DEFAULT 0,
             created_at        INTEGER NOT NULL,
             updated_at        INTEGER NOT NULL
         );
@@ -528,6 +529,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_sharing_identity_generation(conn)?;
     migrate_sharing_identity_generation_floors(conn)?;
     migrate_sync_groups_password_version(conn)?;
+    migrate_sync_groups_pruned_floor_seq(conn)?;
     migrate_devices_ml_dsa_rotation(conn)?;
     migrate_pairing_session_consumed_columns(conn)?;
 
@@ -679,6 +681,16 @@ fn migrate_sync_groups_password_version(conn: &Connection) -> Result<(), rusqlit
     if !has_password_version {
         conn.execute_batch(
             "ALTER TABLE sync_groups ADD COLUMN password_version INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_sync_groups_pruned_floor_seq(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_col = sync_group_has_column(conn, "pruned_floor_seq")?;
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE sync_groups ADD COLUMN pruned_floor_seq INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     Ok(())
@@ -1625,13 +1637,37 @@ pub fn get_batches_since(
 }
 
 /// Return the first retained batch sequence for a sync group, if any.
+///
+/// "Retained" means the relay has guaranteed this sync group's history from
+/// `Some(seq)` onward — anything below that seq has been pruned and is no
+/// longer recoverable from the op log. A `None` result means no pruning has
+/// occurred for this sync group, so a client at any `since` value is allowed
+/// to pull the tail (including a fresh `since=0` cursor on a brand-new group).
+///
+/// The value is derived from `sync_groups.pruned_floor_seq`, which tracks the
+/// highest seq this relay has ever pruned for this sync group. The returned
+/// "first retained" is `pruned_floor_seq + 1` — the lowest seq the relay still
+/// has, equivalent to the historical `MIN(id) FROM batches`. Reading the floor
+/// from `sync_groups` instead of `batches.id` avoids tying the bootstrap rule
+/// to the global SQLite auto-increment, which would falsely trip the rule for
+/// any new sync group whose first push is assigned a high global id.
 pub fn get_first_retained_batch_seq(
     conn: &Connection,
     sync_id: &str,
 ) -> Result<Option<i64>, rusqlite::Error> {
-    conn.query_row("SELECT MIN(id) FROM batches WHERE sync_id = ?1", params![sync_id], |row| {
-        row.get(0)
-    })
+    let pruned_floor: i64 = conn
+        .query_row(
+            "SELECT pruned_floor_seq FROM sync_groups WHERE sync_id = ?1",
+            params![sync_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if pruned_floor > 0 {
+        Ok(Some(pruned_floor + 1))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
@@ -1797,7 +1833,21 @@ pub fn prune_batches_before(
     sync_id: &str,
     before_seq: i64,
 ) -> Result<usize, rusqlite::Error> {
-    conn.execute("DELETE FROM batches WHERE sync_id = ?1 AND id < ?2", params![sync_id, before_seq])
+    let n =
+        conn.execute("DELETE FROM batches WHERE sync_id = ?1 AND id < ?2", params![
+            sync_id, before_seq
+        ])?;
+    if n > 0 && before_seq > 1 {
+        // The highest seq we just pruned is `before_seq - 1`; advance the
+        // floor monotonically so concurrent prune calls can't roll it back.
+        conn.execute(
+            "UPDATE sync_groups
+             SET pruned_floor_seq = MAX(pruned_floor_seq, ?2)
+             WHERE sync_id = ?1",
+            params![sync_id, before_seq - 1],
+        )?;
+    }
+    Ok(n)
 }
 
 /// Prune acknowledged batch history only for sync groups that currently have

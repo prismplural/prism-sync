@@ -484,6 +484,69 @@ async fn test_pull_stale_cursor_returns_must_bootstrap_response() {
     assert_eq!(batches[0]["server_seq"].as_i64(), Some(last_seq));
 }
 
+#[tokio::test]
+async fn test_pull_since_zero_succeeds_when_no_pruning_has_happened() {
+    // Regression: the bootstrap floor must be a per-sync-group "we have pruned
+    // through here" marker, not the global SQLite auto-increment of `batches.id`.
+    // If two sync groups share a relay and the second one's first push lands at
+    // a high global id, a fresh client at since=0 must still be able to pull —
+    // nothing has been pruned for that sync group yet.
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+
+    // Fill global batches.id to a non-trivial value via an unrelated sync group.
+    let other_sync_id = generate_sync_id();
+    let other_device_id = generate_device_id();
+    let other_keys = TestDeviceKeys::generate(&other_device_id);
+    let other_token =
+        register_device(&client, &url, &other_sync_id, &other_device_id, &other_keys).await;
+    for i in 0..5 {
+        let envelope =
+            make_test_envelope(&other_sync_id, &other_device_id, &format!("filler-{i:03}"), 0);
+        let resp = push_signed(
+            &client,
+            &url,
+            &other_sync_id,
+            &other_device_id,
+            &other_token,
+            &other_keys,
+            &envelope,
+        )
+        .await;
+        assert!(resp.status().is_success());
+    }
+
+    // Now create a fresh sync group whose first batch will be assigned a high
+    // global id, and push a single batch into it.
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let envelope = make_test_envelope(&sync_id, &device_id, "first-batch", 0);
+    let push_resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+    assert!(push_resp.status().is_success());
+
+    // A fresh client on this group with since=0 must succeed — no pruning has
+    // happened, so the bootstrap rule should not fire.
+    let pull = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since=0"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pull.status(),
+        200,
+        "fresh client at since=0 must pull successfully when no pruning has occurred (got {})",
+        pull.status()
+    );
+    let body: Value = pull.json().await.unwrap();
+    let batches = body["batches"].as_array().unwrap();
+    assert_eq!(batches.len(), 1, "expected the single pushed batch");
+}
+
 // ───────────────────────────── Test 7: Epoch mismatch on push ───────────
 
 #[tokio::test]
