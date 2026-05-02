@@ -65,6 +65,9 @@ pub enum InjectedPullError {
     Network,
     Auth,
     Server,
+    MustBootstrapFromSnapshot {
+        first_retained_seq: i64,
+    },
     /// Relay responded with `device_revoked` (optionally requesting a
     /// remote wipe). Used to verify that the engine -> sync_service ->
     /// FFI chain propagates the `code` / `remote_wipe` metadata all the
@@ -231,6 +234,15 @@ impl SyncTransport for MockRelay {
                     }
                     InjectedPullError::Server => {
                         RelayError::Server { status_code: 503, message: "mock injected 503".into() }
+                    }
+                    InjectedPullError::MustBootstrapFromSnapshot { first_retained_seq } => {
+                        RelayError::MustBootstrapFromSnapshot {
+                            since_seq: since,
+                            first_retained_seq,
+                            message: format!(
+                                "must bootstrap from snapshot: since_seq={since}, first_retained_seq={first_retained_seq}"
+                            ),
+                        }
                     }
                     InjectedPullError::DeviceRevoked { remote_wipe } => {
                         RelayError::DeviceRevoked { remote_wipe }
