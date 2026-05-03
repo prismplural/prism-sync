@@ -29,6 +29,7 @@ use prism_sync_core::storage::{
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{batch_signature, sync_aad, CrdtChange, Hlc, PrismSync, SyncMetadata};
 use prism_sync_crypto::KeyHierarchy;
+use prism_sync_relay::db;
 
 type CapturingEntityByTable = HashMap<String, Arc<CapturingEntity>>;
 type CapturingEntitySet = (Vec<Arc<dyn SyncableEntity>>, CapturingEntityByTable);
@@ -3106,6 +3107,201 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     assert!(
         entity_b.get_field("gen-test-stale", "title").is_none(),
         "stale gen-0 task should not appear on B"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Late-joiner-after-prune scenario
+//
+// Reproduces a real production failure mode: a new device joins a sync group
+// where the host has already pushed + acked ops, the relay has pruned them,
+// and no bootstrap snapshot was uploaded. The new device gets stuck because
+// there is nothing left on the relay to recover from.
+//
+// The existing core-crate tests (`test_pairing_works_without_snapshot`,
+// `test_bootstrap_without_snapshot_falls_back`) use `MockRelay`, which never
+// prunes — so they pass by virtue of the mock keeping every op forever.
+// A real relay prunes acked ops, which is the regime this test exercises.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_late_joiner_with_pruned_ops_and_no_snapshot() {
+    let (url, _server, db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // ── Register Device A (host) ──
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let kh = shared_key_hierarchy();
+
+    // ── Device A pushes a few batches via the engine ──
+    let storage_a = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_a = Arc::new(MockTaskEntity::new());
+    setup_sync_metadata(&storage_a, &sync_id, &device_a_id);
+    register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
+
+    create_task_ops(&storage_a, &sync_id, &device_a_id, "task-1", "Buy groceries", "batch-a1");
+    create_task_ops(&storage_a, &sync_id, &device_a_id, "task-2", "Walk the dog", "batch-a2");
+    create_task_ops(&storage_a, &sync_id, &device_a_id, "task-3", "Do laundry", "batch-a3");
+
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
+    let engine_a = SyncEngine::new(
+        storage_a.clone(),
+        relay_a.clone(),
+        vec![entity_a.clone() as Arc<dyn SyncableEntity>],
+        test_schema(),
+        SyncConfig::default(),
+    );
+    let ml_dsa_a = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
+
+    let result_a = engine_a
+        .sync(&sync_id, &kh, &keys_a.ed25519_signing_key, Some(&ml_dsa_a), &device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(result_a.error.is_none(), "Device A push failed: {:?}", result_a.error);
+    assert_eq!(result_a.pushed, 3, "expected 3 batches pushed from A");
+
+    // ── Confirm batches landed on the relay ──
+    let sid = sync_id.clone();
+    let pre_prune_count: i64 = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM batches WHERE sync_id = ?1",
+                rusqlite::params![sid],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(pre_prune_count, 3, "all 3 batches should be on the relay before prune");
+
+    // The host's own pull (during sync()) ack'd the batches, so the relay can
+    // now safely prune. We simulate the relay's housekeeping by manually
+    // pruning everything past the last batch's seq.
+    let max_seq: i64 = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT MAX(id) FROM batches WHERE sync_id = ?1",
+                rusqlite::params![sid],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+
+    // Prune everything strictly before max_seq + 1, i.e. all 3 batches.
+    let sid_for_prune = sync_id.clone();
+    let prune_floor = max_seq + 1;
+    db.with_conn(move |conn| {
+        let pruned = db::prune_batches_before(conn, &sid_for_prune, prune_floor)?;
+        assert_eq!(pruned, 3, "expected to prune all 3 acked batches");
+        Ok(())
+    })
+    .unwrap();
+
+    let sid = sync_id.clone();
+    let post_prune_count: i64 = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM batches WHERE sync_id = ?1",
+                rusqlite::params![sid],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(post_prune_count, 0, "relay should have no batches retained for this sync_id");
+
+    // ── Device B (late joiner) registers ──
+    let device_b_id = generate_device_id();
+    let keys_b = TestDeviceKeys::generate(&device_b_id);
+    let token_b = register_joiner_device(
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
+        vec![
+            registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
+            registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
+        ],
+    )
+    .await;
+
+    let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_b = Arc::new(MockTaskEntity::new());
+    setup_sync_metadata(&storage_b, &sync_id, &device_b_id);
+    register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
+
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
+    let engine_b = SyncEngine::new(
+        storage_b.clone(),
+        relay_b.clone(),
+        vec![entity_b.clone() as Arc<dyn SyncableEntity>],
+        test_schema(),
+        SyncConfig::default(),
+    );
+    let ml_dsa_b = keys_b.device_secret.ml_dsa_65_keypair(&device_b_id).unwrap();
+
+    // ── Step 1: Joiner attempts bootstrap. No snapshot was uploaded, so the
+    //           engine returns (0, []) with no error. ──
+    let (snapshot_count, snapshot_changes) =
+        engine_b.bootstrap_from_snapshot(&sync_id, &kh).await.unwrap();
+    assert_eq!(
+        snapshot_count, 0,
+        "no snapshot exists on the relay, so bootstrap should hydrate 0 entities"
+    );
+    assert!(
+        snapshot_changes.is_empty(),
+        "bootstrap with no snapshot should produce no entity changes"
+    );
+
+    // ── Step 2: Joiner runs incremental sync. Its cursor is `since=0`, but
+    //           the relay's pruned_floor advanced past 0, so the relay
+    //           responds with `must_bootstrap_from_snapshot`. The engine
+    //           tries the snapshot path (still empty), then surfaces a
+    //           clear error explaining that another paired device must
+    //           upload a fresh snapshot. ──
+    let result_b = engine_b
+        .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
+        .await
+        .unwrap();
+
+    // Document what the engine reports back. This assertion block is the
+    // load-bearing observation of the test:
+    //
+    //   * `result.pulled == 0` and `result.merged == 0` — no data flowed,
+    //     because the relay had nothing to give.
+    //   * `result.error` is populated with the engine's explanatory string.
+    //   * `result.error_code` is `None` — the engine wraps the relay's
+    //     `must_bootstrap_from_snapshot` code into a free-form
+    //     `CoreError::Engine` message rather than preserving a structured
+    //     code, so callers (Dart UI) cannot programmatically distinguish
+    //     "stuck because the host needs to upload a snapshot" from any
+    //     other transient sync failure. This is the latent ergonomics bug
+    //     this test pins down: the failure mode is recoverable in
+    //     principle (host re-uploads a snapshot), but the engine surfaces
+    //     it through the same untyped channel as everything else.
+    assert_eq!(result_b.pulled, 0, "no batches available on relay, nothing to pull");
+    assert_eq!(result_b.merged, 0, "no ops merged because nothing arrived");
+    assert!(entity_b.row_count() == 0, "joiner should have no entities yet");
+    let error = result_b.error.expect(
+        "engine should populate result.error when relay demands bootstrap and no snapshot exists",
+    );
+    assert!(error.contains("snapshot"), "error should mention snapshot recovery; got: {error}");
+    assert!(
+        result_b.error_code.is_none(),
+        "engine wraps must_bootstrap_from_snapshot into an untyped Engine error, \
+         so error_code is None — callers cannot distinguish this recoverable state \
+         from other failures without string-matching the message; \
+         got error_code = {:?}",
+        result_b.error_code
     );
 }
 
