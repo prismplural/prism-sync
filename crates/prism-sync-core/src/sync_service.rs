@@ -226,6 +226,8 @@ pub fn spawn_auto_sync_task(
 /// - `EpochRotated` → attempts epoch recovery, emits [`SyncEvent::EpochRotated`],
 ///   then triggers sync
 /// - `TokenRotated` → ignored (handled internally by the relay)
+/// - `ConnectionStateChanged { connected: true }` → emits UI state and triggers
+///   sync to recover any notifications missed while disconnected
 ///
 /// When `inner` and `relay` are provided, epoch recovery is attempted on
 /// `EpochRotated` and `DeviceRevoked` (other device) notifications. The
@@ -275,6 +277,9 @@ pub fn spawn_notification_handler(
                 }
                 SyncNotification::ConnectionStateChanged { connected } => {
                     let _ = event_tx.send(SyncEvent::WebSocketStateChanged { connected });
+                    if connected {
+                        let _ = sync_trigger.send(SyncTrigger::WebSocketNewData).await;
+                    }
                 }
             }
         }
@@ -1322,6 +1327,42 @@ mod tests {
             .expect("should receive event")
             .expect("not lagged");
         assert!(matches!(event, SyncEvent::EpochRotated(5)));
+
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn notification_handler_connected_state_triggers_catch_up_sync() {
+        let (trigger_tx, mut trigger_rx) = mpsc::channel::<SyncTrigger>(16);
+        let (event_tx, mut event_rx) = broadcast::channel::<SyncEvent>(16);
+
+        let notifications =
+            futures_util::stream::iter(vec![SyncNotification::ConnectionStateChanged {
+                connected: true,
+            }]);
+        let pinned: std::pin::Pin<Box<dyn futures_util::Stream<Item = SyncNotification> + Send>> =
+            Box::pin(notifications);
+
+        let handle = spawn_notification_handler(
+            pinned,
+            "my-device".to_string(),
+            trigger_tx,
+            event_tx,
+            None,
+            None,
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("should receive connection event")
+            .expect("not lagged");
+        assert!(matches!(event, SyncEvent::WebSocketStateChanged { connected: true }));
+
+        let trigger = tokio::time::timeout(Duration::from_millis(200), trigger_rx.recv())
+            .await
+            .expect("should receive catch-up trigger")
+            .expect("not closed");
+        assert_eq!(trigger, SyncTrigger::WebSocketNewData);
 
         let _ = handle.await;
     }

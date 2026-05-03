@@ -458,6 +458,7 @@ impl PrismSync {
             )
             .await;
         self.apply_recovered_epoch_high_water();
+        self.refresh_op_emitter_hlc_from_storage("sync_now");
         result
     }
 
@@ -848,6 +849,7 @@ impl PrismSync {
             )
             .await;
         self.apply_recovered_epoch_high_water();
+        self.refresh_op_emitter_hlc_from_storage("on_resume");
         result
     }
 
@@ -905,7 +907,9 @@ impl PrismSync {
     /// Requires [`configure_engine`](Self::configure_engine) to have been
     /// called.
     pub async fn bootstrap_from_snapshot(&mut self) -> Result<(u64, Vec<EntityChange>)> {
-        self.sync_service.bootstrap_from_snapshot(&self.key_hierarchy).await
+        let result = self.sync_service.bootstrap_from_snapshot(&self.key_hierarchy).await;
+        self.refresh_op_emitter_hlc_from_storage("bootstrap_from_snapshot");
+        result
     }
 
     /// Seed `field_versions` from pre-existing local data (first-device
@@ -920,35 +924,7 @@ impl PrismSync {
     ) -> Result<BootstrapReport> {
         let report = self.sync_service.bootstrap_existing_state(records).await?;
 
-        // Re-read the max HLC from storage and update the live emitter so
-        // that any subsequent record_create/record_update uses a strictly
-        // greater HLC than anything that was just seeded.
-        if let (Some(sync_id), Some(emitter)) =
-            (self.sync_service.sync_id(), self.op_emitter.as_mut())
-        {
-            match self.storage.list_all_field_version_hlcs(sync_id) {
-                Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
-                    Ok(Some(max)) => {
-                        if &max > emitter.last_hlc() {
-                            emitter.set_last_hlc(max);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "bootstrap_existing_state: failed to parse stored HLCs after seeding"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "bootstrap_existing_state: failed to read stored HLCs after seeding"
-                    );
-                }
-            }
-        }
+        self.refresh_op_emitter_hlc_from_storage("bootstrap_existing_state");
 
         Ok(report)
     }
@@ -1334,6 +1310,40 @@ impl PrismSync {
         };
         if self.epoch.unwrap_or(0) < recovered_epoch as i32 {
             self.advance_epoch(recovered_epoch as i32);
+        }
+    }
+
+    fn refresh_op_emitter_hlc_from_storage(&mut self, context: &'static str) {
+        let Some(sync_id) = self.sync_service.sync_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(emitter) = self.op_emitter.as_mut() else {
+            return;
+        };
+
+        match self.storage.list_all_field_version_hlcs(&sync_id) {
+            Ok(hlcs) => match Hlc::parse_many_and_max(&hlcs) {
+                Ok(Some(max)) => {
+                    if &max > emitter.last_hlc() {
+                        emitter.set_last_hlc(max);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        context,
+                        "failed to parse stored HLCs while refreshing local emitter"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    context,
+                    "failed to read stored HLCs while refreshing local emitter"
+                );
+            }
         }
     }
 
@@ -2270,6 +2280,48 @@ mod tests {
             post_hlc > pre_parsed,
             "post-configure HLC {post_hlc:?} must exceed pre-seeded HLC {pre_parsed:?}"
         );
+    }
+
+    #[test]
+    fn refresh_op_emitter_hlc_preserves_causality_after_near_future_remote_pull() {
+        use crate::hlc::Hlc;
+        use crate::storage::FieldVersion;
+
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let remote_hlc = Hlc::new(Hlc::now_ms() + 5_000, 0, "remote-device");
+        {
+            let mut tx = sync.storage.begin_tx().unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "ent-1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "remote-op".to_string(),
+                winning_device_id: "remote-device".to_string(),
+                winning_hlc: remote_hlc.to_string(),
+                winning_encoded_value: Some("\"Remote\"".to_string()),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        sync.refresh_op_emitter_hlc_from_storage("test");
+
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Local".to_string()));
+        sync.record_update("members", "ent-1", &fields).unwrap();
+
+        let fv =
+            sync.storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
+        let local_hlc = Hlc::from_string(&fv.winning_hlc).unwrap();
+        assert!(
+            local_hlc > remote_hlc,
+            "local mutation HLC {local_hlc:?} must be causally after pulled HLC {remote_hlc:?}"
+        );
+        assert_eq!(local_hlc.node_id, "a1b2c3d4e5f6");
     }
 
     #[test]

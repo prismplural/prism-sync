@@ -22,15 +22,47 @@ use prism_sync_core::engine::{SyncConfig, SyncEngine};
 use prism_sync_core::relay::traits::{DeviceRegistry, RegisterRequest};
 use prism_sync_core::relay::ServerRelay;
 use prism_sync_core::schema::{encode_value, SyncFieldDef, SyncSchema, SyncType, SyncValue};
+use prism_sync_core::secure_store::SecureStore;
 use prism_sync_core::storage::{
     DeviceRecord, FieldVersion, PendingOp, RusqliteSyncStorage, SyncStorage,
 };
 use prism_sync_core::syncable_entity::SyncableEntity;
-use prism_sync_core::{batch_signature, sync_aad, CrdtChange, Hlc, SyncMetadata};
+use prism_sync_core::{batch_signature, sync_aad, CrdtChange, Hlc, PrismSync, SyncMetadata};
 use prism_sync_crypto::KeyHierarchy;
 
 type CapturingEntityByTable = HashMap<String, Arc<CapturingEntity>>;
 type CapturingEntitySet = (Vec<Arc<dyn SyncableEntity>>, CapturingEntityByTable);
+
+struct MemorySecureStore {
+    data: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl MemorySecureStore {
+    fn new() -> Self {
+        Self { data: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl SecureStore for MemorySecureStore {
+    fn get(&self, key: &str) -> prism_sync_core::Result<Option<Vec<u8>>> {
+        Ok(self.data.lock().unwrap().get(key).cloned())
+    }
+
+    fn set(&self, key: &str, value: &[u8]) -> prism_sync_core::Result<()> {
+        self.data.lock().unwrap().insert(key.to_string(), value.to_vec());
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> prism_sync_core::Result<()> {
+        self.data.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    fn clear(&self) -> prism_sync_core::Result<()> {
+        self.data.lock().unwrap().clear();
+        Ok(())
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MockTaskEntity — in-memory SyncableEntity for testing
@@ -209,6 +241,27 @@ fn test_schema() -> SyncSchema {
     SyncSchema::builder()
         .entity("tasks", |e| e.field("title", SyncType::String).field("done", SyncType::Bool))
         .build()
+}
+
+fn fronting_test_schema() -> SyncSchema {
+    SyncSchema::builder()
+        .entity("fronting_sessions", |e| {
+            e.field("start_time", SyncType::DateTime)
+                .field("end_time", SyncType::DateTime)
+                .field("member_id", SyncType::String)
+        })
+        .build()
+}
+
+fn fronting_test_entity() -> Arc<CapturingEntity> {
+    Arc::new(CapturingEntity::new(
+        "fronting_sessions".to_string(),
+        vec![
+            SyncFieldDef { name: "start_time".to_string(), sync_type: SyncType::DateTime },
+            SyncFieldDef { name: "end_time".to_string(), sync_type: SyncType::DateTime },
+            SyncFieldDef { name: "member_id".to_string(), sync_type: SyncType::String },
+        ],
+    ))
 }
 
 /// Initialize a KeyHierarchy with deterministic inputs so multiple devices
@@ -512,6 +565,188 @@ fn make_server_relay(
         None,
     )
     .expect("ServerRelay::new should succeed with localhost URL")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_prism_sync_client(
+    sync_id: &str,
+    device_id: &str,
+    keys: &TestDeviceKeys,
+    relay: ServerRelay,
+    storage: Arc<RusqliteSyncStorage>,
+    entity: Arc<CapturingEntity>,
+    epoch0_key: &[u8],
+) -> PrismSync {
+    setup_sync_metadata(&storage, sync_id, device_id);
+
+    let mut sync = PrismSync::builder()
+        .schema(fronting_test_schema())
+        .storage(storage)
+        .secure_store(Arc::new(MemorySecureStore::new()))
+        .entity(entity)
+        .build()
+        .unwrap();
+    sync.initialize("test-password", &[7u8; 16]).unwrap();
+    let dek = sync.export_dek().unwrap();
+    sync.restore_runtime_keys(&dek, keys.device_secret.as_bytes()).unwrap();
+    sync.key_hierarchy_mut().store_epoch_key(0, zeroize::Zeroizing::new(epoch0_key.to_vec()));
+    sync.configure_engine(Arc::new(relay), sync_id.to_string(), device_id.to_string(), 0, 0);
+    sync
+}
+
+#[tokio::test]
+async fn e2e_replace_front_after_near_future_remote_pull_closes_previous_session() {
+    let (url, _server, _db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let epoch0_key = vec![0xAB; 32];
+
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let device_b_id = generate_device_id();
+    let keys_b = TestDeviceKeys::generate(&device_b_id);
+    let token_b = register_joiner_device(
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
+        vec![
+            registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
+            registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
+        ],
+    )
+    .await;
+
+    let storage_a = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_a, &sync_id, &device_b_id, &keys_b);
+
+    let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
+
+    // Simulate Device B being slightly ahead of Device A. The engine accepts
+    // this drift, so Device A's next local mutation must inherit the watermark
+    // after pulling B's row or its replace-front end_time update will lose.
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64;
+    let b_future_hlc = Hlc::new(now_ms + 5_000, 0, &device_b_id);
+    {
+        let mut tx = storage_b.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: sync_id.clone(),
+            entity_table: "fronting_sessions".to_string(),
+            entity_id: "b-clock-watermark".to_string(),
+            field_name: "start_time".to_string(),
+            winning_op_id: "b-clock-watermark".to_string(),
+            winning_device_id: device_b_id.clone(),
+            winning_hlc: b_future_hlc.to_string(),
+            winning_encoded_value: Some("\"2026-05-03T21:30:00.000Z\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let entity_a = fronting_test_entity();
+    let relay_a = make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a);
+    let mut sync_a = make_prism_sync_client(
+        &sync_id,
+        &device_a_id,
+        &keys_a,
+        relay_a,
+        storage_a.clone(),
+        entity_a,
+        &epoch0_key,
+    );
+
+    let entity_b = fronting_test_entity();
+    let relay_b = make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b);
+    let mut sync_b = make_prism_sync_client(
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        relay_b,
+        storage_b.clone(),
+        entity_b.clone(),
+        &epoch0_key,
+    );
+
+    let old_session_id = "session-old";
+    let old_start = "2026-05-03T21:37:40.000Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+    let replace_at = "2026-05-03T21:40:37.000Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+    let new_session_id = "session-new";
+
+    let old_fields = HashMap::from([
+        ("start_time".to_string(), SyncValue::DateTime(old_start)),
+        ("end_time".to_string(), SyncValue::Null),
+        ("member_id".to_string(), SyncValue::String("member-old".to_string())),
+    ]);
+    sync_b.record_create("fronting_sessions", old_session_id, &old_fields).unwrap();
+    let b_push = sync_b.sync_now().await.unwrap();
+    assert!(b_push.error.is_none(), "B initial push failed: {:?}", b_push.error);
+    assert_eq!(b_push.pushed, 1, "B should push its active fronting session");
+
+    let a_pull = sync_a.sync_now().await.unwrap();
+    assert!(a_pull.error.is_none(), "A pull failed: {:?}", a_pull.error);
+    assert_eq!(a_pull.pulled, 1, "A should pull B's active fronting session");
+    assert!(
+        a_pull.merged >= 3,
+        "A should merge B's fronting session fields before replacing; result={a_pull:?}"
+    );
+
+    let end_fields = HashMap::from([("end_time".to_string(), SyncValue::DateTime(replace_at))]);
+    sync_a.record_update("fronting_sessions", old_session_id, &end_fields).unwrap();
+
+    let new_fields = HashMap::from([
+        ("start_time".to_string(), SyncValue::DateTime(replace_at)),
+        ("end_time".to_string(), SyncValue::Null),
+        ("member_id".to_string(), SyncValue::String("member-new".to_string())),
+    ]);
+    sync_a.record_create("fronting_sessions", new_session_id, &new_fields).unwrap();
+
+    let a_push = sync_a.sync_now().await.unwrap();
+    assert!(a_push.error.is_none(), "A replace push failed: {:?}", a_push.error);
+    assert_eq!(a_push.pushed, 2, "A should push the end update and new session create");
+
+    let b_pull = sync_b.sync_now().await.unwrap();
+    assert!(b_pull.error.is_none(), "B replace pull failed: {:?}", b_pull.error);
+    assert!(b_pull.pulled >= 2, "B should pull both replace-front batches; result={b_pull:?}");
+
+    let old_end = storage_b
+        .get_field_version(&sync_id, "fronting_sessions", old_session_id, "end_time")
+        .unwrap()
+        .expect("B should retain an end_time field version for the old session");
+    assert_eq!(
+        old_end.winning_encoded_value,
+        Some("\"2026-05-03T21:40:37.000Z\"".to_string()),
+        "A's replace-front end_time must win over B's earlier active/null value"
+    );
+    assert_eq!(old_end.winning_device_id, device_a_id);
+
+    let new_member = storage_b
+        .get_field_version(&sync_id, "fronting_sessions", new_session_id, "member_id")
+        .unwrap()
+        .expect("B should receive A's replacement fronting session");
+    assert_eq!(new_member.winning_encoded_value, Some("\"member-new\"".to_string()));
+
+    assert_eq!(
+        entity_b.get_field(old_session_id, "end_time"),
+        Some(SyncValue::DateTime(replace_at)),
+        "consumer apply should close B's old fronting row instead of leaving it active"
+    );
+    assert_eq!(
+        entity_b.get_field(new_session_id, "member_id"),
+        Some(SyncValue::String("member-new".to_string())),
+        "consumer apply should also add the replacement row"
+    );
 }
 
 #[tokio::test]

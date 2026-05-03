@@ -11,6 +11,13 @@ use crate::storage::{FieldVersion, PendingOp, SyncStorage};
 /// Constant field name used for delete tombstone ops.
 pub const DELETED_FIELD: &str = "is_deleted";
 
+/// Match the default engine drift tolerance for remote batches.
+///
+/// Remote ops further in the future than this are dropped before they reach
+/// `field_versions`. Near-future remote HLCs are accepted, so the local emitter
+/// must inherit them to preserve causality for the next local mutation.
+const MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS: i64 = 60_000;
+
 /// Records field-level ops into pending_ops at mutation time.
 ///
 /// The caller is responsible for:
@@ -39,7 +46,7 @@ impl OpEmitter {
                 device_id = %device_id,
                 incoming_node_id = %last_hlc.node_id,
                 incoming_timestamp = last_hlc.timestamp,
-                "Ignoring future remote HLC watermark for local emitter"
+                "Ignoring excessive future remote HLC watermark for local emitter"
             );
             Hlc::zero(&device_id)
         };
@@ -68,7 +75,7 @@ impl OpEmitter {
                 device_id = %self.device_id,
                 incoming_node_id = %new_hlc.node_id,
                 incoming_timestamp = new_hlc.timestamp,
-                "Ignoring future remote HLC watermark for local emitter"
+                "Ignoring excessive future remote HLC watermark for local emitter"
             );
             return;
         }
@@ -79,7 +86,7 @@ impl OpEmitter {
     }
 
     fn can_inherit_hlc(device_id: &str, hlc: &Hlc) -> bool {
-        hlc.node_id == device_id || !hlc.is_future()
+        hlc.node_id == device_id || hlc.future_drift_ms() <= MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS
     }
 
     /// Tick the HLC once and return the new value.
@@ -469,7 +476,22 @@ mod tests {
     }
 
     #[test]
-    fn new_ignores_future_remote_initial_hlc() {
+    fn new_accepts_near_future_remote_initial_hlc() {
+        let local_device = "a1b2c3d4e5f6";
+        let future_remote_hlc = Hlc::new(now_ms() + 5_000, 0, "remote-device");
+
+        let emitter = OpEmitter::new(
+            local_device.to_string(),
+            "sync-1".to_string(),
+            1,
+            Some(future_remote_hlc.clone()),
+        );
+
+        assert_eq!(emitter.last_hlc(), &future_remote_hlc);
+    }
+
+    #[test]
+    fn new_ignores_excessive_future_remote_initial_hlc() {
         let local_device = "a1b2c3d4e5f6";
         let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
 
@@ -484,7 +506,17 @@ mod tests {
     }
 
     #[test]
-    fn set_last_hlc_ignores_future_remote_hlc() {
+    fn set_last_hlc_accepts_near_future_remote_hlc() {
+        let mut emitter = make_emitter();
+        let future_remote_hlc = Hlc::new(now_ms() + 5_000, 0, "remote-device");
+
+        emitter.set_last_hlc(future_remote_hlc.clone());
+
+        assert_eq!(emitter.last_hlc(), &future_remote_hlc);
+    }
+
+    #[test]
+    fn set_last_hlc_ignores_excessive_future_remote_hlc() {
         let mut emitter = make_emitter();
         let original = emitter.last_hlc().clone();
         let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
