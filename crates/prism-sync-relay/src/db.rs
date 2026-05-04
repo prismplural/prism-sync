@@ -1833,10 +1833,10 @@ pub fn prune_batches_before(
     sync_id: &str,
     before_seq: i64,
 ) -> Result<usize, rusqlite::Error> {
-    let n =
-        conn.execute("DELETE FROM batches WHERE sync_id = ?1 AND id < ?2", params![
-            sync_id, before_seq
-        ])?;
+    let n = conn.execute(
+        "DELETE FROM batches WHERE sync_id = ?1 AND id < ?2",
+        params![sync_id, before_seq],
+    )?;
     if n > 0 && before_seq > 1 {
         // The highest seq we just pruned is `before_seq - 1`; advance the
         // floor monotonically so concurrent prune calls can't roll it back.

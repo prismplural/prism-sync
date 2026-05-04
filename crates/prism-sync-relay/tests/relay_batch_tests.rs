@@ -524,7 +524,8 @@ async fn test_pull_since_zero_succeeds_when_no_pruning_has_happened() {
     let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
     let envelope = make_test_envelope(&sync_id, &device_id, "first-batch", 0);
-    let push_resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+    let push_resp =
+        push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
     assert!(push_resp.status().is_success());
 
     // A fresh client on this group with since=0 must succeed — no pruning has
