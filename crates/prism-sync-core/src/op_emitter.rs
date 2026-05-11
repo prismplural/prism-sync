@@ -252,7 +252,16 @@ impl OpEmitter {
             }
         }
 
-        let now = Utc::now();
+        // Offset each partition's `created_at` by its index in microseconds so
+        // the push-side query (`get_unpushed_batch_ids`) — which orders only by
+        // `MIN(created_at) ASC` — yields a deterministic partition order. SQL
+        // `ORDER BY` is non-deterministic on ties, so without this offset two
+        // partitions stamped with the same `Utc::now()` could push out of order
+        // and break invariants like "small-fields partition pushes first so
+        // receivers can insert the entity row before large-field updates".
+        // Rows within a single partition still share an identical timestamp,
+        // preserving the existing same-batch invariants used elsewhere.
+        let base_now = Utc::now();
         let mut tx = match storage.begin_tx() {
             Ok(tx) => tx,
             Err(e) => {
@@ -267,8 +276,12 @@ impl OpEmitter {
         // Track the total field count across partitions for the trace log.
         let mut total_field_count = 0usize;
 
-        for ((fields, batch_id), hlc) in non_empty.iter().zip(partition_hlcs.iter()) {
+        for (partition_index, ((fields, batch_id), hlc)) in
+            non_empty.iter().zip(partition_hlcs.iter()).enumerate()
+        {
             let hlc_string = hlc.to_string();
+            let partition_now =
+                base_now + chrono::Duration::microseconds(partition_index as i64);
 
             for (field_name, value) in *fields {
                 let op_id = Uuid::new_v4().to_string();
@@ -286,7 +299,7 @@ impl OpEmitter {
                     encoded_value: encoded.clone(),
                     is_delete: false,
                     client_hlc: hlc_string.clone(),
-                    created_at: now,
+                    created_at: partition_now,
                     pushed_at: None,
                 }) {
                     let _ = tx.rollback();
@@ -303,7 +316,7 @@ impl OpEmitter {
                     winning_device_id: self.device_id.clone(),
                     winning_hlc: hlc_string.clone(),
                     winning_encoded_value: Some(encoded),
-                    updated_at: now,
+                    updated_at: partition_now,
                 }) {
                     let _ = tx.rollback();
                     self.last_hlc = saved_last_hlc;
@@ -1128,6 +1141,144 @@ mod tests {
         ids.sort();
         let unique_count = ids.iter().collect::<std::collections::HashSet<_>>().len();
         assert_eq!(unique_count, ids.len(), "op_ids must be unique");
+    }
+
+    #[test]
+    fn emit_create_multi_assigns_distinct_created_at_per_partition() {
+        // Regression guard: the push-side query orders unpushed batches by
+        // `MIN(created_at) ASC`. If every partition shares the same
+        // `created_at`, SQL `ORDER BY` is non-deterministic on the tie and
+        // the small-fields-first invariant collapses. `emit_multi` must
+        // offset each partition by its index in microseconds.
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        // Member-shaped multi: small fields in partition 0, large fields in
+        // later partitions — mirrors how the schema actually splits.
+        let mut p0 = HashMap::new();
+        p0.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        p0.insert("pronouns".to_string(), SyncValue::String("she/her".to_string()));
+        let mut p1 = HashMap::new();
+        p1.insert("avatar".to_string(), SyncValue::String("avatar-bytes".to_string()));
+        let mut p2 = HashMap::new();
+        p2.insert("banner".to_string(), SyncValue::String("banner-bytes".to_string()));
+
+        let partitions = vec![
+            (p0, "p-ordered-0".to_string()),
+            (p1, "p-ordered-1".to_string()),
+            (p2, "p-ordered-2".to_string()),
+        ];
+
+        emitter
+            .emit_create_multi(&storage, "members", "ent-order", &partitions)
+            .expect("emit_create_multi should succeed");
+
+        // The push-side query must return partitions in the order we emitted
+        // them (small fields first), not whatever SQL happened to pick on a
+        // tied `created_at`.
+        let unpushed = storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert_eq!(
+            unpushed,
+            vec!["p-ordered-0".to_string(), "p-ordered-1".to_string(), "p-ordered-2".to_string()],
+            "unpushed batches must be returned in emission order"
+        );
+
+        // Every row inside a single partition shares its `created_at`...
+        let b0 = storage.load_batch_ops("p-ordered-0").unwrap();
+        let b1 = storage.load_batch_ops("p-ordered-1").unwrap();
+        let b2 = storage.load_batch_ops("p-ordered-2").unwrap();
+        assert!(!b0.is_empty() && !b1.is_empty() && !b2.is_empty());
+        let ts0 = b0[0].created_at;
+        let ts1 = b1[0].created_at;
+        let ts2 = b2[0].created_at;
+        for op in &b0 {
+            assert_eq!(op.created_at, ts0, "all rows in p-ordered-0 share created_at");
+        }
+        for op in &b1 {
+            assert_eq!(op.created_at, ts1, "all rows in p-ordered-1 share created_at");
+        }
+        for op in &b2 {
+            assert_eq!(op.created_at, ts2, "all rows in p-ordered-2 share created_at");
+        }
+
+        // ...but partitions differ from each other.
+        assert_ne!(ts0, ts1, "partition 0 and 1 must differ in created_at");
+        assert_ne!(ts1, ts2, "partition 1 and 2 must differ in created_at");
+        assert_ne!(ts0, ts2, "partition 0 and 2 must differ in created_at");
+
+        // Delta from partition N's created_at to partition 0's must be
+        // exactly N microseconds.
+        assert_eq!(
+            (ts1 - ts0).num_microseconds(),
+            Some(1),
+            "partition 1 should be exactly 1us after partition 0"
+        );
+        assert_eq!(
+            (ts2 - ts0).num_microseconds(),
+            Some(2),
+            "partition 2 should be exactly 2us after partition 0"
+        );
+    }
+
+    #[test]
+    fn emit_update_multi_assigns_distinct_created_at_per_partition() {
+        // Same invariant as the create-multi regression: update-multi flows
+        // through the same `emit_multi` helper and must produce a
+        // deterministic push order across partitions.
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        // Seed an initial create so the update has something to override.
+        let mut create = HashMap::new();
+        create.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        create.insert("avatar".to_string(), SyncValue::String("avatar-v1".to_string()));
+        create.insert("banner".to_string(), SyncValue::String("banner-v1".to_string()));
+        emitter
+            .emit_create(&storage, "members", "ent-uo", &create, "seed-batch")
+            .expect("seed create");
+
+        let mut u0 = HashMap::new();
+        u0.insert("name".to_string(), SyncValue::String("Alice v2".to_string()));
+        let mut u1 = HashMap::new();
+        u1.insert("avatar".to_string(), SyncValue::String("avatar-v2".to_string()));
+        let mut u2 = HashMap::new();
+        u2.insert("banner".to_string(), SyncValue::String("banner-v2".to_string()));
+
+        let partitions = vec![
+            (u0, "u-ordered-0".to_string()),
+            (u1, "u-ordered-1".to_string()),
+            (u2, "u-ordered-2".to_string()),
+        ];
+
+        emitter
+            .emit_update_multi(&storage, "members", "ent-uo", &partitions)
+            .expect("emit_update_multi should succeed");
+
+        // Push-side query returns the seed batch first (it was inserted
+        // earlier), then the three update batches in emission order.
+        let unpushed = storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert_eq!(
+            unpushed,
+            vec![
+                "seed-batch".to_string(),
+                "u-ordered-0".to_string(),
+                "u-ordered-1".to_string(),
+                "u-ordered-2".to_string(),
+            ],
+            "unpushed batches must be returned in emission order"
+        );
+
+        let b0 = storage.load_batch_ops("u-ordered-0").unwrap();
+        let b1 = storage.load_batch_ops("u-ordered-1").unwrap();
+        let b2 = storage.load_batch_ops("u-ordered-2").unwrap();
+        let ts0 = b0[0].created_at;
+        let ts1 = b1[0].created_at;
+        let ts2 = b2[0].created_at;
+        assert_ne!(ts0, ts1);
+        assert_ne!(ts1, ts2);
+        assert_ne!(ts0, ts2);
+        assert_eq!((ts1 - ts0).num_microseconds(), Some(1));
+        assert_eq!((ts2 - ts0).num_microseconds(), Some(2));
     }
 
     #[test]
