@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use tracing::warn;
 
@@ -155,13 +155,25 @@ fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<Stri
     // also has a defensive `continue` for any batch whose envelope measures
     // over the client-side guard, but excluding them here keeps the cycle
     // from even loading their op rows.
+    //
+    // ORDER BY first_created with first_hlc as a secondary tiebreaker. The
+    // primary sort is fixed-width microsecond timestamps (see
+    // `exec_insert_pending_op`), so lexical order on TEXT matches chronological
+    // order. The HLC tiebreaker is belt-and-suspenders: HLCs are monotonic per
+    // device (`{ms:013}:{counter:010}:{node_id}`), so even if two batches share
+    // an identical `created_at` they still resolve to a deterministic partition
+    // ordering — and any pre-existing variable-width rows from before Fix A
+    // still partition correctly behind it.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT local_batch_id, MIN(created_at) AS first_created \
+        "SELECT DISTINCT local_batch_id, \
+                MIN(created_at) AS first_created, \
+                MIN(client_hlc) AS first_hlc \
              FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NULL \
                AND local_batch_id NOT IN ( \
                    SELECT batch_id FROM push_quarantine WHERE sync_id = ?1 \
                ) \
-             GROUP BY local_batch_id ORDER BY first_created ASC",
+             GROUP BY local_batch_id \
+             ORDER BY first_created ASC, first_hlc ASC",
     )?;
     let rows = stmt.query_map(params![sync_id], |row| row.get::<_, String>(0))?;
     let mut result = Vec::new();
@@ -384,7 +396,11 @@ fn exec_insert_pending_op(conn: &Connection, op: &PendingOp) -> Result<()> {
             op.encoded_value,
             op.is_delete as i32,
             op.client_hlc,
-            op.created_at.to_rfc3339(),
+            // Fixed-width microseconds so TEXT ordering matches chronological
+            // ordering across partition boundaries. `to_rfc3339()` strips
+            // trailing zeros, so timestamps with different microsecond widths
+            // would sort lexically out of order in `query_unpushed_batch_ids`.
+            op.created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
             op.pushed_at.map(|d| d.to_rfc3339()),
         ],
     )?;
@@ -463,7 +479,10 @@ fn exec_upsert_field_version(conn: &Connection, fv: &FieldVersion) -> Result<()>
             fv.winning_device_id,
             fv.winning_hlc,
             fv.winning_encoded_value,
-            fv.updated_at.to_rfc3339(),
+            // Fixed-width microseconds — see `exec_insert_pending_op` for the
+            // rationale. Keeps any push-ordering or TEXT-sort query that
+            // touches `field_versions.updated_at` lexically consistent.
+            fv.updated_at.to_rfc3339_opts(SecondsFormat::Micros, true),
         ],
     )?;
     Ok(())
@@ -2588,6 +2607,162 @@ mod tests {
         let snapshot: SnapshotData = serde_json::from_slice(&json).unwrap();
         assert_eq!(snapshot.field_versions.len(), 3);
         assert_eq!(snapshot.applied_ops.len(), 2);
+    }
+
+    /// Regression for the P1 from the third codex review pass: push ordering
+    /// across multi-batch partitions used to invert in a boundary case.
+    ///
+    /// **Background:** `to_rfc3339()` strips trailing zeros, so an exact-
+    /// millisecond timestamp emits `12:34:56.123Z` while the very next +1µs
+    /// partition emits `12:34:56.123001Z`. Lexical TEXT comparison places
+    /// `.123001Z` *before* `.123Z` (because `.` 0x2E < `Z` 0x5A), so the
+    /// chronologically-earlier partition sorts second, inverting push order.
+    ///
+    /// **Fix A** (verified here): `exec_insert_pending_op` now writes
+    /// `to_rfc3339_opts(SecondsFormat::Micros, true)`, which always emits
+    /// exactly six subsecond digits. Two partitions whose chronological order
+    /// differs by 1µs land at fixed-width `.123000Z` and `.123001Z` strings
+    /// that sort correctly lexically.
+    ///
+    /// **Fix B** (verified here): `query_unpushed_batch_ids` now uses
+    /// `MIN(client_hlc) ASC` as a secondary sort key, so if two batches end
+    /// up sharing an identical `first_created` (e.g., two ops emitted within
+    /// the same microsecond on a coarse clock) the per-device monotonic HLC
+    /// still partitions them deterministically.
+    #[test]
+    fn unpushed_batch_ids_partition_order_is_deterministic_in_boundary_case() {
+        // Part 1 — Fix A: verify the storage trait writes fixed-width
+        // microsecond timestamps so a +1µs partition boundary cannot invert.
+        let storage = make_storage();
+        let sync_id = "sync-1";
+
+        // Synthesize the exact P1 boundary case: partition[0] at an exact
+        // millisecond, partition[1] at +1µs. Before Fix A these would write
+        // as ".123Z" and ".123001Z" and sort lexically out of order.
+        let t_partition0 = DateTime::parse_from_rfc3339("2026-05-11T08:00:00.123000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t_partition1 = DateTime::parse_from_rfc3339("2026-05-11T08:00:00.123001Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let op_partition0 = PendingOp {
+            op_id: "op-partition0".into(),
+            sync_id: sync_id.into(),
+            epoch: 1,
+            device_id: "dev1".into(),
+            local_batch_id: "batch-partition0".into(),
+            entity_table: "members".into(),
+            entity_id: "ent-1".into(),
+            field_name: "name".into(),
+            encoded_value: "\"A\"".into(),
+            is_delete: false,
+            client_hlc: "1778947200123:0000000000:dev1".into(),
+            created_at: t_partition0,
+            pushed_at: None,
+        };
+        let op_partition1 = PendingOp {
+            op_id: "op-partition1".into(),
+            sync_id: sync_id.into(),
+            epoch: 1,
+            device_id: "dev1".into(),
+            local_batch_id: "batch-partition1".into(),
+            entity_table: "members".into(),
+            entity_id: "ent-2".into(),
+            field_name: "name".into(),
+            encoded_value: "\"B\"".into(),
+            is_delete: false,
+            client_hlc: "1778947200123:0000000001:dev1".into(),
+            created_at: t_partition1,
+            pushed_at: None,
+        };
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_pending_op(&op_partition0).unwrap();
+        tx.insert_pending_op(&op_partition1).unwrap();
+        tx.commit().unwrap();
+
+        // Sanity-check that the written strings are fixed-width microseconds.
+        // If this ever regresses (e.g., someone switches back to `to_rfc3339`)
+        // it will be visible here before the ordering assertion below.
+        let stored: Vec<(String, String)> = {
+            let conn = storage.conn.lock().expect("mutex poisoned");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT local_batch_id, created_at FROM pending_ops \
+                     WHERE sync_id = ?1 ORDER BY local_batch_id",
+                )
+                .unwrap();
+            let mut out = Vec::new();
+            let rows = stmt
+                .query_map(params![sync_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap();
+            for r in rows {
+                out.push(r.unwrap());
+            }
+            out
+        };
+        assert_eq!(
+            stored,
+            vec![
+                ("batch-partition0".to_string(), "2026-05-11T08:00:00.123000Z".to_string()),
+                ("batch-partition1".to_string(), "2026-05-11T08:00:00.123001Z".to_string()),
+            ],
+            "pending_ops.created_at must be written as fixed-width microseconds \
+             so lexical TEXT order matches chronological order (Fix A)"
+        );
+
+        let ids = storage.get_unpushed_batch_ids(sync_id).unwrap();
+        assert_eq!(
+            ids,
+            vec!["batch-partition0".to_string(), "batch-partition1".to_string()],
+            "chronologically-earlier partition (`.123000Z`) must sort before \
+             the +1µs partition (`.123001Z`) — Fix A makes the boundary case \
+             impossible to express through the storage trait"
+        );
+
+        // Part 2 — Fix B: when two batches share an identical `created_at`
+        // (e.g., two ops emitted within the same microsecond), the HLC
+        // tiebreaker must produce a deterministic order. Insert via raw SQL
+        // because the storage trait cannot easily produce a same-microsecond
+        // tie at runtime.
+        let storage_ties = make_storage();
+        let sync_id = "sync-2";
+        let same_ts = "2026-05-11T08:00:01.000000Z";
+        let earlier_hlc = "1778947201000:0000000000:dev1";
+        let later_hlc = "1778947201000:0000000001:dev1";
+
+        {
+            let conn = storage_ties.conn.lock().expect("mutex poisoned");
+            // Inserted in reverse chronological order so the test fails if the
+            // SQL relies on insertion order rather than the HLC tiebreaker.
+            conn.execute(
+                "INSERT INTO pending_ops \
+                 (op_id, sync_id, epoch, device_id, local_batch_id, entity_table, entity_id, \
+                  field_name, encoded_value, is_delete, client_hlc, created_at, pushed_at) \
+                 VALUES (?1, ?2, 1, 'dev1', ?3, 'members', 'ent-2', 'name', '\"B\"', 0, ?4, ?5, NULL)",
+                params!["op-later", sync_id, "batch-later", later_hlc, same_ts],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_ops \
+                 (op_id, sync_id, epoch, device_id, local_batch_id, entity_table, entity_id, \
+                  field_name, encoded_value, is_delete, client_hlc, created_at, pushed_at) \
+                 VALUES (?1, ?2, 1, 'dev1', ?3, 'members', 'ent-1', 'name', '\"A\"', 0, ?4, ?5, NULL)",
+                params!["op-earlier", sync_id, "batch-earlier", earlier_hlc, same_ts],
+            )
+            .unwrap();
+        }
+
+        let ids = storage_ties.get_unpushed_batch_ids(sync_id).unwrap();
+        assert_eq!(
+            ids,
+            vec!["batch-earlier".to_string(), "batch-later".to_string()],
+            "when first_created ties, MIN(client_hlc) must break the tie in \
+             HLC order — Fix B's secondary ORDER BY"
+        );
     }
 
     #[test]
