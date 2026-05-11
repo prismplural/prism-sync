@@ -1171,11 +1171,22 @@ impl PrismSync {
     /// `fields` maps are skipped; an empty `fields` argument returns an empty
     /// `Vec`.
     ///
-    /// Algorithm: sort fields by encoded-value length descending, then pack
-    /// greedily (first-fit-decreasing). A field whose own measured envelope
-    /// already exceeds the target is placed alone in its bucket — the push
-    /// path will surface a more precise size error if it actually exceeds
-    /// the relay cap on the wire.
+    /// Algorithm: sort fields by encoded-value length **ascending**, then
+    /// pack greedily into envelope-size-measured buckets. Small fields are
+    /// placed first, so partition 0 accumulates every non-blob field of an
+    /// entity create before a large blob is ever attempted; oversized blobs
+    /// then naturally spill into their own subsequent buckets. A field
+    /// whose own measured envelope already exceeds the target is placed
+    /// alone in its bucket — the push path will surface a more precise size
+    /// error if it actually exceeds the relay cap on the wire.
+    ///
+    /// **Why small-first matters:** receivers apply each pushed batch as a
+    /// single UPSERT against their local schema. If the first partition for
+    /// a member create contained only an avatar blob, the receiver's
+    /// `name`/`created_at` NOT NULL columns would be empty and the insert
+    /// would fail, silently dropping the row on the non-strict apply path.
+    /// Small-first packing keeps partition 0 carrying every required
+    /// column so the initial UPSERT is always a valid insert.
     ///
     /// **Important:** sizes are computed by serializing tentative
     /// `CrdtChange` ops and asking `estimate_envelope_body_size`, NOT by
@@ -1194,8 +1205,11 @@ impl PrismSync {
         }
 
         // Pre-encode every value once so we can use the same plaintext both
-        // for size estimation and for sorting. Sort descending by encoded
-        // length so the largest values are placed first — classic FFD.
+        // for size estimation and for sorting. Sort ascending by encoded
+        // length so the smallest values are placed first — this guarantees
+        // every NOT NULL column lands in partition 0 before any blob is
+        // tried, preventing receivers from UPSERTing a row that lacks
+        // required fields and gets silently dropped on constraint violation.
         let mut entries: Vec<(String, SyncValue, String)> = fields
             .iter()
             .map(|(name, value)| {
@@ -1203,7 +1217,7 @@ impl PrismSync {
                 (name.clone(), value.clone(), encoded)
             })
             .collect();
-        entries.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+        entries.sort_by(|a, b| a.2.len().cmp(&b.2.len()));
 
         // Each bucket carries the partition's field map plus its tentative
         // CrdtChange list (rebuilt as fields are added) for re-measuring.
@@ -3390,6 +3404,75 @@ mod tests {
             .expect("banner bucket present");
         assert_eq!(banner_bucket.0.len(), 1, "banner must be in a bucket alone");
         assert!(banner_bucket.0.contains_key("banner"));
+    }
+
+    #[test]
+    fn partition_packs_all_small_fields_into_first_bucket_when_blob_present() {
+        // Regression: with FFD-descending the first emitted partition for a
+        // member create contained only the avatar blob, so the receiver's
+        // UPSERT had NULL name/created_at and the row was silently dropped
+        // by the non-strict apply path. Ascending order must land every
+        // required NOT NULL column in partition 0 before the blob spills
+        // into its own subsequent bucket.
+        let mut fields: HashMap<String, SyncValue> = HashMap::new();
+        // Small fields shaped like a real member create — all of these are
+        // NOT NULL on the receiver's Drift schema.
+        fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        fields.insert(
+            "created_at".to_string(),
+            SyncValue::String("2026-05-10T00:00:00Z".to_string()),
+        );
+        fields.insert("emoji".to_string(), SyncValue::String("\u{1F33C}".to_string()));
+        fields.insert("is_active".to_string(), SyncValue::Bool(true));
+        fields.insert("pronouns".to_string(), SyncValue::String("she/her".to_string()));
+        fields.insert("custom_color".to_string(), SyncValue::String("#AF8EE9".to_string()));
+        // One synthetic ~600 KB blob forces multi-partition splitting.
+        fields.insert("avatar_image_data".to_string(), image_value(600 * 1024));
+
+        let buckets = PrismSync::partition_fields_into_batches(
+            &fields,
+            "members",
+            "ent-mem-1",
+            "a1b2c3d4e5f6",
+            0,
+        );
+
+        assert!(
+            buckets.len() >= 2,
+            "blob + small fields should split into 2+ buckets, got {}",
+            buckets.len()
+        );
+
+        // Partition 0 (the one the relay receives first, since push order
+        // is FIFO by created_at) must carry every small / NOT NULL field
+        // so the receiver's initial UPSERT is a valid insert.
+        let (first_fields, _) = &buckets[0];
+        for required in ["name", "created_at", "emoji", "is_active", "pronouns", "custom_color"] {
+            assert!(
+                first_fields.contains_key(required),
+                "partition 0 must contain required field {required} so receivers can insert \
+                 the row without violating NOT NULL constraints; partition 0 = {:?}",
+                first_fields.keys().collect::<Vec<_>>(),
+            );
+        }
+        // The blob must NOT be in partition 0 — it spills to a later bucket.
+        assert!(
+            !first_fields.contains_key("avatar_image_data"),
+            "the large blob must not occupy partition 0; partition 0 = {:?}",
+            first_fields.keys().collect::<Vec<_>>(),
+        );
+
+        // The blob still ends up in *some* partition.
+        let blob_bucket = buckets
+            .iter()
+            .find(|(b, _)| b.contains_key("avatar_image_data"))
+            .expect("avatar_image_data must be present in some bucket");
+        assert_eq!(
+            blob_bucket.0.len(),
+            1,
+            "the large blob should be alone in its bucket; got {:?}",
+            blob_bucket.0.keys().collect::<Vec<_>>(),
+        );
     }
 
     #[test]
