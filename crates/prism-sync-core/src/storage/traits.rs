@@ -178,6 +178,35 @@ pub trait SyncStorageTx {
     fn mark_batch_pushed(&mut self, batch_id: &str) -> Result<()>;
     fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()>;
 
+    /// Load all `pending_ops` rows whose `local_batch_id` matches `batch_id`,
+    /// inside the current transaction. Used by Phase 1C recovery to enumerate
+    /// the ops in a quarantined batch before repartitioning them.
+    ///
+    /// Returns an empty vector if no rows match.
+    ///
+    /// Default: empty (no-op for in-memory impls).
+    fn load_batch_ops(&self, _batch_id: &str) -> Result<Vec<PendingOp>> {
+        Ok(vec![])
+    }
+
+    /// Rewrite the `local_batch_id` of a single `pending_ops` row identified
+    /// by `op_id`. Every other column on the row (`op_id`, `client_hlc`,
+    /// `device_id`, `epoch`, `encoded_value`, `created_at`, `entity_table`,
+    /// `entity_id`, `field_name`, `is_delete`, `pushed_at`) must be preserved
+    /// exactly — Phase 1C repair MUST NOT alter CRDT-bearing fields.
+    ///
+    /// Returns an error if the row does not exist or the update affected
+    /// zero rows.
+    ///
+    /// Default: no-op for in-memory impls.
+    fn update_pending_op_batch_id(
+        &mut self,
+        _op_id: &str,
+        _new_batch_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     // ── Applied ops ──
     fn insert_applied_op(&mut self, op: &AppliedOp) -> Result<()>;
 

@@ -33,7 +33,7 @@ use crate::recovery::{commit_recovered_epoch_material, KeyHierarchyRecoverer};
 use crate::relay::SyncRelay;
 use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::secure_store::SecureStore;
-use crate::storage::{StorageError, SyncStorage};
+use crate::storage::{PendingOp, StorageError, SyncStorage};
 use crate::sync_service::{AutoSyncConfig, SyncService};
 use crate::crdt_change::{estimate_envelope_body_size, CrdtChange};
 use crate::syncable_entity::SyncableEntity;
@@ -1283,6 +1283,197 @@ impl PrismSync {
             .filter(|b| !b.fields.is_empty())
             .map(|b| (b.fields, b.batch_id))
             .collect()
+    }
+
+    /// Partition pre-existing `PendingOp` rows into one or more sub-batches
+    /// whose serialized envelope stays under `BATCH_BODY_TARGET_BYTES` (and
+    /// therefore under the relay's 1 MB cap).
+    ///
+    /// Used by Phase 1C recovery to repartition a quarantined batch without
+    /// re-emitting ops — the returned `op_ids` keep their `op_id`,
+    /// `client_hlc`, `device_id`, `epoch`, `encoded_value`, `created_at`,
+    /// `entity_table`, `entity_id`, `field_name`, `is_delete`, `pushed_at`
+    /// fields intact; only `local_batch_id` is rewritten by the caller.
+    ///
+    /// Each entry in the returned vector is `(op_ids, batch_id)` — every
+    /// `op_id` in `op_ids` belongs to the same new `batch_id`. Empty input
+    /// returns an empty Vec.
+    ///
+    /// Algorithm mirrors `partition_fields_into_batches`: sort by
+    /// `encoded_value` length descending, then first-fit-decreasing into
+    /// envelope-size-measured buckets. A single op whose own envelope already
+    /// overshoots the target still gets its own bucket — the push path's
+    /// pre-flight guard re-quarantines it on the next cycle with an
+    /// irreparable-oversized-op diagnostic, which is the correct surface for
+    /// the caller (Phase 1C UI / future Phase 1D handling).
+    fn partition_pending_ops_into_batches(ops: &[PendingOp]) -> Vec<(Vec<String>, String)> {
+        if ops.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort op references by encoded_value length descending so the largest
+        // ops are placed first (classic FFD).
+        let mut entries: Vec<&PendingOp> = ops.iter().collect();
+        entries.sort_by(|a, b| b.encoded_value.len().cmp(&a.encoded_value.len()));
+
+        // Each bucket carries the partition's op_ids list plus its tentative
+        // CrdtChange list for re-measuring envelope size.
+        struct Bucket {
+            op_ids: Vec<String>,
+            ops: Vec<CrdtChange>,
+            batch_id: String,
+        }
+
+        let make_bucket = || Bucket {
+            op_ids: Vec::new(),
+            ops: Vec::new(),
+            batch_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        // Build a CrdtChange from a PendingOp tagged with the candidate
+        // `batch_id`. The shape matches what the push path actually
+        // serializes (`engine::mod::push_phase` builds CrdtChange instances
+        // from the same fields), so the envelope-size estimate is faithful.
+        let make_change = |op: &PendingOp, batch_id: &str| CrdtChange {
+            op_id: op.op_id.clone(),
+            batch_id: Some(batch_id.to_string()),
+            entity_id: op.entity_id.clone(),
+            entity_table: op.entity_table.clone(),
+            field_name: op.field_name.clone(),
+            encoded_value: op.encoded_value.clone(),
+            client_hlc: op.client_hlc.clone(),
+            is_delete: op.is_delete,
+            device_id: op.device_id.clone(),
+            epoch: op.epoch,
+            server_seq: None,
+        };
+
+        let mut buckets: Vec<Bucket> = Vec::new();
+
+        for op in entries {
+            let mut placed = false;
+
+            for bucket in buckets.iter_mut() {
+                let mut candidate_ops = bucket.ops.clone();
+                candidate_ops.push(make_change(op, &bucket.batch_id));
+
+                let body =
+                    estimate_envelope_body_size(&candidate_ops, HYBRID_SIGNATURE_WIRE_BYTES);
+                if body <= BATCH_BODY_TARGET_BYTES {
+                    bucket.op_ids.push(op.op_id.clone());
+                    bucket.ops = candidate_ops;
+                    placed = true;
+                    break;
+                }
+            }
+
+            if !placed {
+                let mut bucket = make_bucket();
+                bucket.ops.push(make_change(op, &bucket.batch_id));
+                bucket.op_ids.push(op.op_id.clone());
+                buckets.push(bucket);
+            }
+        }
+
+        buckets
+            .into_iter()
+            .filter(|b| !b.op_ids.is_empty())
+            .map(|b| (b.op_ids, b.batch_id))
+            .collect()
+    }
+
+    /// Repartition every push-quarantined batch into one or more smaller
+    /// sub-batches sized to fit under the relay's 1 MB envelope cap, and
+    /// clear the matching `push_quarantine` row so the next sync cycle picks
+    /// the new batches up via `get_unpushed_batch_ids`.
+    ///
+    /// Runs in a single `BEGIN IMMEDIATE` transaction so the entire recovery
+    /// either commits as one atomic step or rolls back leaving the
+    /// pre-existing quarantined batches exactly as they were.
+    ///
+    /// Returns the number of `push_quarantine` rows successfully repaired.
+    ///
+    /// **Critical safety property:** every `pending_ops` field other than
+    /// `local_batch_id` is preserved exactly — `op_id`, `client_hlc`,
+    /// `device_id`, `epoch`, `encoded_value`, `created_at`, `entity_table`,
+    /// `entity_id`, `field_name`, `is_delete`, `pushed_at` are NEVER
+    /// touched. Repartitioning is a pure CRDT-no-op: the resulting ops have
+    /// the same field-level LWW outcomes as the originals.
+    ///
+    /// Idempotent: a second call when there are no quarantined batches is a
+    /// cheap no-op returning 0. Re-running on an already-repaired DB returns
+    /// 0 because nothing remains in `push_quarantine` to repair.
+    ///
+    /// Errors with `CoreError::Engine("sync_id not set …")` if the engine
+    /// has not been configured.
+    pub fn repair_quarantined_batches(&mut self) -> Result<i64> {
+        let sync_id = self
+            .sync_service
+            .sync_id()
+            .ok_or_else(|| {
+                CoreError::Engine("sync_id not set — call configure_engine first".into())
+            })?
+            .to_string();
+
+        let infos = self.storage.list_quarantined_batches(&sync_id)?;
+        if infos.is_empty() {
+            return Ok(0);
+        }
+
+        // One transaction wrapping ALL repairs. If any step fails we roll
+        // back the whole thing, leaving the quarantined batches untouched.
+        let mut tx = self.storage.begin_tx()?;
+        let mut repaired = 0i64;
+
+        for info in &infos {
+            let original_batch_id = info.batch_id.as_str();
+            let existing_ops = tx.load_batch_ops(original_batch_id)?;
+
+            // Orphan quarantine row: the underlying pending_ops are gone.
+            // Cleanest fix is to remove the dangling quarantine row so the
+            // banner clears and the user isn't stuck looking at a count
+            // they can't act on.
+            if existing_ops.is_empty() {
+                tx.unquarantine_batch(&sync_id, original_batch_id)?;
+                repaired += 1;
+                continue;
+            }
+
+            let partitions = Self::partition_pending_ops_into_batches(&existing_ops);
+
+            // Defensive: the partitioner must produce at least one bucket if
+            // we got here with non-empty ops. Treat anything else as a bug.
+            if partitions.is_empty() {
+                let _ = tx.rollback();
+                return Err(CoreError::Engine(format!(
+                    "repair_quarantined_batches: partitioner produced no buckets \
+                     for batch_id={original_batch_id} with {} ops",
+                    existing_ops.len(),
+                )));
+            }
+
+            // Decide whether we actually need to rewrite local_batch_id:
+            // if the partitioner produces a single bucket that covers every
+            // existing op, the "new" batch_id is just a fresh UUID for the
+            // same set of ops — rewriting is unnecessary, but we still must
+            // clear the quarantine row.
+            let single_bucket = partitions.len() == 1;
+            let same_size = single_bucket && partitions[0].0.len() == existing_ops.len();
+
+            if !same_size {
+                for (op_ids, new_batch_id) in &partitions {
+                    for op_id in op_ids {
+                        tx.update_pending_op_batch_id(op_id, new_batch_id)?;
+                    }
+                }
+            }
+
+            tx.unquarantine_batch(&sync_id, original_batch_id)?;
+            repaired += 1;
+        }
+
+        tx.commit()?;
+        Ok(repaired)
     }
 
     // ── Epoch rotation ──
@@ -3222,6 +3413,577 @@ mod tests {
                 "duplicate batch_id detected: {batch_id}"
             );
             uuid::Uuid::parse_str(batch_id).expect("batch_id should be a UUID");
+        }
+    }
+
+    // ── Phase 1C: repair_quarantined_batches ──
+
+    /// Construct a `PendingOp` with predictable defaults. The `encoded_value`
+    /// is what drives partitioning size, so the test passes the bytes
+    /// inline.
+    fn pending_op(
+        op_id: &str,
+        sync_id: &str,
+        local_batch_id: &str,
+        field_name: &str,
+        encoded_value: String,
+    ) -> PendingOp {
+        PendingOp {
+            op_id: op_id.to_string(),
+            sync_id: sync_id.to_string(),
+            epoch: 1,
+            device_id: "dev-c1".to_string(),
+            local_batch_id: local_batch_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1c".to_string(),
+            field_name: field_name.to_string(),
+            encoded_value,
+            is_delete: false,
+            client_hlc: format!(
+                "{:013}:{:010}:dev-c1",
+                1_700_000_000_000u64, 42u32
+            ),
+            created_at: chrono::Utc::now(),
+            pushed_at: None,
+        }
+    }
+
+    /// Insert pending ops + a matching push_quarantine row directly into the
+    /// configured sync's storage, bypassing the consumer API. Mirrors what
+    /// the user's DB looks like after the broken sync attempts in the bug
+    /// report.
+    fn seed_quarantined_batch(
+        sync: &PrismSync,
+        sync_id: &str,
+        batch_id: &str,
+        ops: &[PendingOp],
+        body_bytes: i64,
+    ) {
+        let mut tx = sync.storage().begin_tx().unwrap();
+        for op in ops {
+            tx.insert_pending_op(op).unwrap();
+        }
+        tx.quarantine_batch(
+            sync_id,
+            batch_id,
+            "members",
+            "ent-1c",
+            body_bytes,
+            "payload_too_large",
+            "envelope exceeded relay cap",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// Build an `encoded_value` shaped like a base64 image blob (`\"AAAA…\"`)
+    /// whose total length matches `raw_bytes * 4 / 3 + 2` (for the surrounding
+    /// JSON quotes).
+    fn image_encoded(raw_bytes: usize) -> String {
+        let expanded = (raw_bytes * 4).div_ceil(3);
+        format!("\"{}\"", "A".repeat(expanded))
+    }
+
+    #[test]
+    fn repair_quarantined_batches_repartitions_oversized_batch_preserving_op_fields() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // One oversized batch: small name op + two huge image-blob ops that
+        // together overshoot the 950 KB partition target.
+        let sync_id = "sync-1";
+        let original_batch_id = "stuck-batch";
+        let op_name =
+            pending_op("op-name", sync_id, original_batch_id, "name", "\"Big System\"".to_string());
+        let op_avatar = pending_op(
+            "op-avatar",
+            sync_id,
+            original_batch_id,
+            "avatar",
+            image_encoded(500 * 1024),
+        );
+        let op_banner = pending_op(
+            "op-banner",
+            sync_id,
+            original_batch_id,
+            "banner",
+            image_encoded(500 * 1024),
+        );
+        let ops = vec![op_name.clone(), op_avatar.clone(), op_banner.clone()];
+
+        seed_quarantined_batch(&sync, sync_id, original_batch_id, &ops, 1_400_000);
+
+        // Sanity: pre-repair, the batch is hidden from the unpushed-batch query
+        // and the quarantine count is 1.
+        assert!(sync.storage().get_unpushed_batch_ids(sync_id).unwrap().is_empty());
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 1);
+
+        let repaired = sync.repair_quarantined_batches().expect("repair ok");
+        assert_eq!(repaired, 1);
+
+        // The quarantine row is gone.
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 0);
+
+        // The pending_ops rows now appear under at least two different
+        // local_batch_ids — the partitioner split the oversized batch.
+        let post_ops_name =
+            sync.storage().load_batch_ops(original_batch_id).unwrap_or_default();
+        assert!(
+            post_ops_name.is_empty(),
+            "ops should have been moved off the original batch_id, found {post_ops_name:?}"
+        );
+
+        // The post-repair unpushed-batch list contains at least one batch_id
+        // distinct from the quarantined original.
+        let post_batches = sync.storage().get_unpushed_batch_ids(sync_id).unwrap();
+        assert!(
+            !post_batches.is_empty(),
+            "unpushed batches should resurface after repair, got {post_batches:?}"
+        );
+        assert!(
+            post_batches.iter().all(|b| b != original_batch_id),
+            "no surviving op should still carry the original batch_id, got {post_batches:?}"
+        );
+
+        // Every op preserves every field except `local_batch_id`. Verify by
+        // looking up each op in its new batch and comparing the immutable
+        // columns.
+        let mut new_ops_by_id: std::collections::HashMap<String, PendingOp> =
+            std::collections::HashMap::new();
+        for bid in &post_batches {
+            for op in sync.storage().load_batch_ops(bid).unwrap() {
+                new_ops_by_id.insert(op.op_id.clone(), op);
+            }
+        }
+        assert_eq!(new_ops_by_id.len(), 3, "all three ops must survive");
+
+        for original in [&op_name, &op_avatar, &op_banner] {
+            let post = new_ops_by_id.remove(&original.op_id).expect("op preserved");
+            assert_eq!(post.op_id, original.op_id);
+            assert_eq!(post.sync_id, original.sync_id);
+            assert_eq!(post.epoch, original.epoch);
+            assert_eq!(post.device_id, original.device_id);
+            assert_eq!(post.entity_table, original.entity_table);
+            assert_eq!(post.entity_id, original.entity_id);
+            assert_eq!(post.field_name, original.field_name);
+            assert_eq!(post.encoded_value, original.encoded_value);
+            assert_eq!(post.is_delete, original.is_delete);
+            assert_eq!(post.client_hlc, original.client_hlc);
+            assert_eq!(post.created_at, original.created_at);
+            assert_eq!(post.pushed_at, original.pushed_at);
+            assert_ne!(
+                post.local_batch_id, original.local_batch_id,
+                "local_batch_id should have been rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_quarantined_batches_idempotent_no_op_when_empty() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // First call with nothing quarantined: returns 0.
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 0);
+        // Second call still 0.
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 0);
+    }
+
+    #[test]
+    fn repair_quarantined_batches_second_run_is_noop_after_successful_repair() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let sync_id = "sync-1";
+        let original_batch_id = "stuck-batch-2";
+        let ops = vec![
+            pending_op(
+                "op-name-2",
+                sync_id,
+                original_batch_id,
+                "name",
+                "\"Sys2\"".to_string(),
+            ),
+            pending_op(
+                "op-banner-2",
+                sync_id,
+                original_batch_id,
+                "banner",
+                image_encoded(600 * 1024),
+            ),
+        ];
+        seed_quarantined_batch(&sync, sync_id, original_batch_id, &ops, 1_200_000);
+
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 1);
+        // Second call: nothing in push_quarantine, returns 0.
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 0);
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn repair_quarantined_batches_handles_orphan_quarantine_row_without_panic() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let sync_id = "sync-1";
+        let orphan_batch_id = "orphan-batch";
+        // Insert ONLY a quarantine row — no pending_ops. This models the
+        // case where ops were pushed-and-deleted by an earlier sync cycle
+        // but the quarantine row slipped past cleanup.
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.quarantine_batch(
+                sync_id,
+                orphan_batch_id,
+                "members",
+                "ent-orphan",
+                500_000,
+                "payload_too_large",
+                "orphan diagnostics",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let repaired = sync.repair_quarantined_batches().expect("orphan handling ok");
+        assert_eq!(repaired, 1, "orphan row should count as repaired");
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn repair_quarantined_batches_rolls_back_when_storage_errors_midflight() {
+        // Mirror the FailingStorage pattern from op_emitter tests: wrap the
+        // real storage in a test-only `SyncStorage` that injects a failure
+        // on the Nth call to `update_pending_op_batch_id`. We then verify
+        // the transaction rolled back — the quarantine row is still there
+        // and the pending_ops rows still carry the original local_batch_id.
+        let schema = SyncSchema::builder()
+            .entity("members", |e| {
+                e.field("name", SyncType::String)
+                    .field("avatar", SyncType::String)
+                    .field("banner", SyncType::String)
+            })
+            .build();
+        let real_storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
+        let failing = Arc::new(RepairFailingStorage::new(real_storage));
+        let secure_store = Arc::new(MemStore::default());
+
+        let mut sync = PrismSync::builder()
+            .schema(schema)
+            .storage(failing.clone())
+            .secure_store(secure_store)
+            .build()
+            .expect("build ok");
+        configure(&mut sync);
+
+        let sync_id = "sync-1";
+        let original_batch_id = "stuck-batch-3";
+        let op_name = pending_op(
+            "op-name-3",
+            sync_id,
+            original_batch_id,
+            "name",
+            "\"Sys3\"".to_string(),
+        );
+        let op_avatar = pending_op(
+            "op-avatar-3",
+            sync_id,
+            original_batch_id,
+            "avatar",
+            image_encoded(500 * 1024),
+        );
+        let op_banner = pending_op(
+            "op-banner-3",
+            sync_id,
+            original_batch_id,
+            "banner",
+            image_encoded(500 * 1024),
+        );
+        let ops = vec![op_name.clone(), op_avatar.clone(), op_banner.clone()];
+
+        // Use a fresh tx through the real storage to seed (the wrapper
+        // forwards `begin_tx` and the wrapper's update-counter only trips
+        // during the repair call below).
+        {
+            let mut tx = failing.begin_tx().unwrap();
+            for op in &ops {
+                tx.insert_pending_op(op).unwrap();
+            }
+            tx.quarantine_batch(
+                sync_id,
+                original_batch_id,
+                "members",
+                "ent-1c",
+                1_400_000,
+                "payload_too_large",
+                "trip-mid-repair",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Fail on the second `update_pending_op_batch_id` call so the
+        // first one succeeds (proving the rollback actually undoes a
+        // partial mutation, not a no-op).
+        failing.fail_on_update_at(2);
+
+        let err = sync
+            .repair_quarantined_batches()
+            .expect_err("repair must propagate the storage error");
+        assert!(
+            err.to_string().contains("repair-failure"),
+            "unexpected error: {err}"
+        );
+
+        // The quarantine row survives untouched — rollback restored it.
+        assert_eq!(failing.quarantined_batch_count(sync_id).unwrap(), 1);
+
+        // The pending_ops rows still belong to the original batch_id.
+        let still_in_orig = failing.load_batch_ops(original_batch_id).unwrap();
+        assert_eq!(still_in_orig.len(), 3, "all 3 ops must remain under the original batch_id after rollback");
+        let mut by_id: std::collections::HashMap<&str, &PendingOp> = std::collections::HashMap::new();
+        for op in &still_in_orig {
+            by_id.insert(op.op_id.as_str(), op);
+        }
+        for original in [&op_name, &op_avatar, &op_banner] {
+            let post = by_id.remove(original.op_id.as_str()).expect("op present");
+            assert_eq!(post.local_batch_id, original_batch_id);
+            assert_eq!(post.encoded_value, original.encoded_value);
+            assert_eq!(post.client_hlc, original.client_hlc);
+            assert_eq!(post.device_id, original.device_id);
+            assert_eq!(post.epoch, original.epoch);
+        }
+    }
+
+    // Test-only wrapper that injects a failure on the Nth call to
+    // `update_pending_op_batch_id`, to verify Phase 1C rollback semantics.
+    struct RepairFailingStorage {
+        inner: std::sync::Arc<RusqliteSyncStorage>,
+        fail_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RepairFailingStorage {
+        fn new(inner: RusqliteSyncStorage) -> Self {
+            Self {
+                inner: std::sync::Arc::new(inner),
+                fail_at: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn fail_on_update_at(&self, ordinal: usize) {
+            self.fail_at.store(ordinal, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl SyncStorage for RepairFailingStorage {
+        fn begin_tx(&self) -> Result<Box<dyn crate::storage::SyncStorageTx + '_>> {
+            let inner_tx = self.inner.begin_tx()?;
+            Ok(Box::new(RepairFailingTx {
+                inner: inner_tx,
+                fail_at: self.fail_at.clone(),
+                seen: self.seen.clone(),
+            }))
+        }
+
+        fn get_sync_metadata(&self, sync_id: &str) -> Result<Option<crate::storage::SyncMetadata>> {
+            self.inner.get_sync_metadata(sync_id)
+        }
+
+        fn get_unpushed_batch_ids(&self, sync_id: &str) -> Result<Vec<String>> {
+            self.inner.get_unpushed_batch_ids(sync_id)
+        }
+
+        fn load_batch_ops(&self, batch_id: &str) -> Result<Vec<PendingOp>> {
+            self.inner.load_batch_ops(batch_id)
+        }
+
+        fn is_op_applied(&self, op_id: &str) -> Result<bool> {
+            self.inner.is_op_applied(op_id)
+        }
+
+        fn get_field_version(
+            &self,
+            sync_id: &str,
+            table: &str,
+            entity_id: &str,
+            field: &str,
+        ) -> Result<Option<crate::storage::FieldVersion>> {
+            self.inner.get_field_version(sync_id, table, entity_id, field)
+        }
+
+        fn list_quarantined_batches(
+            &self,
+            sync_id: &str,
+        ) -> Result<Vec<crate::storage::QuarantinedBatchInfo>> {
+            self.inner.list_quarantined_batches(sync_id)
+        }
+
+        fn quarantined_batch_count(&self, sync_id: &str) -> Result<i64> {
+            self.inner.quarantined_batch_count(sync_id)
+        }
+
+        fn get_device_record(
+            &self,
+            sync_id: &str,
+            device_id: &str,
+        ) -> Result<Option<crate::storage::DeviceRecord>> {
+            self.inner.get_device_record(sync_id, device_id)
+        }
+
+        fn list_device_records(&self, sync_id: &str) -> Result<Vec<crate::storage::DeviceRecord>> {
+            self.inner.list_device_records(sync_id)
+        }
+
+        fn export_snapshot(&self, sync_id: &str) -> Result<Vec<u8>> {
+            self.inner.export_snapshot(sync_id)
+        }
+
+        fn rekey(&self, new_key: &[u8; 32]) -> Result<()> {
+            self.inner.rekey(new_key)
+        }
+    }
+
+    struct RepairFailingTx<'a> {
+        inner: Box<dyn crate::storage::SyncStorageTx + 'a>,
+        fail_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::storage::SyncStorageTx for RepairFailingTx<'_> {
+        fn is_op_applied(&self, op_id: &str) -> Result<bool> {
+            self.inner.is_op_applied(op_id)
+        }
+
+        fn get_field_version(
+            &self,
+            sync_id: &str,
+            table: &str,
+            entity_id: &str,
+            field: &str,
+        ) -> Result<Option<crate::storage::FieldVersion>> {
+            self.inner.get_field_version(sync_id, table, entity_id, field)
+        }
+
+        fn get_device_record(
+            &self,
+            sync_id: &str,
+            device_id: &str,
+        ) -> Result<Option<crate::storage::DeviceRecord>> {
+            self.inner.get_device_record(sync_id, device_id)
+        }
+
+        fn upsert_sync_metadata(&mut self, meta: &crate::storage::SyncMetadata) -> Result<()> {
+            self.inner.upsert_sync_metadata(meta)
+        }
+
+        fn update_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
+            self.inner.update_last_pulled_seq(sync_id, seq)
+        }
+
+        fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {
+            self.inner.update_last_successful_sync(sync_id)
+        }
+
+        fn update_current_epoch(&mut self, sync_id: &str, epoch: i32) -> Result<()> {
+            self.inner.update_current_epoch(sync_id, epoch)
+        }
+
+        fn update_last_imported_registry_version(
+            &mut self,
+            sync_id: &str,
+            version: i64,
+        ) -> Result<()> {
+            self.inner.update_last_imported_registry_version(sync_id, version)
+        }
+
+        fn insert_pending_op(&mut self, op: &PendingOp) -> Result<()> {
+            self.inner.insert_pending_op(op)
+        }
+
+        fn mark_batch_pushed(&mut self, batch_id: &str) -> Result<()> {
+            self.inner.mark_batch_pushed(batch_id)
+        }
+
+        fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()> {
+            self.inner.delete_pushed_ops(sync_id, batch_id)
+        }
+
+        fn load_batch_ops(&self, batch_id: &str) -> Result<Vec<PendingOp>> {
+            self.inner.load_batch_ops(batch_id)
+        }
+
+        fn update_pending_op_batch_id(
+            &mut self,
+            op_id: &str,
+            new_batch_id: &str,
+        ) -> Result<()> {
+            let next = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let trip = self.fail_at.load(std::sync::atomic::Ordering::SeqCst);
+            if trip != 0 && next == trip {
+                return Err(CoreError::Storage(crate::storage::StorageError::Logic(
+                    "repair-failure injected".to_string(),
+                )));
+            }
+            self.inner.update_pending_op_batch_id(op_id, new_batch_id)
+        }
+
+        fn insert_applied_op(&mut self, op: &crate::storage::AppliedOp) -> Result<()> {
+            self.inner.insert_applied_op(op)
+        }
+
+        fn upsert_field_version(&mut self, fv: &crate::storage::FieldVersion) -> Result<()> {
+            self.inner.upsert_field_version(fv)
+        }
+
+        fn quarantine_batch(
+            &mut self,
+            sync_id: &str,
+            batch_id: &str,
+            entity_table: &str,
+            entity_id: &str,
+            body_bytes: i64,
+            error_code: &str,
+            error_message: &str,
+        ) -> Result<()> {
+            self.inner.quarantine_batch(
+                sync_id,
+                batch_id,
+                entity_table,
+                entity_id,
+                body_bytes,
+                error_code,
+                error_message,
+            )
+        }
+
+        fn unquarantine_batch(&mut self, sync_id: &str, batch_id: &str) -> Result<()> {
+            self.inner.unquarantine_batch(sync_id, batch_id)
+        }
+
+        fn upsert_device_record(&mut self, device: &crate::storage::DeviceRecord) -> Result<()> {
+            self.inner.upsert_device_record(device)
+        }
+
+        fn remove_device_record(&mut self, sync_id: &str, device_id: &str) -> Result<()> {
+            self.inner.remove_device_record(sync_id, device_id)
+        }
+
+        fn clear_sync_state(&mut self, sync_id: &str) -> Result<()> {
+            self.inner.clear_sync_state(sync_id)
+        }
+
+        fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64> {
+            self.inner.import_snapshot(sync_id, data)
+        }
+
+        fn commit(self: Box<Self>) -> Result<()> {
+            self.inner.commit()
+        }
+
+        fn rollback(self: Box<Self>) -> Result<()> {
+            self.inner.rollback()
         }
     }
 }

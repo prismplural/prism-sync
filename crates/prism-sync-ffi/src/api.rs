@@ -2302,6 +2302,37 @@ pub async fn quarantined_batch_count(handle: &PrismSyncHandle) -> Result<i64, St
     .map_err(|e| e.to_string())?
 }
 
+/// Repair every push-quarantined batch by repartitioning its ops into
+/// smaller sub-batches that fit under the relay's 1 MB envelope cap.
+///
+/// Runs in one storage transaction so the entire recovery either commits or
+/// rolls back atomically — there is no observable half-repaired state.
+///
+/// Returns the number of `push_quarantine` rows successfully repaired
+/// (including orphan rows whose underlying `pending_ops` had already been
+/// pushed and deleted). A return value of `0` means there was nothing to
+/// repair (typical idempotent case).
+///
+/// The freshly repartitioned batches are NOT pushed by this call; the next
+/// sync cycle picks them up via the (unchanged) `get_unpushed_batch_ids`
+/// query, which now sees them because they are no longer in
+/// `push_quarantine`. Dart-side callers should follow a successful repair
+/// with an auto-sync trigger so the user observes the queue draining.
+///
+/// Errors with `"Not configured"` if the engine has not been configured.
+pub async fn repair_quarantined_batches(handle: &PrismSyncHandle) -> Result<i64, String> {
+    // The repair runs synchronous SQLite writes on the storage layer; do it
+    // inside `spawn_blocking` so a slow disk write doesn't stall the tokio
+    // worker. `blocking_lock()` acquires the tokio Mutex synchronously,
+    // which is safe inside spawn_blocking.
+    let inner = handle.inner.clone();
+    tokio::task::spawn_blocking(move || {
+        inner.blocking_lock().repair_quarantined_batches().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task failed: {e}"))?
+}
+
 // ── Events stream ──
 
 /// Subscribe to sync events as a continuous stream.

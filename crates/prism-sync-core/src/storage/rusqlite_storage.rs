@@ -408,6 +408,28 @@ fn exec_delete_pushed_ops(conn: &Connection, sync_id: &str, batch_id: &str) -> R
     Ok(())
 }
 
+/// Rewrite `local_batch_id` on a single pending_ops row identified by op_id.
+/// Used by Phase 1C recovery to repartition a quarantined batch into smaller
+/// sub-batches without altering any other field on the row. Returns an error
+/// if the update affected zero rows (caller passed an op_id that no longer
+/// exists, indicating a torn pre-load state we shouldn't silently accept).
+fn exec_update_pending_op_batch_id(
+    conn: &Connection,
+    op_id: &str,
+    new_batch_id: &str,
+) -> Result<()> {
+    let updated = conn.execute(
+        "UPDATE pending_ops SET local_batch_id = ?1 WHERE op_id = ?2",
+        params![new_batch_id, op_id],
+    )?;
+    if updated == 0 {
+        return Err(CoreError::Storage(StorageError::Logic(format!(
+            "update_pending_op_batch_id: no pending_ops row for op_id={op_id}"
+        ))));
+    }
+    Ok(())
+}
+
 fn exec_insert_applied_op(conn: &Connection, op: &AppliedOp) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO applied_ops \
@@ -1202,6 +1224,18 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()> {
         exec_delete_pushed_ops(&self.conn, sync_id, batch_id)
+    }
+
+    fn load_batch_ops(&self, batch_id: &str) -> Result<Vec<PendingOp>> {
+        query_batch_ops(&self.conn, batch_id)
+    }
+
+    fn update_pending_op_batch_id(
+        &mut self,
+        op_id: &str,
+        new_batch_id: &str,
+    ) -> Result<()> {
+        exec_update_pending_op_batch_id(&self.conn, op_id, new_batch_id)
     }
 
     // ── Applied ops ──

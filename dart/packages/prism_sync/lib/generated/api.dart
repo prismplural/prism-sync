@@ -376,6 +376,28 @@ Future<PlatformInt64> quarantinedBatchCount({
   required PrismSyncHandle handle,
 }) => RustLib.instance.api.crateApiQuarantinedBatchCount(handle: handle);
 
+/// Repair every push-quarantined batch by repartitioning its ops into
+/// smaller sub-batches that fit under the relay's 1 MB envelope cap.
+///
+/// Runs in one storage transaction so the entire recovery either commits or
+/// rolls back atomically — there is no observable half-repaired state.
+///
+/// Returns the number of `push_quarantine` rows successfully repaired
+/// (including orphan rows whose underlying `pending_ops` had already been
+/// pushed and deleted). A return value of `0` means there was nothing to
+/// repair (typical idempotent case).
+///
+/// The freshly repartitioned batches are NOT pushed by this call; the next
+/// sync cycle picks them up via the (unchanged) `get_unpushed_batch_ids`
+/// query, which now sees them because they are no longer in
+/// `push_quarantine`. Dart-side callers should follow a successful repair
+/// with an auto-sync trigger so the user observes the queue draining.
+///
+/// Errors with `"Not configured"` if the engine has not been configured.
+Future<PlatformInt64> repairQuarantinedBatches({
+  required PrismSyncHandle handle,
+}) => RustLib.instance.api.crateApiRepairQuarantinedBatches(handle: handle);
+
 /// Subscribe to sync events as a continuous stream.
 ///
 /// Returns a Dart `Stream<String>` that receives JSON-encoded sync events
