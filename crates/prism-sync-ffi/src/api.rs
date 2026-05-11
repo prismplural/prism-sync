@@ -732,6 +732,24 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "sync_id": sync_id,
             "reason": redact_sensitive_message(reason),
         }),
+        SyncEvent::QuarantinedBatch {
+            batch_id,
+            entity_table,
+            entity_id,
+            body_bytes,
+            error_code,
+            error_message,
+        } => serde_json::json!({
+            "type": "QuarantinedBatch",
+            "batch_id": batch_id,
+            "entity_table": entity_table,
+            "entity_id": entity_id,
+            // `body_bytes` is `usize` in Rust; JSON numbers are safe up to 2^53,
+            // and a push body never approaches that even pathologically.
+            "body_bytes": body_bytes,
+            "error_code": error_code,
+            "error_message": redact_sensitive_message(error_message),
+        }),
     }
 }
 
@@ -2208,6 +2226,80 @@ pub async fn status(handle: &PrismSyncHandle) -> Result<String, String> {
     let s = inner.status();
     let json = sync_status_to_json(&s);
     Ok(json.to_string())
+}
+
+/// List local push batches that were quarantined because their envelope
+/// exceeded the relay's 1 MB body cap.
+///
+/// Returns a JSON array of objects with shape:
+/// ```json
+/// [{
+///   "batch_id": "...",
+///   "entity_table": "...",
+///   "entity_id": "...",
+///   "body_bytes": 1234567,
+///   "error_code": "payload_too_large" | "payload_too_large_client_guard",
+///   "error_message": "...",
+///   "quarantined_at": "2026-05-10T12:00:00+00:00"
+/// }, ...]
+/// ```
+///
+/// Used by the sync troubleshooting screen to surface stuck batches before
+/// Phase 1C repair lands. Errors with `"Not configured"` if the engine has
+/// not been configured.
+pub async fn list_quarantined_batches(handle: &PrismSyncHandle) -> Result<String, String> {
+    let (storage, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let sync_id = inner
+            .sync_service()
+            .sync_id()
+            .ok_or_else(|| "Not configured".to_string())?
+            .to_string();
+        (inner.storage().clone(), sync_id)
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let list = storage.list_quarantined_batches(&sync_id).map_err(|e| e.to_string())?;
+        let json: Vec<serde_json::Value> = list
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "batch_id": row.batch_id,
+                    "entity_table": row.entity_table,
+                    "entity_id": row.entity_id,
+                    "body_bytes": row.body_bytes,
+                    "error_code": row.error_code,
+                    "error_message": row.error_message,
+                    "quarantined_at": row.quarantined_at,
+                })
+            })
+            .collect();
+        Ok::<_, String>(serde_json::Value::Array(json).to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Return the count of locally quarantined push batches (defense-in-depth
+/// failure path for the Phase 1B sync poison-pill fix).
+///
+/// Cheaper than `list_quarantined_batches` for callers that only want to
+/// know whether to render the repair banner. Returns 0 if the engine has
+/// not been configured.
+pub async fn quarantined_batch_count(handle: &PrismSyncHandle) -> Result<i64, String> {
+    let (storage, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let Some(sync_id) = inner.sync_service().sync_id() else {
+            return Ok(0);
+        };
+        (inner.storage().clone(), sync_id.to_string())
+    };
+
+    tokio::task::spawn_blocking(move || {
+        storage.quarantined_batch_count(&sync_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ── Events stream ──
@@ -5194,6 +5286,42 @@ mod tests {
         assert_eq!(json["type"], "BackoffScheduled");
         assert_eq!(json["attempt"], 3);
         assert_eq!(json["delay_secs"], 120);
+    }
+
+    #[test]
+    fn quarantined_batch_event_json_serializes_all_fields() {
+        let event = prism_sync_core::events::SyncEvent::QuarantinedBatch {
+            batch_id: "batch-abc".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "member-7".to_string(),
+            body_bytes: 1_337_000,
+            error_code: "payload_too_large".to_string(),
+            error_message: "relay returned 413".to_string(),
+        };
+        let json = sync_event_to_json(&event);
+        assert_eq!(json["type"], "QuarantinedBatch");
+        assert_eq!(json["batch_id"], "batch-abc");
+        assert_eq!(json["entity_table"], "members");
+        assert_eq!(json["entity_id"], "member-7");
+        assert_eq!(json["body_bytes"], 1_337_000);
+        assert_eq!(json["error_code"], "payload_too_large");
+        assert_eq!(json["error_message"], "relay returned 413");
+    }
+
+    #[test]
+    fn quarantined_batch_event_json_supports_client_guard_code() {
+        let event = prism_sync_core::events::SyncEvent::QuarantinedBatch {
+            batch_id: "batch-xyz".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "member-9".to_string(),
+            body_bytes: 1_400_000,
+            error_code: "payload_too_large_client_guard".to_string(),
+            error_message: "Envelope body 1400000 bytes exceeds client guard 1000000".to_string(),
+        };
+        let json = sync_event_to_json(&event);
+        assert_eq!(json["type"], "QuarantinedBatch");
+        assert_eq!(json["error_code"], "payload_too_large_client_guard");
+        assert!(json["error_message"].as_str().unwrap().contains("client guard"));
     }
 
     #[test]

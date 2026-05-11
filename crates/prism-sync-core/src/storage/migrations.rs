@@ -107,6 +107,25 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_quarantined_ops_sync_seq
         ON quarantined_ops(sync_id, server_seq, quarantined_at);
     ",
+    "-- V6: Push-side quarantine for batches whose envelope exceeds the relay cap.
+    -- Distinct from `quarantined_ops` (pull-side schema-unknown path): this is
+    -- local-only diagnostic state, never replayed and never included in
+    -- snapshots. Stores batch IDs + diagnostics only; the original ops live
+    -- in `pending_ops` and recovery (Phase 1C) repartitions them in place.
+    CREATE TABLE IF NOT EXISTS push_quarantine (
+        sync_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL PRIMARY KEY,
+        entity_table TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        body_bytes INTEGER NOT NULL,
+        error_code TEXT NOT NULL,
+        error_message TEXT NOT NULL,
+        quarantined_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS idx_push_quarantine_sync
+        ON push_quarantine(sync_id);
+    ",
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), String> {
@@ -166,6 +185,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(quarantine_table_count, 1);
+
+        let push_quarantine_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'push_quarantine'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(push_quarantine_table_count, 1);
     }
 
     #[test]

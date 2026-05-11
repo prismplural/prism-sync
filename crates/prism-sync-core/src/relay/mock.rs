@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Mutex;
 
@@ -54,6 +54,13 @@ struct MockRelayState {
     media: HashMap<String, Vec<u8>>,
     /// Signed registry artifact to return from get_signed_registry.
     signed_registry: Option<SignedRegistryResponse>,
+    /// Batch IDs that should fail with HTTP 413 `PayloadTooLarge` when
+    /// pushed. Used by Phase 1B push-quarantine tests to simulate relay
+    /// rejection of an oversized envelope without crafting a real
+    /// >1 MB body.
+    push_413_batch_ids: HashSet<String>,
+    /// Records each `push_changes` call's batch_id for test assertions.
+    push_call_batch_ids: Vec<String>,
 }
 
 /// How an injected `pull_changes` failure should present on the wire.
@@ -106,9 +113,26 @@ impl MockRelay {
                 ml_dsa_generations: HashMap::new(),
                 media: HashMap::new(),
                 signed_registry: None,
+                push_413_batch_ids: HashSet::new(),
+                push_call_batch_ids: Vec::new(),
             }),
             notification_tx,
         }
+    }
+
+    /// Cause the next `push_changes(batch_id)` to fail with HTTP 413
+    /// `PayloadTooLarge`. Other batches succeed normally.
+    pub fn fail_push_with_413(&self, batch_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.push_413_batch_ids.insert(batch_id.to_string());
+    }
+
+    /// Returns the list of batch IDs the relay was asked to push, in the
+    /// order they arrived. Includes batches that failed with 413 (the
+    /// engine still calls `push_changes` for them, just observes the error
+    /// afterwards).
+    pub fn push_call_batch_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().push_call_batch_ids.clone()
     }
 
     /// Inject a batch into the relay (simulates another device pushing).
@@ -272,6 +296,16 @@ impl SyncTransport for MockRelay {
 
     async fn push_changes(&self, batch: OutgoingBatch) -> Result<i64, RelayError> {
         let mut state = self.state.lock().unwrap();
+        state.push_call_batch_ids.push(batch.batch_id.clone());
+        if state.push_413_batch_ids.remove(&batch.batch_id) {
+            return Err(RelayError::Server {
+                status_code: 413,
+                message: format!(
+                    "mock injected payload-too-large for batch {}",
+                    batch.batch_id
+                ),
+            });
+        }
         let seq = state.next_server_seq;
         state.next_server_seq += 1;
         state.batches.push(StoredBatch {

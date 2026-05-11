@@ -53,7 +53,8 @@ pub use schema::{
 };
 pub use secure_store::SecureStore;
 pub use storage::{
-    AppliedOp, DeviceRecord, FieldVersion, PendingOp, SyncMetadata, SyncStorage, SyncStorageTx,
+    AppliedOp, DeviceRecord, FieldVersion, PendingOp, QuarantinedBatchInfo, SyncMetadata,
+    SyncStorage, SyncStorageTx,
 };
 pub use sync_service::{
     spawn_auto_sync_task, spawn_notification_handler, AutoSyncConfig, SyncService, SyncTrigger,

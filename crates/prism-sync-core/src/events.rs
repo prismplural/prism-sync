@@ -34,6 +34,22 @@ pub enum SyncEvent {
     /// Pair-time snapshot upload failed. Emitted by `SyncService` before the
     /// underlying `Err(..)` is returned to the caller.
     SnapshotUploadFailed { sync_id: String, reason: String },
+    /// A local push batch was quarantined because its envelope exceeded the
+    /// relay's 1 MB body cap (either rejected with HTTP 413 or caught by the
+    /// client-side guard before push). The batch remains in `pending_ops`
+    /// but is excluded from future push cycles until recovery
+    /// (Phase 1C) repartitions it. `body_bytes` is informational only.
+    QuarantinedBatch {
+        batch_id: String,
+        entity_table: String,
+        entity_id: String,
+        body_bytes: usize,
+        /// `"payload_too_large"` when the relay returned 413, or
+        /// `"payload_too_large_client_guard"` when the client-side guard
+        /// fired before push.
+        error_code: String,
+        error_message: String,
+    },
 }
 
 /// A single entity change with full field data, for consumer DB application.

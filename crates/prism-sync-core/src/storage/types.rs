@@ -77,6 +77,23 @@ pub struct QuarantinedOp {
     pub quarantined_at: DateTime<Utc>,
 }
 
+/// Diagnostic info about a local push batch that was quarantined because its
+/// serialized envelope exceeded the relay's 1 MB body cap.
+///
+/// Stored locally only — never replicated, never included in snapshots, never
+/// re-sent. The original ops remain in `pending_ops`; Phase 1C recovery
+/// repartitions them into smaller batches and clears the quarantine row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedBatchInfo {
+    pub batch_id: String,
+    pub entity_table: String,
+    pub entity_id: String,
+    pub body_bytes: i64,
+    pub error_code: String,
+    pub error_message: String,
+    pub quarantined_at: String,
+}
+
 /// Local device registry record for signature verification on pull.
 #[derive(Debug, Clone)]
 pub struct DeviceRecord {

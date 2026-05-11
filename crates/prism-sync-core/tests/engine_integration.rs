@@ -1856,3 +1856,208 @@ async fn push_honors_max_of_current_and_op_epoch() {
     assert_eq!(pulled.batches.len(), 1);
     assert_eq!(pulled.batches[0].envelope.epoch, 1, "envelope must be at max(current=0, op=1) = 1");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 1B: push-quarantine for oversized batches
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A 413 from the relay must quarantine the offending batch, keep its
+/// `pending_ops` rows intact, leave following batches eligible for push,
+/// and emit `SyncEvent::QuarantinedBatch`. The cycle as a whole must
+/// succeed — no terminal sync error toast.
+#[tokio::test]
+async fn push_quarantines_batch_on_relay_413_and_continues_other_batches() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-413-quarantine";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    // Two batches: the first will be rejected with 413, the second must still push.
+    let bad_op = make_op(device_id, "batch-bad", 0, "bad");
+    let good_op = make_op(device_id, "batch-good", 0, "good");
+    insert_pending_ops(&storage, std::slice::from_ref(&bad_op), "batch-bad");
+    insert_pending_ops(&storage, std::slice::from_ref(&good_op), "batch-good");
+
+    relay.fail_push_with_413("batch-bad");
+
+    let (event_tx, mut event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(32);
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    )
+    .with_event_sink(event_tx.clone());
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "cycle must not surface a terminal error: {:?}", result.error);
+    assert_eq!(result.pushed, 1, "only the non-quarantined batch should be marked pushed");
+
+    // Verify the relay saw push attempts for both batches.
+    let push_calls = relay.push_call_batch_ids();
+    assert!(push_calls.contains(&"batch-bad".to_string()));
+    assert!(push_calls.contains(&"batch-good".to_string()));
+
+    // Storage: bad batch quarantined, good batch deleted from pending_ops.
+    let quarantined = storage.list_quarantined_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1, "exactly one batch must be quarantined");
+    assert_eq!(quarantined[0].batch_id, "batch-bad");
+    assert_eq!(quarantined[0].entity_table, "tasks");
+    assert_eq!(quarantined[0].entity_id, bad_op.entity_id);
+    assert_eq!(quarantined[0].error_code, "payload_too_large");
+    assert!(
+        quarantined[0].error_message.contains("413")
+            || quarantined[0].error_message.to_lowercase().contains("payload"),
+        "error_message should reflect 413 path: {}",
+        quarantined[0].error_message
+    );
+    assert!(quarantined[0].body_bytes > 0, "body_bytes must be populated");
+
+    // The good batch's ops must be gone (push success deletes them).
+    let good_ops = storage.load_batch_ops("batch-good").unwrap();
+    assert!(good_ops.is_empty(), "good batch ops must be deleted after successful push");
+
+    // The bad batch's ops must remain so recovery can repartition them.
+    let bad_ops = storage.load_batch_ops("batch-bad").unwrap();
+    assert_eq!(bad_ops.len(), 1, "quarantined batch ops must be retained");
+
+    // get_unpushed_batch_ids must skip the quarantined batch on subsequent cycles.
+    let unpushed = storage.get_unpushed_batch_ids(SYNC_ID).unwrap();
+    assert!(
+        !unpushed.contains(&"batch-bad".to_string()),
+        "quarantined batch must be excluded from unpushed list"
+    );
+
+    // Drain events and assert QuarantinedBatch fired.
+    let mut saw_quarantine_event = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::QuarantinedBatch {
+            batch_id,
+            error_code,
+            ..
+        } = event
+        {
+            if batch_id == "batch-bad" && error_code == "payload_too_large" {
+                saw_quarantine_event = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_quarantine_event, "expected SyncEvent::QuarantinedBatch for batch-bad");
+}
+
+/// The client-side guard (body > 1_000_000 bytes) must quarantine the
+/// batch BEFORE contacting the relay. Used for defense in depth when the
+/// Phase 1A partitioner mis-estimates envelope size.
+#[tokio::test]
+async fn push_quarantines_batch_when_client_guard_trips() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-guard-quarantine";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    // Build a pending op whose JSON-encoded value alone exceeds the guard.
+    // The envelope wrapping easily pushes the whole body past 1_000_000.
+    // `encoded_value` is stored as a JSON-encoded string, so generate a
+    // ~1.4 MB JSON-safe payload (only ASCII letters — no escaping).
+    let huge_value = format!("\"{}\"", "X".repeat(1_400_000));
+    let hlc = Hlc::now(device_id, None);
+    let big_op = CrdtChange {
+        op_id: format!("tasks:huge:title:{hlc}:{device_id}"),
+        batch_id: Some("batch-huge".to_string()),
+        entity_id: "task-huge".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: huge_value,
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    insert_pending_ops(&storage, std::slice::from_ref(&big_op), "batch-huge");
+
+    let (event_tx, mut event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(32);
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    )
+    .with_event_sink(event_tx.clone());
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "cycle must not surface a terminal error: {:?}", result.error);
+    assert_eq!(result.pushed, 0, "guard-quarantined batch must not be marked pushed");
+
+    // Relay must NOT have seen this batch at all — guard fires before push.
+    let push_calls = relay.push_call_batch_ids();
+    assert!(
+        !push_calls.contains(&"batch-huge".to_string()),
+        "client guard must short-circuit the relay call (saw: {push_calls:?})"
+    );
+
+    let quarantined = storage.list_quarantined_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].batch_id, "batch-huge");
+    assert_eq!(quarantined[0].error_code, "payload_too_large_client_guard");
+    assert!(
+        quarantined[0].body_bytes > 1_000_000,
+        "body_bytes must record the measured envelope size, got {}",
+        quarantined[0].body_bytes
+    );
+
+    let mut saw_event = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::QuarantinedBatch {
+            batch_id,
+            error_code,
+            ..
+        } = event
+        {
+            if batch_id == "batch-huge" && error_code == "payload_too_large_client_guard" {
+                saw_event = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_event, "expected SyncEvent::QuarantinedBatch with client_guard code");
+}

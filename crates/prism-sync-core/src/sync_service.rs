@@ -505,7 +505,14 @@ impl SyncService {
     /// Configure the sync engine and sync group ID.
     ///
     /// Must be called before `sync_now` or `catch_up_if_stale`.
-    pub fn set_engine(&mut self, engine: SyncEngine, sync_id: String) {
+    ///
+    /// Wires the service's `event_tx` into the engine so that engine-emitted
+    /// events (e.g. `SyncEvent::QuarantinedBatch`) reach the same subscriber
+    /// stream as `SyncStarted` / `SyncCompleted`. Without this, quarantine
+    /// notifications would be silently dropped because the engine never has
+    /// a default sink.
+    pub fn set_engine(&mut self, mut engine: SyncEngine, sync_id: String) {
+        engine.set_event_sink(self.event_tx.clone());
         self.engine = Some(engine);
         self.sync_id = Some(sync_id);
     }

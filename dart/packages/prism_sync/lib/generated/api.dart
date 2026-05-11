@@ -344,6 +344,38 @@ Future<BigInt> bootstrapFromSnapshot({required PrismSyncHandle handle}) =>
 Future<String> status({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiStatus(handle: handle);
 
+/// List local push batches that were quarantined because their envelope
+/// exceeded the relay's 1 MB body cap.
+///
+/// Returns a JSON array of objects with shape:
+/// ```json
+/// [{
+///   "batch_id": "...",
+///   "entity_table": "...",
+///   "entity_id": "...",
+///   "body_bytes": 1234567,
+///   "error_code": "payload_too_large" | "payload_too_large_client_guard",
+///   "error_message": "...",
+///   "quarantined_at": "2026-05-10T12:00:00+00:00"
+/// }, ...]
+/// ```
+///
+/// Used by the sync troubleshooting screen to surface stuck batches before
+/// Phase 1C repair lands. Errors with `"Not configured"` if the engine has
+/// not been configured.
+Future<String> listQuarantinedBatches({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiListQuarantinedBatches(handle: handle);
+
+/// Return the count of locally quarantined push batches (defense-in-depth
+/// failure path for the Phase 1B sync poison-pill fix).
+///
+/// Cheaper than `list_quarantined_batches` for callers that only want to
+/// know whether to render the repair banner. Returns 0 if the engine has
+/// not been configured.
+Future<PlatformInt64> quarantinedBatchCount({
+  required PrismSyncHandle handle,
+}) => RustLib.instance.api.crateApiQuarantinedBatchCount(handle: handle);
+
 /// Subscribe to sync events as a continuous stream.
 ///
 /// Returns a Dart `Stream<String>` that receives JSON-encoded sync events

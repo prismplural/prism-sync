@@ -150,9 +150,17 @@ fn query_sync_metadata(conn: &Connection, sync_id: &str) -> Result<Option<SyncMe
 }
 
 fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<String>> {
+    // Exclude batches that are currently quarantined (their envelope exceeded
+    // the relay body cap on a previous push). The push loop in `engine/mod.rs`
+    // also has a defensive `continue` for any batch whose envelope measures
+    // over the client-side guard, but excluding them here keeps the cycle
+    // from even loading their op rows.
     let mut stmt = conn.prepare(
         "SELECT DISTINCT local_batch_id, MIN(created_at) AS first_created \
              FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NULL \
+               AND local_batch_id NOT IN ( \
+                   SELECT batch_id FROM push_quarantine WHERE sync_id = ?1 \
+               ) \
              GROUP BY local_batch_id ORDER BY first_created ASC",
     )?;
     let rows = stmt.query_map(params![sync_id], |row| row.get::<_, String>(0))?;
@@ -468,6 +476,71 @@ fn exec_delete_quarantined_op(conn: &Connection, sync_id: &str, op_id: &str) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn exec_quarantine_batch(
+    conn: &Connection,
+    sync_id: &str,
+    batch_id: &str,
+    entity_table: &str,
+    entity_id: &str,
+    body_bytes: i64,
+    error_code: &str,
+    error_message: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR REPLACE INTO push_quarantine \
+         (sync_id, batch_id, entity_table, entity_id, body_bytes, error_code, error_message, quarantined_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![sync_id, batch_id, entity_table, entity_id, body_bytes, error_code, error_message, now],
+    )?;
+    Ok(())
+}
+
+fn exec_unquarantine_batch(conn: &Connection, sync_id: &str, batch_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM push_quarantine WHERE sync_id = ?1 AND batch_id = ?2",
+        params![sync_id, batch_id],
+    )?;
+    Ok(())
+}
+
+fn query_list_quarantined_batches(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Vec<QuarantinedBatchInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT batch_id, entity_table, entity_id, body_bytes, error_code, error_message, quarantined_at \
+         FROM push_quarantine WHERE sync_id = ?1 \
+         ORDER BY quarantined_at ASC, batch_id ASC",
+    )?;
+    let rows = stmt.query_map(params![sync_id], |row| {
+        Ok(QuarantinedBatchInfo {
+            batch_id: row.get(0)?,
+            entity_table: row.get(1)?,
+            entity_id: row.get(2)?,
+            body_bytes: row.get(3)?,
+            error_code: row.get(4)?,
+            error_message: row.get(5)?,
+            quarantined_at: row.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+fn query_quarantined_batch_count(conn: &Connection, sync_id: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM push_quarantine WHERE sync_id = ?1",
+        params![sync_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 fn exec_upsert_device_record(conn: &Connection, device: &DeviceRecord) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO device_registry \
@@ -505,6 +578,7 @@ fn exec_clear_sync_state(conn: &Connection, sync_id: &str) -> Result<()> {
     conn.execute("DELETE FROM applied_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM field_versions WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM quarantined_ops WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM push_quarantine WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM device_registry WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM sync_metadata WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
@@ -961,6 +1035,16 @@ impl SyncStorage for RusqliteSyncStorage {
         query_quarantined_ops(&conn, sync_id)
     }
 
+    fn list_quarantined_batches(&self, sync_id: &str) -> Result<Vec<QuarantinedBatchInfo>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_list_quarantined_batches(&conn, sync_id)
+    }
+
+    fn quarantined_batch_count(&self, sync_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_quarantined_batch_count(&conn, sync_id)
+    }
+
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_device_record(&conn, sync_id, device_id)
@@ -1140,6 +1224,34 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn delete_quarantined_op(&mut self, sync_id: &str, op_id: &str) -> Result<()> {
         exec_delete_quarantined_op(&self.conn, sync_id, op_id)
+    }
+
+    // ── Quarantined local push batches ──
+
+    fn quarantine_batch(
+        &mut self,
+        sync_id: &str,
+        batch_id: &str,
+        entity_table: &str,
+        entity_id: &str,
+        body_bytes: i64,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        exec_quarantine_batch(
+            &self.conn,
+            sync_id,
+            batch_id,
+            entity_table,
+            entity_id,
+            body_bytes,
+            error_code,
+            error_message,
+        )
+    }
+
+    fn unquarantine_batch(&mut self, sync_id: &str, batch_id: &str) -> Result<()> {
+        exec_unquarantine_batch(&self.conn, sync_id, batch_id)
     }
 
     // ── Device registry ──
@@ -2260,6 +2372,188 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(storage.count_devices_in_group("sync-1").unwrap(), 2);
         assert_eq!(storage.count_devices_in_group("sync-other").unwrap(), 1);
+    }
+
+    // ── Push-quarantine tests (Phase 1B) ──
+
+    #[test]
+    fn quarantine_batch_round_trip_and_unquarantine() {
+        let storage = make_storage();
+
+        // List on empty storage returns empty + count 0.
+        assert!(storage.list_quarantined_batches("sync-1").unwrap().is_empty());
+        assert_eq!(storage.quarantined_batch_count("sync-1").unwrap(), 0);
+
+        // Quarantine one batch.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.quarantine_batch(
+            "sync-1",
+            "batch-too-big",
+            "members",
+            "member-1",
+            1_400_000,
+            "payload_too_large",
+            "relay returned 413",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_quarantined_batches("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].batch_id, "batch-too-big");
+        assert_eq!(rows[0].entity_table, "members");
+        assert_eq!(rows[0].entity_id, "member-1");
+        assert_eq!(rows[0].body_bytes, 1_400_000);
+        assert_eq!(rows[0].error_code, "payload_too_large");
+        assert_eq!(rows[0].error_message, "relay returned 413");
+        assert!(!rows[0].quarantined_at.is_empty(), "quarantined_at populated by impl");
+        assert_eq!(storage.quarantined_batch_count("sync-1").unwrap(), 1);
+
+        // Unquarantine deletes the row.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.unquarantine_batch("sync-1", "batch-too-big").unwrap();
+        tx.commit().unwrap();
+
+        assert!(storage.list_quarantined_batches("sync-1").unwrap().is_empty());
+        assert_eq!(storage.quarantined_batch_count("sync-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn quarantine_batch_is_scoped_by_sync_id() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.quarantine_batch(
+            "sync-1",
+            "batch-a",
+            "members",
+            "member-1",
+            1_200_000,
+            "payload_too_large",
+            "a",
+        )
+        .unwrap();
+        tx.quarantine_batch(
+            "sync-other",
+            "batch-b",
+            "members",
+            "member-2",
+            1_300_000,
+            "payload_too_large_client_guard",
+            "b",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(storage.quarantined_batch_count("sync-1").unwrap(), 1);
+        assert_eq!(storage.quarantined_batch_count("sync-other").unwrap(), 1);
+
+        let rows = storage.list_quarantined_batches("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].batch_id, "batch-a");
+    }
+
+    #[test]
+    fn get_unpushed_batch_ids_excludes_quarantined() {
+        let storage = make_storage();
+
+        // Insert two pending batches.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-good", "sync-1", "batch-good")).unwrap();
+        tx.insert_pending_op(&sample_pending_op("op-bad", "sync-1", "batch-bad")).unwrap();
+        tx.commit().unwrap();
+
+        // Before quarantine: both batches show up.
+        let ids = storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"batch-good".to_string()));
+        assert!(ids.contains(&"batch-bad".to_string()));
+
+        // Quarantine the bad one.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.quarantine_batch(
+            "sync-1",
+            "batch-bad",
+            "members",
+            "member-1",
+            1_400_000,
+            "payload_too_large",
+            "relay 413",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // After quarantine: only the good one shows up.
+        let ids = storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert_eq!(ids, vec!["batch-good".to_string()]);
+    }
+
+    #[test]
+    fn clear_sync_state_empties_push_quarantine() {
+        let storage = make_storage();
+
+        // Seed metadata + quarantine row.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+        tx.quarantine_batch(
+            "sync-1",
+            "batch-stuck",
+            "members",
+            "member-1",
+            1_400_000,
+            "payload_too_large",
+            "relay 413",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(storage.quarantined_batch_count("sync-1").unwrap(), 1);
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_sync_state("sync-1").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(storage.quarantined_batch_count("sync-1").unwrap(), 0);
+        assert!(storage.list_quarantined_batches("sync-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn export_snapshot_excludes_push_quarantine_rows() {
+        let storage = make_storage();
+        populate_for_snapshot(&storage);
+
+        // Add a push_quarantine row that must NOT bleed into the snapshot.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.quarantine_batch(
+            "sync-1",
+            "batch-secret",
+            "members",
+            "member-1",
+            1_400_000,
+            "payload_too_large",
+            "relay 413",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let blob = storage.export_snapshot("sync-1").unwrap();
+        let json = zstd::decode_all(blob.as_slice()).unwrap();
+
+        // Decoded JSON must not contain the quarantine batch_id or error_code.
+        let as_str = String::from_utf8_lossy(&json);
+        assert!(
+            !as_str.contains("batch-secret"),
+            "snapshot leaked push_quarantine batch_id: {as_str}"
+        );
+        assert!(
+            !as_str.contains("payload_too_large"),
+            "snapshot leaked push_quarantine error_code: {as_str}"
+        );
+
+        // SnapshotData must still deserialize and only contain the populate_for_snapshot fields.
+        let snapshot: SnapshotData = serde_json::from_slice(&json).unwrap();
+        assert_eq!(snapshot.field_versions.len(), 3);
+        assert_eq!(snapshot.applied_ops.len(), 2);
     }
 
     #[test]

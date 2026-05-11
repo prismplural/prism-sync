@@ -45,6 +45,27 @@ pub trait SyncStorage: Send + Sync {
         Ok(vec![])
     }
 
+    /// List local push batches that were quarantined because their envelope
+    /// exceeded the relay's body cap. Returns rows in `quarantined_at`
+    /// insertion order.
+    ///
+    /// Default: empty (no-op for in-memory impls).
+    fn list_quarantined_batches(
+        &self,
+        _sync_id: &str,
+    ) -> Result<Vec<QuarantinedBatchInfo>> {
+        Ok(vec![])
+    }
+
+    /// Return the count of push-quarantined batches for this sync group.
+    /// Cheap wrapper around `list_quarantined_batches` so callers can poll
+    /// for a UI banner without paying the row-construction cost.
+    ///
+    /// Default: 0 (no-op for in-memory impls).
+    fn quarantined_batch_count(&self, _sync_id: &str) -> Result<i64> {
+        Ok(0)
+    }
+
     /// Get a device record by sync_id and device_id.
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>>;
 
@@ -168,6 +189,34 @@ pub trait SyncStorageTx {
         Ok(())
     }
     fn delete_quarantined_op(&mut self, _sync_id: &str, _op_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    // ── Quarantined local push batches ──
+
+    /// Insert (or replace) a row recording that a local batch was quarantined
+    /// because its envelope exceeded the relay body cap. The impl sets
+    /// `quarantined_at` to `Utc::now().to_rfc3339()`.
+    ///
+    /// Default: no-op for in-memory impls.
+    #[allow(clippy::too_many_arguments)]
+    fn quarantine_batch(
+        &mut self,
+        _sync_id: &str,
+        _batch_id: &str,
+        _entity_table: &str,
+        _entity_id: &str,
+        _body_bytes: i64,
+        _error_code: &str,
+        _error_message: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove the quarantine row for a batch. Used by Phase 1C recovery
+    /// after the batch's ops are repartitioned into smaller sub-batches.
+    /// Default: no-op for in-memory impls.
+    fn unquarantine_batch(&mut self, _sync_id: &str, _batch_id: &str) -> Result<()> {
         Ok(())
     }
 

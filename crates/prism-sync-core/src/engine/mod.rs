@@ -8,13 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::batch_signature;
 use crate::crdt_change::CrdtChange;
 use crate::device_registry::DeviceRegistryManager;
 use crate::error::{CoreError, Result};
-use crate::events::EntityChange;
+use crate::events::{EntityChange, SyncEvent};
 use crate::hlc::Hlc;
 use crate::op_emitter::OpEmitter;
 use crate::pruning::TombstonePruner;
@@ -117,6 +117,21 @@ fn debug_assert_remote_op_matches_sender(op: &CrdtChange, trusted_sender_device_
 #[cfg(not(debug_assertions))]
 fn debug_assert_remote_op_matches_sender(_op: &CrdtChange, _trusted_sender_device_id: &str) {}
 
+/// Defensive client-side body cap for push envelopes.
+///
+/// The relay rejects envelopes larger than `MAX_CHANGESET_SIZE = 1 MiB`. We
+/// quarantine at `1_000_000` bytes — slightly under that — so the push path
+/// surfaces a clean local quarantine instead of round-tripping a 413 for the
+/// pathological cases that slip past Phase 1A's measured partitioner.
+const RELAY_BODY_GUARD_BYTES: usize = 1_000_000;
+
+/// Whether a `RelayError` corresponds to the relay's 413 `PayloadTooLarge`
+/// response. Used by `push_phase` to quarantine the offending batch and
+/// continue pushing the rest of the cycle.
+fn is_payload_too_large_error(err: &RelayError) -> bool {
+    matches!(err, RelayError::Server { status_code: 413, .. })
+}
+
 /// Result of the pull phase, bundling counts with relay-reported metadata.
 struct PullPhaseResult {
     pulled: u64,
@@ -148,6 +163,15 @@ pub struct SyncEngine {
     state_tx: watch::Sender<SyncState>,
     state_rx: watch::Receiver<SyncState>,
     merge_engine: MergeEngine,
+    /// Optional channel for surfacing engine-side events to consumers.
+    ///
+    /// `SyncService` calls `with_event_sink` after construction so that
+    /// `SyncEvent::QuarantinedBatch` (and any future engine-emitted variant)
+    /// can reach the same `event_tx` that the service uses for
+    /// `SyncStarted` / `SyncCompleted` / `RemoteChanges`. Tests that construct
+    /// a `SyncEngine` directly without wiring a sink still work — emissions
+    /// are silently dropped.
+    event_tx: Option<broadcast::Sender<SyncEvent>>,
 }
 
 impl SyncEngine {
@@ -161,7 +185,40 @@ impl SyncEngine {
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(SyncState::Idle);
         let merge_engine = MergeEngine::new(schema.clone());
-        Self { storage, relay, entities, schema, config, state_tx, state_rx, merge_engine }
+        Self {
+            storage,
+            relay,
+            entities,
+            schema,
+            config,
+            state_tx,
+            state_rx,
+            merge_engine,
+            event_tx: None,
+        }
+    }
+
+    /// Install an event sink so engine-side events (e.g.
+    /// `SyncEvent::QuarantinedBatch`) reach consumers. Called by
+    /// `SyncService::set_engine` so the service and the engine share one
+    /// broadcast channel; direct test consumers may skip this call.
+    pub fn with_event_sink(mut self, event_tx: broadcast::Sender<SyncEvent>) -> Self {
+        self.event_tx = Some(event_tx);
+        self
+    }
+
+    /// Replace the event sink in place. Mirror of `with_event_sink` for
+    /// callers that already hold a `&mut SyncEngine`.
+    pub fn set_event_sink(&mut self, event_tx: broadcast::Sender<SyncEvent>) {
+        self.event_tx = Some(event_tx);
+    }
+
+    fn emit_event(&self, event: SyncEvent) {
+        if let Some(tx) = &self.event_tx {
+            // We intentionally ignore send errors: a closed channel means no
+            // one is listening, and an emit failure must not abort sync.
+            let _ = tx.send(event);
+        }
     }
 
     /// Get the current sync state.
@@ -1298,6 +1355,12 @@ impl SyncEngine {
             // is missing (first push) or somehow behind the stored op epoch.
             let epoch = current_epoch_i32.max(ops[0].epoch);
 
+            // Cache entity_table / entity_id for diagnostic quarantine rows.
+            // Per Phase 1A's atomic emission, a single batch covers exactly
+            // one entity, so the first op is authoritative.
+            let entity_table = ops[0].entity_table.clone();
+            let entity_id = ops[0].entity_id.clone();
+
             // Convert PendingOps to CrdtChanges for encoding
             let changes: Vec<CrdtChange> = ops
                 .iter()
@@ -1359,28 +1422,135 @@ impl SyncEngine {
                 ciphertext,
             )?;
 
+            // Measure the serialized envelope and apply the client-side body
+            // guard before contacting the relay. Phase 1A's measured
+            // partitioner should keep us well under this cap, but we still
+            // check here so that any pathological case (oversized single
+            // field, future schema changes, broken estimator) lands in
+            // quarantine rather than 413-looping forever.
+            let envelope_json = serde_json::to_vec(&envelope).map_err(|e| {
+                CoreError::Engine(format!("failed to serialize envelope for size check: {e}"))
+            })?;
+            let body_bytes = envelope_json.len();
+
+            if body_bytes > RELAY_BODY_GUARD_BYTES {
+                tracing::warn!(
+                    batch_id = %batch_id,
+                    body_bytes,
+                    guard = RELAY_BODY_GUARD_BYTES,
+                    "engine: envelope exceeds client-side body guard — quarantining without push"
+                );
+                let error_message = format!(
+                    "Envelope body {body_bytes} bytes exceeds client guard {RELAY_BODY_GUARD_BYTES}"
+                );
+                self.quarantine_batch_record(
+                    sync_id,
+                    batch_id,
+                    &entity_table,
+                    &entity_id,
+                    body_bytes,
+                    "payload_too_large_client_guard",
+                    &error_message,
+                )
+                .await?;
+                self.emit_event(SyncEvent::QuarantinedBatch {
+                    batch_id: batch_id.clone(),
+                    entity_table: entity_table.clone(),
+                    entity_id: entity_id.clone(),
+                    body_bytes,
+                    error_code: "payload_too_large_client_guard".to_string(),
+                    error_message,
+                });
+                continue;
+            }
+
             // Push to relay
             let outgoing = OutgoingBatch { batch_id: batch_id.clone(), envelope };
-            self.relay.push_changes(outgoing).await.map_err(CoreError::from_relay)?;
+            match self.relay.push_changes(outgoing).await {
+                Ok(_) => {
+                    // Mark batch as pushed
+                    let storage = self.storage.clone();
+                    let bid = batch_id.clone();
+                    let sid = sync_id.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        let mut tx = storage.begin_tx()?;
+                        tx.mark_batch_pushed(&bid)?;
+                        tx.delete_pushed_ops(&sid, &bid)?;
+                        tx.commit()?;
+                        Ok::<_, CoreError>(())
+                    })
+                    .await
+                    .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
-            // Mark batch as pushed
-            let storage = self.storage.clone();
-            let bid = batch_id.clone();
-            let sid = sync_id.to_string();
-            tokio::task::spawn_blocking(move || {
-                let mut tx = storage.begin_tx()?;
-                tx.mark_batch_pushed(&bid)?;
-                tx.delete_pushed_ops(&sid, &bid)?;
-                tx.commit()?;
-                Ok::<_, CoreError>(())
-            })
-            .await
-            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
-
-            pushed_count += 1;
+                    pushed_count += 1;
+                }
+                Err(relay_err) if is_payload_too_large_error(&relay_err) => {
+                    tracing::warn!(
+                        batch_id = %batch_id,
+                        body_bytes,
+                        relay_error = %relay_err,
+                        "engine: relay returned 413 — quarantining batch and continuing"
+                    );
+                    let error_message = relay_err.to_string();
+                    self.quarantine_batch_record(
+                        sync_id,
+                        batch_id,
+                        &entity_table,
+                        &entity_id,
+                        body_bytes,
+                        "payload_too_large",
+                        &error_message,
+                    )
+                    .await?;
+                    self.emit_event(SyncEvent::QuarantinedBatch {
+                        batch_id: batch_id.clone(),
+                        entity_table: entity_table.clone(),
+                        entity_id: entity_id.clone(),
+                        body_bytes,
+                        error_code: "payload_too_large".to_string(),
+                        error_message,
+                    });
+                    continue;
+                }
+                Err(relay_err) => {
+                    return Err(CoreError::from_relay(relay_err));
+                }
+            }
         }
 
         Ok(pushed_count)
+    }
+
+    /// Persist a `push_quarantine` row for a batch that failed the body
+    /// guard or was rejected with 413. Shared by both branches so the SQL
+    /// and the tx lifecycle stay in one place.
+    async fn quarantine_batch_record(
+        &self,
+        sync_id: &str,
+        batch_id: &str,
+        entity_table: &str,
+        entity_id: &str,
+        body_bytes: usize,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let bid = batch_id.to_string();
+        let etable = entity_table.to_string();
+        let eid = entity_id.to_string();
+        let code = error_code.to_string();
+        let msg = error_message.to_string();
+        let body_i64 = body_bytes as i64;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut tx = storage.begin_tx()?;
+            tx.quarantine_batch(&sid, &bid, &etable, &eid, body_i64, &code, &msg)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        Ok(())
     }
 
     // ── Snapshot operations ──
