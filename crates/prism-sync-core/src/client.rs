@@ -35,8 +35,24 @@ use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::secure_store::SecureStore;
 use crate::storage::{StorageError, SyncStorage};
 use crate::sync_service::{AutoSyncConfig, SyncService};
+use crate::crdt_change::{estimate_envelope_body_size, CrdtChange};
 use crate::syncable_entity::SyncableEntity;
 use prism_sync_crypto::{mnemonic, DeviceSecret, KeyHierarchy};
+
+/// Wire-format size in bytes of a single Ed25519 + ML-DSA-65 hybrid signature
+/// as produced by `HybridSignature::to_bytes`: a 4-byte LE length, the
+/// 64-byte Ed25519 signature, another 4-byte LE length, then the 3309-byte
+/// ML-DSA-65 signature.
+pub(crate) const HYBRID_SIGNATURE_WIRE_BYTES: usize = 4 + 64 + 4 + 3309;
+
+/// Target serialized body size (in bytes) for a pushed batch envelope.
+///
+/// The relay's hard `MAX_CHANGESET_SIZE` is 1 MiB (1,048,576 bytes). 950 KB
+/// leaves ~100 KB of headroom for the unaccounted envelope variability the
+/// estimator does not model (oversized `sync_id`, longer-than-expected
+/// device ids, future schema additions) and still accommodates a banner-only
+/// batch (~925 KB body) as a single partition.
+pub(crate) const BATCH_BODY_TARGET_BYTES: usize = 950 * 1024;
 
 /// How encryption keys are managed.
 pub enum KeyMode {
@@ -943,8 +959,13 @@ impl PrismSync {
 
     /// Record a newly created entity for sync.
     ///
-    /// Each field in `fields` becomes a pending op. Returns an error if the
-    /// sync engine has not been configured via [`configure_engine`](Self::configure_engine).
+    /// Each field in `fields` becomes a pending op. Large entities (e.g.
+    /// members with avatars + banners) are partitioned across multiple
+    /// batches so each batch's serialized envelope stays under the relay's
+    /// 1 MB cap. All partitions commit in one storage transaction so a
+    /// partial failure does not leave a half-written entity in
+    /// `pending_ops` / `field_versions`. Returns an error if the sync engine
+    /// has not been configured via [`configure_engine`](Self::configure_engine).
     pub fn record_create(
         &mut self,
         table: &str,
@@ -955,12 +976,26 @@ impl PrismSync {
             return Err(CoreError::Engine("sync not configured".into()));
         }
         self.validate_mutation_fields(table, fields)?;
+        let (device_id, epoch) = {
+            let emitter = self
+                .op_emitter
+                .as_ref()
+                .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+            (emitter.last_hlc().node_id.clone(), emitter.epoch())
+        };
+        let partitions = Self::partition_fields_into_batches(
+            fields,
+            table,
+            entity_id,
+            &device_id,
+            epoch,
+        );
         let emitter = self
             .op_emitter
             .as_mut()
             .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-        let batch_id = uuid::Uuid::new_v4().to_string();
-        let result = emitter.emit_create(&*self.storage, table, entity_id, fields, &batch_id);
+        let result =
+            emitter.emit_create_multi(&*self.storage, table, entity_id, &partitions);
         if result.is_ok() {
             if let Some(tx) = self.sync_service.auto_sync_sender() {
                 let _ = tx.try_send(());
@@ -971,7 +1006,9 @@ impl PrismSync {
 
     /// Record changed fields on an existing entity for sync.
     ///
-    /// Only pass the fields that actually changed. Returns an error if the
+    /// Only pass the fields that actually changed. The change set is
+    /// partitioned across multiple size-bounded batches if needed (see
+    /// [`record_create`](Self::record_create)). Returns an error if the
     /// sync engine has not been configured.
     pub fn record_update(
         &mut self,
@@ -986,13 +1023,26 @@ impl PrismSync {
             return Ok(());
         }
         self.validate_mutation_fields(table, changed_fields)?;
+        let (device_id, epoch) = {
+            let emitter = self
+                .op_emitter
+                .as_ref()
+                .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+            (emitter.last_hlc().node_id.clone(), emitter.epoch())
+        };
+        let partitions = Self::partition_fields_into_batches(
+            changed_fields,
+            table,
+            entity_id,
+            &device_id,
+            epoch,
+        );
         let emitter = self
             .op_emitter
             .as_mut()
             .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-        let batch_id = uuid::Uuid::new_v4().to_string();
         let result =
-            emitter.emit_update(&*self.storage, table, entity_id, changed_fields, &batch_id);
+            emitter.emit_update_multi(&*self.storage, table, entity_id, &partitions);
         if result.is_ok() {
             if let Some(tx) = self.sync_service.auto_sync_sender() {
                 let _ = tx.try_send(());
@@ -1111,6 +1161,128 @@ impl PrismSync {
         }
 
         Ok(())
+    }
+
+    /// Split `fields` into one or more partitions whose serialized envelope
+    /// stays under `BATCH_BODY_TARGET_BYTES` (and therefore under the relay's
+    /// 1 MB cap).
+    ///
+    /// Each entry in the returned vector is `(field_map, batch_id)`. Empty
+    /// `fields` maps are skipped; an empty `fields` argument returns an empty
+    /// `Vec`.
+    ///
+    /// Algorithm: sort fields by encoded-value length descending, then pack
+    /// greedily (first-fit-decreasing). A field whose own measured envelope
+    /// already exceeds the target is placed alone in its bucket — the push
+    /// path will surface a more precise size error if it actually exceeds
+    /// the relay cap on the wire.
+    ///
+    /// **Important:** sizes are computed by serializing tentative
+    /// `CrdtChange` ops and asking `estimate_envelope_body_size`, NOT by
+    /// summing `encoded_value` lengths. Plaintext-only estimates ignore the
+    /// AEAD padding buckets and the base64/JSON envelope overhead and so
+    /// underestimate large batches.
+    fn partition_fields_into_batches(
+        fields: &HashMap<String, SyncValue>,
+        table: &str,
+        entity_id: &str,
+        device_id: &str,
+        epoch: i32,
+    ) -> Vec<(HashMap<String, SyncValue>, String)> {
+        if fields.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-encode every value once so we can use the same plaintext both
+        // for size estimation and for sorting. Sort descending by encoded
+        // length so the largest values are placed first — classic FFD.
+        let mut entries: Vec<(String, SyncValue, String)> = fields
+            .iter()
+            .map(|(name, value)| {
+                let encoded = crate::schema::encode_value(value);
+                (name.clone(), value.clone(), encoded)
+            })
+            .collect();
+        entries.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+
+        // Each bucket carries the partition's field map plus its tentative
+        // CrdtChange list (rebuilt as fields are added) for re-measuring.
+        struct Bucket {
+            fields: HashMap<String, SyncValue>,
+            // Tentative ops shaped the same way the push path will reshape
+            // them — values are the actual encoded JSON strings. The
+            // estimator uses these to compute exact plaintext length.
+            ops: Vec<CrdtChange>,
+            batch_id: String,
+        }
+
+        let make_bucket = || Bucket {
+            fields: HashMap::new(),
+            ops: Vec::new(),
+            batch_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        // Build a CrdtChange placeholder shaped like the ops the push path
+        // will encode. The HLC string uses a worst-case length so the
+        // plaintext-size estimate is an upper bound: 13-digit ms timestamp,
+        // 10-digit counter (max u32), and the device id verbatim — this
+        // never under-counts vs the real HLC the push path stamps later.
+        let placeholder_hlc =
+            format!("{:013}:{:010}:{}", u64::MAX % 10_000_000_000_000u64, u32::MAX, device_id);
+        let make_change =
+            |field_name: &str, encoded: &str, batch_id: &str, device: &str, ep: i32| CrdtChange {
+                op_id: uuid::Uuid::new_v4().to_string(),
+                batch_id: Some(batch_id.to_string()),
+                entity_id: entity_id.to_string(),
+                entity_table: table.to_string(),
+                field_name: field_name.to_string(),
+                encoded_value: encoded.to_string(),
+                client_hlc: placeholder_hlc.clone(),
+                is_delete: false,
+                device_id: device.to_string(),
+                epoch: ep,
+                server_seq: None,
+            };
+
+        let mut buckets: Vec<Bucket> = Vec::new();
+
+        for (name, value, encoded) in entries {
+            let mut placed = false;
+
+            for bucket in buckets.iter_mut() {
+                // Build the candidate op list for this bucket if we add the
+                // new field to it.
+                let mut candidate_ops = bucket.ops.clone();
+                candidate_ops.push(make_change(&name, &encoded, &bucket.batch_id, device_id, epoch));
+
+                let body =
+                    estimate_envelope_body_size(&candidate_ops, HYBRID_SIGNATURE_WIRE_BYTES);
+                if body <= BATCH_BODY_TARGET_BYTES {
+                    bucket.fields.insert(name.clone(), value.clone());
+                    bucket.ops = candidate_ops;
+                    placed = true;
+                    break;
+                }
+            }
+
+            if !placed {
+                // No existing bucket can fit this field. Start a fresh one.
+                // If this single field alone overshoots the target it still
+                // gets its own bucket — the push path's pre-flight guard
+                // (Phase 1B) will catch any batch that genuinely exceeds the
+                // 1 MB relay cap on the wire.
+                let mut bucket = make_bucket();
+                bucket.ops.push(make_change(&name, &encoded, &bucket.batch_id, device_id, epoch));
+                bucket.fields.insert(name, value);
+                buckets.push(bucket);
+            }
+        }
+
+        buckets
+            .into_iter()
+            .filter(|b| !b.fields.is_empty())
+            .map(|b| (b.fields, b.batch_id))
+            .collect()
     }
 
     // ── Epoch rotation ──
@@ -2868,5 +3040,188 @@ mod tests {
 
         assert!(sync.storage().get_sync_metadata("sync-other").unwrap().is_some());
         assert!(!sync.storage().list_device_records("sync-other").unwrap().is_empty());
+    }
+
+    // ── partition_fields_into_batches ──
+
+    /// Build a `SyncValue::String` whose `encode_value` form roughly matches a
+    /// real base64-encoded image blob of `raw_bytes` raw bytes. (Encoded form
+    /// adds JSON quotes; the test only relies on relative magnitudes so this
+    /// approximation is fine.)
+    fn image_value(raw_bytes: usize) -> SyncValue {
+        // Real avatars/banners are base64-encoded by Dart before crossing
+        // FFI, so the value is a ~4/3 expansion of the raw image. Build a
+        // string of approximately the same size for the test.
+        let expanded = (raw_bytes * 4).div_ceil(3);
+        SyncValue::String("A".repeat(expanded))
+    }
+
+    #[test]
+    fn partition_small_entity_returns_one_bucket() {
+        let mut fields: HashMap<String, SyncValue> = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        fields.insert("pronouns".to_string(), SyncValue::String("she/her".to_string()));
+        fields.insert("is_active".to_string(), SyncValue::Bool(true));
+
+        let buckets = PrismSync::partition_fields_into_batches(
+            &fields,
+            "members",
+            "ent-small",
+            "a1b2c3d4e5f6",
+            0,
+        );
+
+        assert_eq!(buckets.len(), 1);
+        // All fields landed in the single bucket.
+        let (only, batch_id) = &buckets[0];
+        assert_eq!(only.len(), 3);
+        for key in ["name", "pronouns", "is_active"] {
+            assert!(only.contains_key(key), "missing {key}");
+        }
+        // Batch ID is a valid UUID.
+        uuid::Uuid::parse_str(batch_id).expect("batch_id should be a UUID");
+    }
+
+    #[test]
+    fn partition_empty_fields_returns_empty_vec() {
+        let fields: HashMap<String, SyncValue> = HashMap::new();
+        let buckets = PrismSync::partition_fields_into_batches(
+            &fields,
+            "members",
+            "ent-empty",
+            "device-empty",
+            0,
+        );
+        assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn partition_avatar_plus_banner_splits_into_multiple_buckets_each_under_target() {
+        // Real-world worst case: avatar (256 KB raw) + banner (512 KB raw).
+        // Combined plaintext exceeds 1 MB → must be split.
+        let mut fields: HashMap<String, SyncValue> = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Big System".to_string()));
+        fields.insert("avatar".to_string(), image_value(256 * 1024));
+        fields.insert("banner".to_string(), image_value(512 * 1024));
+
+        let buckets = PrismSync::partition_fields_into_batches(
+            &fields,
+            "members",
+            "ent-big",
+            "a1b2c3d4e5f6",
+            0,
+        );
+
+        assert!(
+            buckets.len() >= 2,
+            "avatar+banner should split into 2 or more buckets, got {}",
+            buckets.len()
+        );
+
+        // Every produced bucket must measure under the target on its own.
+        // Use the same placeholder HLC the partitioner uses so this is a
+        // faithful re-measure of what the partitioner saw.
+        let placeholder_hlc = format!(
+            "{:013}:{:010}:{}",
+            u64::MAX % 10_000_000_000_000u64,
+            u32::MAX,
+            "a1b2c3d4e5f6"
+        );
+        for (i, (bucket_fields, batch_id)) in buckets.iter().enumerate() {
+            let ops: Vec<CrdtChange> = bucket_fields
+                .iter()
+                .map(|(name, value)| CrdtChange {
+                    op_id: uuid::Uuid::new_v4().to_string(),
+                    batch_id: Some(batch_id.clone()),
+                    entity_id: "ent-big".to_string(),
+                    entity_table: "members".to_string(),
+                    field_name: name.clone(),
+                    encoded_value: crate::schema::encode_value(value),
+                    client_hlc: placeholder_hlc.clone(),
+                    is_delete: false,
+                    device_id: "a1b2c3d4e5f6".to_string(),
+                    epoch: 0,
+                    server_seq: None,
+                })
+                .collect();
+            let body = estimate_envelope_body_size(&ops, HYBRID_SIGNATURE_WIRE_BYTES);
+            assert!(
+                body <= BATCH_BODY_TARGET_BYTES,
+                "bucket {i} measured {body} > target {BATCH_BODY_TARGET_BYTES}",
+            );
+        }
+
+        // The combined field set is preserved across all buckets — no field
+        // is dropped or duplicated.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (bucket_fields, _) in &buckets {
+            for key in bucket_fields.keys() {
+                assert!(seen.insert(key), "field {key} appears in more than one bucket");
+            }
+        }
+        assert_eq!(seen.len(), 3);
+        for key in ["name", "avatar", "banner"] {
+            assert!(seen.contains(key), "missing field {key} after partitioning");
+        }
+    }
+
+    #[test]
+    fn partition_single_oversized_field_gets_its_own_bucket() {
+        // One field whose encoded value alone overflows the target. Greedy
+        // packing places it in its own bucket; downstream guards decide
+        // whether it actually fits on the wire.
+        let mut fields: HashMap<String, SyncValue> = HashMap::new();
+        // 950 KB raw -> ~1.25 MB JSON-encoded -> single-field envelope
+        // estimate is well over BATCH_BODY_TARGET_BYTES.
+        fields.insert("banner".to_string(), image_value(950 * 1024));
+        fields.insert("name".to_string(), SyncValue::String("Megabig".to_string()));
+
+        let buckets = PrismSync::partition_fields_into_batches(
+            &fields,
+            "members",
+            "ent-mega",
+            "a1b2c3d4e5f6",
+            0,
+        );
+
+        // The oversized field must be alone in one bucket; the small field
+        // gets its own bucket too (cannot be packed alongside oversize).
+        assert!(
+            buckets.len() >= 2,
+            "expected 2 buckets (oversized alone + remainder), got {}",
+            buckets.len(),
+        );
+
+        // The banner bucket has exactly one field.
+        let banner_bucket = buckets
+            .iter()
+            .find(|(b, _)| b.contains_key("banner"))
+            .expect("banner bucket present");
+        assert_eq!(banner_bucket.0.len(), 1, "banner must be in a bucket alone");
+        assert!(banner_bucket.0.contains_key("banner"));
+    }
+
+    #[test]
+    fn partition_emits_unique_batch_ids_per_bucket() {
+        let mut fields: HashMap<String, SyncValue> = HashMap::new();
+        fields.insert("avatar".to_string(), image_value(256 * 1024));
+        fields.insert("banner".to_string(), image_value(512 * 1024));
+
+        let buckets = PrismSync::partition_fields_into_batches(
+            &fields,
+            "members",
+            "ent-uuid",
+            "deviceXYZ",
+            3,
+        );
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, batch_id) in &buckets {
+            assert!(
+                seen.insert(batch_id.clone()),
+                "duplicate batch_id detected: {batch_id}"
+            );
+            uuid::Uuid::parse_str(batch_id).expect("batch_id should be a UUID");
+        }
     }
 }

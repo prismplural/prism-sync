@@ -58,6 +58,11 @@ impl OpEmitter {
         &self.last_hlc
     }
 
+    /// The epoch currently stamped on emitted ops.
+    pub fn epoch(&self) -> i32 {
+        self.epoch
+    }
+
     /// Update the epoch used for new ops.
     pub fn set_epoch(&mut self, new_epoch: i32) {
         self.epoch = new_epoch;
@@ -160,6 +165,171 @@ impl OpEmitter {
             field_count = fields.len(),
             batch_id = local_batch_id,
             "Queued create ops"
+        );
+
+        Ok(())
+    }
+
+    /// Emit ops for a newly created entity, split across several batches.
+    ///
+    /// Each `(fields, batch_id)` partition becomes one logical batch of
+    /// pending ops. The partitioner in `client.rs` builds the partition list
+    /// to keep each batch's serialized envelope under the relay's 1 MB body
+    /// cap. All partitions share **one** `storage.begin_tx()` transaction so
+    /// the entire emission is atomic — a failure midway rolls back every
+    /// partition, leaving no half-created entity in `pending_ops` /
+    /// `field_versions`.
+    ///
+    /// HLC monotonicity: one `tick()` per partition. Partitions are emitted
+    /// in the supplied order so the HLC values are deterministic; receivers
+    /// merge by per-field LWW so per-partition HLCs do not need to be the
+    /// same.
+    ///
+    /// Empty `fields` maps are skipped. If every partition is empty the call
+    /// is a no-op (no transaction is opened).
+    pub fn emit_create_multi(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        partitions: &[(HashMap<String, SyncValue>, String)],
+    ) -> Result<()> {
+        self.emit_multi(storage, entity_table, entity_id, partitions, "create")
+    }
+
+    /// Emit ops for changed fields on an existing entity, split across
+    /// several batches.
+    ///
+    /// See [`emit_create_multi`](Self::emit_create_multi) for the atomicity
+    /// and HLC semantics. The same contract applies: every supplied
+    /// partition commits together or none of them do.
+    pub fn emit_update_multi(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        partitions: &[(HashMap<String, SyncValue>, String)],
+    ) -> Result<()> {
+        self.emit_multi(storage, entity_table, entity_id, partitions, "update")
+    }
+
+    /// Shared implementation for `emit_create_multi` and `emit_update_multi`.
+    /// `kind` is used only for trace logging — the on-wire op shape is the
+    /// same in both directions.
+    fn emit_multi(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        partitions: &[(HashMap<String, SyncValue>, String)],
+        kind: &'static str,
+    ) -> Result<()> {
+        // Skip partitions with no fields up front so we never open a tx for
+        // an entirely empty emission.
+        let non_empty: Vec<(&HashMap<String, SyncValue>, &str)> = partitions
+            .iter()
+            .filter(|(fields, _)| !fields.is_empty())
+            .map(|(fields, batch_id)| (fields, batch_id.as_str()))
+            .collect();
+        if non_empty.is_empty() {
+            return Ok(());
+        }
+
+        // Tick once per partition up front so a tick failure (HLC counter
+        // overflow) is observed before we touch storage. `tick()` mutates
+        // `self.last_hlc`, which we restore on rollback below.
+        let saved_last_hlc = self.last_hlc.clone();
+        let mut partition_hlcs: Vec<Hlc> = Vec::with_capacity(non_empty.len());
+        for _ in 0..non_empty.len() {
+            match self.tick() {
+                Ok(hlc) => partition_hlcs.push(hlc),
+                Err(e) => {
+                    // Pre-storage failure: nothing was written. Restore the
+                    // HLC watermark so the next emit attempts a clean tick.
+                    self.last_hlc = saved_last_hlc;
+                    return Err(e);
+                }
+            }
+        }
+
+        let now = Utc::now();
+        let mut tx = match storage.begin_tx() {
+            Ok(tx) => tx,
+            Err(e) => {
+                // begin_tx failed after we already advanced the HLC. Restore
+                // the watermark so the next call doesn't observe a phantom
+                // advance.
+                self.last_hlc = saved_last_hlc;
+                return Err(e);
+            }
+        };
+
+        // Track the total field count across partitions for the trace log.
+        let mut total_field_count = 0usize;
+
+        for ((fields, batch_id), hlc) in non_empty.iter().zip(partition_hlcs.iter()) {
+            let hlc_string = hlc.to_string();
+
+            for (field_name, value) in *fields {
+                let op_id = Uuid::new_v4().to_string();
+                let encoded = encode_value(value);
+
+                if let Err(e) = tx.insert_pending_op(&PendingOp {
+                    op_id: op_id.clone(),
+                    sync_id: self.sync_id.clone(),
+                    epoch: self.epoch,
+                    device_id: self.device_id.clone(),
+                    local_batch_id: (*batch_id).to_string(),
+                    entity_table: entity_table.to_string(),
+                    entity_id: entity_id.to_string(),
+                    field_name: field_name.clone(),
+                    encoded_value: encoded.clone(),
+                    is_delete: false,
+                    client_hlc: hlc_string.clone(),
+                    created_at: now,
+                    pushed_at: None,
+                }) {
+                    let _ = tx.rollback();
+                    self.last_hlc = saved_last_hlc;
+                    return Err(e);
+                }
+
+                if let Err(e) = tx.upsert_field_version(&FieldVersion {
+                    sync_id: self.sync_id.clone(),
+                    entity_table: entity_table.to_string(),
+                    entity_id: entity_id.to_string(),
+                    field_name: field_name.clone(),
+                    winning_op_id: op_id,
+                    winning_device_id: self.device_id.clone(),
+                    winning_hlc: hlc_string.clone(),
+                    winning_encoded_value: Some(encoded),
+                    updated_at: now,
+                }) {
+                    let _ = tx.rollback();
+                    self.last_hlc = saved_last_hlc;
+                    return Err(e);
+                }
+
+                total_field_count += 1;
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            // commit() consumes `tx`, so we cannot call rollback() here;
+            // SQLite will already have rolled back its open transaction on
+            // commit failure. Restore the HLC watermark so the next caller
+            // doesn't observe a phantom advance.
+            self.last_hlc = saved_last_hlc;
+            return Err(e);
+        }
+
+        tracing::debug!(
+            table = entity_table,
+            entity_id = entity_id,
+            partition_count = non_empty.len(),
+            field_count = total_field_count,
+            kind = kind,
+            "Queued multi-batch ops"
         );
 
         Ok(())
@@ -759,6 +929,461 @@ mod tests {
                 "note" => assert_eq!(op.encoded_value, "null"),
                 other => panic!("Unexpected field: {other}"),
             }
+        }
+    }
+
+    // ── Multi-batch atomic emission tests ──
+
+    #[test]
+    fn emit_create_multi_writes_all_partitions_in_one_transaction() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        let mut p1 = HashMap::new();
+        p1.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        p1.insert("pronouns".to_string(), SyncValue::String("she/her".to_string()));
+        let mut p2 = HashMap::new();
+        p2.insert("avatar".to_string(), SyncValue::String("avatar-bytes".to_string()));
+        let mut p3 = HashMap::new();
+        p3.insert("banner".to_string(), SyncValue::String("banner-bytes".to_string()));
+
+        let partitions = vec![
+            (p1, "batch-1".to_string()),
+            (p2, "batch-2".to_string()),
+            (p3, "batch-3".to_string()),
+        ];
+
+        emitter
+            .emit_create_multi(&storage, "members", "ent-multi", &partitions)
+            .expect("emit_create_multi should succeed");
+
+        // Each partition produced its own batch with the right field count.
+        let b1 = storage.load_batch_ops("batch-1").unwrap();
+        let b2 = storage.load_batch_ops("batch-2").unwrap();
+        let b3 = storage.load_batch_ops("batch-3").unwrap();
+        assert_eq!(b1.len(), 2);
+        assert_eq!(b2.len(), 1);
+        assert_eq!(b3.len(), 1);
+
+        // All ops share the same entity/sync metadata.
+        for op in b1.iter().chain(b2.iter()).chain(b3.iter()) {
+            assert_eq!(op.entity_table, "members");
+            assert_eq!(op.entity_id, "ent-multi");
+            assert_eq!(op.sync_id, "sync-1");
+            assert!(!op.is_delete);
+        }
+
+        // Within a single partition, the HLC is shared.
+        let p1_hlc = &b1[0].client_hlc;
+        for op in &b1 {
+            assert_eq!(&op.client_hlc, p1_hlc);
+        }
+        // Across partitions, HLCs differ (one tick per partition).
+        let p2_hlc = &b2[0].client_hlc;
+        let p3_hlc = &b3[0].client_hlc;
+        assert_ne!(p1_hlc, p2_hlc);
+        assert_ne!(p2_hlc, p3_hlc);
+        assert_ne!(p1_hlc, p3_hlc);
+
+        // field_versions exist for every field across partitions.
+        for field in ["name", "pronouns", "avatar", "banner"] {
+            let fv = storage
+                .get_field_version("sync-1", "members", "ent-multi", field)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing field_version for {field}"));
+            assert_eq!(fv.winning_device_id, "a1b2c3d4e5f6");
+            assert!(fv.winning_encoded_value.is_some());
+        }
+
+        // All three batches show up in the unpushed set.
+        let mut batch_ids = storage.get_unpushed_batch_ids("sync-1").unwrap();
+        batch_ids.sort();
+        assert_eq!(batch_ids, vec!["batch-1", "batch-2", "batch-3"]);
+    }
+
+    #[test]
+    fn emit_update_multi_writes_all_partitions_in_one_transaction() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        // Seed an initial create so the update has something to override.
+        let mut create = HashMap::new();
+        create.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        create.insert("avatar".to_string(), SyncValue::String("avatar-v1".to_string()));
+        emitter
+            .emit_create(&storage, "members", "ent-u", &create, "create-batch")
+            .expect("seed create");
+
+        let mut p1 = HashMap::new();
+        p1.insert("name".to_string(), SyncValue::String("Alice v2".to_string()));
+        let mut p2 = HashMap::new();
+        p2.insert("avatar".to_string(), SyncValue::String("avatar-v2".to_string()));
+
+        let partitions =
+            vec![(p1, "update-1".to_string()), (p2, "update-2".to_string())];
+
+        emitter
+            .emit_update_multi(&storage, "members", "ent-u", &partitions)
+            .expect("emit_update_multi should succeed");
+
+        let u1 = storage.load_batch_ops("update-1").unwrap();
+        let u2 = storage.load_batch_ops("update-2").unwrap();
+        assert_eq!(u1.len(), 1);
+        assert_eq!(u2.len(), 1);
+        assert_eq!(u1[0].field_name, "name");
+        assert_eq!(u1[0].encoded_value, "\"Alice v2\"");
+        assert_eq!(u2[0].field_name, "avatar");
+
+        // field_versions reflect the new winners
+        let fv_name =
+            storage.get_field_version("sync-1", "members", "ent-u", "name").unwrap().unwrap();
+        assert_eq!(fv_name.winning_encoded_value, Some("\"Alice v2\"".to_string()));
+        let fv_avatar =
+            storage.get_field_version("sync-1", "members", "ent-u", "avatar").unwrap().unwrap();
+        assert_eq!(fv_avatar.winning_encoded_value, Some("\"avatar-v2\"".to_string()));
+    }
+
+    #[test]
+    fn emit_create_multi_empty_partition_list_is_noop() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        let hlc_before = emitter.last_hlc().clone();
+
+        emitter
+            .emit_create_multi(&storage, "members", "ent-noop", &[])
+            .expect("empty partitions ok");
+
+        let batches = storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert!(batches.is_empty());
+        assert_eq!(*emitter.last_hlc(), hlc_before);
+    }
+
+    #[test]
+    fn emit_create_multi_skips_empty_partitions_in_list() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        let mut p1 = HashMap::new();
+        p1.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        let p_empty: HashMap<String, SyncValue> = HashMap::new();
+
+        let partitions = vec![
+            (p_empty.clone(), "empty-1".to_string()),
+            (p1, "real".to_string()),
+            (p_empty, "empty-2".to_string()),
+        ];
+
+        emitter
+            .emit_create_multi(&storage, "members", "ent-mixed", &partitions)
+            .expect("mixed partitions ok");
+
+        // Only the non-empty partition produced rows.
+        let real = storage.load_batch_ops("real").unwrap();
+        let empty_1 = storage.load_batch_ops("empty-1").unwrap();
+        let empty_2 = storage.load_batch_ops("empty-2").unwrap();
+        assert_eq!(real.len(), 1);
+        assert!(empty_1.is_empty());
+        assert!(empty_2.is_empty());
+    }
+
+    #[test]
+    fn emit_create_multi_all_ops_in_partition_share_hlc_and_batch_id() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        let mut p1 = HashMap::new();
+        for n in 0..4 {
+            p1.insert(format!("f{n}"), SyncValue::String(format!("v{n}")));
+        }
+        let mut p2 = HashMap::new();
+        for n in 0..3 {
+            p2.insert(format!("g{n}"), SyncValue::String(format!("w{n}")));
+        }
+
+        let partitions = vec![(p1, "p-1".to_string()), (p2, "p-2".to_string())];
+
+        emitter
+            .emit_create_multi(&storage, "members", "ent-share", &partitions)
+            .expect("multi ok");
+
+        let ops_p1 = storage.load_batch_ops("p-1").unwrap();
+        let ops_p2 = storage.load_batch_ops("p-2").unwrap();
+        assert_eq!(ops_p1.len(), 4);
+        assert_eq!(ops_p2.len(), 3);
+
+        let hlc_p1 = &ops_p1[0].client_hlc;
+        for op in &ops_p1 {
+            assert_eq!(op.local_batch_id, "p-1");
+            assert_eq!(&op.client_hlc, hlc_p1);
+        }
+        let hlc_p2 = &ops_p2[0].client_hlc;
+        for op in &ops_p2 {
+            assert_eq!(op.local_batch_id, "p-2");
+            assert_eq!(&op.client_hlc, hlc_p2);
+        }
+        assert_ne!(hlc_p1, hlc_p2);
+
+        // Every op_id is unique across the whole emission.
+        let mut ids: Vec<_> = ops_p1.iter().chain(ops_p2.iter()).map(|op| op.op_id.clone()).collect();
+        ids.sort();
+        let unique_count = ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, ids.len(), "op_ids must be unique");
+    }
+
+    #[test]
+    fn emit_create_multi_rolls_back_entire_emission_on_storage_failure() {
+        // Seed a real storage so we can verify state after the failed emit.
+        let real_storage = make_storage();
+        // Wrap it in a FailingStorage that errors on the Nth pending_op insert.
+        let failing = FailingStorage::new(real_storage);
+        // Fail mid-way through the second partition. Partition 1 has 2 ops,
+        // partition 2 has 3 ops; failing on the 3rd op (1-indexed) means one
+        // op of partition 2 has already been inserted before the failure.
+        failing.fail_on_pending_op_insert_at(3);
+
+        let mut emitter = make_emitter();
+
+        let mut p1 = HashMap::new();
+        p1.insert("a".to_string(), SyncValue::String("aa".to_string()));
+        p1.insert("b".to_string(), SyncValue::String("bb".to_string()));
+        let mut p2 = HashMap::new();
+        p2.insert("c".to_string(), SyncValue::String("cc".to_string()));
+        p2.insert("d".to_string(), SyncValue::String("dd".to_string()));
+        p2.insert("e".to_string(), SyncValue::String("ee".to_string()));
+
+        let partitions = vec![(p1, "roll-1".to_string()), (p2, "roll-2".to_string())];
+
+        let hlc_before = emitter.last_hlc().clone();
+        let err = emitter
+            .emit_create_multi(&failing, "members", "ent-roll", &partitions)
+            .expect_err("emit_create_multi must propagate the storage error");
+        assert!(
+            err.to_string().contains("FailingStorage induced error"),
+            "unexpected error: {err}"
+        );
+
+        // No pending_ops persisted for either batch.
+        let b1 = failing.inner().load_batch_ops("roll-1").unwrap();
+        let b2 = failing.inner().load_batch_ops("roll-2").unwrap();
+        assert!(b1.is_empty(), "partition 1 should have rolled back, found: {b1:?}");
+        assert!(b2.is_empty(), "partition 2 should have rolled back, found: {b2:?}");
+
+        // No field_versions persisted.
+        for field in ["a", "b", "c", "d", "e"] {
+            let fv = failing
+                .inner()
+                .get_field_version("sync-1", "members", "ent-roll", field)
+                .unwrap();
+            assert!(fv.is_none(), "field_version for {field} should have rolled back");
+        }
+
+        // No unpushed batch IDs for this sync group.
+        let batches = failing.inner().get_unpushed_batch_ids("sync-1").unwrap();
+        assert!(batches.is_empty(), "unpushed_batch_ids should be empty, found: {batches:?}");
+
+        // HLC watermark restored — no phantom advance.
+        assert_eq!(*emitter.last_hlc(), hlc_before, "HLC watermark must be restored on failure");
+    }
+
+    // ── Test-only storage that injects a failure mid-emission ──
+
+    /// A `SyncStorage` wrapper that delegates to an inner store, but causes
+    /// the next `Box<dyn SyncStorageTx>` it hands out to return an error from
+    /// `insert_pending_op` on the configured call ordinal (1-indexed). The
+    /// inner SQLite tx will then be rolled back implicitly when the dropped
+    /// `RusqliteTx` releases its connection without committing.
+    struct FailingStorage {
+        inner: std::sync::Arc<RusqliteSyncStorage>,
+        fail_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FailingStorage {
+        fn new(inner: RusqliteSyncStorage) -> Self {
+            Self {
+                inner: std::sync::Arc::new(inner),
+                fail_at: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn fail_on_pending_op_insert_at(&self, ordinal: usize) {
+            self.fail_at.store(ordinal, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn inner(&self) -> &RusqliteSyncStorage {
+            &self.inner
+        }
+    }
+
+    impl SyncStorage for FailingStorage {
+        fn begin_tx(&self) -> Result<Box<dyn crate::storage::SyncStorageTx + '_>> {
+            let inner_tx = self.inner.begin_tx()?;
+            Ok(Box::new(FailingTx {
+                inner: inner_tx,
+                fail_at: self.fail_at.clone(),
+                seen: self.seen.clone(),
+            }))
+        }
+
+        fn get_sync_metadata(
+            &self,
+            sync_id: &str,
+        ) -> Result<Option<crate::storage::SyncMetadata>> {
+            self.inner.get_sync_metadata(sync_id)
+        }
+
+        fn get_unpushed_batch_ids(&self, sync_id: &str) -> Result<Vec<String>> {
+            self.inner.get_unpushed_batch_ids(sync_id)
+        }
+
+        fn load_batch_ops(&self, batch_id: &str) -> Result<Vec<PendingOp>> {
+            self.inner.load_batch_ops(batch_id)
+        }
+
+        fn is_op_applied(&self, op_id: &str) -> Result<bool> {
+            self.inner.is_op_applied(op_id)
+        }
+
+        fn get_field_version(
+            &self,
+            sync_id: &str,
+            table: &str,
+            entity_id: &str,
+            field: &str,
+        ) -> Result<Option<FieldVersion>> {
+            self.inner.get_field_version(sync_id, table, entity_id, field)
+        }
+
+        fn get_device_record(
+            &self,
+            sync_id: &str,
+            device_id: &str,
+        ) -> Result<Option<crate::storage::DeviceRecord>> {
+            self.inner.get_device_record(sync_id, device_id)
+        }
+
+        fn list_device_records(
+            &self,
+            sync_id: &str,
+        ) -> Result<Vec<crate::storage::DeviceRecord>> {
+            self.inner.list_device_records(sync_id)
+        }
+
+        fn export_snapshot(&self, sync_id: &str) -> Result<Vec<u8>> {
+            self.inner.export_snapshot(sync_id)
+        }
+
+        fn rekey(&self, new_key: &[u8; 32]) -> Result<()> {
+            self.inner.rekey(new_key)
+        }
+    }
+
+    /// Transactional wrapper that injects an error on a configured ordinal
+    /// `insert_pending_op` call. All other ops delegate to the inner
+    /// rusqlite transaction.
+    struct FailingTx<'a> {
+        inner: Box<dyn crate::storage::SyncStorageTx + 'a>,
+        fail_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::storage::SyncStorageTx for FailingTx<'_> {
+        fn is_op_applied(&self, op_id: &str) -> Result<bool> {
+            self.inner.is_op_applied(op_id)
+        }
+
+        fn get_field_version(
+            &self,
+            sync_id: &str,
+            table: &str,
+            entity_id: &str,
+            field: &str,
+        ) -> Result<Option<FieldVersion>> {
+            self.inner.get_field_version(sync_id, table, entity_id, field)
+        }
+
+        fn get_device_record(
+            &self,
+            sync_id: &str,
+            device_id: &str,
+        ) -> Result<Option<crate::storage::DeviceRecord>> {
+            self.inner.get_device_record(sync_id, device_id)
+        }
+
+        fn upsert_sync_metadata(&mut self, meta: &crate::storage::SyncMetadata) -> Result<()> {
+            self.inner.upsert_sync_metadata(meta)
+        }
+
+        fn update_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
+            self.inner.update_last_pulled_seq(sync_id, seq)
+        }
+
+        fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {
+            self.inner.update_last_successful_sync(sync_id)
+        }
+
+        fn update_current_epoch(&mut self, sync_id: &str, epoch: i32) -> Result<()> {
+            self.inner.update_current_epoch(sync_id, epoch)
+        }
+
+        fn update_last_imported_registry_version(
+            &mut self,
+            sync_id: &str,
+            version: i64,
+        ) -> Result<()> {
+            self.inner.update_last_imported_registry_version(sync_id, version)
+        }
+
+        fn insert_pending_op(&mut self, op: &PendingOp) -> Result<()> {
+            let next = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let trip = self.fail_at.load(std::sync::atomic::Ordering::SeqCst);
+            if trip != 0 && next == trip {
+                return Err(CoreError::Storage(crate::storage::StorageError::Logic(
+                    "FailingStorage induced error".to_string(),
+                )));
+            }
+            self.inner.insert_pending_op(op)
+        }
+
+        fn mark_batch_pushed(&mut self, batch_id: &str) -> Result<()> {
+            self.inner.mark_batch_pushed(batch_id)
+        }
+
+        fn delete_pushed_ops(&mut self, sync_id: &str, batch_id: &str) -> Result<()> {
+            self.inner.delete_pushed_ops(sync_id, batch_id)
+        }
+
+        fn insert_applied_op(&mut self, op: &crate::storage::AppliedOp) -> Result<()> {
+            self.inner.insert_applied_op(op)
+        }
+
+        fn upsert_field_version(&mut self, fv: &FieldVersion) -> Result<()> {
+            self.inner.upsert_field_version(fv)
+        }
+
+        fn upsert_device_record(&mut self, device: &crate::storage::DeviceRecord) -> Result<()> {
+            self.inner.upsert_device_record(device)
+        }
+
+        fn remove_device_record(&mut self, sync_id: &str, device_id: &str) -> Result<()> {
+            self.inner.remove_device_record(sync_id, device_id)
+        }
+
+        fn clear_sync_state(&mut self, sync_id: &str) -> Result<()> {
+            self.inner.clear_sync_state(sync_id)
+        }
+
+        fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64> {
+            self.inner.import_snapshot(sync_id, data)
+        }
+
+        fn commit(self: Box<Self>) -> Result<()> {
+            self.inner.commit()
+        }
+
+        fn rollback(self: Box<Self>) -> Result<()> {
+            self.inner.rollback()
         }
     }
 }

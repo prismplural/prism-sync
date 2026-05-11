@@ -244,6 +244,154 @@ impl CrdtChange {
     }
 }
 
+/// Length of the base64-encoded form of `raw_len` raw bytes, using standard
+/// padding (each 3 input bytes -> 4 output chars, rounded up).
+const fn base64_encoded_len(raw_len: usize) -> usize {
+    // Standard base64 with `=` padding: ceil(raw_len / 3) * 4.
+    raw_len.div_ceil(3) * 4
+}
+
+/// Length in characters of the JSON-decimal form of a `u64` (no sign).
+fn json_u64_len(n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut len = 0usize;
+    let mut x = n;
+    while x > 0 {
+        len += 1;
+        x /= 10;
+    }
+    len
+}
+
+/// Length in characters of the JSON-decimal form of an `i64` (with optional
+/// leading minus sign).
+fn json_i64_len(n: i64) -> usize {
+    if n < 0 {
+        // i64::MIN cannot be negated, so go through unsigned absolute form.
+        1 + json_u64_len(n.unsigned_abs())
+    } else {
+        json_u64_len(n as u64)
+    }
+}
+
+/// Conservative budget for fields in a `SignedBatchEnvelope` we cannot derive
+/// from `&[CrdtChange]`. The partitioner uses this to keep the estimate tight
+/// without taking extra parameters: real sync ids are 64 hex chars.
+const ESTIMATED_SYNC_ID_LEN: usize = 64;
+/// `batch_kind` is always `"ops"` for the push path the partitioner targets.
+const ESTIMATED_BATCH_KIND: &str = "ops";
+
+/// Conservative upper bound on the serialized JSON body size of a
+/// `SignedBatchEnvelope` carrying `ops`, given the signature's raw byte count.
+///
+/// Accounts for:
+///   * `ops` plaintext (`CrdtChange::encode_batch`),
+///   * the 16-byte XChaCha20-Poly1305 AEAD tag,
+///   * AEAD ciphertext padding (`PADDED_OP_BATCH_CIPHERTEXT_BUCKETS`) — when
+///     the plaintext fits in a bucket the ciphertext lands at the bucket size;
+///     beyond 512 KiB the ciphertext is unpadded,
+///   * base64 expansion (`ceil(N/3) * 4`) for `ciphertext`, `signature`,
+///     `nonce` (always 24 bytes), and `payload_hash` (always 32 bytes),
+///   * the fixed envelope-key overhead and the variable field strings
+///     `batch_id`, `device_id`, and `epoch` taken from the first op. The
+///     `sync_id` field is budgeted at `ESTIMATED_SYNC_ID_LEN` (typical
+///     production size).
+///
+/// The estimate is tight to a small constant: the partitioner sizes batches
+/// against this number, leaving the relay-cap headroom to absorb the slack.
+pub fn estimate_envelope_body_size(ops: &[CrdtChange], signature_bytes: usize) -> usize {
+    // 1. Plaintext length is the same the engine would produce when it calls
+    //    `encode_batch` on this op list. A serialization error here returns
+    //    `usize::MAX` so the partitioner forces an own-bucket placement.
+    let plaintext_len = match CrdtChange::encode_batch(ops) {
+        Ok(p) => p.len(),
+        Err(_) => return usize::MAX,
+    };
+
+    // 2. Ciphertext = plaintext + AEAD tag. `encode_batch` already padded
+    //    plaintext so that ciphertext lands on a bucket boundary (if one
+    //    applies); beyond 512 KiB the plaintext is left as-is.
+    let ciphertext_len = plaintext_len + OP_BATCH_AEAD_TAG_BYTES;
+
+    // 3. Base64 expansion for the four byte-array envelope fields.
+    let ciphertext_b64_len = base64_encoded_len(ciphertext_len);
+    let signature_b64_len = base64_encoded_len(signature_bytes);
+    let nonce_b64_len = base64_encoded_len(24);
+    let payload_hash_b64_len = base64_encoded_len(32);
+
+    // 4. Per-op contextual fields. All ops in one batch share `device_id`,
+    //    `batch_id`, and `epoch`, so the first op is representative.
+    let (device_id_len, batch_id_len, epoch_len) = match ops.first() {
+        Some(op) => {
+            let batch_id_len = op.batch_id.as_deref().map(str::len).unwrap_or(0);
+            (op.device_id.len(), batch_id_len, json_i64_len(op.epoch as i64))
+        }
+        None => (0, 0, json_u64_len(0)),
+    };
+
+    // 5. Envelope key + delimiter overhead. Each `"key":` token contributes
+    //    its UTF-8 length plus the surrounding JSON quote/colon characters,
+    //    and one separator comma per field (the trailing field has no comma,
+    //    but accounting one for all simplifies the math; we shave the extra
+    //    later via the trailing brace adjustment).
+    //
+    // JSON skeleton (newlines/spaces are illustrative — `to_vec` emits a
+    // single-line, no-whitespace form):
+    //
+    // {"protocol_version":<n>,"sync_id":"<sync_id>",
+    //  "epoch":<n>,"batch_id":"<batch_id>",
+    //  "batch_kind":"ops","sender_device_id":"<device_id>",
+    //  "sender_ml_dsa_key_generation":<n>,"payload_hash":"<b64>",
+    //  "signature":"<b64>","nonce":"<b64>","ciphertext":"<b64>"}
+    //
+    // We size the key-and-quote overhead conservatively:
+    //   * `"<key>":` for each of the 11 fields
+    //   * `"<value>"` quotes for the 8 string fields
+    //   * `,` between fields (one fewer than field count)
+    //   * `{}` braces
+    //
+    // Numeric value characters are added separately. `sender_ml_dsa_key_generation`
+    // and `protocol_version` are budgeted at 10 chars each (max digits of u32),
+    // which is conservative.
+
+    let fixed_overhead = 2 /* braces */
+        // field-name overhead: `"<name>":` (i.e. name.len() + 3) for each field.
+        + ("protocol_version".len() + 3)
+        + ("sync_id".len() + 3)
+        + ("epoch".len() + 3)
+        + ("batch_id".len() + 3)
+        + ("batch_kind".len() + 3)
+        + ("sender_device_id".len() + 3)
+        + ("sender_ml_dsa_key_generation".len() + 3)
+        + ("payload_hash".len() + 3)
+        + ("signature".len() + 3)
+        + ("nonce".len() + 3)
+        + ("ciphertext".len() + 3)
+        // separators between the 11 fields
+        + 10
+        // string value quotes for the 8 string-typed fields
+        // (sync_id, batch_id, batch_kind, sender_device_id,
+        //  payload_hash, signature, nonce, ciphertext)
+        + 16
+        // conservative max digit count for u16 protocol_version
+        + 5
+        // conservative max digit count for u32 sender_ml_dsa_key_generation
+        + 10;
+
+    fixed_overhead
+        + ESTIMATED_SYNC_ID_LEN
+        + epoch_len
+        + batch_id_len
+        + ESTIMATED_BATCH_KIND.len()
+        + device_id_len
+        + payload_hash_b64_len
+        + signature_b64_len
+        + nonce_b64_len
+        + ciphertext_b64_len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +654,179 @@ mod tests {
     #[test]
     fn decode_batch_invalid_json() {
         assert!(CrdtChange::decode_batch(b"not json").is_err());
+    }
+
+    /// Realistic sender state used by the envelope-size tests below.
+    struct EstimateFixture {
+        sync_id: String,
+        epoch: i32,
+        device_id: String,
+        ml_dsa_key_generation: u32,
+        ed25519_signing_key: ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: prism_sync_crypto::DevicePqSigningKey,
+        encryption_key: [u8; 32],
+    }
+
+    impl EstimateFixture {
+        fn new() -> Self {
+            use rand::rngs::OsRng;
+            let ed25519_signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+            let device_secret = prism_sync_crypto::DeviceSecret::generate();
+            let device_id = "ee1ee1ee1ee1ee1ee1ee1ee1ee1ee1ee".to_string();
+            let ml_dsa_signing_key =
+                device_secret.ml_dsa_65_keypair(&device_id).expect("ml-dsa-65 keypair");
+            Self {
+                sync_id:
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                epoch: 7,
+                device_id,
+                ml_dsa_key_generation: 0,
+                ed25519_signing_key,
+                ml_dsa_signing_key,
+                encryption_key: [42u8; 32],
+            }
+        }
+
+        /// Encode + encrypt + sign the same way the push path does, so we can
+        /// compare the estimate to a real envelope serialization.
+        fn real_envelope_body_size(&self, ops: &[CrdtChange], batch_id: &str) -> usize {
+            let plaintext = CrdtChange::encode_batch(ops).expect("encode_batch");
+            let payload_hash = crate::batch_signature::compute_payload_hash(&plaintext);
+            let aad =
+                crate::sync_aad::build_sync_aad(&self.sync_id, &self.device_id, self.epoch, batch_id, "ops");
+            let (ciphertext, nonce) =
+                prism_sync_crypto::aead::xchacha_encrypt_for_sync(&self.encryption_key, &plaintext, &aad)
+                    .expect("encrypt");
+            let envelope = crate::batch_signature::sign_batch(
+                &self.ed25519_signing_key,
+                &self.ml_dsa_signing_key,
+                &self.sync_id,
+                self.epoch,
+                batch_id,
+                "ops",
+                &self.device_id,
+                self.ml_dsa_key_generation,
+                &payload_hash,
+                nonce,
+                ciphertext,
+            )
+            .expect("sign_batch");
+            serde_json::to_vec(&envelope).expect("envelope to_vec").len()
+        }
+
+        fn signature_bytes(&self, ops: &[CrdtChange]) -> usize {
+            // Sign once just to discover the produced signature width
+            // (length-prefixed wire format: 4 + 64 + 4 + 3309 = 3381).
+            let plaintext = CrdtChange::encode_batch(ops).expect("encode_batch");
+            let payload_hash = crate::batch_signature::compute_payload_hash(&plaintext);
+            let envelope = crate::batch_signature::sign_batch(
+                &self.ed25519_signing_key,
+                &self.ml_dsa_signing_key,
+                &self.sync_id,
+                self.epoch,
+                "estimate-probe",
+                "ops",
+                &self.device_id,
+                self.ml_dsa_key_generation,
+                &payload_hash,
+                [0u8; 24],
+                vec![],
+            )
+            .expect("sign_batch");
+            envelope.signature.len()
+        }
+
+        fn make_op(&self, field_name: &str, encoded_value: String, batch_id: &str) -> CrdtChange {
+            CrdtChange {
+                op_id: format!("op-{field_name}-1234abcd-5678efab-90ab-cdef01234567"),
+                batch_id: Some(batch_id.to_string()),
+                entity_id: "entity-abcdefabcdefabcdefabcdefabcdef12".to_string(),
+                entity_table: "members".to_string(),
+                field_name: field_name.to_string(),
+                encoded_value,
+                client_hlc: format!("1715000000000:5:{}", self.device_id),
+                is_delete: false,
+                device_id: self.device_id.clone(),
+                epoch: self.epoch,
+                server_seq: None,
+            }
+        }
+    }
+
+    fn quoted_string_of_len(byte_len: usize) -> String {
+        // Avatar/banner blobs go through SyncValue::String (base64) → encoded
+        // as a JSON-quoted string. Produce one of approximately `byte_len`.
+        format!("\"{}\"", "A".repeat(byte_len))
+    }
+
+    fn assert_estimate_within_slack(estimate: usize, actual: usize, label: &str) {
+        // The estimator MUST be an upper bound and within a small slack so the
+        // partitioner can be sized against it.
+        assert!(
+            estimate >= actual,
+            "{label}: estimate {estimate} < actual {actual} (must be an upper bound)",
+        );
+        let slack = estimate - actual;
+        assert!(
+            slack <= 200,
+            "{label}: estimate {estimate} exceeded actual {actual} by {slack} bytes (cap 200)",
+        );
+    }
+
+    #[test]
+    fn estimate_envelope_body_size_tight_for_small_batch() {
+        let fixture = EstimateFixture::new();
+        let batch_id = "0aaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let ops = vec![
+            fixture.make_op("name", "\"Alice\"".to_string(), batch_id),
+            fixture.make_op("pronouns", "\"she/her\"".to_string(), batch_id),
+        ];
+
+        let actual = fixture.real_envelope_body_size(&ops, batch_id);
+        let estimate = estimate_envelope_body_size(&ops, fixture.signature_bytes(&ops));
+        assert_estimate_within_slack(estimate, actual, "small batch");
+    }
+
+    #[test]
+    fn estimate_envelope_body_size_tight_for_avatar_only_batch() {
+        let fixture = EstimateFixture::new();
+        let batch_id = "0aaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        // Avatar after base64 expansion ≈ 256 KB raw → 342 KB JSON string body.
+        let avatar_value = quoted_string_of_len(342 * 1024);
+        let ops = vec![fixture.make_op("avatar", avatar_value, batch_id)];
+
+        let actual = fixture.real_envelope_body_size(&ops, batch_id);
+        let estimate = estimate_envelope_body_size(&ops, fixture.signature_bytes(&ops));
+        assert_estimate_within_slack(estimate, actual, "avatar-only batch");
+    }
+
+    #[test]
+    fn estimate_envelope_body_size_tight_for_banner_only_batch() {
+        let fixture = EstimateFixture::new();
+        let batch_id = "0aaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        // Banner ≈ 512 KB raw → 683 KB JSON string body. Exceeds the largest
+        // ciphertext-padding bucket; the ciphertext is left unpadded.
+        let banner_value = quoted_string_of_len(683 * 1024);
+        let ops = vec![fixture.make_op("banner", banner_value, batch_id)];
+
+        let actual = fixture.real_envelope_body_size(&ops, batch_id);
+        let estimate = estimate_envelope_body_size(&ops, fixture.signature_bytes(&ops));
+        assert_estimate_within_slack(estimate, actual, "banner-only batch");
+    }
+
+    #[test]
+    fn estimate_envelope_body_size_tight_for_avatar_plus_banner_batch() {
+        let fixture = EstimateFixture::new();
+        let batch_id = "0aaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let avatar_value = quoted_string_of_len(342 * 1024);
+        let banner_value = quoted_string_of_len(683 * 1024);
+        let ops = vec![
+            fixture.make_op("avatar", avatar_value, batch_id),
+            fixture.make_op("banner", banner_value, batch_id),
+        ];
+
+        let actual = fixture.real_envelope_body_size(&ops, batch_id);
+        let estimate = estimate_envelope_body_size(&ops, fixture.signature_bytes(&ops));
+        assert_estimate_within_slack(estimate, actual, "avatar + banner batch");
     }
 }
