@@ -147,6 +147,23 @@ Future<int> changePassword({
   currentIdentityGeneration: currentIdentityGeneration,
 );
 
+/// Recovery: regenerate `wrapped_dek` + `dek_salt` for the in-memory DEK.
+///
+/// Use when the wrapped DEK is missing from the secure store but the engine
+/// is still unlocked (runtime DEK cache survived). Unlike `change_password`,
+/// this does NOT bump `identity_generation` and does NOT touch the sharing
+/// prekey — the DEK itself is unchanged, only its at-rest wrapping is
+/// re-emitted under the same password.
+Future<void> rewrapDek({
+  required PrismSyncHandle handle,
+  required List<int> password,
+  required List<int> secretKey,
+}) => RustLib.instance.api.crateApiRewrapDek(
+  handle: handle,
+  password: password,
+  secretKey: secretKey,
+);
+
 /// Record a new entity creation.
 ///
 /// `fields_json` is a JSON object: `{"field_name": value, ...}`.

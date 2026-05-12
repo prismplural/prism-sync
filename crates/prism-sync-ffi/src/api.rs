@@ -1759,6 +1759,56 @@ pub async fn change_password(
     Ok(next_identity_generation)
 }
 
+/// Recovery: regenerate `wrapped_dek` + `dek_salt` for the in-memory DEK.
+///
+/// Use when the wrapped DEK is missing from the secure store but the engine
+/// is still unlocked (runtime DEK cache survived). Unlike `change_password`,
+/// this does NOT bump `identity_generation` and does NOT touch the sharing
+/// prekey — the DEK itself is unchanged, only its at-rest wrapping is
+/// re-emitted under the same password.
+pub async fn rewrap_dek(
+    handle: &PrismSyncHandle,
+    password: Vec<u8>,
+    secret_key: Vec<u8>,
+) -> Result<(), String> {
+    let password = zeroize::Zeroizing::new(password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    std::str::from_utf8(password.as_slice())
+        .map_err(|_| "password must be valid UTF-8".to_string())?;
+
+    {
+        let inner = handle.inner.lock().await;
+        if !inner.is_unlocked() {
+            return Err("rewrap_dek requires unlocked handle".to_string());
+        }
+    }
+
+    // Argon2id (re-wrap DEK under password) must not run on a tokio worker.
+    let inner_arc = handle.inner.clone();
+    tokio::task::spawn_blocking(move || {
+        let inner = inner_arc.blocking_lock();
+        let password = std::str::from_utf8(password.as_slice())
+            .map_err(|_| "password must be valid UTF-8".to_string())?;
+        let (new_wrapped_dek, new_salt) = inner
+            .key_hierarchy()
+            .change_password(password, secret_key.as_slice())
+            .map_err(|e| format!("rewrap_dek failed: {e}"))?;
+        inner
+            .secure_store()
+            .set("wrapped_dek", &new_wrapped_dek)
+            .map_err(|e| format!("Failed to persist wrapped_dek: {e}"))?;
+        inner
+            .secure_store()
+            .set("dek_salt", &new_salt)
+            .map_err(|e| format!("Failed to persist dek_salt: {e}"))?;
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| format!("task failed: {e}"))??;
+
+    Ok(())
+}
+
 // ── Mutation recording ──
 
 /// Record a new entity creation.

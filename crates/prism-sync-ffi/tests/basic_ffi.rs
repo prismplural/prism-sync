@@ -357,6 +357,93 @@ async fn change_password_rejects_non_utf8_new_password() {
     );
 }
 
+// ── rewrap_dek (wrapped_dek recovery) ──
+
+#[tokio::test]
+async fn rewrap_dek_succeeds() {
+    let handle = make_handle();
+    let secret = api::generate_secret_key().unwrap();
+    let secret_bytes = secret.as_bytes().to_vec();
+
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes.clone()).await.unwrap();
+
+    // Snapshot current wrapped_dek + dek_salt so we can verify they rotate.
+    let before = api::drain_secure_store(&handle).await.expect("drain before");
+    let before_wrapped = before.get("wrapped_dek").cloned().expect("wrapped_dek present");
+    let before_salt = before.get("dek_salt").cloned().expect("dek_salt present");
+    api::seed_secure_store(&handle, before.clone()).await.expect("reseed before");
+
+    let result = api::rewrap_dek(&handle, b"pw".to_vec(), secret_bytes).await;
+    assert!(result.is_ok(), "rewrap_dek should succeed: {:?}", result.err());
+
+    let after = api::drain_secure_store(&handle).await.expect("drain after");
+    let after_wrapped = after.get("wrapped_dek").cloned().expect("wrapped_dek present");
+    let after_salt = after.get("dek_salt").cloned().expect("dek_salt present");
+    assert_ne!(before_wrapped, after_wrapped, "wrapped_dek should rotate");
+    assert_ne!(before_salt, after_salt, "dek_salt should rotate");
+}
+
+#[tokio::test]
+async fn rewrap_dek_rejects_locked_handle() {
+    let handle = make_handle();
+    let secret = api::generate_secret_key().unwrap();
+    let secret_bytes = secret.as_bytes().to_vec();
+
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes.clone()).await.unwrap();
+    api::lock(&handle).await;
+
+    let result = api::rewrap_dek(&handle, b"pw".to_vec(), secret_bytes).await;
+    assert!(
+        matches!(
+            result.as_ref().err().map(String::as_str),
+            Some("rewrap_dek requires unlocked handle")
+        ),
+        "rewrap_dek should reject locked handle: {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn rewrap_dek_rejects_non_utf8_password() {
+    let handle = make_handle();
+    let secret = api::generate_secret_key().unwrap();
+    let secret_bytes = secret.as_bytes().to_vec();
+
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes.clone()).await.unwrap();
+
+    let result = api::rewrap_dek(&handle, vec![0xff], secret_bytes).await;
+    assert!(
+        matches!(
+            result.as_ref().err().map(String::as_str),
+            Some("password must be valid UTF-8")
+        ),
+        "rewrap_dek should reject invalid UTF-8 before crypto: {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn rewrap_dek_does_not_change_dek() {
+    let handle = make_handle();
+    let secret = api::generate_secret_key().unwrap();
+    let secret_bytes = secret.as_bytes().to_vec();
+
+    api::initialize(&handle, b"pw".to_vec(), secret_bytes.clone()).await.unwrap();
+
+    let db_key_before = api::database_key(&handle).await.expect("database_key");
+
+    api::rewrap_dek(&handle, b"pw".to_vec(), secret_bytes.clone()).await.unwrap();
+
+    let db_key_after = api::database_key(&handle).await.expect("database_key");
+    assert_eq!(db_key_before, db_key_after, "DEK-derived database key must be unchanged");
+
+    // Lock and re-unlock with same PIN must still work using the new wrapped_dek.
+    api::lock(&handle).await;
+    let unlock = api::unlock(&handle, b"pw".to_vec(), secret_bytes).await;
+    assert!(unlock.is_ok(), "unlock with same PIN should succeed after rewrap: {:?}", unlock.err());
+
+    let db_key_after_unlock = api::database_key(&handle).await.expect("database_key");
+    assert_eq!(db_key_before, db_key_after_unlock, "DEK must survive lock/unlock after rewrap");
+}
+
 // ── Mutation recording (requires configure_engine, tested via status) ──
 
 #[tokio::test]
