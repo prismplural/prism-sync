@@ -1,6 +1,6 @@
 [package]
 name = "prism-sync-relay"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 description = "V2 relay server for prism-sync encrypted CRDT sync"

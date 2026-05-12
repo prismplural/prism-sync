@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "prism-sync-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "prism-sync-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2342,7 +2342,7 @@ dependencies = [
 
 [[package]]
 name = "prism-sync-crypto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "bip39",
@@ -2371,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "prism-sync-relay"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2412,7 +2412,7 @@ dependencies = [
 
 [[package]]
 name = "prism_sync_ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
