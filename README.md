@@ -1,61 +1,110 @@
 # prism-sync
 
-End-to-end encrypted CRDT sync library in Rust. Add private, multi-device sync to any app
-with field-level conflict resolution and end-to-end encryption — the relay server stores
-only encrypted blobs and never sees plaintext.
+Hi. This is the sync engine behind [Prism](https://github.com/prismplural/prism-app)
+— a plural system management app built by a plural system that uses it every day.
+We pulled the sync layer out of the app repo so it can be audited and embedded
+on its own.
 
-## Highlights
+It's a Rust CRDT library with end-to-end encryption, a `flutter_rust_bridge`
+FFI surface, Dart packages for Flutter integration, and a self-hostable relay
+server. The relay only ever sees encrypted blobs.
 
-- **Field-level CRDTs** — Last-Write-Wins with Hybrid Logical Clocks, not row-level overwrites
-- **Ciphertext-only relay** — the server sees encrypted blobs, device IDs, and timing; never content
-- **Post-quantum ready** — hybrid Ed25519 + ML-DSA-65 signatures, X-Wing (X25519 + ML-KEM-768) epoch rekey
-- **Self-contained** — crypto, storage, sync engine, relay server, and FFI bindings in one repo
-- **Flutter integration** — Dart bindings, Drift adapter, and Riverpod providers included
+If you're here to deploy a relay rather than work on the code, the
+[self-hosting guide](self-host/SELF-HOSTING.md) is what you want.
+[ARCHITECTURE.md](ARCHITECTURE.md) covers the protocol and threat model.
 
-## How It Works
+## What's in here
 
-```
-Password + BIP39 mnemonic → Argon2id → MEK → wraps DEK
-  DEK → HKDF → epoch sync keys (XChaCha20-Poly1305)
-  DEK → HKDF → database encryption key
-  DeviceSecret (per-device CSPRNG) → HKDF → Ed25519 + X25519 + ML-DSA-65 + ML-KEM-768 + X-Wing
-
-Sync cycle: pull → verify signature → decrypt → merge → ack → prune → push
-```
-
-Each device has its own cryptographic identity derived from a local secret. Devices pair via
-a relay-mediated ceremony with SAS verification. When a device is revoked, epoch rotation
-uses X-Wing hybrid KEM to distribute fresh keys to surviving devices.
-
-Password changes re-wrap the DEK — no data re-encryption needed.
-
-## Architecture
+Rust 2021 (MSRV 1.75), tokio, Axum for the relay, `rusqlite` (bundled SQLite),
+RustCrypto for symmetric crypto and signatures, `ml-dsa` / `ml-kem` / `x-wing`
+for the post-quantum layer, and `flutter_rust_bridge` 2.12.0 for the FFI.
 
 ```
 crates/
-├── prism-sync-crypto/     # Standalone crypto primitives
-├── prism-sync-core/       # CRDT engine, storage, relay client, pairing
-├── prism-sync-ffi/        # FFI layer for Flutter/Dart
-└── prism-sync-relay/      # Self-hosted relay server (Axum + SQLite)
+├── prism-sync-crypto/   # Standalone crypto primitives — no sync awareness
+├── prism-sync-core/     # CRDT engine, HLC, storage, pairing, relay client
+├── prism-sync-ffi/      # flutter_rust_bridge surface — Dart/Flutter bindings
+├── prism-sync-relay/    # Self-hostable relay (Axum + SQLite + WebSockets)
+└── prism-sync-bench/    # Criterion benchmarks
 
 dart/packages/
-├── prism_sync/            # Generated Dart bindings
-├── prism_sync_drift/      # Drift database adapter
-└── prism_sync_flutter/    # Flutter secure storage + Riverpod providers
+├── prism_sync/          # Generated Dart bindings (never edit by hand)
+├── prism_sync_drift/    # Drift database adapter
+└── prism_sync_flutter/  # Flutter secure storage + Riverpod providers
+
+self-host/               # Dockerfile, compose, Kubernetes manifests, runbook
+docs/                    # Protocol specs
 ```
 
-`prism-sync-crypto` is standalone with no sync awareness. `prism-sync-core` builds on it
-for the CRDT engine and sync protocol. `prism-sync-relay` is independently deployable with
-no dependency on the other crates.
+Dependency-wise: `prism-sync-crypto` is pure cryptography with no sync state
+and is safe to use on its own. `prism-sync-core` builds on it and owns
+everything sync-related — HLC, CRDT merge, schema, storage traits, engine,
+relay client, pairing, and the consumer `PrismSync` builder. `prism-sync-ffi`
+sits on top with a flat, primitive-typed function API that
+`flutter_rust_bridge` codegen consumes. `prism-sync-relay` is fully
+standalone — it stores opaque encrypted blobs and depends on none of the
+other crates.
 
-## Quick Start
+## Build and test
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+```
+
+A `justfile` wraps these (`just build`, `just test`, `just test-crate <name>`,
+`just lint`, `just fmt`).
+
+Per-crate testing:
+
+```bash
+cargo test -p prism-sync-crypto
+cargo test -p prism-sync-core
+cargo test -p prism-sync-relay
+cargo test -p prism-sync-crypto --test cross_language_vectors -- --ignored
+```
+
+The cross-language vector tests verify crypto outputs byte-for-byte against
+the Dart/libsodium side. Run them whenever you touch the crypto crate or the
+FFI boundary.
+
+## FFI codegen
+
+After changing the public FFI API in `crates/prism-sync-ffi/src/api.rs`:
+
+```bash
+flutter_rust_bridge_codegen generate
+```
+
+That regenerates `dart/packages/prism_sync/lib/generated/`. **Never edit those
+files by hand** — they'll be clobbered on the next codegen run.
+
+## Dart packages
+
+The `dart/packages/` workspace is managed via Melos.
+
+```bash
+cd dart
+dart pub global activate melos
+melos bootstrap
+melos run test
+```
+
+Consumers can either depend on these packages via git or point at a local
+checkout via `pubspec_overrides.yaml`. The prism-app README has the override
+pattern.
+
+## Using it from Rust
+
+A minimal embed looks like this:
 
 ```rust
 use prism_sync_core::{PrismSync, SyncSchema, SyncType};
 use prism_sync_core::storage::RusqliteSyncStorage;
 use std::sync::Arc;
 
-// Define your schema
 let schema = SyncSchema::builder()
     .entity("tasks", |e| {
         e.field("title", SyncType::String)
@@ -63,7 +112,6 @@ let schema = SyncSchema::builder()
     })
     .build();
 
-// Build the sync client
 let storage = Arc::new(RusqliteSyncStorage::in_memory()?);
 let client = PrismSync::builder()
     .schema(schema)
@@ -72,80 +120,60 @@ let client = PrismSync::builder()
     .relay_url("https://relay.example.com")
     .build()?;
 
-// Initialize with credentials
 client.initialize("my_password", &secret_key_bytes)?;
-
-// Record mutations — these become CRDT ops
 client.record_create("tasks", &task_id, &fields)?;
-
-// Sync with the relay
-let result = client.sync().await?;
+let _result = client.sync().await?;
 ```
-
-## Building
-
-```bash
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-## Testing
-
-920+ tests across all crates:
-
-- Crypto: AEAD roundtrip, KDF determinism, key hierarchy, device identity, cross-language vectors
-- CRDT: HLC merge, LWW tiebreakers, tombstone protection, schema validation
-- Storage: transactions, CRUD, migration, pruning
-- Sync engine: push/pull roundtrip, conflict resolution, signature verification, payload tampering
-- Pairing: create/join ceremony, tampered invitation rejection, wrong-password handling
-- Epoch rotation: revoke → rekey → unwrap → encrypt/decrypt full cycle
-- Relay: authentication, quota enforcement, WebSocket notifications
-
-```bash
-cargo test --workspace                    # Everything
-cargo test -p prism-sync-crypto           # Crypto only
-cargo test -p prism-sync-core             # Engine + CRDT
-cargo test -p prism-sync-relay            # Relay server
-```
-
-## Security
-
-| Layer | Primitive |
-|-------|-----------|
-| Encryption | XChaCha20-Poly1305 (24-byte random nonces) |
-| Key derivation | Argon2id (64 MiB, 3 iterations) + HKDF-SHA256 |
-| Signatures | Hybrid Ed25519 + ML-DSA-65 batch signatures |
-| Post-quantum KEM | X-Wing (X25519 + ML-KEM-768) for epoch rekey |
-| Device identity | Per-device CSPRNG keys (5 keypairs), never derived from shared secrets |
-| Transport | HTTPS/WSS required (enforced at builder and relay constructor) |
-| Memory | All key material in `Zeroizing<Vec<u8>>` — auto-zeroed on drop |
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and threat model.
-
-## Self-Hosting
-
-The relay server is included in this repo and can be self-hosted with Docker or built from
-source. See the [self-hosting guide](self-host/SELF-HOSTING.md) for setup instructions,
-Kubernetes manifests, and configuration reference.
-
-## AI Disclosure
-
-Prism uses AI for development. Prism is written by a plural system that actually uses it
-every day. We use Claude extensively as a coding tool.
-
-The security architecture, design decisions, interface — the things that make this app what
-it is — are ours. The encryption is fully auditable and open source regardless of what tools
-wrote it, and we hope the app's quality stands on its own.
 
 ## Contributing
 
-Contributions are welcome! Whether it's bug reports, feature ideas, or pull requests — all
-help is appreciated. For larger changes, opening an issue first helps us coordinate and
-avoid duplicated effort.
+We're glad you're here. Bug reports, protocol questions, performance work, and
+patches are all welcome.
 
-By submitting a pull request, you agree to the [Contributor License Agreement](CLA.md).
+Please open an issue before starting on anything larger than a bug fix or a
+doc PR. Crypto, CRDT, and pairing changes especially benefit from up-front
+discussion — they're easy to get subtly wrong, and once a protocol version
+ships we have to keep parsing it forever. We'd rather talk through the design
+before you spend time on code.
+
+A few things worth knowing before sending a patch:
+
+- All key material lives in `Zeroizing<Vec<u8>>` and auto-zeroes on drop.
+  Don't introduce raw `Vec<u8>` for keys.
+- `SyncStorage` and `SyncRelay` are object-safe traits. Keep them that way —
+  no generic methods.
+- `SyncStorage` calls inside the engine are wrapped in
+  `tokio::task::spawn_blocking`.
+- FFI functions use primitive types only. No trait objects across the FFI
+  boundary.
+- Merge order is field-level LWW with a 3-level tiebreaker: HLC → device_id →
+  op_id. Don't reorder without a protocol version bump.
+- Relay paths are `/v1/sync/{sync_id}/...`. Don't break path versioning.
+- If you change the FFI surface, regenerate Dart bindings and commit both
+  sides in the same change.
+
+By submitting a pull request you agree to the
+[Contributor License Agreement](CLA.md). The CLA exists so the project can
+cleanly dual-license under MIT and Apache 2.0.
+
+For security issues, please don't open a public issue. See
+[SECURITY.md](SECURITY.md) — it lists scope, disclosure process, and the
+categories of bugs we care about most (key-material leakage, signature or
+authentication bypass, CRDT soundness, relay flaws).
+
+## Related repositories
+
+- [prism-app](https://github.com/prismplural/prism-app) — the Flutter app
+  that consumes this engine.
+
+## On AI
+
+We use AI coding tools (local and hosted) heavily while building Prism. The
+security architecture, design decisions, and protocol are ours; the
+encryption is fully auditable regardless of what tools wrote the surrounding
+code.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE).
+Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE), at
+your option.
