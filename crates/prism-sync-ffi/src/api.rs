@@ -2300,11 +2300,8 @@ pub async fn status(handle: &PrismSyncHandle) -> Result<String, String> {
 pub async fn list_quarantined_batches(handle: &PrismSyncHandle) -> Result<String, String> {
     let (storage, sync_id) = {
         let inner = handle.inner.lock().await;
-        let sync_id = inner
-            .sync_service()
-            .sync_id()
-            .ok_or_else(|| "Not configured".to_string())?
-            .to_string();
+        let sync_id =
+            inner.sync_service().sync_id().ok_or_else(|| "Not configured".to_string())?.to_string();
         (inner.storage().clone(), sync_id)
     };
 
@@ -2485,10 +2482,9 @@ fn build_relay(
     // skip the check by using the URL as-is and relying on the caller.
     let url = relay_url.to_string();
     if !allow_insecure && !url.starts_with("https://") && !url.starts_with("http://localhost") {
-        return Err(format!(
-            "Relay URL must use https:// (got {url:?}). \
-             Set allow_insecure=true for development."
-        ));
+        return Err(
+            "Relay URL must use https://. Set allow_insecure=true for development.".to_string()
+        );
     }
     let parsed_secret = device_secret.and_then(|bytes| DeviceSecret::from_bytes(bytes).ok());
     let signing_key = parsed_secret
@@ -2521,7 +2517,7 @@ fn build_relay(
         ml_dsa_signing_key,
         registration_token,
     )
-    .map_err(|e| format!("Failed to create ServerRelay: {e}"))?;
+    .map_err(|_| "Failed to create ServerRelay: invalid relay URL".to_string())?;
     Ok(Arc::new(relay))
 }
 
@@ -3116,6 +3112,276 @@ pub async fn delete_sync_group(
         Ok(()) => Ok(()),
         Err(error) => Err(format_handle_relay_error(handle, "delete_sync_group", error).await),
     }
+}
+
+/// Roll back a relay-side first-device registration when initiator setup
+/// fails after `create_sync_group` returned but before local credentials
+/// were durably written.
+///
+/// This is a registry-free variant of [`deregister_device`]: it intentionally
+/// bypasses [`load_device_ml_dsa_generation`] (which requires a seeded local
+/// device-registry row) because the failure window opens before
+/// `create_sync_group` reaches its `import_keyring`/`ensure_local_sync_metadata`
+/// call (`api.rs` ~line 2727). Without this bypass, the existing deregister
+/// path returns "device not in local registry" and the relay-side row is
+/// orphaned forever — every retry mints a fresh `sync_id` (see
+/// `EpochManager::generate_sync_id`) and walks away from the previous one.
+///
+/// Reads `sync_id`, `device_id`, `session_token`, and `device_secret` from
+/// the in-memory `MemorySecureStore` only. Uses ML-DSA generation `0` as the
+/// initial generation (matches the value initiator setup writes via
+/// `import_keyring` and is what `create_sync_group` would have written had it
+/// succeeded). When `device_secret` is missing, returns `NoOp` without
+/// contacting the relay: rollback cannot construct an authentic signature, and
+/// a guaranteed-reject request would only burn relay budget.
+///
+/// On success, also clears those four secure-store entries so a follow-up call
+/// is idempotent (and so the next setup retry starts from a clean slate). If
+/// any of those four are absent on entry, returns the `NoOp` outcome without
+/// touching the network — that makes the second of two back-to-back calls
+/// safe.
+///
+/// If the relay rejects `deregister` with `403 Forbidden` and the body matches
+/// the "last active device" pattern from `prism-sync-relay`'s
+/// `do_self_deregister` (`crates/prism-sync-relay/src/routes/devices.rs`),
+/// falls back to `delete_sync_group` so the sole-device registration is still
+/// removed end-to-end.
+///
+/// Returns a JSON string with one of these shapes:
+/// ```json
+/// {"outcome":"no_op","reason":"sync_id missing"}
+/// {"outcome":"deregistered"}
+/// {"outcome":"group_deleted","fallback_from":"last_active_device"}
+/// {"outcome":"failed","stage":"deregister","reason":"network error: ..."}
+/// ```
+///
+/// Never throws / never panics over the FFI: relay/network errors are
+/// reported via the `failed` variant so the Dart caller can log them as a
+/// non-fatal warning without masking the original setup error.
+///
+/// Does NOT mutate Dart-side platform-keychain state — the Dart caller still
+/// runs its own `_restoreKeychainSnapshot` after this returns.
+pub async fn rollback_first_device_registration(
+    handle: &PrismSyncHandle,
+) -> Result<String, String> {
+    // Snapshot the four credentials we need from the in-memory secure store.
+    // We deliberately do NOT touch the local registry / sync metadata here:
+    // for the early-failure window the registry row is not yet seeded.
+    //
+    // The raw bytes are retained alongside the parsed strings so that the
+    // post-relay `clear_rollback_credentials` step can do a compare-and-swap
+    // against the store: only delete a key if the value still matches the
+    // snapshot. This protects against a setup retry that re-seeded the
+    // four keys with NEW values during the relay request window — without
+    // CAS, the unconditional delete would silently wipe those new values
+    // and leave the user with a half-set-up handle.
+    let (sync_id_raw, device_id_raw, session_token_raw, device_secret_raw) = {
+        let inner = handle.inner.lock().await;
+        let store = inner.secure_store();
+        let sync_id = store.get("sync_id").map_err(|e| e.to_string())?;
+        let device_id = store.get("device_id").map_err(|e| e.to_string())?;
+        let session_token = store.get("session_token").map_err(|e| e.to_string())?;
+        let device_secret = store.get("device_secret").map_err(|e| e.to_string())?;
+        (sync_id, device_id, session_token, device_secret)
+    };
+    let sync_id_str = sync_id_raw.as_ref().and_then(|b| String::from_utf8(b.clone()).ok());
+    let device_id_str = device_id_raw.as_ref().and_then(|b| String::from_utf8(b.clone()).ok());
+    let session_token_str =
+        session_token_raw.as_ref().and_then(|b| String::from_utf8(b.clone()).ok());
+
+    // Idempotence: a second call after a successful first call lands here
+    // because we cleared the four keys on success. Same outcome shape as the
+    // "nothing to roll back" case so the Dart caller doesn't need to special-
+    // case "I already cleaned this up."
+    let sync_id = match sync_id_str {
+        Some(value) if !value.is_empty() => value,
+        _ => return Ok(rollback_outcome_no_op("sync_id missing")),
+    };
+    let device_id = match device_id_str {
+        Some(value) if !value.is_empty() => value,
+        _ => return Ok(rollback_outcome_no_op("device_id missing")),
+    };
+    let session_token = match session_token_str {
+        Some(value) if !value.is_empty() => value,
+        _ => return Ok(rollback_outcome_no_op("session_token missing")),
+    };
+    if device_secret_raw.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
+        return Ok(rollback_outcome_no_op("device_secret missing"));
+    }
+
+    // Snapshot bundle for the CAS-protected clear after the relay call.
+    let snapshot = RollbackCredentialSnapshot {
+        sync_id: sync_id_raw,
+        device_id: device_id_raw,
+        session_token: session_token_raw,
+        device_secret: device_secret_raw.clone(),
+    };
+
+    // Build the relay using only in-memory credentials. ML-DSA generation
+    // `0` matches what `create_sync_group` writes via `import_keyring` —
+    // it's the only value the relay could have observed at registration.
+    let relay = match build_relay(
+        &handle.relay_url,
+        &sync_id,
+        &device_id,
+        &session_token,
+        device_secret_raw,
+        0,
+        handle.allow_insecure,
+        None,
+    ) {
+        Ok(relay) => relay,
+        Err(error) => {
+            return Ok(rollback_outcome_failed("build_relay", redact_display(&error)));
+        }
+    };
+
+    // 1. Try the self-deregister path first. The relay distinguishes this
+    //    from "delete the whole group" by the path/auth: it preserves any
+    //    other devices in the group.
+    match relay.deregister().await {
+        Ok(()) => {
+            clear_rollback_credentials(handle, &snapshot).await;
+            return Ok(rollback_outcome_deregistered());
+        }
+        Err(error) => {
+            if !is_last_active_device_error(&error) {
+                return Ok(rollback_outcome_failed("deregister", redact_display(&error)));
+            }
+            // Fall through to delete_sync_group below.
+            tracing::debug!(
+                "rollback_first_device_registration: deregister rejected as sole active \
+                 device, attempting delete_sync_group fallback"
+            );
+        }
+    }
+
+    // 2. Sole-device fallback. Mirrors the Dart-side reset path
+    //    (`reset_data_provider.dart` ~line 480) which has been the
+    //    canonical handling for this case.
+    match relay.delete_sync_group().await {
+        Ok(()) => {
+            clear_rollback_credentials(handle, &snapshot).await;
+            Ok(rollback_outcome_group_deleted())
+        }
+        Err(error) => Ok(rollback_outcome_failed("delete_sync_group", redact_display(&error))),
+    }
+}
+
+/// Bytes captured from the secure store at the start of
+/// [`rollback_first_device_registration`]. Used as a compare-and-swap token
+/// by [`clear_rollback_credentials`] so a concurrent setup retry that
+/// re-seeded the four keys with NEW values during the relay request window
+/// is not silently overwritten.
+struct RollbackCredentialSnapshot {
+    sync_id: Option<Vec<u8>>,
+    device_id: Option<Vec<u8>>,
+    session_token: Option<Vec<u8>>,
+    device_secret: Option<Vec<u8>>,
+}
+
+/// Detect the relay's "last active device" 403 so we know to fall back to
+/// `delete_sync_group`. Mirrors the substring match used Dart-side in
+/// `_resetSyncSystem` (`reset_data_provider.dart` ~line 479) and the literal
+/// emitted by `do_self_deregister` in
+/// `crates/prism-sync-relay/src/routes/devices.rs`.
+///
+/// `ServerRelay::classify_error` maps HTTP 403 to `RelayError::Auth` (it
+/// shares a bucket with 401), so the substring check has to inspect that
+/// variant too — the body text is preserved in the message there. The
+/// `Forbidden` and `Http { status: 403, .. }` arms cover the other relay
+/// methods (`delete_sync_group`, etc.) that classify 403 differently.
+fn is_last_active_device_error(error: &prism_sync_core::relay::traits::RelayError) -> bool {
+    use prism_sync_core::relay::traits::RelayError;
+    let needle = "last active device";
+    match error {
+        RelayError::Forbidden { message } => message.to_lowercase().contains(needle),
+        RelayError::Http { status: 403, body } => body.to_lowercase().contains(needle),
+        // `classify_error` packs `403`/`401` into Auth with body text in the
+        // message string (`format!("HTTP {status}: {body}")`). Only treat it
+        // as "last active device" if both the 403 marker AND the substring
+        // appear, so a stray "last active device" in an unrelated 401 body
+        // doesn't trigger a destructive group delete.
+        RelayError::Auth { message } => {
+            let lower = message.to_lowercase();
+            lower.contains("http 403") && lower.contains(needle)
+        }
+        _ => false,
+    }
+}
+
+/// Compare-and-swap delete: only remove the four rollback credential keys
+/// if the value still matches the one snapshotted at the start of the
+/// rollback. If a setup retry (or any other writer) updated a key during
+/// the relay request window, leave the new value in place so we don't
+/// silently wipe in-flight credentials that belong to a different
+/// registration attempt.
+///
+/// Best-effort: a failure to read or delete here is not worth surfacing —
+/// the user-visible setup error is already what we propagate, and the Dart
+/// catch path runs `_restoreKeychainSnapshot` after this regardless.
+async fn clear_rollback_credentials(
+    handle: &PrismSyncHandle,
+    snapshot: &RollbackCredentialSnapshot,
+) {
+    let inner = handle.inner.lock().await;
+    let store = inner.secure_store();
+    cas_delete(store.as_ref(), "session_token", snapshot.session_token.as_deref());
+    cas_delete(store.as_ref(), "device_secret", snapshot.device_secret.as_deref());
+    cas_delete(store.as_ref(), "device_id", snapshot.device_id.as_deref());
+    cas_delete(store.as_ref(), "sync_id", snapshot.sync_id.as_deref());
+}
+
+/// Delete `key` only if its current value still equals `expected`. If the
+/// value changed (or a read fails), log at debug level and leave the entry
+/// alone so a concurrent setup retry's freshly-seeded value is preserved.
+fn cas_delete(
+    store: &dyn prism_sync_core::secure_store::SecureStore,
+    key: &str,
+    expected: Option<&[u8]>,
+) {
+    match store.get(key) {
+        Ok(current) => {
+            if current.as_deref() == expected {
+                let _ = store.delete(key);
+            } else {
+                tracing::debug!(
+                    "rollback_first_device_registration: {key} mutated during relay request \
+                     window; skipping clear to preserve concurrent writer's value"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                "rollback_first_device_registration: failed to read {key} during clear: {error}"
+            );
+        }
+    }
+}
+
+fn rollback_outcome_no_op(reason: &str) -> String {
+    serde_json::json!({ "outcome": "no_op", "reason": reason }).to_string()
+}
+
+fn rollback_outcome_deregistered() -> String {
+    serde_json::json!({ "outcome": "deregistered" }).to_string()
+}
+
+fn rollback_outcome_group_deleted() -> String {
+    serde_json::json!({
+        "outcome": "group_deleted",
+        "fallback_from": "last_active_device",
+    })
+    .to_string()
+}
+
+fn rollback_outcome_failed(stage: &str, reason: impl Into<String>) -> String {
+    serde_json::json!({
+        "outcome": "failed",
+        "stage": stage,
+        "reason": reason.into(),
+    })
+    .to_string()
 }
 
 /// Atomically wipe all local sync engine state for the configured sync group.

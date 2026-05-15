@@ -412,10 +412,7 @@ async fn rewrap_dek_rejects_non_utf8_password() {
 
     let result = api::rewrap_dek(&handle, vec![0xff], secret_bytes).await;
     assert!(
-        matches!(
-            result.as_ref().err().map(String::as_str),
-            Some("password must be valid UTF-8")
-        ),
+        matches!(result.as_ref().err().map(String::as_str), Some("password must be valid UTF-8")),
         "rewrap_dek should reject invalid UTF-8 before crypto: {result:?}",
     );
 }

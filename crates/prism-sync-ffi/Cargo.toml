@@ -31,3 +31,4 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
+axum = { workspace = true }
