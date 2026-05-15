@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::error::{CoreError, Result};
 use crate::pairing::compute_epoch_key_hash;
 use crate::recovery::{persist_epoch_cache, persist_epoch_key};
-use crate::relay::SyncRelay;
+use crate::relay::{DeviceInfo, SyncRelay};
 use crate::secure_store::SecureStore;
 use crate::storage::StorageError;
 use prism_sync_crypto::{DeviceSecret, DeviceXWingKey, KeyHierarchy};
@@ -144,18 +144,26 @@ impl EpochManager {
         new_epoch: u32,
         excluded_device_id: Option<&str>,
     ) -> Result<(Zeroizing<Vec<u8>>, HashMap<String, Vec<u8>>)> {
-        // 1. Generate a random 32-byte epoch key
-        let mut epoch_key_bytes = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, epoch_key_bytes.as_mut());
-
-        // 2. List active devices from relay
+        // 1. List active devices from relay
         let devices = relay.list_devices().await.map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("failed to list devices: {e}")))
         })?;
 
-        // 3. For each active surviving device, wrap the epoch key via X-Wing KEM
+        Self::prepare_wrapped_keys_for_devices(&devices, new_epoch, excluded_device_id)
+    }
+
+    pub fn prepare_wrapped_keys_for_devices(
+        devices: &[DeviceInfo],
+        new_epoch: u32,
+        excluded_device_id: Option<&str>,
+    ) -> Result<(Zeroizing<Vec<u8>>, HashMap<String, Vec<u8>>)> {
+        // 1. Generate a random 32-byte epoch key
+        let mut epoch_key_bytes = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, epoch_key_bytes.as_mut());
+
+        // 2. For each active surviving device, wrap the epoch key via X-Wing KEM
         let mut wrapped_keys: HashMap<String, Vec<u8>> = HashMap::with_capacity(devices.len());
-        for device in &devices {
+        for device in devices {
             if device.status != "active" {
                 continue;
             }

@@ -1521,23 +1521,30 @@ impl PrismSync {
             })?
             .to_string();
 
-        // 1. Get current epoch from local metadata
-        let storage = self.storage().clone();
-        let sid = sync_id.clone();
-        let meta = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
-            .await
-            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
-        let current_epoch = meta.map(|m| m.current_epoch).unwrap_or(0);
-        let new_epoch = (current_epoch + 1) as u32;
+        // 1. Use the relay registry epoch for the atomic revoke precondition.
+        //    Local metadata can lag after this device recovers from another
+        //    device's earlier rekey, but the relay is authoritative here.
+        let devices = relay.list_devices().await?;
+        let self_device =
+            devices.iter().find(|device| device.device_id == self_device_id).ok_or_else(|| {
+                CoreError::Engine("current device missing from relay device list".into())
+            })?;
+        if self_device.status != "active" {
+            return Err(CoreError::Engine(format!(
+                "current device is not active in relay device list: {}",
+                self_device.status
+            )));
+        }
+        let new_epoch = self_device.epoch.max(0) as u32 + 1;
 
         // 2. Generate wrapped keys for surviving devices, then perform the
         //    atomic revoke+epoch-rotation request against the relay.
-        let (epoch_key, wrapped_keys) = crate::epoch::EpochManager::prepare_wrapped_keys(
-            relay.as_ref(),
-            new_epoch,
-            Some(target_device_id),
-        )
-        .await?;
+        let (epoch_key, wrapped_keys) =
+            crate::epoch::EpochManager::prepare_wrapped_keys_for_devices(
+                &devices,
+                new_epoch,
+                Some(target_device_id),
+            )?;
 
         let committed_epoch = match relay
             .revoke_device(target_device_id, remote_wipe, new_epoch as i32, wrapped_keys)
@@ -2079,6 +2086,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum RevokeBehavior {
         Success,
+        SuccessWithEpochCheck,
+        AdvanceBeforeEpochCheck,
         CommitThenTimeout,
         TimeoutBeforeCommit,
     }
@@ -2190,7 +2199,36 @@ mod tests {
             state.revoke_calls += 1;
 
             match state.behavior {
-                RevokeBehavior::Success => {
+                RevokeBehavior::Success
+                | RevokeBehavior::SuccessWithEpochCheck
+                | RevokeBehavior::AdvanceBeforeEpochCheck => {
+                    if matches!(state.behavior, RevokeBehavior::AdvanceBeforeEpochCheck) {
+                        for device in &mut state.devices {
+                            if device.status == "active" {
+                                device.epoch += 1;
+                            }
+                        }
+                    }
+                    if matches!(
+                        state.behavior,
+                        RevokeBehavior::SuccessWithEpochCheck
+                            | RevokeBehavior::AdvanceBeforeEpochCheck
+                    ) {
+                        let current_epoch = state
+                            .devices
+                            .iter()
+                            .filter(|device| device.status == "active")
+                            .map(|device| device.epoch)
+                            .max()
+                            .unwrap_or(0);
+                        if new_epoch != current_epoch + 1 {
+                            return Err(RelayError::Protocol {
+                                message: format!(
+                                    "new_epoch must be current_epoch + 1 (current={current_epoch}, got={new_epoch})"
+                                ),
+                            });
+                        }
+                    }
                     Self::commit_revoke(&mut state, device_id, new_epoch, wrapped_keys);
                     Ok(new_epoch)
                 }
@@ -2978,6 +3016,118 @@ mod tests {
         assert!(sync.key_hierarchy().has_epoch_key(1));
         assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 1);
         assert!(sync.secure_store().get("epoch_key_1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_uses_relay_epoch_when_local_metadata_is_stale() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, sync.device_secret().unwrap(), 6, "active"),
+                make_device_info(target_device_id, &target_secret, 6, "active"),
+            ],
+            RevokeBehavior::SuccessWithEpochCheck,
+        ));
+
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
+
+        assert_eq!(committed_epoch, 7);
+        assert_eq!(relay.revoke_calls(), 1);
+        assert_eq!(sync.epoch(), Some(7));
+        assert!(sync.key_hierarchy().has_epoch_key(7));
+        assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 7);
+        assert!(sync.secure_store().get("epoch_key_7").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_uses_relay_epoch_when_persisted_metadata_is_stale() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, sync.device_secret().unwrap(), 6, "active"),
+                make_device_info(target_device_id, &target_secret, 6, "active"),
+            ],
+            RevokeBehavior::SuccessWithEpochCheck,
+        ));
+
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.update_current_epoch("sync-1", 3).unwrap();
+            tx.commit().unwrap();
+        }
+        sync.secure_store().set("epoch", b"3").unwrap();
+
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            3,
+            0,
+        );
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
+
+        assert_eq!(committed_epoch, 7);
+        assert_eq!(relay.revoke_calls(), 1);
+        assert_eq!(sync.epoch(), Some(7));
+        assert!(sync.key_hierarchy().has_epoch_key(7));
+        assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 7);
+        assert!(sync.secure_store().get("epoch_key_7").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_does_not_commit_local_epoch_after_relay_epoch_race() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, sync.device_secret().unwrap(), 6, "active"),
+                make_device_info(target_device_id, &target_secret, 6, "active"),
+            ],
+            RevokeBehavior::AdvanceBeforeEpochCheck,
+        ));
+
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
+
+        let error =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap_err();
+
+        assert!(error.to_string().contains("new_epoch must be current_epoch + 1"));
+        assert_eq!(relay.revoke_calls(), 1);
+        assert_eq!(sync.epoch(), Some(0));
+        assert!(!sync.key_hierarchy().has_epoch_key(7));
+        assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
+        assert!(sync.secure_store().get("epoch_key_7").unwrap().is_none());
     }
 
     #[tokio::test]
