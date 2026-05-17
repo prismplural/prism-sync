@@ -2,6 +2,14 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.9.0] - 2026-05-16
+
+Tagged for the matching `prism-app 0.9.0+9001` release. Cargo crate versions remain `0.1.1`.
+
+### Fixed
+- `crates/prism-sync-ffi` windows build: `windows/CMakeLists.txt` now passes the cargo crate name `prism_sync_ffi` (matching `[lib]` in `crates/prism-sync-ffi/Cargo.toml` and what `linux/CMakeLists.txt` passes) instead of `prism_sync`. Cargo produced `prism_sync_ffi.dll` while cargokit's install rule looked for `prism_sync.dll`, so `cmake_install` failed with the misleading "cannot find ... File exists" wording on windows.
+- Device revoke now uses the relay epoch instead of the local epoch when sealing the revoke envelope, so a stale local epoch can't leave a revoke un-applied on the relay.
+
 ## [0.1.1] - 2026-05-11
 
 ### Added
