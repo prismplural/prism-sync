@@ -296,7 +296,7 @@ impl Config {
             ),
             nonce_rate_limit: parse_env_with(&env, "NONCE_RATE_LIMIT", 10),
             nonce_rate_window_secs: parse_env_with(&env, "NONCE_RATE_WINDOW_SECS", 60),
-            revoke_rate_limit: parse_env_with(&env, "REVOKE_RATE_LIMIT", 2),
+            revoke_rate_limit: parse_env_with(&env, "REVOKE_RATE_LIMIT", 20),
             revoke_rate_window_secs: parse_env_with(&env, "REVOKE_RATE_WINDOW_SECS", 3600),
             ws_upgrade_rate_limit: parse_env_with(&env, "WS_UPGRADE_RATE_LIMIT", 20),
             ws_upgrade_rate_window_secs: parse_env_with(&env, "WS_UPGRADE_RATE_WINDOW_SECS", 60),
