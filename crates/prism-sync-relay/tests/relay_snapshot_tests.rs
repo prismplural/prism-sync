@@ -696,3 +696,60 @@ async fn test_snapshot_uses_its_own_timeout_not_the_default() {
 
     assert_eq!(resp.status(), 204);
 }
+
+#[tokio::test]
+async fn test_non_snapshot_route_still_respects_default_timeout() {
+    // Inverse of `test_snapshot_uses_its_own_timeout_not_the_default`. If a
+    // future refactor accidentally moved /changes into the snapshot sub-router,
+    // the snapshot timeout (5 min in production, 30s here) would shadow the
+    // default and this test would catch it.
+    //
+    // default=2s, snapshot=30s. Slow-stream a /changes PUT that takes ~3.5s.
+    // Expect 408 from the default scope OR a client-side transport error
+    // (server drops mid-write).
+    let config = timeout_test_config(2, 30);
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // Body content doesn't matter — auth will accept the signature over the
+    // bytes we sign, and the handler would reject malformed JSON normally,
+    // but the timeout fires during body buffering before the handler runs.
+    let body_bytes = vec![b'{'; 64 * 1024]; // 64 KB of garbage
+    let path = format!("/v1/sync/{sync_id}/changes");
+    let builder = client
+        .put(format!("{url}{path}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .header("Content-Type", "application/json");
+    let signed = apply_signed_headers(
+        builder,
+        &keys,
+        "PUT",
+        &path,
+        &sync_id,
+        &device_id,
+        &body_bytes,
+    );
+    // Stream the body at 8 KB / 450 ms → ~3.6s total, well past the 2s default.
+    let result = signed
+        .body(slow_body(body_bytes, 8 * 1024, Duration::from_millis(450)))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) => assert_eq!(
+            resp.status(),
+            408,
+            "slow /changes PUT should be rejected by the default timeout, \
+             not allowed to run to completion under the snapshot's wider scope"
+        ),
+        Err(err) => assert!(
+            err.is_request() || err.is_body() || err.is_timeout() || err.is_connect(),
+            "expected client-side transport error when server drops mid-write; got: {err}"
+        ),
+    }
+}
