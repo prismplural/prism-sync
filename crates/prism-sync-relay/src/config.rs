@@ -669,6 +669,13 @@ mod tests {
     }
 
     #[test]
+    fn default_revoke_rate_limit_allows_cleanup_bursts() {
+        let config = config_from_env_pairs(&[]).unwrap();
+
+        assert_eq!(config.revoke_rate_limit, 20);
+    }
+
+    #[test]
     fn rejects_apple_attestation_enabled_without_trust_roots() {
         let err = config_from_env_pairs(&[("FIRST_DEVICE_APPLE_ATTESTATION_ENABLED", "true")])
             .unwrap_err();

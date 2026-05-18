@@ -163,7 +163,7 @@ All environment variables with their defaults. Everything is production-ready ou
 |----------|---------|-------------|
 | `NONCE_RATE_LIMIT` | `10` | Max registration nonces per sync group per window |
 | `NONCE_RATE_WINDOW_SECS` | `60` | Nonce rate limit window |
-| `REVOKE_RATE_LIMIT` | `2` | Max device revocations per group per window |
+| `REVOKE_RATE_LIMIT` | `20` | Max device revocations per group per window |
 | `REVOKE_RATE_WINDOW_SECS` | `3600` | Revocation rate limit window |
 
 ### Maintenance
