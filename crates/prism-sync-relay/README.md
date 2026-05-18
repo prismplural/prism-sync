@@ -24,6 +24,12 @@ All configuration via environment variables:
 | MAX_UNPRUNED_BATCHES | 10000 | Max batches before rejecting push |
 | METRICS_TOKEN | (none) | Optional bearer token for /metrics |
 | RUST_LOG | info | Tracing log level |
+| DEFAULT_REQUEST_TIMEOUT_SECS | 30 | Per-request timeout for light routes (408 on expiry) |
+| SNAPSHOT_REQUEST_TIMEOUT_SECS | 300 | Per-request timeout for `PUT /snapshot` (5 min for large uploads on slow connections) |
+| MEDIA_REQUEST_TIMEOUT_SECS | 120 | Per-request timeout for media upload/download (covers up to response headers; streamed download bodies continue past) |
+| DEFAULT_REQUEST_CONCURRENCY | 512 | Max in-flight light requests (must be ≥ 1) |
+| SNAPSHOT_UPLOAD_CONCURRENCY | 8 | Max in-flight snapshot PUTs; bounds peak memory (must be ≥ 1) |
+| MEDIA_UPLOAD_CONCURRENCY | 32 | Max in-flight media uploads/downloads (must be ≥ 1) |
 
 ## API Endpoints
 

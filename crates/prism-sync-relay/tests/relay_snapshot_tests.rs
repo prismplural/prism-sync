@@ -522,3 +522,177 @@ async fn test_snapshot_delete_accepts_request_with_body() {
             .unwrap();
     assert_eq!(resp.status(), 204, "DELETE must succeed regardless of body (body is ignored)",);
 }
+
+// ───────────────────────── Per-route timeout scoping ─────────────────────────
+//
+// These tests confirm that `PUT /v1/sync/{sync_id}/snapshot` is wrapped by its
+// own `TimeoutLayer` with the configured `snapshot_request_timeout_secs`, and
+// that the default-route timeout does NOT apply to it. The 30s production
+// global timeout used to clip large snapshot uploads on slow connections,
+// surfacing to users as 502 (broken pipe at cloudflared) on the pair flow.
+
+use std::time::Duration;
+
+/// Build a `reqwest::Body` that emits `bytes` slowly, one chunk at a time.
+///
+/// Signs over the full `bytes` slice (already done by `apply_signed_headers`),
+/// but the wire transfer is paced so the request body extraction on the relay
+/// takes long enough to exercise the timeout.
+fn slow_body(bytes: Vec<u8>, chunk_size: usize, interval: Duration) -> reqwest::Body {
+    use futures::stream::{self, StreamExt};
+
+    let chunk_size = chunk_size.max(1);
+    let chunks: Vec<Vec<u8>> = bytes.chunks(chunk_size).map(<[u8]>::to_vec).collect();
+    let stream = stream::iter(chunks).then(move |chunk| async move {
+        tokio::time::sleep(interval).await;
+        Ok::<_, std::io::Error>(chunk)
+    });
+    reqwest::Body::wrap_stream(stream)
+}
+
+/// Build a Config tuned for the timeout tests below.
+fn timeout_test_config(default_secs: u64, snapshot_secs: u64) -> prism_sync_relay::config::Config {
+    let mut config = test_config();
+    config.default_request_timeout_secs = default_secs;
+    config.snapshot_request_timeout_secs = snapshot_secs;
+    config
+}
+
+/// Snapshot PUT that streams the body slowly. Signs over `snapshot_data` so
+/// the request is otherwise indistinguishable from a normal upload.
+#[allow(clippy::too_many_arguments)]
+async fn put_snapshot_with_slow_body(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    server_seq_at: &str,
+    snapshot_data: Vec<u8>,
+    chunk_size: usize,
+    interval: Duration,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let path = format!("/v1/sync/{sync_id}/snapshot");
+    let builder = client
+        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", device_id)
+        .header("X-Server-Seq-At", server_seq_at);
+    apply_signed_headers(builder, keys, "PUT", &path, sync_id, device_id, &snapshot_data)
+        .body(slow_body(snapshot_data, chunk_size, interval))
+        .send()
+        .await
+}
+
+#[tokio::test]
+async fn test_snapshot_put_completes_past_default_timeout() {
+    // default=1s would have killed any upload >1s under the old global timeout.
+    // snapshot=10s gives this 1 MB upload enough room to finish despite the
+    // slow body pacing (~1.5s wall clock here).
+    let config = timeout_test_config(1, 10);
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let snapshot = vec![0u8; 1024 * 1024]; // 1 MB
+    let resp = put_snapshot_with_slow_body(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        snapshot,
+        128 * 1024, // 128 KB chunks → 8 chunks total
+        Duration::from_millis(200),
+    )
+    .await
+    .expect("slow snapshot upload should complete");
+
+    assert_eq!(
+        resp.status(),
+        204,
+        "snapshot PUT should succeed within its own (longer) timeout window \
+         even when the upload exceeds the default 1s timeout"
+    );
+}
+
+#[tokio::test]
+async fn test_snapshot_put_times_out_at_its_own_ceiling() {
+    // snapshot=2s; body paced to take ~5s. Expect 408 (or the client-side
+    // equivalent of "server closed mid-write"). We accept either a clean 408
+    // or a client-side connection error, because once the server drops the
+    // TCP socket, reqwest may surface it as a transport error rather than a
+    // response.
+    let config = timeout_test_config(1, 2);
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let snapshot = vec![0u8; 512 * 1024]; // 512 KB
+    let result = put_snapshot_with_slow_body(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        snapshot,
+        32 * 1024, // 32 KB chunks → 16 chunks
+        Duration::from_millis(350), // ~5.6s total
+    )
+    .await;
+
+    match result {
+        Ok(resp) => assert_eq!(
+            resp.status(),
+            408,
+            "slow snapshot exceeding its own timeout should be rejected with 408"
+        ),
+        Err(err) => assert!(
+            err.is_request() || err.is_body() || err.is_timeout() || err.is_connect(),
+            "expected a client-side transport error when server drops the socket; got: {err}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn test_snapshot_uses_its_own_timeout_not_the_default() {
+    // Sanity check that the two scopes are genuinely independent: pin
+    // default to 1s and snapshot to 30s, then upload a 256 KB body paced to
+    // take ~2.5s. Default would kill it, snapshot allows it.
+    let config = timeout_test_config(1, 30);
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let snapshot = vec![0u8; 256 * 1024];
+    let resp = put_snapshot_with_slow_body(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        snapshot,
+        32 * 1024,
+        Duration::from_millis(350),
+    )
+    .await
+    .expect("upload should complete under the snapshot timeout");
+
+    assert_eq!(resp.status(), 204);
+}

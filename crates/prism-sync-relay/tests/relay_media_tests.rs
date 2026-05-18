@@ -85,6 +85,12 @@ fn base_test_config() -> Config {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     }
 }
 
@@ -638,4 +644,66 @@ async fn upload_rate_limited() {
         upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "rate-media-003", &data3)
             .await;
     assert_eq!(resp.status(), 429, "third upload should be rate limited");
+}
+
+// ───────────────────────── Per-route timeout scoping ─────────────────────────
+
+use std::time::Duration;
+
+/// Build a `reqwest::Body` that emits `bytes` slowly so request-body extraction
+/// on the relay takes longer than the default-route timeout. Used to verify
+/// that media upload has its own, longer `TimeoutLayer` scope.
+fn slow_body(bytes: Vec<u8>, chunk_size: usize, interval: Duration) -> reqwest::Body {
+    use futures::stream::{self, StreamExt};
+
+    let chunk_size = chunk_size.max(1);
+    let chunks: Vec<Vec<u8>> = bytes.chunks(chunk_size).map(<[u8]>::to_vec).collect();
+    let stream = stream::iter(chunks).then(move |chunk| async move {
+        tokio::time::sleep(interval).await;
+        Ok::<_, std::io::Error>(chunk)
+    });
+    reqwest::Body::wrap_stream(stream)
+}
+
+#[tokio::test]
+async fn media_upload_completes_past_default_timeout() {
+    // default=1s would have killed any upload >1s. media=10s gives this
+    // small blob enough room despite slow pacing.
+    let mut config = base_test_config();
+    config.default_request_timeout_secs = 1;
+    config.media_request_timeout_secs = 10;
+
+    let (url, _handle, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+
+    db.with_conn(|conn| {
+        db::create_sync_group(conn, &sync_id, 0)?;
+        Ok(())
+    })
+    .unwrap();
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data: Vec<u8> = vec![0u8; 256 * 1024]; // 256 KB
+    let hash = sha256_hex(&data);
+    let path = format!("/v1/sync/{sync_id}/media");
+    let builder = client
+        .post(format!("{url}{path}"))
+        .bearer_auth(&token)
+        .header("X-Media-Id", "slow-media-001")
+        .header("X-Content-Hash", &hash);
+
+    let resp = apply_signed_headers(builder, &keys, "POST", &path, &sync_id, &device_id, &data)
+        .body(slow_body(data, 32 * 1024, Duration::from_millis(250)))
+        .send()
+        .await
+        .expect("slow media upload should complete");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "media POST should succeed within its own (longer) timeout window \
+         even when the upload exceeds the default 1s timeout"
+    );
 }

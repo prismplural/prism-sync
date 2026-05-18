@@ -13,3 +13,17 @@ data:
   # Keep data for 1 year instead of 90 days (prevents auto-deletion on private relays)
   SYNC_INACTIVE_TTL_SECS: "31536000"
   REGISTRATION_ENABLED: "true"
+  # Request timeouts (seconds) — heavy upload routes get more headroom than
+  # the default because real-world snapshots can be 30-150 MB and need
+  # minutes over slow mobile links. Lower if you have a fast, controlled
+  # network and want tighter SLOs.
+  DEFAULT_REQUEST_TIMEOUT_SECS: "30"
+  SNAPSHOT_REQUEST_TIMEOUT_SECS: "300"
+  MEDIA_REQUEST_TIMEOUT_SECS: "120"
+  # Concurrency caps — each in-flight snapshot PUT buffers up to 150 MB in
+  # memory, so this bounds peak RAM. Lower these (and the deployment's
+  # memory limit) to fit on smaller nodes; raise them for high-throughput
+  # public relays after measuring.
+  DEFAULT_REQUEST_CONCURRENCY: "512"
+  SNAPSHOT_UPLOAD_CONCURRENCY: "8"
+  MEDIA_UPLOAD_CONCURRENCY: "32"

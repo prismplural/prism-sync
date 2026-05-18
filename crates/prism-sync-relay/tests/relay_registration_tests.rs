@@ -429,6 +429,12 @@ async fn test_registration_rejects_expired_nonce() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -556,6 +562,12 @@ async fn test_nonce_rate_limiting() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -707,6 +719,12 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -831,6 +849,12 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1006,6 +1030,12 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1167,6 +1197,12 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1521,6 +1557,12 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -1919,6 +1961,12 @@ async fn test_nonce_rate_limiting_window_expiry() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, db) = start_test_relay_with_config(config).await;
@@ -2992,6 +3040,12 @@ async fn test_revoke_rate_limiting() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let db = Database::in_memory().expect("in-memory db");
@@ -4021,6 +4075,12 @@ fn default_test_config() -> Config {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     }
 }
 

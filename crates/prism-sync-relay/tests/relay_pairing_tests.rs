@@ -295,6 +295,12 @@ async fn test_pairing_expired_session_returns_404() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -426,6 +432,12 @@ async fn test_pairing_rate_limiting_ignores_spoofed_forwarded_headers() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
     let (url, _server, _db) = start_test_relay_with_config(config).await;
     let client = Client::new();
@@ -519,6 +531,12 @@ async fn test_pairing_payload_too_large_returns_413() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;
@@ -605,6 +623,12 @@ async fn test_pairing_put_slot_payload_too_large() {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     };
 
     let (url, _server, _db) = start_test_relay_with_config(config).await;

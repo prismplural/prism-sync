@@ -94,6 +94,12 @@ fn base_test_config() -> Config {
         gif_request_rate_limit: 20,
         gif_request_rate_window_secs: 60,
         gif_query_max_len: 200,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
     }
 }
 

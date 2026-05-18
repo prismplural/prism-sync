@@ -439,8 +439,9 @@ pub async fn put_snapshot(
     let db = state.db.clone();
     let sid = sync_id.clone();
     let did = device_id;
-    let data = body.to_vec();
-
+    // `body` is a `bytes::Bytes` — cheap to move into the blocking task
+    // (reference-counted, no allocation). Avoid an extra ~150 MB copy via
+    // `body.to_vec()` that the handler used to do.
     tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             Ok(do_put_snapshot(
@@ -448,7 +449,7 @@ pub async fn put_snapshot(
                 &sid,
                 &did,
                 server_seq_at,
-                &data,
+                &body,
                 expires_at,
                 target_device_id.as_deref(),
             ))

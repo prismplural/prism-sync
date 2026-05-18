@@ -40,11 +40,16 @@ spec:
               mountPath: /data
           resources:
             requests:
-              memory: "128Mi"
+              memory: "256Mi"
               cpu: "100m"
+            # Memory limit budgets for the worst-case in-flight upload mix:
+            # 8 snapshot PUTs × 150 MB = 1.2 GB, plus 32 media uploads × 10 MB
+            # = 320 MB, plus baseline + headroom. Lower the concurrency knobs
+            # (SNAPSHOT_UPLOAD_CONCURRENCY, MEDIA_UPLOAD_CONCURRENCY) in the
+            # ConfigMap if you want to fit on a smaller node.
             limits:
-              memory: "512Mi"
-              cpu: "500m"
+              memory: "2Gi"
+              cpu: "1000m"
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

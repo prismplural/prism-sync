@@ -14,6 +14,8 @@ pub enum ConfigError {
         "FIRST_DEVICE_ANDROID_ATTESTATION_ENABLED=true requires FIRST_DEVICE_ANDROID_ATTESTATION_TRUST_ROOTS_PEM"
     )]
     AndroidAttestationEnabledWithoutTrustRoots,
+    #[error("{key} must be >= 1 (a zero concurrency cap blocks requests indefinitely)")]
+    ConcurrencyLimitZero { key: &'static str },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +150,29 @@ pub struct Config {
     pub media_upload_rate_window_secs: u64,
     /// Interval in seconds for cleaning up orphaned media files.
     pub media_orphan_cleanup_secs: u64,
+    /// Wall-clock timeout applied to most non-WebSocket routes. Returns 408 on
+    /// expiry. Heavy upload routes (snapshot, media) have their own longer
+    /// timeouts so large transfers over slow connections don't trip this cap.
+    pub default_request_timeout_secs: u64,
+    /// Timeout for PUT /v1/sync/{sync_id}/snapshot. Encrypted snapshots up to
+    /// `MAX_SNAPSHOT_WIRE_BYTES` (~150 MB) need significantly longer than the
+    /// default to upload over slow mobile links.
+    pub snapshot_request_timeout_secs: u64,
+    /// Timeout for media upload/download. Sized between the default and the
+    /// snapshot timeout because `media_max_file_bytes` is smaller. Covers
+    /// request handling through response headers only; streaming response
+    /// bodies (downloads) continue past this deadline.
+    pub media_request_timeout_secs: u64,
+    /// Maximum simultaneous in-flight snapshot PUTs. Each upload buffers the
+    /// full body in memory before signature verification, so this directly
+    /// bounds peak memory. Must be >= 1; zero would deadlock the route.
+    pub snapshot_upload_concurrency: usize,
+    /// Maximum simultaneous in-flight media upload/download requests. Same
+    /// memory-bounding intent as `snapshot_upload_concurrency`. Must be >= 1.
+    pub media_upload_concurrency: usize,
+    /// Maximum simultaneous in-flight requests on light (non-heavy-upload)
+    /// routes. Replaces the historical global concurrency cap. Must be >= 1.
+    pub default_request_concurrency: usize,
     /// GIF provider mode for chat GIF search.
     pub gif_provider_mode: GifProviderMode,
     /// Public base URL that clients should use for GIF API calls when this relay
@@ -235,6 +260,22 @@ impl Config {
             && first_device_android_attestation_trust_roots_pem.is_empty()
         {
             return Err(ConfigError::AndroidAttestationEnabledWithoutTrustRoots);
+        }
+
+        let snapshot_upload_concurrency: usize =
+            parse_env_with(&env, "SNAPSHOT_UPLOAD_CONCURRENCY", 8);
+        if snapshot_upload_concurrency == 0 {
+            return Err(ConfigError::ConcurrencyLimitZero { key: "SNAPSHOT_UPLOAD_CONCURRENCY" });
+        }
+        let media_upload_concurrency: usize =
+            parse_env_with(&env, "MEDIA_UPLOAD_CONCURRENCY", 32);
+        if media_upload_concurrency == 0 {
+            return Err(ConfigError::ConcurrencyLimitZero { key: "MEDIA_UPLOAD_CONCURRENCY" });
+        }
+        let default_request_concurrency: usize =
+            parse_env_with(&env, "DEFAULT_REQUEST_CONCURRENCY", 512);
+        if default_request_concurrency == 0 {
+            return Err(ConfigError::ConcurrencyLimitZero { key: "DEFAULT_REQUEST_CONCURRENCY" });
         }
 
         Ok(Self {
@@ -331,6 +372,16 @@ impl Config {
                 60,
             ),
             media_orphan_cleanup_secs: parse_env_with(&env, "MEDIA_ORPHAN_CLEANUP_SECS", 86400),
+            default_request_timeout_secs: parse_env_with(&env, "DEFAULT_REQUEST_TIMEOUT_SECS", 30),
+            snapshot_request_timeout_secs: parse_env_with(
+                &env,
+                "SNAPSHOT_REQUEST_TIMEOUT_SECS",
+                300,
+            ),
+            media_request_timeout_secs: parse_env_with(&env, "MEDIA_REQUEST_TIMEOUT_SECS", 120),
+            snapshot_upload_concurrency,
+            media_upload_concurrency,
+            default_request_concurrency,
             gif_provider_mode: parse_gif_provider_mode_env_with(
                 &env,
                 "GIF_PROVIDER_MODE",
@@ -701,5 +752,82 @@ mod tests {
         );
         assert!(GENERATED_REGISTRATION_TOKEN_LOG_MESSAGE
             .contains("the full token is not printed in logs"));
+    }
+
+    #[test]
+    fn request_timeout_and_concurrency_defaults_match_documented_values() {
+        let config = config_from_env_pairs(&[]).unwrap();
+
+        assert_eq!(config.default_request_timeout_secs, 30);
+        assert_eq!(config.snapshot_request_timeout_secs, 300);
+        assert_eq!(config.media_request_timeout_secs, 120);
+        assert_eq!(config.snapshot_upload_concurrency, 8);
+        assert_eq!(config.media_upload_concurrency, 32);
+        assert_eq!(config.default_request_concurrency, 512);
+    }
+
+    #[test]
+    fn request_timeout_and_concurrency_honor_env_overrides() {
+        let config = config_from_env_pairs(&[
+            ("DEFAULT_REQUEST_TIMEOUT_SECS", "45"),
+            ("SNAPSHOT_REQUEST_TIMEOUT_SECS", "600"),
+            ("MEDIA_REQUEST_TIMEOUT_SECS", "180"),
+            ("SNAPSHOT_UPLOAD_CONCURRENCY", "4"),
+            ("MEDIA_UPLOAD_CONCURRENCY", "16"),
+            ("DEFAULT_REQUEST_CONCURRENCY", "256"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.default_request_timeout_secs, 45);
+        assert_eq!(config.snapshot_request_timeout_secs, 600);
+        assert_eq!(config.media_request_timeout_secs, 180);
+        assert_eq!(config.snapshot_upload_concurrency, 4);
+        assert_eq!(config.media_upload_concurrency, 16);
+        assert_eq!(config.default_request_concurrency, 256);
+    }
+
+    #[test]
+    fn invalid_request_timeout_env_falls_back_to_default() {
+        // `parse_env_with` silently falls back on parse failure (existing
+        // convention). A timeout knob with garbage shouldn't crash the relay
+        // — it just uses the default.
+        let config = config_from_env_pairs(&[
+            ("DEFAULT_REQUEST_TIMEOUT_SECS", "not-a-number"),
+            ("SNAPSHOT_REQUEST_TIMEOUT_SECS", "abc"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.default_request_timeout_secs, 30);
+        assert_eq!(config.snapshot_request_timeout_secs, 300);
+    }
+
+    #[test]
+    fn zero_snapshot_upload_concurrency_is_rejected() {
+        let err =
+            config_from_env_pairs(&[("SNAPSHOT_UPLOAD_CONCURRENCY", "0")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConcurrencyLimitZero { key: "SNAPSHOT_UPLOAD_CONCURRENCY" }
+        );
+    }
+
+    #[test]
+    fn zero_media_upload_concurrency_is_rejected() {
+        let err =
+            config_from_env_pairs(&[("MEDIA_UPLOAD_CONCURRENCY", "0")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConcurrencyLimitZero { key: "MEDIA_UPLOAD_CONCURRENCY" }
+        );
+    }
+
+    #[test]
+    fn zero_default_request_concurrency_is_rejected() {
+        let err =
+            config_from_env_pairs(&[("DEFAULT_REQUEST_CONCURRENCY", "0")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConcurrencyLimitZero { key: "DEFAULT_REQUEST_CONCURRENCY" }
+        );
     }
 }

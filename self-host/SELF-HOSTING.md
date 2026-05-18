@@ -189,6 +189,29 @@ All environment variables with their defaults. Everything is production-ready ou
 | `MEDIA_UPLOAD_RATE_WINDOW_SECS` | `60` | Rate limit sliding window |
 | `MEDIA_ORPHAN_CLEANUP_SECS` | `86400` | Interval for cleaning up orphaned media files (24 hours) |
 
+### Request Timeouts and Concurrency
+
+Each route has a wall-clock timeout. Returns `408 Request Timeout` on expiry.
+Heavy upload routes have their own (much larger) timeouts because real-world
+encrypted snapshots can reach 150 MB and need minutes to upload over slow
+mobile links. Concurrency caps bound in-memory body buffering — the per-route
+defaults are sized so the worst case fits comfortably under a 4 GB RAM budget
+(8 × 150 MB snapshot uploads = 1.2 GB; 32 × 10 MB media uploads = 320 MB; light
+routes are cheap).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEFAULT_REQUEST_TIMEOUT_SECS` | `30` | Timeout for light routes (sync, devices, sharing, registration, health, metrics, WebSocket upgrade) |
+| `SNAPSHOT_REQUEST_TIMEOUT_SECS` | `300` | Timeout for `PUT /v1/sync/{sync_id}/snapshot` (5 min — fits 150 MB at ~500 KB/s) |
+| `MEDIA_REQUEST_TIMEOUT_SECS` | `120` | Timeout for media upload/download (2 min — covers request handling through response headers; streamed download bodies continue past this deadline) |
+| `DEFAULT_REQUEST_CONCURRENCY` | `512` | Max simultaneous in-flight light requests. Must be ≥ 1 |
+| `SNAPSHOT_UPLOAD_CONCURRENCY` | `8` | Max simultaneous in-flight snapshot PUTs. Each buffers the full body in memory. Must be ≥ 1 |
+| `MEDIA_UPLOAD_CONCURRENCY` | `32` | Max simultaneous in-flight media uploads/downloads. Must be ≥ 1 |
+
+A concurrency value of `0` is rejected at startup — a zero-permit semaphore
+would queue requests forever inside `poll_ready`, where the timeout does not
+apply.
+
 ### Anti-Abuse
 
 | Variable | Default | Description |

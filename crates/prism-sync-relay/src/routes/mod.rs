@@ -19,7 +19,7 @@ use axum::{
 };
 use base64::Engine;
 use std::net::{IpAddr, SocketAddr};
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
@@ -282,23 +282,54 @@ fn ipv6_prefix_mask(prefix: u8) -> u128 {
 
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
-    // Snapshot PUT accepts the full encrypted+base64 envelope (up to
-    // ~150 MB). GET and DELETE carry no bodies in practice, so they live
-    // in the normal authenticated router under the global 10 MiB cap —
-    // there is no reason to give unbounded body room to methods that
-    // don't read a body. The large body-limit layer is scoped to PUT only.
+    // Snapshot PUT — heavy upload, large body, slow-network tolerant.
+    //
+    // Layer order (innermost to outermost): handler → auth → body limits →
+    // concurrency → timeout. The timeout therefore wraps the entire request
+    // including auth and body buffering, matching the previous global
+    // timeout's semantics — just with a far higher ceiling because real
+    // pair-time snapshots can be 30-150 MB and need minutes on slow mobile
+    // links.
+    //
+    // Known limitation: `TimeoutLayer` cancels by dropping the request
+    // future, but `tokio::task::spawn_blocking` inside `put_snapshot`
+    // continues to completion. A timed-out blocking write can still commit
+    // after the client gives up. The current `upsert_snapshot` SQL uses
+    // `ON CONFLICT(sync_id) DO UPDATE`, so a late commit can overwrite a
+    // newer snapshot — a pre-existing race not introduced (or fixed) by
+    // this scoping. Track separately if it matters in practice.
+    //
+    // Also note: concurrency-permit acquisition happens in `poll_ready`,
+    // which is NOT timed by `TimeoutLayer` (it only times `call`). A
+    // saturated route queues, it doesn't fast-fail with 408.
     let snapshot_put_route = Router::new()
         .route("/v1/sync/{sync_id}/snapshot", put(sync::put_snapshot))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_WIRE_BYTES))
         .layer(RequestBodyLimitLayer::new(MAX_SNAPSHOT_WIRE_BYTES))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(GlobalConcurrencyLimitLayer::new(state.config.snapshot_upload_concurrency))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(state.config.snapshot_request_timeout_secs),
+        ));
 
+    // Media routes — moderate-size upload + streaming download.
+    //
+    // The timeout only covers request handling through the moment response
+    // headers are produced. Streaming response bodies (e.g. `Body::from_stream`
+    // returned by `download_media`) continue past this deadline; use a
+    // `ResponseBodyTimeoutLayer` if you need to bound total transfer time.
     let media_routes = Router::new()
         .route("/v1/sync/{sync_id}/media", post(media::upload_media))
         .route("/v1/sync/{sync_id}/media/{media_id}", get(media::download_media))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(DefaultBodyLimit::max(state.config.media_max_file_bytes))
         .layer(RequestBodyLimitLayer::new(state.config.media_max_file_bytes))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(GlobalConcurrencyLimitLayer::new(state.config.media_upload_concurrency))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(state.config.media_request_timeout_secs),
+        ));
 
     // Routes that require authentication (small-body — capped at 10 MiB by
     // the global body limit applied below).
@@ -336,8 +367,6 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
 
-    let authenticated_routes = authenticated_routes.merge(snapshot_put_route).merge(media_routes);
-
     // Routes that do NOT require authentication.
     let public_routes = Router::new()
         .merge(register::routes())
@@ -351,11 +380,17 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
 
-    // Relay is accessed only by native clients — no browser origin is expected.
-    // Default CorsLayer rejects all cross-origin requests.
-    let cors = CorsLayer::new();
-
-    Router::new()
+    // Default-timeout routes: everything that's not snapshot PUT or media.
+    // Returns 408 on expiry. WebSocket upgrades complete inside this window;
+    // the long-lived WS connection runs after upgrade and is unaffected.
+    //
+    // The default concurrency cap replaces the historical outer
+    // `ConcurrencyLimitLayer(512)` and prevents connection exhaustion on
+    // light routes. Heavy upload routes have their own (much smaller) caps
+    // sized for memory headroom.
+    let default_request_timeout_secs = state.config.default_request_timeout_secs;
+    let default_request_concurrency = state.config.default_request_concurrency;
+    let default_timeout_routes = Router::new()
         .merge(public_routes)
         .merge(authenticated_routes)
         .merge(metrics::routes())
@@ -363,10 +398,25 @@ pub fn router(state: AppState) -> Router {
             "/health",
             axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         )
+        .layer(GlobalConcurrencyLimitLayer::new(default_request_concurrency))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(default_request_timeout_secs),
+        ));
+
+    // Relay is accessed only by native clients — no browser origin is expected.
+    // Default CorsLayer rejects all cross-origin requests.
+    let cors = CorsLayer::new();
+
+    // Outer router carries only cross-cutting layers (CORS, request id,
+    // tracing). Timeouts and concurrency caps live on each sub-router so
+    // heavy upload routes can have their own ceilings without affecting
+    // light routes.
+    Router::new()
+        .merge(default_timeout_routes)
+        .merge(snapshot_put_route)
+        .merge(media_routes)
         .layer(cors)
-        // Body limits are applied per sub-router above so the snapshot PUT
-        // can accept MAX_SNAPSHOT_WIRE_BYTES while everything else stays
-        // capped at 10 MiB (or media_max_file_bytes for media routes).
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(
             TraceLayer::new_for_http()
@@ -386,15 +436,6 @@ pub fn router(state: AppState) -> Router {
                 })
                 .on_response(DefaultOnResponse::new().level(Level::DEBUG)),
         )
-        // 30s timeout for non-WebSocket requests (returns 408 on expiry).
-        // WebSocket upgrades complete before the timeout fires, so long-lived
-        // WS connections are unaffected.
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(30),
-        ))
-        // Cap concurrent in-flight requests to prevent connection exhaustion.
-        .layer(ConcurrencyLimitLayer::new(512))
         .with_state(state)
 }
 
