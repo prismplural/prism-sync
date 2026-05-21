@@ -32,6 +32,15 @@ const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 #[cfg(test)]
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 
+fn diag_hash(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(&digest[..8])
+}
+
+fn diag_prefix(bytes: &[u8]) -> String {
+    hex::encode(&bytes[..bytes.len().min(8)])
+}
+
 /// Orchestrates sync group creation and joining.
 ///
 /// Holds a shared reference to the secure store (for credential persistence).
@@ -575,15 +584,24 @@ impl PairingService {
         mnemonic: &str,
         sync_relay: &dyn SyncRelay,
     ) -> Result<()> {
+        let rendezvous_id = ceremony.rendezvous_id_hex();
+        let transcript_prefix = diag_prefix(ceremony.transcript_hash());
+
         // Verify the joiner's confirmation MAC before sending credentials.
         let confirmation = wait_for_pairing_slot_bytes(
             pairing_relay,
-            &ceremony.rendezvous_id_hex(),
+            &rendezvous_id,
             PairingSlot::Confirmation,
             "joiner confirmation",
         )
         .await?;
-        ceremony.verify_joiner_confirmation(&confirmation)?;
+        let confirmation_hash = diag_hash(&confirmation);
+        ceremony.verify_joiner_confirmation(&confirmation).map_err(|e| {
+            CoreError::Engine(format!(
+                "initiator joiner confirmation verification failed; rid={rendezvous_id}; transcript={transcript_prefix}; confirmation_len={}; confirmation_sha={confirmation_hash}; err={e}",
+                confirmation.len()
+            ))
+        })?;
 
         let (device_secret, device_id) = self.load_current_device_identity()?;
         let signing_key = device_secret.ed25519_keypair(&device_id).map_err(CoreError::Crypto)?;
@@ -619,7 +637,7 @@ impl PairingService {
         self.restore_persisted_epoch_keys(&mut key_hierarchy, current_epoch)?;
 
         let bootstrap_bytes = pairing_relay
-            .get_bootstrap(&ceremony.rendezvous_id_hex())
+            .get_bootstrap(&rendezvous_id)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("fetching bootstrap"), e))?;
         let bootstrap_record = JoinerBootstrapRecord::from_canonical_bytes(&bootstrap_bytes)
@@ -630,6 +648,13 @@ impl PairingService {
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("listing devices"), e))?;
         devices.retain(|device| device.status == "active");
+        let current_signed_registry = sync_relay
+            .get_signed_registry()
+            .await
+            .map_err(|e| CoreError::from_relay_with_context(Some("fetching signed registry"), e))?;
+        let next_registry_version = next_pairing_registry_version(
+            current_signed_registry.as_ref().map(|response| response.registry_version),
+        );
 
         let current_device =
             devices.iter().find(|device| device.device_id == device_id).ok_or_else(|| {
@@ -642,20 +667,11 @@ impl PairingService {
             .map_err(CoreError::Crypto)?;
 
         if relay_epoch > current_epoch {
-            let registry_response = sync_relay
-                .get_signed_registry()
-                .await
-                .map_err(|e| {
-                    CoreError::from_relay_with_context(
-                        Some("fetching signed registry for epoch catch-up"),
-                        e,
-                    )
-                })?
-                .ok_or_else(|| {
-                    CoreError::Engine(format!(
-                        "relay epoch {relay_epoch} is ahead of local epoch {current_epoch}, but no signed registry is available"
-                    ))
-                })?;
+            let registry_response = current_signed_registry.clone().ok_or_else(|| {
+                CoreError::Engine(format!(
+                    "relay epoch {relay_epoch} is ahead of local epoch {current_epoch}, but no signed registry is available"
+                ))
+            })?;
             let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
                 &registry_response.artifact_blob,
                 &signing_key.public_key_bytes(),
@@ -764,11 +780,9 @@ impl PairingService {
         // initiator commits to the epoch it believes itself to be in and to a
         // hash of every epoch key it currently holds. Joiners and (in later
         // phases) reconciliation paths use this to detect a malicious relay
-        // that fabricates registry/epoch state. registry_version stays at the
-        // current floor here — the in-tree relay-driven version progression
-        // happens via the FFI rotate_ml_dsa path, which carries its own
-        // monotonic counter.
-        let registry_version = SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING;
+        // that fabricates registry/epoch state. The snapshot version advances
+        // with the relay registry so existing devices accept the newly added
+        // joiner when they fetch the signed registry before applying its ops.
         let epoch_key_hashes = build_epoch_key_hashes(&key_hierarchy)?;
         // Belt-and-suspenders: catch the bug where the inviter ships a
         // snapshot with current_epoch > 0 but no epoch_key_hash for it.
@@ -783,7 +797,7 @@ impl PairingService {
         }
         let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
             snapshot_entries,
-            registry_version,
+            next_registry_version,
             current_epoch,
             epoch_key_hashes,
         );
@@ -823,18 +837,28 @@ impl PairingService {
 
         let credential_envelope = ceremony.encrypt_credentials(&credential_bundle)?;
         pairing_relay
-            .put_slot(&ceremony.rendezvous_id_hex(), PairingSlot::Credentials, &credential_envelope)
+            .put_slot(&rendezvous_id, PairingSlot::Credentials, &credential_envelope)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("posting credentials"), e))?;
 
         let joiner_bundle_bytes = wait_for_pairing_slot_bytes(
             pairing_relay,
-            &ceremony.rendezvous_id_hex(),
+            &rendezvous_id,
             PairingSlot::Joiner,
             "joiner bundle",
         )
         .await?;
-        let _joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes)?;
+        let joiner_bundle_hash = diag_hash(&joiner_bundle_bytes);
+        let joiner_bundle_version =
+            joiner_bundle_bytes.first().map(|b| b.to_string()).unwrap_or_else(|| "none".into());
+        let _joiner_bundle = ceremony.decrypt_joiner_bundle(&joiner_bundle_bytes).map_err(|e| {
+            CoreError::Engine(format!(
+                "initiator failed to decrypt joiner bundle; rid={rendezvous_id}; transcript={transcript_prefix}; expected_joiner_device={}; confirmation_len={}; confirmation_sha={confirmation_hash}; joiner_bundle_len={}; joiner_bundle_version={joiner_bundle_version}; joiner_bundle_sha={joiner_bundle_hash}; err={e}",
+                ceremony.joiner_device_id(),
+                confirmation.len(),
+                joiner_bundle_bytes.len()
+            ))
+        })?;
 
         let next_epoch = current_epoch.saturating_add(1);
         let (next_epoch_key, wrapped_keys) =
@@ -872,7 +896,7 @@ impl PairingService {
         self.secure_store.set(&format!("epoch_key_{next_epoch}"), encoded.as_bytes())?;
 
         pairing_relay
-            .delete_session(&ceremony.rendezvous_id_hex())
+            .delete_session(&rendezvous_id)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("deleting pairing session"), e))?;
         self.secure_store.delete("bootstrap_joiner_bundle")?;
@@ -1023,6 +1047,13 @@ fn build_epoch_key_hashes(
         out.insert(epoch, compute_epoch_key_hash(key));
     }
     Ok(out)
+}
+
+fn next_pairing_registry_version(relay_registry_version: Option<i64>) -> i64 {
+    relay_registry_version
+        .map(|version| version + 1)
+        .unwrap_or(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+        .max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
 }
 
 fn verify_bundle_epoch_anchor(
@@ -1644,14 +1675,17 @@ mod tests {
         ) -> std::result::Result<RegisterResponse, RelayError> {
             let mut state = self.state.lock().unwrap();
             state.register_requests.push(req.clone());
-            if state.signed_registry.is_none() {
-                if let Some(approval) = &req.registry_approval {
-                    state.signed_registry = Some(SignedRegistryResponse {
-                        registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
-                        artifact_blob: approval.signed_registry_snapshot.clone(),
-                        artifact_kind: "signed_registry_snapshot".to_string(),
-                    });
-                }
+            if let Some(approval) = &req.registry_approval {
+                let registry_version = state
+                    .signed_registry
+                    .as_ref()
+                    .map(|registry| registry.registry_version + 1)
+                    .unwrap_or(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING);
+                state.signed_registry = Some(SignedRegistryResponse {
+                    registry_version,
+                    artifact_blob: approval.signed_registry_snapshot.clone(),
+                    artifact_kind: "signed_registry_snapshot".to_string(),
+                });
             }
             state.devices.push(DeviceInfo {
                 device_id: req.device_id,
@@ -1705,12 +1739,17 @@ mod tests {
             signed_registry_snapshot: &[u8],
         ) -> std::result::Result<i64, RelayError> {
             let mut state = self.state.lock().unwrap();
+            let registry_version = state
+                .signed_registry
+                .as_ref()
+                .map(|registry| registry.registry_version + 1)
+                .unwrap_or(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING);
             state.signed_registry = Some(SignedRegistryResponse {
-                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+                registry_version,
                 artifact_blob: signed_registry_snapshot.to_vec(),
                 artifact_kind: "signed_registry_snapshot".to_string(),
             });
-            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+            Ok(registry_version)
         }
     }
     #[async_trait]
@@ -1745,8 +1784,13 @@ mod tests {
                 state.rekey_artifacts.insert((epoch, device_id.clone()), artifact.clone());
             }
             if let Some(snapshot) = signed_registry_snapshot {
+                let registry_version = state
+                    .signed_registry
+                    .as_ref()
+                    .map(|registry| registry.registry_version)
+                    .unwrap_or(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING);
                 state.signed_registry = Some(SignedRegistryResponse {
-                    registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+                    registry_version,
                     artifact_blob: snapshot.to_vec(),
                     artifact_kind: "signed_registry_snapshot".to_string(),
                 });
@@ -3429,6 +3473,19 @@ mod tests {
     // `tests/pairing_failures.rs` also exercise the legacy flow for
     // backwards compatibility and are kept intact.
 
+    #[test]
+    fn next_pairing_registry_version_advances_relay_version() {
+        assert_eq!(next_pairing_registry_version(Some(4)), 5);
+    }
+
+    #[test]
+    fn next_pairing_registry_version_uses_floor_without_registry() {
+        assert_eq!(
+            next_pairing_registry_version(None),
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING
+        );
+    }
+
     /// Unit test for the helper itself: post-revoke / post-rekey flows
     /// persist `epoch_key_{N}` to the secure store, but a freshly-unlocked
     /// `KeyHierarchy` only has epoch 0. The helper must restore each
@@ -3503,7 +3560,7 @@ mod tests {
 
         // Relay reports the inviter at epoch 1 (matches local) — no
         // catch-up branch will run, so the bug fires if it's still there.
-        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+        let inviter_info = DeviceInfo {
             device_id: device_id.clone(),
             epoch: 1,
             status: "active".to_string(),
@@ -3514,7 +3571,8 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
-        }]));
+        };
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![inviter_info.clone()]));
 
         // Seed initiator store at epoch=1 with persisted epoch_key_1, the
         // shape `revoke_and_rekey` leaves behind.
@@ -3535,6 +3593,30 @@ mod tests {
             initiator_store.set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes()).unwrap();
         }
         initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let mut current_epoch_hashes = build_epoch_key_hashes(&key_hierarchy).unwrap();
+        current_epoch_hashes.insert(1, compute_epoch_key_hash(&epoch_1_key));
+        let current_registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: inviter_info.device_id.clone(),
+                ed25519_public_key: inviter_info.ed25519_public_key.clone(),
+                x25519_public_key: inviter_info.x25519_public_key.clone(),
+                ml_dsa_65_public_key: inviter_info.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: inviter_info.ml_kem_768_public_key.clone(),
+                x_wing_public_key: inviter_info.x_wing_public_key.clone(),
+                status: inviter_info.status.clone(),
+                ml_dsa_key_generation: inviter_info.ml_dsa_key_generation,
+            }],
+            4,
+            1,
+            current_epoch_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: 4,
+            artifact_blob: current_registry
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
         let initiator_service = PairingService::new(initiator_store.clone());
 
         let joiner_store = Arc::new(MemStore::default());
@@ -3585,6 +3667,10 @@ mod tests {
         // have panicked with "registry epoch_key_hashes missing entry for
         // current_epoch 1".
         let (_joiner_key_hierarchy, joiner_snapshot) = joiner_handle.await.unwrap();
+        assert_eq!(
+            joiner_snapshot.registry_version, 5,
+            "pairing a new device must advance the signed registry version"
+        );
         // Bundle's current_epoch reflects the post-rekey advance (initiator
         // bumps to next_epoch after registering the joiner).
         assert!(joiner_snapshot.current_epoch >= 1);

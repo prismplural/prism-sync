@@ -10,6 +10,7 @@
 
 use prism_sync_crypto::pq::hybrid_kem::XWingKem;
 use prism_sync_crypto::DeviceSecret;
+use sha2::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroizing;
 
@@ -30,6 +31,15 @@ fn sas_display_from_confirmation(confirmation: &ConfirmationCode) -> SasDisplay 
         words: confirmation.sas_words(),
         word_list: confirmation.sas_word_list(),
     }
+}
+
+fn diag_hash(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    hex::encode(&digest[..8])
+}
+
+fn diag_prefix(bytes: &[u8]) -> String {
+    hex::encode(&bytes[..bytes.len().min(8)])
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +233,16 @@ impl JoinerCeremony {
             transcript_hash,
         };
 
-        let plaintext = EncryptedEnvelope::open(key, envelope_bytes, &context)?;
+        let plaintext = EncryptedEnvelope::open(key, envelope_bytes, &context).map_err(|e| {
+            CoreError::Engine(format!(
+                "joiner failed to decrypt credentials; rid={}; transcript={}; credential_len={}; credential_version={}; credential_sha={}; err={e}",
+                self.rendezvous_id_hex(),
+                diag_prefix(transcript_hash),
+                envelope_bytes.len(),
+                envelope_bytes.first().map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+                diag_hash(envelope_bytes)
+            ))
+        })?;
         let bundle: CredentialBundle = serde_json::from_slice(&plaintext)?;
         Ok(bundle)
     }
@@ -484,7 +503,16 @@ impl InitiatorCeremony {
             session_id: &self.rendezvous_id,
             transcript_hash: &self.transcript_hash,
         };
-        let plaintext = EncryptedEnvelope::open(key, envelope_bytes, &context)?;
+        let plaintext = EncryptedEnvelope::open(key, envelope_bytes, &context).map_err(|e| {
+            CoreError::Engine(format!(
+                "initiator failed to open joiner bundle envelope; rid={}; transcript={}; joiner_bundle_len={}; joiner_bundle_version={}; joiner_bundle_sha={}; err={e}",
+                self.rendezvous_id_hex(),
+                diag_prefix(&self.transcript_hash),
+                envelope_bytes.len(),
+                envelope_bytes.first().map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+                diag_hash(envelope_bytes)
+            ))
+        })?;
         let bundle: JoinerBundle = serde_json::from_slice(&plaintext)?;
         Ok(bundle)
     }

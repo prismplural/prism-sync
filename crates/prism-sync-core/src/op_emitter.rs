@@ -280,8 +280,7 @@ impl OpEmitter {
             non_empty.iter().zip(partition_hlcs.iter()).enumerate()
         {
             let hlc_string = hlc.to_string();
-            let partition_now =
-                base_now + chrono::Duration::microseconds(partition_index as i64);
+            let partition_now = base_now + chrono::Duration::microseconds(partition_index as i64);
 
             for (field_name, value) in *fields {
                 let op_id = Uuid::new_v4().to_string();
@@ -1032,8 +1031,7 @@ mod tests {
         let mut p2 = HashMap::new();
         p2.insert("avatar".to_string(), SyncValue::String("avatar-v2".to_string()));
 
-        let partitions =
-            vec![(p1, "update-1".to_string()), (p2, "update-2".to_string())];
+        let partitions = vec![(p1, "update-1".to_string()), (p2, "update-2".to_string())];
 
         emitter
             .emit_update_multi(&storage, "members", "ent-u", &partitions)
@@ -1115,9 +1113,7 @@ mod tests {
 
         let partitions = vec![(p1, "p-1".to_string()), (p2, "p-2".to_string())];
 
-        emitter
-            .emit_create_multi(&storage, "members", "ent-share", &partitions)
-            .expect("multi ok");
+        emitter.emit_create_multi(&storage, "members", "ent-share", &partitions).expect("multi ok");
 
         let ops_p1 = storage.load_batch_ops("p-1").unwrap();
         let ops_p2 = storage.load_batch_ops("p-2").unwrap();
@@ -1137,7 +1133,8 @@ mod tests {
         assert_ne!(hlc_p1, hlc_p2);
 
         // Every op_id is unique across the whole emission.
-        let mut ids: Vec<_> = ops_p1.iter().chain(ops_p2.iter()).map(|op| op.op_id.clone()).collect();
+        let mut ids: Vec<_> =
+            ops_p1.iter().chain(ops_p2.iter()).map(|op| op.op_id.clone()).collect();
         ids.sort();
         let unique_count = ids.iter().collect::<std::collections::HashSet<_>>().len();
         assert_eq!(unique_count, ids.len(), "op_ids must be unique");
@@ -1321,10 +1318,8 @@ mod tests {
 
         // No field_versions persisted.
         for field in ["a", "b", "c", "d", "e"] {
-            let fv = failing
-                .inner()
-                .get_field_version("sync-1", "members", "ent-roll", field)
-                .unwrap();
+            let fv =
+                failing.inner().get_field_version("sync-1", "members", "ent-roll", field).unwrap();
             assert!(fv.is_none(), "field_version for {field} should have rolled back");
         }
 
@@ -1377,10 +1372,7 @@ mod tests {
             }))
         }
 
-        fn get_sync_metadata(
-            &self,
-            sync_id: &str,
-        ) -> Result<Option<crate::storage::SyncMetadata>> {
+        fn get_sync_metadata(&self, sync_id: &str) -> Result<Option<crate::storage::SyncMetadata>> {
             self.inner.get_sync_metadata(sync_id)
         }
 
@@ -1414,10 +1406,7 @@ mod tests {
             self.inner.get_device_record(sync_id, device_id)
         }
 
-        fn list_device_records(
-            &self,
-            sync_id: &str,
-        ) -> Result<Vec<crate::storage::DeviceRecord>> {
+        fn list_device_records(&self, sync_id: &str) -> Result<Vec<crate::storage::DeviceRecord>> {
             self.inner.list_device_records(sync_id)
         }
 

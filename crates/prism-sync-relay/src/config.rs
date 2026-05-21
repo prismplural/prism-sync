@@ -267,8 +267,7 @@ impl Config {
         if snapshot_upload_concurrency == 0 {
             return Err(ConfigError::ConcurrencyLimitZero { key: "SNAPSHOT_UPLOAD_CONCURRENCY" });
         }
-        let media_upload_concurrency: usize =
-            parse_env_with(&env, "MEDIA_UPLOAD_CONCURRENCY", 32);
+        let media_upload_concurrency: usize = parse_env_with(&env, "MEDIA_UPLOAD_CONCURRENCY", 32);
         if media_upload_concurrency == 0 {
             return Err(ConfigError::ConcurrencyLimitZero { key: "MEDIA_UPLOAD_CONCURRENCY" });
         }
@@ -810,31 +809,19 @@ mod tests {
 
     #[test]
     fn zero_snapshot_upload_concurrency_is_rejected() {
-        let err =
-            config_from_env_pairs(&[("SNAPSHOT_UPLOAD_CONCURRENCY", "0")]).unwrap_err();
-        assert_eq!(
-            err,
-            ConfigError::ConcurrencyLimitZero { key: "SNAPSHOT_UPLOAD_CONCURRENCY" }
-        );
+        let err = config_from_env_pairs(&[("SNAPSHOT_UPLOAD_CONCURRENCY", "0")]).unwrap_err();
+        assert_eq!(err, ConfigError::ConcurrencyLimitZero { key: "SNAPSHOT_UPLOAD_CONCURRENCY" });
     }
 
     #[test]
     fn zero_media_upload_concurrency_is_rejected() {
-        let err =
-            config_from_env_pairs(&[("MEDIA_UPLOAD_CONCURRENCY", "0")]).unwrap_err();
-        assert_eq!(
-            err,
-            ConfigError::ConcurrencyLimitZero { key: "MEDIA_UPLOAD_CONCURRENCY" }
-        );
+        let err = config_from_env_pairs(&[("MEDIA_UPLOAD_CONCURRENCY", "0")]).unwrap_err();
+        assert_eq!(err, ConfigError::ConcurrencyLimitZero { key: "MEDIA_UPLOAD_CONCURRENCY" });
     }
 
     #[test]
     fn zero_default_request_concurrency_is_rejected() {
-        let err =
-            config_from_env_pairs(&[("DEFAULT_REQUEST_CONCURRENCY", "0")]).unwrap_err();
-        assert_eq!(
-            err,
-            ConfigError::ConcurrencyLimitZero { key: "DEFAULT_REQUEST_CONCURRENCY" }
-        );
+        let err = config_from_env_pairs(&[("DEFAULT_REQUEST_CONCURRENCY", "0")]).unwrap_err();
+        assert_eq!(err, ConfigError::ConcurrencyLimitZero { key: "DEFAULT_REQUEST_CONCURRENCY" });
     }
 }

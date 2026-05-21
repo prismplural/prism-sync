@@ -50,10 +50,7 @@ pub trait SyncStorage: Send + Sync {
     /// insertion order.
     ///
     /// Default: empty (no-op for in-memory impls).
-    fn list_quarantined_batches(
-        &self,
-        _sync_id: &str,
-    ) -> Result<Vec<QuarantinedBatchInfo>> {
+    fn list_quarantined_batches(&self, _sync_id: &str) -> Result<Vec<QuarantinedBatchInfo>> {
         Ok(vec![])
     }
 
@@ -199,11 +196,7 @@ pub trait SyncStorageTx {
     /// zero rows.
     ///
     /// Default: no-op for in-memory impls.
-    fn update_pending_op_batch_id(
-        &mut self,
-        _op_id: &str,
-        _new_batch_id: &str,
-    ) -> Result<()> {
+    fn update_pending_op_batch_id(&mut self, _op_id: &str, _new_batch_id: &str) -> Result<()> {
         Ok(())
     }
 

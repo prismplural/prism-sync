@@ -1249,11 +1249,7 @@ impl SyncStorageTx for RusqliteTx<'_> {
         query_batch_ops(&self.conn, batch_id)
     }
 
-    fn update_pending_op_batch_id(
-        &mut self,
-        op_id: &str,
-        new_batch_id: &str,
-    ) -> Result<()> {
+    fn update_pending_op_batch_id(&mut self, op_id: &str, new_batch_id: &str) -> Result<()> {
         exec_update_pending_op_batch_id(&self.conn, op_id, new_batch_id)
     }
 

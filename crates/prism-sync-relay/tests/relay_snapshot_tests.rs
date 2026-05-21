@@ -647,7 +647,7 @@ async fn test_snapshot_put_times_out_at_its_own_ceiling() {
         &keys,
         "1",
         snapshot,
-        32 * 1024, // 32 KB chunks → 16 chunks
+        32 * 1024,                  // 32 KB chunks → 16 chunks
         Duration::from_millis(350), // ~5.6s total
     )
     .await;
@@ -725,20 +725,11 @@ async fn test_non_snapshot_route_still_respects_default_timeout() {
         .header("Authorization", format!("Bearer {token}"))
         .header("X-Device-Id", &device_id)
         .header("Content-Type", "application/json");
-    let signed = apply_signed_headers(
-        builder,
-        &keys,
-        "PUT",
-        &path,
-        &sync_id,
-        &device_id,
-        &body_bytes,
-    );
+    let signed =
+        apply_signed_headers(builder, &keys, "PUT", &path, &sync_id, &device_id, &body_bytes);
     // Stream the body at 8 KB / 450 ms → ~3.6s total, well past the 2s default.
-    let result = signed
-        .body(slow_body(body_bytes, 8 * 1024, Duration::from_millis(450)))
-        .send()
-        .await;
+    let result =
+        signed.body(slow_body(body_bytes, 8 * 1024, Duration::from_millis(450))).send().await;
 
     match result {
         Ok(resp) => assert_eq!(

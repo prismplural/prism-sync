@@ -1951,9 +1951,7 @@ async fn push_quarantines_batch_on_relay_413_and_continues_other_batches() {
     let mut saw_quarantine_event = false;
     while let Ok(event) = event_rx.try_recv() {
         if let prism_sync_core::events::SyncEvent::QuarantinedBatch {
-            batch_id,
-            error_code,
-            ..
+            batch_id, error_code, ..
         } = event
         {
             if batch_id == "batch-bad" && error_code == "payload_too_large" {
@@ -2048,9 +2046,7 @@ async fn push_quarantines_batch_when_client_guard_trips() {
     let mut saw_event = false;
     while let Ok(event) = event_rx.try_recv() {
         if let prism_sync_core::events::SyncEvent::QuarantinedBatch {
-            batch_id,
-            error_code,
-            ..
+            batch_id, error_code, ..
         } = event
         {
             if batch_id == "batch-huge" && error_code == "payload_too_large_client_guard" {

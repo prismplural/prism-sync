@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::crdt_change::{estimate_envelope_body_size, CrdtChange};
 use crate::device_registry::DeviceRegistryManager;
 use crate::engine::{BootstrapReport, SeedRecord, SyncConfig, SyncEngine};
 use crate::epoch::EpochManager;
@@ -35,7 +36,6 @@ use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::secure_store::SecureStore;
 use crate::storage::{PendingOp, StorageError, SyncStorage};
 use crate::sync_service::{AutoSyncConfig, SyncService};
-use crate::crdt_change::{estimate_envelope_body_size, CrdtChange};
 use crate::syncable_entity::SyncableEntity;
 use prism_sync_crypto::{mnemonic, DeviceSecret, KeyHierarchy};
 
@@ -761,10 +761,10 @@ impl PrismSync {
 
         let registry_version = match relay.get_signed_registry().await {
             Ok(Some(response)) => {
-                let current_snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+                let current_snapshot = DeviceRegistryManager::verify_signed_registry_snapshot(
+                    self.storage.as_ref(),
+                    sync_id,
                     &response.artifact_blob,
-                    &signing_key.public_key_bytes(),
-                    &pq_signing_key.public_key_bytes(),
                 )
                 .map_err(|e| {
                     CoreError::Engine(format!(
@@ -774,8 +774,7 @@ impl PrismSync {
                 if current_snapshot.current_epoch >= target_epoch {
                     return Ok(());
                 }
-                current_snapshot
-                    .registry_version
+                (current_snapshot.registry_version + 1)
                     .max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
             }
             Ok(None) => SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
@@ -983,19 +982,13 @@ impl PrismSync {
                 .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
             (emitter.last_hlc().node_id.clone(), emitter.epoch())
         };
-        let partitions = Self::partition_fields_into_batches(
-            fields,
-            table,
-            entity_id,
-            &device_id,
-            epoch,
-        );
+        let partitions =
+            Self::partition_fields_into_batches(fields, table, entity_id, &device_id, epoch);
         let emitter = self
             .op_emitter
             .as_mut()
             .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-        let result =
-            emitter.emit_create_multi(&*self.storage, table, entity_id, &partitions);
+        let result = emitter.emit_create_multi(&*self.storage, table, entity_id, &partitions);
         if result.is_ok() {
             if let Some(tx) = self.sync_service.auto_sync_sender() {
                 let _ = tx.try_send(());
@@ -1041,8 +1034,7 @@ impl PrismSync {
             .op_emitter
             .as_mut()
             .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-        let result =
-            emitter.emit_update_multi(&*self.storage, table, entity_id, &partitions);
+        let result = emitter.emit_update_multi(&*self.storage, table, entity_id, &partitions);
         if result.is_ok() {
             if let Some(tx) = self.sync_service.auto_sync_sender() {
                 let _ = tx.try_send(());
@@ -1267,10 +1259,15 @@ impl PrismSync {
                 // Build the candidate op list for this bucket if we add the
                 // new field to it.
                 let mut candidate_ops = bucket.ops.clone();
-                candidate_ops.push(make_change(&name, &encoded, &bucket.batch_id, device_id, epoch));
+                candidate_ops.push(make_change(
+                    &name,
+                    &encoded,
+                    &bucket.batch_id,
+                    device_id,
+                    epoch,
+                ));
 
-                let body =
-                    estimate_envelope_body_size(&candidate_ops, HYBRID_SIGNATURE_WIRE_BYTES);
+                let body = estimate_envelope_body_size(&candidate_ops, HYBRID_SIGNATURE_WIRE_BYTES);
                 if body <= BATCH_BODY_TARGET_BYTES {
                     bucket.fields.insert(name.clone(), value.clone());
                     bucket.ops = candidate_ops;
@@ -1371,8 +1368,7 @@ impl PrismSync {
                 let mut candidate_ops = bucket.ops.clone();
                 candidate_ops.push(make_change(op, &bucket.batch_id));
 
-                let body =
-                    estimate_envelope_body_size(&candidate_ops, HYBRID_SIGNATURE_WIRE_BYTES);
+                let body = estimate_envelope_body_size(&candidate_ops, HYBRID_SIGNATURE_WIRE_BYTES);
                 if body <= BATCH_BODY_TARGET_BYTES {
                     bucket.op_ids.push(op.op_id.clone());
                     bucket.ops = candidate_ops;
@@ -2267,12 +2263,17 @@ mod tests {
             signed_registry_snapshot: &[u8],
         ) -> std::result::Result<i64, RelayError> {
             let mut state = self.state.lock().unwrap();
+            let registry_version = state
+                .signed_registry
+                .as_ref()
+                .map(|registry| registry.registry_version + 1)
+                .unwrap_or(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING);
             state.signed_registry = Some(SignedRegistryResponse {
-                registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+                registry_version,
                 artifact_blob: signed_registry_snapshot.to_vec(),
                 artifact_kind: "signed_registry_snapshot".to_string(),
             });
-            Ok(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+            Ok(registry_version)
         }
     }
 
@@ -2603,6 +2604,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.current_epoch, 2);
+        assert_eq!(snapshot.registry_version, 2);
         assert!(snapshot.epoch_key_hashes.contains_key(&2));
     }
 
@@ -3287,7 +3289,7 @@ mod tests {
     /// epoch, and the `SyncService` engine intact — so a host that
     /// re-seeded credentials from its own keychain on next launch could
     /// silently re-attach to the OLD sync group with the in-memory state
-    /// still pointing at it. Codex P1 #5.
+    /// still pointing at it.
     #[tokio::test]
     async fn reset_sync_state_clears_runtime_engine_and_keys() {
         let mut sync = make_sync();
@@ -3476,12 +3478,8 @@ mod tests {
         // Every produced bucket must measure under the target on its own.
         // Use the same placeholder HLC the partitioner uses so this is a
         // faithful re-measure of what the partitioner saw.
-        let placeholder_hlc = format!(
-            "{:013}:{:010}:{}",
-            u64::MAX % 10_000_000_000_000u64,
-            u32::MAX,
-            "a1b2c3d4e5f6"
-        );
+        let placeholder_hlc =
+            format!("{:013}:{:010}:{}", u64::MAX % 10_000_000_000_000u64, u32::MAX, "a1b2c3d4e5f6");
         for (i, (bucket_fields, batch_id)) in buckets.iter().enumerate() {
             let ops: Vec<CrdtChange> = bucket_fields
                 .iter()
@@ -3548,10 +3546,8 @@ mod tests {
         );
 
         // The banner bucket has exactly one field.
-        let banner_bucket = buckets
-            .iter()
-            .find(|(b, _)| b.contains_key("banner"))
-            .expect("banner bucket present");
+        let banner_bucket =
+            buckets.iter().find(|(b, _)| b.contains_key("banner")).expect("banner bucket present");
         assert_eq!(banner_bucket.0.len(), 1, "banner must be in a bucket alone");
         assert!(banner_bucket.0.contains_key("banner"));
     }
@@ -3641,10 +3637,7 @@ mod tests {
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (_, batch_id) in &buckets {
-            assert!(
-                seen.insert(batch_id.clone()),
-                "duplicate batch_id detected: {batch_id}"
-            );
+            assert!(seen.insert(batch_id.clone()), "duplicate batch_id detected: {batch_id}");
             uuid::Uuid::parse_str(batch_id).expect("batch_id should be a UUID");
         }
     }
@@ -3672,10 +3665,7 @@ mod tests {
             field_name: field_name.to_string(),
             encoded_value,
             is_delete: false,
-            client_hlc: format!(
-                "{:013}:{:010}:dev-c1",
-                1_700_000_000_000u64, 42u32
-            ),
+            client_hlc: format!("{:013}:{:010}:dev-c1", 1_700_000_000_000u64, 42u32),
             created_at: chrono::Utc::now(),
             pushed_at: None,
         }
@@ -3759,8 +3749,7 @@ mod tests {
 
         // The pending_ops rows now appear under at least two different
         // local_batch_ids — the partitioner split the oversized batch.
-        let post_ops_name =
-            sync.storage().load_batch_ops(original_batch_id).unwrap_or_default();
+        let post_ops_name = sync.storage().load_batch_ops(original_batch_id).unwrap_or_default();
         assert!(
             post_ops_name.is_empty(),
             "ops should have been moved off the original batch_id, found {post_ops_name:?}"
@@ -3830,13 +3819,7 @@ mod tests {
         let sync_id = "sync-1";
         let original_batch_id = "stuck-batch-2";
         let ops = vec![
-            pending_op(
-                "op-name-2",
-                sync_id,
-                original_batch_id,
-                "name",
-                "\"Sys2\"".to_string(),
-            ),
+            pending_op("op-name-2", sync_id, original_batch_id, "name", "\"Sys2\"".to_string()),
             pending_op(
                 "op-banner-2",
                 sync_id,
@@ -3911,13 +3894,8 @@ mod tests {
 
         let sync_id = "sync-1";
         let original_batch_id = "stuck-batch-3";
-        let op_name = pending_op(
-            "op-name-3",
-            sync_id,
-            original_batch_id,
-            "name",
-            "\"Sys3\"".to_string(),
-        );
+        let op_name =
+            pending_op("op-name-3", sync_id, original_batch_id, "name", "\"Sys3\"".to_string());
         let op_avatar = pending_op(
             "op-avatar-3",
             sync_id,
@@ -3960,21 +3938,22 @@ mod tests {
         // partial mutation, not a no-op).
         failing.fail_on_update_at(2);
 
-        let err = sync
-            .repair_quarantined_batches()
-            .expect_err("repair must propagate the storage error");
-        assert!(
-            err.to_string().contains("repair-failure"),
-            "unexpected error: {err}"
-        );
+        let err =
+            sync.repair_quarantined_batches().expect_err("repair must propagate the storage error");
+        assert!(err.to_string().contains("repair-failure"), "unexpected error: {err}");
 
         // The quarantine row survives untouched — rollback restored it.
         assert_eq!(failing.quarantined_batch_count(sync_id).unwrap(), 1);
 
         // The pending_ops rows still belong to the original batch_id.
         let still_in_orig = failing.load_batch_ops(original_batch_id).unwrap();
-        assert_eq!(still_in_orig.len(), 3, "all 3 ops must remain under the original batch_id after rollback");
-        let mut by_id: std::collections::HashMap<&str, &PendingOp> = std::collections::HashMap::new();
+        assert_eq!(
+            still_in_orig.len(),
+            3,
+            "all 3 ops must remain under the original batch_id after rollback"
+        );
+        let mut by_id: std::collections::HashMap<&str, &PendingOp> =
+            std::collections::HashMap::new();
         for op in &still_in_orig {
             by_id.insert(op.op_id.as_str(), op);
         }
@@ -4147,11 +4126,7 @@ mod tests {
             self.inner.load_batch_ops(batch_id)
         }
 
-        fn update_pending_op_batch_id(
-            &mut self,
-            op_id: &str,
-            new_batch_id: &str,
-        ) -> Result<()> {
+        fn update_pending_op_batch_id(&mut self, op_id: &str, new_batch_id: &str) -> Result<()> {
             let next = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let trip = self.fail_at.load(std::sync::atomic::Ordering::SeqCst);
             if trip != 0 && next == trip {

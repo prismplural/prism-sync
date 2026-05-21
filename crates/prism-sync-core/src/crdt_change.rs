@@ -676,8 +676,8 @@ mod tests {
             let ml_dsa_signing_key =
                 device_secret.ml_dsa_65_keypair(&device_id).expect("ml-dsa-65 keypair");
             Self {
-                sync_id:
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                sync_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
                 epoch: 7,
                 device_id,
                 ml_dsa_key_generation: 0,
@@ -692,11 +692,19 @@ mod tests {
         fn real_envelope_body_size(&self, ops: &[CrdtChange], batch_id: &str) -> usize {
             let plaintext = CrdtChange::encode_batch(ops).expect("encode_batch");
             let payload_hash = crate::batch_signature::compute_payload_hash(&plaintext);
-            let aad =
-                crate::sync_aad::build_sync_aad(&self.sync_id, &self.device_id, self.epoch, batch_id, "ops");
-            let (ciphertext, nonce) =
-                prism_sync_crypto::aead::xchacha_encrypt_for_sync(&self.encryption_key, &plaintext, &aad)
-                    .expect("encrypt");
+            let aad = crate::sync_aad::build_sync_aad(
+                &self.sync_id,
+                &self.device_id,
+                self.epoch,
+                batch_id,
+                "ops",
+            );
+            let (ciphertext, nonce) = prism_sync_crypto::aead::xchacha_encrypt_for_sync(
+                &self.encryption_key,
+                &plaintext,
+                &aad,
+            )
+            .expect("encrypt");
             let envelope = crate::batch_signature::sign_batch(
                 &self.ed25519_signing_key,
                 &self.ml_dsa_signing_key,

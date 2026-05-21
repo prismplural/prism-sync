@@ -300,10 +300,7 @@ impl SyncTransport for MockRelay {
         if state.push_413_batch_ids.remove(&batch.batch_id) {
             return Err(RelayError::Server {
                 status_code: 413,
-                message: format!(
-                    "mock injected payload-too-large for batch {}",
-                    batch.batch_id
-                ),
+                message: format!("mock injected payload-too-large for batch {}", batch.batch_id),
             });
         }
         let seq = state.next_server_seq;
