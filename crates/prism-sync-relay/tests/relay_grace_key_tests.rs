@@ -29,7 +29,7 @@ async fn setup_device(
 }
 
 /// Helper: push a test envelope using the given ML-DSA keypair for signing.
-/// Returns the HTTP status code.
+/// Returns status and body.
 async fn push_with_ml_dsa_key(
     url: &str,
     token: &str,
@@ -38,7 +38,7 @@ async fn push_with_ml_dsa_key(
     ed25519_key: &ed25519_dalek::SigningKey,
     ml_dsa_key: &prism_sync_crypto::DevicePqSigningKey,
     batch_id: &str,
-) -> u16 {
+) -> (u16, String) {
     let client = Client::new();
     let envelope = make_test_envelope(sync_id, device_id, batch_id, 0);
     let body_bytes = serde_json::to_vec(&envelope).unwrap();
@@ -63,7 +63,9 @@ async fn push_with_ml_dsa_key(
     .await
     .unwrap();
 
-    resp.status().as_u16()
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    (status, body)
 }
 
 /// Request signed with the current ML-DSA key passes (baseline).
@@ -75,7 +77,7 @@ async fn test_current_key_passes() {
     let (token, keys) = setup_device(&url, &db, &sync_id, &device_id).await;
 
     let ml_dsa_kp = keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
-    let status = push_with_ml_dsa_key(
+    let (status, _body) = push_with_ml_dsa_key(
         &url,
         &token,
         &sync_id,
@@ -122,7 +124,7 @@ async fn test_grace_key_passes_during_grace_period() {
     .unwrap();
 
     // Sign with the OLD ML-DSA key (grace key) — should succeed
-    let status = push_with_ml_dsa_key(
+    let (status, _body) = push_with_ml_dsa_key(
         &url,
         &token,
         &sync_id,
@@ -167,7 +169,7 @@ async fn test_expired_grace_key_fails() {
     .unwrap();
 
     // Sign with the OLD ML-DSA key — should fail (grace period expired)
-    let status = push_with_ml_dsa_key(
+    let (status, body) = push_with_ml_dsa_key(
         &url,
         &token,
         &sync_id,
@@ -179,6 +181,10 @@ async fn test_expired_grace_key_fails() {
     .await;
 
     assert_eq!(status, 401, "expired grace key should be rejected: {status}");
+    assert!(
+        body.contains(r#""error":"device_identity_mismatch""#),
+        "signature mismatch should be structured as device_identity_mismatch: {body}"
+    );
 }
 
 /// Request signed with a completely unknown key fails (neither current nor grace).
@@ -194,7 +200,7 @@ async fn test_unknown_key_fails() {
     let unknown_ml_dsa_kp = unknown_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
     // Sign with an unknown ML-DSA key — should fail
-    let status = push_with_ml_dsa_key(
+    let (status, body) = push_with_ml_dsa_key(
         &url,
         &token,
         &sync_id,
@@ -206,4 +212,8 @@ async fn test_unknown_key_fails() {
     .await;
 
     assert_eq!(status, 401, "unknown key should be rejected: {status}");
+    assert!(
+        body.contains(r#""error":"device_identity_mismatch""#),
+        "unknown signing key should be structured as device_identity_mismatch: {body}"
+    );
 }

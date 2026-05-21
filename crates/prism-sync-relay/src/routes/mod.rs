@@ -66,13 +66,25 @@ pub(crate) fn verify_signed_request(
         .ok_or(AppError::BadRequest("Missing X-Prism-Signature"))?;
 
     if !auth::is_valid_device_id(&auth_identity.device_id) {
+        log_signed_request_rejection(auth_identity, method, path, "invalid_device_id");
         return Err(AppError::Unauthorized);
     }
 
     let timestamp_i64 =
         timestamp.parse::<i64>().map_err(|_| AppError::BadRequest("Invalid X-Prism-Timestamp"))?;
     let now = db::now_secs();
-    if (now - timestamp_i64).abs() > state.config.signed_request_max_skew_secs {
+    let timestamp_drift_secs = (now - timestamp_i64).abs();
+    if timestamp_drift_secs > state.config.signed_request_max_skew_secs {
+        tracing::warn!(
+            sync_id = %trunc_id(&auth_identity.sync_id),
+            device_id = %trunc_id(&auth_identity.device_id),
+            method,
+            route = %redacted_signed_route(path, &auth_identity.sync_id),
+            reason = "timestamp_skew",
+            drift_secs = timestamp_drift_secs,
+            max_skew_secs = state.config.signed_request_max_skew_secs,
+            "Signed request rejected"
+        );
         return Err(AppError::Unauthorized);
     }
 
@@ -82,10 +94,12 @@ pub(crate) fn verify_signed_request(
 
     // Reject devices without PQ keys (should not exist after V1 removal)
     if auth_identity.ml_dsa_65_public_key.is_empty() {
+        log_signed_request_rejection(auth_identity, method, path, "missing_pq_public_key");
         return Err(AppError::Unauthorized);
     }
 
     let Some(&signature_version) = signature.first() else {
+        log_signed_request_rejection(auth_identity, method, path, "empty_signature");
         return Err(AppError::Unauthorized);
     };
 
@@ -121,7 +135,8 @@ pub(crate) fn verify_signed_request(
     });
 
     if !verified {
-        return Err(AppError::Unauthorized);
+        log_signed_request_rejection(auth_identity, method, path, "signature_mismatch");
+        return Err(AppError::DeviceIdentityMismatch);
     }
 
     let nonce_window = i64::try_from(state.config.signed_request_nonce_window_secs)
@@ -136,10 +151,40 @@ pub(crate) fn verify_signed_request(
         })
         .map_err(AppError::from)?;
     if !nonce_accepted {
+        log_signed_request_rejection(auth_identity, method, path, "nonce_replay");
         return Err(AppError::Unauthorized);
     }
 
     Ok(())
+}
+
+fn log_signed_request_rejection(
+    auth_identity: &AuthIdentity,
+    method: &str,
+    path: &str,
+    reason: &'static str,
+) {
+    tracing::warn!(
+        sync_id = %trunc_id(&auth_identity.sync_id),
+        device_id = %trunc_id(&auth_identity.device_id),
+        method,
+        route = %redacted_signed_route(path, &auth_identity.sync_id),
+        reason,
+        "Signed request rejected"
+    );
+}
+
+fn redacted_signed_route(path: &str, sync_id: &str) -> String {
+    let sync_prefix = format!("/v1/sync/{sync_id}");
+    if let Some(suffix) = path.strip_prefix(&sync_prefix) {
+        return format!("/v1/sync/<sync_id>{suffix}");
+    }
+    path.to_string()
+}
+
+fn trunc_id(value: &str) -> &str {
+    let end = value.len().min(16);
+    &value[..end]
 }
 
 pub(crate) fn client_ip_for_rate_limit(
