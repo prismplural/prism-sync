@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 1838049058;
+  int get rustContentHash => -363963092;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -417,6 +417,12 @@ abstract class RustLibApi extends BaseApi {
     required PrismSyncHandle handle,
     required BigInt ttlSecs,
     String? forDeviceId,
+  });
+
+  Future<bool> crateApiVerifyMnemonicPin({
+    required PrismSyncHandle handle,
+    required List<int> password,
+    required List<int> secretKey,
   });
 
   RustArcIncrementStrongCountFnType
@@ -3324,6 +3330,45 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "upload_pairing_snapshot",
         argNames: ["handle", "ttlSecs", "forDeviceId"],
       );
+
+  @override
+  Future<bool> crateApiVerifyMnemonicPin({
+    required PrismSyncHandle handle,
+    required List<int> password,
+    required List<int> secretKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerPrismSyncHandle(
+            handle,
+            serializer,
+          );
+          sse_encode_list_prim_u_8_loose(password, serializer);
+          sse_encode_list_prim_u_8_loose(secretKey, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 80,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_bool,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiVerifyMnemonicPinConstMeta,
+        argValues: [handle, password, secretKey],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiVerifyMnemonicPinConstMeta => const TaskConstMeta(
+    debugName: "verify_mnemonic_pin",
+    argNames: ["handle", "password", "secretKey"],
+  );
 
   RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_MemorySecureStore => wire

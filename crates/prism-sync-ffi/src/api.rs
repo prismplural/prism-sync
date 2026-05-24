@@ -1437,6 +1437,37 @@ pub async fn unlock(
     ratchet_handle_min_signature_version_floor(handle, None).await
 }
 
+/// Read-only credential check. Derives the MEK from `password` + `secret_key`
+/// and attempts the wrapped DEK AEAD unwrap. Returns `Ok(true)` on success,
+/// `Ok(false)` on authentication failure (wrong password or secret key), and
+/// `Err` on infrastructure problems (missing wrapped_dek, missing salt, IO).
+///
+/// **Does NOT modify engine state**: does not unlock the handle, cache key
+/// material, reconfigure the sync engine, or mutate any persisted state. The
+/// handle remains in exactly the same locked/unlocked state after the call.
+///
+/// SECURITY: A 6-digit PIN has only 10^6 entropy. Call sites MUST enforce
+/// rate-limiting in the host layer — Argon2id alone will not make brute force
+/// infeasible against a recovered `wrapped_dek` + `dek_salt`. Wrap all call
+/// sites in a `PinLockoutState` (or equivalent) that increments failure
+/// counters and enforces exponential backoff before invoking this function.
+pub async fn verify_mnemonic_pin(
+    handle: &PrismSyncHandle,
+    password: Vec<u8>,
+    secret_key: Vec<u8>,
+) -> Result<bool, String> {
+    let inner = handle.inner.clone();
+    let password = zeroize::Zeroizing::new(password);
+    let secret_key = zeroize::Zeroizing::new(secret_key);
+    // Argon2id is CPU-heavy — run on a spawn_blocking thread so we do not
+    // stall the tokio worker. blocking_lock() is safe inside spawn_blocking.
+    tokio::task::spawn_blocking(move || {
+        inner.blocking_lock().verify_credentials(&password, &secret_key).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("verify_mnemonic_pin: {e}"))?
+}
+
 /// Restore the unlocked state directly from raw key material.
 ///
 /// Bypasses Argon2id password derivation entirely. Use when the host has

@@ -271,6 +271,42 @@ impl PrismSync {
         Ok(())
     }
 
+    /// Read-only credential check. Derives the MEK from `password` + `secret_key`
+    /// and attempts the wrapped DEK AEAD unwrap. Returns `Ok(true)` on success,
+    /// `Ok(false)` on AEAD authentication failure (wrong password or secret key),
+    /// and `Err` on infrastructure problems (missing wrapped_dek, missing salt, IO).
+    ///
+    /// **Does NOT modify engine state**: does not touch `self.key_hierarchy`,
+    /// `self.device_secret`, or call `restore_persisted_epoch_keys`. The engine
+    /// remains in exactly the same locked/unlocked state it was in before the
+    /// call.
+    ///
+    /// Both `password` and `secret_key` must be valid UTF-8 and raw bytes
+    /// respectively. `password` is treated as a UTF-8 string before KDF; if it
+    /// is not valid UTF-8, an `Err` is returned.
+    pub fn verify_credentials(&self, password: &[u8], secret_key: &[u8]) -> Result<bool> {
+        let wrapped_dek = self.secure_store.get("wrapped_dek")?.ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("no wrapped DEK found".into()))
+        })?;
+        let salt = self
+            .secure_store
+            .get("dek_salt")?
+            .ok_or_else(|| CoreError::Storage(StorageError::Logic("no salt found".into())))?;
+
+        let password_str = std::str::from_utf8(password)
+            .map_err(|_| CoreError::Engine("password must be valid UTF-8".into()))?;
+
+        // Attempt the unlock on a fresh, throwaway key hierarchy. This runs
+        // Argon2id + AEAD unwrap exactly as `unlock` does, but writes nothing
+        // to `self`. The temporary hierarchy and its DEK are zeroized on drop.
+        let mut temp = KeyHierarchy::new();
+        match temp.unlock(password_str, secret_key, &wrapped_dek, &salt) {
+            Ok(()) => Ok(true),
+            Err(prism_sync_crypto::CryptoError::DecryptionFailed(_)) => Ok(false),
+            Err(e) => Err(CoreError::Crypto(e)),
+        }
+    }
+
     /// Restore the unlocked state directly from raw key material.
     ///
     /// Bypasses Argon2id password derivation. Use when the host has recovered

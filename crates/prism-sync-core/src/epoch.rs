@@ -152,6 +152,7 @@ impl EpochManager {
         Self::prepare_wrapped_keys_for_devices(&devices, new_epoch, excluded_device_id)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn prepare_wrapped_keys_for_devices(
         devices: &[DeviceInfo],
         new_epoch: u32,

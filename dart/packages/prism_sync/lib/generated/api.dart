@@ -57,6 +57,30 @@ Future<void> unlock({
   secretKey: secretKey,
 );
 
+/// Read-only credential check. Derives the MEK from `password` + `secret_key`
+/// and attempts the wrapped DEK AEAD unwrap. Returns `Ok(true)` on success,
+/// `Ok(false)` on authentication failure (wrong password or secret key), and
+/// `Err` on infrastructure problems (missing wrapped_dek, missing salt, IO).
+///
+/// **Does NOT modify engine state**: does not unlock the handle, cache key
+/// material, reconfigure the sync engine, or mutate any persisted state. The
+/// handle remains in exactly the same locked/unlocked state after the call.
+///
+/// SECURITY: A 6-digit PIN has only 10^6 entropy. Call sites MUST enforce
+/// rate-limiting in the host layer — Argon2id alone will not make brute force
+/// infeasible against a recovered `wrapped_dek` + `dek_salt`. Wrap all call
+/// sites in a `PinLockoutState` (or equivalent) that increments failure
+/// counters and enforces exponential backoff before invoking this function.
+Future<bool> verifyMnemonicPin({
+  required PrismSyncHandle handle,
+  required List<int> password,
+  required List<int> secretKey,
+}) => RustLib.instance.api.crateApiVerifyMnemonicPin(
+  handle: handle,
+  password: password,
+  secretKey: secretKey,
+);
+
 /// Restore the unlocked state directly from raw key material.
 ///
 /// Bypasses Argon2id password derivation entirely. Use when the host has
