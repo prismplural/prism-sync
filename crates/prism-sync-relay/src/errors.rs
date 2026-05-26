@@ -35,6 +35,17 @@ pub enum AppError {
         "MustBootstrapFromSnapshot(since_seq={since_seq}, first_retained_seq={first_retained_seq})"
     )]
     MustBootstrapFromSnapshot { since_seq: i64, first_retained_seq: i64 },
+    /// A `PUT /snapshot` upload lost the seq-ordering race. Returned
+    /// as `409 Conflict` with a structured `stale_snapshot_seq` body
+    /// (`current_server_seq_at`, `current_target_device_id`) so the
+    /// client can route it to the snapshot-specific recovery path
+    /// rather than the generic epoch-rotation one and feed the existing
+    /// target into its suppression matrix.
+    #[error(
+        "SnapshotStale(current_server_seq_at={current_server_seq_at}, \
+         current_target_device_id={current_target_device_id:?})"
+    )]
+    SnapshotStale { current_server_seq_at: i64, current_target_device_id: Option<String> },
     #[error("Internal({0})")]
     Internal(String),
 }
@@ -56,6 +67,7 @@ impl IntoResponse for AppError {
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             AppError::StorageFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             AppError::MustBootstrapFromSnapshot { .. } => StatusCode::CONFLICT,
+            AppError::SnapshotStale { .. } => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let response = match &self {
@@ -141,6 +153,19 @@ impl IntoResponse for AppError {
                 }),
             )
                 .into_response(),
+            AppError::SnapshotStale { current_server_seq_at, current_target_device_id } => {
+                // Local JSON body rather than a field on the shared
+                // `ErrorBody` — this variant's payload doesn't overlap
+                // any other. `Option::None` serialises as JSON `null`,
+                // which is the wire contract the client expects.
+                let body = serde_json::json!({
+                    "error": "stale_snapshot_seq",
+                    "message": "Snapshot upload superseded by a newer server snapshot",
+                    "current_server_seq_at": current_server_seq_at,
+                    "current_target_device_id": current_target_device_id,
+                });
+                (status, Json(body)).into_response()
+            }
             AppError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);
                 (status, "Internal Server Error".to_string()).into_response()

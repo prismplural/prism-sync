@@ -61,6 +61,9 @@ struct MockRelayState {
     push_413_batch_ids: HashSet<String>,
     /// Records each `push_changes` call's batch_id for test assertions.
     push_call_batch_ids: Vec<String>,
+    /// If set, the next `put_snapshot` call returns `SnapshotStale`
+    /// with these values and clears the slot.
+    next_put_snapshot_stale: Option<(i64, Option<String>)>,
 }
 
 /// How an injected `pull_changes` failure should present on the wire.
@@ -115,9 +118,22 @@ impl MockRelay {
                 signed_registry: None,
                 push_413_batch_ids: HashSet::new(),
                 push_call_batch_ids: Vec::new(),
+                next_put_snapshot_stale: None,
             }),
             notification_tx,
         }
+    }
+
+    /// Cause the next `put_snapshot` to fail with
+    /// `RelayError::SnapshotStale`, simulating a relay race. Feeds the
+    /// engine's audience-aware suppression matrix.
+    pub fn fail_next_put_snapshot_stale(
+        &self,
+        current_server_seq_at: i64,
+        current_target_device_id: Option<String>,
+    ) {
+        self.state.lock().unwrap().next_put_snapshot_stale =
+            Some((current_server_seq_at, current_target_device_id));
     }
 
     /// Cause the next `push_changes(batch_id)` to fail with HTTP 413
@@ -454,6 +470,17 @@ impl SnapshotExchange for MockRelay {
         uploader_device_id: String,
         progress: Option<SnapshotUploadProgress>,
     ) -> Result<(), RelayError> {
+        // Consume any injected stale-409 before storing, matching the
+        // real relay where a rejected upsert leaves the existing row
+        // intact.
+        if let Some((current_server_seq_at, current_target_device_id)) =
+            self.state.lock().unwrap().next_put_snapshot_stale.take()
+        {
+            return Err(RelayError::SnapshotStale {
+                current_server_seq_at,
+                current_target_device_id,
+            });
+        }
         let total = envelope_bytes.len() as u64;
         let mut state = self.state.lock().unwrap();
         state.snapshot = Some(SnapshotResponse {

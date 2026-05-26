@@ -1688,6 +1688,14 @@ pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite:
 // Snapshot queries
 // ---------------------------------------------------------------------------
 
+/// Insert or replace the per-sync snapshot row, only if the incoming
+/// `server_seq_at` is strictly greater than the stored one or the stored
+/// snapshot has already expired. Returns 1 on write, 0 if the WHERE
+/// guard filtered the upsert (caller should surface a 409 to the client).
+///
+/// The expiry leg mirrors the read-time filter in [`get_snapshot`] —
+/// an expired row is invisible to readers anyway, so a lower-seq upload
+/// is allowed to replace it without waiting for cleanup.
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_snapshot(
     conn: &Connection,
@@ -1698,9 +1706,9 @@ pub fn upsert_snapshot(
     expires_at: Option<i64>,
     target_device_id: Option<&str>,
     uploaded_by_device_id: Option<&str>,
-) -> Result<(), rusqlite::Error> {
+) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
-    conn.execute(
+    let affected = conn.execute(
         "INSERT INTO snapshots (sync_id, epoch, server_seq_at, data, created_at, expires_at, target_device_id, uploaded_by_device_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(sync_id) DO UPDATE SET
@@ -1710,7 +1718,9 @@ pub fn upsert_snapshot(
             created_at = excluded.created_at,
             expires_at = excluded.expires_at,
             target_device_id = excluded.target_device_id,
-            uploaded_by_device_id = excluded.uploaded_by_device_id",
+            uploaded_by_device_id = excluded.uploaded_by_device_id
+         WHERE excluded.server_seq_at > snapshots.server_seq_at
+            OR (snapshots.expires_at IS NOT NULL AND snapshots.expires_at < unixepoch())",
         params![
             sync_id,
             epoch,
@@ -1722,7 +1732,25 @@ pub fn upsert_snapshot(
             uploaded_by_device_id,
         ],
     )?;
-    Ok(())
+    Ok(affected)
+}
+
+/// Look up `(server_seq_at, target_device_id)` of the stored snapshot.
+///
+/// Used by the put-snapshot handler on a stale-upload rejection so the
+/// 409 body can carry the existing target alongside its seq, which
+/// drives the engine's suppression matrix. Does not filter expired
+/// rows — callers invoke this immediately after a write-side rejection.
+pub fn get_snapshot_seq_and_target(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<(i64, Option<String>)>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT server_seq_at, target_device_id FROM snapshots WHERE sync_id = ?1",
+        params![sync_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
 }
 
 pub fn get_snapshot(
@@ -3694,21 +3722,22 @@ mod tests {
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
 
-            // Snapshot with expiry in the past is not returned by get_snapshot
+            // Seq bumps across the three upserts keep this test scoped to
+            // expiry semantics; the strict-newer-wins guard is exercised
+            // in `tests/relay_snapshot_tests.rs`.
             let past = now_secs() - 60;
             upsert_snapshot(conn, "sg1", 1, 10, b"expired", Some(past), None, Some("dev1"))?;
             let snap = get_snapshot(conn, "sg1")?;
             assert!(snap.is_none(), "expired snapshot should not be returned");
 
-            // Snapshot with expiry in the future is returned
             let future = now_secs() + 3600;
-            upsert_snapshot(conn, "sg1", 1, 10, b"valid", Some(future), None, Some("dev1"))?;
+            upsert_snapshot(conn, "sg1", 1, 11, b"valid", Some(future), None, Some("dev1"))?;
             let snap = get_snapshot(conn, "sg1")?.unwrap();
             assert_eq!(snap.data, b"valid");
             assert_eq!(snap.uploaded_by_device_id.as_deref(), Some("dev1"));
 
-            // Snapshot with no expiry (legacy) is always returned
-            upsert_snapshot(conn, "sg1", 1, 10, b"permanent", None, None, None)?;
+            // Snapshot with no expiry (legacy) is always returned.
+            upsert_snapshot(conn, "sg1", 1, 12, b"permanent", None, None, None)?;
             let snap = get_snapshot(conn, "sg1")?.unwrap();
             assert_eq!(snap.data, b"permanent");
             assert_eq!(snap.uploaded_by_device_id, None);

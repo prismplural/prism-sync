@@ -217,22 +217,53 @@ impl ServerRelay {
             408 | 504 => RelayError::Timeout { message: format!("HTTP {status}: {body}") },
             409 => {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-                    if json.get("error").and_then(|v| v.as_str())
-                        == Some("must_bootstrap_from_snapshot")
-                    {
-                        let since_seq = json.get("since_seq").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let first_retained_seq =
-                            json.get("first_retained_seq").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let message = json
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
-                        return RelayError::MustBootstrapFromSnapshot {
-                            since_seq,
-                            first_retained_seq,
-                            message,
-                        };
+                    match json.get("error").and_then(|v| v.as_str()) {
+                        Some("must_bootstrap_from_snapshot") => {
+                            let since_seq =
+                                json.get("since_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let first_retained_seq = json
+                                .get("first_retained_seq")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            let message = json
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+                            return RelayError::MustBootstrapFromSnapshot {
+                                since_seq,
+                                first_retained_seq,
+                                message,
+                            };
+                        }
+                        Some("stale_snapshot_seq") => {
+                            // Distinct from the `EpochRotation` fallback so
+                            // the engine can route the 409 through the
+                            // suppression matrix instead of epoch recovery.
+                            //
+                            // `current_server_seq_at` and
+                            // `current_target_device_id` are both required.
+                            // Missing-vs-`null` is a meaningful distinction
+                            // for the target field — JSON `null` means the
+                            // existing snapshot is untargeted (a real
+                            // semantic value), but an absent field means
+                            // the body is malformed and substituting `None`
+                            // would collapse a (None, Some) race into the
+                            // (None, None) suppress branch.
+                            let seq = json.get("current_server_seq_at").and_then(|v| v.as_i64());
+                            let target_parsed = match json.get("current_target_device_id") {
+                                None => None,
+                                Some(v) if v.is_null() => Some(None),
+                                Some(v) => v.as_str().map(|s| Some(s.to_owned())),
+                            };
+                            if let (Some(seq), Some(target)) = (seq, target_parsed) {
+                                return RelayError::SnapshotStale {
+                                    current_server_seq_at: seq,
+                                    current_target_device_id: target,
+                                };
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 RelayError::EpochRotation {
@@ -1173,6 +1204,90 @@ mod tests {
                 ref message,
             } if message == "bootstrap"
         ));
+    }
+
+    #[test]
+    fn classify_error_recognizes_snapshot_stale() {
+        let err = ServerRelay::classify_error(
+            409,
+            r#"{"error":"stale_snapshot_seq","current_server_seq_at":42,"current_target_device_id":"joiner-A"}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::SnapshotStale {
+                current_server_seq_at: 42,
+                ref current_target_device_id,
+            } if current_target_device_id.as_deref() == Some("joiner-A")
+        ));
+    }
+
+    #[test]
+    fn classify_error_snapshot_stale_handles_null_target() {
+        // JSON `null` means the existing snapshot is untargeted (a real
+        // semantic value, distinct from an absent field).
+        let err = ServerRelay::classify_error(
+            409,
+            r#"{"error":"stale_snapshot_seq","current_server_seq_at":7,"current_target_device_id":null}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::SnapshotStale { current_server_seq_at: 7, current_target_device_id: None }
+        ));
+    }
+
+    #[test]
+    fn classify_error_snapshot_stale_falls_back_when_target_field_absent() {
+        // Absence is treated as malformed body rather than untargeted —
+        // mapping it to `None` would collapse a (None, Some) race into
+        // the (None, None) suppress branch in the engine matrix and
+        // silently lose an untargeted upload's universal availability
+        // when a partially-upgraded relay returns this shape.
+        // existing snapshot collapses to `(None, None)` in the matrix
+        // and gets silently suppressed — losing universal availability.
+        // Falling through to `EpochRotation` surfaces the malformed body
+        // as a real error so callers don't silently drop the upload.
+        let err = ServerRelay::classify_error(
+            409,
+            r#"{"error":"stale_snapshot_seq","current_server_seq_at":42}"#,
+        );
+        match err {
+            RelayError::EpochRotation { new_epoch: 0 } => {}
+            other => panic!("expected EpochRotation fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_error_snapshot_stale_falls_back_when_seq_missing() {
+        // A body claiming `stale_snapshot_seq` without `current_server_seq_at`
+        // must NOT coerce to seq=0 — that would let the engine absorb a
+        // malformed 409 as Ok(()) through the suppression path.
+        let body = r#"{"error":"stale_snapshot_seq","current_target_device_id":"foo"}"#;
+        let err = ServerRelay::classify_error(409, body);
+        match err {
+            RelayError::EpochRotation { new_epoch: 0 } => {}
+            other => panic!("expected EpochRotation fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_error_snapshot_stale_falls_back_when_seq_wrong_type() {
+        let body = r#"{"error":"stale_snapshot_seq","current_server_seq_at":"not-a-number"}"#;
+        let err = ServerRelay::classify_error(409, body);
+        match err {
+            RelayError::EpochRotation { new_epoch: 0 } => {}
+            other => panic!("expected EpochRotation fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_error_falls_back_for_unknown_409_body() {
+        // The unknown-409 fallback must survive the addition of the
+        // `stale_snapshot_seq` branch, or 409s that genuinely need
+        // epoch-rotation handling will misroute.
+        let err = ServerRelay::classify_error(409, r#"{"error":"something_else"}"#);
+        assert!(matches!(err, RelayError::EpochRotation { new_epoch: 0 }));
     }
 
     #[test]

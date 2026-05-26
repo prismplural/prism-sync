@@ -744,3 +744,368 @@ async fn test_non_snapshot_route_still_respects_default_timeout() {
         ),
     }
 }
+
+// ───────────────────── put_snapshot seq-ordering race ─────────────────────
+//
+// Repros for the `WHERE excluded.server_seq_at > snapshots.server_seq_at OR
+// snapshots.expires_at < unixepoch()` guard added to `db::upsert_snapshot`,
+// plus the `AppError::SnapshotStale` mapping in `do_put_snapshot`.
+//
+// Policy: equal-seq is treated as stale (`>` not `>=`) because we want
+// "strictly newer wins". Concurrent uploaders racing on the same
+// `server_seq_at` thus see exactly one winner — the row content is
+// deterministic regardless of arrival order.
+
+/// Helper that reads a snapshot back as the uploader and returns the parsed
+/// JSON body. Used by the race tests to verify which payload "won".
+async fn fetch_snapshot_json(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+) -> serde_json::Value {
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "snapshot fetch should succeed");
+    resp.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn put_snapshot_stale_seq_returns_conflict() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // First upload at server_seq_at=100 — fresh insert.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "100",
+        b"fresh-data".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "first upload should succeed");
+
+    // Try to upload server_seq_at=42 (stale).
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "42",
+        b"stale-data".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "stale upload should return Conflict");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "stale_snapshot_seq", "structured error key");
+    assert_eq!(
+        body["current_server_seq_at"].as_i64().unwrap(),
+        100,
+        "must report the current (newer) seq so the client can advance"
+    );
+    // The field's presence (vs. omission) is the wire signal that
+    // distinguishes "existing snapshot is untargeted" from "malformed
+    // body" on the client side, so it must be in the 409 even when
+    // the existing snapshot was untargeted.
+    assert!(
+        body.get("current_target_device_id").is_some(),
+        "current_target_device_id field must be present"
+    );
+    assert!(
+        body["current_target_device_id"].is_null(),
+        "existing snapshot was untargeted, so the field must be JSON null: {body:?}"
+    );
+
+    // Verify GET returns the fresh snapshot, not the stale one.
+    let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &device_id, &token).await;
+    assert_eq!(snapshot["server_seq_at"].as_i64().unwrap(), 100);
+    let decoded = BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded.as_slice(), b"fresh-data");
+}
+
+#[tokio::test]
+async fn put_snapshot_equal_seq_returns_conflict() {
+    // The upsert WHERE uses `>`, not `>=`, so equal-seq uploads land
+    // on the rejected branch and the existing payload is preserved.
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "100",
+        b"data-v1".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // Same server_seq_at=100, different body — must be treated as stale.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "100",
+        b"data-v2".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "equal seq is stale per > policy");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "stale_snapshot_seq");
+    assert_eq!(body["current_server_seq_at"].as_i64().unwrap(), 100);
+    assert!(
+        body.get("current_target_device_id").is_some(),
+        "current_target_device_id field must be present"
+    );
+    assert!(
+        body["current_target_device_id"].is_null(),
+        "untargeted existing snapshot → JSON null target"
+    );
+
+    // Original payload preserved.
+    let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &device_id, &token).await;
+    let decoded = BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded.as_slice(), b"data-v1");
+}
+
+#[tokio::test]
+async fn put_snapshot_stale_includes_target_in_409_body() {
+    // When a stale upload loses to an existing targeted snapshot, the
+    // 409 body must carry that target so the engine can route the
+    // (Some, Some) cross-target case to propagation. The `snapshots`
+    // table has PRIMARY KEY on `sync_id` alone, so two concurrent
+    // pairing snapshots for different joiners race for one row and
+    // the losing joiner would later 403 on download.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // Initiator uploads the snapshots; two joiners are the targets.
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner_a = generate_device_id();
+    let (_token_a, _keys_a) = prepare_device(&db, &sync_id, &joiner_a).await;
+    let joiner_b = generate_device_id();
+    let (_token_b, _keys_b) = prepare_device(&db, &sync_id, &joiner_b).await;
+
+    // 1. Initiator uploads snapshot seq=100 targeting joiner-A.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "100",
+        b"snapshot-for-A".to_vec(),
+        &[("X-For-Device-Id", &joiner_a)],
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "first targeted upload should succeed");
+
+    // 2. Initiator uploads snapshot seq=42 targeting joiner-B.
+    //    seq=42 is stale relative to seq=100, so this loses the race
+    //    against the existing row. The 409 body must report:
+    //      - current_server_seq_at = 100 (the existing row's seq)
+    //      - current_target_device_id = joiner-A (the existing row's target)
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "42",
+        b"snapshot-for-B".to_vec(),
+        &[("X-For-Device-Id", &joiner_b)],
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "stale targeted upload must return Conflict");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "stale_snapshot_seq");
+    assert_eq!(
+        body["current_server_seq_at"].as_i64().unwrap(),
+        100,
+        "must report the existing snapshot's seq"
+    );
+    assert_eq!(
+        body["current_target_device_id"].as_str(),
+        Some(joiner_a.as_str()),
+        "must report the existing snapshot's target so the engine can detect cross-target overwrite \
+         (body = {body})"
+    );
+}
+
+#[tokio::test]
+async fn put_snapshot_replaces_expired_high_seq() {
+    // The WHERE leg `OR snapshots.expires_at < unixepoch()` is what keeps an
+    // expired high-seq row from blocking a fresh lower-seq upload. Without it
+    // the new snapshot would 409 until the cleanup job ran.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // Upload server_seq_at=100 with a TTL header (any TTL will do — we force
+    // expiry directly afterwards to make the test deterministic instead of
+    // sleeping).
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "100",
+        b"old-high-seq".to_vec(),
+        &[("X-Snapshot-TTL", "60")],
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // Force the row to look expired. Avoids a real `tokio::time::sleep`.
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE snapshots SET expires_at = ?1 WHERE sync_id = ?2",
+            rusqlite::params![db::now_secs() - 1, sync_id],
+        )?;
+        Ok(())
+    })
+    .expect("force snapshot expiry");
+
+    // Lower seq (=42) must succeed because the high-seq snapshot is expired.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "42",
+        b"fresh-low-seq".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "fresh upload should succeed over expired high-seq");
+
+    let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &device_id, &token).await;
+    assert_eq!(snapshot["server_seq_at"].as_i64().unwrap(), 42);
+    let decoded = BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded.as_slice(), b"fresh-low-seq");
+}
+
+#[tokio::test]
+async fn put_snapshot_concurrent_higher_seq_wins() {
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // Clone everything per task. `TestDeviceKeys` is not `Clone`, so we sign
+    // both requests sequentially before racing — the actual relay PUTs are
+    // what get raced, not the signature build.
+    let client_a = client.clone();
+    let client_b = client.clone();
+    let url_a = url.clone();
+    let url_b = url.clone();
+    let sync_id_a = sync_id.clone();
+    let sync_id_b = sync_id.clone();
+    let device_id_a = device_id.clone();
+    let device_id_b = device_id.clone();
+    let token_a = token.clone();
+    let token_b = token.clone();
+    let path = format!("/v1/sync/{sync_id}/snapshot");
+
+    let body_100 = b"hundred".to_vec();
+    let req_100 = client_a
+        .put(format!("{url_a}{path}"))
+        .header("Authorization", format!("Bearer {token_a}"))
+        .header("X-Device-Id", &device_id_a)
+        .header("X-Server-Seq-At", "100");
+    let req_100 =
+        apply_signed_headers(req_100, &keys, "PUT", &path, &sync_id_a, &device_id_a, &body_100)
+            .body(body_100);
+
+    let body_42 = b"forty-two".to_vec();
+    let req_42 = client_b
+        .put(format!("{url_b}{path}"))
+        .header("Authorization", format!("Bearer {token_b}"))
+        .header("X-Device-Id", &device_id_b)
+        .header("X-Server-Seq-At", "42");
+    let req_42 =
+        apply_signed_headers(req_42, &keys, "PUT", &path, &sync_id_b, &device_id_b, &body_42)
+            .body(body_42);
+
+    // Issue both PUTs concurrently. Whichever order they hit SQLite, the WHERE
+    // guard ensures the higher-seq payload is what's stored.
+    //
+    // We don't assert specific status codes here because there are two valid
+    // outcomes depending on SQLite's serialisation:
+    //
+    //   - seq=100 lands first, seq=42 lands second → 204 then 409 (the 42
+    //     upload is stale w.r.t. the already-stored 100).
+    //   - seq=42 lands first, seq=100 lands second → 204 then 204 (strictly
+    //     newer; the upsert overwrites the older row legitimately).
+    //
+    // What matters for the race-correctness invariant is the *final stored
+    // state*: regardless of who got accepted, the highest seq must win and
+    // its payload must be on disk. The "stale" 409 is exercised
+    // deterministically by `put_snapshot_stale_seq_returns_conflict` above
+    // — this test specifically guards the convergence property.
+    let (r1, r2) = tokio::join!(req_100.send(), req_42.send());
+    let r1 = r1.unwrap();
+    let r2 = r2.unwrap();
+    let statuses = [r1.status().as_u16(), r2.status().as_u16()];
+    assert!(
+        statuses.iter().all(|s| *s == 204 || *s == 409),
+        "expected only 204 or 409 outcomes; got {statuses:?}"
+    );
+    assert!(statuses.contains(&204), "at least one upload should have succeeded; got {statuses:?}");
+
+    let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &device_id, &token).await;
+    assert_eq!(
+        snapshot["server_seq_at"].as_i64().unwrap(),
+        100,
+        "higher seq must win regardless of arrival order"
+    );
+    let decoded = BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded.as_slice(), b"hundred");
+}

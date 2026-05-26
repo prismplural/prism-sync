@@ -407,16 +407,22 @@ async fn test_cleanup_pruning_requires_group_wide_snapshot() {
             let batches = db::get_batches_since(conn, &sync_id, 0, 100)?;
             assert_eq!(batches.len(), 5);
 
+            // Bump the seq because `upsert_snapshot` rejects equal-seq
+            // overwrites; incidental to this test's purpose (group-wide
+            // snapshot enables pruning).
             db::upsert_snapshot(
                 conn,
                 &sync_id,
                 0,
-                last_seq,
+                last_seq + 1,
                 b"group-wide-snapshot",
                 Some(future),
                 None,
                 Some(&device_a_id),
             )?;
+            // Safe prune watermark is `min(snap_seq, min_acked)`; both
+            // devices acked at `last_seq` so it stays at `last_seq`
+            // despite the snapshot sitting one ahead.
             assert_eq!(db::get_safe_prune_seq(conn, &sync_id, 3600)?, Some(last_seq));
             let pruned = db::prune_batches_with_unexpired_snapshots(conn, 3600)?;
             assert_eq!(pruned, 4, "group-wide snapshot should permit cleanup pruning");

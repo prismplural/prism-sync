@@ -136,6 +136,19 @@ impl CoreError {
                 None,
                 None,
             ),
+            // The engine intercepts `SnapshotStale` for the audience-
+            // compatible suppress paths before this conversion runs;
+            // anything that reaches here is being propagated. Callers
+            // that need the existing target should pattern-match on
+            // `CoreError::Relay { source, .. }` and downcast — the
+            // `SyncResult` schema doesn't have a slot for it.
+            RelayError::SnapshotStale { .. } => (
+                RelayErrorCategory::Protocol,
+                Some(409),
+                Some("stale_snapshot_seq".to_string()),
+                None,
+                None,
+            ),
             RelayError::Protocol { .. }
             | RelayError::EpochRotation { .. }
             | RelayError::ClockSkew { .. }

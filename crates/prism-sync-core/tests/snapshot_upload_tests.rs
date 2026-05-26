@@ -19,6 +19,8 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine};
+use prism_sync_core::error::{CoreError, RelayErrorCategory};
+use prism_sync_core::relay::traits::RelayError;
 use prism_sync_core::relay::MockRelay;
 use prism_sync_core::storage::RusqliteSyncStorage;
 use prism_sync_core::syncable_entity::SyncableEntity;
@@ -349,4 +351,166 @@ async fn test_snapshot_roundtrip_preserves_data() {
 
     let task_2 = entity_changes.iter().find(|c| c.entity_id == "task-2").unwrap();
     assert_eq!(task_2.fields.get("done"), Some(&"true".to_string()));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Engine-level SnapshotStale handling
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These tests drive `SyncEngine::upload_pairing_snapshot` end-to-end
+// against a `MockRelay` injected to return `SnapshotStale`, complementing
+// the free-function matrix tests in `engine/mod.rs` and the wire-level
+// tests in `relay_snapshot_tests.rs`.
+
+/// Same-target race — the existing snapshot serves the same joiner, so
+/// the engine treats the 409 as success-equivalent.
+#[tokio::test]
+async fn upload_pairing_snapshot_suppresses_same_target_stale_409() {
+    let (relay, key_hierarchy, _sk_a, sk_b, ml_b, storage_b) =
+        push_and_create_snapshot(vec![("task-1", "First", false, "batch-1")]).await;
+
+    let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+    let engine_b = SyncEngine::new(
+        storage_b.clone(),
+        relay.clone(),
+        vec![entity_b],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Existing snapshot on the relay is at a much higher seq AND already
+    // targets "joiner-A" — same as our intended upload. Engine must suppress.
+    relay.fail_next_put_snapshot_stale(9_999, Some("joiner-A".to_string()));
+
+    let result = engine_b
+        .upload_pairing_snapshot(
+            SYNC_ID,
+            &key_hierarchy,
+            0,
+            "device-bbb",
+            &sk_b,
+            &ml_b,
+            0,
+            Some(300),
+            Some("joiner-A".to_string()),
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "same-target stale 409 should suppress as success-equivalent, got: {result:?}"
+    );
+}
+
+/// Untargeted upload racing a targeted existing — propagating preserves
+/// the universal-availability intent that suppression would silently
+/// lose.
+#[tokio::test]
+async fn upload_pairing_snapshot_propagates_untargeted_vs_targeted_stale_409() {
+    let (relay, key_hierarchy, _sk_a, sk_b, ml_b, storage_b) =
+        push_and_create_snapshot(vec![("task-1", "First", false, "batch-1")]).await;
+
+    let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+    let engine_b = SyncEngine::new(
+        storage_b.clone(),
+        relay.clone(),
+        vec![entity_b],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    relay.fail_next_put_snapshot_stale(9_999, Some("joiner-A".to_string()));
+
+    let err = engine_b
+        .upload_pairing_snapshot(
+            SYNC_ID,
+            &key_hierarchy,
+            0,
+            "device-bbb",
+            &sk_b,
+            &ml_b,
+            0,
+            Some(300),
+            None, // untargeted
+            None,
+        )
+        .await
+        .expect_err("untargeted-vs-targeted stale 409 must propagate, not suppress");
+
+    match err {
+        CoreError::Relay {
+            kind: RelayErrorCategory::Protocol,
+            status: Some(409),
+            code: Some(ref code),
+            source:
+                Some(RelayError::SnapshotStale { current_server_seq_at, ref current_target_device_id }),
+            ..
+        } if code == "stale_snapshot_seq" => {
+            assert_eq!(current_server_seq_at, 9_999);
+            assert_eq!(
+                current_target_device_id.as_deref(),
+                Some("joiner-A"),
+                "propagated error must carry the existing target"
+            );
+        }
+        other => panic!("expected propagated SnapshotStale, got: {other:?}"),
+    }
+}
+
+/// Cross-target race — the loser's targeted snapshot is silently
+/// overwritten, so the engine must propagate rather than suppress.
+#[tokio::test]
+async fn upload_pairing_snapshot_propagates_cross_target_stale_409() {
+    let (relay, key_hierarchy, _sk_a, sk_b, ml_b, storage_b) =
+        push_and_create_snapshot(vec![("task-1", "First", false, "batch-1")]).await;
+
+    let entity_b: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+    let engine_b = SyncEngine::new(
+        storage_b.clone(),
+        relay.clone(),
+        vec![entity_b],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    relay.fail_next_put_snapshot_stale(9_999, Some("joiner-B".to_string()));
+
+    let err = engine_b
+        .upload_pairing_snapshot(
+            SYNC_ID,
+            &key_hierarchy,
+            0,
+            "device-bbb",
+            &sk_b,
+            &ml_b,
+            0,
+            Some(300),
+            Some("joiner-A".to_string()),
+            None,
+        )
+        .await
+        .expect_err("cross-target stale 409 must propagate, not suppress");
+
+    // Surface as Protocol/409/stale_snapshot_seq with the inner RelayError
+    // preserved on `source` so downstream callers can recover the existing
+    // target for diagnostics.
+    match err {
+        CoreError::Relay {
+            kind: RelayErrorCategory::Protocol,
+            status: Some(409),
+            code: Some(ref code),
+            source:
+                Some(RelayError::SnapshotStale { current_server_seq_at, ref current_target_device_id }),
+            ..
+        } if code == "stale_snapshot_seq" => {
+            assert_eq!(current_server_seq_at, 9_999);
+            assert_eq!(
+                current_target_device_id.as_deref(),
+                Some("joiner-B"),
+                "propagated error should carry the existing target so callers can diagnose"
+            );
+        }
+        other => panic!("expected propagated SnapshotStale, got: {other:?}"),
+    }
 }

@@ -442,7 +442,7 @@ pub async fn put_snapshot(
     // `body` is a `bytes::Bytes` — cheap to move into the blocking task
     // (reference-counted, no allocation). Avoid an extra ~150 MB copy via
     // `body.to_vec()` that the handler used to do.
-    tokio::task::spawn_blocking(move || {
+    let upsert_result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             Ok(do_put_snapshot(
                 conn,
@@ -457,7 +457,12 @@ pub async fn put_snapshot(
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| AppError::Internal(e.to_string()))??;
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if matches!(upsert_result, Err(AppError::SnapshotStale { .. })) {
+        state.metrics.inc(&state.metrics.snapshots_rejected_stale);
+    }
+    upsert_result?;
 
     tracing::debug!(sync_id = %trunc(&sync_id), "Put snapshot stored");
     Ok(StatusCode::NO_CONTENT)
@@ -478,7 +483,7 @@ fn do_put_snapshot(
         .ok_or(AppError::NotFound)?;
     let epoch = device.epoch;
 
-    db::upsert_snapshot(
+    let affected = db::upsert_snapshot(
         conn,
         sync_id,
         epoch,
@@ -488,7 +493,25 @@ fn do_put_snapshot(
         target_device_id,
         Some(device_id),
     )
-    .map_err(|e| AppError::Internal(e.to_string()))
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if affected == 0 {
+        // The upsert's WHERE guard filtered our write: a snapshot with
+        // a >= server_seq_at is already stored. Report the existing
+        // (seq, target) so the client can advance its watermark and
+        // route the 409 through the engine's suppression matrix.
+        //
+        // The lookup is a separate auto-commit statement, not a SQL
+        // transaction. Safe because `with_conn` serializes writers
+        // behind a single `Mutex<Connection>`, so no other writer can
+        // mutate the row between the failed upsert and this read.
+        let (current_server_seq_at, current_target_device_id) =
+            db::get_snapshot_seq_and_target(conn, sync_id)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .unwrap_or((0, None));
+        return Err(AppError::SnapshotStale { current_server_seq_at, current_target_device_id });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

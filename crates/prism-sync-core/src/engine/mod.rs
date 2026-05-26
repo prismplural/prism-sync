@@ -132,6 +132,44 @@ fn is_payload_too_large_error(err: &RelayError) -> bool {
     matches!(err, RelayError::Server { status_code: 413, .. })
 }
 
+/// Decide whether a `RelayError::SnapshotStale` 409 from `put_snapshot`
+/// should be suppressed as success-equivalent in `upload_pairing_snapshot`.
+///
+/// Suppress only when the existing snapshot's audience is a superset of
+/// (or equal to) our intended audience — anything narrower would
+/// silently lose availability for some device, because `snapshots` has
+/// PRIMARY KEY on `sync_id` alone and the relay's GET 403s every device
+/// that doesn't match the stored `target_device_id`.
+///
+/// | our target | existing target | suppress? |
+/// |------------|-----------------|-----------|
+/// | `None`     | `None`          | yes       |
+/// | `None`     | `Some(_)`       | no — universal intent lost |
+/// | `Some(x)`  | `None`          | no — targeted snapshot lost |
+/// | `Some(x)`  | `Some(x)`       | yes — same-target race |
+/// | `Some(x)`  | `Some(y)` (≠ x) | no — cross-target overwrite |
+///
+/// Also propagates a "stale" 409 whose cited seq is strictly lower than
+/// ours, since that's a logically-invalid response from the relay.
+///
+/// Free function so the matrix can be unit-tested without a `SyncEngine`.
+fn should_suppress_stale_snapshot(
+    our_target: Option<&str>,
+    existing_target: Option<&str>,
+    our_seq: i64,
+    existing_seq: i64,
+) -> bool {
+    if existing_seq < our_seq {
+        return false;
+    }
+    match (our_target, existing_target) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(_), None) => false,
+        (Some(ours), Some(theirs)) => ours == theirs,
+    }
+}
+
 /// Result of the pull phase, bundling counts with relay-reported metadata.
 struct PullPhaseResult {
     pulled: u64,
@@ -1633,7 +1671,11 @@ impl SyncEngine {
         // 5. Serialize the envelope to JSON bytes and upload
         let envelope_bytes =
             serde_json::to_vec(&envelope).map_err(|e| CoreError::Serialization(e.to_string()))?;
-        self.relay
+        // Clone before `for_device_id` is moved into `put_snapshot`;
+        // the SnapshotStale arm below feeds it to the suppression matrix.
+        let our_target = for_device_id.clone();
+        match self
+            .relay
             .put_snapshot(
                 epoch,
                 server_seq,
@@ -1644,9 +1686,49 @@ impl SyncEngine {
                 progress,
             )
             .await
-            .map_err(CoreError::from_relay)?;
-
-        Ok(())
+        {
+            Ok(()) => Ok(()),
+            // Route the 409 through the suppression matrix
+            // (`should_suppress_stale_snapshot`) instead of letting it
+            // become a generic `CoreError::Relay` event — only the
+            // audience-compatible cases (both untargeted, or same
+            // specific target) are success-equivalent.
+            Err(crate::relay::traits::RelayError::SnapshotStale {
+                current_server_seq_at,
+                current_target_device_id,
+            }) => {
+                if should_suppress_stale_snapshot(
+                    our_target.as_deref(),
+                    current_target_device_id.as_deref(),
+                    server_seq,
+                    current_server_seq_at,
+                ) {
+                    tracing::debug!(
+                        sync_id = %sync_id,
+                        current_server_seq_at,
+                        our_server_seq = server_seq,
+                        our_target = ?our_target,
+                        existing_target = ?current_target_device_id,
+                        "snapshot upload superseded by newer server snapshot; treating as success"
+                    );
+                    Ok(())
+                } else {
+                    tracing::warn!(
+                        sync_id = %sync_id,
+                        current_server_seq_at,
+                        our_server_seq = server_seq,
+                        our_target = ?our_target,
+                        existing_target = ?current_target_device_id,
+                        "snapshot upload superseded with incompatible audience; propagating"
+                    );
+                    Err(CoreError::from_relay(crate::relay::traits::RelayError::SnapshotStale {
+                        current_server_seq_at,
+                        current_target_device_id,
+                    }))
+                }
+            }
+            Err(other) => Err(CoreError::from_relay(other)),
+        }
     }
 
     /// Seed `field_versions` from pre-existing local data (first-device
@@ -2255,5 +2337,61 @@ mod tests {
             assert!(result.error_code.is_none(), "{err:?}");
             assert!(result.remote_wipe.is_none(), "{err:?}");
         }
+    }
+
+    // ── SnapshotStale suppression matrix ─────────────────────────────
+
+    #[test]
+    fn should_suppress_stale_snapshot_untargeted_vs_untargeted_suppresses() {
+        assert!(should_suppress_stale_snapshot(None, None, 42, 42));
+        assert!(should_suppress_stale_snapshot(None, None, 42, 100));
+    }
+
+    /// Universal intent racing a targeted existing must propagate;
+    /// the relay's GET 403s every device that doesn't match the
+    /// stored target, so suppression would silently lose availability
+    /// for every joiner except that one.
+    #[test]
+    fn should_suppress_stale_snapshot_untargeted_upload_vs_targeted_existing_propagates() {
+        assert!(!should_suppress_stale_snapshot(None, Some("joiner-A"), 42, 100));
+        assert!(!should_suppress_stale_snapshot(None, Some("joiner-B"), 42, 50));
+    }
+
+    #[test]
+    fn should_suppress_stale_snapshot_targeted_upload_vs_untargeted_existing_propagates() {
+        assert!(!should_suppress_stale_snapshot(Some("joiner-A"), None, 42, 100));
+    }
+
+    #[test]
+    fn should_suppress_stale_snapshot_same_target_suppresses() {
+        assert!(should_suppress_stale_snapshot(Some("joiner-A"), Some("joiner-A"), 42, 100));
+    }
+
+    /// Cross-target race: the loser's targeted snapshot is silently
+    /// lost (PK on `sync_id` alone), so the losing joiner would later
+    /// 403 on download.
+    #[test]
+    fn should_suppress_stale_snapshot_cross_target_propagates() {
+        assert!(!should_suppress_stale_snapshot(Some("joiner-A"), Some("joiner-B"), 42, 100));
+        assert!(!should_suppress_stale_snapshot(Some("joiner-B"), Some("joiner-A"), 42, 100));
+    }
+
+    /// Relay claims our upload is stale but cites a strictly lower
+    /// seq — logically impossible. Propagate rather than silently
+    /// no-op, as defense against malformed or hostile responses.
+    #[test]
+    fn should_suppress_stale_snapshot_rejects_seq_inversion() {
+        assert!(!should_suppress_stale_snapshot(Some("joiner-A"), Some("joiner-A"), 42, 0));
+        assert!(!should_suppress_stale_snapshot(None, None, 42, 0));
+        assert!(!should_suppress_stale_snapshot(None, Some("joiner-A"), 42, 41));
+    }
+
+    /// Equal seqs are valid for suppression — under the `>` policy the
+    /// relay legitimately rejects equal-seq uploads as stale (existing
+    /// wins ties). The seq-sanity check uses `>=`, not `>`.
+    #[test]
+    fn should_suppress_stale_snapshot_allows_equal_seq() {
+        assert!(should_suppress_stale_snapshot(None, None, 42, 42));
+        assert!(should_suppress_stale_snapshot(Some("joiner-A"), Some("joiner-A"), 42, 42));
     }
 }

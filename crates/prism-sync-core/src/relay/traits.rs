@@ -54,6 +54,22 @@ pub enum RelayError {
     #[error("must bootstrap from snapshot: since_seq={since_seq}, first_retained_seq={first_retained_seq}")]
     MustBootstrapFromSnapshot { since_seq: i64, first_retained_seq: i64, message: String },
 
+    /// A `PUT /snapshot` upload lost the seq-ordering race against an
+    /// existing snapshot. Distinct from [`Self::EpochRotation`] so the
+    /// engine can route it through the suppression matrix in
+    /// `SyncEngine::upload_pairing_snapshot` (see
+    /// `should_suppress_stale_snapshot` for the audience rules).
+    ///
+    /// `current_target_device_id` carries the existing snapshot's
+    /// pairing target so the matrix can distinguish the cases that
+    /// suppress (same audience or wider) from the cases that propagate
+    /// (any narrower audience would silently lose availability).
+    #[error(
+        "snapshot stale: current_server_seq_at={current_server_seq_at}, \
+         current_target_device_id={current_target_device_id:?}"
+    )]
+    SnapshotStale { current_server_seq_at: i64, current_target_device_id: Option<String> },
+
     #[error("not found")]
     NotFound,
 
@@ -82,6 +98,7 @@ impl RelayError {
             RelayError::MustBootstrapFromSnapshot { .. } => {
                 RelayErrorKind::MustBootstrapFromSnapshot
             }
+            RelayError::SnapshotStale { .. } => RelayErrorKind::SnapshotStale,
             RelayError::NotFound => RelayErrorKind::NotFound,
             RelayError::Forbidden { .. } => RelayErrorKind::Forbidden,
             RelayError::Http { .. } => RelayErrorKind::Http,
@@ -112,6 +129,11 @@ pub enum RelayErrorKind {
     KeyChanged,
     DeviceRevoked,
     MustBootstrapFromSnapshot,
+    /// Stale snapshot upload — the relay already has a snapshot with a
+    /// `server_seq_at` strictly greater than (or equal to) ours. The
+    /// caller should treat this as success-equivalent and drop the
+    /// upload rather than triggering any recovery codepath.
+    SnapshotStale,
     NotFound,
     Forbidden,
     Http,
