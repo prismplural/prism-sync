@@ -36,6 +36,8 @@ async fn prometheus_metrics(
     let stored_batches = m.cached_stored_batches.load(Ordering::Relaxed);
     let db_size_bytes = m.cached_db_size_bytes.load(Ordering::Relaxed);
     let freelist_pages = m.cached_freelist_pages.load(Ordering::Relaxed);
+    let ws_notifications_dropped = m.ws_notifications_dropped.load(Ordering::Relaxed);
+    let snapshots_rejected_stale = m.snapshots_rejected_stale.load(Ordering::Relaxed);
 
     let output = format!(
         "# HELP prism_connected_devices Current WebSocket connections\n\
@@ -52,7 +54,13 @@ async fn prometheus_metrics(
          prism_freelist_pages {freelist_pages}\n\
          # HELP prism_last_cleanup_timestamp_seconds Unix timestamp of last successful cleanup cycle\n\
          # TYPE prism_last_cleanup_timestamp_seconds gauge\n\
-         prism_last_cleanup_timestamp_seconds {}\n",
+         prism_last_cleanup_timestamp_seconds {}\n\
+         # HELP prism_ws_notifications_dropped_total WebSocket notifications dropped on a full or closed per-device channel\n\
+         # TYPE prism_ws_notifications_dropped_total counter\n\
+         prism_ws_notifications_dropped_total {ws_notifications_dropped}\n\
+         # HELP prism_snapshots_rejected_stale_total PUT /snapshot rejected with 409 stale_snapshot_seq\n\
+         # TYPE prism_snapshots_rejected_stale_total counter\n\
+         prism_snapshots_rejected_stale_total {snapshots_rejected_stale}\n",
         m.last_cleanup_epoch_secs.load(Ordering::Relaxed),
     );
 
