@@ -126,6 +126,12 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_push_quarantine_sync
         ON push_quarantine(sync_id);
     ",
+    "-- V7: Index applied_ops(sync_id, server_seq) for prune-window queries.
+    -- Without it, prune-window queries scan the full table; with it, SEARCH.
+    -- Tombstone-prune joins by op_id (the PK) and is unaffected.
+    CREATE INDEX IF NOT EXISTS idx_applied_ops_sync_seq
+        ON applied_ops(sync_id, server_seq);
+    ",
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), String> {

@@ -41,6 +41,7 @@ prism-sync-crypto = { workspace = true, features = ["legacy-hybrid-v2"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 criterion = { workspace = true }
 proptest = "1"
+tempfile = { workspace = true }
 
 [[bench]]
 name = "batch_bench"
