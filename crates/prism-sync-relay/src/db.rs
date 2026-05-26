@@ -200,7 +200,10 @@ fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
          PRAGMA temp_store = memory;
          PRAGMA mmap_size = 268435456;
          PRAGMA cache_size = -65536;
-         PRAGMA auto_vacuum = INCREMENTAL;",
+         PRAGMA auto_vacuum = INCREMENTAL;
+         PRAGMA cell_size_check = ON;
+         PRAGMA wal_autocheckpoint = 1000;
+         PRAGMA journal_size_limit = 67108864;",
     )?;
 
     // auto_vacuum mode can only change on a newly created database. If the DB
@@ -230,7 +233,10 @@ fn apply_read_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
          PRAGMA temp_store = memory;
          PRAGMA mmap_size = 268435456;
          PRAGMA cache_size = -65536;
-         PRAGMA query_only = ON;",
+         PRAGMA query_only = ON;
+         PRAGMA cell_size_check = ON;
+         PRAGMA wal_autocheckpoint = 1000;
+         PRAGMA journal_size_limit = 67108864;",
     )?;
     Ok(())
 }
@@ -2870,6 +2876,43 @@ mod tests {
 
     fn test_db() -> Database {
         Database::in_memory().expect("failed to create in-memory db")
+    }
+
+    #[test]
+    fn pragmas_set_on_writer_connection() {
+        let db = Database::in_memory().expect("failed to create in-memory db");
+        db.with_conn(|conn| {
+            let cell_size_check: i64 =
+                conn.pragma_query_value(None, "cell_size_check", |r| r.get(0))?;
+            let autocheckpoint: i64 =
+                conn.pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0))?;
+            let size_limit: i64 =
+                conn.pragma_query_value(None, "journal_size_limit", |r| r.get(0))?;
+            assert_eq!(cell_size_check, 1, "cell_size_check should be ON");
+            assert_eq!(autocheckpoint, 1000);
+            assert_eq!(size_limit, 67_108_864);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pragmas_set_on_reader_connection() {
+        let db = Database::in_memory().expect("failed to create in-memory db");
+        db.with_read_conn(|conn| {
+            let cell_size_check: i64 =
+                conn.pragma_query_value(None, "cell_size_check", |r| r.get(0))?;
+            let autocheckpoint: i64 =
+                conn.pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0))?;
+            let size_limit: i64 =
+                conn.pragma_query_value(None, "journal_size_limit", |r| r.get(0))?;
+            // query_only is already verified by other tests; this is additive.
+            assert_eq!(cell_size_check, 1);
+            assert_eq!(autocheckpoint, 1000);
+            assert_eq!(size_limit, 67_108_864);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
     }
 
     #[test]

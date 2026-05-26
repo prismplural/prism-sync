@@ -18,6 +18,7 @@ pub struct Metrics {
     pub changesets_pulled: AtomicU64,
     pub changesets_pruned: AtomicU64,
     pub ws_notifications: AtomicU64,
+    pub ws_notifications_dropped: AtomicU64,
     pub auth_failures: AtomicU64,
     pub snapshots_exchanged: AtomicU64,
     pub registrations: AtomicU64,
@@ -49,6 +50,7 @@ impl Metrics {
             ("changesets_pulled", &self.changesets_pulled),
             ("changesets_pruned", &self.changesets_pruned),
             ("ws_notifications", &self.ws_notifications),
+            ("ws_notifications_dropped", &self.ws_notifications_dropped),
             ("auth_failures", &self.auth_failures),
             ("snapshots_exchanged", &self.snapshots_exchanged),
             ("registrations", &self.registrations),
@@ -71,6 +73,7 @@ impl Metrics {
             ("changesets_pulled", self.changesets_pulled.load(Ordering::Relaxed)),
             ("changesets_pruned", self.changesets_pruned.load(Ordering::Relaxed)),
             ("ws_notifications", self.ws_notifications.load(Ordering::Relaxed)),
+            ("ws_notifications_dropped", self.ws_notifications_dropped.load(Ordering::Relaxed)),
             ("auth_failures", self.auth_failures.load(Ordering::Relaxed)),
             ("snapshots_exchanged", self.snapshots_exchanged.load(Ordering::Relaxed)),
             ("registrations", self.registrations.load(Ordering::Relaxed)),
@@ -230,17 +233,48 @@ impl AppState {
 
     /// Broadcast a message to all WS connections for a sync group, excluding one device.
     pub async fn notify_devices(&self, sync_id: &str, exclude_device: Option<&str>, message: &str) {
-        let conns = self.ws_connections.read().await;
-        if let Some(devices) = conns.get(sync_id) {
-            for (device_id, sender) in devices {
-                if exclude_device == Some(device_id.as_str()) {
-                    continue;
+        // Snapshot senders under the read guard, then drop the guard before
+        // sending. A slow consumer with a full 64-slot channel must NOT block
+        // the broadcast loop or stall register_ws/unregister_ws (which take
+        // the write guard).
+        let senders: Vec<(String, WsSender)> = {
+            let conns = self.ws_connections.read().await;
+            conns
+                .get(sync_id)
+                .map(|devices| {
+                    devices
+                        .iter()
+                        .filter(|(device_id, _)| exclude_device != Some(device_id.as_str()))
+                        .map(|(id, sender)| (id.clone(), sender.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }; // RwLock guard dropped here.
+
+        if senders.is_empty() {
+            return;
+        }
+
+        let mut dropped = 0u64;
+        for (device_id, sender) in senders {
+            match sender.try_send(message.to_string()) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    dropped += 1;
+                    tracing::debug!("WS channel full for device {device_id}, dropped notification");
                 }
-                if sender.send(message.to_string()).await.is_err() {
-                    tracing::debug!("Failed to send to device {}, likely disconnected", device_id);
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    dropped += 1;
+                    tracing::debug!(
+                        "WS channel closed for device {device_id}, dropped notification"
+                    );
                 }
             }
-            self.metrics.inc(&self.metrics.ws_notifications);
+        }
+
+        self.metrics.inc(&self.metrics.ws_notifications);
+        if dropped > 0 {
+            self.metrics.inc_by(&self.metrics.ws_notifications_dropped, dropped);
         }
     }
 
@@ -281,6 +315,58 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::db::Database;
+
+    fn test_app_state() -> AppState {
+        let db = Database::in_memory().expect("in-memory db");
+        let config = Config::from_env();
+        AppState::new(db, config)
+    }
+
+    #[tokio::test]
+    async fn notify_devices_does_not_block_on_slow_consumer() {
+        // The bug this fix targets: a single slow WS consumer with a full
+        // channel can stall the broadcast loop for every device in the sync
+        // group. The fix is `try_send` + drop-on-full. The right assertions
+        // are (a) the broadcast loop never blocks regardless of consumer
+        // state, and (b) dropped messages are accounted for. We do NOT
+        // assert that any specific receiver gets a specific count, because
+        // under bursty load `try_send` can drop on any receiver that
+        // briefly fills its channel, even fast ones — that's the deliberate
+        // tradeoff (fanout never blocks; clients catch up on next pull).
+        let state = test_app_state();
+        let sync_id = "sync-1";
+
+        // dev_a registers but never reads — its 64-slot channel will fill up.
+        let _dev_a_rx = state.register_ws(sync_id, "dev-a").await;
+        // dev_b registers — we just need it to exist for the fanout loop.
+        let _dev_b_rx = state.register_ws(sync_id, "dev-b").await;
+
+        // Send 80 notifications. Without the fix, calls #65+ block on
+        // dev_a's full channel for many seconds (the WS sender's
+        // send().await never returns until the consumer drains). With the
+        // fix (try_send + drop-on-full), all 80 calls return promptly.
+        let send_start = std::time::Instant::now();
+        for i in 0..80u32 {
+            state.notify_devices(sync_id, None, &format!("msg-{i}")).await;
+        }
+        let send_elapsed = send_start.elapsed();
+        assert!(
+            send_elapsed < std::time::Duration::from_millis(500),
+            "all 80 notify_devices calls should complete promptly (got {send_elapsed:?}); \
+             the slow-consumer bug would stall this for many seconds"
+        );
+
+        // dev_a's drop counter must show that try_send dropped messages on
+        // dev_a's full channel. Without the fix, the sender would have
+        // blocked instead of dropping, so this counter would be 0.
+        let dropped = state.metrics.ws_notifications_dropped.load(Ordering::Relaxed);
+        assert!(
+            dropped >= 16,
+            "expected >= 16 dropped notifications for dev_a (80 sends - 64 buffer), got {dropped}"
+        );
+    }
 
     #[test]
     fn rate_limiter_allows_up_to_limit() {

@@ -2,22 +2,20 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use prism_sync_crypto::pq::{hybrid_signature_contexts, HybridSignature};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 
 /// Constant-time comparison for fixed-length values (SHA-256 hex digests).
 ///
-/// XOR fold runs in constant time over the full length. The early length check
-/// does not leak information because both inputs are always 64-char hex-encoded
-/// SHA-256 hashes in practice.
+/// Uses `subtle::ConstantTimeEq` for the canonical, miswriting-resistant
+/// implementation. Note that `ConstantTimeEq for [u8]` still short-circuits
+/// on length mismatch (returns `Choice(0)` immediately for unequal lengths);
+/// in practice both inputs are 64-char hex-encoded SHA-256 hashes, so the
+/// length check does not leak meaningful information.
 pub(crate) fn timing_safe_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (&x, &y)| acc | (x ^ y)) == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// Verify an Ed25519 challenge signature.
@@ -282,6 +280,21 @@ mod tests {
         assert!(!timing_safe_eq("abc", "ab"));
         assert!(!timing_safe_eq("", "a"));
         assert!(timing_safe_eq("", ""));
+    }
+
+    #[test]
+    fn timing_safe_eq_rejects_length_mismatch() {
+        assert!(!timing_safe_eq("a", "abc"));
+        assert!(!timing_safe_eq("", "abc"));
+        assert!(!timing_safe_eq(&"a".repeat(10_000), "b"));
+        assert!(!timing_safe_eq("hello", "world"));
+    }
+
+    #[test]
+    fn timing_safe_eq_accepts_equal_strings() {
+        assert!(timing_safe_eq("hello", "hello"));
+        assert!(timing_safe_eq("", ""));
+        assert!(timing_safe_eq(&"x".repeat(64), &"x".repeat(64)));
     }
 
     #[test]
