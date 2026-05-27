@@ -19,6 +19,8 @@ use super::redact_url;
 use super::traits::*;
 use super::websocket::WebSocketClient;
 
+const SNAPSHOT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 /// HTTP relay client for the V2 sync API.
 ///
 /// Ported from Dart `lib/core/sync/server_relay.dart`.
@@ -87,7 +89,9 @@ impl ServerRelay {
             registration_token,
             client,
             request_timeout: Duration::from_secs(15),
-            snapshot_timeout: Duration::from_secs(120),
+            // Align snapshot uploads with the relay default. This also bounds
+            // media transfers; relay media routes may time out sooner.
+            snapshot_timeout: Duration::from_secs(SNAPSHOT_REQUEST_TIMEOUT_SECS),
             notification_tx,
             ws_client: tokio::sync::Mutex::new(None),
         })
@@ -1133,6 +1137,16 @@ mod tests {
             None,
         )
         .expect("test relay")
+    }
+
+    #[test]
+    fn snapshot_timeout_matches_relay_default() {
+        let relay = test_relay("token");
+
+        assert_eq!(
+            relay.snapshot_timeout,
+            std::time::Duration::from_secs(super::SNAPSHOT_REQUEST_TIMEOUT_SECS)
+        );
     }
 
     #[test]

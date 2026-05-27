@@ -745,8 +745,8 @@ impl SyncService {
         let (count, entity_changes) =
             engine.bootstrap_from_snapshot(sync_id, key_hierarchy).await?;
 
-        // Emit RemoteChanges event so Dart's drift sync adapter populates
-        // the consumer database from the snapshot data.
+        // Emit one RemoteChanges event with the full snapshot entity list so
+        // Dart can use the event length as the restore progress denominator.
         if !entity_changes.is_empty() {
             let changeset = build_changeset(&entity_changes);
             let _ = self.event_tx.send(SyncEvent::RemoteChanges(changeset));
