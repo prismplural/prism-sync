@@ -2,6 +2,30 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.10.0] - 2026-05-26
+
+Tagged for the matching `prism-app 0.10.0+10001` release. Cargo crate versions remain `0.1.1`.
+
+### Added
+- `verify_mnemonic_pin` FFI for credential pre-flight. The app can verify a phrase + PIN locally before committing to the sync chain, and can verify a saved backup phrase + PIN without performing a restore.
+- `/metrics` on prism-sync-relay surfaces `ws_notifications_dropped` and `snapshots_rejected_stale` counters alongside the existing relay metrics.
+
+### Changed
+- Stale `PUT /snapshot` requests are now suppressed via audience-aware logic: the relay drops a snapshot upload that targets a strictly older audience than the latest accepted snapshot for the same syncer, instead of accepting it and confusing downstream readers.
+- Relay request authentication surfaces signed request identity mismatches as a typed error rather than a generic 401, so device-pairing diagnostics can show what was actually wrong.
+- Relay WS broadcast is no longer blockable by a single slow subscriber: the broadcast path switches to `tokio::sync::broadcast` (subtle channel) and tightens WAL pragmas on the relay sqlite to avoid checkpoint stalls under contention.
+
+### Perf
+- New V7 index on `applied_ops(sync_id, server_seq)`. Speeds up the relay's per-syncer applied-ops scan that runs on every push and pull batch.
+
+## [0.9.3] - 2026-05-20
+
+Tagged for the matching `prism-app 0.9.3` / `0.9.4` releases. Cargo crate versions remain `0.1.1`.
+
+### Fixed
+- Pair-time signed registry snapshots now advance from the relay's current version so existing devices accept newly paired joiners after epoch or revoke activity. Signed-registry repair verifies against the trusted local registry, and pairing decrypt errors include non-secret envelope metadata for future diagnosis.
+- prism-sync-relay revoke rate limit default increased from 2 to 20 per hour. Users were hitting the prior cap when retrying device revoke during sync setup hiccups in public beta; 20/hour still bounds abuse while giving real users room to recover.
+
 ## [0.9.0] - 2026-05-16
 
 Tagged for the matching `prism-app 0.9.0+9001` release. Cargo crate versions remain `0.1.1`.
