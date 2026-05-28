@@ -4775,10 +4775,6 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
 
     let mut current_gen = current_record.ml_dsa_key_generation;
 
-    // 2b. Check relay's generation to handle crash recovery.
-    // If the relay is ahead of local (e.g., previous rotation succeeded on
-    // relay but client crashed before updating local registry), sync local
-    // state forward so we rotate from the relay's generation.
     let relay = build_relay(
         &relay_url,
         &sync_id,
@@ -4790,28 +4786,21 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
         None,
     )?;
 
-    let relay_devices = relay.list_devices().await.unwrap_or_default();
-    if let Some(relay_self) = relay_devices.iter().find(|d| d.device_id == device_id) {
-        if relay_self.ml_dsa_key_generation > current_gen {
-            // Relay is ahead — re-derive the key at relay's generation and
-            // update local registry so our next rotation starts from there.
-            let relay_gen = relay_self.ml_dsa_key_generation;
-            let synced_ml_dsa =
-                device_secret.ml_dsa_65_keypair_v(&device_id, relay_gen).map_err(|e| {
-                    format!("failed to derive ML-DSA key at relay gen {relay_gen}: {e}")
-                })?;
-            set_local_device_ml_dsa_state(
-                storage.clone(),
-                &sync_id,
-                &device_id,
-                synced_ml_dsa.public_key_bytes(),
-                relay_gen,
-            )
-            .await?;
-
-            current_gen = relay_gen;
-        }
-    }
+    // 2b. Crash recovery: a previous rotation may have committed on the relay
+    // (signed registry published) but crashed before persisting local state.
+    // Catch up to the relay's generation — but only through a verified signed
+    // registry import, never by trusting the relay's unauthenticated device
+    // list, which a malicious relay could otherwise use to inflate our
+    // generation and wedge future rotations.
+    current_gen = sync_ml_dsa_generation_forward(
+        storage.clone(),
+        relay.as_ref(),
+        &device_secret,
+        &sync_id,
+        &device_id,
+        current_gen,
+    )
+    .await;
 
     let new_gen = current_gen + 1;
     let last_imported_registry_version = {
@@ -4986,30 +4975,111 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
     Ok(result.to_string())
 }
 
-async fn set_local_device_ml_dsa_state(
+/// Catch the local ML-DSA generation up to the relay's, for crash recovery
+/// (a prior rotation committed remotely but crashed before persisting locally).
+///
+/// The relay's device list is an unauthenticated hint only — used to decide
+/// whether to bother fetching. The advance is committed solely by importing the
+/// relay's signed registry, which `verify_and_import_signed_registry` checks
+/// against locally pinned keys and the monotonic registry version. A malicious
+/// relay therefore cannot push the local generation forward without a verifiable
+/// artifact. The returned generation never goes below `current_gen`. The
+/// registry's own-device entry is validated (still active, ML-DSA key
+/// reproducible from this device's secret) *before* importing, so a member's
+/// registry carrying a bogus self entry never mutates local storage.
+async fn sync_ml_dsa_generation_forward(
     storage: Arc<dyn SyncStorage>,
+    relay: &dyn SyncRelay,
+    device_secret: &DeviceSecret,
     sync_id: &str,
     device_id: &str,
-    public_key: Vec<u8>,
-    generation: u32,
-) -> Result<(), String> {
+    current_gen: u32,
+) -> u32 {
+    let relay_claims_ahead = relay
+        .list_devices()
+        .await
+        .ok()
+        .and_then(|devices| {
+            devices.into_iter().find(|d| d.device_id == device_id).map(|d| d.ml_dsa_key_generation)
+        })
+        .is_some_and(|relay_gen| relay_gen > current_gen);
+    if !relay_claims_ahead {
+        return current_gen;
+    }
+
+    let artifact_blob = match relay.get_signed_registry().await {
+        Ok(Some(response)) => response.artifact_blob,
+        Ok(None) => return current_gen,
+        Err(error) => {
+            tracing::warn!(
+                device_id = %redacted_identifier_for_log(device_id),
+                error = %redact_display(&error),
+                "rotate_ml_dsa_key: crash-recovery could not fetch signed registry; proceeding from local generation"
+            );
+            return current_gen;
+        }
+    };
+
+    // Verify and decode the artifact WITHOUT importing, then validate our own
+    // entry before persisting anything. A registry signed by another member can
+    // carry a bogus self entry (revoked, or an ML-DSA key not derivable from our
+    // secret); importing it would persist that bad state, so refuse first.
+    let snapshot = {
+        let verify_storage = storage.clone();
+        let verify_sid = sync_id.to_string();
+        let verify_blob = artifact_blob.clone();
+        match tokio::task::spawn_blocking(move || {
+            DeviceRegistryManager::verify_signed_registry_snapshot(
+                verify_storage.as_ref(),
+                &verify_sid,
+                &verify_blob,
+            )
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    device_id = %redacted_identifier_for_log(device_id),
+                    error = %redact_display(&error),
+                    "rotate_ml_dsa_key: crash-recovery signed registry failed verification; proceeding from local generation"
+                );
+                return current_gen;
+            }
+            Err(_) => return current_gen,
+        }
+    };
+
+    let self_state_ok =
+        snapshot.entries.iter().find(|e| e.device_id == device_id).is_some_and(|entry| {
+            entry.status == "active"
+                && device_secret
+                    .ml_dsa_65_keypair_v(device_id, entry.ml_dsa_key_generation)
+                    .is_ok_and(|key| key.public_key_bytes() == entry.ml_dsa_65_public_key)
+        });
+    if !self_state_ok {
+        tracing::warn!(
+            device_id = %redacted_identifier_for_log(device_id),
+            "rotate_ml_dsa_key: crash-recovery signed registry has unusable self state; not advancing"
+        );
+        return current_gen;
+    }
+
+    if let Err(error) = import_signed_registry(storage.clone(), sync_id, artifact_blob).await {
+        tracing::warn!(
+            device_id = %redacted_identifier_for_log(device_id),
+            error = %redact_sensitive_message(&error),
+            "rotate_ml_dsa_key: crash-recovery signed registry import failed; proceeding from local generation"
+        );
+        return current_gen;
+    }
+
     let sid = sync_id.to_string();
     let did = device_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut record = storage.get_device_record(&sid, &did)?.ok_or_else(|| {
-            prism_sync_core::error::CoreError::Storage(
-                prism_sync_core::storage::StorageError::Logic("device not in registry".into()),
-            )
-        })?;
-        record.ml_dsa_65_public_key = public_key;
-        record.ml_dsa_key_generation = generation;
-        let mut tx = storage.begin_tx()?;
-        tx.upsert_device_record(&record)?;
-        tx.commit()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    match tokio::task::spawn_blocking(move || storage.get_device_record(&sid, &did)).await {
+        Ok(Ok(Some(record))) => record.ml_dsa_key_generation.max(current_gen),
+        _ => current_gen,
+    }
 }
 
 async fn import_signed_registry(
@@ -5809,6 +5879,157 @@ mod tests {
             storage.get_sync_metadata(sync_id).unwrap().unwrap().last_imported_registry_version,
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn sync_ml_dsa_generation_forward_ignores_unproven_relay_advance() {
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let record = make_device_record(sync_id, device_id, &device_secret, 0);
+        let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+        seed_rotation_storage(storage.as_ref(), sync_id, device_id, &record, Some(1));
+
+        // Malicious relay: claims a wildly inflated generation in its device
+        // list but offers no signed registry to back it up.
+        let relay = MockRelay::new();
+        relay.add_device(make_device_info(sync_id, device_id, &device_secret, 99));
+
+        let result = sync_ml_dsa_generation_forward(
+            storage.clone(),
+            &relay,
+            &device_secret,
+            sync_id,
+            device_id,
+            0,
+        )
+        .await;
+
+        assert_eq!(result, 0, "must not advance on an unauthenticated relay device list");
+        let stored = storage.get_device_record(sync_id, device_id).unwrap().unwrap();
+        assert_eq!(stored.ml_dsa_key_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_ml_dsa_generation_forward_caps_at_verified_registry() {
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let record = make_device_record(sync_id, device_id, &device_secret, 0);
+        let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+        seed_rotation_storage(storage.as_ref(), sync_id, device_id, &record, Some(1));
+
+        // Relay claims gen 99, but the only signed registry it can produce
+        // proves a gen 0 -> 1 rotation. We advance to 1, never to 99.
+        let relay = MockRelay::new();
+        relay.add_device(make_device_info(sync_id, device_id, &device_secret, 99));
+        relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: 2,
+            artifact_blob: make_signed_registry_artifact(sync_id, device_id, &device_secret, 1, 2),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        let result = sync_ml_dsa_generation_forward(
+            storage.clone(),
+            &relay,
+            &device_secret,
+            sync_id,
+            device_id,
+            0,
+        )
+        .await;
+
+        assert_eq!(result, 1, "must advance only to the cryptographically verified generation");
+        let stored = storage.get_device_record(sync_id, device_id).unwrap().unwrap();
+        assert_eq!(stored.ml_dsa_key_generation, 1);
+        assert_eq!(
+            stored.ml_dsa_65_public_key,
+            device_secret.ml_dsa_65_keypair_v(device_id, 1).unwrap().public_key_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_ml_dsa_generation_forward_refuses_unreproducible_self_key() {
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let record = make_device_record(sync_id, device_id, &device_secret, 0);
+        let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+        seed_rotation_storage(storage.as_ref(), sync_id, device_id, &record, Some(1));
+
+        // A validly-signed registry whose self entry advances to gen 1 but
+        // carries an ML-DSA key NOT derivable from this device's secret.
+        let mut epoch_key_hashes = BTreeMap::new();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&[0x42; 32]));
+        let ed25519_key = device_secret.ed25519_keypair(device_id).unwrap();
+        let old_ml_dsa_key = device_secret.ml_dsa_65_keypair_v(device_id, 0).unwrap();
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device_id.to_string(),
+                ed25519_public_key: record.ed25519_public_key.clone(),
+                x25519_public_key: record.x25519_public_key.clone(),
+                ml_dsa_65_public_key: vec![0xAA; record.ml_dsa_65_public_key.len()], // bogus
+                ml_kem_768_public_key: record.ml_kem_768_public_key.clone(),
+                x_wing_public_key: record.x_wing_public_key.clone(),
+                status: "active".to_string(),
+                ml_dsa_key_generation: 1,
+            }],
+            2,
+            0,
+            epoch_key_hashes,
+        );
+        let artifact = snapshot.sign_hybrid(&ed25519_key, &old_ml_dsa_key);
+
+        let relay = MockRelay::new();
+        relay.add_device(make_device_info(sync_id, device_id, &device_secret, 99));
+        relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: 2,
+            artifact_blob: artifact,
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        let result = sync_ml_dsa_generation_forward(
+            storage.clone(),
+            &relay,
+            &device_secret,
+            sync_id,
+            device_id,
+            0,
+        )
+        .await;
+
+        assert_eq!(result, 0, "must not advance to a non-reproducible self ML-DSA key");
+        let stored = storage.get_device_record(sync_id, device_id).unwrap().unwrap();
+        assert_eq!(stored.ml_dsa_key_generation, 0, "bogus registry must not be persisted");
+        assert_eq!(stored.ml_dsa_65_public_key, record.ml_dsa_65_public_key);
+    }
+
+    #[tokio::test]
+    async fn sync_ml_dsa_generation_forward_noop_when_relay_not_ahead() {
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let record = make_device_record(sync_id, device_id, &device_secret, 2);
+        let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+        seed_rotation_storage(storage.as_ref(), sync_id, device_id, &record, Some(1));
+
+        let relay = MockRelay::new();
+        relay.add_device(make_device_info(sync_id, device_id, &device_secret, 2));
+
+        let result = sync_ml_dsa_generation_forward(
+            storage.clone(),
+            &relay,
+            &device_secret,
+            sync_id,
+            device_id,
+            2,
+        )
+        .await;
+
+        assert_eq!(result, 2);
+        let stored = storage.get_device_record(sync_id, device_id).unwrap().unwrap();
+        assert_eq!(stored.ml_dsa_key_generation, 2);
     }
 
     // ── Phase 1C: clear_sync_state FFI ──
