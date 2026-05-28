@@ -1910,6 +1910,73 @@ pub fn prune_batches_with_unexpired_snapshots(
     Ok(pruned)
 }
 
+/// Minimum acked seq across all non-revoked devices (`active` + `stale`), with
+/// no staleness cutoff. The floor for ack-only pruning: never prune past a
+/// device that could still reconnect.
+///
+/// `stale` is included deliberately. A device is marked `stale` at 30d but not
+/// auto-revoked until 90d, and `touch_device` never flips it back to `active`;
+/// excluding it would prune a returning device's history out from under it,
+/// forcing a re-pair (no group-wide snapshot to bootstrap from). Only
+/// revocation drops a device from the floor.
+///
+/// No receipt row coalesces to `0` (pins the floor until first ack). No
+/// non-revoked devices yields `None` (MIN over zero rows); the caller skips it.
+pub fn get_min_acked_seq_unrevoked(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT MIN(COALESCE(dr.last_acked_seq, 0))
+         FROM devices d
+         LEFT JOIN device_receipts dr
+           ON d.sync_id = dr.sync_id AND d.device_id = dr.device_id
+         WHERE d.sync_id = ?1 AND d.status IN ('active', 'stale')",
+        params![sync_id],
+        |row| row.get(0),
+    )
+}
+
+/// Prune batch history for every group *without* a group-wide snapshot, down
+/// to the lowest seq all non-revoked devices have acked. Returns rows deleted.
+///
+/// The ack-only counterpart to [`prune_batches_with_unexpired_snapshots`],
+/// covering the common case where no group-wide snapshot is ever published
+/// (otherwise batch history grows without bound).
+///
+/// Groups that have an unexpired group-wide snapshot are skipped — the
+/// snapshot-gated path owns them and caps at the snapshot seq. Running both
+/// would let this path advance `pruned_floor_seq` past the snapshot, stranding
+/// it as a bootstrap floor (`MustBootstrapFromSnapshot` loop). Both paths share
+/// the floor, so they must not disagree.
+pub fn prune_batches_by_acks(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT sg.sync_id
+         FROM sync_groups sg
+         WHERE NOT EXISTS (
+             SELECT 1 FROM snapshots s
+             WHERE s.sync_id = sg.sync_id
+               AND s.target_device_id IS NULL
+               AND (s.expires_at IS NULL OR s.expires_at >= unixepoch())
+         )",
+    )?;
+    let sync_ids =
+        stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+
+    let mut pruned = 0usize;
+    for sync_id in sync_ids {
+        // prune_batches_before deletes id < before_seq, so +1 deletes through
+        // min_acked. 0 means a device hasn't acked yet — leave history intact.
+        if let Some(min_acked) = get_min_acked_seq_unrevoked(conn, &sync_id)? {
+            if min_acked > 0 {
+                pruned += prune_batches_before(conn, &sync_id, min_acked + 1)?;
+            }
+        }
+    }
+
+    Ok(pruned)
+}
+
 // ---------------------------------------------------------------------------
 // Rekey artifact queries
 // ---------------------------------------------------------------------------
@@ -3876,6 +3943,245 @@ mod tests {
 
             let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
             assert_eq!(pruned, 0, "cleanup must still not prune without a snapshot");
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Ack-only pruning never prunes past the slowest active device, even
+    /// with no group-wide snapshot present.
+    #[test]
+    fn ack_prune_stops_at_slowest_active_device() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
+            touch_device(conn, "sg1", "dev1")?;
+            touch_device(conn, "sg1", "dev2")?;
+
+            let _seq1 = insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            let _seq2 = insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+            let seq3 = insert_batch(conn, "sg1", 0, "dev1", "b3", b"d3")?;
+            let _seq4 = insert_batch(conn, "sg1", 0, "dev1", "b4", b"d4")?;
+            let seq5 = insert_batch(conn, "sg1", 0, "dev1", "b5", b"d5")?;
+
+            // dev1 is caught up; dev2 lags at seq3.
+            upsert_device_receipt(conn, "sg1", "dev1", seq5)?;
+            upsert_device_receipt(conn, "sg1", "dev2", seq3)?;
+
+            assert_eq!(get_min_acked_seq_unrevoked(conn, "sg1")?, Some(seq3));
+
+            let pruned = prune_batches_by_acks(conn)?;
+            assert_eq!(pruned, 3, "should prune only the 3 batches dev2 has acked");
+
+            let remaining = get_batches_since(conn, "sg1", 0, 100)?;
+            assert_eq!(remaining.len(), 2, "batches 4 and 5 must survive for dev2");
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A still-active device that has acked nothing pins the floor at 0, so
+    /// ack-only pruning deletes nothing — until the device is revoked (e.g.
+    /// by `auto_revoke_devices`), after which the floor advances to the
+    /// remaining device's ack.
+    #[test]
+    fn ack_prune_resumes_after_abandoned_device_revoked() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
+            touch_device(conn, "sg1", "dev1")?;
+            touch_device(conn, "sg1", "dev2")?;
+
+            let _seq1 = insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            let seq2 = insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+            let seq3 = insert_batch(conn, "sg1", 0, "dev1", "b3", b"d3")?;
+
+            // dev1 acked everything; dev2 never acked anything.
+            upsert_device_receipt(conn, "sg1", "dev1", seq3)?;
+
+            assert_eq!(
+                get_min_acked_seq_unrevoked(conn, "sg1")?,
+                Some(0),
+                "an active device with no receipt pins the floor at 0"
+            );
+            assert_eq!(prune_batches_by_acks(conn)?, 0, "nothing prunes while dev2 lingers");
+            assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 3);
+
+            // dev2 is abandoned and revoked; only dev1 remains active.
+            assert!(revoke_device(conn, "sg1", "dev2", false)?);
+            assert_eq!(get_min_acked_seq_unrevoked(conn, "sg1")?, Some(seq3));
+
+            let pruned = prune_batches_by_acks(conn)?;
+            assert_eq!(pruned, 3, "all dev1-acked batches prune once dev2 is gone");
+            assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 0);
+
+            let _ = seq2; // referenced for clarity of the seq progression
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A group with no active devices yields `None` (MIN over zero rows) and
+    /// prunes nothing — orphaned-group reclamation is handled separately.
+    #[test]
+    fn ack_prune_skips_groups_with_no_active_devices() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            let seq1 = insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            upsert_device_receipt(conn, "sg1", "dev1", seq1)?;
+            assert!(revoke_device(conn, "sg1", "dev1", false)?);
+
+            assert_eq!(get_min_acked_seq_unrevoked(conn, "sg1")?, None);
+            assert_eq!(prune_batches_by_acks(conn)?, 0);
+            assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 1);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Ack-only pruning must NOT touch a group that has an unexpired
+    /// group-wide snapshot — otherwise it could advance pruned_floor_seq
+    /// past the snapshot seq when all devices have acked beyond it, stranding
+    /// the snapshot as a bootstrap floor. Those groups belong to the
+    /// snapshot-gated path, which caps at the snapshot seq.
+    #[test]
+    fn ack_prune_skips_groups_with_group_wide_snapshot() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
+            touch_device(conn, "sg1", "dev1")?;
+            touch_device(conn, "sg1", "dev2")?;
+
+            for i in 1..=15 {
+                insert_batch(conn, "sg1", 0, "dev1", &format!("b{i}"), b"d")?;
+            }
+
+            // Group-wide snapshot at seq 10 (target_device_id = NULL).
+            upsert_snapshot(conn, "sg1", 0, 10, b"snap", None, None, Some("dev1"))?;
+
+            // Both active devices have acked past the snapshot.
+            upsert_device_receipt(conn, "sg1", "dev1", 15)?;
+            upsert_device_receipt(conn, "sg1", "dev2", 15)?;
+
+            // Ack-only pruning must skip this group entirely.
+            let pruned = prune_batches_by_acks(conn)?;
+            assert_eq!(pruned, 0, "snapshot'd group must be left to the snapshot path");
+            assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 15);
+
+            // The snapshot-gated path is the one allowed to prune it, capped
+            // at the snapshot seq (10): batches 1..=9 go, 10..=15 stay.
+            let snap_pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(snap_pruned, 9, "snapshot path caps pruning at the snapshot seq");
+            assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 6);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A `stale`-status device still pins the prune floor: it has not been
+    /// revoked, so it may reconnect, and `touch_device` never resets it back
+    /// to `active`. Pruning past it would force a re-pair on return. Only
+    /// auto-revoke (90d) releases the floor.
+    #[test]
+    fn ack_prune_does_not_prune_past_stale_device() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
+            touch_device(conn, "sg1", "dev1")?;
+            touch_device(conn, "sg1", "dev2")?;
+
+            let _s1 = insert_batch(conn, "sg1", 0, "dev1", "b1", b"d")?;
+            let _s2 = insert_batch(conn, "sg1", 0, "dev1", "b2", b"d")?;
+            let seq3 = insert_batch(conn, "sg1", 0, "dev1", "b3", b"d")?;
+            let _s4 = insert_batch(conn, "sg1", 0, "dev1", "b4", b"d")?;
+            let seq5 = insert_batch(conn, "sg1", 0, "dev1", "b5", b"d")?;
+
+            // dev1 caught up at 5; dev2 only acked 3, then goes quiet.
+            upsert_device_receipt(conn, "sg1", "dev1", seq5)?;
+            upsert_device_receipt(conn, "sg1", "dev2", seq3)?;
+
+            // dev2 crosses the 30d staleness line and is marked 'stale'.
+            conn.execute(
+                "UPDATE devices SET last_seen_at = 0 WHERE sync_id = 'sg1' AND device_id = 'dev2'",
+                [],
+            )?;
+            assert_eq!(mark_stale_devices(conn, 2_592_000)?, 1, "dev2 marked stale");
+
+            // The floor still includes dev2 — prune only up to its ack (3).
+            assert_eq!(get_min_acked_seq_unrevoked(conn, "sg1")?, Some(seq3));
+            assert_eq!(prune_batches_by_acks(conn)?, 3);
+            assert_eq!(
+                get_batches_since(conn, "sg1", 0, 100)?.len(),
+                2,
+                "batches 4,5 retained for the stale-but-not-revoked dev2"
+            );
+
+            // Once dev2 is actually revoked (a stale device goes through
+            // auto_revoke, not revoke_device which only matches 'active'),
+            // the floor advances to dev1's ack.
+            let revoked = auto_revoke_devices(conn, 7_776_000)?;
+            assert!(revoked.contains(&"sg1".to_string()), "dev2 auto-revoked at the 90d TTL");
+            assert_eq!(get_min_acked_seq_unrevoked(conn, "sg1")?, Some(seq5));
+            assert_eq!(prune_batches_by_acks(conn)?, 2, "remaining batches prune once dev2 revoked");
+            assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 0);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// `prune_batches_by_acks` processes every eligible group in one pass and
+    /// returns the summed deletion count, while leaving independent groups at
+    /// their own floors.
+    #[test]
+    fn ack_prune_handles_multiple_groups_independently() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            // Batch ids are globally monotonic, so capture the real seqs
+            // each group got rather than assuming per-group 1..N.
+
+            // Group A: one device caught up — fully prunable below its ack.
+            create_sync_group(conn, "sgA", 0)?;
+            register_device(conn, "sgA", "a1", &[1; 32], &[2; 32], 0)?;
+            touch_device(conn, "sgA", "a1")?;
+            let mut a_seqs = Vec::new();
+            for i in 1..=4 {
+                a_seqs.push(insert_batch(conn, "sgA", 0, "a1", &format!("a{i}"), b"d")?);
+            }
+            upsert_device_receipt(conn, "sgA", "a1", *a_seqs.last().unwrap())?;
+
+            // Group B: two devices; slower one acked only its 2nd batch.
+            create_sync_group(conn, "sgB", 0)?;
+            register_device(conn, "sgB", "b1", &[5; 32], &[6; 32], 0)?;
+            register_device(conn, "sgB", "b2", &[7; 32], &[8; 32], 0)?;
+            touch_device(conn, "sgB", "b1")?;
+            touch_device(conn, "sgB", "b2")?;
+            let mut b_seqs = Vec::new();
+            for i in 1..=4 {
+                b_seqs.push(insert_batch(conn, "sgB", 0, "b1", &format!("b{i}"), b"d")?);
+            }
+            upsert_device_receipt(conn, "sgB", "b1", *b_seqs.last().unwrap())?;
+            upsert_device_receipt(conn, "sgB", "b2", b_seqs[1])?;
+
+            // A: prune all 4 (every device acked the last). B: prune the 2
+            // below b2's ack. Total 6.
+            assert_eq!(prune_batches_by_acks(conn)?, 6);
+            assert_eq!(get_batches_since(conn, "sgA", 0, 100)?.len(), 0);
+            assert_eq!(get_batches_since(conn, "sgB", 0, 100)?.len(), 2);
 
             Ok(())
         })

@@ -63,6 +63,11 @@ async fn run_cleanup(state: &AppState) {
                 config.stale_device_secs as i64,
             )?;
 
+            // 7b. Ack-only pruning for groups with no group-wide snapshot.
+            //     Never prunes past a non-revoked device; step 3's revocation
+            //     is what lets the floor advance past an abandoned one.
+            let pruned_batches_by_acks = crate::db::prune_batches_by_acks(conn)?;
+
             // 8. Remove superseded registry artifacts now that the current
             //    registry state is persisted separately.
             let superseded_registry_artifacts =
@@ -111,6 +116,7 @@ async fn run_cleanup(state: &AppState) {
                 abandoned_new_groups,
                 expired_snapshots,
                 pruned_batches,
+                pruned_batches_by_acks,
                 superseded_registry_artifacts,
                 expired_pairing_sessions,
                 revoked_tombstones,
@@ -136,6 +142,7 @@ async fn run_cleanup(state: &AppState) {
             abandoned_new_groups,
             expired_snapshots,
             pruned_batches,
+            pruned_batches_by_acks,
             superseded_registry_artifacts,
             expired_pairing_sessions,
             revoked_tombstones,
@@ -177,6 +184,7 @@ async fn run_cleanup(state: &AppState) {
                 || abandoned_new_groups > 0
                 || expired_snapshots > 0
                 || pruned_batches > 0
+                || pruned_batches_by_acks > 0
                 || superseded_registry_artifacts > 0
                 || expired_pairing_sessions > 0
                 || revoked_tombstones > 0
@@ -193,6 +201,7 @@ async fn run_cleanup(state: &AppState) {
                     stale,
                     pruned,
                     pruned_batches,
+                    pruned_batches_by_acks,
                     abandoned_new_groups,
                     expired_snapshots,
                     superseded_registry_artifacts,
