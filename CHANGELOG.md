@@ -2,6 +2,19 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.10.1] - 2026-05-28
+
+Tagged for the matching `prism-app 0.10.1+10101` release. Cargo crate versions remain `0.1.1`.
+
+### Added
+- `/metrics` on prism-sync-relay surfaces `ws_notifications_total`, the total WS broadcast count, alongside the existing `ws_notifications_dropped` counter so the notification fan-out rate is observable.
+
+### Changed
+- Snapshot bootstrap now emits a single `RemoteChanges` event carrying the full snapshot entity list, so the app can use the event length as a restore-progress denominator. (Consumed by the app's onboarding snapshot-restore progress indicator.)
+
+### Fixed
+- Acknowledged batches are now pruned even for groups without a group-wide snapshot. Pruning was gated entirely on an unexpired group-wide snapshot, which clients only ever upload pairing-targeted (never group-wide for normal groups), so batch history grew without bound. The relay now prunes each group with no group-wide snapshot down to the lowest seq all non-revoked devices have acknowledged; the floor includes stale-but-not-revoked devices so a returning device is never forced to re-bootstrap, and only revocation advances the floor. Groups that do have a group-wide snapshot stay on the snapshot-gated path, so the two paths never disagree on `pruned_floor_seq`. Runs as cleanup step 7b.
+
 ## [0.10.0] - 2026-05-26
 
 Tagged for the matching `prism-app 0.10.0+10001` release. Cargo crate versions remain `0.1.1`.
