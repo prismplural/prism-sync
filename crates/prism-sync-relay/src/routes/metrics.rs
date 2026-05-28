@@ -36,6 +36,7 @@ async fn prometheus_metrics(
     let stored_batches = m.cached_stored_batches.load(Ordering::Relaxed);
     let db_size_bytes = m.cached_db_size_bytes.load(Ordering::Relaxed);
     let freelist_pages = m.cached_freelist_pages.load(Ordering::Relaxed);
+    let ws_notifications = m.ws_notifications.load(Ordering::Relaxed);
     let ws_notifications_dropped = m.ws_notifications_dropped.load(Ordering::Relaxed);
     let snapshots_rejected_stale = m.snapshots_rejected_stale.load(Ordering::Relaxed);
 
@@ -55,6 +56,9 @@ async fn prometheus_metrics(
          # HELP prism_last_cleanup_timestamp_seconds Unix timestamp of last successful cleanup cycle\n\
          # TYPE prism_last_cleanup_timestamp_seconds gauge\n\
          prism_last_cleanup_timestamp_seconds {}\n\
+         # HELP prism_ws_notifications_total WebSocket notify fan-outs broadcast to sync groups\n\
+         # TYPE prism_ws_notifications_total counter\n\
+         prism_ws_notifications_total {ws_notifications}\n\
          # HELP prism_ws_notifications_dropped_total WebSocket notifications dropped on a full or closed per-device channel\n\
          # TYPE prism_ws_notifications_dropped_total counter\n\
          prism_ws_notifications_dropped_total {ws_notifications_dropped}\n\
