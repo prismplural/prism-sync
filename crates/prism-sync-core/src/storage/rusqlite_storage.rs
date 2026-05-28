@@ -10,6 +10,7 @@ use super::migrations;
 use super::snapshot_format::*;
 use super::traits::*;
 use super::types::*;
+use crate::device_registry::{registry_import_action, RegistryImportAction, RegistryImportSource};
 use crate::error::{CoreError, Result};
 use crate::hlc::Hlc;
 
@@ -892,7 +893,11 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
         }
     }
 
-    // 4. Insert device_registry (INSERT OR REPLACE)
+    // 4. Insert device_registry through the same fail-closed reconciliation as
+    //    every other registry write (`registry_import_action`). A snapshot's
+    //    entries are attacker-influenced and can name any device id, so a raw
+    //    INSERT OR REPLACE would let one rebind another device's pinned keys or
+    //    un-revoke a local tombstone.
     for dr in &snapshot.device_registry {
         let ed25519 = hex::decode(&dr.ed25519_public_key).map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("bad hex in ed25519_public_key: {e}")))
@@ -911,6 +916,47 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
         let x_wing = hex::decode(&dr.x_wing_public_key).map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("bad hex in x_wing_public_key: {e}")))
         })?;
+
+        let existing = query_device_record(conn, sync_id, &dr.device_id)?;
+        // Timestamps don't affect the decision, so dummy values are fine here.
+        let candidate = DeviceRecord {
+            sync_id: sync_id.to_string(),
+            device_id: dr.device_id.clone(),
+            ed25519_public_key: ed25519.clone(),
+            x25519_public_key: x25519.clone(),
+            ml_dsa_65_public_key: ml_dsa.clone(),
+            ml_kem_768_public_key: ml_kem.clone(),
+            x_wing_public_key: x_wing.clone(),
+            status: dr.status.clone(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: dr.ml_dsa_key_generation,
+        };
+
+        match registry_import_action(existing.as_ref(), &candidate, RegistryImportSource::Snapshot)
+        {
+            RegistryImportAction::RejectKeyChange => {
+                // Err rolls back the whole import transaction, so a poisoned
+                // snapshot cannot partially apply.
+                return Err(CoreError::DeviceKeyChanged { device_id: dr.device_id.clone() });
+            }
+            RegistryImportAction::KeepExisting => {
+                tracing::warn!(
+                    device_id = %dr.device_id,
+                    "snapshot import: keeping pinned device record over unauthenticated change"
+                );
+                continue;
+            }
+            RegistryImportAction::Write => {}
+        }
+
+        // Keep the local generation for an already-pinned device: a snapshot
+        // can't carry an authenticated rotation, so letting it bump the
+        // generation (with unchanged key bytes) would only block a later
+        // legitimate signed gen+1 rotation.
+        let ml_dsa_generation_to_persist =
+            existing.as_ref().map(|e| e.ml_dsa_key_generation).unwrap_or(dr.ml_dsa_key_generation);
+
         conn.execute(
             "INSERT OR REPLACE INTO device_registry \
              (sync_id, device_id, ed25519_public_key, x25519_public_key, \
@@ -928,7 +974,7 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
                 dr.status,
                 dr.registered_at,
                 dr.revoked_at,
-                dr.ml_dsa_key_generation as i32,
+                ml_dsa_generation_to_persist as i32,
             ],
         )?;
     }
@@ -2191,6 +2237,124 @@ mod tests {
         // Data should still be correct
         let fv = dst.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
         assert_eq!(fv.winning_op_id, "op-1");
+    }
+
+    #[test]
+    fn import_snapshot_rejects_device_key_rebind() {
+        // A snapshot must never rebind an already-pinned device's permanent keys.
+        let src = make_storage();
+        populate_for_snapshot(&src);
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        // Destination already has dev-1 pinned with a DIFFERENT ed25519 key.
+        let dst = make_storage();
+        let mut pinned = sample_device_record("sync-1", "dev-1");
+        pinned.ed25519_public_key = vec![42, 42, 42, 42];
+        let mut tx = dst.begin_tx().unwrap();
+        tx.upsert_device_record(&pinned).unwrap();
+        tx.commit().unwrap();
+
+        // Import fails closed, and (because it errors mid-transaction) nothing
+        // partially applies.
+        let mut tx = dst.begin_tx().unwrap();
+        let result = tx.import_snapshot("sync-1", &blob);
+        assert!(
+            matches!(result, Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-1"),
+            "expected DeviceKeyChanged, got: {result:?}"
+        );
+        drop(tx); // rollback
+
+        let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
+        assert_eq!(d1.ed25519_public_key, vec![42, 42, 42, 42], "pinned key must be unchanged");
+        assert!(
+            dst.get_device_record("sync-1", "dev-2").unwrap().is_none(),
+            "snapshot must not partially apply when it fails closed"
+        );
+    }
+
+    #[test]
+    fn import_snapshot_does_not_unrevoke_pinned_device() {
+        // A snapshot listing a locally revoked device as active must not un-revoke it.
+        let src = make_storage();
+        populate_for_snapshot(&src); // lists dev-1 as active
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        let mut tx = dst.begin_tx().unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1")).unwrap();
+        tx.commit().unwrap();
+        crate::device_registry::DeviceRegistryManager::revoke_device(&dst, "sync-1", "dev-1")
+            .unwrap();
+
+        let mut tx = dst.begin_tx().unwrap();
+        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.commit().unwrap();
+
+        let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
+        assert_eq!(d1.status, "revoked", "import must not un-revoke a local tombstone");
+        // The new device from the snapshot is still imported normally.
+        assert!(dst.get_device_record("sync-1", "dev-2").unwrap().is_some());
+    }
+
+    #[test]
+    fn import_snapshot_does_not_apply_ml_dsa_rotation() {
+        // A snapshot must not rebind an existing device's ML-DSA signing key,
+        // even with a higher generation — rotations are trusted only from a
+        // signed registry artifact, never from unauthenticated snapshot data.
+        let src = make_storage();
+        let mut tx = src.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+        let mut rotated = sample_device_record("sync-1", "dev-1");
+        rotated.ml_dsa_65_public_key = vec![77u8; 1952]; // attacker-chosen ML-DSA key
+        rotated.ml_dsa_key_generation = 5; // inflated generation
+        tx.upsert_device_record(&rotated).unwrap();
+        tx.commit().unwrap();
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        // Destination has dev-1 pinned at the original ML-DSA key / generation 0.
+        let dst = make_storage();
+        let mut tx = dst.begin_tx().unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1")).unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = dst.begin_tx().unwrap();
+        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.commit().unwrap();
+
+        let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
+        assert_eq!(
+            d1.ml_dsa_65_public_key,
+            vec![9u8; 1952],
+            "snapshot must not rebind the pinned ML-DSA key"
+        );
+        assert_eq!(d1.ml_dsa_key_generation, 0, "snapshot must not bump the ML-DSA generation");
+    }
+
+    #[test]
+    fn import_snapshot_does_not_inflate_ml_dsa_generation() {
+        // A snapshot with the SAME ML-DSA key bytes but an inflated generation
+        // must not bump the pinned generation — otherwise it could block a
+        // later legitimate signed gen+1 rotation.
+        let src = make_storage();
+        let mut tx = src.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+        let mut inflated = sample_device_record("sync-1", "dev-1"); // identical key bytes
+        inflated.ml_dsa_key_generation = 9; // inflated generation, key bytes unchanged
+        tx.upsert_device_record(&inflated).unwrap();
+        tx.commit().unwrap();
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        let mut tx = dst.begin_tx().unwrap();
+        tx.upsert_device_record(&sample_device_record("sync-1", "dev-1")).unwrap(); // gen 0
+        tx.commit().unwrap();
+
+        let mut tx = dst.begin_tx().unwrap();
+        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.commit().unwrap();
+
+        let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
+        assert_eq!(d1.ml_dsa_key_generation, 0, "snapshot must not inflate the ML-DSA generation");
     }
 
     #[test]

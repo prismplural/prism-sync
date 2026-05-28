@@ -15,6 +15,84 @@ use prism_sync_crypto::pq::continuity_proof::MlDsaContinuityProof;
 
 const SUPPORTED_REGISTRY_ARTIFACT_VERSION: u8 = 0x03;
 
+/// Outcome of reconciling an incoming device record (from a signed registry
+/// import or a snapshot import) against the locally pinned record.
+///
+/// This is the single source of truth for the fail-closed rules that every
+/// registry *write* path must honour, so the signed-registry path
+/// ([`DeviceRegistryManager::pin_device`]) and the snapshot-import path
+/// (`storage::exec_import_snapshot`) cannot diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryImportAction {
+    /// The candidate is safe to persist.
+    Write,
+    /// Keep the existing record untouched. Either the candidate is a stale /
+    /// unverified ML-DSA view, or it would silently un-revoke a local tombstone.
+    KeepExisting,
+    /// The candidate changes a permanent identity key. Fail closed.
+    RejectKeyChange,
+}
+
+/// Where an incoming device record came from, which determines how much trust
+/// its ML-DSA key carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryImportSource {
+    /// A hybrid-signed registry artifact or pairing keyring: a trusted device
+    /// has signed over every entry, so a strictly-forward ML-DSA rotation is
+    /// vouched for and may be applied.
+    SignedArtifact,
+    /// A state snapshot blob. Its per-device registry entries are *not*
+    /// individually authenticated — the blob can name any device id with any
+    /// ML-DSA key. Never apply an ML-DSA change from this source; a legitimate
+    /// rotation always arrives through a [`RegistryImportSource::SignedArtifact`]
+    /// import or an explicit continuity-proof acceptance.
+    Snapshot,
+}
+
+/// Reconcile an incoming `candidate` device record against the locally pinned
+/// `existing` record, returning the fail-closed action to take. The invariants:
+/// permanent identity keys (Ed25519 / X25519 / ML-KEM / X-Wing) never change, a
+/// revoked tombstone is never un-revoked, and an ML-DSA rotation is honoured
+/// only from a signed artifact (see [`RegistryImportSource`]).
+pub(crate) fn registry_import_action(
+    existing: Option<&DeviceRecord>,
+    candidate: &DeviceRecord,
+    source: RegistryImportSource,
+) -> RegistryImportAction {
+    let Some(existing) = existing else {
+        return RegistryImportAction::Write;
+    };
+
+    if existing.status == "revoked" && candidate.status != "revoked" {
+        return RegistryImportAction::KeepExisting;
+    }
+
+    if DeviceRegistryManager::keys_match(existing, candidate) {
+        return RegistryImportAction::Write;
+    }
+
+    let permanent_keys_match = existing.ed25519_public_key == candidate.ed25519_public_key
+        && existing.x25519_public_key == candidate.x25519_public_key
+        && existing.ml_kem_768_public_key == candidate.ml_kem_768_public_key
+        && existing.x_wing_public_key == candidate.x_wing_public_key;
+    if !permanent_keys_match {
+        return RegistryImportAction::RejectKeyChange;
+    }
+
+    // Only the ML-DSA key differs. Accept a strictly-forward rotation only from
+    // a signed artifact; a snapshot's entries are unauthenticated, so applying
+    // one would let a malicious member rebind a victim's signing key or wedge it
+    // with a bogus generation.
+    match source {
+        RegistryImportSource::SignedArtifact
+            if candidate.ml_dsa_key_generation > existing.ml_dsa_key_generation =>
+        {
+            RegistryImportAction::Write
+        }
+        _ => RegistryImportAction::KeepExisting,
+    }
+}
+
 /// Stateless helper for device registry operations.
 ///
 /// All state lives in the [`SyncStorage`] implementation; this struct provides
@@ -39,32 +117,36 @@ impl DeviceRegistryManager {
     /// Pin a device's keys on first sight (Trust On First Use).
     ///
     /// If the device already exists with the same keys, status metadata may be
-    /// updated. Key changes fail closed.
+    /// updated. Permanent key changes fail closed. A locally revoked device is
+    /// never silently un-revoked by an incoming record listing it as active.
+    /// ML-DSA rotations are accepted only when the generation strictly increases.
     pub fn pin_device(
         storage: &dyn SyncStorage,
         sync_id: &str,
         device: &DeviceRecord,
     ) -> Result<()> {
         let _ = sync_id; // sync_id is part of the DeviceRecord
-        match storage.get_device_record(sync_id, &device.device_id)? {
-            None => Self::write_device_record(storage, device),
-            Some(existing) if Self::keys_match(&existing, device) => {
-                Self::write_device_record(storage, device)
+        let existing = storage.get_device_record(sync_id, &device.device_id)?;
+        match registry_import_action(
+            existing.as_ref(),
+            device,
+            RegistryImportSource::SignedArtifact,
+        ) {
+            RegistryImportAction::Write => Self::write_device_record(storage, device),
+            RegistryImportAction::KeepExisting => {
+                if existing.as_ref().is_some_and(|e| e.status == "revoked")
+                    && device.status != "revoked"
+                {
+                    tracing::warn!(
+                        device_id = %device.device_id,
+                        "ignoring registry import that would un-revoke a locally revoked device"
+                    );
+                }
+                Ok(())
             }
-            Some(existing)
-                if device.ml_dsa_key_generation > existing.ml_dsa_key_generation
-                    && device.ed25519_public_key == existing.ed25519_public_key
-                    && device.x25519_public_key == existing.x25519_public_key
-                    && device.ml_kem_768_public_key == existing.ml_kem_768_public_key
-                    && device.x_wing_public_key == existing.x_wing_public_key =>
-            {
-                // ML-DSA key rotation: a peer device rotated its PQ signing key
-                // (which is allowed) without changing its permanent Ed25519/X25519/
-                // ML-KEM/X-Wing keys. We learn about this through the signed device
-                // registry gossip. Accept if generation strictly increases (prevents rollback).
-                Self::write_device_record(storage, device)
+            RegistryImportAction::RejectKeyChange => {
+                Err(CoreError::DeviceKeyChanged { device_id: device.device_id.clone() })
             }
-            Some(_) => Err(CoreError::DeviceKeyChanged { device_id: device.device_id.clone() }),
         }
     }
 
@@ -105,6 +187,30 @@ impl DeviceRegistryManager {
         sync_id: &str,
         keyring: &[DeviceRecord],
     ) -> Result<()> {
+        // Preflight every entry before any write: `pin_device` commits per
+        // record, so a reject on a later entry would otherwise leave earlier
+        // ones partially applied. A duplicate device id is checked here too —
+        // the per-entry check only compares against current storage, so two
+        // entries for the same new device would both pass and then conflict
+        // mid-write. A well-formed artifact lists each device once.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for device in keyring {
+            if !seen.insert(device.device_id.as_str()) {
+                return Err(CoreError::Engine(format!(
+                    "duplicate device id {} in registry artifact",
+                    device.device_id
+                )));
+            }
+            let existing = storage.get_device_record(sync_id, &device.device_id)?;
+            if registry_import_action(
+                existing.as_ref(),
+                device,
+                RegistryImportSource::SignedArtifact,
+            ) == RegistryImportAction::RejectKeyChange
+            {
+                return Err(CoreError::DeviceKeyChanged { device_id: device.device_id.clone() });
+            }
+        }
         for device in keyring {
             Self::pin_device(storage, sync_id, device)?;
         }
@@ -668,6 +774,115 @@ mod tests {
             result,
             Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-a"
         ));
+    }
+
+    #[test]
+    fn import_keyring_rejects_duplicate_device_ids() {
+        let storage = make_storage();
+        // Two entries for the same not-yet-pinned device with different keys.
+        let a1 = make_device("sync-1", "dev-dup", &[1u8; 32]);
+        let a2 = make_device("sync-1", "dev-dup", &[2u8; 32]);
+        let result = DeviceRegistryManager::import_keyring(&storage, "sync-1", &[a1, a2]);
+        assert!(result.is_err(), "duplicate device id in artifact must be rejected");
+        // Rejected during preflight — nothing was written.
+        assert!(storage.get_device_record("sync-1", "dev-dup").unwrap().is_none());
+    }
+
+    #[test]
+    fn pin_device_does_not_unrevoke_local_tombstone() {
+        let storage = make_storage();
+        let device = make_device("sync-1", "dev-a", &[1u8; 32]);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &device).unwrap();
+        DeviceRegistryManager::revoke_device(&storage, "sync-1", "dev-a").unwrap();
+
+        // A signed registry import that lists the device as active again (same
+        // pinned keys) must NOT silently un-revoke it.
+        let active_again = make_device("sync-1", "dev-a", &[1u8; 32]);
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &active_again).unwrap();
+
+        let stored = storage.get_device_record("sync-1", "dev-a").unwrap().unwrap();
+        assert_eq!(stored.status, "revoked");
+
+        // And verification still fails closed.
+        let result =
+            DeviceRegistryManager::verify_device_key(&storage, "sync-1", "dev-a", &[1u8; 32]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn registry_import_action_covers_fail_closed_rules() {
+        use RegistryImportSource::{SignedArtifact, Snapshot};
+        let existing = with_x_wing_public_key(make_device("sync-1", "dev-a", &[1u8; 32]), 1);
+
+        // No existing record → write (TOFU), regardless of source.
+        assert_eq!(
+            registry_import_action(None, &existing, SignedArtifact),
+            RegistryImportAction::Write
+        );
+        assert_eq!(registry_import_action(None, &existing, Snapshot), RegistryImportAction::Write);
+
+        // Same keys → write.
+        assert_eq!(
+            registry_import_action(Some(&existing), &existing, Snapshot),
+            RegistryImportAction::Write
+        );
+
+        // Permanent key change → reject, regardless of source.
+        let mut ed_changed = existing.clone();
+        ed_changed.ed25519_public_key = vec![9u8; 32];
+        assert_eq!(
+            registry_import_action(Some(&existing), &ed_changed, SignedArtifact),
+            RegistryImportAction::RejectKeyChange
+        );
+        assert_eq!(
+            registry_import_action(Some(&existing), &ed_changed, Snapshot),
+            RegistryImportAction::RejectKeyChange
+        );
+        let mut xwing_changed = existing.clone();
+        xwing_changed.x_wing_public_key = vec![2u8; X_WING_PUBLIC_KEY_LEN];
+        assert_eq!(
+            registry_import_action(Some(&existing), &xwing_changed, Snapshot),
+            RegistryImportAction::RejectKeyChange
+        );
+
+        // ML-DSA forward rotation (permanent keys equal, gen up): accepted from a
+        // signed artifact, but NEVER from an (unauthenticated) snapshot.
+        let mut rotated = existing.clone();
+        rotated.ml_dsa_65_public_key = vec![7u8; 1952];
+        rotated.ml_dsa_key_generation = existing.ml_dsa_key_generation + 1;
+        assert_eq!(
+            registry_import_action(Some(&existing), &rotated, SignedArtifact),
+            RegistryImportAction::Write
+        );
+        assert_eq!(
+            registry_import_action(Some(&existing), &rotated, Snapshot),
+            RegistryImportAction::KeepExisting,
+            "snapshot must never apply an ML-DSA rotation"
+        );
+
+        // ML-DSA stale/downgrade (gen not higher) → keep existing, never downgrade.
+        let mut stale = existing.clone();
+        stale.ml_dsa_65_public_key = vec![8u8; 1952];
+        // generation unchanged
+        assert_eq!(
+            registry_import_action(Some(&existing), &stale, SignedArtifact),
+            RegistryImportAction::KeepExisting
+        );
+
+        // Revoked locally, candidate active → keep tombstone.
+        let mut revoked = existing.clone();
+        revoked.status = "revoked".into();
+        let mut active = existing.clone();
+        active.status = "active".into();
+        assert_eq!(
+            registry_import_action(Some(&revoked), &active, SignedArtifact),
+            RegistryImportAction::KeepExisting
+        );
+        // Revoked locally, candidate also revoked → write (apply metadata).
+        assert_eq!(
+            registry_import_action(Some(&revoked), &revoked, Snapshot),
+            RegistryImportAction::Write
+        );
     }
 
     #[test]
