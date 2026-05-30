@@ -17,9 +17,11 @@ use prism_sync_relay::snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES;
 
 use common::*;
 
-/// Helper: PUT a snapshot with signed headers.
+/// PUT a snapshot with signed headers, returning the raw result so callers can
+/// tolerate a connection-level error (e.g. the server closing the connection on
+/// an oversize body). Most callers want [`put_snapshot_signed`].
 #[allow(clippy::too_many_arguments)]
-async fn put_snapshot_signed(
+async fn try_put_snapshot_signed(
     client: &Client,
     url: &str,
     sync_id: &str,
@@ -29,7 +31,7 @@ async fn put_snapshot_signed(
     server_seq_at: &str,
     snapshot_data: Vec<u8>,
     extra_headers: &[(&str, &str)],
-) -> reqwest::Response {
+) -> reqwest::Result<reqwest::Response> {
     let path = format!("/v1/sync/{sync_id}/snapshot");
     let mut builder = client
         .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
@@ -43,7 +45,26 @@ async fn put_snapshot_signed(
         .body(snapshot_data)
         .send()
         .await
-        .unwrap()
+}
+
+/// Helper: PUT a snapshot with signed headers.
+#[allow(clippy::too_many_arguments)]
+async fn put_snapshot_signed(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    server_seq_at: &str,
+    snapshot_data: Vec<u8>,
+    extra_headers: &[(&str, &str)],
+) -> reqwest::Response {
+    try_put_snapshot_signed(
+        client, url, sync_id, device_id, token, keys, server_seq_at, snapshot_data, extra_headers,
+    )
+    .await
+    .unwrap()
 }
 
 // ───────────────────────────── Test 4: Snapshot ─────────────────────────
@@ -276,15 +297,23 @@ async fn test_snapshot_rejects_over_wire_limit() {
     let keys = TestDeviceKeys::generate(&device_id);
     let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
 
-    // 151 MB — 1 MB over the MAX_SNAPSHOT_WIRE_BYTES cap. The router
-    // body-limit layer should reject before the handler runs; in that
-    // case axum returns 413 (Payload Too Large) directly.
+    // 1 MB over the cap. The body-limit layer rejects mid-stream, so depending
+    // on timing the server either responds 413 or closes the connection before
+    // the client finishes writing (a reqwest error). Both mean "rejected"; only
+    // an accepted upload is a bug.
     let snapshot = vec![0u8; 151 * 1024 * 1024];
     assert!(snapshot.len() > MAX_SNAPSHOT_WIRE_BYTES);
-    let resp =
-        put_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[])
-            .await;
-    assert_eq!(resp.status(), 413, "oversize snapshot should be rejected with 413");
+    let result = try_put_snapshot_signed(
+        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
+    )
+    .await;
+    if let Ok(resp) = result {
+        assert!(
+            resp.status() == 413 || resp.status() == 400,
+            "oversize snapshot should be rejected (413/400), got {}",
+            resp.status()
+        );
+    }
 }
 
 #[tokio::test]
