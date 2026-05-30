@@ -4066,6 +4066,82 @@ pub fn hex_decode(hex_str: String) -> Result<Vec<u8>, String> {
     prism_sync_crypto::hex::decode(&hex_str).map_err(|e| e.to_string())
 }
 
+/// Decode an image (JPEG/PNG/WebP/etc.), resize to fit within
+/// `max_width × max_height` (Lanczos3, aspect-ratio preserving), and
+/// re-encode in the best format based on content:
+///
+/// - **Uses transparency** (a pixel with alpha < 255) → lossless WebP
+///   (preserves transparency, small for flat-color art/banners/dividers).
+/// - **Opaque** (no alpha channel, or an alpha channel that is fully opaque) →
+///   JPEG at `quality` (1–100). Compact for photographic content.
+///
+/// Returns `(encoded_bytes, mime_type)` where mime_type is `"image/webp"` or
+/// `"image/jpeg"`.
+pub fn encode_image(
+    image_bytes: Vec<u8>,
+    max_width: u32,
+    max_height: u32,
+    quality: u32,
+) -> Result<(Vec<u8>, String), String> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::codecs::webp::WebPEncoder;
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    let reader = ImageReader::new(Cursor::new(&image_bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to read image: {e}"))?;
+
+    let img = reader
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {e}"))?;
+
+    let resized = img.resize(max_width, max_height, image::imageops::FilterType::Lanczos3);
+
+    // The color *type* carrying an alpha channel does not mean the image
+    // actually uses transparency — opaque PNGs / exported screenshots commonly
+    // carry a fully-opaque alpha channel. Encoding those as lossless WebP
+    // bloats the output (often past the caller's 5 MB cap, rejecting a
+    // perfectly valid photo). So only take the lossless-WebP path when at least
+    // one pixel is actually non-opaque; otherwise fall through to JPEG.
+    let rgba_buf = if resized.color().has_alpha() {
+        let buf = resized.to_rgba8();
+        let uses_alpha = buf.pixels().any(|p| p.0[3] != 255);
+        if uses_alpha {
+            Some(buf)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut output = Vec::new();
+
+    if let Some(rgba) = rgba_buf {
+        WebPEncoder::new_lossless(&mut output)
+            .encode(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| format!("Failed to encode WebP: {e}"))?;
+        Ok((output, "image/webp".to_string()))
+    } else {
+        let rgb = resized.to_rgb8();
+        JpegEncoder::new_with_quality(&mut output, quality.min(100) as u8)
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| format!("Failed to encode JPEG: {e}"))?;
+        Ok((output, "image/jpeg".to_string()))
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Relay-based PQ pairing ceremony (Phase 3 bootstrap)
 // ══════════════════════════════════════════════════════════════════════
