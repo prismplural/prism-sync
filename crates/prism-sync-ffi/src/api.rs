@@ -73,6 +73,69 @@ fn install_trace_subscriber_once() {
     });
 }
 
+/// The most recently captured Rust panic, retrievable from Dart via
+/// [`take_last_panic`]. Holds a pre-formatted `"<location>: <payload>"` string.
+static LAST_PANIC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Install a process-global panic hook exactly once.
+///
+/// On iOS the *default* panic hook writes the panic message to stderr, and
+/// while the app is backgrounded/resuming that write fails with EIO (os error
+/// 5). The failed write itself panics (`"failed printing to stderr"`), and
+/// flutter_rust_bridge surfaces *that* secondary panic to Dart — masking the
+/// original cause. Observed in the field as:
+///   `onResume failed (non-fatal): PanicException(failed printing to stderr:
+///    Input/output error (os error 5))`
+///
+/// This hook routes the panic payload + location to (1) [`LAST_PANIC`] for
+/// retrieval from Dart and (2) the `tracing` logger, and crucially NEVER
+/// writes to stderr — so the secondary "failed printing to stderr" panic can
+/// no longer occur and the real cause survives. Calling more than once is a
+/// no-op thanks to `Once`.
+fn install_panic_hook_once() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "unknown location".to_string());
+
+            // (1) Stash for retrieval from Dart. Recover from a poisoned lock
+            //     so a panic can never wedge the slot. Never panics, never
+            //     touches stderr.
+            let formatted = format!("{location}: {payload}");
+            let mut slot = LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(formatted);
+            drop(slot);
+
+            // (2) Emit via tracing. The fmt subscriber swallows writer errors,
+            //     so this stays safe even when stderr is broken. Do NOT
+            //     `eprintln!` / write stderr directly here.
+            tracing::error!(target: "prism_sync_ffi", "rust panic captured at {location}: {payload}");
+        }));
+    });
+}
+
+/// Retrieve and clear the most recently captured Rust panic, if any.
+///
+/// When an FFI call fails on iOS the surfaced error may be an opaque
+/// `PanicException`. Call this immediately afterwards to recover the real
+/// panic payload + source location captured by the hook installed at engine
+/// creation. Returns `None` when no panic has been captured since the last
+/// call (the slot is cleared on read).
+pub fn take_last_panic() -> Option<String> {
+    LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// Opaque handle wrapping PrismSync for FFI.
 /// Uses tokio::sync::Mutex so async methods can hold the lock across .await.
 /// MUST be Send + Sync for flutter_rust_bridge.
@@ -1325,6 +1388,7 @@ pub fn create_prism_sync(
     schema_json: String,
     database_key: Option<Vec<u8>>,
 ) -> Result<PrismSyncHandle, String> {
+    install_panic_hook_once();
     install_trace_subscriber_once();
 
     let schema = if schema_json.is_empty() || schema_json == "{}" {
@@ -5382,6 +5446,42 @@ mod tests {
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
     use std::sync::Arc;
 
+    /// Serializes the tests that exercise the process-global panic hook and the
+    /// shared `LAST_PANIC` slot. Without this, a panic from another test in the
+    /// same binary (e.g. `lock_or_recover_handles_poisoned_mutex`'s intentional
+    /// thread panic) can overwrite the captured payload between this test's
+    /// `catch_unwind` and `take_last_panic`, making the marker assertion flaky.
+    static PANIC_HOOK_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The panic hook must capture the *real* payload + source location into
+    /// `LAST_PANIC` (retrievable via `take_last_panic`) WITHOUT writing to
+    /// stderr — that's what unmasks the iOS resume panic that previously
+    /// surfaced only as "failed printing to stderr". `take_last_panic` then
+    /// drains the slot.
+    #[test]
+    fn panic_hook_captures_payload_and_location_then_drains() {
+        let _serial = PANIC_HOOK_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        install_panic_hook_once();
+        // Clear any residue from an unrelated earlier panic in this binary.
+        let _ = take_last_panic();
+
+        let marker = "prism_resume_panic_marker_b41c7e";
+        let unwound = std::panic::catch_unwind(|| panic!("{marker}"));
+        assert!(unwound.is_err(), "catch_unwind should observe the panic");
+
+        let captured = take_last_panic().expect("panic hook should capture the payload");
+        assert!(
+            captured.contains(marker),
+            "captured panic should include the payload, got: {captured}"
+        );
+        assert!(
+            captured.contains("api.rs:"),
+            "captured panic should include the source location, got: {captured}"
+        );
+        // Reading drains the slot so a stale panic can't be reported twice.
+        assert!(take_last_panic().is_none(), "take_last_panic should clear the slot");
+    }
+
     #[test]
     fn min_signature_version_omitted_response_ratchets_to_source_floor() {
         let store = MemorySecureStore::new();
@@ -5850,6 +5950,9 @@ mod tests {
 
     #[test]
     fn lock_or_recover_handles_poisoned_mutex() {
+        // Hold the shared guard across the intentional thread panic so it can't
+        // clobber `panic_hook_captures_*`'s captured payload mid-assertion.
+        let _serial = PANIC_HOOK_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let mutex = std::sync::Arc::new(std::sync::Mutex::new(42));
         let m = mutex.clone();
         let _ = std::thread::spawn(move || {

@@ -6,9 +6,18 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `RollbackCredentialSnapshot`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
+
+/// Retrieve and clear the most recently captured Rust panic, if any.
+///
+/// When an FFI call fails on iOS the surfaced error may be an opaque
+/// `PanicException`. Call this immediately afterwards to recover the real
+/// panic payload + source location captured by the hook installed at engine
+/// creation. Returns `None` when no panic has been captured since the last
+/// call (the slot is cleared on read).
+Future<String?> takeLastPanic() => RustLib.instance.api.crateApiTakeLastPanic();
 
 /// Build and configure a PrismSync instance.
 ///
@@ -896,9 +905,10 @@ Future<Uint8List> hexDecode({required String hexStr}) =>
 /// `max_width × max_height` (Lanczos3, aspect-ratio preserving), and
 /// re-encode in the best format based on content:
 ///
-/// - **Has alpha channel** → lossless WebP (preserves transparency, small for
-///   flat-color art/banners/dividers).
-/// - **No alpha** → JPEG at `quality` (1–100). Compact for photographic content.
+/// - **Uses transparency** (a pixel with alpha < 255) → lossless WebP
+///   (preserves transparency, small for flat-color art/banners/dividers).
+/// - **Opaque** (no alpha channel, or an alpha channel that is fully opaque) →
+///   JPEG at `quality` (1–100). Compact for photographic content.
 ///
 /// Returns `(encoded_bytes, mime_type)` where mime_type is `"image/webp"` or
 /// `"image/jpeg"`.
