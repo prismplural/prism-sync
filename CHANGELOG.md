@@ -2,6 +2,21 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.11.0] - 2026-05-31
+
+Tagged for the matching `prism-app 0.11.0+11001` release. Cargo crate versions remain `0.1.1`.
+
+### Added
+- `encode_image` FFI for cross-platform image normalization. The Dart bindings can now pass JPEG/PNG/WebP-style input through Rust, resize it to Prism's target bounds, and receive JPEG for opaque images or lossless WebP for images that use transparency. This supports Prism's encrypted bio-image pipeline consistently across desktop and mobile builds.
+- `take_last_panic` FFI diagnostic hook. Panics caught across the FFI boundary are captured in a redacted last-panic slot so app-side recovery paths can log the real Rust panic location/payload while still presenting a recoverable sync error to users.
+
+### Fixed
+- Relay snapshot replacement now permits the same uploader to replace the same sequence snapshot, which keeps retry/idempotency behavior from being rejected as stale.
+- Device-registry import now fails closed for unverified registry paths, and ML-DSA rotation catch-up requires a verified registry before accepting rotation state from the relay.
+
+### Internal
+- Added regression coverage for snapshot over-wire-limit handling, fronting `end_time` null/timestamp convergence, and panic-hook behavior.
+
 ## [0.10.1] - 2026-05-28
 
 Tagged for the matching `prism-app 0.10.1+10101` release. Cargo crate versions remain `0.1.1`.
