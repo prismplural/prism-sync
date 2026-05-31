@@ -1688,14 +1688,10 @@ pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite:
 // Snapshot queries
 // ---------------------------------------------------------------------------
 
-/// Insert or replace the per-sync snapshot row, only if the incoming
-/// `server_seq_at` is strictly greater than the stored one or the stored
-/// snapshot has already expired. Returns 1 on write, 0 if the WHERE
-/// guard filtered the upsert (caller should surface a 409 to the client).
+/// Insert or replace the per-sync snapshot row.
 ///
-/// The expiry leg mirrors the read-time filter in [`get_snapshot`] —
-/// an expired row is invisible to readers anyway, so a lower-seq upload
-/// is allowed to replace it without waiting for cleanup.
+/// Equal-seq retries from the same uploader may retarget a stranded pair
+/// snapshot. Returns 1 on write and 0 when the guard rejects the upsert.
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_snapshot(
     conn: &Connection,
@@ -1720,7 +1716,12 @@ pub fn upsert_snapshot(
             target_device_id = excluded.target_device_id,
             uploaded_by_device_id = excluded.uploaded_by_device_id
          WHERE excluded.server_seq_at > snapshots.server_seq_at
-            OR (snapshots.expires_at IS NOT NULL AND snapshots.expires_at < unixepoch())",
+            OR (snapshots.expires_at IS NOT NULL AND snapshots.expires_at < unixepoch())
+            OR (
+                excluded.server_seq_at = snapshots.server_seq_at
+                AND excluded.uploaded_by_device_id IS NOT NULL
+                AND excluded.uploaded_by_device_id = snapshots.uploaded_by_device_id
+            )",
         params![
             sync_id,
             epoch,

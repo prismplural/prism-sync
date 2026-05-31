@@ -872,44 +872,47 @@ async fn put_snapshot_stale_seq_returns_conflict() {
 }
 
 #[tokio::test]
-async fn put_snapshot_equal_seq_returns_conflict() {
-    // The upsert WHERE uses `>`, not `>=`, so equal-seq uploads land
-    // on the rejected branch and the existing payload is preserved.
-    let (url, _server, _db) = start_test_relay().await;
+async fn put_snapshot_equal_seq_cross_uploader_returns_conflict() {
+    // Equal-seq cross-uploader writes still lose to the existing row.
+    let (url, _server, db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
-    let device_id = generate_device_id();
-    let keys = TestDeviceKeys::generate(&device_id);
-    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let device_a = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a);
+    let token_a = register_device(&client, &url, &sync_id, &device_a, &keys_a).await;
+
+    let device_b = generate_device_id();
+    let (token_b, keys_b) = prepare_device(&db, &sync_id, &device_b).await;
 
     let resp = put_snapshot_signed(
         &client,
         &url,
         &sync_id,
-        &device_id,
-        &token,
-        &keys,
+        &device_a,
+        &token_a,
+        &keys_a,
         "100",
-        b"data-v1".to_vec(),
+        b"data-from-a".to_vec(),
         &[],
     )
     .await;
     assert_eq!(resp.status(), 204);
 
-    // Same server_seq_at=100, different body — must be treated as stale.
+    // Same seq, different uploader.
     let resp = put_snapshot_signed(
         &client,
         &url,
         &sync_id,
-        &device_id,
-        &token,
-        &keys,
+        &device_b,
+        &token_b,
+        &keys_b,
         "100",
-        b"data-v2".to_vec(),
+        b"data-from-b".to_vec(),
         &[],
     )
     .await;
-    assert_eq!(resp.status(), 409, "equal seq is stale per > policy");
+    assert_eq!(resp.status(), 409, "equal seq cross-uploader is still stale");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "stale_snapshot_seq");
     assert_eq!(body["current_server_seq_at"].as_i64().unwrap(), 100);
@@ -923,9 +926,65 @@ async fn put_snapshot_equal_seq_returns_conflict() {
     );
 
     // Original payload preserved.
-    let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &device_id, &token).await;
+    let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &device_a, &token_a).await;
     let decoded = BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap();
-    assert_eq!(decoded.as_slice(), b"data-v1");
+    assert_eq!(decoded.as_slice(), b"data-from-a");
+}
+
+#[tokio::test]
+async fn put_snapshot_equal_seq_same_uploader_replaces() {
+    // Pair retries reuse the uploader and seq but target a fresh joiner.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator);
+    let token_init = register_device(&client, &url, &sync_id, &initiator, &keys_init).await;
+
+    let joiner_old = generate_device_id();
+    let (_token_old, _keys_old) = prepare_device(&db, &sync_id, &joiner_old).await;
+    let joiner_new = generate_device_id();
+    let (token_new, _keys_new) = prepare_device(&db, &sync_id, &joiner_new).await;
+
+    // First pairing attempt targets joiner_old.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator,
+        &token_init,
+        &keys_init,
+        "100",
+        b"first-attempt-snapshot".to_vec(),
+        &[("X-For-Device-Id", &joiner_old)],
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // Retry targets the fresh joiner at the same seq.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator,
+        &token_init,
+        &keys_init,
+        "100",
+        b"retry-snapshot".to_vec(),
+        &[("X-For-Device-Id", &joiner_new)],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        204,
+        "same uploader, same seq, fresh joiner target must replace"
+    );
+
+    // The new joiner can fetch, so the stored target changed too.
+    let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &joiner_new, &token_new).await;
+    let decoded = BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded.as_slice(), b"retry-snapshot");
 }
 
 #[tokio::test]
