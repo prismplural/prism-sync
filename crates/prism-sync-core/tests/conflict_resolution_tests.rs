@@ -18,7 +18,7 @@ use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{MergeEngine, SyncConfig, SyncEngine};
 use prism_sync_core::relay::MockRelay;
-use prism_sync_core::schema::SyncValue;
+use prism_sync_core::schema::{SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{FieldVersion, RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::syncable_entity::SyncableEntity;
 use prism_sync_core::{batch_signature, sync_aad, CrdtChange, Hlc};
@@ -1101,4 +1101,165 @@ fn test_undeleted_entity_allows_field_updates() {
     assert_eq!(winners.len(), 1, "field update on un-deleted entity should be accepted");
     let winner = winners.values().next().unwrap();
     assert_eq!(winner.op.encoded_value, "\"Alive Again\"");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// fronting_sessions end_time convergence (null ↔ timestamp LWW)
+//
+// Regression coverage for the cross-device fronting bug where a session was
+// open on one device and closed on another. The merge is field-level LWW by
+// HLC, so a fronting "close" (end_time: null → timestamp) converges as long as
+// the close op carries a later HLC than the open create — and a stale op can
+// never silently revert a newer close. These pin that behaviour for the
+// `end_time` field specifically.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn fronting_schema() -> SyncSchema {
+    SyncSchema::builder()
+        .entity("fronting_sessions", |e| {
+            e.field("start_time", SyncType::String)
+                .field("end_time", SyncType::String)
+                .field("member_id", SyncType::String)
+        })
+        .build()
+}
+
+fn make_fronting_op(
+    entity_id: &str,
+    field_name: &str,
+    encoded_value: &str,
+    hlc: &Hlc,
+    device_id: &str,
+) -> CrdtChange {
+    CrdtChange {
+        op_id: format!("fronting_sessions:{entity_id}:{field_name}:{hlc}:{device_id}"),
+        batch_id: Some("batch-1".to_string()),
+        entity_id: entity_id.to_string(),
+        entity_table: "fronting_sessions".to_string(),
+        field_name: field_name.to_string(),
+        encoded_value: encoded_value.to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }
+}
+
+/// A persisted `end_time` field version on `sess-1` with the given encoded
+/// value + HLC. Every other field resolves to `None` — notably `is_deleted`,
+/// so the row is not treated as tombstoned.
+fn end_time_field_version(
+    encoded_value: &str,
+    hlc: &Hlc,
+    device_id: &str,
+) -> impl Fn(&str, &str, &str, &str) -> prism_sync_core::Result<Option<FieldVersion>> {
+    let encoded_value = encoded_value.to_string();
+    let hlc = hlc.to_string();
+    let device_id = device_id.to_string();
+    move |_sync_id: &str, _table: &str, _eid: &str, field: &str| {
+        if field == "end_time" {
+            Ok(Some(FieldVersion {
+                sync_id: SYNC_ID.to_string(),
+                entity_table: "fronting_sessions".to_string(),
+                entity_id: "sess-1".to_string(),
+                field_name: "end_time".to_string(),
+                winning_op_id: "persisted-op".to_string(),
+                winning_device_id: device_id.clone(),
+                winning_hlc: hlc.clone(),
+                winning_encoded_value: Some(encoded_value.clone()),
+                updated_at: chrono::Utc::now(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+const TS_EARLY: &str = "\"2026-05-28T10:00:00.000Z\"";
+const TS_LATE: &str = "\"2026-05-28T11:00:00.000Z\"";
+
+#[test]
+fn fronting_close_converges_over_open_create() {
+    // Persisted: the create left end_time = null at HLC 1000. A close op
+    // (end_time = timestamp) arrives at HLC 2000 and must win, so a session
+    // open on this device converges to closed.
+    let merge = MergeEngine::new(fronting_schema());
+    let get_fv = end_time_field_version("null", &Hlc::new(1000, 0, "device-a"), "device-a");
+
+    let close_hlc = Hlc::new(2000, 0, "device-b");
+    let ops = vec![make_fronting_op("sess-1", "end_time", TS_LATE, &close_hlc, "device-b")];
+
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert!(
+        winners.contains_key(&ops[0].op_id),
+        "a later close must win over the open create"
+    );
+}
+
+#[test]
+fn fronting_stale_reopen_does_not_revert_close() {
+    // Persisted: closed at HLC 2000. A stale end_time = null at HLC 1500 (a
+    // late-arriving op from before the close) must NOT reopen the row.
+    let merge = MergeEngine::new(fronting_schema());
+    let get_fv = end_time_field_version(TS_LATE, &Hlc::new(2000, 0, "device-b"), "device-b");
+
+    let stale_hlc = Hlc::new(1500, 0, "device-a");
+    let ops = vec![make_fronting_op("sess-1", "end_time", "null", &stale_hlc, "device-a")];
+
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert!(
+        !winners.contains_key(&ops[0].op_id),
+        "a stale reopen must not revert a newer close"
+    );
+}
+
+#[test]
+fn fronting_genuine_later_reopen_wins() {
+    // Persisted: closed at HLC 2000. A genuine reopen (end_time = null) at HLC
+    // 3000 — the delete/makePreviousActive path — must win. LWW does not
+    // special-case null; a strictly-later write always takes effect.
+    let merge = MergeEngine::new(fronting_schema());
+    let get_fv = end_time_field_version(TS_LATE, &Hlc::new(2000, 0, "device-b"), "device-b");
+
+    let reopen_hlc = Hlc::new(3000, 0, "device-a");
+    let ops = vec![make_fronting_op("sess-1", "end_time", "null", &reopen_hlc, "device-a")];
+
+    let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert!(
+        winners.contains_key(&ops[0].op_id),
+        "a genuinely newer reopen wins (makePreviousActive correctness)"
+    );
+}
+
+#[test]
+fn fronting_concurrent_closes_resolve_deterministically() {
+    // Two devices close the same session concurrently (identical HLC clock).
+    // Both compute the same winner (HLC node_id breaks the tie), so the two
+    // devices converge on one end_time rather than durably disagreeing.
+    let merge = MergeEngine::new(fronting_schema());
+
+    let op_a = make_fronting_op(
+        "sess-1",
+        "end_time",
+        TS_EARLY,
+        &Hlc::new(2000, 0, "device-a"),
+        "device-a",
+    );
+    let op_b = make_fronting_op(
+        "sess-1",
+        "end_time",
+        TS_LATE,
+        &Hlc::new(2000, 0, "device-b"),
+        "device-b",
+    );
+
+    // Arrival order within the batch must not change the outcome.
+    for ops in [vec![op_a.clone(), op_b.clone()], vec![op_b.clone(), op_a.clone()]] {
+        let winners = merge
+            .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
+            .unwrap();
+        assert!(winners.contains_key(&op_b.op_id), "device-b's close wins deterministically");
+        assert!(!winners.contains_key(&op_a.op_id), "the losing close is not a winner");
+    }
 }
