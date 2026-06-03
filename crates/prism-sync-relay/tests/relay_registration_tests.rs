@@ -2387,6 +2387,73 @@ async fn test_old_revoke_other_path_is_gated() {
     assert_eq!(revoke_resp.status(), 409, "legacy revoke path should be gated");
 }
 
+#[tokio::test]
+async fn test_self_deregister_with_active_peer_is_gated() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let device_b_id = generate_device_id();
+    let (_token_b, _keys_b) = prepare_device(&db, &sync_id, &device_b_id).await;
+
+    let path = format!("/v1/sync/{sync_id}/devices/{device_a_id}");
+    let resp = apply_signed_headers(
+        client
+            .delete(format!("{url}{path}"))
+            .header("Authorization", format!("Bearer {token_a}"))
+            .header("X-Device-Id", &device_a_id),
+        &keys_a,
+        "DELETE",
+        &path,
+        &sync_id,
+        &device_a_id,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        409,
+        "self-deregister with peers must not hard-delete the device row"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("requires atomic revoke"),
+        "app-side cleanup relies on this conflict being distinguishable: {body}"
+    );
+
+    db.with_conn(|conn| {
+        assert!(db::get_device(conn, &sync_id, &device_a_id)?.is_some());
+        assert!(db::get_device(conn, &sync_id, &device_b_id)?.is_some());
+        assert_eq!(db::count_active_devices(conn, &sync_id)?, 2);
+
+        let _seq1 = db::insert_batch(conn, &sync_id, 0, &device_b_id, "b1", b"d1")?;
+        let _seq2 = db::insert_batch(conn, &sync_id, 0, &device_b_id, "b2", b"d2")?;
+        let seq3 = db::insert_batch(conn, &sync_id, 0, &device_b_id, "b3", b"d3")?;
+        db::upsert_device_receipt(conn, &sync_id, &device_b_id, seq3)?;
+
+        assert_eq!(
+            db::get_min_acked_seq_unrevoked(conn, &sync_id)?,
+            Some(0),
+            "blocked self-deregister keeps the requester in the ACK floor"
+        );
+        assert_eq!(
+            db::prune_batches_by_acks(conn)?,
+            0,
+            "peer ACKs alone must not prune while the requester row remains active"
+        );
+        assert_eq!(db::get_batches_since(conn, &sync_id, 0, 100)?.len(), 3);
+        Ok::<_, rusqlite::Error>(())
+    })
+    .unwrap();
+}
+
 // ────────────── Test: Revoke then rekey atomic flow ──────────────
 
 #[tokio::test]

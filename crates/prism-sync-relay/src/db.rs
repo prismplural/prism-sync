@@ -1661,19 +1661,23 @@ pub fn get_first_retained_batch_seq(
     conn: &Connection,
     sync_id: &str,
 ) -> Result<Option<i64>, rusqlite::Error> {
-    let pruned_floor: i64 = conn
+    let pruned_floor = get_pruned_floor_seq(conn, sync_id)?;
+    if pruned_floor > 0 {
+        Ok(Some(pruned_floor + 1))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn get_pruned_floor_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
+    Ok(conn
         .query_row(
             "SELECT pruned_floor_seq FROM sync_groups WHERE sync_id = ?1",
             params![sync_id],
             |row| row.get(0),
         )
         .optional()?
-        .unwrap_or(0);
-    if pruned_floor > 0 {
-        Ok(Some(pruned_floor + 1))
-    } else {
-        Ok(None)
-    }
+        .unwrap_or(0))
 }
 
 pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
@@ -4137,7 +4141,11 @@ mod tests {
             let revoked = auto_revoke_devices(conn, 7_776_000)?;
             assert!(revoked.contains(&"sg1".to_string()), "dev2 auto-revoked at the 90d TTL");
             assert_eq!(get_min_acked_seq_unrevoked(conn, "sg1")?, Some(seq5));
-            assert_eq!(prune_batches_by_acks(conn)?, 2, "remaining batches prune once dev2 revoked");
+            assert_eq!(
+                prune_batches_by_acks(conn)?,
+                2,
+                "remaining batches prune once dev2 revoked"
+            );
             assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 0);
 
             Ok(())

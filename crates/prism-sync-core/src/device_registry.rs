@@ -114,6 +114,43 @@ impl DeviceRegistryManager {
         tx.commit()
     }
 
+    fn is_same_version_repair_only(
+        storage: &dyn SyncStorage,
+        sync_id: &str,
+        devices: &[DeviceRecord],
+    ) -> Result<bool> {
+        for device in devices {
+            let existing = storage.get_device_record(sync_id, &device.device_id)?;
+            let Some(existing) = existing else {
+                continue;
+            };
+
+            if !Self::keys_match(&existing, device)
+                || existing.status != device.status
+                || existing.ml_dsa_key_generation != device.ml_dsa_key_generation
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn import_missing_keyring_records(
+        storage: &dyn SyncStorage,
+        sync_id: &str,
+        keyring: &[DeviceRecord],
+    ) -> Result<()> {
+        let mut missing = Vec::new();
+        for device in keyring {
+            if storage.get_device_record(sync_id, &device.device_id)?.is_none() {
+                missing.push(device.clone());
+            }
+        }
+
+        Self::import_keyring(storage, sync_id, &missing)
+    }
+
     /// Pin a device's keys on first sight (Trust On First Use).
     ///
     /// If the device already exists with the same keys, status metadata may be
@@ -407,15 +444,6 @@ impl DeviceRegistryManager {
     ) -> Result<i64> {
         let snapshot = Self::verify_signed_registry_snapshot(storage, sync_id, artifact_blob)?;
 
-        // 4a. Monotonicity check — reject stale or replayed artifacts
-        if snapshot.registry_version <= last_imported_version.unwrap_or(-1) {
-            return Err(CoreError::Engine(format!(
-                "stale registry artifact: version {} <= last imported {}",
-                snapshot.registry_version,
-                last_imported_version.unwrap_or(-1)
-            )));
-        }
-
         let signed_version = snapshot.registry_version;
         let entries = snapshot.entries;
 
@@ -439,6 +467,23 @@ impl DeviceRegistryManager {
                 }
             })
             .collect();
+
+        let last_imported = last_imported_version.unwrap_or(-1);
+        if signed_version < last_imported {
+            return Err(CoreError::Engine(format!(
+                "stale registry artifact: version {signed_version} < last imported {last_imported}",
+            )));
+        }
+
+        if signed_version == last_imported {
+            if !Self::is_same_version_repair_only(storage, sync_id, &device_records)? {
+                return Err(CoreError::Engine(format!(
+                    "stale registry artifact: version {signed_version} changes existing device records",
+                )));
+            }
+            Self::import_missing_keyring_records(storage, sync_id, &device_records)?;
+            return Ok(signed_version);
+        }
 
         Self::import_keyring(storage, sync_id, &device_records)?;
 

@@ -139,7 +139,7 @@ pub async fn delete_device(
 fn do_self_deregister(
     conn: &rusqlite::Connection,
     sync_id: &str,
-    device_id: &str,
+    _device_id: &str,
 ) -> Result<(), AppError> {
     let active =
         db::count_active_devices(conn, sync_id).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -148,12 +148,7 @@ fn do_self_deregister(
             "Cannot deregister the last active device; delete the sync group instead",
         ));
     }
-    let deleted = db::delete_device(conn, sync_id, device_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if !deleted {
-        return Err(AppError::NotFound);
-    }
-    Ok(())
+    Err(AppError::Conflict("Self-deregister with active peers requires atomic revoke"))
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +621,8 @@ pub async fn post_ack(
     let accepted = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             let latest_seq = db::get_latest_seq(conn, &sid)?;
-            if server_seq > latest_seq {
+            let pruned_floor_seq = db::get_pruned_floor_seq(conn, &sid)?;
+            if server_seq > latest_seq && server_seq > pruned_floor_seq {
                 return Ok(false);
             }
             db::upsert_device_receipt(conn, &sid, &did, server_seq)?;

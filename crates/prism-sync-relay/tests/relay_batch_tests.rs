@@ -491,6 +491,47 @@ async fn test_pull_stale_cursor_returns_must_bootstrap_response() {
 }
 
 #[tokio::test]
+async fn test_ack_accepts_cursor_at_pruned_floor() {
+    let (url, _server, relay_db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let mut last_seq = 0i64;
+    for i in 0..3 {
+        let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
+        let resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+        assert!(resp.status().is_success(), "push failed: {}", resp.status());
+        let json: Value = resp.json().await.unwrap();
+        last_seq = json["server_seq"].as_i64().unwrap();
+    }
+
+    relay_db
+        .with_conn(|conn| {
+            let pruned = db::prune_batches_before(conn, &sync_id, last_seq + 1)?;
+            assert_eq!(pruned, 3);
+            assert_eq!(db::get_latest_seq(conn, &sync_id)?, 0);
+            assert_eq!(db::get_pruned_floor_seq(conn, &sync_id)?, last_seq);
+            Ok(())
+        })
+        .unwrap();
+
+    let accepted = ack_signed(&client, &url, &sync_id, &device_id, &token, &keys, last_seq).await;
+    assert_eq!(
+        accepted.status(),
+        204,
+        "ack at a known pruned floor should not produce a 400 storm"
+    );
+
+    let too_far =
+        ack_signed(&client, &url, &sync_id, &device_id, &token, &keys, last_seq + 1).await;
+    assert_eq!(too_far.status(), 400, "ack beyond retained or pruned history is still invalid");
+}
+
+#[tokio::test]
 async fn test_pull_since_zero_succeeds_when_no_pruning_has_happened() {
     // Regression: the bootstrap floor must be a per-sync-group "we have pruned
     // through here" marker, not the global SQLite auto-increment of `batches.id`.

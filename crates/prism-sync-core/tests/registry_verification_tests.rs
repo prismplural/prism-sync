@@ -71,10 +71,23 @@ fn build_signed_registry_blob(
     signer_device_secret: &DeviceSecret,
     signer_device_id: &str,
 ) -> Vec<u8> {
+    build_signed_registry_blob_with_version(entries, signer_device_secret, signer_device_id, 1)
+}
+
+fn build_signed_registry_blob_with_version(
+    entries: Vec<RegistrySnapshotEntry>,
+    signer_device_secret: &DeviceSecret,
+    signer_device_id: &str,
+    registry_version: i64,
+) -> Vec<u8> {
     let signing_key = signer_device_secret.ed25519_keypair(signer_device_id).unwrap();
     let pq_signing_key = signer_device_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
-    let snapshot =
-        SignedRegistrySnapshot::new_with_epoch_binding(entries, 1, 0, test_epoch_key_hashes());
+    let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+        entries,
+        registry_version,
+        0,
+        test_epoch_key_hashes(),
+    );
     snapshot.sign_hybrid(&signing_key, &pq_signing_key)
 }
 
@@ -290,6 +303,282 @@ async fn registry_verification_verified_import_happy_path() {
         .unwrap()
         .expect("device B should be in local storage after verified import");
     assert_eq!(device_b_record.status, "active");
+}
+
+#[tokio::test]
+async fn registry_verification_same_version_artifact_repairs_missing_device_record() {
+    let key_hierarchy = init_key_hierarchy();
+
+    let device_a_id = "device-aaa";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let device_b_id = "device-bbb";
+    let device_secret_b = DeviceSecret::generate();
+    let ed25519_b = device_secret_b.ed25519_keypair(device_b_id).unwrap();
+    let x25519_b = device_secret_b.x25519_keypair(device_b_id).unwrap();
+    let ml_dsa_b = device_secret_b.ml_dsa_65_keypair(device_b_id).unwrap();
+    let ml_kem_b = device_secret_b.ml_kem_768_keypair(device_b_id).unwrap();
+
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: device_a_id.to_string(),
+            ed25519_public_key: ed25519_a.public_key_bytes().to_vec(),
+            x25519_public_key: x25519_a.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: device_b_id.to_string(),
+            ed25519_public_key: ed25519_b.public_key_bytes().to_vec(),
+            x25519_public_key: x25519_b.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa_b.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        },
+    ];
+
+    let registry_version = 5;
+    let signed_blob = build_signed_registry_blob_with_version(
+        entries,
+        &device_secret_a,
+        device_a_id,
+        registry_version,
+    );
+
+    let relay = Arc::new(MockRelay::new());
+    relay.set_signed_registry(SignedRegistryResponse {
+        registry_version,
+        artifact_blob: signed_blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, device_a_id);
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_imported_registry_version(SYNC_ID, registry_version).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let signing_key_b = ed25519_b.into_signing_key();
+    let hlc = Hlc::now(device_b_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-1:title:{}:{}", hlc, device_b_id),
+        batch_id: Some("batch-b1".to_string()),
+        entity_id: "task-1".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Hello from B\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_b_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+
+    let envelope = make_encrypted_batch(
+        &ops,
+        &key_hierarchy,
+        &signing_key_b,
+        &ml_dsa_b,
+        "batch-b1",
+        device_b_id,
+    );
+    relay.inject_batch(envelope);
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let signing_key_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_a.into_signing_key(), None, device_a_id, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        result.error.is_none(),
+        "sync should succeed via same-version repair: {:?}",
+        result.error
+    );
+    assert!(result.pulled > 0, "expected the remote batch to be pulled");
+    assert!(result.merged > 0, "same-version registry repair should allow B's ops to merge");
+    assert_eq!(
+        entity.get_field("task-1", "title"),
+        Some(SyncValue::String("Hello from B".to_string()))
+    );
+    assert!(
+        storage.get_device_record(SYNC_ID, device_b_id).unwrap().is_some(),
+        "same-version registry artifact repaired the missing device record",
+    );
+}
+
+#[test]
+fn registry_verification_same_version_artifact_rejects_existing_key_change() {
+    let device_a_id = "device-a-same-version-change";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let storage = RusqliteSyncStorage::in_memory().unwrap();
+    setup_sync_metadata(&storage, device_a_id);
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+
+    let registry_version = 5;
+    let entries = vec![RegistrySnapshotEntry {
+        sync_id: SYNC_ID.to_string(),
+        device_id: device_a_id.to_string(),
+        ed25519_public_key: ed25519_a.public_key_bytes().to_vec(),
+        x25519_public_key: vec![0x99; 32],
+        ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+        x_wing_public_key: vec![],
+        status: "active".to_string(),
+        ml_dsa_key_generation: 0,
+    }];
+    let signed_blob = build_signed_registry_blob_with_version(
+        entries,
+        &device_secret_a,
+        device_a_id,
+        registry_version,
+    );
+
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage,
+        SYNC_ID,
+        &signed_blob,
+        Some(registry_version),
+    );
+
+    assert!(result.is_err(), "same-version registry artifacts must not mutate existing key pins");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("changes existing device records"), "unexpected error: {err}");
+
+    let record = storage.get_device_record(SYNC_ID, device_a_id).unwrap().unwrap();
+    assert_eq!(record.x25519_public_key, x25519_a.public_key_bytes().to_vec());
+}
+
+#[test]
+fn registry_verification_same_version_artifact_rejects_existing_status_or_generation_change() {
+    let device_a_id = "device-a-same-version-status";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let device_b_id = "device-b-same-version-status";
+    let device_secret_b = DeviceSecret::generate();
+    let ed25519_b = device_secret_b.ed25519_keypair(device_b_id).unwrap();
+    let x25519_b = device_secret_b.x25519_keypair(device_b_id).unwrap();
+    let ml_dsa_b = device_secret_b.ml_dsa_65_keypair(device_b_id).unwrap();
+    let ml_kem_b = device_secret_b.ml_kem_768_keypair(device_b_id).unwrap();
+
+    let storage = RusqliteSyncStorage::in_memory().unwrap();
+    setup_sync_metadata(&storage, device_a_id);
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+    register_device_in_storage(
+        &storage,
+        device_b_id,
+        &ed25519_b.public_key_bytes(),
+        &x25519_b.public_key_bytes(),
+        &ml_dsa_b.public_key_bytes(),
+        &ml_kem_b.public_key_bytes(),
+        0,
+    );
+
+    let registry_version = 5;
+    let unchanged_signer = RegistrySnapshotEntry {
+        sync_id: SYNC_ID.to_string(),
+        device_id: device_a_id.to_string(),
+        ed25519_public_key: ed25519_a.public_key_bytes().to_vec(),
+        x25519_public_key: x25519_a.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+        x_wing_public_key: vec![],
+        status: "active".to_string(),
+        ml_dsa_key_generation: 0,
+    };
+    let changed_peer = RegistrySnapshotEntry {
+        sync_id: SYNC_ID.to_string(),
+        device_id: device_b_id.to_string(),
+        ed25519_public_key: ed25519_b.public_key_bytes().to_vec(),
+        x25519_public_key: x25519_b.public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: ml_dsa_b.public_key_bytes(),
+        ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+        x_wing_public_key: vec![],
+        status: "revoked".to_string(),
+        ml_dsa_key_generation: 1,
+    };
+    let signed_blob = build_signed_registry_blob_with_version(
+        vec![unchanged_signer, changed_peer],
+        &device_secret_a,
+        device_a_id,
+        registry_version,
+    );
+
+    let result = DeviceRegistryManager::verify_and_import_signed_registry(
+        &storage,
+        SYNC_ID,
+        &signed_blob,
+        Some(registry_version),
+    );
+
+    assert!(
+        result.is_err(),
+        "same-version registry artifacts must only add missing rows, not mutate known status or generation"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("changes existing device records"), "unexpected error: {err}");
+
+    let record = storage.get_device_record(SYNC_ID, device_b_id).unwrap().unwrap();
+    assert_eq!(record.status, "active");
+    assert_eq!(record.ml_dsa_key_generation, 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
