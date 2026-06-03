@@ -1245,7 +1245,7 @@ impl PrismSync {
                 (name.clone(), value.clone(), encoded)
             })
             .collect();
-        entries.sort_by(|a, b| a.2.len().cmp(&b.2.len()));
+        entries.sort_by_key(|a| a.2.len());
 
         // Each bucket carries the partition's field map plus its tentative
         // CrdtChange list (rebuilt as fields are added) for re-measuring.
@@ -1361,7 +1361,7 @@ impl PrismSync {
         // Sort op references by encoded_value length descending so the largest
         // ops are placed first (classic FFD).
         let mut entries: Vec<&PendingOp> = ops.iter().collect();
-        entries.sort_by(|a, b| b.encoded_value.len().cmp(&a.encoded_value.len()));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.encoded_value.len()));
 
         // Each bucket carries the partition's op_ids list plus its tentative
         // CrdtChange list for re-measuring envelope size.
