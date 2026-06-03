@@ -60,6 +60,11 @@ pub struct SyncResult {
     /// the winning field values grouped by entity. The consumer uses
     /// this to apply changes to its own database (e.g. Drift).
     pub entity_changes: Vec<EntityChange>,
+    /// `true` when the push phase stopped at its per-cycle cap
+    /// ([`SyncConfig::push_batch_cap`]) with local batches still unsent. The
+    /// sync driver re-arms another cycle so the queue keeps draining without
+    /// waiting for a new local mutation. Always `false` on error paths.
+    pub push_incomplete: bool,
 }
 
 impl Default for SyncResult {
@@ -75,6 +80,7 @@ impl Default for SyncResult {
             error_code: None,
             remote_wipe: None,
             entity_changes: Vec::new(),
+            push_incomplete: false,
         }
     }
 }
@@ -95,6 +101,11 @@ impl SyncResult {
 /// of 100 while keeping each response small enough to decode/apply per page.
 pub const DEFAULT_PULL_PAGE_LIMIT: i64 = 500;
 
+/// Default cap on batches pushed per sync cycle. Bounds how long one cycle
+/// spends pushing so a large outbound backlog can't starve the pull phase (and
+/// thus delay incoming changes); the driver re-arms to drain the rest.
+pub const DEFAULT_PUSH_BATCH_CAP: usize = 256;
+
 /// Configuration for the sync engine.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -105,10 +116,17 @@ pub struct SyncConfig {
     /// draining to head. See [`DEFAULT_PULL_PAGE_LIMIT`]. The relay clamps the
     /// value to 1..=1000.
     pub pull_page_limit: i64,
+    /// Maximum batches pushed in a single cycle before yielding back to the
+    /// pull phase. See [`DEFAULT_PUSH_BATCH_CAP`]. `0` disables the cap.
+    pub push_batch_cap: usize,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self { max_clock_drift_ms: 60_000, pull_page_limit: DEFAULT_PULL_PAGE_LIMIT }
+        Self {
+            max_clock_drift_ms: 60_000,
+            pull_page_limit: DEFAULT_PULL_PAGE_LIMIT,
+            push_batch_cap: DEFAULT_PUSH_BATCH_CAP,
+        }
     }
 }

@@ -43,6 +43,10 @@ pub enum SyncTrigger {
     WebSocketNewData,
     /// The caller explicitly requested a sync.
     ManualSync,
+    /// A prior cycle's push phase hit its per-cycle cap with batches still
+    /// unsent; the driver re-arms this to keep draining the outbound queue
+    /// without waiting for a new local mutation.
+    PushContinuation,
 }
 
 /// Configuration for automatic sync behaviour.

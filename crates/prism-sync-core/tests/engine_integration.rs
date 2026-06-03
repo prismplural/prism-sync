@@ -1838,6 +1838,57 @@ async fn push_uses_current_epoch_not_stored_op_epoch() {
     );
 }
 
+/// The push phase stops at `push_batch_cap` batches per cycle and flags
+/// `push_incomplete`; a second cycle drains the remainder and clears the flag.
+#[tokio::test]
+async fn push_caps_batches_per_cycle_and_flags_incomplete() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-push-cap";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    // Three local batches queued for push.
+    for i in 0..3 {
+        let ops = vec![make_op(device_id, &format!("batch-{i}"), 0, &i.to_string())];
+        insert_pending_ops(&storage, &ops, &format!("batch-{i}"));
+    }
+
+    let config = SyncConfig { push_batch_cap: 2, ..Default::default() };
+    let engine =
+        SyncEngine::new(storage.clone(), relay.clone(), vec![entity], test_schema(), config);
+
+    // Cycle 1: the cap stops the push at 2 and flags more remaining.
+    let r1 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(r1.pushed, 2, "first cycle pushes exactly the cap");
+    assert!(r1.push_incomplete, "first cycle flags more to push");
+    assert_eq!(relay.batch_count(), 2);
+
+    // Cycle 2: drains the remaining batch and clears the flag.
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(r2.pushed, 1, "second cycle pushes the remainder");
+    assert!(!r2.push_incomplete, "second cycle is complete");
+    assert_eq!(relay.batch_count(), 3);
+}
+
 /// Degenerate case: metadata claims current_epoch = N but the KeyHierarchy
 /// has no key at N. Push must fail with a clear error, NOT silently fall
 /// back to an older epoch key. It must bubble as `MissingEpochKey` so the

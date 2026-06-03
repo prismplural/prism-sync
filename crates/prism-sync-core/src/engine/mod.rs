@@ -432,8 +432,9 @@ impl SyncEngine {
             )
             .await;
         match push_result {
-            Ok(pushed) => {
+            Ok((pushed, push_incomplete)) => {
                 result.pushed = pushed;
+                result.push_incomplete = push_incomplete;
             }
             Err(e) => {
                 if should_bubble_recoverable_key_error(&e) {
@@ -1442,7 +1443,7 @@ impl SyncEngine {
         ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
         ml_dsa_key_generation: u32,
-    ) -> Result<u64> {
+    ) -> Result<(u64, bool)> {
         // Get dirty batch IDs
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
@@ -1451,7 +1452,7 @@ impl SyncEngine {
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
         if batch_ids.is_empty() {
-            return Ok(0);
+            return Ok((0, false));
         }
 
         // Read the authoritative group epoch once at the top of the push
@@ -1472,9 +1473,20 @@ impl SyncEngine {
                 .map(|m| m.current_epoch)
                 .unwrap_or(0);
 
+        let push_cap = self.config.push_batch_cap;
         let mut pushed_count = 0u64;
+        let mut push_incomplete = false;
 
         for batch_id in &batch_ids {
+            // Per-cycle push cap: stop once we've pushed `push_cap` batches,
+            // flagging the remainder so the driver re-arms another cycle. This
+            // bounds how long a cycle spends pushing so a large outbound backlog
+            // can't starve the (Phase 1) pull. `0` disables the cap.
+            if push_cap != 0 && pushed_count >= push_cap as u64 {
+                push_incomplete = true;
+                break;
+            }
+
             // Load batch ops
             let storage = self.storage.clone();
             let bid = batch_id.clone();
@@ -1653,7 +1665,7 @@ impl SyncEngine {
             }
         }
 
-        Ok(pushed_count)
+        Ok((pushed_count, push_incomplete))
     }
 
     /// Persist a `push_quarantine` row for a batch that failed the body

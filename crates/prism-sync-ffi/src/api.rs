@@ -402,6 +402,10 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
         "error_kind": result.error_kind.as_ref().map(|k| format!("{k:?}")),
         "error_code": result.error_code,
         "remote_wipe": result.remote_wipe,
+        // True when the push phase stopped at its per-cycle cap with batches
+        // still queued; the driver re-arms another cycle. Dart treats such a
+        // `SyncCompleted` as mid-drain (no spinner flip / re-query / drain).
+        "push_incomplete": result.push_incomplete,
     })
 }
 
@@ -2135,10 +2139,28 @@ pub async fn set_auto_sync(
                 }
 
                 match inner.lock().await.sync_now().await {
-                    Ok(_) => {
+                    Ok(result) => {
                         backoff_secs = 0;
                         backoff_attempt = 0;
                         cumulative_backoff_secs = 0;
+
+                        // A capped push left local batches unsent. Re-arm a
+                        // continuation after a short breather so the queue keeps
+                        // draining without a new mutation; pulls and other
+                        // triggers are still serviced first, and the queue
+                        // strictly shrinks each cycle so this terminates.
+                        if result.push_incomplete {
+                            if let Some(ref tx) = backoff_tx {
+                                let tx = tx.clone();
+                                let task = tokio::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                    let _ = tx.send(SyncTrigger::PushContinuation).await;
+                                });
+                                if let Ok(mut guard) = backoff_abort.lock() {
+                                    *guard = Some(task.abort_handle());
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         // Non-retryable errors (auth failures, protocol errors,
