@@ -346,11 +346,19 @@ fn write_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
-#[async_trait]
-impl SyncTransport for ServerRelay {
-    async fn pull_changes(&self, since: i64) -> Result<PullResponse, RelayError> {
-        let url = format!("{}/changes?since={since}", self.base_path());
-        debug!("pull_changes since={since}");
+impl ServerRelay {
+    /// Shared pull implementation for both [`pull_changes`] and
+    /// [`pull_changes_paged`]. When `limit` is `Some`, it is sent as a query
+    /// param; the relay clamps it to 1..=1000 server-side.
+    ///
+    /// [`pull_changes`]: SyncTransport::pull_changes
+    /// [`pull_changes_paged`]: SyncTransport::pull_changes_paged
+    async fn do_pull(&self, since: i64, limit: Option<i64>) -> Result<PullResponse, RelayError> {
+        let url = match limit {
+            Some(n) => format!("{}/changes?since={since}&limit={n}", self.base_path()),
+            None => format!("{}/changes?since={since}", self.base_path()),
+        };
+        debug!("pull_changes since={since} limit={limit:?}");
 
         let resp = self
             .apply_auth(self.client.get(&url))
@@ -395,6 +403,21 @@ impl SyncTransport for ServerRelay {
             json.get("password_version").and_then(|v| v.as_i64()).map(|v| v as i32);
 
         Ok(PullResponse { batches, max_server_seq, min_acked_seq, password_version })
+    }
+}
+
+#[async_trait]
+impl SyncTransport for ServerRelay {
+    async fn pull_changes(&self, since: i64) -> Result<PullResponse, RelayError> {
+        self.do_pull(since, None).await
+    }
+
+    async fn pull_changes_paged(
+        &self,
+        since: i64,
+        limit: i64,
+    ) -> Result<PullResponse, RelayError> {
+        self.do_pull(since, Some(limit)).await
     }
 
     async fn push_changes(&self, batch: OutgoingBatch) -> Result<i64, RelayError> {

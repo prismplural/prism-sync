@@ -475,6 +475,24 @@ pub trait SyncTransport: Send + Sync {
     /// Pull encrypted batches since a given server sequence number.
     async fn pull_changes(&self, since: i64) -> std::result::Result<PullResponse, RelayError>;
 
+    /// Pull at most `limit` batches since `since`.
+    ///
+    /// The default implementation ignores `limit` and delegates to
+    /// [`pull_changes`], so existing test doubles and minimal transports keep
+    /// working unchanged (they return whatever page size the relay defaults to).
+    /// Real transports (the HTTP `ServerRelay`) override this to request a
+    /// specific page size, letting the client drain a large backlog in far
+    /// fewer round-trips by paging to head within one sync cycle.
+    ///
+    /// [`pull_changes`]: SyncTransport::pull_changes
+    async fn pull_changes_paged(
+        &self,
+        since: i64,
+        _limit: i64,
+    ) -> std::result::Result<PullResponse, RelayError> {
+        self.pull_changes(since).await
+    }
+
     /// Push an encrypted batch. Returns the server-assigned sequence number.
     async fn push_changes(&self, batch: OutgoingBatch) -> std::result::Result<i64, RelayError>;
 

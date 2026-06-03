@@ -90,16 +90,25 @@ impl SyncResult {
     }
 }
 
+/// Default page size for the pull-to-head loop. The relay clamps to 1..=1000;
+/// 500 drains a backlog in ~5x fewer round-trips than the relay's own default
+/// of 100 while keeping each response small enough to decode/apply per page.
+pub const DEFAULT_PULL_PAGE_LIMIT: i64 = 500;
+
 /// Configuration for the sync engine.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     /// Maximum clock drift allowed before halting sync (milliseconds).
     /// Default: 60_000 (60 seconds).
     pub max_clock_drift_ms: i64,
+    /// Number of batches the client requests per `pull_changes` call while
+    /// draining to head. See [`DEFAULT_PULL_PAGE_LIMIT`]. The relay clamps the
+    /// value to 1..=1000.
+    pub pull_page_limit: i64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self { max_clock_drift_ms: 60_000 }
+        Self { max_clock_drift_ms: 60_000, pull_page_limit: DEFAULT_PULL_PAGE_LIMIT }
     }
 }

@@ -226,6 +226,82 @@ fn snapshot_device_entry(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Pull-to-head paging
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A backlog larger than one page must drain to head within a single sync
+/// cycle. With `pull_page_limit = 2` and 5 batches, the loop pages 2 + 2 + 1
+/// (a short final page signals "caught up"). The pre-fix single-pull behaviour
+/// — or the buggy `last_pulled < max_server_seq` loop condition, where
+/// `max_server_seq` is only the page max — would stop after the first 2.
+#[tokio::test]
+async fn pull_to_head_drains_backlog_larger_than_one_page() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    const N: usize = 5;
+    for i in 0..N {
+        // Distinct op_id / batch_id / entity_id per batch so all five apply.
+        let hlc = Hlc::new(1_710_500_000_000 + i as i64, 0, sender_id);
+        let op = CrdtChange {
+            op_id: format!("op-{i}"),
+            batch_id: Some(format!("batch-{i}")),
+            entity_id: format!("task-{i}"),
+            entity_table: "tasks".to_string(),
+            field_name: "title".to_string(),
+            encoded_value: "\"hi\"".to_string(),
+            client_hlc: hlc.to_string(),
+            is_delete: false,
+            device_id: sender_id.to_string(),
+            epoch: 0,
+            server_seq: None,
+        };
+        let envelope = make_encrypted_batch(
+            std::slice::from_ref(&op),
+            &key_hierarchy,
+            &signing_key_sender,
+            &ml_dsa_key_sender,
+            &format!("batch-{i}"),
+            sender_id,
+        );
+        relay.inject_batch(envelope);
+    }
+
+    let config = SyncConfig { pull_page_limit: 2, ..Default::default() };
+    let engine =
+        SyncEngine::new(storage.clone(), relay.clone(), vec![entity_ref], test_schema(), config);
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(result.pulled, N as u64, "every batch should drain to head in one cycle");
+    assert_eq!(relay.pull_call_count(), 3, "5 batches @ page size 2 => 3 pull calls (2+2+1)");
+    for i in 0..N {
+        assert!(storage.is_op_applied(&format!("op-{i}")).unwrap(), "op-{i} should be applied");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Attribution binding regressions
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -728,7 +804,7 @@ async fn drops_future_drifted_op_without_blocking_good_ops_in_same_batch() {
 
     let (result, storage, entity) = pull_injected_sender_batch_with_config(
         vec![good, future_drifted],
-        SyncConfig { max_clock_drift_ms: 1_000 },
+        SyncConfig { max_clock_drift_ms: 1_000, ..Default::default() },
     )
     .await;
 

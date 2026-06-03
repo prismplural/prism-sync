@@ -6,7 +6,7 @@ pub use state::{SyncConfig, SyncResult, SyncState};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, watch};
 
@@ -124,6 +124,18 @@ fn debug_assert_remote_op_matches_sender(_op: &CrdtChange, _trusted_sender_devic
 /// surfaces a clean local quarantine instead of round-tripping a 413 for the
 /// pathological cases that slip past Phase 1A's measured partitioner.
 const RELAY_BODY_GUARD_BYTES: usize = 1_000_000;
+
+/// Per-cycle budget for the pull-to-head loop. One sync cycle drains at most
+/// `MAX_PULL_PAGES_PER_CYCLE * config.pull_page_limit` batches (20k at the
+/// default page size) or runs for at most `MAX_PULL_CYCLE_DURATION`, whichever
+/// comes first. The cursor advances as we go, so a backlog larger than the
+/// budget simply finishes draining on the next sync trigger instead of
+/// monopolising one cycle (and starving the push phase). Page size itself is
+/// configurable via [`SyncConfig::pull_page_limit`].
+///
+/// [`SyncConfig::pull_page_limit`]: crate::engine::state::SyncConfig::pull_page_limit
+const MAX_PULL_PAGES_PER_CYCLE: usize = 40;
+const MAX_PULL_CYCLE_DURATION: Duration = Duration::from_secs(20);
 
 /// Whether a `RelayError` corresponds to the relay's 413 `PayloadTooLarge`
 /// response. Used by `push_phase` to quarantine the offending batch and
@@ -456,15 +468,90 @@ impl SyncEngine {
         let _ = self.state_tx.send(state);
     }
 
-    /// Pull phase: fetch batches, verify signature, decrypt, verify payload hash, merge.
-    #[tracing::instrument(skip(self, key_hierarchy), fields(sync_id, device_id), err)]
+    /// Pull phase: drain the relay to head (or the per-cycle budget) by paging.
+    ///
+    /// Repeatedly pulls fixed-size pages via [`pull_one_page`] and accumulates
+    /// the results. Terminates when the relay returns a short page (caught up)
+    /// or a budget guard trips. The cursor lives in storage and advances as each
+    /// page is applied, so a backlog larger than one cycle's budget resumes
+    /// cleanly on the next sync trigger.
+    ///
+    /// [`pull_one_page`]: SyncEngine::pull_one_page
     async fn pull_phase(
         &self,
         sync_id: &str,
         key_hierarchy: &prism_sync_crypto::KeyHierarchy,
         device_id: &str,
     ) -> Result<PullPhaseResult> {
-        // Get last pulled seq from storage (spawn_blocking)
+        let mut total_pulled = 0u64;
+        let mut total_merged = 0u64;
+        let mut all_entity_changes: Vec<EntityChange> = Vec::new();
+        let mut max_server_seq = 0i64;
+        // Assigned on every loop iteration (the loop always runs once and writes
+        // this before any break), so it is definitely set by the final return.
+        let mut min_acked_seq: Option<i64>;
+
+        let page_limit = self.config.pull_page_limit;
+        let pull_start = Instant::now();
+        let mut pages = 0usize;
+
+        loop {
+            let (page, page_len) =
+                self.pull_one_page(sync_id, key_hierarchy, device_id).await?;
+
+            total_pulled += page.pulled;
+            total_merged += page.merged;
+            all_entity_changes.extend(page.entity_changes);
+            max_server_seq = max_server_seq.max(page.max_server_seq);
+            min_acked_seq = page.min_acked_seq;
+
+            // Empty page: nothing new on the relay → done.
+            if page_len == 0 {
+                break;
+            }
+            pages += 1;
+            // A short page means the relay had fewer than a full page left, i.e.
+            // we've reached head. (`max_server_seq` is only the page max, so a
+            // seq comparison can't detect this — the page length does.)
+            if (page_len as i64) < page_limit {
+                break;
+            }
+            // Per-cycle budget: bound one cycle so a huge backlog can't
+            // monopolise it (which would starve the push phase). The cursor has
+            // already advanced, so the next trigger resumes the drain.
+            if pages >= MAX_PULL_PAGES_PER_CYCLE
+                || pull_start.elapsed() >= MAX_PULL_CYCLE_DURATION
+            {
+                tracing::debug!(
+                    pages,
+                    total_pulled,
+                    "pull-to-head hit per-cycle budget; will resume next trigger"
+                );
+                break;
+            }
+        }
+
+        Ok(PullPhaseResult {
+            pulled: total_pulled,
+            merged: total_merged,
+            entity_changes: all_entity_changes,
+            max_server_seq,
+            min_acked_seq,
+        })
+    }
+
+    /// Pull and process a single page (one `pull_changes` round-trip). Returns
+    /// the page's accumulated result plus the number of batches in the page, so
+    /// the caller can detect a short/empty page (= caught up to head).
+    #[tracing::instrument(skip(self, key_hierarchy), fields(sync_id, device_id), err)]
+    async fn pull_one_page(
+        &self,
+        sync_id: &str,
+        key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+        device_id: &str,
+    ) -> Result<(PullPhaseResult, usize)> {
+        // Get last pulled seq from storage (spawn_blocking). The cursor advances
+        // as batches are applied, so each call resumes from the prior page.
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         let meta = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
@@ -473,21 +560,28 @@ impl SyncEngine {
 
         let since_seq = meta.map(|m| m.last_pulled_server_seq).unwrap_or(0);
 
-        // Pull from relay
-        let pull_response =
-            self.relay.pull_changes(since_seq).await.map_err(CoreError::from_relay)?;
+        // Pull from relay (configurable page size; relay clamps to 1..=1000).
+        let pull_response = self
+            .relay
+            .pull_changes_paged(since_seq, self.config.pull_page_limit)
+            .await
+            .map_err(CoreError::from_relay)?;
 
         let min_acked_seq = pull_response.min_acked_seq;
         let max_server_seq = pull_response.max_server_seq;
+        let page_len = pull_response.batches.len();
 
         if pull_response.batches.is_empty() {
-            return Ok(PullPhaseResult {
-                pulled: 0,
-                merged: 0,
-                entity_changes: Vec::new(),
-                max_server_seq,
-                min_acked_seq,
-            });
+            return Ok((
+                PullPhaseResult {
+                    pulled: 0,
+                    merged: 0,
+                    entity_changes: Vec::new(),
+                    max_server_seq,
+                    min_acked_seq,
+                },
+                0,
+            ));
         }
 
         let mut total_pulled = 0u64;
@@ -633,13 +727,16 @@ impl SyncEngine {
             total_pulled += 1;
         }
 
-        Ok(PullPhaseResult {
-            pulled: total_pulled,
-            merged: total_merged,
-            entity_changes: all_entity_changes,
-            max_server_seq,
-            min_acked_seq,
-        })
+        Ok((
+            PullPhaseResult {
+                pulled: total_pulled,
+                merged: total_merged,
+                entity_changes: all_entity_changes,
+                max_server_seq,
+                min_acked_seq,
+            },
+            page_len,
+        ))
     }
 
     /// Resolve a sender's key material from the local device registry,

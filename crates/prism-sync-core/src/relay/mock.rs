@@ -259,6 +259,16 @@ impl Default for MockRelay {
 #[async_trait]
 impl SyncTransport for MockRelay {
     async fn pull_changes(&self, since: i64) -> Result<PullResponse, RelayError> {
+        // No explicit page size → return everything since `since` (legacy
+        // behaviour for the many tests that call `pull_changes` directly).
+        self.pull_changes_paged(since, i64::MAX).await
+    }
+
+    async fn pull_changes_paged(
+        &self,
+        since: i64,
+        limit: i64,
+    ) -> Result<PullResponse, RelayError> {
         {
             let mut guard = self.state.lock().unwrap();
             guard.pull_call_count += 1;
@@ -291,7 +301,7 @@ impl SyncTransport for MockRelay {
             }
         }
         let state = self.state.lock().unwrap();
-        let batches: Vec<ReceivedBatch> = state
+        let mut batches: Vec<ReceivedBatch> = state
             .batches
             .iter()
             .filter(|b| b.server_seq > since)
@@ -301,6 +311,13 @@ impl SyncTransport for MockRelay {
                 envelope: b.envelope.clone(),
             })
             .collect();
+        // Page in server_seq order and truncate to `limit`, mirroring the real
+        // relay: `max_server_seq` is the max seq of the RETURNED page, not the
+        // group head — so a full page is the only signal that more remains.
+        batches.sort_by_key(|b| b.server_seq);
+        if limit >= 0 {
+            batches.truncate(limit as usize);
+        }
         let max_server_seq = batches.iter().map(|b| b.server_seq).max().unwrap_or(since);
         Ok(PullResponse {
             batches,
