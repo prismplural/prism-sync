@@ -667,7 +667,10 @@ pub fn localhost_test_config() -> Config {
         registration_enabled: true,
         pairing_session_ttl_secs: 300,
         pairing_session_rate_limit: 100,
-        pairing_session_max_payload_bytes: 32768,
+        // 256 KB to match production — real PQ credential bundles (ML-DSA /
+        // ML-KEM / X-Wing keys + signed registry) exceed the relay test
+        // harness's 32 KB, which would 413 the pairing credentials PUT.
+        pairing_session_max_payload_bytes: 262144,
         sharing_init_ttl_secs: 604800,
         sharing_init_max_payload_bytes: 65536,
         sharing_identity_max_bytes: 8192,
