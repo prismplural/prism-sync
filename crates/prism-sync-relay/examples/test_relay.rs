@@ -1,8 +1,13 @@
 //! Throwaway localhost relay for the end-to-end FFI test harness.
 //!
-//! Binds an ephemeral 127.0.0.1 port with an in-memory DB and OPEN registration,
-//! prints `RELAY_URL=http://127.0.0.1:<port>` to stdout (so a spawning test can
-//! read the URL), then serves until the process is killed. NOT for production.
+//! Binds 127.0.0.1 with OPEN registration, prints `RELAY_URL=http://127.0.0.1:<port>`
+//! to stdout (so a spawning test can read the URL), then serves until killed.
+//! NOT for production.
+//!
+//! Env overrides (for the kill+restart chaos test — so the relay can come back
+//! on the SAME url with the SAME state):
+//!   TEST_RELAY_PORT=<n>   bind a fixed port instead of an ephemeral one
+//!   TEST_RELAY_DB=<path>  open a persistent file DB instead of in-memory
 //!
 //! Build: `cargo build --release -p prism-sync-relay --example test_relay`
 
@@ -11,11 +16,17 @@ use std::io::Write;
 #[tokio::main]
 async fn main() {
     let config = prism_sync_relay::config::localhost_test_config();
-    let db = prism_sync_relay::db::Database::in_memory().expect("in-memory db");
+    let db = match std::env::var("TEST_RELAY_DB") {
+        Ok(path) if !path.is_empty() => {
+            prism_sync_relay::db::Database::open(&path, 2).expect("open file db")
+        }
+        _ => prism_sync_relay::db::Database::in_memory().expect("in-memory db"),
+    };
     let state = prism_sync_relay::state::AppState::new(db, config);
     let app = prism_sync_relay::routes::router(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let port: u16 = std::env::var("TEST_RELAY_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind port");
     let addr = listener.local_addr().expect("local addr");
 
     // The spawning test reads this line to discover the port.

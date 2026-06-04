@@ -439,6 +439,23 @@ Future<PlatformInt64> quarantinedBatchCount({
   required PrismSyncHandle handle,
 }) => RustLib.instance.api.crateApiQuarantinedBatchCount(handle: handle);
 
+/// Read the current LWW-winning encoded value of a single field, or `None` if
+/// no `field_version` row exists yet. This is the engine's merged state read
+/// directly from local storage — independent of any sync event — so tests and
+/// diagnostics can assert convergence. Values are JSON-encoded (strings are
+/// quoted, e.g. `"\"hello\""`). Returns `None` if the engine is not configured.
+Future<String?> readFieldValue({
+  required PrismSyncHandle handle,
+  required String table,
+  required String entityId,
+  required String field,
+}) => RustLib.instance.api.crateApiReadFieldValue(
+  handle: handle,
+  table: table,
+  entityId: entityId,
+  field: field,
+);
+
 /// Repair every push-quarantined batch by repartitioning its ops into
 /// smaller sub-batches that fit under the relay's 1 MB envelope cap.
 ///

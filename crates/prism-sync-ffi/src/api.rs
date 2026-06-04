@@ -2478,6 +2478,35 @@ pub async fn quarantined_batch_count(handle: &PrismSyncHandle) -> Result<i64, St
     .map_err(|e| e.to_string())?
 }
 
+/// Read the current LWW-winning encoded value of a single field, or `None` if
+/// no `field_version` row exists yet. This is the engine's merged state read
+/// directly from local storage — independent of any sync event — so tests and
+/// diagnostics can assert convergence. Values are JSON-encoded (strings are
+/// quoted, e.g. `"\"hello\""`). Returns `None` if the engine is not configured.
+pub async fn read_field_value(
+    handle: &PrismSyncHandle,
+    table: String,
+    entity_id: String,
+    field: String,
+) -> Result<Option<String>, String> {
+    let (storage, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let Some(sync_id) = inner.sync_service().sync_id() else {
+            return Ok(None);
+        };
+        (inner.storage().clone(), sync_id.to_string())
+    };
+
+    tokio::task::spawn_blocking(move || {
+        storage
+            .get_field_version(&sync_id, &table, &entity_id, &field)
+            .map(|opt| opt.and_then(|fv| fv.winning_encoded_value))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Repair every push-quarantined batch by repartitioning its ops into
 /// smaller sub-batches that fit under the relay's 1 MB envelope cap.
 ///
