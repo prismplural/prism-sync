@@ -301,6 +301,85 @@ async fn pull_to_head_drains_backlog_larger_than_one_page() {
     }
 }
 
+/// The pull-to-head loop stops at its per-cycle page budget rather than
+/// monopolising one cycle; the cursor advances so the next cycle resumes. With
+/// `pull_page_limit = 1` and `max_pull_pages_per_cycle = 3`, 5 batches drain as
+/// 3 (budget) then 2 — not 5 in one cycle.
+#[tokio::test]
+async fn pull_to_head_stops_at_per_cycle_page_budget() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    const N: usize = 5;
+    for i in 0..N {
+        let hlc = Hlc::new(1_710_500_000_000 + i as i64, 0, sender_id);
+        let op = CrdtChange {
+            op_id: format!("budget-op-{i}"),
+            batch_id: Some(format!("budget-batch-{i}")),
+            entity_id: format!("budget-task-{i}"),
+            entity_table: "tasks".to_string(),
+            field_name: "title".to_string(),
+            encoded_value: "\"hi\"".to_string(),
+            client_hlc: hlc.to_string(),
+            is_delete: false,
+            device_id: sender_id.to_string(),
+            epoch: 0,
+            server_seq: None,
+        };
+        let envelope = make_encrypted_batch(
+            std::slice::from_ref(&op),
+            &key_hierarchy,
+            &signing_key_sender,
+            &ml_dsa_key_sender,
+            &format!("budget-batch-{i}"),
+            sender_id,
+        );
+        relay.inject_batch(envelope);
+    }
+
+    // One batch per page, budget of 3 pages per cycle.
+    let config =
+        SyncConfig { pull_page_limit: 1, max_pull_pages_per_cycle: 3, ..Default::default() };
+    let engine =
+        SyncEngine::new(storage.clone(), relay.clone(), vec![entity_ref], test_schema(), config);
+
+    // Cycle 1: stops at the 3-page budget with batches still on the relay.
+    let r1 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(r1.pulled, 3, "first cycle stops at the page budget (3), not the full 5");
+
+    // Cycle 2: cursor advanced, so it resumes and drains the remaining 2.
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(r2.pulled, 2, "second cycle drains the remainder");
+    for i in 0..N {
+        assert!(storage.is_op_applied(&format!("budget-op-{i}")).unwrap(), "budget-op-{i} applied");
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Attribution binding regressions
 // ═══════════════════════════════════════════════════════════════════════════

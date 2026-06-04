@@ -106,6 +106,11 @@ pub const DEFAULT_PULL_PAGE_LIMIT: i64 = 500;
 /// thus delay incoming changes); the driver re-arms to drain the rest.
 pub const DEFAULT_PUSH_BATCH_CAP: usize = 256;
 
+/// Default cap on pull pages per sync cycle. Bounds how long one cycle spends
+/// draining incoming so a huge backlog can't monopolise it; the cursor advances
+/// so the next trigger resumes. At the default page size this is ~20k batches.
+pub const DEFAULT_PULL_PAGES_PER_CYCLE: usize = 40;
+
 /// Configuration for the sync engine.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -116,6 +121,9 @@ pub struct SyncConfig {
     /// draining to head. See [`DEFAULT_PULL_PAGE_LIMIT`]. The relay clamps the
     /// value to 1..=1000.
     pub pull_page_limit: i64,
+    /// Maximum pull pages per cycle before the pull-to-head loop yields and lets
+    /// the next trigger resume. See [`DEFAULT_PULL_PAGES_PER_CYCLE`].
+    pub max_pull_pages_per_cycle: usize,
     /// Maximum batches pushed in a single cycle before yielding back to the
     /// pull phase. See [`DEFAULT_PUSH_BATCH_CAP`]. `0` disables the cap.
     pub push_batch_cap: usize,
@@ -126,6 +134,7 @@ impl Default for SyncConfig {
         Self {
             max_clock_drift_ms: 60_000,
             pull_page_limit: DEFAULT_PULL_PAGE_LIMIT,
+            max_pull_pages_per_cycle: DEFAULT_PULL_PAGES_PER_CYCLE,
             push_batch_cap: DEFAULT_PUSH_BATCH_CAP,
         }
     }

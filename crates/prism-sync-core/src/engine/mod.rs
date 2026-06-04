@@ -125,16 +125,16 @@ fn debug_assert_remote_op_matches_sender(_op: &CrdtChange, _trusted_sender_devic
 /// pathological cases that slip past Phase 1A's measured partitioner.
 const RELAY_BODY_GUARD_BYTES: usize = 1_000_000;
 
-/// Per-cycle budget for the pull-to-head loop. One sync cycle drains at most
-/// `MAX_PULL_PAGES_PER_CYCLE * config.pull_page_limit` batches (20k at the
-/// default page size) or runs for at most `MAX_PULL_CYCLE_DURATION`, whichever
-/// comes first. The cursor advances as we go, so a backlog larger than the
-/// budget simply finishes draining on the next sync trigger instead of
-/// monopolising one cycle (and starving the push phase). Page size itself is
-/// configurable via [`SyncConfig::pull_page_limit`].
+/// Wall-clock half of the per-cycle pull budget. One sync cycle drains at most
+/// `config.max_pull_pages_per_cycle * config.pull_page_limit` batches or runs
+/// for at most this duration, whichever comes first. The cursor advances as we
+/// go, so a backlog larger than the budget finishes draining on the next sync
+/// trigger instead of monopolising one cycle (and starving the push phase).
+/// Page size and page count are configurable via [`SyncConfig::pull_page_limit`]
+/// and [`SyncConfig::max_pull_pages_per_cycle`].
 ///
 /// [`SyncConfig::pull_page_limit`]: crate::engine::state::SyncConfig::pull_page_limit
-const MAX_PULL_PAGES_PER_CYCLE: usize = 40;
+/// [`SyncConfig::max_pull_pages_per_cycle`]: crate::engine::state::SyncConfig::max_pull_pages_per_cycle
 const MAX_PULL_CYCLE_DURATION: Duration = Duration::from_secs(20);
 
 /// Whether a `RelayError` corresponds to the relay's 413 `PayloadTooLarge`
@@ -493,6 +493,7 @@ impl SyncEngine {
         let mut min_acked_seq: Option<i64>;
 
         let page_limit = self.config.pull_page_limit;
+        let max_pages = self.config.max_pull_pages_per_cycle;
         let pull_start = Instant::now();
         let mut pages = 0usize;
 
@@ -520,9 +521,7 @@ impl SyncEngine {
             // Per-cycle budget: bound one cycle so a huge backlog can't
             // monopolise it (which would starve the push phase). The cursor has
             // already advanced, so the next trigger resumes the drain.
-            if pages >= MAX_PULL_PAGES_PER_CYCLE
-                || pull_start.elapsed() >= MAX_PULL_CYCLE_DURATION
-            {
+            if pages >= max_pages || pull_start.elapsed() >= MAX_PULL_CYCLE_DURATION {
                 tracing::debug!(
                     pages,
                     total_pulled,

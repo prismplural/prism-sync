@@ -467,6 +467,99 @@ async fn test_soft_delete_wins_with_later_hlc() {
     assert!(entity.is_deleted("t-del").await.unwrap(), "entity should be soft deleted");
 }
 
+/// A SINGLE batch carrying delete tombstones for MANY DIFFERENT entities — the
+/// exact shape `record_delete_multi` / `emit_delete_multi` produce — must
+/// converge on a receiver: every entity ends up soft-deleted. Guards the Fix 3
+/// claim that multi-entity delete batches are safe because apply keys per-op by
+/// (table, entity_id), not per-batch.
+#[tokio::test]
+async fn test_multi_entity_delete_batch_converges_on_receiver() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_local = make_signing_key();
+    let signing_key_remote = make_signing_key();
+    let ml_dsa_key_remote = make_ml_dsa_keypair();
+    let local_device = "device-local";
+    let remote_device = "device-remote";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, local_device);
+    register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
+    register_device_with_pq(
+        &relay,
+        &storage,
+        remote_device,
+        &signing_key_remote.verifying_key(),
+        &ml_dsa_key_remote.public_key_bytes(),
+    );
+
+    let entities = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+
+    // Pre-seed each entity locally (earlier HLC) so the deletes land on
+    // existing rows — the realistic bulk-delete case.
+    let hlc_local = Hlc::new(1000, 0, local_device);
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        for e in entities {
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: SYNC_ID.to_string(),
+                entity_table: "tasks".to_string(),
+                entity_id: e.to_string(),
+                field_name: "title".to_string(),
+                winning_op_id: format!("local-title-{e}"),
+                winning_device_id: local_device.to_string(),
+                winning_hlc: hlc_local.to_string(),
+                winning_encoded_value: Some("\"t\"".to_string()),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    // Remote deletes all five DISTINCT entities, packed into ONE batch
+    // (later HLC → delete wins).
+    let hlc_delete = Hlc::new(2000, 0, remote_device);
+    let ops: Vec<CrdtChange> =
+        entities.iter().map(|e| make_delete_op(e, &hlc_delete, remote_device)).collect();
+    let envelope = make_encrypted_batch(
+        &ops,
+        &key_hierarchy,
+        &signing_key_remote,
+        &ml_dsa_key_remote,
+        "del-multi-batch",
+        remote_device,
+    );
+    relay.inject_batch(envelope);
+    assert_eq!(relay.batch_count(), 1, "all five deletes are a single batch on the wire");
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "sync error: {:?}", result.error);
+    assert_eq!(result.pulled, 1, "one batch pulled");
+    assert_eq!(result.merged, 5, "all five tombstones merged from the single batch");
+
+    for e in entities {
+        assert!(
+            entity.is_deleted(e).await.unwrap(),
+            "{e} should be soft-deleted on the receiver after the multi-entity batch"
+        );
+    }
+}
+
 /// After a soft delete is tombstoned (is_deleted field_version exists),
 /// a subsequent field update should NOT resurrect the entity.
 #[test]

@@ -1442,6 +1442,83 @@ mod tests {
         assert_eq!(*emitter.last_hlc(), hlc_before, "HLC watermark must be restored on failure");
     }
 
+    #[test]
+    fn emit_delete_multi_all_ops_in_partition_share_hlc_and_batch_id() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        let p1: Vec<String> = (0..4).map(|n| format!("ent-{n}")).collect();
+        let p2: Vec<String> = (4..7).map(|n| format!("ent-{n}")).collect();
+        let partitions = vec![(p1, "del-1".to_string()), (p2, "del-2".to_string())];
+
+        emitter.emit_delete_multi(&storage, "members", &partitions).expect("multi delete ok");
+
+        let ops_p1 = storage.load_batch_ops("del-1").unwrap();
+        let ops_p2 = storage.load_batch_ops("del-2").unwrap();
+        assert_eq!(ops_p1.len(), 4);
+        assert_eq!(ops_p2.len(), 3);
+
+        // Each partition: shared HLC + batch_id; every op is a tombstone.
+        let hlc_p1 = &ops_p1[0].client_hlc;
+        for op in &ops_p1 {
+            assert_eq!(op.local_batch_id, "del-1");
+            assert_eq!(&op.client_hlc, hlc_p1);
+            assert!(op.is_delete);
+            assert_eq!(op.field_name, DELETED_FIELD);
+            assert_eq!(op.encoded_value, "true");
+        }
+        let hlc_p2 = &ops_p2[0].client_hlc;
+        for op in &ops_p2 {
+            assert_eq!(op.local_batch_id, "del-2");
+            assert_eq!(&op.client_hlc, hlc_p2);
+        }
+        assert_ne!(hlc_p1, hlc_p2, "distinct partitions get distinct HLC ticks");
+
+        // Every entity appears exactly once; op_ids are unique.
+        let mut entities: Vec<_> =
+            ops_p1.iter().chain(ops_p2.iter()).map(|o| o.entity_id.clone()).collect();
+        entities.sort();
+        assert_eq!(entities, vec!["ent-0", "ent-1", "ent-2", "ent-3", "ent-4", "ent-5", "ent-6"]);
+        let ids: std::collections::HashSet<_> =
+            ops_p1.iter().chain(ops_p2.iter()).map(|o| o.op_id.clone()).collect();
+        assert_eq!(ids.len(), 7, "op_ids must be unique across the emission");
+    }
+
+    #[test]
+    fn emit_delete_multi_rolls_back_entire_emission_on_storage_failure() {
+        let real_storage = make_storage();
+        let failing = FailingStorage::new(real_storage);
+        // Partition 1 has 2 ops, partition 2 has 3; fail on the 3rd insert =>
+        // mid partition 2, after partition 1 was fully inserted.
+        failing.fail_on_pending_op_insert_at(3);
+
+        let mut emitter = make_emitter();
+
+        let p1: Vec<String> = vec!["d0".into(), "d1".into()];
+        let p2: Vec<String> = vec!["d2".into(), "d3".into(), "d4".into()];
+        let partitions = vec![(p1, "droll-1".to_string()), (p2, "droll-2".to_string())];
+
+        let hlc_before = emitter.last_hlc().clone();
+        let err = emitter
+            .emit_delete_multi(&failing, "members", &partitions)
+            .expect_err("emit_delete_multi must propagate the storage error");
+        assert!(
+            err.to_string().contains("FailingStorage induced error"),
+            "unexpected error: {err}"
+        );
+
+        // Nothing persisted for either batch — all partitions roll back together.
+        assert!(failing.inner().load_batch_ops("droll-1").unwrap().is_empty());
+        assert!(failing.inner().load_batch_ops("droll-2").unwrap().is_empty());
+        for ent in ["d0", "d1", "d2", "d3", "d4"] {
+            let fv =
+                failing.inner().get_field_version("sync-1", "members", ent, DELETED_FIELD).unwrap();
+            assert!(fv.is_none(), "field_version for {ent} must roll back");
+        }
+        assert!(failing.inner().get_unpushed_batch_ids("sync-1").unwrap().is_empty());
+        assert_eq!(*emitter.last_hlc(), hlc_before, "HLC watermark must be restored on failure");
+    }
+
     // ── Test-only storage that injects a failure mid-emission ──
 
     /// A `SyncStorage` wrapper that delegates to an inner store, but causes
