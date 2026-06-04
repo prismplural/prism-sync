@@ -627,6 +627,87 @@ fn default_android_attestation_roots() -> Vec<String> {
     ]
 }
 
+/// Config for a throwaway localhost relay: in-memory DB, ephemeral port, OPEN
+/// registration, zero PoW, attestation disabled. Used by the `test_relay`
+/// example (and any local harness) to bring up a real relay without a deploy
+/// environment. NOT for production.
+pub fn localhost_test_config() -> Config {
+    Config {
+        port: 0,
+        db_path: ":memory:".into(),
+        nonce_expiry_secs: 60,
+        session_expiry_secs: 3600,
+        first_device_pow_difficulty_bits: 0,
+        invite_ttl_secs: 86400,
+        sync_inactive_ttl_secs: 7_776_000,
+        stale_device_secs: 2_592_000,
+        cleanup_interval_secs: 3600,
+        max_unpruned_batches: 10_000,
+        metrics_token: None,
+        nonce_rate_limit: 100,
+        nonce_rate_window_secs: 60,
+        revoke_rate_limit: 100,
+        revoke_rate_window_secs: 60,
+        ws_upgrade_rate_limit: 100,
+        ws_upgrade_rate_window_secs: 60,
+        trusted_proxy_cidrs: vec![],
+        signed_request_max_skew_secs: 60,
+        signed_request_nonce_window_secs: 120,
+        snapshot_default_ttl_secs: 86400,
+        revoked_tombstone_retention_secs: 2_592_000,
+        reader_pool_size: 2,
+        node_exporter_url: None,
+        first_device_apple_attestation_enabled: false,
+        first_device_apple_attestation_trust_roots_pem: vec![],
+        first_device_apple_attestation_allowed_app_ids: vec![],
+        first_device_android_attestation_enabled: false,
+        first_device_android_attestation_trust_roots_pem: vec![],
+        grapheneos_verified_boot_key_allowlist: vec![],
+        registration_token: None,
+        registration_enabled: true,
+        pairing_session_ttl_secs: 300,
+        pairing_session_rate_limit: 100,
+        pairing_session_max_payload_bytes: 32768,
+        sharing_init_ttl_secs: 604800,
+        sharing_init_max_payload_bytes: 65536,
+        sharing_identity_max_bytes: 8192,
+        sharing_prekey_max_bytes: 4096,
+        sharing_fetch_rate_limit: 100,
+        sharing_init_rate_limit: 100,
+        sharing_init_max_pending: 50,
+        prekey_upload_max_age_secs: 604800,
+        prekey_serve_max_age_secs: 2_592_000,
+        prekey_max_future_skew_secs: 300,
+        min_signature_version: 3,
+        media_storage_path: std::env::temp_dir()
+            .join(format!("prism_test_media_{}", uuid::Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string(),
+        media_max_file_bytes: 10_485_760,
+        media_quota_bytes_per_group: 1_073_741_824,
+        media_retention_days: 90,
+        media_upload_rate_limit: 100,
+        media_upload_rate_window_secs: 60,
+        media_orphan_cleanup_secs: 86400,
+        default_request_timeout_secs: 30,
+        snapshot_request_timeout_secs: 300,
+        media_request_timeout_secs: 120,
+        snapshot_upload_concurrency: 8,
+        media_upload_concurrency: 32,
+        default_request_concurrency: 512,
+        gif_provider_mode: GifProviderMode::Disabled,
+        gif_public_base_url: None,
+        gif_prism_base_url: None,
+        gif_api_base_url: "https://api.klipy.com".into(),
+        gif_api_key: None,
+        gif_http_timeout_secs: 15,
+        gif_request_rate_limit: 20,
+        gif_request_rate_window_secs: 60,
+        gif_query_max_len: 200,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
