@@ -2,6 +2,26 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.12.0] - 2026-06-04
+
+Tagged for the matching `prism-app 0.12.0+12001` release. Cargo crate versions remain `0.1.1`. The app's sync pin moves from v0.11.0 (`b99d64d`) to v0.12.0 (`00db70a`); the 0.11.x app patches kept the v0.11.0 pin.
+
+### Added
+- `read_field_value` FFI surface. Dart can read a single op field by op id without scanning the full event stream, which is the lookup primitive the app's new cross-device end-to-end sync harness uses to drive assertions against the real sync state. Paired with a spawnable localhost test-relay (`crates/prism-sync-relay/examples/test_relay.rs`) and a 256 KB pairing payload cap on that test-relay that matches the prod cap.
+
+### Changed
+- Push engine caps emissions per cycle and re-arms to drain the backlog. A large push backlog (e.g. coalesced bulk deletes, or a long-disconnected device coming back online) now paces out over multiple cycles instead of bursting in one shot and starving pull. App-side status reporting was updated to stay steady through mid-drain continuations.
+- Bulk deletes coalesce into batched tombstones. The op emitter recognizes a bulk-delete intent and serializes it as a single coalesced batched-tombstone op on the wire instead of N per-row tombstones. Consumed by the app's group/field clear paths.
+- The sync engine pages pull-to-head within a single sync cycle. Large pull deltas (e.g. a paired device coming back to a system after a bulk change or large import) now stream through in one cycle instead of returning early after the first page and waiting on the next cycle, so receive feels steadier rather than long-idle. No FFI symbol change.
+
+### Fixed
+- Relay no longer strands pull cursors when a device deregisters itself mid-cycle. A self-deregister that raced with prune cleanup could leave the device's pull cursor pointing at a pruned position; the relay now resolves the deregister and cursor cleanup together so the next sync cycle for any other device does not trip on the orphan cursor.
+- Sync apply drops superseded quarantined ops rather than churning on un-fixable ones. Quarantined ops that have been superseded by a later op (or that are structurally un-fixable) are now dropped from the quarantine table instead of being re-attempted every apply cycle.
+
+### Internal
+- New tests cover delete-coalesce convergence, op-emitter atomicity, and the pull budget enforcement.
+- Replaced an unnecessary `sort_by` with `sort_by_key` to satisfy `clippy::unnecessary_sort_by`.
+
 ## [0.11.0] - 2026-05-31
 
 Tagged for the matching `prism-app 0.11.0+11001` release. Cargo crate versions remain `0.1.1`.
