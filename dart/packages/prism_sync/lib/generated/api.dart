@@ -239,6 +239,19 @@ Future<void> recordDelete({
   entityId: entityId,
 );
 
+/// Delete many entities of one table in a single call. Their tombstones are
+/// packed into a few batches instead of one push round-trip per row — use this
+/// for bulk deletes (clearing a list, deleting a group's members, etc.).
+Future<void> recordDeleteMulti({
+  required PrismSyncHandle handle,
+  required String table,
+  required List<String> entityIds,
+}) => RustLib.instance.api.crateApiRecordDeleteMulti(
+  handle: handle,
+  table: table,
+  entityIds: entityIds,
+);
+
 /// Seed `field_versions` from pre-existing local data for the first device in
 /// a sync group. No relay traffic; no `pending_ops` produced.
 ///

@@ -1503,8 +1503,10 @@ impl SyncEngine {
             let epoch = current_epoch_i32.max(ops[0].epoch);
 
             // Cache entity_table / entity_id for diagnostic quarantine rows.
-            // Per Phase 1A's atomic emission, a single batch covers exactly
-            // one entity, so the first op is authoritative.
+            // Field-write batches cover one entity. `record_delete_multi` packs
+            // tombstones for MANY entities into one batch, so for those the
+            // first op is only a representative label on the (diagnostic-only)
+            // quarantine row — convergence keys per-op by (table, entity_id).
             let entity_table = ops[0].entity_table.clone();
             let entity_id = ops[0].entity_id.clone();
 

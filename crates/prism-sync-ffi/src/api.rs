@@ -1949,6 +1949,18 @@ pub async fn record_delete(
     inner.record_delete(&table, &entity_id).map_err(|e| e.to_string())
 }
 
+/// Delete many entities of one table in a single call. Their tombstones are
+/// packed into a few batches instead of one push round-trip per row — use this
+/// for bulk deletes (clearing a list, deleting a group's members, etc.).
+pub async fn record_delete_multi(
+    handle: &PrismSyncHandle,
+    table: String,
+    entity_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut inner = handle.inner.lock().await;
+    inner.record_delete_multi(&table, &entity_ids).map_err(|e| e.to_string())
+}
+
 // ── First-device bootstrap ──
 
 /// Seed `field_versions` from pre-existing local data for the first device in

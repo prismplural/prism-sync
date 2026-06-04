@@ -54,6 +54,11 @@ pub(crate) const HYBRID_SIGNATURE_WIRE_BYTES: usize = 4 + 64 + 4 + 3309;
 /// batch (~925 KB body) as a single partition.
 pub(crate) const BATCH_BODY_TARGET_BYTES: usize = 950 * 1024;
 
+/// Maximum delete tombstones packed into one batch by `record_delete_multi`.
+/// The partitioner also enforces a conservative byte bound, so this count is
+/// the cap for normal (short) entity ids; long ids hit the byte bound first.
+const DELETE_BATCH_OP_CAP: usize = 500;
+
 /// How encryption keys are managed.
 pub enum KeyMode {
     /// Keys are fully managed by `PrismSync` (password + secret key).
@@ -1084,22 +1089,64 @@ impl PrismSync {
     /// Creates a tombstone op (`is_deleted = true`). Returns an error if the
     /// sync engine has not been configured.
     pub fn record_delete(&mut self, table: &str, entity_id: &str) -> Result<()> {
+        self.record_delete_multi(table, &[entity_id.to_string()])
+    }
+
+    /// Delete many entities at once, packing their tombstones into a few
+    /// batches instead of one batch (and one push round-trip) per row. All
+    /// entity ids must belong to `table`. Empty input is a no-op.
+    pub fn record_delete_multi(&mut self, table: &str, entity_ids: &[String]) -> Result<()> {
         if self.op_emitter.is_none() {
             return Err(CoreError::Engine("sync not configured".into()));
         }
         self.schema.entity(table).ok_or_else(|| CoreError::UnknownTable(table.to_string()))?;
+        if entity_ids.is_empty() {
+            return Ok(());
+        }
+        let partitions = Self::partition_deletes_into_batches(entity_ids);
         let emitter = self
             .op_emitter
             .as_mut()
             .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-        let batch_id = uuid::Uuid::new_v4().to_string();
-        let result = emitter.emit_delete(&*self.storage, table, entity_id, &batch_id);
+        let result = emitter.emit_delete_multi(&*self.storage, table, &partitions);
         if result.is_ok() {
             if let Some(tx) = self.sync_service.auto_sync_sender() {
                 let _ = tx.try_send(());
             }
         }
         result
+    }
+
+    /// Split delete tombstones into batches bounded by BOTH a count
+    /// ([`DELETE_BATCH_OP_CAP`]) and a conservative byte estimate, each with its
+    /// own `batch_id`. The byte bound keeps the public/FFI `record_delete_multi`
+    /// safe even for pathologically long entity ids (without the per-op
+    /// re-encoding the field-write partitioner needs for multi-MB blobs).
+    fn partition_deletes_into_batches(entity_ids: &[String]) -> Vec<(Vec<String>, String)> {
+        // Conservative per-op envelope cost: ~280 B of fixed JSON (op_id,
+        // batch_id, device id, hlc, keys) plus the entity id, doubled to cover
+        // AEAD tag + base64 expansion of the ciphertext. Over-estimating only
+        // makes batches smaller — never over the relay cap.
+        const OP_ENVELOPE_OVERHEAD: usize = 640;
+
+        let mut partitions: Vec<(Vec<String>, String)> = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+        let mut current_bytes = 0usize;
+        for id in entity_ids {
+            let op_bytes = OP_ENVELOPE_OVERHEAD + 2 * id.len();
+            let would_overflow = current.len() >= DELETE_BATCH_OP_CAP
+                || current_bytes + op_bytes > BATCH_BODY_TARGET_BYTES;
+            if would_overflow && !current.is_empty() {
+                partitions.push((std::mem::take(&mut current), uuid::Uuid::new_v4().to_string()));
+                current_bytes = 0;
+            }
+            current.push(id.clone());
+            current_bytes += op_bytes;
+        }
+        if !current.is_empty() {
+            partitions.push((current, uuid::Uuid::new_v4().to_string()));
+        }
+        partitions
     }
 
     // ── Sync state reset ──
@@ -2900,6 +2947,79 @@ mod tests {
         assert_eq!(ops[0].field_name, DELETED_FIELD);
         assert_eq!(ops[0].encoded_value, "true");
         assert!(ops[0].is_delete);
+    }
+
+    #[test]
+    fn record_delete_multi_packs_many_deletes_into_one_batch() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let ids: Vec<String> = (0..5).map(|i| format!("ent-{i}")).collect();
+        sync.record_delete_multi("members", &ids).unwrap();
+
+        // 5 deletes (< DELETE_BATCH_OP_CAP) coalesce into a single batch.
+        let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert_eq!(batch_ids.len(), 1, "5 deletes should be one batch, not five");
+
+        let ops = sync.storage.load_batch_ops(&batch_ids[0]).unwrap();
+        assert_eq!(ops.len(), 5);
+        for op in &ops {
+            assert!(op.is_delete);
+            assert_eq!(op.field_name, DELETED_FIELD);
+            assert_eq!(op.encoded_value, "true");
+        }
+        let mut entities: Vec<&str> = ops.iter().map(|o| o.entity_id.as_str()).collect();
+        entities.sort_unstable();
+        assert_eq!(entities, vec!["ent-0", "ent-1", "ent-2", "ent-3", "ent-4"]);
+    }
+
+    #[test]
+    fn record_delete_multi_splits_beyond_cap() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // One past the cap spans two batches (cap, then 1) covering every id.
+        let ids: Vec<String> = (0..DELETE_BATCH_OP_CAP + 1).map(|i| format!("ent-{i}")).collect();
+        sync.record_delete_multi("members", &ids).unwrap();
+
+        let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert_eq!(batch_ids.len(), 2, "cap+1 deletes should span two batches");
+
+        let total: usize =
+            batch_ids.iter().map(|b| sync.storage.load_batch_ops(b).unwrap().len()).sum();
+        assert_eq!(total, DELETE_BATCH_OP_CAP + 1);
+    }
+
+    #[test]
+    fn record_delete_multi_splits_on_byte_budget_for_long_ids() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // 5 KB ids blow the byte budget long before the count cap, so batches
+        // stay small and well under DELETE_BATCH_OP_CAP — the public/FFI API
+        // can't produce an over-relay-cap batch even with pathological ids.
+        let long = "x".repeat(5000);
+        let ids: Vec<String> = (0..200).map(|i| format!("{long}-{i}")).collect();
+        sync.record_delete_multi("members", &ids).unwrap();
+
+        let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
+        assert!(batch_ids.len() > 1, "long ids must split into multiple batches");
+
+        let mut total = 0usize;
+        for b in &batch_ids {
+            let n = sync.storage.load_batch_ops(b).unwrap().len();
+            assert!(n < DELETE_BATCH_OP_CAP, "byte bound should cap below the count cap");
+            total += n;
+        }
+        assert_eq!(total, 200, "every id must be tombstoned exactly once");
+    }
+
+    #[test]
+    fn record_delete_multi_empty_is_noop() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        sync.record_delete_multi("members", &[]).unwrap();
+        assert!(sync.storage.get_unpushed_batch_ids("sync-1").unwrap().is_empty());
     }
 
     #[test]

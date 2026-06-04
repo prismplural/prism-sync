@@ -532,6 +532,117 @@ impl OpEmitter {
 
         Ok(())
     }
+
+    /// Emit delete tombstones for many entities at once, packed into the
+    /// supplied batches. Each partition is `(entity_ids, batch_id)`; all ops in
+    /// a partition share one HLC tick and the batch id, so the push phase sends
+    /// them as a single batch with many tombstone ops instead of one batch per
+    /// row. All partitions commit in one transaction — together or not at all.
+    pub fn emit_delete_multi(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        partitions: &[(Vec<String>, String)],
+    ) -> Result<()> {
+        let non_empty: Vec<(&[String], &str)> = partitions
+            .iter()
+            .filter(|(ids, _)| !ids.is_empty())
+            .map(|(ids, batch_id)| (ids.as_slice(), batch_id.as_str()))
+            .collect();
+        if non_empty.is_empty() {
+            return Ok(());
+        }
+
+        // Tick once per partition up front so an HLC overflow is observed
+        // before we touch storage; restore the watermark on any failure.
+        let saved_last_hlc = self.last_hlc.clone();
+        let mut partition_hlcs: Vec<Hlc> = Vec::with_capacity(non_empty.len());
+        for _ in 0..non_empty.len() {
+            match self.tick() {
+                Ok(hlc) => partition_hlcs.push(hlc),
+                Err(e) => {
+                    self.last_hlc = saved_last_hlc;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Offset each partition's `created_at` by its index (microseconds) so
+        // `get_unpushed_batch_ids` (which orders by MIN(created_at)) yields a
+        // deterministic batch order, matching `emit_multi`.
+        let base_now = Utc::now();
+        let mut tx = match storage.begin_tx() {
+            Ok(tx) => tx,
+            Err(e) => {
+                self.last_hlc = saved_last_hlc;
+                return Err(e);
+            }
+        };
+
+        let mut total_delete_count = 0usize;
+        for (partition_index, ((entity_ids, batch_id), hlc)) in
+            non_empty.iter().zip(partition_hlcs.iter()).enumerate()
+        {
+            let hlc_string = hlc.to_string();
+            let partition_now = base_now + chrono::Duration::microseconds(partition_index as i64);
+
+            for entity_id in *entity_ids {
+                let op_id = Uuid::new_v4().to_string();
+
+                if let Err(e) = tx.insert_pending_op(&PendingOp {
+                    op_id: op_id.clone(),
+                    sync_id: self.sync_id.clone(),
+                    epoch: self.epoch,
+                    device_id: self.device_id.clone(),
+                    local_batch_id: (*batch_id).to_string(),
+                    entity_table: entity_table.to_string(),
+                    entity_id: entity_id.clone(),
+                    field_name: DELETED_FIELD.to_string(),
+                    encoded_value: "true".to_string(),
+                    is_delete: true,
+                    client_hlc: hlc_string.clone(),
+                    created_at: partition_now,
+                    pushed_at: None,
+                }) {
+                    let _ = tx.rollback();
+                    self.last_hlc = saved_last_hlc;
+                    return Err(e);
+                }
+
+                if let Err(e) = tx.upsert_field_version(&FieldVersion {
+                    sync_id: self.sync_id.clone(),
+                    entity_table: entity_table.to_string(),
+                    entity_id: entity_id.clone(),
+                    field_name: DELETED_FIELD.to_string(),
+                    winning_op_id: op_id,
+                    winning_device_id: self.device_id.clone(),
+                    winning_hlc: hlc_string.clone(),
+                    winning_encoded_value: Some("true".to_string()),
+                    updated_at: partition_now,
+                }) {
+                    let _ = tx.rollback();
+                    self.last_hlc = saved_last_hlc;
+                    return Err(e);
+                }
+
+                total_delete_count += 1;
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            self.last_hlc = saved_last_hlc;
+            return Err(e);
+        }
+
+        tracing::debug!(
+            table = entity_table,
+            partition_count = non_empty.len(),
+            delete_count = total_delete_count,
+            "Queued multi-batch deletes"
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
