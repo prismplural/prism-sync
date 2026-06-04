@@ -123,7 +123,11 @@ fn debug_assert_remote_op_matches_sender(_op: &CrdtChange, _trusted_sender_devic
 /// quarantine at `1_000_000` bytes — slightly under that — so the push path
 /// surfaces a clean local quarantine instead of round-tripping a 413 for the
 /// pathological cases that slip past Phase 1A's measured partitioner.
-const RELAY_BODY_GUARD_BYTES: usize = 1_000_000;
+///
+/// `pub(crate)` so Phase 1C repair can tell whether a single op is genuinely
+/// un-splittable (its own envelope exceeds this) versus merely needing
+/// repartitioning.
+pub(crate) const RELAY_BODY_GUARD_BYTES: usize = 1_000_000;
 
 /// Wall-clock half of the per-cycle pull budget. One sync cycle drains at most
 /// `config.max_pull_pages_per_cycle * config.pull_page_limit` batches or runs

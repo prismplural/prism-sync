@@ -200,6 +200,14 @@ pub trait SyncStorageTx {
         Ok(())
     }
 
+    /// Delete a single `pending_ops` row by `op_id`. Used by Phase 1C repair to
+    /// drop an op the field has moved past (a newer write for the same field
+    /// won LWW) — pushing it would only re-quarantine. Default: no-op for
+    /// in-memory impls.
+    fn delete_pending_op(&mut self, _op_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     // ── Applied ops ──
     fn insert_applied_op(&mut self, op: &AppliedOp) -> Result<()>;
 

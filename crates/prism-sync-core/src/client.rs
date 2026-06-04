@@ -1428,19 +1428,7 @@ impl PrismSync {
         // `batch_id`. The shape matches what the push path actually
         // serializes (`engine::mod::push_phase` builds CrdtChange instances
         // from the same fields), so the envelope-size estimate is faithful.
-        let make_change = |op: &PendingOp, batch_id: &str| CrdtChange {
-            op_id: op.op_id.clone(),
-            batch_id: Some(batch_id.to_string()),
-            entity_id: op.entity_id.clone(),
-            entity_table: op.entity_table.clone(),
-            field_name: op.field_name.clone(),
-            encoded_value: op.encoded_value.clone(),
-            client_hlc: op.client_hlc.clone(),
-            is_delete: op.is_delete,
-            device_id: op.device_id.clone(),
-            epoch: op.epoch,
-            server_seq: None,
-        };
+        let make_change = Self::pending_op_to_change;
 
         let mut buckets: Vec<Bucket> = Vec::new();
 
@@ -1473,6 +1461,33 @@ impl PrismSync {
             .filter(|b| !b.op_ids.is_empty())
             .map(|b| (b.op_ids, b.batch_id))
             .collect()
+    }
+
+    /// Build a `CrdtChange` from a `PendingOp` tagged with `batch_id`. The shape
+    /// matches what `engine::push_phase` serializes, so envelope-size estimates
+    /// off this are faithful to the wire.
+    fn pending_op_to_change(op: &PendingOp, batch_id: &str) -> CrdtChange {
+        CrdtChange {
+            op_id: op.op_id.clone(),
+            batch_id: Some(batch_id.to_string()),
+            entity_id: op.entity_id.clone(),
+            entity_table: op.entity_table.clone(),
+            field_name: op.field_name.clone(),
+            encoded_value: op.encoded_value.clone(),
+            client_hlc: op.client_hlc.clone(),
+            is_delete: op.is_delete,
+            device_id: op.device_id.clone(),
+            epoch: op.epoch,
+            server_seq: None,
+        }
+    }
+
+    /// Whether a single op's own push envelope exceeds the relay body cap, so it
+    /// can't be made pushable by repartitioning (nothing to split off).
+    fn op_alone_exceeds_wire_cap(op: &PendingOp) -> bool {
+        let change = Self::pending_op_to_change(op, &op.local_batch_id);
+        estimate_envelope_body_size(&[change], HYBRID_SIGNATURE_WIRE_BYTES)
+            > crate::engine::RELAY_BODY_GUARD_BYTES
     }
 
     /// Repartition every push-quarantined batch into one or more smaller
@@ -1532,7 +1547,41 @@ impl PrismSync {
                 continue;
             }
 
-            let partitions = Self::partition_pending_ops_into_batches(&existing_ops);
+            // Drop ops the field has already moved past: if the winning version
+            // is a different op, this one lost LWW and would lose on every peer,
+            // so pushing it only re-quarantines. Keyed off the field version, not
+            // pending ops, so it holds even after the newer op has pushed.
+            let mut live_ops = Vec::with_capacity(existing_ops.len());
+            for op in existing_ops {
+                let fv = tx.get_field_version(
+                    &sync_id,
+                    &op.entity_table,
+                    &op.entity_id,
+                    &op.field_name,
+                )?;
+                let superseded = fv.is_some_and(|fv| fv.winning_op_id != op.op_id);
+                if superseded {
+                    tx.delete_pending_op(&op.op_id)?;
+                } else {
+                    live_ops.push(op);
+                }
+            }
+
+            // Every op was superseded → nothing left to push; clear the row.
+            if live_ops.is_empty() {
+                tx.unquarantine_batch(&sync_id, original_batch_id)?;
+                repaired += 1;
+                continue;
+            }
+
+            // An op whose own envelope still exceeds the cap can't be split
+            // smaller. Leave it quarantined rather than unquarantine it for the
+            // next push to re-quarantine — that loop made "Repair" a no-op.
+            if live_ops.iter().any(Self::op_alone_exceeds_wire_cap) {
+                continue;
+            }
+
+            let partitions = Self::partition_pending_ops_into_batches(&live_ops);
 
             // Defensive: the partitioner must produce at least one bucket if
             // we got here with non-empty ops. Treat anything else as a bug.
@@ -1541,17 +1590,17 @@ impl PrismSync {
                 return Err(CoreError::Engine(format!(
                     "repair_quarantined_batches: partitioner produced no buckets \
                      for batch_id={original_batch_id} with {} ops",
-                    existing_ops.len(),
+                    live_ops.len(),
                 )));
             }
 
             // Decide whether we actually need to rewrite local_batch_id:
             // if the partitioner produces a single bucket that covers every
-            // existing op, the "new" batch_id is just a fresh UUID for the
+            // live op, the "new" batch_id is just a fresh UUID for the
             // same set of ops — rewriting is unnecessary, but we still must
             // clear the quarantine row.
             let single_bucket = partitions.len() == 1;
-            let same_size = single_bucket && partitions[0].0.len() == existing_ops.len();
+            let same_size = single_bucket && partitions[0].0.len() == live_ops.len();
 
             if !same_size {
                 for (op_ids, new_batch_id) in &partitions {
@@ -3863,6 +3912,34 @@ mod tests {
         format!("\"{}\"", "A".repeat(expanded))
     }
 
+    /// A field_version marking `winning_op_id` as the current LWW winner for
+    /// `field`. Mirrors what `emit_update` writes alongside a local op.
+    fn field_version(sync_id: &str, field: &str, winning_op_id: &str) -> crate::storage::FieldVersion {
+        crate::storage::FieldVersion {
+            sync_id: sync_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1c".to_string(),
+            field_name: field.to_string(),
+            winning_op_id: winning_op_id.to_string(),
+            winning_device_id: "dev-c1".to_string(),
+            winning_hlc: format!("{:013}:{:010}:dev-c1", 1_700_000_000_000u64, 42u32),
+            winning_encoded_value: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Every still-unpushed op id, across all (repartitioned) batches.
+    fn unpushed_op_ids(sync: &PrismSync, sync_id: &str) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        for bid in sync.storage().get_unpushed_batch_ids(sync_id).unwrap() {
+            let tx = sync.storage().begin_tx().unwrap();
+            for op in tx.load_batch_ops(&bid).unwrap() {
+                ids.insert(op.op_id);
+            }
+        }
+        ids
+    }
+
     #[test]
     fn repair_quarantined_batches_repartitions_oversized_batch_preserving_op_fields() {
         let mut sync = make_sync();
@@ -3974,6 +4051,9 @@ mod tests {
 
         let sync_id = "sync-1";
         let original_batch_id = "stuck-batch-2";
+        // Each op is individually pushable (its own envelope is under the cap),
+        // so the batch is genuinely repairable — repartitioning yields pushable
+        // sub-batches and the quarantine clears.
         let ops = vec![
             pending_op("op-name-2", sync_id, original_batch_id, "name", "\"Sys2\"".to_string()),
             pending_op(
@@ -3981,7 +4061,7 @@ mod tests {
                 sync_id,
                 original_batch_id,
                 "banner",
-                image_encoded(600 * 1024),
+                image_encoded(400 * 1024),
             ),
         ];
         seed_quarantined_batch(&sync, sync_id, original_batch_id, &ops, 1_200_000);
@@ -3990,6 +4070,182 @@ mod tests {
         // Second call: nothing in push_quarantine, returns 0.
         assert_eq!(sync.repair_quarantined_batches().unwrap(), 0);
         assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn repair_drops_a_superseded_quarantined_op_and_clears_the_banner() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let sync_id = "sync-1";
+        let stuck_batch = "stuck-avatar-batch";
+        // A stuck oversized avatar op (won't fit one envelope on its own).
+        let stuck = vec![pending_op(
+            "op-avatar-old",
+            sync_id,
+            stuck_batch,
+            "avatar_image_data",
+            image_encoded(900 * 1024),
+        )];
+        seed_quarantined_batch(&sync, sync_id, stuck_batch, &stuck, 1_400_000);
+
+        // A later re-emit of the SAME field (e.g. the re-normalized avatar) with
+        // a newer HLC, in its own un-quarantined batch.
+        let mut newer = pending_op(
+            "op-avatar-new",
+            sync_id,
+            "fresh-batch",
+            "avatar_image_data",
+            image_encoded(200 * 1024),
+        );
+        newer.client_hlc = format!("{:013}:{:010}:dev-c1", 1_700_000_009_000u64, 0u32);
+        // The re-emit also moves the field's winning version to the new op —
+        // which is what repair keys off (record_update upserts this locally).
+        let fv = crate::storage::FieldVersion {
+            sync_id: sync_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1c".to_string(),
+            field_name: "avatar_image_data".to_string(),
+            winning_op_id: "op-avatar-new".to_string(),
+            winning_device_id: "dev-c1".to_string(),
+            winning_hlc: newer.client_hlc.clone(),
+            winning_encoded_value: Some(image_encoded(200 * 1024)),
+            updated_at: chrono::Utc::now(),
+        };
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.insert_pending_op(&newer).unwrap();
+            tx.upsert_field_version(&fv).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Repair drops the superseded oversized op and clears the quarantine.
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 1);
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 0);
+
+        // The newer op survives and is unpushed (it will push normally).
+        let unpushed = sync.storage().get_unpushed_batch_ids(sync_id).unwrap();
+        assert!(
+            unpushed.contains(&"fresh-batch".to_string()),
+            "the re-normalized op should remain pushable (was: {unpushed:?})"
+        );
+        // The superseded op is gone.
+        assert!(sync.storage().begin_tx().unwrap().load_batch_ops(stuck_batch).unwrap().is_empty());
+    }
+
+    #[test]
+    fn repair_leaves_a_single_unsplittable_op_quarantined() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let sync_id = "sync-1";
+        let stuck_batch = "stuck-unsplittable";
+        // One op whose own envelope exceeds the cap and nothing supersedes it —
+        // repair can't fix it, so it must stay quarantined (no oscillation) and
+        // not be counted as repaired.
+        let ops = vec![pending_op(
+            "op-huge",
+            sync_id,
+            stuck_batch,
+            "avatar_image_data",
+            image_encoded(900 * 1024),
+        )];
+        seed_quarantined_batch(&sync, sync_id, stuck_batch, &ops, 1_400_000);
+        // This op is still the field's winner (nothing superseded it), so repair
+        // must not drop it — it just can't be made to fit.
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.upsert_field_version(&crate::storage::FieldVersion {
+                sync_id: sync_id.to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "ent-1c".to_string(),
+                field_name: "avatar_image_data".to_string(),
+                winning_op_id: "op-huge".to_string(),
+                winning_device_id: "dev-c1".to_string(),
+                winning_hlc: format!("{:013}:{:010}:dev-c1", 1_700_000_000_000u64, 42u32),
+                winning_encoded_value: Some(image_encoded(900 * 1024)),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 0);
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 1);
+        // Still excluded from the push set, so it doesn't churn.
+        let unpushed = sync.storage().get_unpushed_batch_ids(sync_id).unwrap();
+        assert!(!unpushed.contains(&stuck_batch.to_string()));
+        // And it was NOT deleted — a stuck winner stays in its quarantined
+        // batch (excluded from the push set, but never lost).
+        let still_there =
+            sync.storage().begin_tx().unwrap().load_batch_ops(stuck_batch).unwrap();
+        assert!(still_there.iter().any(|o| o.op_id == "op-huge"));
+    }
+
+    #[test]
+    fn repair_preserves_winner_ops_when_repartitioning_a_splittable_batch() {
+        // The dangerous regression: repair must NEVER drop an op that is still
+        // the field's winner. Two winner ops, each individually pushable but
+        // together over the cap, must both SURVIVE the repartition.
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let sync_id = "sync-1";
+        let stuck_batch = "splittable-winners";
+        let ops = vec![
+            pending_op("op-a", sync_id, stuck_batch, "field_a", image_encoded(400 * 1024)),
+            pending_op("op-b", sync_id, stuck_batch, "field_b", image_encoded(400 * 1024)),
+        ];
+        seed_quarantined_batch(&sync, sync_id, stuck_batch, &ops, 1_300_000);
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.upsert_field_version(&field_version(sync_id, "field_a", "op-a")).unwrap();
+            tx.upsert_field_version(&field_version(sync_id, "field_b", "op-b")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 1);
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 0);
+        // Both winners survive (repartitioned, never deleted) and are pushable.
+        let survivors = unpushed_op_ids(&sync, sync_id);
+        assert!(survivors.contains("op-a"), "op-a must survive repair");
+        assert!(survivors.contains("op-b"), "op-b must survive repair");
+    }
+
+    #[test]
+    fn repair_drops_only_the_superseded_op_in_a_mixed_batch() {
+        // A batch holding one stale (superseded) op and one still-winning op:
+        // only the superseded one is dropped; the winner is preserved and pushed.
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let sync_id = "sync-1";
+        let stuck_batch = "mixed-batch";
+        let ops = vec![
+            pending_op("op-keep", sync_id, stuck_batch, "name", "\"Sys\"".to_string()),
+            pending_op(
+                "op-drop",
+                sync_id,
+                stuck_batch,
+                "avatar_image_data",
+                image_encoded(900 * 1024),
+            ),
+        ];
+        seed_quarantined_batch(&sync, sync_id, stuck_batch, &ops, 1_400_000);
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            // `name` winner is op-keep itself; `avatar` has moved on to a newer op.
+            tx.upsert_field_version(&field_version(sync_id, "name", "op-keep")).unwrap();
+            tx.upsert_field_version(&field_version(sync_id, "avatar_image_data", "op-newer"))
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(sync.repair_quarantined_batches().unwrap(), 1);
+        assert_eq!(sync.storage().quarantined_batch_count(sync_id).unwrap(), 0);
+        let remaining = unpushed_op_ids(&sync, sync_id);
+        assert!(remaining.contains("op-keep"), "the winning op must be preserved");
+        assert!(!remaining.contains("op-drop"), "the superseded op must be dropped");
     }
 
     #[test]

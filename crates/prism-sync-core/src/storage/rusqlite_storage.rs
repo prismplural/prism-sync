@@ -1299,6 +1299,12 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_update_pending_op_batch_id(&self.conn, op_id, new_batch_id)
     }
 
+    fn delete_pending_op(&mut self, op_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_ops WHERE op_id = ?1", params![op_id])?;
+        Ok(())
+    }
+
     // ── Applied ops ──
 
     fn insert_applied_op(&mut self, op: &AppliedOp) -> Result<()> {
