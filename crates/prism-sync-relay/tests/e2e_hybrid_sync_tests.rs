@@ -12,16 +12,20 @@
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use common::*;
 use reqwest::Client;
 
-use prism_sync_core::engine::{SyncConfig, SyncEngine};
+use prism_sync_core::engine::{SeedRecord, SyncConfig, SyncEngine};
 use prism_sync_core::relay::traits::{DeviceRegistry, RegisterRequest};
 use prism_sync_core::relay::ServerRelay;
-use prism_sync_core::schema::{encode_value, SyncFieldDef, SyncSchema, SyncType, SyncValue};
+use prism_sync_core::schema::{
+    encode_value, parse_datetime_utc, SyncFieldDef, SyncSchema, SyncType, SyncValue,
+};
 use prism_sync_core::secure_store::SecureStore;
 use prism_sync_core::storage::{
     DeviceRecord, FieldVersion, PendingOp, RusqliteSyncStorage, SyncStorage,
@@ -459,11 +463,29 @@ struct TypeProbe {
     expected: SyncValue,
 }
 
-fn app_sync_schema_json() -> Option<String> {
-    let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../app");
-    if !app_dir.exists() {
-        return None;
+fn app_dir_with_sync_schema() -> Option<PathBuf> {
+    let schema_path = |dir: &Path| dir.join("lib/core/sync/sync_schema.dart");
+
+    if let Ok(app_dir) = std::env::var("PRISM_APP_DIR") {
+        let app_dir = PathBuf::from(app_dir);
+        assert!(
+            schema_path(&app_dir).exists(),
+            "PRISM_APP_DIR points to an app checkout without lib/core/sync/sync_schema.dart: {}",
+            app_dir.display()
+        );
+        return Some(app_dir);
     }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    [
+        manifest_dir.join("../../../prism-app"),
+        manifest_dir.join("../../../app"),
+    ]
+    .into_iter()
+    .find(|candidate| schema_path(candidate).exists())
+}
+
+fn app_sync_schema_json(app_dir: &Path) -> String {
     let path = app_dir.join("lib/core/sync/sync_schema.dart");
     let source = std::fs::read_to_string(path).expect("failed to read app sync schema");
 
@@ -471,7 +493,152 @@ fn app_sync_schema_json() -> Option<String> {
     let start = source.find(marker).expect("prismSyncSchema const should exist") + marker.len();
     let rest = &source[start..];
     let end = rest.find("''';").expect("prismSyncSchema const should be closed");
-    Some(rest[..end].trim().to_string())
+    rest[..end].trim().to_string()
+}
+
+fn app_full_remote_payload_fixture_json(app_dir: &Path) -> Option<String> {
+    let path = app_dir.join("test/fixtures/sync/full_remote_payloads.json");
+    if !path.exists() {
+        return None;
+    }
+    Some(std::fs::read_to_string(path).expect("failed to read full remote payload fixture"))
+}
+
+fn app_fixture_json_value_to_sync_value(
+    table: &str,
+    field: &str,
+    value: &serde_json::Value,
+    sync_type: SyncType,
+) -> SyncValue {
+    if value.is_null() {
+        return SyncValue::Null;
+    }
+
+    match sync_type {
+        SyncType::String => {
+            if let Some(s) = value.as_str() {
+                SyncValue::String(s.to_string())
+            } else if table == "members" && field == "age" && value.is_number() {
+                // Legacy fixture: old clients sent members.age as Int.
+                SyncValue::String(value.to_string())
+            } else {
+                panic!("fixture field {table}.{field} should be a String, got {value}");
+            }
+        }
+        SyncType::Int => SyncValue::Int(
+            value
+                .as_i64()
+                .unwrap_or_else(|| panic!("fixture field {table}.{field} should be an Int")),
+        ),
+        SyncType::Real => SyncValue::Real(
+            value
+                .as_f64()
+                .filter(|f| f.is_finite())
+                .unwrap_or_else(|| panic!("fixture field {table}.{field} should be a finite Real")),
+        ),
+        SyncType::Bool => SyncValue::Bool(
+            value
+                .as_bool()
+                .unwrap_or_else(|| panic!("fixture field {table}.{field} should be a Bool")),
+        ),
+        SyncType::DateTime => {
+            let s = value.as_str().unwrap_or_else(|| {
+                panic!("fixture field {table}.{field} should be a DateTime string")
+            });
+            SyncValue::DateTime(
+                parse_datetime_utc(s).unwrap_or_else(|e| {
+                    panic!("fixture field {table}.{field} invalid DateTime: {e}")
+                }),
+            )
+        }
+        SyncType::Blob => {
+            let s = value
+                .as_str()
+                .unwrap_or_else(|| panic!("fixture field {table}.{field} should be base64"));
+            SyncValue::Blob(
+                BASE64.decode(s).unwrap_or_else(|e| {
+                    panic!("fixture field {table}.{field} invalid base64: {e}")
+                }),
+            )
+        }
+    }
+}
+
+fn app_full_restore_fixture_records(
+    schema: &SyncSchema,
+    fixture_json: &str,
+) -> (
+    Vec<SeedRecord>,
+    BTreeMap<(String, String), BTreeMap<String, String>>,
+    BTreeMap<String, Vec<SyncFieldDef>>,
+) {
+    let value: serde_json::Value =
+        serde_json::from_str(fixture_json).expect("full remote payload fixture should parse");
+    let order = value["order"]
+        .as_array()
+        .expect("fixture order should be an array")
+        .iter()
+        .map(|v| v.as_str().expect("fixture order entries should be strings").to_string())
+        .collect::<Vec<_>>();
+    let ids = value["ids"].as_object().expect("fixture ids should be an object");
+    let payloads = value["payloads"].as_object().expect("fixture payloads should be an object");
+
+    let fixture_tables = order.iter().cloned().collect::<BTreeSet<_>>();
+    let schema_tables =
+        schema.table_names().into_iter().map(str::to_string).collect::<BTreeSet<_>>();
+    assert_eq!(
+        fixture_tables, schema_tables,
+        "full remote payload fixture must cover every app sync schema entity"
+    );
+
+    let mut records = Vec::with_capacity(order.len());
+    let mut expected = BTreeMap::new();
+    let mut tables = BTreeMap::new();
+
+    for table in order {
+        let entity = schema
+            .entity(&table)
+            .unwrap_or_else(|| panic!("fixture table {table} should exist in schema"));
+        let entity_id = ids
+            .get(&table)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("fixture should provide an id for {table}"))
+            .to_string();
+        let payload = payloads
+            .get(&table)
+            .and_then(|v| v.as_object())
+            .unwrap_or_else(|| panic!("fixture should provide a payload for {table}"));
+
+        let payload_fields = payload.keys().cloned().collect::<BTreeSet<_>>();
+        let schema_fields =
+            entity.fields.iter().map(|field| field.name.clone()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            payload_fields, schema_fields,
+            "full remote payload fixture must cover every synced field for {table}"
+        );
+
+        tables.insert(table.clone(), entity.fields.clone());
+        let mut fields = HashMap::new();
+        let mut expected_fields = BTreeMap::new();
+        for (field_name, json_value) in payload {
+            let field = entity
+                .field_by_name(field_name)
+                .unwrap_or_else(|| panic!("fixture field {table}.{field_name} should exist"));
+            let value = app_fixture_json_value_to_sync_value(
+                &table,
+                field_name,
+                json_value,
+                field.sync_type,
+            );
+            expected_fields.insert(field_name.clone(), encode_value(&value));
+            fields.insert(field_name.clone(), value);
+        }
+
+        expected.insert((table.clone(), entity_id.clone()), expected_fields);
+        records.push(SeedRecord { table, entity_id, fields });
+    }
+
+    (records, expected, tables)
 }
 
 fn type_probe_value(type_name: &str) -> SyncValue {
@@ -926,10 +1093,11 @@ async fn e2e_hybrid_batch_push_pull_cross_device() {
 
 #[tokio::test]
 async fn e2e_app_schema_declared_types_round_trip_through_real_relay() {
-    let Some(schema_json) = app_sync_schema_json() else {
+    let Some(app_dir) = app_dir_with_sync_schema() else {
         eprintln!("skipping app-schema type probe; app sync schema is not present");
         return;
     };
+    let schema_json = app_sync_schema_json(&app_dir);
     let schema = SyncSchema::from_json(&schema_json).expect("app sync schema should parse");
     let probes = app_schema_type_probes(&schema_json);
     assert!(!probes.is_empty(), "app sync schema should declare at least one field type");
@@ -1050,6 +1218,138 @@ async fn e2e_app_schema_declared_types_round_trip_through_real_relay() {
             probe.field
         );
     }
+}
+
+#[tokio::test]
+async fn e2e_app_full_restore_fixture_pairing_snapshot_round_trips_through_real_relay() {
+    let Some(app_dir) = app_dir_with_sync_schema() else {
+        eprintln!("skipping app full-restore snapshot E2E; app sync schema is not present");
+        return;
+    };
+    let Some(fixture_json) = app_full_remote_payload_fixture_json(&app_dir) else {
+        eprintln!(
+            "skipping app full-restore snapshot E2E; full remote payload fixture is not present"
+        );
+        return;
+    };
+    let schema_json = app_sync_schema_json(&app_dir);
+    let schema = SyncSchema::from_json(&schema_json).expect("app sync schema should parse");
+    let (records, expected_changes, tables) =
+        app_full_restore_fixture_records(&schema, &fixture_json);
+
+    let make_entities = || -> CapturingEntitySet {
+        let mut trait_objects = Vec::<Arc<dyn SyncableEntity>>::new();
+        let mut by_table = HashMap::<String, Arc<CapturingEntity>>::new();
+        for (table, fields) in &tables {
+            let entity = Arc::new(CapturingEntity::new(table.clone(), fields.clone()));
+            trait_objects.push(entity.clone() as Arc<dyn SyncableEntity>);
+            by_table.insert(table.clone(), entity);
+        }
+        (trait_objects, by_table)
+    };
+
+    let (url, _server, _db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let device_b_id = generate_device_id();
+    let keys_b = TestDeviceKeys::generate(&device_b_id);
+    let token_b = register_joiner_device(
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
+        vec![
+            registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
+            registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
+        ],
+    )
+    .await;
+
+    let kh = shared_key_hierarchy();
+
+    let storage_a = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage_a, &sync_id, &device_a_id);
+    register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
+    let (entities_a, _) = make_entities();
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a));
+    let engine_a =
+        SyncEngine::new(storage_a, relay_a, entities_a, schema.clone(), SyncConfig::default());
+
+    let report = engine_a
+        .bootstrap_existing_state(&sync_id, records)
+        .await
+        .expect("source device should seed full app fixture");
+    assert_eq!(
+        report.entity_count,
+        expected_changes.len() as u64,
+        "source bootstrap should seed every fixture entity"
+    );
+
+    let ml_dsa_a = keys_a.device_secret.ml_dsa_65_keypair(&device_a_id).unwrap();
+    engine_a
+        .upload_pairing_snapshot(
+            &sync_id,
+            &kh,
+            0,
+            &device_a_id,
+            &keys_a.ed25519_signing_key,
+            &ml_dsa_a,
+            0,
+            Some(300),
+            Some(device_b_id.clone()),
+            None,
+        )
+        .await
+        .expect("source device should upload targeted pairing snapshot");
+
+    let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage_b, &sync_id, &device_b_id);
+    register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
+    let (entities_b, _) = make_entities();
+    let relay_b =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b));
+    let engine_b = SyncEngine::new(storage_b, relay_b, entities_b, schema, SyncConfig::default());
+
+    let (snapshot_count, entity_changes) = engine_b
+        .bootstrap_from_snapshot(&sync_id, &kh)
+        .await
+        .expect("joiner should bootstrap from pairing snapshot");
+    assert_eq!(
+        snapshot_count,
+        expected_changes.len() as u64,
+        "joiner snapshot bootstrap should restore every fixture entity"
+    );
+    assert_eq!(
+        entity_changes.len(),
+        expected_changes.len(),
+        "joiner snapshot bootstrap should emit one EntityChange per fixture entity"
+    );
+
+    let actual_changes = entity_changes
+        .into_iter()
+        .map(|change| {
+            assert!(!change.is_delete, "full fixture contains no tombstone entities");
+            (
+                (change.table, change.entity_id),
+                change.fields.into_iter().collect::<BTreeMap<_, _>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        actual_changes, expected_changes,
+        "pairing snapshot EntityChanges should preserve every encoded fixture field"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -5991,6 +5991,56 @@ mod tests {
     }
 
     #[test]
+    fn remote_changes_event_json_decodes_encoded_fields_to_natural_json() {
+        use prism_sync_core::events::{ChangeSet, EntityChange, SyncEvent};
+        use prism_sync_core::schema::encode_value;
+
+        let mut fields = HashMap::new();
+        fields.insert("null_value".to_string(), encode_value(&SyncValue::Null));
+        fields.insert(
+            "string_value".to_string(),
+            encode_value(&SyncValue::String("hello".to_string())),
+        );
+        fields.insert("int_value".to_string(), encode_value(&SyncValue::Int(42)));
+        fields.insert("real_value".to_string(), encode_value(&SyncValue::Real(7.25)));
+        fields.insert("bool_value".to_string(), encode_value(&SyncValue::Bool(true)));
+        fields.insert(
+            "datetime_value".to_string(),
+            encode_value(&SyncValue::DateTime(
+                parse_datetime_utc("2026-04-29T12:00:00.000Z").unwrap(),
+            )),
+        );
+        fields.insert("blob_value".to_string(), encode_value(&SyncValue::Blob(vec![1, 2, 3])));
+
+        let event = SyncEvent::RemoteChanges(ChangeSet {
+            created: vec![("members".to_string(), "member-1".to_string())],
+            updated: vec![],
+            deleted: vec![],
+            entity_changes: vec![EntityChange {
+                table: "members".to_string(),
+                entity_id: "member-1".to_string(),
+                is_delete: false,
+                fields,
+            }],
+        });
+
+        let json = sync_event_to_json(&event);
+        assert_eq!(json["type"], "RemoteChanges");
+        assert_eq!(json["changes"][0]["table"], "members");
+        assert_eq!(json["changes"][0]["entity_id"], "member-1");
+        assert_eq!(json["changes"][0]["is_delete"], false);
+
+        let fields = &json["changes"][0]["fields"];
+        assert!(fields["null_value"].is_null());
+        assert_eq!(fields["string_value"], "hello");
+        assert_eq!(fields["int_value"], 42);
+        assert_eq!(fields["real_value"], 7.25);
+        assert_eq!(fields["bool_value"], true);
+        assert_eq!(fields["datetime_value"], "2026-04-29T12:00:00.000Z");
+        assert_eq!(fields["blob_value"], "AQID");
+    }
+
+    #[test]
     fn quarantined_batch_event_json_serializes_all_fields() {
         let event = prism_sync_core::events::SyncEvent::QuarantinedBatch {
             batch_id: "batch-abc".to_string(),
