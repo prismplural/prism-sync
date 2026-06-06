@@ -817,18 +817,32 @@ fn snapshot_field_import_decision(
     fv: &FieldVersionEntry,
 ) -> Result<SnapshotFieldImportDecision> {
     let snapshot_hlc = Hlc::from_string(&fv.winning_hlc)?;
-    let existing_hlc: Option<String> = conn
+    let existing: Option<(String, Option<String>)> = conn
         .query_row(
-            "SELECT winning_hlc FROM field_versions \
+            "SELECT winning_hlc, winning_encoded_value FROM field_versions \
              WHERE sync_id = ?1 AND entity_table = ?2 AND entity_id = ?3 AND field_name = ?4",
             params![sync_id, fv.entity_table, fv.entity_id, fv.field_name],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
 
-    let Some(existing_hlc) = existing_hlc else {
+    let Some((existing_hlc, existing_value)) = existing else {
         return Ok(SnapshotFieldImportDecision::InsertOrUpdate);
     };
+
+    // `is_deleted` is absorbing on the snapshot channel too (mirrors
+    // engine::merge): a snapshot's `false` must never replace a local `true` (any
+    // HLC), and a `true` always wins over a local `false`, else a stale un-delete
+    // could resurrect a tombstone via bootstrap. NULL local value = tombstone.
+    if fv.field_name == "is_deleted" {
+        let incoming_true = fv.winning_encoded_value.as_deref() == Some("true");
+        let existing_true = existing_value.as_deref() != Some("false");
+        match (incoming_true, existing_true) {
+            (true, false) => return Ok(SnapshotFieldImportDecision::InsertOrUpdate),
+            (false, true) => return Ok(SnapshotFieldImportDecision::SkipStale),
+            _ => {}
+        }
+    }
 
     let existing_hlc = Hlc::from_string(&existing_hlc)?;
     if snapshot_hlc > existing_hlc {
@@ -2219,6 +2233,84 @@ mod tests {
         let meta = dst.get_sync_metadata("sync-1").unwrap().unwrap();
         assert_eq!(meta.current_epoch, 1);
         assert_eq!(meta.last_pulled_server_seq, 42);
+    }
+
+    #[test]
+    fn import_snapshot_is_deleted_is_absorbing() {
+        // The snapshot channel must honor the same absorbing tombstone rule as
+        // engine::merge: a snapshot's is_deleted=false must NOT overwrite a local
+        // tombstone (any HLC), and a snapshot's is_deleted=true must win over a
+        // local live value even at a lower HLC. Guards the snapshot-resurrection
+        // vector found in review.
+        let is_deleted_fv = |entity_id: &str, value: &str, hlc: &str, dev: &str| FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: entity_id.to_string(),
+            field_name: "is_deleted".to_string(),
+            winning_op_id: format!("op-{value}-{hlc}"),
+            winning_device_id: dev.to_string(),
+            winning_hlc: hlc.to_string(),
+            winning_encoded_value: Some(value.to_string()),
+            updated_at: Utc::now(),
+        };
+
+        // Case 1: snapshot false@high must NOT beat a local tombstone true@low.
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&is_deleted_fv("e1", "false", "9000:0:src", "src")).unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&is_deleted_fv("e1", "true", "1000:0:dst", "dst")).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.import_snapshot("sync-1", &blob).unwrap();
+            tx.commit().unwrap();
+        }
+        let fv = dst.get_field_version("sync-1", "members", "e1", "is_deleted").unwrap().unwrap();
+        assert_eq!(
+            fv.winning_encoded_value,
+            Some("true".to_string()),
+            "tombstone must survive a snapshot's higher-HLC is_deleted=false"
+        );
+
+        // Case 2: snapshot true@low must beat a local live is_deleted=false@high.
+        let src2 = make_storage();
+        {
+            let mut tx = src2.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&is_deleted_fv("e2", "true", "1000:0:src", "src")).unwrap();
+            tx.commit().unwrap();
+        }
+        let blob2 = src2.export_snapshot("sync-1").unwrap();
+
+        let dst2 = make_storage();
+        {
+            let mut tx = dst2.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&is_deleted_fv("e2", "false", "9000:0:dst", "dst")).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let mut tx = dst2.begin_tx().unwrap();
+            tx.import_snapshot("sync-1", &blob2).unwrap();
+            tx.commit().unwrap();
+        }
+        let fv2 = dst2.get_field_version("sync-1", "members", "e2", "is_deleted").unwrap().unwrap();
+        assert_eq!(
+            fv2.winning_encoded_value,
+            Some("true".to_string()),
+            "a snapshot tombstone must win over a local higher-HLC is_deleted=false"
+        );
     }
 
     #[test]

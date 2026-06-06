@@ -1197,6 +1197,173 @@ fn test_undeleted_entity_allows_field_updates() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 17b. Tombstoned entity rejects a phantom un-delete (is_deleted = false)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A delete is terminal: once an entity has a winning is_deleted="true"
+/// tombstone, an incoming is_deleted="false" (a re-create's phantom un-delete,
+/// even with a fresher HLC) must NOT win — otherwise the deleted entity
+/// resurrects on every peer. Receiver-side guard complementing the sender-side
+/// strip in `client::record_create`. Repro: prism-app
+/// test/e2e/board_post_delete_resurrection_test.dart.
+#[test]
+fn test_tombstoned_entity_rejects_phantom_undelete() {
+    let schema = test_schema();
+    let merge = MergeEngine::new(schema);
+
+    let hlc_delete = Hlc::new(5000, 0, "dev-deleter");
+    let get_fv = |_sync_id: &str,
+                  _table: &str,
+                  _eid: &str,
+                  field: &str|
+     -> prism_sync_core::Result<Option<FieldVersion>> {
+        if field == "is_deleted" {
+            Ok(Some(FieldVersion {
+                sync_id: SYNC_ID.to_string(),
+                entity_table: "tasks".to_string(),
+                entity_id: "t-dead".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "delete-op".to_string(),
+                winning_device_id: "dev-deleter".to_string(),
+                winning_hlc: hlc_delete.to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: chrono::Utc::now(),
+            }))
+        } else {
+            Ok(None)
+        }
+    };
+
+    // A re-create emits a FRESHER is_deleted=false. It must be rejected.
+    let hlc_recreate = Hlc::new(6000, 0, "dev-importer");
+    let undelete = make_op("t-dead", "is_deleted", "false", &hlc_recreate, "dev-importer", None);
+    let winners = merge.determine_winners(&[undelete], &get_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert!(
+        winners.is_empty(),
+        "a fresher is_deleted=false must NOT resurrect a tombstoned entity (got {} winners)",
+        winners.len()
+    );
+
+    // A non-is_deleted field update is rejected too (classic edit-after-delete).
+    let edit = make_op("t-dead", "title", "\"Back?\"", &hlc_recreate, "dev-importer", None);
+    let winners = merge.determine_winners(&[edit], &get_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert!(winners.is_empty(), "edit-after-delete must not resurrect a tombstoned entity");
+
+    // A fresher re-delete (is_deleted=true) is still allowed through (idempotent).
+    let redelete = make_op("t-dead", "is_deleted", "true", &hlc_recreate, "dev-importer", None);
+    let winners = merge.determine_winners(&[redelete], &get_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert_eq!(winners.len(), 1, "a fresher re-delete should still be accepted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 17c. Tombstone is absorbing & order-independent (within a single batch)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// is_deleted merges as `true ∨ false = true`. Even when BOTH a delete and a
+/// fresher un-delete land in ONE determine_winners call (one batch / one pull,
+/// e.g. a buggy or foreign peer that packs both, or a future batch-coalescing
+/// apply path), the delete must win regardless of HLC or in-batch order.
+#[test]
+fn test_tombstone_absorbs_undelete_in_same_batch() {
+    let merge = MergeEngine::new(test_schema());
+    let no_fv = |_: &str, _: &str, _: &str, _: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+        Ok(None)
+    };
+
+    // delete first, then a FRESHER (higher-HLC) un-delete in the same batch.
+    let del = make_op("t-x", "is_deleted", "true", &Hlc::new(200, 0, "d"), "d", None);
+    let undel = make_op("t-x", "is_deleted", "false", &Hlc::new(300, 0, "d"), "d", None);
+    let winners = merge
+        .determine_winners(&[del.clone(), undel], &no_fv, &no_ops_applied, SYNC_ID)
+        .unwrap();
+    assert_eq!(winners.len(), 1, "exactly one is_deleted winner");
+    let w = winners.values().next().unwrap();
+    assert_eq!(w.op.encoded_value, "true", "delete absorbs a fresher in-batch un-delete");
+    assert_eq!(w.op.op_id, del.op_id);
+}
+
+/// Same as above but the un-delete is processed FIRST and has the higher HLC —
+/// proves order-independence (a plain in-batch LWW would let the false win here).
+#[test]
+fn test_tombstone_absorbs_reordered_undelete_in_same_batch() {
+    let merge = MergeEngine::new(test_schema());
+    let no_fv = |_: &str, _: &str, _: &str, _: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+        Ok(None)
+    };
+
+    let undel = make_op("t-y", "is_deleted", "false", &Hlc::new(300, 0, "d"), "d", None); // higher HLC, first
+    let del = make_op("t-y", "is_deleted", "true", &Hlc::new(200, 0, "d"), "d", None); // lower HLC, second
+    let winners = merge
+        .determine_winners(&[undel, del.clone()], &no_fv, &no_ops_applied, SYNC_ID)
+        .unwrap();
+    assert_eq!(winners.len(), 1);
+    let w = winners.values().next().unwrap();
+    assert_eq!(
+        w.op.encoded_value, "true",
+        "delete absorbs a higher-HLC, earlier-in-batch un-delete (order-independent)"
+    );
+    assert_eq!(w.op.op_id, del.op_id);
+}
+
+/// A non-`true` is_deleted value (malformed / foreign) must NOT count as an
+/// un-delete against a persisted tombstone, even with a far-future HLC.
+#[test]
+fn test_malformed_is_deleted_cannot_resurrect_tombstone() {
+    let merge = MergeEngine::new(test_schema());
+    let tomb_fv = |_: &str, _: &str, _: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+        if field == "is_deleted" {
+            Ok(Some(FieldVersion {
+                sync_id: SYNC_ID.to_string(),
+                entity_table: "tasks".to_string(),
+                entity_id: "t-z".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "del-op".to_string(),
+                winning_device_id: "d".to_string(),
+                winning_hlc: Hlc::new(100, 0, "d").to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: chrono::Utc::now(),
+            }))
+        } else {
+            Ok(None)
+        }
+    };
+
+    let garbage = make_op("t-z", "is_deleted", "1", &Hlc::new(9000, 0, "d"), "d", None);
+    let winners = merge.determine_winners(&[garbage], &tomb_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert!(winners.is_empty(), "a non-true is_deleted value cannot override a tombstone");
+}
+
+/// Absorbing via the PERSISTED path: a delete with a LOWER HLC than a persisted
+/// is_deleted="false" (a stale un-delete) must still win. Plain HLC-LWW would let
+/// the higher-HLC false survive; absorbing makes the delete terminal.
+#[test]
+fn test_lower_hlc_delete_absorbs_persisted_undelete() {
+    let merge = MergeEngine::new(test_schema());
+    let live_fv = |_: &str, _: &str, _: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+        if field == "is_deleted" {
+            Ok(Some(FieldVersion {
+                sync_id: SYNC_ID.to_string(),
+                entity_table: "tasks".to_string(),
+                entity_id: "t-l".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "undel".to_string(),
+                winning_device_id: "d".to_string(),
+                winning_hlc: Hlc::new(9000, 0, "d").to_string(),
+                winning_encoded_value: Some("false".to_string()),
+                updated_at: chrono::Utc::now(),
+            }))
+        } else {
+            Ok(None)
+        }
+    };
+
+    let del = make_op("t-l", "is_deleted", "true", &Hlc::new(200, 0, "d"), "d", None);
+    let winners = merge.determine_winners(&[del.clone()], &live_fv, &no_ops_applied, SYNC_ID).unwrap();
+    assert_eq!(winners.len(), 1, "a lower-HLC delete absorbs a persisted higher-HLC un-delete");
+    assert_eq!(winners.values().next().unwrap().op.encoded_value, "true");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // fronting_sessions end_time convergence (null ↔ timestamp LWW)
 //
 // Regression coverage for the cross-device fronting bug where a session was

@@ -25,7 +25,7 @@ use crate::epoch::EpochManager;
 use crate::error::{CoreError, Result};
 use crate::events::{event_channel, EntityChange, SyncEvent};
 use crate::hlc::Hlc;
-use crate::op_emitter::OpEmitter;
+use crate::op_emitter::{OpEmitter, DELETED_FIELD};
 use crate::pairing::{
     compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
     SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
@@ -1015,6 +1015,10 @@ impl PrismSync {
         if self.op_emitter.is_none() {
             return Err(CoreError::Engine("sync not configured".into()));
         }
+        // Strip a phantom `is_deleted = false` (would resurrect a re-created
+        // deleted id; see [`without_phantom_undelete`]).
+        let stripped = Self::without_phantom_undelete(fields);
+        let fields = stripped.as_ref().unwrap_or(fields);
         self.validate_mutation_fields(table, fields)?;
         let (device_id, epoch) = {
             let emitter = self
@@ -1053,6 +1057,10 @@ impl PrismSync {
         if self.op_emitter.is_none() {
             return Err(CoreError::Engine("sync not configured".into()));
         }
+        // Strip before the empty check so an update of only `is_deleted = false`
+        // is a no-op (see [`without_phantom_undelete`]).
+        let stripped = Self::without_phantom_undelete(changed_fields);
+        let changed_fields = stripped.as_ref().unwrap_or(changed_fields);
         if changed_fields.is_empty() {
             return Ok(());
         }
@@ -1082,6 +1090,30 @@ impl PrismSync {
             }
         }
         result
+    }
+
+    /// Drop a phantom `is_deleted = false` from a mutation's fields.
+    ///
+    /// `is_deleted` is write-once-true: a create/update carrying `false` stamps a
+    /// fresh-HLC live-marker that, on a re-create of a deleted id, beats the older
+    /// tombstone under per-field LWW and resurrects the entity.
+    /// [`MergeEngine`](crate::engine::merge) enforces the same on receive. Returns
+    /// `Some` only when a strip was needed (otherwise allocation-free).
+    fn without_phantom_undelete(
+        fields: &HashMap<String, SyncValue>,
+    ) -> Option<HashMap<String, SyncValue>> {
+        if !matches!(fields.get(DELETED_FIELD), Some(SyncValue::Bool(false))) {
+            return None;
+        }
+        Some(
+            fields
+                .iter()
+                .filter(|(k, v)| {
+                    !(k.as_str() == DELETED_FIELD && matches!(v, SyncValue::Bool(false)))
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
     }
 
     /// Record a soft-delete for an entity.
@@ -2614,6 +2646,10 @@ mod tests {
                     .field("age", SyncType::Int)
                     .field("active", SyncType::Bool)
                     .field("score", SyncType::Real)
+                    // Registered so the phantom-undelete strip tests exercise the
+                    // real path (is_deleted is a valid Bool field in prod schema),
+                    // not an incidental UnknownField rejection.
+                    .field("is_deleted", SyncType::Bool)
             })
             .build();
         let storage = RusqliteSyncStorage::in_memory().expect("in-memory storage");
@@ -2950,6 +2986,67 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].field_name, "score");
         assert_eq!(ops[0].encoded_value, "8");
+    }
+
+    #[test]
+    fn record_create_strips_phantom_is_deleted_false() {
+        // Regression: a create carrying is_deleted=false must NOT emit an
+        // is_deleted op. On a re-create of a deleted id that fresh-HLC `false`
+        // beats the older tombstone under per-field LWW and resurrects the
+        // entity on every peer. See prism-app
+        // test/e2e/board_post_delete_resurrection_test.dart.
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        fields.insert(DELETED_FIELD.to_string(), SyncValue::Bool(false));
+
+        sync.record_create("members", "ent-1", &fields).unwrap();
+
+        // Only the real field was emitted; the phantom is_deleted=false is gone.
+        let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
+        let ops = sync.storage.load_batch_ops(&batch_ids[0]).unwrap();
+        assert_eq!(ops.len(), 1, "only the name op should be emitted, not is_deleted");
+        assert_eq!(ops[0].field_name, "name");
+        assert!(
+            sync.storage
+                .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
+                .unwrap()
+                .is_none(),
+            "create must not write an is_deleted=false field version"
+        );
+    }
+
+    #[test]
+    fn record_update_strips_phantom_is_deleted_false() {
+        // A field update carrying is_deleted=false must also drop it; an update
+        // of ONLY is_deleted=false becomes a no-op rather than a phantom
+        // un-delete that would resurrect a tombstoned entity.
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut create = HashMap::new();
+        create.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        sync.record_create("members", "ent-1", &create).unwrap();
+        let batches_after_create = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+
+        let mut changed = HashMap::new();
+        changed.insert(DELETED_FIELD.to_string(), SyncValue::Bool(false));
+        sync.record_update("members", "ent-1", &changed).unwrap();
+
+        assert_eq!(
+            sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len(),
+            batches_after_create,
+            "an update of only is_deleted=false must emit nothing"
+        );
+        assert!(
+            sync.storage
+                .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
+                .unwrap()
+                .is_none(),
+            "a phantom un-delete must not write an is_deleted field version"
+        );
     }
 
     #[test]

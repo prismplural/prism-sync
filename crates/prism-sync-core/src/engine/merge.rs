@@ -49,9 +49,10 @@ pub struct MergeOutcome {
 ///
 /// For a group of ops targeting the same entity:
 ///
-/// 1. **Tombstone protection:** If the entity already has a winning
-///    `is_deleted = true` tombstone in field_versions, reject ALL
-///    non-delete ops to prevent resurrection.
+/// 1. **Tombstone is absorbing:** `is_deleted` merges as `true ∨ false = true`
+///    (not HLC-LWW) — `true` always wins, `false` never overrides it — and any
+///    other op on a tombstoned entity is dropped. Blocks edit-after-delete and
+///    phantom-un-delete resurrection, order-independently.
 ///
 /// 2. **Per-field LWW merge:** For each op in the group:
 ///    a. Check in-batch winners first (handles multiple ops on
@@ -69,6 +70,30 @@ pub struct MergeOutcome {
 #[derive(Debug, Clone)]
 pub struct MergeEngine {
     schema: SyncSchema,
+}
+
+/// Reconstruct a minimal [`CrdtChange`] from a persisted [`FieldVersion`] for
+/// LWW comparison. Carries the winning value (a `None` becomes `"null"`) for the
+/// absorbing `is_deleted` check; [`CrdtChange::wins_over`] ignores it.
+fn field_version_to_change(
+    fv: FieldVersion,
+    entity_table: &str,
+    entity_id: &str,
+    field_name: &str,
+) -> CrdtChange {
+    CrdtChange::new(
+        Some(fv.winning_op_id),
+        None,
+        entity_id.to_string(),
+        entity_table.to_string(),
+        field_name.to_string(),
+        fv.winning_encoded_value,
+        Some(fv.winning_hlc),
+        false,
+        Some(fv.winning_device_id),
+        None,
+        None,
+    )
 }
 
 impl MergeEngine {
@@ -160,62 +185,69 @@ impl MergeEngine {
                 continue;
             }
 
-            // Tombstone protection: check if entity is already tombstoned.
-            // If so, only allow is_deleted ops (prevents resurrection).
-            //
-            // We also check that the winning encoded_value is "true" to handle
-            // un-delete operations (is_deleted = "false"). If the winning value
-            // is "false", the entity has been un-deleted and non-delete ops should
-            // be allowed through.
-            //
-            // NOTE: We currently only emit `is_deleted = "true"` in the op emitter,
-            // so the value will always be "true" in practice. The check is included
-            // for safety and correctness if un-delete ops are added in the future.
-            let delete_fv =
-                get_field_version(sync_id, &op.entity_table, &op.entity_id, "is_deleted")?;
-            let is_tombstoned = delete_fv
-                .as_ref()
-                .map(|fv| {
-                    // Only treat as tombstoned if the winning value is "true".
-                    // An is_deleted = "false" field version means the entity was un-deleted.
-                    fv.winning_encoded_value.as_deref().unwrap_or("true") == "true"
-                })
-                .unwrap_or(false);
-            if is_tombstoned && op.field_name != "is_deleted" {
+            // `is_deleted` is ABSORBING, not HLC-LWW: an incoming `true` always
+            // beats `false` and `false` never overrides `true`, so a delete is
+            // terminal regardless of HLC, batch grouping, or arrival order
+            // (`true ∨ false = true` is a convergent join). The sender strips
+            // `is_deleted = false` so honest peers never emit it; this is the
+            // receiver backstop. Effective state = the in-batch winner if any,
+            // else the persisted version.
+            let is_deleted_key = format!("{}:{}:is_deleted", op.entity_table, op.entity_id);
+            let current_deleted: Option<CrdtChange> =
+                if let Some(bw) = batch_winners.get(&is_deleted_key) {
+                    Some(bw.clone())
+                } else {
+                    get_field_version(sync_id, &op.entity_table, &op.entity_id, "is_deleted")?
+                        .map(|fv| {
+                            field_version_to_change(fv, &op.entity_table, &op.entity_id, "is_deleted")
+                        })
+                };
+            // NULL/absent counts as a tombstone (defensive default); only an
+            // explicit "false" is live.
+            let is_tombstoned =
+                current_deleted.as_ref().map(|c| c.encoded_value != "false").unwrap_or(false);
+
+            // A delete subsumes every other field: drop non-`is_deleted` ops on a
+            // tombstoned entity.
+            if op.field_name != "is_deleted" && is_tombstoned {
                 continue;
             }
 
-            // Per-field LWW merge
             let field_key = format!("{}:{}:{}", op.entity_table, op.entity_id, op.field_name);
 
-            // Check in-batch winner first, then fall back to persisted field_versions
-            let current_winner: Option<CrdtChange> = if let Some(bw) = batch_winners.get(&field_key)
-            {
-                Some(bw.clone())
+            let op_wins = if op.field_name == "is_deleted" {
+                match &current_deleted {
+                    None => true,
+                    Some(cur) => {
+                        let incoming_true = op.encoded_value == "true";
+                        let current_true = cur.encoded_value != "false";
+                        match (incoming_true, current_true) {
+                            (true, false) => true,  // true absorbs false, any HLC
+                            (false, true) => false, // false never beats a tombstone
+                            _ => op.wins_over(cur)?, // same value: HLC tiebreak
+                        }
+                    }
+                }
             } else {
-                // Fall back to persisted field_versions
-                let fv =
-                    get_field_version(sync_id, &op.entity_table, &op.entity_id, &op.field_name)?;
-                fv.map(|fv| {
-                    CrdtChange::new(
-                        Some(fv.winning_op_id),
-                        None,
-                        op.entity_id.clone(),
-                        op.entity_table.clone(),
-                        op.field_name.clone(),
-                        None,
-                        Some(fv.winning_hlc),
-                        false,
-                        Some(fv.winning_device_id),
-                        None,
-                        None,
-                    )
-                })
-            };
-
-            let op_wins = match &current_winner {
-                Some(cw) => op.wins_over(cw)?,
-                None => true, // no current winner, this op wins by default
+                // Plain per-field LWW: in-batch winner first, then persisted.
+                let current_winner: Option<CrdtChange> =
+                    if let Some(bw) = batch_winners.get(&field_key) {
+                        Some(bw.clone())
+                    } else {
+                        get_field_version(sync_id, &op.entity_table, &op.entity_id, &op.field_name)?
+                            .map(|fv| {
+                                field_version_to_change(
+                                    fv,
+                                    &op.entity_table,
+                                    &op.entity_id,
+                                    &op.field_name,
+                                )
+                            })
+                    };
+                match &current_winner {
+                    Some(cw) => op.wins_over(cw)?,
+                    None => true, // no current winner, this op wins by default
+                }
             };
 
             if !op_wins {

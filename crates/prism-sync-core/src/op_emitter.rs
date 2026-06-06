@@ -447,6 +447,13 @@ impl OpEmitter {
         let mut tx = storage.begin_tx()?;
 
         for (field_name, value) in fields {
+            // Never seed a phantom `is_deleted = false`: write-once-true, or it
+            // could ride this device's bootstrap snapshot and beat a peer's
+            // tombstone. Absence already reads as live.
+            if field_name == DELETED_FIELD && matches!(value, SyncValue::Bool(false)) {
+                continue;
+            }
+
             let op_id = Uuid::new_v4().to_string();
             let encoded = encode_value(value);
 
