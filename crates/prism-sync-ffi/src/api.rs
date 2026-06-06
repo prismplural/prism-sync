@@ -4906,9 +4906,12 @@ pub async fn complete_initiator_ceremony(
     Ok("ok".to_string())
 }
 
-/// Poll a pairing relay slot with exponential backoff.
+/// Poll a pairing relay slot with exponential backoff (~60s budget).
 ///
-/// Retries up to ~60s with increasing delays before giving up.
+/// Transient relay errors (timeout/network/5xx) are re-polled rather than
+/// aborting — pairing is human-paced and must survive a blip. Bails on a fatal
+/// error or too many consecutive transient failures. Mirrors
+/// `PairingService::wait_for_pairing_slot_bytes` (covered by its tests).
 async fn poll_pairing_slot(
     relay: &ServerPairingRelay,
     rendezvous_id: &str,
@@ -4918,10 +4921,22 @@ async fn poll_pairing_slot(
     use std::time::Duration;
 
     let delays = [1, 1, 2, 2, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]; // ~60s total
+    const MAX_CONSECUTIVE_TRANSIENT: u32 = 5;
+    let mut consecutive_transient = 0u32;
     for delay in &delays {
         match relay.get_slot(rendezvous_id, slot).await {
             Ok(Some(data)) => return Ok(data),
             Ok(None) => {
+                consecutive_transient = 0;
+                tokio::time::sleep(Duration::from_secs(*delay)).await;
+            }
+            Err(e) if e.is_retryable() => {
+                consecutive_transient += 1;
+                if consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT {
+                    return Err(format!(
+                        "relay error polling {slot:?} after {consecutive_transient} consecutive retries: {e}"
+                    ));
+                }
                 tokio::time::sleep(Duration::from_secs(*delay)).await;
             }
             Err(e) => return Err(format!("relay error polling {slot:?}: {e}")),

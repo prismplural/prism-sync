@@ -1395,14 +1395,26 @@ async fn wait_for_pairing_slot_bytes(
     description: &str,
 ) -> Result<Vec<u8>> {
     const MAX_ATTEMPTS: usize = 200;
+    // Pairing is human-paced, so a transient relay error (timeout/network/5xx) is
+    // recoverable — re-poll it like an empty slot. Abort only on a fatal error or
+    // too many consecutive transient failures (relay unreachable).
+    const MAX_CONSECUTIVE_TRANSIENT: u32 = 5;
+    let mut consecutive_transient = 0u32;
     for _ in 0..MAX_ATTEMPTS {
-        match relay
-            .get_slot(rendezvous_id, slot)
-            .await
-            .map_err(|e| CoreError::from_relay_with_context(Some(description), e))?
-        {
-            Some(bytes) => return Ok(bytes),
-            None => sleep(Duration::from_millis(25)).await,
+        match relay.get_slot(rendezvous_id, slot).await {
+            Ok(Some(bytes)) => return Ok(bytes),
+            Ok(None) => {
+                consecutive_transient = 0;
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) if e.is_retryable() => {
+                consecutive_transient += 1;
+                if consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT {
+                    return Err(CoreError::from_relay_with_context(Some(description), e));
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(CoreError::from_relay_with_context(Some(description), e)),
         }
     }
 
@@ -1443,6 +1455,107 @@ mod tests {
             self.0.lock().unwrap().clear();
             Ok(())
         }
+    }
+
+    // ── Flaky pairing relay (transient-error injection) ──
+    //
+    // Serves a configurable number of transient (retryable) relay errors before
+    // returning the slot, or a fatal (non-retryable) error. Used to prove the
+    // pairing poll loop rides out transient relay failures instead of aborting
+    // the whole ceremony on the first blip — the "one network timeout kills
+    // pairing" regression.
+    struct FlakyPairingRelay {
+        transient_failures_remaining: Mutex<u32>,
+        slot_payload: Option<Vec<u8>>,
+        fatal: bool,
+    }
+
+    impl FlakyPairingRelay {
+        fn transient_then_ok(failures: u32, payload: Vec<u8>) -> Self {
+            Self {
+                transient_failures_remaining: Mutex::new(failures),
+                slot_payload: Some(payload),
+                fatal: false,
+            }
+        }
+
+        fn always_fatal() -> Self {
+            Self {
+                transient_failures_remaining: Mutex::new(0),
+                slot_payload: None,
+                fatal: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PairingRelay for FlakyPairingRelay {
+        async fn create_session(
+            &self,
+            _joiner_bootstrap: &[u8],
+        ) -> std::result::Result<[u8; 16], RelayError> {
+            unimplemented!("not exercised by wait_for_pairing_slot_bytes tests")
+        }
+        async fn get_bootstrap(
+            &self,
+            _rendezvous_id: &str,
+        ) -> std::result::Result<Vec<u8>, RelayError> {
+            unimplemented!("not exercised by wait_for_pairing_slot_bytes tests")
+        }
+        async fn put_slot(
+            &self,
+            _rendezvous_id: &str,
+            _slot: PairingSlot,
+            _data: &[u8],
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!("not exercised by wait_for_pairing_slot_bytes tests")
+        }
+        async fn get_slot(
+            &self,
+            _rendezvous_id: &str,
+            _slot: PairingSlot,
+        ) -> std::result::Result<Option<Vec<u8>>, RelayError> {
+            if self.fatal {
+                return Err(RelayError::NotFound);
+            }
+            let mut remaining = self.transient_failures_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(RelayError::Timeout {
+                    message: "synthetic transient timeout".to_string(),
+                });
+            }
+            Ok(self.slot_payload.clone())
+        }
+        async fn delete_session(
+            &self,
+            _rendezvous_id: &str,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!("not exercised by wait_for_pairing_slot_bytes tests")
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_pairing_slot_bytes_rides_out_transient_relay_errors() {
+        // Three transient relay timeouts in a row, then the slot lands. The old
+        // loop aborted on the first error (`map_err(..)?`); the fixed loop must
+        // re-poll and ultimately return the payload.
+        let relay = FlakyPairingRelay::transient_then_ok(3, b"pairing-init-bytes".to_vec());
+        let result =
+            wait_for_pairing_slot_bytes(&relay, "rendezvous-hex", PairingSlot::Init, "PairingInit")
+                .await;
+        assert_eq!(result.unwrap(), b"pairing-init-bytes".to_vec());
+    }
+
+    #[tokio::test]
+    async fn wait_for_pairing_slot_bytes_aborts_on_fatal_relay_error() {
+        // A non-retryable error (e.g. the rendezvous session expired) must still
+        // fail fast rather than spinning out the full attempt budget.
+        let relay = FlakyPairingRelay::always_fatal();
+        let result =
+            wait_for_pairing_slot_bytes(&relay, "rendezvous-hex", PairingSlot::Init, "PairingInit")
+                .await;
+        assert!(result.is_err(), "fatal relay error should abort the wait");
     }
 
     // ── Mock Relay (minimal) ──
