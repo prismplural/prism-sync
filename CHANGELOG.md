@@ -2,6 +2,23 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.12.2] - 2026-06-06
+
+Tagged for the matching `prism-app 0.12.2+12201` release. Cargo crate
+versions remain `0.1.1`.
+
+### Fixed
+- Pairing slot polling now retries transient relay failures, so setup is less
+  likely to fail on a short-lived relay error while waiting for the other
+  device.
+- Delete tombstones are absorbing during sync merge. A stale live snapshot can
+  no longer resurrect records that another peer has already deleted.
+
+### Internal
+- Added real-relay coverage for pairing snapshot restore fields and aligned the
+  fixture expectations with the live-state encoding for omitted
+  `is_deleted=false` fields.
+
 ## [0.12.0] - 2026-06-04
 
 Tagged for the matching `prism-app 0.12.0+12001` release. Cargo crate versions remain `0.1.1`. The app's sync pin moves from v0.11.0 (`b99d64d`) to v0.12.0 (`00db70a`); the 0.11.x app patches kept the v0.11.0 pin.
