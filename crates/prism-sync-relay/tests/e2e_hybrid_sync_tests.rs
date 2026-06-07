@@ -630,7 +630,14 @@ fn app_full_restore_fixture_records(
                 json_value,
                 field.sync_type,
             );
-            expected_fields.insert(field_name.clone(), encode_value(&value));
+            // The app fixture must still include every schema field, but the
+            // sync engine deliberately does not seed phantom live tombstones.
+            // Absence of `is_deleted` already means live; carrying
+            // `is_deleted=false` through a bootstrap snapshot can resurrect a
+            // peer's tombstone.
+            if !(field_name == "is_deleted" && matches!(value, SyncValue::Bool(false))) {
+                expected_fields.insert(field_name.clone(), encode_value(&value));
+            }
             fields.insert(field_name.clone(), value);
         }
 
