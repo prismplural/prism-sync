@@ -669,6 +669,19 @@ pub trait MediaRelay: Send + Sync {
 
     /// Download an encrypted media blob from the relay.
     async fn download_media(&self, media_id: &str) -> std::result::Result<Vec<u8>, RelayError>;
+
+    /// Return the subset of `media_ids` the relay currently holds and can serve
+    /// (committed, not deleted, not past TTL) — the C2 batch-exists query. Lets
+    /// the C4 requester skip blobs the relay already has and the C5 pairing push
+    /// skip present ones.
+    ///
+    /// An old relay without this endpoint returns a transport error (404/405)
+    /// rather than an empty list; the caller (C4) must treat that as "feature
+    /// absent ⇒ no-op", never as "all blobs absent".
+    async fn batch_exists(
+        &self,
+        media_ids: &[String],
+    ) -> std::result::Result<Vec<String>, RelayError>;
 }
 
 /// Transport layer for communicating with the relay server.

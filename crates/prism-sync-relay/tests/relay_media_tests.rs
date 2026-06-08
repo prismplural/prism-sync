@@ -1096,6 +1096,132 @@ async fn always_sweep_keeps_disk_near_quota() {
     assert!(final_media_path(&storage, &sync_id, "c-fresh").exists());
 }
 
+// ───────────────────────── C2: batch-exists ─────────────────────────
+
+async fn batch_exists(
+    client: &Client,
+    url: &str,
+    token: &str,
+    sync_id: &str,
+    media_ids: &[&str],
+) -> reqwest::Response {
+    client
+        .post(format!("{url}/v1/sync/{sync_id}/media/exists"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "media_ids": media_ids }))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn batch_exists_returns_only_servable() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    for id in ["a", "b"] {
+        let data = vec![1u8; 32];
+        assert_eq!(
+            upload_media(&client, &url, &token, &keys, &sync_id, &device_id, id, &data).await.status(),
+            200
+        );
+    }
+
+    // Both servable initially; an unknown id is absent.
+    let resp = batch_exists(&client, &url, &token, &sync_id, &["a", "b", "nope"]).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let mut present: Vec<String> = body["present"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    present.sort();
+    assert_eq!(present, vec!["a".to_string(), "b".to_string()]);
+
+    // Expire "a" → batch-exists must drop it (TTL → absent), matching download-404.
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE media_metadata SET expires_at = ?1 WHERE media_id = 'a'",
+            rusqlite::params![db::now_secs() - 10],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let resp = batch_exists(&client, &url, &token, &sync_id, &["a", "b"]).await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let present: Vec<String> = body["present"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(present, vec!["b".to_string()], "expired blob is not servable");
+}
+
+#[tokio::test]
+async fn batch_exists_is_scoped_to_sync_group() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id_a = generate_sync_id();
+    let device_a = generate_device_id();
+    let sync_id_b = generate_sync_id();
+    let device_b = generate_device_id();
+    setup_group(&db, &sync_id_a).await;
+    setup_group(&db, &sync_id_b).await;
+    let (token_a, keys_a) = prepare_device(&db, &sync_id_a, &device_a).await;
+    let (token_b, _keys_b) = prepare_device(&db, &sync_id_b, &device_b).await;
+
+    let data = vec![2u8; 32];
+    upload_media(&client, &url, &token_a, &keys_a, &sync_id_a, &device_a, "secret", &data).await;
+
+    // Group B asks about group A's media_id → must be absent (no cross-group leak).
+    let resp = batch_exists(&client, &url, &token_b, &sync_id_b, &["secret"]).await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["present"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn batch_exists_rejects_oversized_request() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, _keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let ids: Vec<String> = (0..1025).map(|i| format!("id-{i}")).collect();
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/media/exists"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "media_ids": ids }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "over the per-request id cap");
+}
+
+#[tokio::test]
+async fn batch_exists_requires_auth() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    setup_group(&db, &sync_id).await;
+
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/media/exists"))
+        .json(&serde_json::json!({ "media_ids": ["x"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
 #[tokio::test]
 async fn servable_upload_implies_file_present() {
     let tmp = tempfile::TempDir::new().unwrap();

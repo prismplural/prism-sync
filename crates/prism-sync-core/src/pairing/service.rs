@@ -1782,6 +1782,12 @@ mod tests {
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
             unimplemented!()
         }
+        async fn batch_exists(
+            &self,
+            _: &[String],
+        ) -> std::result::Result<Vec<String>, RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl SyncRelay for MockRelay {
@@ -2065,6 +2071,12 @@ mod tests {
             unimplemented!()
         }
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
+            unimplemented!()
+        }
+        async fn batch_exists(
+            &self,
+            _: &[String],
+        ) -> std::result::Result<Vec<String>, RelayError> {
             unimplemented!()
         }
     }
@@ -4135,6 +4147,12 @@ mod tests {
                 unimplemented!()
             }
             async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
+                unimplemented!()
+            }
+            async fn batch_exists(
+                &self,
+                _: &[String],
+            ) -> std::result::Result<Vec<String>, RelayError> {
                 unimplemented!()
             }
         }

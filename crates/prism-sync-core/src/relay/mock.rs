@@ -582,6 +582,11 @@ impl MediaRelay for MockRelay {
             .cloned()
             .ok_or(RelayError::Server { status_code: 404, message: "Media not found".into() })
     }
+
+    async fn batch_exists(&self, media_ids: &[String]) -> Result<Vec<String>, RelayError> {
+        let state = self.state.lock().unwrap();
+        Ok(media_ids.iter().filter(|id| state.media.contains_key(*id)).cloned().collect())
+    }
 }
 
 #[async_trait]

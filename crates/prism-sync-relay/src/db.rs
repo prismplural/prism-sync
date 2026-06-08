@@ -2974,6 +2974,48 @@ pub fn all_media_keys(conn: &Connection) -> Result<Vec<(String, String)>, rusqli
     Ok(pairs)
 }
 
+/// Return the subset of `media_ids` (scoped to `sync_id`) that the relay
+/// considers servable at the metadata level — committed, not soft-deleted, not
+/// past TTL — for the C2 `batch-exists` endpoint. Metadata-only is sound after
+/// the reconciliation sweep (C1) repairs legacy file-missing crash rows; C4
+/// tolerates residual divergence (download-404 ⇒ request anyway).
+///
+/// `media_ids` MUST be bounded by the caller (the route caps the request size).
+pub fn servable_media_subset(
+    conn: &Connection,
+    sync_id: &str,
+    media_ids: &[String],
+    now: i64,
+) -> Result<Vec<String>, rusqlite::Error> {
+    if media_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    use rusqlite::types::Value;
+    // ?1 = sync_id, ?2 = now, ?3.. = each media_id.
+    let placeholders: Vec<String> = (0..media_ids.len()).map(|i| format!("?{}", i + 3)).collect();
+    let sql = format!(
+        "SELECT media_id FROM media_metadata
+         WHERE sync_id = ?1
+           AND committed_at IS NOT NULL
+           AND deleted_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?2)
+           AND media_id IN ({})",
+        placeholders.join(", ")
+    );
+    let mut params: Vec<Value> = Vec::with_capacity(media_ids.len() + 2);
+    params.push(Value::Text(sync_id.to_string()));
+    params.push(Value::Integer(now));
+    for id in media_ids {
+        params.push(Value::Text(id.clone()));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let present: Vec<String> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(present)
+}
+
 /// List every row the relay currently considers servable at the metadata level
 /// (committed, not soft-deleted, not past TTL) — i.e. the rows download and
 /// batch-exists would claim are present. The reconciliation sweep cross-checks
@@ -5383,6 +5425,43 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn servable_media_subset_returns_only_servable_in_group() {
+        let db = media_test_db();
+        db.with_conn(|c| create_sync_group(c, "sg2", 0)).unwrap();
+        let now = 1_000_000;
+        db.with_conn(|c| {
+            // committed-live (no TTL) and committed-live (future TTL) → present
+            reserve_media_upload(c, "live", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            finalize_media(c, "live", now)?;
+            reserve_media_upload(c, "live-ttl", "sg", "d", 10, HASH_B, Some(now + 1000), 10_000, now, 300, false)?;
+            finalize_media(c, "live-ttl", now)?;
+            // pending, expired, soft-deleted → absent
+            reserve_media_upload(c, "pending", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            reserve_media_upload(c, "expired", "sg", "d", 10, HASH_B, Some(now - 1), 10_000, now, 300, false)?;
+            finalize_media(c, "expired", now)?;
+            reserve_media_upload(c, "deleted", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            finalize_media(c, "deleted", now)?;
+            mark_media_deleted(c, "deleted")?;
+            // same role in another group → must NOT leak across sync_id
+            reserve_media_upload(c, "other", "sg2", "d", 10, HASH_B, None, 10_000, now, 300, false)?;
+            finalize_media(c, "other", now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let req: Vec<String> =
+            ["live", "live-ttl", "pending", "expired", "deleted", "other", "nope"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let mut got = db.with_read_conn(|c| servable_media_subset(c, "sg", &req, now)).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["live".to_string(), "live-ttl".to_string()]);
+        // Empty input → empty (no all-rows query).
+        assert!(db.with_read_conn(|c| servable_media_subset(c, "sg", &[], now)).unwrap().is_empty());
     }
 
     #[test]

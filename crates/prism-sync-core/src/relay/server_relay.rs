@@ -1157,6 +1157,35 @@ impl MediaRelay for ServerRelay {
         // otherwise be read fully into memory.
         Self::read_body_capped(resp, MAX_MEDIA_RESPONSE_BYTES, "/media").await
     }
+
+    async fn batch_exists(&self, media_ids: &[String]) -> Result<Vec<String>, RelayError> {
+        let url = format!("{}/media/exists", self.base_path());
+        debug!("batch_exists count={}", media_ids.len());
+
+        let resp = self
+            .apply_auth(self.client.post(&url))
+            .json(&serde_json::json!({ "media_ids": media_ids }))
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            // 404/405 from an old relay surfaces here; C4 treats that as
+            // "feature absent", distinct from a successful empty result.
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let body: serde_json::Value = resp.json().await.map_err(Self::classify_reqwest_error)?;
+        let present = body
+            .get("present")
+            .and_then(|p| p.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        Ok(present)
+    }
 }
 
 #[async_trait]

@@ -383,6 +383,21 @@ Future<Uint8List> downloadMedia({
   mediaId: mediaId,
 );
 
+/// Return the subset of `media_ids` the relay currently holds and can serve
+/// (C2 batch-exists). Lets the caller skip blobs the relay already has before
+/// requesting (C4) or pushing (C5) them.
+///
+/// Requires `configure_engine`. Against an old relay without the endpoint this
+/// returns an error string; the caller treats "feature absent" as a no-op
+/// rather than as "all blobs absent".
+Future<List<String>> mediaExists({
+  required PrismSyncHandle handle,
+  required List<String> mediaIds,
+}) => RustLib.instance.api.crateApiMediaExists(
+  handle: handle,
+  mediaIds: mediaIds,
+);
+
 /// Upload an ephemeral snapshot for device pairing.
 ///
 /// Called by the existing device after generating an invite. The snapshot

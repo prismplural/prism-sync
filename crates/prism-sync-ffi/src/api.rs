@@ -2490,6 +2490,30 @@ pub async fn download_media(handle: &PrismSyncHandle, media_id: String) -> Resul
     }
 }
 
+/// Return the subset of `media_ids` the relay currently holds and can serve
+/// (C2 batch-exists). Lets the caller skip blobs the relay already has before
+/// requesting (C4) or pushing (C5) them.
+///
+/// Requires `configure_engine`. Against an old relay without the endpoint this
+/// returns an error string; the caller treats "feature absent" as a no-op
+/// rather than as "all blobs absent".
+pub async fn media_exists(
+    handle: &PrismSyncHandle,
+    media_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let relay = handle
+        .relay
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| "Relay not configured".to_string())?;
+
+    match relay.batch_exists(&media_ids).await {
+        Ok(present) => Ok(present),
+        Err(error) => Err(format_handle_relay_error(handle, "media_exists", error).await),
+    }
+}
+
 /// Upload an ephemeral snapshot for device pairing.
 ///
 /// Called by the existing device after generating an invite. The snapshot

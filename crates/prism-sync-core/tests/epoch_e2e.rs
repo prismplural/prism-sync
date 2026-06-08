@@ -232,6 +232,9 @@ impl MediaRelay for RekeyMockRelay {
     async fn download_media(&self, _: &str) -> Result<Vec<u8>, RelayError> {
         unimplemented!()
     }
+    async fn batch_exists(&self, _: &[String]) -> Result<Vec<String>, RelayError> {
+        unimplemented!()
+    }
 }
 
 #[async_trait]

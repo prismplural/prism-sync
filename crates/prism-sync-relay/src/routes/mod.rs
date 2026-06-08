@@ -397,6 +397,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{sync_id}/rekey/{device_id}", get(devices::get_rekey_artifact))
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
         .route("/v1/sync/{sync_id}/capabilities", get(gifs::get_capabilities))
+        // Media batch-exists (C2): small JSON read; sits under the normal cap.
+        .route("/v1/sync/{sync_id}/media/exists", post(media::media_exists))
         .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade))
         // Registry routes (auth + signed)
         .merge(registry::routes())

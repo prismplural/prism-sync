@@ -338,6 +338,60 @@ pub async fn upload_media(
 }
 
 // ---------------------------------------------------------------------------
+// media_exists — POST /v1/sync/{sync_id}/media/exists   (batch-exists, C2)
+// ---------------------------------------------------------------------------
+
+/// Maximum media_ids accepted in one batch-exists request. Clients chunk larger
+/// sets; this bounds per-request work and the IN-clause size.
+const MAX_MEDIA_EXISTS_IDS: usize = 1024;
+
+#[derive(serde::Deserialize)]
+pub struct MediaExistsRequest {
+    pub media_ids: Vec<String>,
+}
+
+/// Return the subset of the requested media_ids that are servable (metadata
+/// level) for this sync group: committed, not deleted, not past TTL. Lets a
+/// client (C4 requester / C5 pairing push) avoid re-requesting blobs the relay
+/// already holds. Read-only ⇒ bearer auth (no request-body signature needed; the
+/// query is scoped to the authenticated sync_id).
+pub async fn media_exists(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthIdentity>,
+    Path(path_sync_id): Path<String>,
+    Json(req): Json<MediaExistsRequest>,
+) -> Result<Response, AppError> {
+    if path_sync_id != auth.sync_id {
+        return Err(AppError::Forbidden("sync_id mismatch"));
+    }
+    if req.media_ids.len() > MAX_MEDIA_EXISTS_IDS {
+        return Err(AppError::BadRequest("Too many media_ids in one batch-exists request"));
+    }
+
+    // Drop malformed ids (they can never be servable) and dedup.
+    let mut ids: Vec<String> =
+        req.media_ids.into_iter().filter(|id| is_valid_media_id(id)).collect();
+    ids.sort();
+    ids.dedup();
+
+    let present: Vec<String> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        let now = db::now_secs();
+        let sync_id = auth.sync_id.clone();
+        let db = state.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with_read_conn(|conn| db::servable_media_subset(conn, &sync_id, &ids, now))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    };
+
+    Ok(Json(serde_json::json!({ "present": present })).into_response())
+}
+
+// ---------------------------------------------------------------------------
 // download_media — GET /v1/sync/{sync_id}/media/{media_id}
 // ---------------------------------------------------------------------------
 
