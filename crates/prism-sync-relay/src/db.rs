@@ -544,6 +544,51 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS idx_media_sync_id ON media_metadata(sync_id);
         CREATE INDEX IF NOT EXISTS idx_media_expires ON media_metadata(expires_at) WHERE expires_at IS NOT NULL;
+
+        -- Ephemeral signal lane (media re-supply C3): a relay-blind
+        -- store-and-forward mailbox. A sender posts a small fixed-size opaque
+        -- `payload` (kind + media_id live encrypted under the group epoch key);
+        -- recipients drain it on their next sync. `recipient_device_id IS NULL`
+        -- is a group broadcast. `message_id` is an HMAC-of-the-epoch-key dedup
+        -- key, so the composite PRIMARY KEY coalesces in-window duplicates
+        -- (INSERT OR IGNORE) without the relay being able to correlate it to a
+        -- media_id. `epoch_id` is the only cleartext crypto hint (recipient key
+        -- selection). Short TTL (`expires_at`) bounds staleness; the cleanup
+        -- sweep sheds expired + fully-acked rows.
+        CREATE TABLE IF NOT EXISTS device_messages (
+            sync_id              TEXT NOT NULL,
+            message_id           TEXT NOT NULL,
+            sender_device_id     TEXT NOT NULL,
+            recipient_device_id  TEXT,
+            epoch_id             INTEGER NOT NULL,
+            payload              BLOB NOT NULL,
+            created_at           INTEGER NOT NULL,
+            expires_at           INTEGER NOT NULL,
+            PRIMARY KEY (sync_id, message_id),
+            FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+        );
+        -- Pending fetch: scoped to a group, filtered by recipient/broadcast and
+        -- TTL.
+        CREATE INDEX IF NOT EXISTS idx_device_messages_recipient
+            ON device_messages(sync_id, recipient_device_id, expires_at);
+        -- Per-sender pending-count cap.
+        CREATE INDEX IF NOT EXISTS idx_device_messages_sender
+            ON device_messages(sync_id, sender_device_id, expires_at);
+        -- Cleanup sweep by TTL.
+        CREATE INDEX IF NOT EXISTS idx_device_messages_expires
+            ON device_messages(expires_at);
+
+        -- Per-device acknowledgements for the mailbox above. A separate ack row
+        -- per device (composite PK) means one device acking a message can never
+        -- hide it from the other recipients of a broadcast — the GET-pending
+        -- filter only suppresses a message for the *acking* device.
+        CREATE TABLE IF NOT EXISTS device_message_acks (
+            sync_id      TEXT NOT NULL,
+            message_id   TEXT NOT NULL,
+            device_id    TEXT NOT NULL,
+            acked_at     INTEGER NOT NULL,
+            PRIMARY KEY (sync_id, message_id, device_id)
+        );
         ",
     )?;
 
@@ -2294,6 +2339,9 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<Vec<String>
     tx.execute("DELETE FROM batches WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM snapshots WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM media_metadata WHERE sync_id = ?1", params![sync_id])?;
+    // Ephemeral mailbox (C3): acks first, then messages (FK to sync_groups).
+    tx.execute("DELETE FROM device_message_acks WHERE sync_id = ?1", params![sync_id])?;
+    tx.execute("DELETE FROM device_messages WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM registration_nonces WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM devices WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM sync_groups WHERE sync_id = ?1", params![sync_id])?;
@@ -3429,6 +3477,228 @@ pub fn cleanup_expired_sharing_init_payloads(conn: &Connection) -> Result<usize,
         params![now],
     )?;
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Ephemeral signal lane / device-message mailbox (media re-supply C3)
+// ---------------------------------------------------------------------------
+
+/// One pending mailbox message returned to a draining recipient.
+#[derive(Debug, Clone)]
+pub struct PendingDeviceMessage {
+    pub message_id: String,
+    pub sender_device_id: String,
+    pub recipient_device_id: Option<String>,
+    pub epoch_id: i64,
+    pub payload: Vec<u8>,
+    pub created_at: i64,
+}
+
+/// Outcome of an attempted mailbox send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMessageSendOutcome {
+    /// A new row was stored.
+    Stored,
+    /// An identical `(sync_id, message_id)` already existed — coalesced, no new
+    /// storage. A success for the caller (the dedup key did its job).
+    Coalesced,
+    /// The sender already holds `max_pending` non-expired messages; rejected.
+    PendingCapExceeded,
+}
+
+/// Insert one ephemeral mailbox message, deduping on the composite
+/// `(sync_id, message_id)` PRIMARY KEY (`INSERT OR IGNORE`). A genuinely new id
+/// is stored; an identical id coalesces with no new storage.
+///
+/// The per-sender pending-count cap is enforced **after** a successful insert
+/// (and only for a genuinely new row), so a benign re-send of an already-stored
+/// message never trips the cap. Runs in one transaction; the relay serialises
+/// writes on a single writer connection, so the insert-then-count is atomic.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_device_message(
+    conn: &Connection,
+    sync_id: &str,
+    message_id: &str,
+    sender_device_id: &str,
+    recipient_device_id: Option<&str>,
+    epoch_id: i64,
+    payload: &[u8],
+    ttl_secs: u64,
+    max_pending: u32,
+) -> Result<DeviceMessageSendOutcome, rusqlite::Error> {
+    let now = now_secs();
+    let expires_at = now + ttl_secs as i64;
+    let tx = conn.unchecked_transaction()?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO device_messages
+         (sync_id, message_id, sender_device_id, recipient_device_id, epoch_id, payload, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![sync_id, message_id, sender_device_id, recipient_device_id, epoch_id, payload, now, expires_at],
+    )?;
+    if inserted == 0 {
+        tx.commit()?;
+        return Ok(DeviceMessageSendOutcome::Coalesced);
+    }
+    let pending: u32 = tx.query_row(
+        "SELECT COUNT(*) FROM device_messages
+         WHERE sync_id = ?1 AND sender_device_id = ?2 AND expires_at > ?3",
+        params![sync_id, sender_device_id, now],
+        |row| row.get(0),
+    )?;
+    if pending > max_pending {
+        tx.rollback()?;
+        return Ok(DeviceMessageSendOutcome::PendingCapExceeded);
+    }
+    tx.commit()?;
+    Ok(DeviceMessageSendOutcome::Stored)
+}
+
+/// Fetch the pending mailbox for `device_id` in `sync_id`: messages addressed to
+/// this device or broadcast (`recipient_device_id IS NULL`), not sent by it, not
+/// expired, and not yet acked by it. Read-only — the ack is a separate explicit
+/// call so a broadcast stays visible to the *other* recipients (the per-device
+/// ack table is what makes that safe). Bounded by `limit`.
+pub fn fetch_pending_device_messages(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    limit: u32,
+) -> Result<Vec<PendingDeviceMessage>, rusqlite::Error> {
+    let now = now_secs();
+    let mut stmt = conn.prepare(
+        "SELECT message_id, sender_device_id, recipient_device_id, epoch_id, payload, created_at
+         FROM device_messages m
+         WHERE m.sync_id = ?1
+           AND m.expires_at > ?2
+           AND m.sender_device_id != ?3
+           AND (m.recipient_device_id IS NULL OR m.recipient_device_id = ?3)
+           AND NOT EXISTS (
+               SELECT 1 FROM device_message_acks a
+               WHERE a.sync_id = m.sync_id AND a.message_id = m.message_id AND a.device_id = ?3
+           )
+         ORDER BY m.created_at ASC, m.message_id ASC
+         LIMIT ?4",
+    )?;
+    let rows = stmt
+        .query_map(params![sync_id, now, device_id, limit], |row| {
+            Ok(PendingDeviceMessage {
+                message_id: row.get(0)?,
+                sender_device_id: row.get(1)?,
+                recipient_device_id: row.get(2)?,
+                epoch_id: row.get(3)?,
+                payload: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Record this device's acks for `message_ids`. Only acks referencing a message
+/// that actually exists in this group are inserted (`WHERE EXISTS …`), so a
+/// client cannot grow the ack table with arbitrary ids. Idempotent
+/// (`INSERT OR IGNORE`). Returns the number of new ack rows written.
+pub fn ack_device_messages(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    message_ids: &[String],
+) -> Result<usize, rusqlite::Error> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = now_secs();
+    let tx = conn.unchecked_transaction()?;
+    let mut acked = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO device_message_acks (sync_id, message_id, device_id, acked_at)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE EXISTS (
+                 SELECT 1 FROM device_messages WHERE sync_id = ?1 AND message_id = ?2
+             )",
+        )?;
+        for mid in message_ids {
+            acked += stmt.execute(params![sync_id, mid, device_id, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(acked)
+}
+
+/// Sweep the mailbox: delete messages past their TTL or already fully acked,
+/// then drop orphaned ack rows. Returns the number of messages deleted. The
+/// short TTL is the primary bound; fully-acked deletion sheds the working set
+/// earlier.
+///
+/// "Fully acked" means:
+/// - **targeted** (`recipient_device_id` set) ⇒ that recipient has an ack row;
+/// - **broadcast** (`recipient_device_id IS NULL`) ⇒ at least one eligible
+///   recipient exists and *every* eligible (currently-active, non-sender) device
+///   has an ack row. The condition is phrased over the device set, NOT a raw ack
+///   count, so a sender acking its own broadcast — or a since-revoked device's
+///   ack — can't satisfy it early and shed the message before a real recipient
+///   drains it. The basis is the *current* active device set, so a recipient
+///   revoked after acking only lowers the bar (it's gone — still safe), and the
+///   short TTL is the real bound. A device that joins after a broadcast never
+///   acks it, so the message just lingers until its TTL — fine for an advisory /
+///   lossy-OK lane.
+pub fn cleanup_expired_device_messages(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    let tx = conn.unchecked_transaction()?;
+    let deleted = tx.execute(
+        "DELETE FROM device_messages
+         WHERE expires_at <= ?1
+            OR (
+                recipient_device_id IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM device_message_acks a
+                    WHERE a.sync_id = device_messages.sync_id
+                      AND a.message_id = device_messages.message_id
+                      AND a.device_id = device_messages.recipient_device_id
+                )
+            )
+            OR (
+                recipient_device_id IS NULL
+                -- At least one eligible recipient exists (don't shed an
+                -- undeliverable broadcast early; its TTL handles that).
+                AND EXISTS (
+                    SELECT 1 FROM devices d
+                    WHERE d.sync_id = device_messages.sync_id
+                      AND d.status = 'active'
+                      AND d.device_id != device_messages.sender_device_id
+                )
+                -- ...and no eligible recipient is still missing an ack. Phrased
+                -- over the device set so a sender self-ack or a non-active
+                -- device's ack can never satisfy it.
+                AND NOT EXISTS (
+                    SELECT 1 FROM devices d
+                    WHERE d.sync_id = device_messages.sync_id
+                      AND d.status = 'active'
+                      AND d.device_id != device_messages.sender_device_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM device_message_acks a
+                          WHERE a.sync_id = device_messages.sync_id
+                            AND a.message_id = device_messages.message_id
+                            AND a.device_id = d.device_id
+                      )
+                )
+            )",
+        params![now],
+    )?;
+    // Drop ack rows whose message is gone (expired, fully-acked above, or the
+    // group was pruned out from under them).
+    tx.execute(
+        "DELETE FROM device_message_acks
+         WHERE NOT EXISTS (
+             SELECT 1 FROM device_messages m
+             WHERE m.sync_id = device_message_acks.sync_id
+               AND m.message_id = device_message_acks.message_id
+         )",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -5488,5 +5758,230 @@ mod tests {
         // If the reserve were stale (reserved_at well before the cutoff) it would
         // drop out (about to be reaped).
         assert_eq!(db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now + 10_000, 300)).unwrap(), 0);
+    }
+
+    // -- Ephemeral mailbox (C3) --------------------------------------------
+
+    /// Create a group `g` with `devices` registered active.
+    fn mailbox_group(db: &Database, devices: &[&str]) {
+        db.with_conn(|conn| {
+            create_sync_group(conn, "g", 0)?;
+            for d in devices {
+                register_device(conn, "g", d, &[1; 32], &[2; 32], 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn send(db: &Database, mid: &str, sender: &str, recipient: Option<&str>) -> DeviceMessageSendOutcome {
+        db.with_conn(|conn| {
+            insert_device_message(conn, "g", mid, sender, recipient, 0, b"payload", 3600, 100)
+        })
+        .unwrap()
+    }
+
+    fn pending_ids(db: &Database, device: &str) -> Vec<String> {
+        db.with_read_conn(|conn| fetch_pending_device_messages(conn, "g", device, 256))
+            .unwrap()
+            .into_iter()
+            .map(|m| m.message_id)
+            .collect()
+    }
+
+    #[test]
+    fn device_message_broadcast_roundtrip_excludes_sender() {
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2", "d3"]);
+        assert_eq!(send(&db, "m1", "d1", None), DeviceMessageSendOutcome::Stored);
+        // Broadcast reaches every other device, not the sender.
+        assert!(pending_ids(&db, "d1").is_empty());
+        assert_eq!(pending_ids(&db, "d2"), vec!["m1".to_string()]);
+        assert_eq!(pending_ids(&db, "d3"), vec!["m1".to_string()]);
+    }
+
+    #[test]
+    fn device_message_targeted_only_to_recipient() {
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2", "d3"]);
+        send(&db, "m1", "d1", Some("d2"));
+        assert_eq!(pending_ids(&db, "d2"), vec!["m1".to_string()]);
+        assert!(pending_ids(&db, "d3").is_empty());
+        assert!(pending_ids(&db, "d1").is_empty());
+    }
+
+    #[test]
+    fn device_message_per_device_ack_does_not_suppress_others() {
+        // Spec test: A acks a message, B must still see it (per-device ack).
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2", "d3"]);
+        send(&db, "m1", "d1", None);
+        let n = db
+            .with_conn(|c| ack_device_messages(c, "g", "d2", &["m1".to_string()]))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(pending_ids(&db, "d2").is_empty(), "d2 acked → suppressed for d2");
+        assert_eq!(pending_ids(&db, "d3"), vec!["m1".to_string()], "d3 still sees it");
+    }
+
+    #[test]
+    fn device_message_dedup_coalesces_same_id() {
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2"]);
+        assert_eq!(send(&db, "dup", "d1", None), DeviceMessageSendOutcome::Stored);
+        // A second send with the same message_id (even different sender) coalesces.
+        assert_eq!(send(&db, "dup", "d2", None), DeviceMessageSendOutcome::Coalesced);
+        let count: i64 = db
+            .with_read_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM device_messages WHERE message_id = 'dup'", [], |r| r.get(0))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn device_message_pending_cap_enforced_but_dups_exempt() {
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2"]);
+        // Cap of 2: third distinct message from d1 is rejected.
+        let mk = |c: &Connection, mid: &str| {
+            insert_device_message(c, "g", mid, "d1", None, 0, b"p", 3600, 2)
+        };
+        assert_eq!(db.with_conn(|c| mk(c, "a")).unwrap(), DeviceMessageSendOutcome::Stored);
+        assert_eq!(db.with_conn(|c| mk(c, "b")).unwrap(), DeviceMessageSendOutcome::Stored);
+        assert_eq!(db.with_conn(|c| mk(c, "c")).unwrap(), DeviceMessageSendOutcome::PendingCapExceeded);
+        // Re-sending an already-stored id at the cap is a coalesce, NOT a reject.
+        assert_eq!(db.with_conn(|c| mk(c, "a")).unwrap(), DeviceMessageSendOutcome::Coalesced);
+        // The rejected message was not stored.
+        let count: i64 = db
+            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_messages WHERE sender_device_id = 'd1'", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn device_message_ack_only_for_existing_messages() {
+        // A client cannot grow the ack table with arbitrary ids.
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2"]);
+        send(&db, "real", "d1", None);
+        let n = db
+            .with_conn(|c| {
+                ack_device_messages(c, "g", "d2", &["real".to_string(), "bogus".to_string()])
+            })
+            .unwrap();
+        assert_eq!(n, 1, "only the real message id is acked");
+        let count: i64 = db
+            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn device_message_cleanup_expired() {
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2"]);
+        let now = now_secs();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO device_messages (sync_id, message_id, sender_device_id, recipient_device_id, epoch_id, payload, created_at, expires_at)
+                 VALUES ('g', 'old', 'd1', NULL, 0, X'00', ?1, ?2)",
+                params![now - 1000, now - 10],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        send(&db, "fresh", "d1", None);
+        let deleted = db.with_conn(cleanup_expired_device_messages).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(pending_ids(&db, "d2"), vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn device_message_cleanup_fully_acked_broadcast() {
+        // Broadcast to a 3-device group (sender + 2 recipients): deleted once
+        // both recipients ack.
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2", "d3"]);
+        send(&db, "bcast", "d1", None);
+        db.with_conn(|c| ack_device_messages(c, "g", "d2", &["bcast".to_string()])).unwrap();
+        // Only one of two recipients acked → not yet fully acked.
+        assert_eq!(db.with_conn(cleanup_expired_device_messages).unwrap(), 0);
+        db.with_conn(|c| ack_device_messages(c, "g", "d3", &["bcast".to_string()])).unwrap();
+        // Both recipients acked → fully acked → swept (with its ack rows).
+        assert_eq!(db.with_conn(cleanup_expired_device_messages).unwrap(), 1);
+        let acks: i64 = db
+            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(acks, 0, "orphan acks cleaned with their message");
+    }
+
+    #[test]
+    fn device_message_cleanup_fully_acked_targeted() {
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2", "d3"]);
+        send(&db, "t", "d1", Some("d2"));
+        // d3 acking is irrelevant (not the recipient); only d2's ack sheds it.
+        db.with_conn(|c| ack_device_messages(c, "g", "d2", &["t".to_string()])).unwrap();
+        assert_eq!(db.with_conn(cleanup_expired_device_messages).unwrap(), 1);
+    }
+
+    #[test]
+    fn device_message_cleanup_broadcast_ignores_sender_self_ack() {
+        // A sender (or colluder) must NOT be able to shed its own broadcast
+        // before the real recipients drain it. Eligible recipients are d2, d3.
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2", "d3"]);
+        send(&db, "bc", "d1", None);
+        // Sender self-acks, and one real recipient acks: still not fully acked
+        // (d3 hasn't), so the broadcast must survive.
+        db.with_conn(|c| ack_device_messages(c, "g", "d1", &["bc".to_string()])).unwrap();
+        db.with_conn(|c| ack_device_messages(c, "g", "d2", &["bc".to_string()])).unwrap();
+        assert_eq!(
+            db.with_conn(cleanup_expired_device_messages).unwrap(),
+            0,
+            "sender self-ack + one recipient must not shed the broadcast"
+        );
+        assert_eq!(pending_ids(&db, "d3"), vec!["bc".to_string()], "d3 can still drain it");
+        // Now the last real recipient acks → fully acked → swept.
+        db.with_conn(|c| ack_device_messages(c, "g", "d3", &["bc".to_string()])).unwrap();
+        assert_eq!(db.with_conn(cleanup_expired_device_messages).unwrap(), 1);
+    }
+
+    #[test]
+    fn device_message_cleanup_broadcast_not_shed_without_eligible_recipient() {
+        // If the only other device is not active, the broadcast is undeliverable
+        // *now* but must not be shed early on a zero/ack-count match — it lingers
+        // until TTL (the device may return).
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2"]);
+        db.with_conn(|c| {
+            c.execute("UPDATE devices SET status = 'stale' WHERE device_id = 'd2'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        send(&db, "bc", "d1", None);
+        assert_eq!(
+            db.with_conn(cleanup_expired_device_messages).unwrap(),
+            0,
+            "no eligible recipient ⇒ not fully acked ⇒ kept until TTL"
+        );
+    }
+
+    #[test]
+    fn device_message_deleted_with_sync_group() {
+        let db = test_db();
+        mailbox_group(&db, &["d1", "d2"]);
+        send(&db, "m", "d1", None);
+        db.with_conn(|c| ack_device_messages(c, "g", "d2", &["m".to_string()])).unwrap();
+        // FK to sync_groups: deletion must remove mailbox rows first or fail.
+        db.with_conn(|c| delete_sync_group(c, "g")).unwrap();
+        let msgs: i64 = db
+            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_messages", [], |r| r.get(0)))
+            .unwrap();
+        let acks: i64 = db
+            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!((msgs, acks), (0, 0));
     }
 }

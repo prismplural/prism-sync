@@ -452,6 +452,11 @@ impl SyncEngine {
             }
         }
 
+        // Phase 3: drain the ephemeral device-message mailbox (media re-supply
+        // C3). Best-effort and non-fatal — runs only after a successful
+        // pull/push so a failed cycle (which returns early above) just retries.
+        self.drain_ephemeral_messages(sync_id, key_hierarchy).await;
+
         result.duration = start.elapsed();
         self.set_state(SyncState::Idle);
 
@@ -471,6 +476,45 @@ impl SyncEngine {
 
     fn set_state(&self, state: SyncState) {
         let _ = self.state_tx.send(state);
+    }
+
+    /// Drain the relay's ephemeral device-message mailbox (media re-supply C3):
+    /// decrypt each pending message, surface the readable ones as
+    /// [`SyncEvent::EphemeralMessage`], and ACK every drained id (decryptable or
+    /// not — see [`crate::ephemeral::process_ephemeral_drain`]).
+    ///
+    /// Best-effort: an old relay without the endpoint (404/405) or any transient
+    /// error is a silent no-op — never treated as "no messages" in a way that
+    /// loses data, because the requester re-issues on its next cycle. Errors
+    /// here never fail the surrounding sync.
+    async fn drain_ephemeral_messages(
+        &self,
+        sync_id: &str,
+        key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    ) {
+        let envelopes = match self.relay.fetch_pending_ephemeral().await {
+            Ok(envelopes) => envelopes,
+            Err(e) => {
+                tracing::debug!("ephemeral drain skipped (feature absent or transient): {e}");
+                return;
+            }
+        };
+        if envelopes.is_empty() {
+            return;
+        }
+        let (decoded, ack_ids) =
+            crate::ephemeral::process_ephemeral_drain(key_hierarchy, sync_id, &envelopes);
+        for msg in decoded {
+            self.emit_event(SyncEvent::EphemeralMessage {
+                sender_device_id: msg.sender_device_id,
+                kind: msg.kind,
+                media_id: msg.media_id,
+                epoch_id: msg.epoch_id,
+            });
+        }
+        if let Err(e) = self.relay.ack_ephemeral(&ack_ids).await {
+            tracing::debug!("ephemeral ack failed (non-fatal): {e}");
+        }
     }
 
     /// Pull phase: drain the relay to head (or the per-cycle budget) by paging.
@@ -2507,5 +2551,74 @@ mod tests {
     fn should_suppress_stale_snapshot_allows_equal_seq() {
         assert!(should_suppress_stale_snapshot(None, None, 42, 42));
         assert!(should_suppress_stale_snapshot(Some("joiner-A"), Some("joiner-A"), 42, 42));
+    }
+
+    // -- Ephemeral mailbox drain (media re-supply C3) ----------------------
+
+    fn drain_test_engine(relay: Arc<crate::relay::MockRelay>) -> (SyncEngine, broadcast::Receiver<SyncEvent>) {
+        let storage = Arc::new(crate::storage::RusqliteSyncStorage::in_memory().unwrap());
+        let schema = crate::schema::SyncSchema::builder().build();
+        let engine =
+            SyncEngine::new(storage, relay, vec![], schema, SyncConfig::default());
+        let (tx, rx) = broadcast::channel(16);
+        (engine.with_event_sink(tx), rx)
+    }
+
+    fn unlocked_kh_with(epoch: u32, key: &[u8]) -> prism_sync_crypto::KeyHierarchy {
+        let mut kh = prism_sync_crypto::KeyHierarchy::new();
+        kh.initialize("pw", &[1u8; 16]).unwrap();
+        kh.store_epoch_key(epoch, zeroize::Zeroizing::new(key.to_vec()));
+        kh
+    }
+
+    #[tokio::test]
+    async fn drain_emits_decryptable_and_acks_every_drained_id() {
+        let epoch_key = vec![3u8; 32];
+        let kh = unlocked_kh_with(2, &epoch_key);
+        let relay = Arc::new(crate::relay::MockRelay::new());
+
+        // One decryptable (epoch 2) + one unreadable (epoch 9, no key) message.
+        let mut good = crate::ephemeral::seal_envelope(
+            &epoch_key, "sync-1", 2, "media_request", "blob-1", None, 0,
+        )
+        .unwrap();
+        good.sender_device_id = "dev-2".into();
+        relay.seed_ephemeral(good.clone());
+        let bad = crate::ephemeral::seal_envelope(
+            &epoch_key, "sync-1", 9, "media_request", "blob-2", None, 0,
+        )
+        .unwrap();
+        relay.seed_ephemeral(bad.clone());
+
+        let (engine, mut rx) = drain_test_engine(relay.clone());
+        engine.drain_ephemeral_messages("sync-1", &kh).await;
+
+        match rx.try_recv().unwrap() {
+            SyncEvent::EphemeralMessage { sender_device_id, kind, media_id, epoch_id } => {
+                assert_eq!(sender_device_id, "dev-2");
+                assert_eq!(kind, "media_request");
+                assert_eq!(media_id, "blob-1");
+                assert_eq!(epoch_id, 2);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the unreadable message is skipped, not surfaced");
+
+        let mut expected = vec![good.message_id.clone(), bad.message_id.clone()];
+        expected.sort();
+        assert_eq!(relay.ephemeral_acked(), expected, "both drained ids are acked");
+    }
+
+    #[tokio::test]
+    async fn drain_old_relay_is_a_noop() {
+        let relay = Arc::new(crate::relay::MockRelay::new());
+        relay.set_ephemeral_feature_absent(true); // models a relay without the endpoint
+        let kh = unlocked_kh_with(0, &[3u8; 32]);
+        let (engine, mut rx) = drain_test_engine(relay.clone());
+
+        engine.drain_ephemeral_messages("sync-1", &kh).await;
+
+        assert!(rx.try_recv().is_err(), "no events from an old relay");
+        assert!(relay.ephemeral_acked().is_empty(), "nothing acked when the feature is absent");
     }
 }

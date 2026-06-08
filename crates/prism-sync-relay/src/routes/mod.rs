@@ -1,3 +1,4 @@
+pub mod device_messages;
 pub mod devices;
 pub mod gifs;
 pub mod media;
@@ -404,6 +405,23 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/sync/{sync_id}/media/exists",
             post(media::media_exists).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        // Ephemeral signal lane / device-message mailbox (C3). Small bodies:
+        // send carries one ≤4 KiB padded payload (base64'd) + envelope, ack a
+        // bounded id list. Tight per-route caps override the shared 10 MiB
+        // authenticated cap so an authed caller can't force large-body buffering
+        // before the field checks run. GET pending is bodyless.
+        .route(
+            "/v1/sync/{sync_id}/device-messages",
+            post(device_messages::send_device_message).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/v1/sync/{sync_id}/device-messages/pending",
+            get(device_messages::pending_device_messages),
+        )
+        .route(
+            "/v1/sync/{sync_id}/device-messages/ack",
+            post(device_messages::ack_device_messages).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route("/v1/sync/{sync_id}/ws", get(ws::ws_upgrade))
         // Registry routes (auth + signed)

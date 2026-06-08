@@ -907,6 +907,15 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "error_code": error_code,
             "error_message": redact_sensitive_message(error_message),
         }),
+        SyncEvent::EphemeralMessage { sender_device_id, kind, media_id, epoch_id } => {
+            serde_json::json!({
+                "type": "EphemeralMessage",
+                "sender_device_id": sender_device_id,
+                "kind": kind,
+                "media_id": media_id,
+                "epoch_id": epoch_id,
+            })
+        }
     }
 }
 
@@ -2511,6 +2520,42 @@ pub async fn media_exists(
     match relay.batch_exists(&media_ids).await {
         Ok(present) => Ok(present),
         Err(error) => Err(format_handle_relay_error(handle, "media_exists", error).await),
+    }
+}
+
+/// Send one sealed ephemeral message to the relay's device-message mailbox
+/// (media re-supply C3). `kind` is an app-level label (e.g. `"media_request"` /
+/// `"media_uploaded"`); `recipient_device_id` targets a single device or `None`
+/// broadcasts to the group. The envelope is sealed with this client's current
+/// epoch key under the state lock, then transported.
+///
+/// Requires `configure_engine`. Against an old relay without the endpoint this
+/// returns an error string; the caller (C4) treats "feature absent" as a no-op.
+pub async fn send_ephemeral(
+    handle: &PrismSyncHandle,
+    kind: String,
+    media_id: String,
+    recipient_device_id: Option<String>,
+) -> Result<(), String> {
+    // Seal the envelope under the state lock (pure, no I/O), then drop the lock
+    // before the network call so a slow relay never blocks other state access.
+    let envelope = {
+        let inner = handle.inner.lock().await;
+        inner
+            .build_ephemeral_envelope(&kind, &media_id, recipient_device_id)
+            .map_err(|e| e.to_string())?
+    };
+
+    let relay = handle
+        .relay
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| "Relay not configured".to_string())?;
+
+    match relay.send_ephemeral(&envelope).await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format_handle_relay_error(handle, "send_ephemeral", error).await),
     }
 }
 

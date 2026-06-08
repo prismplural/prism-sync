@@ -71,6 +71,14 @@ struct MockRelayState {
     /// If set, the next `put_snapshot` call returns `SnapshotStale`
     /// with these values and clears the slot.
     next_put_snapshot_stale: Option<(i64, Option<String>)>,
+    /// Ephemeral mailbox (C3). Tests seed `ephemeral_inbox`; `fetch` returns its
+    /// entries minus those in `ephemeral_acked`; `send` appends to
+    /// `ephemeral_sent`. When `ephemeral_feature_absent` is set, all three
+    /// methods return a 404-like error to model an old relay (feature-detection).
+    ephemeral_inbox: Vec<crate::ephemeral::EphemeralEnvelope>,
+    ephemeral_sent: Vec<crate::ephemeral::EphemeralEnvelope>,
+    ephemeral_acked: HashSet<String>,
+    ephemeral_feature_absent: bool,
 }
 
 /// How an injected `pull_changes` failure should present on the wire.
@@ -128,9 +136,38 @@ impl MockRelay {
                 push_413_batch_ids: HashSet::new(),
                 push_call_batch_ids: Vec::new(),
                 next_put_snapshot_stale: None,
+                ephemeral_inbox: Vec::new(),
+                ephemeral_sent: Vec::new(),
+                ephemeral_acked: HashSet::new(),
+                ephemeral_feature_absent: false,
             }),
             notification_tx,
         }
+    }
+
+    /// Seed the ephemeral mailbox inbox with a message a drain will fetch (C3).
+    pub fn seed_ephemeral(&self, envelope: crate::ephemeral::EphemeralEnvelope) {
+        self.state.lock().unwrap().ephemeral_inbox.push(envelope);
+    }
+
+    /// Model an old relay lacking the device-message endpoint: all three
+    /// ephemeral methods return a 404-like error so callers can verify the
+    /// feature-detection no-op.
+    pub fn set_ephemeral_feature_absent(&self, absent: bool) {
+        self.state.lock().unwrap().ephemeral_feature_absent = absent;
+    }
+
+    /// Envelopes passed to `send_ephemeral`, in order (for send assertions).
+    pub fn ephemeral_sent(&self) -> Vec<crate::ephemeral::EphemeralEnvelope> {
+        self.state.lock().unwrap().ephemeral_sent.clone()
+    }
+
+    /// Message ids this relay has been asked to ack, sorted.
+    pub fn ephemeral_acked(&self) -> Vec<String> {
+        let mut v: Vec<String> =
+            self.state.lock().unwrap().ephemeral_acked.iter().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Cause the next `put_snapshot` to fail with
@@ -586,6 +623,44 @@ impl MediaRelay for MockRelay {
     async fn batch_exists(&self, media_ids: &[String]) -> Result<Vec<String>, RelayError> {
         let state = self.state.lock().unwrap();
         Ok(media_ids.iter().filter(|id| state.media.contains_key(*id)).cloned().collect())
+    }
+
+    async fn send_ephemeral(
+        &self,
+        envelope: &crate::ephemeral::EphemeralEnvelope,
+    ) -> Result<(), RelayError> {
+        let mut state = self.state.lock().unwrap();
+        if state.ephemeral_feature_absent {
+            return Err(RelayError::Server { status_code: 404, message: "not found".into() });
+        }
+        state.ephemeral_sent.push(envelope.clone());
+        Ok(())
+    }
+
+    async fn fetch_pending_ephemeral(
+        &self,
+    ) -> Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+        let state = self.state.lock().unwrap();
+        if state.ephemeral_feature_absent {
+            return Err(RelayError::Server { status_code: 404, message: "not found".into() });
+        }
+        Ok(state
+            .ephemeral_inbox
+            .iter()
+            .filter(|e| !state.ephemeral_acked.contains(&e.message_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn ack_ephemeral(&self, message_ids: &[String]) -> Result<(), RelayError> {
+        let mut state = self.state.lock().unwrap();
+        if state.ephemeral_feature_absent {
+            return Err(RelayError::Server { status_code: 404, message: "not found".into() });
+        }
+        for id in message_ids {
+            state.ephemeral_acked.insert(id.clone());
+        }
+        Ok(())
     }
 }
 

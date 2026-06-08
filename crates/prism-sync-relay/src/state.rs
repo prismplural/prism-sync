@@ -183,6 +183,9 @@ pub struct AppState {
     /// Pairing-push upload limiter (C5), keyed per pairing-event/device. Keeps a
     /// joiner's burst off the group fresh-send bucket. Scaffolding (see above).
     pub media_pairing_push_rate_limiter: RateLimiter,
+    /// Ephemeral mailbox send limiter (C3), keyed per sender-device. The real
+    /// request-storm bound for the re-supply signal lane.
+    pub device_message_send_rate_limiter: RateLimiter,
     pub gif_request_rate_limiter: RateLimiter,
     pub gif_http_client: reqwest::Client,
 }
@@ -246,6 +249,7 @@ impl AppState {
             media_upload_rate_limiter: RateLimiter::default(),
             media_resupply_rate_limiter: RateLimiter::default(),
             media_pairing_push_rate_limiter: RateLimiter::default(),
+            device_message_send_rate_limiter: RateLimiter::default(),
             gif_request_rate_limiter: RateLimiter::default(),
             gif_http_client,
         }

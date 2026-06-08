@@ -15,6 +15,7 @@ pub mod crdt_change;
 pub mod debug_log;
 pub mod device_registry;
 pub mod engine;
+pub mod ephemeral;
 pub mod epoch;
 pub mod error;
 pub mod events;

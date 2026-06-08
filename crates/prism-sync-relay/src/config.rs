@@ -184,6 +184,23 @@ pub struct Config {
     pub media_pairing_push_rate_limit: u32,
     /// (Scaffolding.) Sliding window in seconds for the pairing-push limiter.
     pub media_pairing_push_rate_window_secs: u64,
+    /// Ephemeral signal lane / device-message mailbox (C3): TTL in seconds for a
+    /// stored mailbox message (default 7 days). Short, so the mailbox sheds fast.
+    pub device_message_ttl_secs: u64,
+    /// Max size in bytes of a mailbox payload BLOB. Clients send a fixed-size
+    /// padded payload; this caps it (≤ 4 KiB) as the DoS bound.
+    pub device_message_max_payload_bytes: usize,
+    /// Per-sender-device mailbox sends allowed within
+    /// `device_message_send_rate_window_secs` — the real request-storm bound (the
+    /// requester's per-media cooldown is device-local/advisory).
+    pub device_message_send_rate_limit: u32,
+    /// Sliding window in seconds for the mailbox send rate limiter.
+    pub device_message_send_rate_window_secs: u64,
+    /// Max non-expired mailbox messages a single sender may hold outstanding
+    /// (per-sender pending cap), bounding stored bytes.
+    pub device_message_max_pending: u32,
+    /// Max messages returned by one GET-pending mailbox drain (clients page).
+    pub device_message_fetch_limit: u32,
     /// Wall-clock timeout applied to most non-WebSocket routes. Returns 408 on
     /// expiry. Heavy upload routes (snapshot, media) have their own longer
     /// timeouts so large transfers over slow connections don't trip this cap.
@@ -430,6 +447,24 @@ impl Config {
                 "MEDIA_PAIRING_PUSH_RATE_WINDOW_SECS",
                 60,
             ),
+            device_message_ttl_secs: parse_env_with(&env, "DEVICE_MESSAGE_TTL_SECS", 604_800), // 7 days
+            device_message_max_payload_bytes: parse_env_with(
+                &env,
+                "DEVICE_MESSAGE_MAX_PAYLOAD_BYTES",
+                4096,
+            ),
+            device_message_send_rate_limit: parse_env_with(
+                &env,
+                "DEVICE_MESSAGE_SEND_RATE_LIMIT",
+                60,
+            ),
+            device_message_send_rate_window_secs: parse_env_with(
+                &env,
+                "DEVICE_MESSAGE_SEND_RATE_WINDOW_SECS",
+                60,
+            ),
+            device_message_max_pending: parse_env_with(&env, "DEVICE_MESSAGE_MAX_PENDING", 256),
+            device_message_fetch_limit: parse_env_with(&env, "DEVICE_MESSAGE_FETCH_LIMIT", 256),
             default_request_timeout_secs: parse_env_with(&env, "DEFAULT_REQUEST_TIMEOUT_SECS", 30),
             snapshot_request_timeout_secs: parse_env_with(
                 &env,
@@ -761,6 +796,12 @@ pub fn localhost_test_config() -> Config {
         media_resupply_rate_window_secs: 60,
         media_pairing_push_rate_limit: 60,
         media_pairing_push_rate_window_secs: 60,
+        device_message_ttl_secs: 604_800,
+        device_message_max_payload_bytes: 4096,
+        device_message_send_rate_limit: 100,
+        device_message_send_rate_window_secs: 60,
+        device_message_max_pending: 256,
+        device_message_fetch_limit: 256,
         default_request_timeout_secs: 30,
         snapshot_request_timeout_secs: 300,
         media_request_timeout_secs: 120,

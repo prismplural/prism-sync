@@ -50,6 +50,20 @@ pub enum SyncEvent {
         error_code: String,
         error_message: String,
     },
+    /// A decrypted ephemeral message drained from the relay's device-message
+    /// mailbox during a sync cycle (media re-supply C3). Advisory / lossy-OK:
+    /// the app reactor dispatches on `kind` (e.g. `"media_request"` /
+    /// `"media_uploaded"`); the requester re-issues if a message is missed.
+    EphemeralMessage {
+        /// The authenticated device that sent the message.
+        sender_device_id: String,
+        /// App-level message kind.
+        kind: String,
+        /// The media id the message concerns.
+        media_id: String,
+        /// The epoch the message was sealed under.
+        epoch_id: u32,
+    },
 }
 
 /// A single entity change with full field data, for consumer DB application.

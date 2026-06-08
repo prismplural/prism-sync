@@ -1192,6 +1192,129 @@ impl MediaRelay for ServerRelay {
             }),
         }
     }
+
+    async fn send_ephemeral(
+        &self,
+        envelope: &crate::ephemeral::EphemeralEnvelope,
+    ) -> Result<(), RelayError> {
+        let path = self.canonical_path("/device-messages");
+        let url = format!("{}/device-messages", self.base_path());
+        debug!("send_ephemeral message_id={} epoch_id={}", envelope.message_id, envelope.epoch_id);
+
+        let body = serde_json::json!({
+            "message_id": envelope.message_id,
+            "epoch_id": envelope.epoch_id,
+            "recipient_device_id": envelope.recipient_device_id,
+            "payload": BASE64.encode(&envelope.payload),
+        });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to serialize send_ephemeral body: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            // 404/405 from an old relay surfaces here; the caller treats that as
+            // "feature absent ⇒ no-op".
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+        Ok(())
+    }
+
+    async fn fetch_pending_ephemeral(
+        &self,
+    ) -> Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+        let path = self.canonical_path("/device-messages/pending");
+        let url = format!("{}/device-messages/pending", self.base_path());
+        debug!("fetch_pending_ephemeral");
+
+        let resp = self
+            .apply_signed_auth(self.client.get(&url), "GET", &path, &[])
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+
+        let body: serde_json::Value = resp.json().await.map_err(Self::classify_reqwest_error)?;
+        let arr = body.get("messages").and_then(|m| m.as_array()).ok_or_else(|| {
+            RelayError::Protocol {
+                message: "pending-messages response missing 'messages' array".into(),
+            }
+        })?;
+
+        let mut out = Vec::with_capacity(arr.len());
+        for m in arr {
+            // Skip a malformed entry rather than failing the whole drain — one
+            // bad row from a misbehaving proxy shouldn't strand the others.
+            let (Some(message_id), Some(epoch_id), Some(payload_b64), Some(sender)) = (
+                m.get("message_id").and_then(|v| v.as_str()),
+                m.get("epoch_id").and_then(|v| v.as_u64()),
+                m.get("payload").and_then(|v| v.as_str()),
+                m.get("sender_device_id").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let Ok(epoch_id) = u32::try_from(epoch_id) else { continue };
+            let Ok(payload) = BASE64.decode(payload_b64) else { continue };
+            let recipient_device_id = m
+                .get("recipient_device_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            out.push(crate::ephemeral::EphemeralEnvelope {
+                message_id: message_id.to_string(),
+                epoch_id,
+                sender_device_id: sender.to_string(),
+                recipient_device_id,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn ack_ephemeral(&self, message_ids: &[String]) -> Result<(), RelayError> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let path = self.canonical_path("/device-messages/ack");
+        let url = format!("{}/device-messages/ack", self.base_path());
+        debug!("ack_ephemeral count={}", message_ids.len());
+
+        let body = serde_json::json!({ "message_ids": message_ids });
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
+            message: format!("Failed to serialize ack_ephemeral body: {e}"),
+        })?;
+
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(Self::classify_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Self::classify_error(status, &body_text));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

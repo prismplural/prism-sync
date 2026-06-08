@@ -102,6 +102,10 @@ async fn run_cleanup(state: &AppState) {
             let expired_media =
                 crate::db::cleanup_expired_media(conn, config.media_retention_days)?;
 
+            // 14b. Sweep the ephemeral device-message mailbox (C3): rows past
+            // their short TTL or already fully acked by every eligible recipient.
+            let expired_device_messages = crate::db::cleanup_expired_device_messages(conn)?;
+
             // 15. Reclaim freed pages (incremental auto_vacuum)
             let freelist_before: i64 =
                 conn.query_row("PRAGMA freelist_count;", [], |r| r.get(0)).unwrap_or(0);
@@ -128,6 +132,7 @@ async fn run_cleanup(state: &AppState) {
                 expired_sharing_inits,
                 expired_grace_keys,
                 expired_media,
+                expired_device_messages,
                 pages_freed,
             ))
         })
@@ -154,6 +159,7 @@ async fn run_cleanup(state: &AppState) {
             expired_sharing_inits,
             expired_grace_keys,
             expired_media,
+            expired_device_messages,
             pages_freed,
         ))) => {
             // Clean up media files from disk for pruned sync groups
@@ -196,6 +202,7 @@ async fn run_cleanup(state: &AppState) {
                 || expired_sharing_inits > 0
                 || expired_grace_keys > 0
                 || expired_media_count > 0
+                || expired_device_messages > 0
                 || pages_freed > 0
             {
                 tracing::info!(
@@ -215,6 +222,7 @@ async fn run_cleanup(state: &AppState) {
                     expired_sharing_inits,
                     expired_grace_keys,
                     expired_media_count,
+                    expired_device_messages,
                     pages_freed,
                     "cleanup cycle complete"
                 );
@@ -339,6 +347,9 @@ async fn run_cleanup(state: &AppState) {
     state
         .media_pairing_push_rate_limiter
         .prune_stale(state.config.media_pairing_push_rate_window_secs);
+    state
+        .device_message_send_rate_limiter
+        .prune_stale(state.config.device_message_send_rate_window_secs);
 }
 
 /// Collect media_ids for sync groups that are about to be pruned.

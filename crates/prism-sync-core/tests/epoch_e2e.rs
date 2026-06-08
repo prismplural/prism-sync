@@ -235,6 +235,20 @@ impl MediaRelay for RekeyMockRelay {
     async fn batch_exists(&self, _: &[String]) -> Result<Vec<String>, RelayError> {
         unimplemented!()
     }
+    async fn send_ephemeral(
+        &self,
+        _: &prism_sync_core::ephemeral::EphemeralEnvelope,
+    ) -> Result<(), RelayError> {
+        unimplemented!()
+    }
+    async fn fetch_pending_ephemeral(
+        &self,
+    ) -> Result<Vec<prism_sync_core::ephemeral::EphemeralEnvelope>, RelayError> {
+        unimplemented!()
+    }
+    async fn ack_ephemeral(&self, _: &[String]) -> Result<(), RelayError> {
+        unimplemented!()
+    }
 }
 
 #[async_trait]

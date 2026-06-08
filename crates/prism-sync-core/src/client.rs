@@ -2431,6 +2431,37 @@ impl PrismSync {
     pub fn device_secret(&self) -> Option<&DeviceSecret> {
         self.device_secret.as_ref()
     }
+
+    /// Build a sealed ephemeral-message envelope for the device-message mailbox
+    /// (media re-supply C3), keyed by this client's current epoch key. Pure
+    /// (no I/O) so the FFI can construct it under the state lock and then
+    /// transport it via [`MediaRelay::send_ephemeral`](crate::relay::traits::MediaRelay::send_ephemeral)
+    /// without holding the lock across the network call.
+    pub fn build_ephemeral_envelope(
+        &self,
+        kind: &str,
+        media_id: &str,
+        recipient_device_id: Option<String>,
+    ) -> Result<crate::ephemeral::EphemeralEnvelope> {
+        let sync_id = self
+            .sync_service
+            .sync_id()
+            .ok_or_else(|| CoreError::Engine("no sync_id; engine not configured".into()))?;
+        let epoch = self.epoch.ok_or_else(|| CoreError::Engine("no current epoch".into()))?;
+        let epoch_u32 =
+            u32::try_from(epoch).map_err(|_| CoreError::Engine(format!("invalid epoch {epoch}")))?;
+        let epoch_key = self.key_hierarchy.epoch_key(epoch_u32)?;
+        let now = chrono::Utc::now().timestamp();
+        crate::ephemeral::seal_envelope(
+            epoch_key,
+            sync_id,
+            epoch_u32,
+            kind,
+            media_id,
+            recipient_device_id,
+            now,
+        )
+    }
 }
 
 fn validate_sync_value_type(
@@ -2647,6 +2678,23 @@ mod tests {
             &self,
             _: &[String],
         ) -> std::result::Result<Vec<String>, RelayError> {
+            unimplemented!()
+        }
+        async fn send_ephemeral(
+            &self,
+            _: &crate::ephemeral::EphemeralEnvelope,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn fetch_pending_ephemeral(
+            &self,
+        ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+            unimplemented!()
+        }
+        async fn ack_ephemeral(
+            &self,
+            _: &[String],
+        ) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -2949,6 +2997,23 @@ mod tests {
             &self,
             _: &[String],
         ) -> std::result::Result<Vec<String>, RelayError> {
+            unimplemented!()
+        }
+        async fn send_ephemeral(
+            &self,
+            _: &crate::ephemeral::EphemeralEnvelope,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn fetch_pending_ephemeral(
+            &self,
+        ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+            unimplemented!()
+        }
+        async fn ack_ephemeral(
+            &self,
+            _: &[String],
+        ) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }

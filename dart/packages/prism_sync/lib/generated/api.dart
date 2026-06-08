@@ -398,6 +398,26 @@ Future<List<String>> mediaExists({
   mediaIds: mediaIds,
 );
 
+/// Send one sealed ephemeral message to the relay's device-message mailbox
+/// (media re-supply C3). `kind` is an app-level label (e.g. `"media_request"` /
+/// `"media_uploaded"`); `recipient_device_id` targets a single device or `None`
+/// broadcasts to the group. The envelope is sealed with this client's current
+/// epoch key under the state lock, then transported.
+///
+/// Requires `configure_engine`. Against an old relay without the endpoint this
+/// returns an error string; the caller (C4) treats "feature absent" as a no-op.
+Future<void> sendEphemeral({
+  required PrismSyncHandle handle,
+  required String kind,
+  required String mediaId,
+  String? recipientDeviceId,
+}) => RustLib.instance.api.crateApiSendEphemeral(
+  handle: handle,
+  kind: kind,
+  mediaId: mediaId,
+  recipientDeviceId: recipientDeviceId,
+);
+
 /// Upload an ephemeral snapshot for device pairing.
 ///
 /// Called by the existing device after generating an invite. The snapshot

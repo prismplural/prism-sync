@@ -1788,6 +1788,23 @@ mod tests {
         ) -> std::result::Result<Vec<String>, RelayError> {
             unimplemented!()
         }
+        async fn send_ephemeral(
+            &self,
+            _: &crate::ephemeral::EphemeralEnvelope,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn fetch_pending_ephemeral(
+            &self,
+        ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+            unimplemented!()
+        }
+        async fn ack_ephemeral(
+            &self,
+            _: &[String],
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
     }
     #[async_trait]
     impl SyncRelay for MockRelay {
@@ -2077,6 +2094,23 @@ mod tests {
             &self,
             _: &[String],
         ) -> std::result::Result<Vec<String>, RelayError> {
+            unimplemented!()
+        }
+        async fn send_ephemeral(
+            &self,
+            _: &crate::ephemeral::EphemeralEnvelope,
+        ) -> std::result::Result<(), RelayError> {
+            unimplemented!()
+        }
+        async fn fetch_pending_ephemeral(
+            &self,
+        ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+            unimplemented!()
+        }
+        async fn ack_ephemeral(
+            &self,
+            _: &[String],
+        ) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -4153,6 +4187,23 @@ mod tests {
                 &self,
                 _: &[String],
             ) -> std::result::Result<Vec<String>, RelayError> {
+                unimplemented!()
+            }
+            async fn send_ephemeral(
+                &self,
+                _: &crate::ephemeral::EphemeralEnvelope,
+            ) -> std::result::Result<(), RelayError> {
+                unimplemented!()
+            }
+            async fn fetch_pending_ephemeral(
+                &self,
+            ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+                unimplemented!()
+            }
+            async fn ack_ephemeral(
+                &self,
+                _: &[String],
+            ) -> std::result::Result<(), RelayError> {
                 unimplemented!()
             }
         }

@@ -682,6 +682,33 @@ pub trait MediaRelay: Send + Sync {
         &self,
         media_ids: &[String],
     ) -> std::result::Result<Vec<String>, RelayError>;
+
+    /// Post one sealed ephemeral message to the relay's device-message mailbox
+    /// (media re-supply C3). The relay stamps the authenticated sender; the
+    /// envelope's `sender_device_id` is ignored on send. An old relay without
+    /// the endpoint returns a transport error (404/405) the caller treats as
+    /// "feature absent ⇒ no-op".
+    async fn send_ephemeral(
+        &self,
+        envelope: &crate::ephemeral::EphemeralEnvelope,
+    ) -> std::result::Result<(), RelayError>;
+
+    /// Drain this device's pending mailbox: messages addressed to it or
+    /// broadcast, not sent by it, not expired, not yet acked by it. Read-only —
+    /// the caller decrypts each and then ACKs (a separate call) so a broadcast
+    /// stays visible to the other recipients. An old relay returns a transport
+    /// error (404/405) ⇒ no-op.
+    async fn fetch_pending_ephemeral(
+        &self,
+    ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError>;
+
+    /// Acknowledge processed (or skipped/undecryptable) mailbox messages so the
+    /// relay stops redelivering them to this device. Per-device — never hides a
+    /// broadcast from the other recipients.
+    async fn ack_ephemeral(
+        &self,
+        message_ids: &[String],
+    ) -> std::result::Result<(), RelayError>;
 }
 
 /// Transport layer for communicating with the relay server.
