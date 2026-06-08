@@ -150,6 +150,34 @@ pub struct Config {
     pub media_upload_rate_window_secs: u64,
     /// Interval in seconds for cleaning up orphaned media files.
     pub media_orphan_cleanup_secs: u64,
+    /// Minimum per-blob TTL (seconds) an `X-Media-TTL` upload may request. Floors
+    /// churny sub-minute TTLs; the relay clamps a requested TTL to
+    /// `[media_resupply_ttl_min_secs, media_retention_days]`.
+    pub media_resupply_ttl_min_secs: u64,
+    /// Grace window (seconds) before an un-finalized PENDING media reserve is
+    /// reaped as abandoned. Must be ≫ a normal promote so a healthy in-flight
+    /// upload is never reaped.
+    pub media_pending_grace_secs: u64,
+    /// Maximum expired media rows a single upload's always-sweep reclaims before
+    /// the quota preflight. Bounds per-upload work; the cleanup loop is the
+    /// catch-all backstop.
+    pub media_expired_sweep_cap: u32,
+    /// (Scaffolding for C4/C5 — inert in C1.) Per-group ceiling, in bytes, on
+    /// live re-supply/heal media so demand-driven heal can't fill the quota
+    /// faster than the TTL sheds it.
+    pub media_resupply_byte_ceiling_bytes: u64,
+    /// (Scaffolding.) Re-supply/heal uploads allowed per group within
+    /// `media_resupply_rate_window_secs` — a separate lane from fresh-send so
+    /// heal can't starve normal sends.
+    pub media_resupply_rate_limit: u32,
+    /// (Scaffolding.) Sliding window in seconds for the re-supply rate limiter.
+    pub media_resupply_rate_window_secs: u64,
+    /// (Scaffolding.) Pairing-push uploads allowed per pairing-event/device
+    /// within `media_pairing_push_rate_window_secs` — a separate bucket so a
+    /// joiner's burst can't consume the group's fresh-send budget.
+    pub media_pairing_push_rate_limit: u32,
+    /// (Scaffolding.) Sliding window in seconds for the pairing-push limiter.
+    pub media_pairing_push_rate_window_secs: u64,
     /// Wall-clock timeout applied to most non-WebSocket routes. Returns 408 on
     /// expiry. Heavy upload routes (snapshot, media) have their own longer
     /// timeouts so large transfers over slow connections don't trip this cap.
@@ -371,6 +399,30 @@ impl Config {
                 60,
             ),
             media_orphan_cleanup_secs: parse_env_with(&env, "MEDIA_ORPHAN_CLEANUP_SECS", 86400),
+            media_resupply_ttl_min_secs: parse_env_with(&env, "MEDIA_RESUPPLY_TTL_MIN", 3600),
+            media_pending_grace_secs: parse_env_with(&env, "MEDIA_PENDING_GRACE_SECS", 300),
+            media_expired_sweep_cap: parse_env_with(&env, "MEDIA_EXPIRED_SWEEP_CAP", 64),
+            media_resupply_byte_ceiling_bytes: parse_env_with(
+                &env,
+                "MEDIA_RESUPPLY_BYTE_CEILING_BYTES",
+                536_870_912, // 512 MiB
+            ),
+            media_resupply_rate_limit: parse_env_with(&env, "MEDIA_RESUPPLY_RATE_LIMIT", 10),
+            media_resupply_rate_window_secs: parse_env_with(
+                &env,
+                "MEDIA_RESUPPLY_RATE_WINDOW_SECS",
+                60,
+            ),
+            media_pairing_push_rate_limit: parse_env_with(
+                &env,
+                "MEDIA_PAIRING_PUSH_RATE_LIMIT",
+                60,
+            ),
+            media_pairing_push_rate_window_secs: parse_env_with(
+                &env,
+                "MEDIA_PAIRING_PUSH_RATE_WINDOW_SECS",
+                60,
+            ),
             default_request_timeout_secs: parse_env_with(&env, "DEFAULT_REQUEST_TIMEOUT_SECS", 30),
             snapshot_request_timeout_secs: parse_env_with(
                 &env,
@@ -693,6 +745,14 @@ pub fn localhost_test_config() -> Config {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        media_resupply_ttl_min_secs: 3600,
+        media_pending_grace_secs: 300,
+        media_expired_sweep_cap: 64,
+        media_resupply_byte_ceiling_bytes: 536_870_912,
+        media_resupply_rate_limit: 10,
+        media_resupply_rate_window_secs: 60,
+        media_pairing_push_rate_limit: 60,
+        media_pairing_push_rate_window_secs: 60,
         default_request_timeout_secs: 30,
         snapshot_request_timeout_secs: 300,
         media_request_timeout_secs: 120,

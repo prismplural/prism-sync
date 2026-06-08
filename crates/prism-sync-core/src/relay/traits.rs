@@ -625,16 +625,47 @@ pub trait SnapshotExchange: Send + Sync {
     async fn delete_snapshot(&self) -> std::result::Result<(), RelayError>;
 }
 
+/// Outcome of a media upload, distinguishing a committed (servable) blob from a
+/// 202 "another writer is mid-upload" response.
+///
+/// The relay's idempotent upsert returns HTTP 200 when the blob is committed
+/// (insert / idempotent / repair / resurrect) and HTTP 202 when a concurrent
+/// writer already holds the PENDING reserve. **Only a `committed` outcome is a
+/// success the caller may act on** — e.g. C4's responder may broadcast
+/// `media_uploaded` only on `committed`; on `in_progress` it must back off and
+/// re-check batch-exists (the in-flight writer may still fail, in which case the
+/// blob heals on the next demand after the stale-pending reap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaUploadOutcome {
+    /// The blob is committed and servable (HTTP 200).
+    pub committed: bool,
+    /// Another writer holds the reserve; this upload had no effect (HTTP 202).
+    pub in_progress: bool,
+}
+
+impl MediaUploadOutcome {
+    /// The blob is committed and servable.
+    pub const COMMITTED: Self = Self { committed: true, in_progress: false };
+    /// Another writer holds the reserve; back off, do not treat as success.
+    pub const IN_PROGRESS: Self = Self { committed: false, in_progress: true };
+}
+
 /// Media upload and download.
 #[async_trait]
 pub trait MediaRelay: Send + Sync {
     /// Upload an encrypted media blob to the relay.
+    ///
+    /// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
+    /// push); the relay clamps it to `[MEDIA_RESUPPLY_TTL_MIN, retention]`.
+    /// `None` ⇒ the relay's default retention. The header is ignored by an old
+    /// relay (graceful downgrade to default retention).
     async fn upload_media(
         &self,
         media_id: &str,
         content_hash: &str,
         data: Vec<u8>,
-    ) -> std::result::Result<(), RelayError>;
+        ttl_secs: Option<u64>,
+    ) -> std::result::Result<MediaUploadOutcome, RelayError>;
 
     /// Download an encrypted media blob from the relay.
     async fn download_media(&self, media_id: &str) -> std::result::Result<Vec<u8>, RelayError>;

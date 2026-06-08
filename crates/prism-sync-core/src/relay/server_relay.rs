@@ -175,6 +175,19 @@ impl ServerRelay {
         data
     }
 
+    /// Map a non-error (`< 400`) media-upload status to an outcome. `202` is the
+    /// relay's "another writer holds the PENDING reserve" response (in-progress,
+    /// NOT a success the caller may act on); everything else non-error — `200`
+    /// (insert / idempotent / repair / resurrect) and any `204`/`2xx` from an old
+    /// relay — is committed/servable.
+    fn upload_outcome_for_status(status: u16) -> MediaUploadOutcome {
+        if status == 202 {
+            MediaUploadOutcome::IN_PROGRESS
+        } else {
+            MediaUploadOutcome::COMMITTED
+        }
+    }
+
     /// Classify an HTTP status code into a RelayError.
     fn classify_error(status: u16, body: &str) -> RelayError {
         match status {
@@ -998,16 +1011,25 @@ impl MediaRelay for ServerRelay {
         media_id: &str,
         content_hash: &str,
         data: Vec<u8>,
-    ) -> Result<(), RelayError> {
+        ttl_secs: Option<u64>,
+    ) -> Result<MediaUploadOutcome, RelayError> {
         let url = format!("{}/media", self.base_path());
         let path = self.canonical_path("/media");
-        debug!("upload_media media_id={media_id}");
+        debug!("upload_media media_id={media_id} ttl_secs={ttl_secs:?}");
 
-        let resp = self
+        // X-Media-TTL is NOT part of the signed request bytes (signing covers
+        // body/path/device/timestamp/nonce), so an old relay simply ignores it
+        // and applies its default retention — back-compat both ways.
+        let mut req = self
             .apply_signed_auth(self.client.post(&url), "POST", &path, &data)
             .header("X-Media-Id", media_id)
             .header("X-Content-Hash", content_hash)
-            .header("Content-Type", "application/octet-stream")
+            .header("Content-Type", "application/octet-stream");
+        if let Some(ttl) = ttl_secs {
+            req = req.header("X-Media-TTL", ttl.to_string());
+        }
+
+        let resp = req
             .body(data)
             .timeout(self.snapshot_timeout)
             .send()
@@ -1019,8 +1041,7 @@ impl MediaRelay for ServerRelay {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(Self::classify_error(status, &body_text));
         }
-
-        Ok(())
+        Ok(Self::upload_outcome_for_status(status))
     }
 
     async fn download_media(&self, media_id: &str) -> Result<Vec<u8>, RelayError> {
@@ -1141,7 +1162,22 @@ fn build_register_device_body(req: &RegisterRequest) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::ServerRelay;
-    use crate::relay::traits::{RegisterRequest, RegistryApproval, RelayError};
+    use crate::relay::traits::{
+        MediaUploadOutcome, RegisterRequest, RegistryApproval, RelayError,
+    };
+
+    #[test]
+    fn media_upload_status_maps_to_outcome() {
+        // 200 (insert / idempotent / repair / resurrect) ⇒ committed.
+        assert_eq!(ServerRelay::upload_outcome_for_status(200), MediaUploadOutcome::COMMITTED);
+        // 202 (a concurrent writer holds the reserve) ⇒ in-progress, NOT success.
+        let in_progress = ServerRelay::upload_outcome_for_status(202);
+        assert_eq!(in_progress, MediaUploadOutcome::IN_PROGRESS);
+        assert!(!in_progress.committed, "202 must not look like a committed success");
+        assert!(in_progress.in_progress);
+        // An old relay's 204/other 2xx ⇒ committed (back-compat).
+        assert_eq!(ServerRelay::upload_outcome_for_status(204), MediaUploadOutcome::COMMITTED);
+    }
 
     fn test_relay(initial_session_token: &str) -> ServerRelay {
         let device_id = "test-device";

@@ -76,6 +76,14 @@ fn base_test_config() -> Config {
         media_upload_rate_limit: 100,
         media_upload_rate_window_secs: 60,
         media_orphan_cleanup_secs: 86400,
+        media_resupply_ttl_min_secs: 3600,
+        media_pending_grace_secs: 300,
+        media_expired_sweep_cap: 64,
+        media_resupply_byte_ceiling_bytes: 536_870_912,
+        media_resupply_rate_limit: 10,
+        media_resupply_rate_window_secs: 60,
+        media_pairing_push_rate_limit: 60,
+        media_pairing_push_rate_window_secs: 60,
         gif_provider_mode: prism_sync_relay::GifProviderMode::Disabled,
         gif_public_base_url: None,
         gif_prism_base_url: None,
@@ -706,4 +714,407 @@ async fn media_upload_completes_past_default_timeout() {
         "media POST should succeed within its own (longer) timeout window \
          even when the upload exceeds the default 1s timeout"
     );
+}
+
+// ───────────────────────── C1: lifecycle / TTL / idempotent upsert ─────────────
+
+/// Upload helper that also sends an `X-Media-TTL` header (re-supply variant).
+/// The header is intentionally NOT covered by the request signature, so a
+/// successful upload also proves it is not part of the signed bytes.
+#[allow(clippy::too_many_arguments)]
+async fn upload_media_with_ttl(
+    client: &Client,
+    url: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    sync_id: &str,
+    device_id: &str,
+    media_id: &str,
+    data: &[u8],
+    ttl_secs: u64,
+) -> reqwest::Response {
+    let hash = sha256_hex(data);
+    let path = format!("/v1/sync/{sync_id}/media");
+    let builder = client
+        .post(format!("{url}{path}"))
+        .bearer_auth(token)
+        .header("X-Media-Id", media_id)
+        .header("X-Content-Hash", &hash)
+        .header("X-Media-TTL", ttl_secs.to_string())
+        .body(data.to_vec());
+
+    apply_signed_headers(builder, keys, "POST", &path, sync_id, device_id, data)
+        .send()
+        .await
+        .unwrap()
+}
+
+fn config_with_storage(path: &str) -> Config {
+    let mut c = base_test_config();
+    c.media_storage_path = path.to_string();
+    c
+}
+
+fn final_media_path(storage: &str, sync_id: &str, media_id: &str) -> std::path::PathBuf {
+    std::path::Path::new(storage).join(sync_id).join(media_id)
+}
+
+async fn setup_group(db: &std::sync::Arc<prism_sync_relay::db::Database>, sync_id: &str) {
+    db.with_conn(|conn| {
+        db::create_sync_group(conn, sync_id, 0)?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn upload_without_ttl_defaults_to_no_expiry() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![1u8; 64];
+    let resp = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-no-ttl", &data)
+        .await;
+    assert_eq!(resp.status(), 200);
+
+    let row = db.with_conn(|c| db::get_media_metadata(c, "m-no-ttl")).unwrap().unwrap();
+    assert!(row.expires_at.is_none(), "no X-Media-TTL ⇒ default retention (NULL)");
+    assert!(row.committed_at.is_some(), "successful upload ⇒ committed");
+}
+
+#[tokio::test]
+async fn upload_with_ttl_sets_clamped_expires_at() {
+    let (url, _h, db) = start_test_relay().await; // default min=3600, retention=90d
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    // Below the floor → clamped up to the 3600s minimum.
+    let data = vec![2u8; 64];
+    upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "m-min", &data, 1)
+        .await;
+    let row = db.with_conn(|c| db::get_media_metadata(c, "m-min")).unwrap().unwrap();
+    assert_eq!(row.expires_at, Some(row.created_at + 3600), "clamped to min floor");
+
+    // Within range → honored exactly.
+    upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "m-mid", &data, 7200)
+        .await;
+    let row = db.with_conn(|c| db::get_media_metadata(c, "m-mid")).unwrap().unwrap();
+    assert_eq!(row.expires_at, Some(row.created_at + 7200), "honored within range");
+
+    // Above retention → clamped down to retention (90d = 7_776_000s).
+    upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "m-max", &data, 999_999_999,
+    )
+    .await;
+    let row = db.with_conn(|c| db::get_media_metadata(c, "m-max")).unwrap().unwrap();
+    assert_eq!(row.expires_at, Some(row.created_at + 7_776_000), "clamped to retention ceiling");
+}
+
+#[tokio::test]
+async fn download_404_after_ttl_expiry() {
+    let mut config = base_test_config();
+    config.media_resupply_ttl_min_secs = 1; // allow a 1s TTL for the test
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![3u8; 64];
+    let resp =
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "m-ttl", &data, 1)
+            .await;
+    assert_eq!(resp.status(), 200);
+
+    // Servable immediately.
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/media/m-ttl"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Past TTL ⇒ servable predicate fails ⇒ 404 (independent of the file).
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/media/m-ttl"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "expired blob is not servable");
+}
+
+#[tokio::test]
+async fn idempotent_reupload_same_content_zero_quota_delta() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![4u8; 128];
+    assert_eq!(
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-idem", &data)
+            .await
+            .status(),
+        200
+    );
+    let usage_before = db.with_conn(|c| db::get_group_media_usage(c, &sync_id)).unwrap();
+
+    // Re-upload identical bytes (same content hash) → idempotent 200, Δquota 0.
+    assert_eq!(
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-idem", &data)
+            .await
+            .status(),
+        200
+    );
+    let usage_after = db.with_conn(|c| db::get_group_media_usage(c, &sync_id)).unwrap();
+    assert_eq!(usage_before, usage_after, "idempotent re-upload must not change quota");
+
+    // Still downloadable with the original bytes.
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/media/m-idem"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap()[..], data[..]);
+}
+
+#[tokio::test]
+async fn repair_reupload_when_file_missing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let storage = tmp.path().to_str().unwrap().to_string();
+    let (url, _h, db) = start_test_relay_with_config(config_with_storage(&storage)).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![5u8; 256];
+    assert_eq!(
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-repair", &data)
+            .await
+            .status(),
+        200
+    );
+    let usage_before = db.with_conn(|c| db::get_group_media_usage(c, &sync_id)).unwrap();
+
+    // Simulate a lost file (legacy crash row): metadata says committed, file gone.
+    let file = final_media_path(&storage, &sync_id, "m-repair");
+    std::fs::remove_file(&file).unwrap();
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/media/m-repair"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "missing file ⇒ download 404 (belt-and-suspenders)");
+
+    // Re-upload identical bytes → repair: re-stage→promote→finalize, Δquota 0.
+    assert_eq!(
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-repair", &data)
+            .await
+            .status(),
+        200
+    );
+    assert!(file.exists(), "repair restores the file");
+    let usage_after = db.with_conn(|c| db::get_group_media_usage(c, &sync_id)).unwrap();
+    assert_eq!(usage_before, usage_after, "repair must not change quota");
+
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/media/m-repair"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap()[..], data[..]);
+}
+
+#[tokio::test]
+async fn resurrect_after_expiry_recounts_quota() {
+    let mut config = base_test_config();
+    config.media_resupply_ttl_min_secs = 1;
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![6u8; 200];
+    upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "m-res", &data, 1)
+        .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Expired ⇒ excluded from quota.
+    assert_eq!(db.with_conn(|c| db::get_group_media_usage(c, &sync_id)).unwrap(), 0);
+
+    // Re-upload ⇒ resurrect, Δquota +size, servable again.
+    assert_eq!(
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-res", &data)
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(db.with_conn(|c| db::get_group_media_usage(c, &sync_id)).unwrap(), 200);
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/media/m-res"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn over_quota_preflight_rejects_before_staging() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let storage = tmp.path().to_str().unwrap().to_string();
+    let mut config = config_with_storage(&storage);
+    config.media_quota_bytes_per_group = 1024;
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data1 = vec![7u8; 900];
+    assert_eq!(
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-fill", &data1)
+            .await
+            .status(),
+        200
+    );
+
+    // 900 + 200 > 1024 ⇒ rejected before any bytes are staged.
+    let data2 = vec![8u8; 200];
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-over", &data2).await;
+    assert_eq!(resp.status(), 507);
+
+    // No final file and no leftover staging file for the rejected upload.
+    assert!(!final_media_path(&storage, &sync_id, "m-over").exists());
+    let staging_dir = std::path::Path::new(&storage).join(&sync_id).join(".staging");
+    if staging_dir.exists() {
+        let leftovers: Vec<_> = std::fs::read_dir(&staging_dir).unwrap().flatten().collect();
+        assert!(leftovers.is_empty(), "preflight reject must not leave staging files");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_same_media_id_uploads_no_clobber() {
+    use futures::future::join_all;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let storage = tmp.path().to_str().unwrap().to_string();
+    let (url, _h, db) = start_test_relay_with_config(config_with_storage(&storage)).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![9u8; 512];
+    // Fire several concurrent uploads of the SAME id + content.
+    let uploads = (0..8).map(|_| {
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-conc", &data)
+    });
+    let results = join_all(uploads).await;
+    for resp in results {
+        let status = resp.status().as_u16();
+        assert!(status == 200 || status == 202, "each upload is committed or in-progress, got {status}");
+    }
+
+    // The blob ends servable with the right bytes…
+    let resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/media/m-conc"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap()[..], data[..]);
+
+    // …and there is exactly one final file (no cross-delete / clobber).
+    let sync_dir = std::path::Path::new(&storage).join(&sync_id);
+    let finals: Vec<_> = std::fs::read_dir(&sync_dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .collect();
+    assert_eq!(finals.len(), 1, "exactly one committed file for the media_id");
+}
+
+#[tokio::test]
+async fn always_sweep_keeps_disk_near_quota() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let storage = tmp.path().to_str().unwrap().to_string();
+    let mut config = config_with_storage(&storage);
+    config.media_resupply_ttl_min_secs = 1;
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    // Three short-TTL blobs land on disk.
+    let data = vec![0xAAu8; 300];
+    for id in ["c1", "c2", "c3"] {
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, id, &data, 1)
+            .await;
+        assert!(final_media_path(&storage, &sync_id, id).exists());
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // A fresh upload's always-sweep reclaims the expired files first, so
+    // physical disk tracks the live set (≈ quota), not the whole history.
+    let fresh = vec![0xBBu8; 64];
+    upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "c-fresh", &fresh).await;
+    for id in ["c1", "c2", "c3"] {
+        assert!(
+            !final_media_path(&storage, &sync_id, id).exists(),
+            "expired file {id} swept from disk by the next upload"
+        );
+    }
+    assert!(final_media_path(&storage, &sync_id, "c-fresh").exists());
+}
+
+#[tokio::test]
+async fn servable_upload_implies_file_present() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let storage = tmp.path().to_str().unwrap().to_string();
+    let (url, _h, db) = start_test_relay_with_config(config_with_storage(&storage)).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![0xCDu8; 128];
+    assert_eq!(
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-inv", &data)
+            .await
+            .status(),
+        200
+    );
+    // The servable-⟹-file invariant: a committed/servable row has its file.
+    let row = db.with_conn(|c| db::get_media_metadata(c, "m-inv")).unwrap().unwrap();
+    assert!(row.committed_at.is_some() && row.deleted_at.is_none());
+    assert!(final_media_path(&storage, &sync_id, "m-inv").exists());
 }

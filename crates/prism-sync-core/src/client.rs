@@ -2216,7 +2216,8 @@ mod tests {
             _: &str,
             _: &str,
             _: Vec<u8>,
-        ) -> std::result::Result<(), RelayError> {
+            _: Option<u64>,
+        ) -> std::result::Result<MediaUploadOutcome, RelayError> {
             unimplemented!()
         }
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
@@ -2492,7 +2493,8 @@ mod tests {
             _: &str,
             _: &str,
             _: Vec<u8>,
-        ) -> std::result::Result<(), RelayError> {
+            _: Option<u64>,
+        ) -> std::result::Result<MediaUploadOutcome, RelayError> {
             unimplemented!()
         }
 

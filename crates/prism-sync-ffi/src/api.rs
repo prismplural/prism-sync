@@ -2333,7 +2333,21 @@ pub async fn on_resume(handle: &PrismSyncHandle) -> Result<(), String> {
     }
 }
 
+/// Outcome of a media upload surfaced to Dart.
+///
+/// `committed` ⇒ the blob is committed and servable (relay HTTP 200).
+/// `in_progress` ⇒ another writer holds the PENDING reserve (relay HTTP 202):
+/// this is **not** a success to act on — the caller (C4 responder) must back off
+/// and re-check batch-exists rather than broadcast `media_uploaded`.
+pub struct MediaUploadOutcome {
+    pub committed: bool,
+    pub in_progress: bool,
+}
+
 /// Upload an encrypted media blob to the relay.
+///
+/// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
+/// push); the relay clamps it and an old relay ignores it (default retention).
 ///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 pub async fn upload_media(
@@ -2341,7 +2355,8 @@ pub async fn upload_media(
     media_id: String,
     content_hash: String,
     data: Vec<u8>,
-) -> Result<(), String> {
+    ttl_secs: Option<u64>,
+) -> Result<MediaUploadOutcome, String> {
     let relay = handle
         .relay
         .lock()
@@ -2349,8 +2364,11 @@ pub async fn upload_media(
         .and_then(|guard| guard.clone())
         .ok_or_else(|| "Relay not configured".to_string())?;
 
-    match relay.upload_media(&media_id, &content_hash, data).await {
-        Ok(()) => Ok(()),
+    match relay.upload_media(&media_id, &content_hash, data, ttl_secs).await {
+        Ok(outcome) => Ok(MediaUploadOutcome {
+            committed: outcome.committed,
+            in_progress: outcome.in_progress,
+        }),
         Err(error) => Err(format_handle_relay_error(handle, "upload_media", error).await),
     }
 }
