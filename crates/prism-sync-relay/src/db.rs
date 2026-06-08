@@ -2674,14 +2674,20 @@ pub fn get_group_media_usage_at(
     pending_grace_secs: i64,
 ) -> Result<i64, rusqlite::Error> {
     let stale_pending_cutoff = now.saturating_sub(pending_grace_secs);
+    // Two independently-gated classes count toward quota:
+    //  - committed & live: not past its TTL (`expires_at` governs).
+    //  - pending & non-stale: a reserve still occupying space. This is gated by
+    //    `reserved_at` staleness ALONE — a pending row's `expires_at` is
+    //    irrelevant (a not-yet-promoted upload still holds bytes regardless of
+    //    its prospective TTL), otherwise an abandoned-but-not-yet-reaped pending
+    //    row could stop counting before the reaper deletes it.
     conn.query_row(
         "SELECT COALESCE(SUM(size_bytes), 0) FROM media_metadata
          WHERE sync_id = ?1
            AND deleted_at IS NULL
-           AND (expires_at IS NULL OR expires_at > ?2)
            AND (
-                 committed_at IS NOT NULL
-              OR reserved_at >= ?3
+                 (committed_at IS NOT NULL AND (expires_at IS NULL OR expires_at > ?2))
+              OR (committed_at IS NULL AND reserved_at >= ?3)
            )",
         params![sync_id, now, stale_pending_cutoff],
         |row| row.get(0),
@@ -2767,6 +2773,17 @@ pub fn reserve_media_upload(
         )?;
         return Ok(ReserveOutcome::ReservedPending);
     };
+
+    // `media_id` is a GLOBAL primary key, so a row may belong to another sync
+    // group. We must never mutate or promote against another group's row, and
+    // the uploader can't insert its own row (PK collision), so this is a hard
+    // conflict. Unreachable for honest clients (media_ids are random /
+    // content-derived and globally unique in practice), but the relay must not
+    // assume that — a forged `X-Media-Id` referencing another group's id would
+    // otherwise corrupt that group's availability accounting.
+    if row.sync_id != sync_id {
+        return Ok(ReserveOutcome::HashConflict);
+    }
 
     // A different content for the same id is a hard conflict in every state
     // (the id⟺content bijection means this never happens in practice).
@@ -2880,12 +2897,18 @@ pub fn mark_media_deleted(conn: &Connection, media_id: &str) -> Result<(), rusql
     Ok(())
 }
 
-/// Find committed media that has exceeded retention — either the global
-/// `retention_days` floor (legacy `created_at` cutoff) OR its own per-blob
-/// `expires_at` TTL — and mark it deleted. Returns the (sync_id, media_id)
-/// pairs for disk cleanup. Only touches COMMITTED rows: in-flight/abandoned
-/// PENDING reserves are owned by [`reap_stale_pending_media`], so this can
-/// never race a live upload.
+/// Find committed media that has exceeded retention and mark it deleted.
+/// Returns the (sync_id, media_id) pairs for disk cleanup. Only touches
+/// COMMITTED rows: in-flight/abandoned PENDING reserves are owned by
+/// [`reap_stale_pending_media`], so this can never race a live upload.
+///
+/// Retention is governed per blob: a blob WITH a per-blob `expires_at` (a
+/// short-TTL re-supply / pairing push) lives exactly until its TTL — the legacy
+/// `created_at` floor does NOT apply, because a re-supply only refreshes
+/// `expires_at`, and applying the `created_at` floor too would delete a
+/// long-tail blob right after it was healed (its `created_at` may be years old
+/// while its TTL is hours in the future). A blob WITHOUT a TTL (default
+/// retention) is governed by the global `retention_days` `created_at` floor.
 pub fn cleanup_expired_media(
     conn: &Connection,
     retention_days: u64,
@@ -2896,7 +2919,10 @@ pub fn cleanup_expired_media(
         "UPDATE media_metadata SET deleted_at = ?1
          WHERE deleted_at IS NULL
            AND committed_at IS NOT NULL
-           AND (created_at < ?2 OR (expires_at IS NOT NULL AND expires_at <= ?1))
+           AND (
+                 (expires_at IS NOT NULL AND expires_at <= ?1)
+              OR (expires_at IS NULL AND created_at < ?2)
+           )
          RETURNING sync_id, media_id",
     )?;
     let pairs: Vec<(String, String)> = stmt
@@ -2931,13 +2957,16 @@ pub fn reap_stale_pending_media(
     Ok(pairs)
 }
 
-/// Return the full set of `(sync_id, media_id)` for currently-staged
-/// (`committed_at IS NULL`) media in the DB. Used by the orphan-file sweep to
-/// decide which staging files still have a backing row. Also returns every
-/// known final-path key so the sweep can detect rows whose existence is real
-/// vs. files with no row at all.
+/// Return `(sync_id, media_id)` for every NON-deleted row (committed or pending)
+/// — the set of final files that legitimately back a row. Used by the
+/// orphan-file sweep: any final file NOT in this set is reclaimable. Soft-
+/// deleted rows are EXCLUDED so that a file whose unlink failed at soft-delete
+/// time (transient FS error) is later reclaimed as an orphan rather than leaked
+/// forever (`cleanup_expired_media` never revisits a `deleted_at IS NOT NULL`
+/// row).
 pub fn all_media_keys(conn: &Connection) -> Result<Vec<(String, String)>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT sync_id, media_id FROM media_metadata")?;
+    let mut stmt =
+        conn.prepare("SELECT sync_id, media_id FROM media_metadata WHERE deleted_at IS NULL")?;
     let pairs: Vec<(String, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
@@ -5274,5 +5303,111 @@ mod tests {
                 ("sg".to_string(), "live-ttl".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn reserve_cross_sync_same_media_id_is_conflict_and_leaves_other_group_untouched() {
+        // media_id is a GLOBAL primary key. A row owned by another sync group
+        // must never be mutated/promoted by this group's upload — even on the
+        // same content hash (the cross-tenant hole codex flagged).
+        let db = media_test_db();
+        db.with_conn(|c| create_sync_group(c, "sg2", 0)).unwrap();
+        let now = 1_000_000;
+        // Group "sg" owns media_id "m" with a fixed TTL.
+        db.with_conn(|c| {
+            reserve_media_upload(c, "m", "sg", "d", 10, HASH_A, Some(now + 1000), 10_000, now, 300, false)?;
+            finalize_media(c, "m", now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Group "sg2" tries to upload the SAME media_id + SAME hash → conflict,
+        // not an idempotent/repair on sg's row.
+        let oc = db
+            .with_conn(|c| {
+                let tx = c.unchecked_transaction()?;
+                let oc = reserve_media_upload(
+                    &tx, "m", "sg2", "d2", 10, HASH_A, None, 10_000, now, 300, true,
+                )?;
+                tx.commit()?;
+                Ok(oc)
+            })
+            .unwrap();
+        assert_eq!(oc, ReserveOutcome::HashConflict);
+
+        // sg's row is completely untouched: still its sync_id, TTL unchanged.
+        db.with_read_conn(|c| {
+            let row = get_media_metadata(c, "m")?.unwrap();
+            assert_eq!(row.sync_id, "sg");
+            assert_eq!(row.expires_at, Some(now + 1000), "other group's TTL not mutated");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_respects_future_ttl_over_created_at_floor() {
+        // The whole point of re-supply: a blob with a fresh per-blob TTL must
+        // survive even if its created_at is years past the global retention
+        // floor (a re-upload only refreshes expires_at, not created_at).
+        let db = media_test_db();
+        let now = now_secs();
+        let ancient = now - 365 * 86400; // ~1 year old
+        db.with_conn(|c| {
+            // Old created_at but a FUTURE per-blob TTL → must NOT be cleaned.
+            c.execute(
+                "INSERT INTO media_metadata
+                     (media_id, sync_id, device_id, size_bytes, content_hash, created_at, expires_at, committed_at)
+                 VALUES ('healed','sg','d',10,?1,?2,?3,?2)",
+                params![HASH_A, ancient, now + 48 * 3600],
+            )?;
+            // Old created_at, NO TTL (default retention) → governed by floor → cleaned.
+            c.execute(
+                "INSERT INTO media_metadata
+                     (media_id, sync_id, device_id, size_bytes, content_hash, created_at, committed_at)
+                 VALUES ('stale-default','sg','d',10,?1,?2,?2)",
+                params![HASH_B, ancient],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cleaned = db.with_conn(|c| cleanup_expired_media(c, 90)).unwrap();
+        assert_eq!(cleaned, vec![("sg".to_string(), "stale-default".to_string())]);
+        db.with_read_conn(|c| {
+            assert!(
+                get_media_metadata(c, "healed")?.unwrap().deleted_at.is_none(),
+                "future-TTL blob must survive its old created_at"
+            );
+            assert!(get_media_metadata(c, "stale-default")?.unwrap().deleted_at.is_some());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pending_counts_toward_quota_regardless_of_ttl() {
+        // A non-stale pending reserve occupies space even if its prospective TTL
+        // has nominally elapsed — quota must count it by reserved_at staleness
+        // alone, or it could stop counting before the reaper deletes it.
+        let db = media_test_db();
+        let now = now_secs();
+        db.with_conn(|c| {
+            // Pending (committed_at NULL), fresh reserve, but expires_at already
+            // in the past.
+            c.execute(
+                "INSERT INTO media_metadata
+                     (media_id, sync_id, device_id, size_bytes, content_hash, created_at, expires_at, reserved_at)
+                 VALUES ('p','sg','d',100,?1,?2,?3,?2)",
+                params![HASH_A, now, now - 5],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // grace 300s, reserved_at = now (fresh) → counts despite past expires_at.
+        assert_eq!(db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now, 300)).unwrap(), 100);
+        // If the reserve were stale (reserved_at well before the cutoff) it would
+        // drop out (about to be reaped).
+        assert_eq!(db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now + 10_000, 300)).unwrap(), 0);
     }
 }

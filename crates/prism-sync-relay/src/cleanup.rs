@@ -242,12 +242,19 @@ async fn run_cleanup(state: &AppState) {
         match result {
             Ok(Ok((reaped, known))) => {
                 let storage = &state.config.media_storage_path;
-                let grace = state.config.media_pending_grace_secs as i64;
                 // Unlink final files for reaped pending rows, then sweep
-                // orphaned finals + abandoned staging files.
+                // orphaned finals + abandoned staging files. The orphan sweep
+                // age-gates with the dedicated, long `media_orphan_cleanup_secs`
+                // (not the 5-min pending grace): `rename` preserves the staging
+                // file's mtime, so a lock-delayed upload could be promoted with
+                // an "old" mtime just after the known-rows snapshot was taken —
+                // a short gate could then delete a healthy just-committed file.
+                // A day-long gate closes that race (an upload that old has long
+                // since timed out and been reaped).
+                let orphan_grace = state.config.media_orphan_cleanup_secs as i64;
                 let reaped_cleaned = cleanup_media_files(storage, &reaped);
                 cleanup_empty_media_dirs(storage, &reaped);
-                let orphans_cleaned = sweep_orphan_media_files(storage, &known, grace);
+                let orphans_cleaned = sweep_orphan_media_files(storage, &known, orphan_grace);
                 if !reaped.is_empty() || orphans_cleaned > 0 {
                     tracing::info!(
                         reaped_pending = reaped.len(),

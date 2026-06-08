@@ -51,10 +51,16 @@ fn staging_file_path(
 /// default 90-day retention). The header is NOT part of the signed request
 /// bytes, so old/new client+relay combinations all degrade gracefully.
 fn parse_media_ttl(headers: &HeaderMap, config: &crate::config::Config, now: i64) -> Option<i64> {
-    let requested = headers
-        .get("X-Media-TTL")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())?;
+    let raw = headers.get("X-Media-TTL")?;
+    let Some(requested) = raw.to_str().ok().and_then(|s| s.parse::<u64>().ok()) else {
+        // A PRESENT-but-malformed header almost certainly means a client bug.
+        // We still fall through to default retention (back-compat requires
+        // ignoring unknown/garbage headers), but log it: silently pinning a
+        // re-supply blob for the full 90 days would quietly defeat the
+        // ephemerality goal.
+        tracing::debug!("ignoring unparseable X-Media-TTL header; using default retention");
+        return None;
+    };
     let min = config.media_resupply_ttl_min_secs;
     let max = config.media_retention_days.saturating_mul(86_400);
     let clamped = requested.clamp(min, max.max(min));
