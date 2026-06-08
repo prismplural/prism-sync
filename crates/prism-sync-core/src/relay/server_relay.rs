@@ -1179,12 +1179,18 @@ impl MediaRelay for ServerRelay {
         }
 
         let body: serde_json::Value = resp.json().await.map_err(Self::classify_reqwest_error)?;
-        let present = body
-            .get("present")
-            .and_then(|p| p.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        Ok(present)
+        // A 200 that lacks a `present` array is a malformed response (e.g. a
+        // misbehaving proxy) — surface it as an error rather than silently
+        // reading it as "all absent", which C4 would misinterpret as "request
+        // everything".
+        match body.get("present").and_then(|p| p.as_array()) {
+            Some(arr) => {
+                Ok(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            }
+            None => Err(RelayError::Protocol {
+                message: "batch-exists response missing 'present' array".into(),
+            }),
+        }
     }
 }
 

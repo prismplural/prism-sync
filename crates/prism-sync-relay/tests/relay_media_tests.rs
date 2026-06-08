@@ -1207,6 +1207,55 @@ async fn batch_exists_rejects_oversized_request() {
 }
 
 #[tokio::test]
+async fn batch_exists_accepts_id_count_at_cap() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![3u8; 16];
+    upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "real-one", &data).await;
+
+    // Exactly the cap (1024 ids), one of which is servable.
+    let mut ids: Vec<String> = (0..1023).map(|i| format!("id-{i}")).collect();
+    ids.push("real-one".to_string());
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/media/exists"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "media_ids": ids }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "1024 ids is at the cap, not over it");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["present"].as_array().unwrap(), &vec![serde_json::json!("real-one")]);
+}
+
+#[tokio::test]
+async fn batch_exists_rejects_oversized_body() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, _keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    // A body well over the route's 64 KiB cap must be rejected before parsing,
+    // even though it stays within the shared 10 MiB authenticated limit.
+    let big = "x".repeat(200 * 1024);
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/media/exists"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "media_ids": [big] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413, "oversized body rejected by the per-route limit");
+}
+
+#[tokio::test]
 async fn batch_exists_requires_auth() {
     let (url, _h, db) = start_test_relay().await;
     let client = Client::new();
