@@ -220,7 +220,13 @@ impl SnapshotExchange for RekeyMockRelay {
 
 #[async_trait]
 impl MediaRelay for RekeyMockRelay {
-    async fn upload_media(&self, _: &str, _: &str, _: Vec<u8>) -> Result<(), RelayError> {
+    async fn upload_media(
+        &self,
+        _: &str,
+        _: &str,
+        _: Vec<u8>,
+        _: Option<u64>,
+    ) -> Result<MediaUploadOutcome, RelayError> {
         unimplemented!()
     }
     async fn download_media(&self, _: &str) -> Result<Vec<u8>, RelayError> {

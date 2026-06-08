@@ -220,6 +220,44 @@ async fn run_cleanup(state: &AppState) {
         Err(e) => tracing::error!("cleanup task panic: {e}"),
     }
 
+    // Media lifecycle backstops: reap abandoned PENDING reserves (row + files)
+    // and sweep orphaned media files. Kept separate from the giant cleanup
+    // tuple above for clarity. The stale-pending grace must be ≫ a normal
+    // promote so a healthy in-flight upload is never reaped.
+    {
+        let db = state.db.clone();
+        let grace = state.config.media_pending_grace_secs as i64;
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let reaped = crate::db::reap_stale_pending_media(conn, grace)?;
+                let known = crate::db::all_media_keys(conn)?;
+                Ok::<_, rusqlite::Error>((reaped, known))
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok((reaped, known))) => {
+                let storage = &state.config.media_storage_path;
+                let grace = state.config.media_pending_grace_secs as i64;
+                // Unlink final files for reaped pending rows, then sweep
+                // orphaned finals + abandoned staging files.
+                let reaped_cleaned = cleanup_media_files(storage, &reaped);
+                cleanup_empty_media_dirs(storage, &reaped);
+                let orphans_cleaned = sweep_orphan_media_files(storage, &known, grace);
+                if !reaped.is_empty() || orphans_cleaned > 0 {
+                    tracing::info!(
+                        reaped_pending = reaped.len(),
+                        reaped_cleaned,
+                        orphans_cleaned,
+                        "media pending/orphan sweep complete"
+                    );
+                }
+            }
+            Ok(Err(e)) => tracing::error!("media pending/orphan sweep db error: {e}"),
+            Err(e) => tracing::error!("media pending/orphan sweep task panicked: {e}"),
+        }
+    }
+
     // Refresh DB-state metric cache. Runs after the cleanup block regardless
     // of whether cleanup succeeded, so metrics don't go stale on cleanup errors.
     // Keeps previous cached values on query failure rather than storing 0.
@@ -280,6 +318,12 @@ async fn run_cleanup(state: &AppState) {
     state.revoke_rate_limiter.prune_stale(state.config.revoke_rate_window_secs);
     state.pairing_rate_limiter.prune_stale(60);
     state.media_upload_rate_limiter.prune_stale(state.config.media_upload_rate_window_secs);
+    // Re-supply / pairing-push limiters are scaffolding (enforcement lands with
+    // C4/C5) but are pruned here so their windows don't accumulate.
+    state.media_resupply_rate_limiter.prune_stale(state.config.media_resupply_rate_window_secs);
+    state
+        .media_pairing_push_rate_limiter
+        .prune_stale(state.config.media_pairing_push_rate_window_secs);
 }
 
 /// Collect media_ids for sync groups that are about to be pruned.
@@ -322,6 +366,93 @@ fn cleanup_media_files(storage_path: &str, items: &[(String, String)]) -> usize 
             std::fs::remove_file(&path).is_ok()
         })
         .count()
+}
+
+/// Remove media files with no backing DB row (orphaned final files) and
+/// abandoned staging files. Pure disk hygiene — the DB is the source of truth.
+///
+/// Both removals are age-gated by `staging_grace_secs`: `known` is a snapshot
+/// that may be slightly stale relative to the filesystem walk, so a final file
+/// younger than the grace window might belong to a just-committed upload not yet
+/// in the snapshot. Only files older than the grace are removed, which is safe
+/// because a healthy upload commits its row within seconds (≪ grace). Returns
+/// the number of files removed.
+fn sweep_orphan_media_files(
+    storage_path: &str,
+    known: &[(String, String)],
+    staging_grace_secs: i64,
+) -> usize {
+    use std::collections::HashSet;
+    let known: HashSet<(&str, &str)> =
+        known.iter().map(|(s, m)| (s.as_str(), m.as_str())).collect();
+    let root = std::path::Path::new(storage_path);
+    let Ok(sync_dirs) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let now = crate::db::now_secs();
+    let mut removed = 0usize;
+
+    for sync_entry in sync_dirs.flatten() {
+        let sync_path = sync_entry.path();
+        if !sync_path.is_dir() {
+            continue;
+        }
+        let Some(sync_id) =
+            sync_path.file_name().and_then(|n| n.to_str()).map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(files) = std::fs::read_dir(&sync_path) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+
+            if name == ".staging" {
+                // Abandoned staging files older than the grace window. A live
+                // upload's staging file is < grace old.
+                if let Ok(staging) = std::fs::read_dir(&path) {
+                    for st in staging.flatten() {
+                        let stp = st.path();
+                        if stp.is_file()
+                            && file_older_than(&stp, now, staging_grace_secs)
+                            && std::fs::remove_file(&stp).is_ok()
+                        {
+                            removed += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // A final file with no backing row is an orphan (age-gated against
+            // the snapshot-vs-walk race — see fn doc).
+            if path.is_file()
+                && !known.contains(&(sync_id.as_str(), name.as_str()))
+                && file_older_than(&path, now, staging_grace_secs)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+
+    removed
+}
+
+/// True if `path`'s mtime is more than `age_secs` before `now` (unix seconds).
+/// Errors (missing file / unreadable mtime) conservatively return `false` so a
+/// file is never removed on a metadata read failure.
+fn file_older_than(path: &std::path::Path, now: i64, age_secs: i64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (now - d.as_secs() as i64) > age_secs)
+        .unwrap_or(false)
 }
 
 /// Try to remove empty sync_id directories after media files have been cleaned up.
@@ -399,5 +530,44 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn orphan_sweep_removes_unbacked_finals_and_staging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = tmp.path().to_str().unwrap();
+        let sync_dir = tmp.path().join("sg");
+        let staging_dir = sync_dir.join(".staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+
+        // A final file with a backing row (kept), one without (orphan), and a
+        // staging file (abandoned).
+        std::fs::write(sync_dir.join("keep"), b"k").unwrap();
+        std::fs::write(sync_dir.join("orphan"), b"o").unwrap();
+        std::fs::write(staging_dir.join("up.deadbeef"), b"s").unwrap();
+
+        let known = vec![("sg".to_string(), "keep".to_string())];
+        // age_secs = -1 forces the age gate true regardless of mtime.
+        let removed = sweep_orphan_media_files(storage, &known, -1);
+        assert_eq!(removed, 2, "orphan final + staging file removed");
+        assert!(sync_dir.join("keep").exists(), "backed final survives");
+        assert!(!sync_dir.join("orphan").exists(), "unbacked final removed");
+        assert!(!staging_dir.join("up.deadbeef").exists(), "staging removed");
+    }
+
+    #[test]
+    fn orphan_sweep_age_gate_spares_fresh_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = tmp.path().to_str().unwrap();
+        let sync_dir = tmp.path().join("sg");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::write(sync_dir.join("fresh-orphan"), b"x").unwrap();
+
+        // A just-written file is younger than a large grace window, so even
+        // though it has no backing row it must NOT be removed (protects the
+        // snapshot-vs-walk race against a just-committed upload).
+        let removed = sweep_orphan_media_files(storage, &[], 86_400);
+        assert_eq!(removed, 0);
+        assert!(sync_dir.join("fresh-orphan").exists());
     }
 }

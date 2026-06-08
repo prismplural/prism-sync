@@ -4502,6 +4502,7 @@ fn wire__crate__api__upload_media_impl(
             let api_media_id = <String>::sse_decode(&mut deserializer);
             let api_content_hash = <String>::sse_decode(&mut deserializer);
             let api_data = <Vec<u8>>::sse_decode(&mut deserializer);
+            let api_ttl_secs = <Option<u64>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, String>(
@@ -4530,6 +4531,7 @@ fn wire__crate__api__upload_media_impl(
                             api_media_id,
                             api_content_hash,
                             api_data,
+                            api_ttl_secs,
                         )
                         .await?;
                         Ok(output_ok)
@@ -4842,6 +4844,18 @@ impl SseDecode for Vec<(String, String)> {
     }
 }
 
+impl SseDecode for crate::api::MediaUploadOutcome {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_committed = <bool>::sse_decode(deserializer);
+        let mut var_inProgress = <bool>::sse_decode(deserializer);
+        return crate::api::MediaUploadOutcome {
+            committed: var_committed,
+            in_progress: var_inProgress,
+        };
+    }
+}
+
 impl SseDecode for Option<String> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -4858,6 +4872,17 @@ impl SseDecode for Option<bool> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<bool>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<u64> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<u64>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -5146,6 +5171,24 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<PrismSyncHandle>> for PrismSyn
 }
 
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::MediaUploadOutcome {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [self.committed.into_into_dart().into_dart(), self.in_progress.into_into_dart().into_dart()]
+            .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::MediaUploadOutcome
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::MediaUploadOutcome>
+    for crate::api::MediaUploadOutcome
+{
+    fn into_into_dart(self) -> crate::api::MediaUploadOutcome {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::SharingProcessPendingInputs {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -5332,6 +5375,14 @@ impl SseEncode for Vec<(String, String)> {
     }
 }
 
+impl SseEncode for crate::api::MediaUploadOutcome {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.committed, serializer);
+        <bool>::sse_encode(self.in_progress, serializer);
+    }
+}
+
 impl SseEncode for Option<String> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -5348,6 +5399,16 @@ impl SseEncode for Option<bool> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <bool>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<u64> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <u64>::sse_encode(value, serializer);
         }
     }
 }

@@ -26,6 +26,41 @@ fn media_file_path(storage_path: &str, sync_id: &str, media_id: &str) -> std::pa
     std::path::Path::new(storage_path).join(sync_id).join(media_id)
 }
 
+/// Build a unique staging path for an in-flight upload:
+/// `{storage_path}/{sync_id}/.staging/{media_id}.{nonce}`. Never the final path,
+/// so a failed or concurrent writer can only ever touch its own staging file
+/// (the final path is shared, keyed by `{sync_id}/{media_id}`). A validated
+/// `media_id` is alphanumeric/hyphens, so it can never collide with the
+/// `.staging` directory name.
+fn staging_file_path(
+    storage_path: &str,
+    sync_id: &str,
+    media_id: &str,
+    nonce: &str,
+) -> std::path::PathBuf {
+    std::path::Path::new(storage_path)
+        .join(sync_id)
+        .join(".staging")
+        .join(format!("{media_id}.{nonce}"))
+}
+
+/// Parse the optional `X-Media-TTL` (seconds) header into an absolute
+/// `expires_at`, clamped to `[media_resupply_ttl_min_secs, retention]`. Absent
+/// or unparseable header ⇒ `None` ⇒ the global retention applies (back-compat:
+/// an old relay ignores the header, a new relay treats a missing header as the
+/// default 90-day retention). The header is NOT part of the signed request
+/// bytes, so old/new client+relay combinations all degrade gracefully.
+fn parse_media_ttl(headers: &HeaderMap, config: &crate::config::Config, now: i64) -> Option<i64> {
+    let requested = headers
+        .get("X-Media-TTL")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())?;
+    let min = config.media_resupply_ttl_min_secs;
+    let max = config.media_retention_days.saturating_mul(86_400);
+    let clamped = requested.clamp(min, max.max(min));
+    Some(now + clamped as i64)
+}
+
 // ---------------------------------------------------------------------------
 // upload_media — POST /v1/sync/{sync_id}/media
 // ---------------------------------------------------------------------------
@@ -39,7 +74,7 @@ pub async fn upload_media(
     // Acceptable at current scale. For high-concurrency deployments, consider
     // streaming to disk via axum::body::Body with incremental SHA-256.
     body: Bytes,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     // 1. Validate path_sync_id == auth.sync_id
     if path_sync_id != auth.sync_id {
         return Err(AppError::Forbidden("sync_id mismatch"));
@@ -96,98 +131,204 @@ pub async fn upload_media(
     let path = format!("/v1/sync/{}/media", auth.sync_id);
     verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
 
-    // 9. DB: check quota, insert metadata
+    // 9. Resolve the per-upload TTL (clamped) → absolute expires_at.
+    let now = db::now_secs();
+    let ttl_expires_at = parse_media_ttl(&headers, &state.config, now);
+
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();
     let media_id_owned = media_id.to_string();
     let content_hash_owned = content_hash.to_string();
     let size_bytes = body.len() as i64;
-    let quota = state.config.media_quota_bytes_per_group;
+    let quota = state.config.media_quota_bytes_per_group as i64;
+    let grace = state.config.media_pending_grace_secs as i64;
+    let sweep_cap = state.config.media_expired_sweep_cap;
+    let storage_path = state.config.media_storage_path.clone();
+    let final_path = media_file_path(&storage_path, &sync_id, &media_id_owned);
 
-    let db = state.db.clone();
-    let sid = sync_id.clone();
-    let did = device_id.clone();
-    let mid = media_id_owned.clone();
-    let chash = content_hash_owned.clone();
+    // 10. Preflight: always-sweep this group's expired rows (bounded ≤ cap),
+    //     then a cheap quota reject *before* staging any bytes. Sweeping every
+    //     upload bounds physical disk to ≈ the live quota; the cleanup loop is
+    //     the catch-all backstop. The authoritative quota decision is re-checked
+    //     inside the reserve txn below, so this preflight only needs to reject
+    //     the obvious "would add bytes over quota" case to avoid staging a body
+    //     that's doomed. Idempotent/repair re-uploads of an existing committed
+    //     blob (Δquota 0) are NOT rejected here.
+    {
+        let db = state.db.clone();
+        let sid = sync_id.clone();
+        let mid = media_id_owned.clone();
+        let (swept, usage, would_add_bytes) = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let swept = db::sweep_expired_media_for_group(&tx, &sid, now, sweep_cap)?;
+                let usage = db::get_group_media_usage_at(&tx, &sid, now, grace)?;
+                let would_add_bytes = match db::get_media_metadata(&tx, &mid)? {
+                    // No row, or an expired/soft-deleted row (resurrect) adds
+                    // its bytes back. A committed-live row (idempotent/repair)
+                    // or a pending reserve (→ 202) adds nothing.
+                    None => true,
+                    Some(row) => !row.is_servable_at(now) && !row.is_pending(),
+                };
+                tx.commit()?;
+                Ok((swept, usage, would_add_bytes))
+            })
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let inserted = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let tx = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
+        // Unlink swept expired files (best-effort; the cleanup loop backstops).
+        for swept_id in &swept {
+            let _ = tokio::fs::remove_file(media_file_path(&storage_path, &sync_id, swept_id)).await;
+        }
 
-            // Check quota
-            let current_usage = db::get_group_media_usage(&tx, &sid)?;
-            if current_usage + size_bytes > quota as i64 {
-                tx.rollback()?;
-                return Ok(false); // quota exceeded
+        if would_add_bytes && usage + size_bytes > quota {
+            return Err(AppError::StorageFull("Media quota exceeded for sync group"));
+        }
+    }
+
+    // 11. Stage: write the body to a UNIQUE staging path (never the final path).
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let staging_path = staging_file_path(&storage_path, &sync_id, &media_id_owned, &nonce);
+    {
+        let staging_path = staging_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+            if let Some(parent) = staging_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&staging_path, &body)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(format!("Failed to stage media file: {e}")))?;
+    }
+
+    // 12. Reserve: resolve the upsert case table in an IMMEDIATE txn that
+    //     serializes same-media_id writers, writing a PENDING row for an
+    //     insert/resurrect. File presence (checked just before the txn to keep
+    //     the TOCTOU window tiny) distinguishes idempotent from repair.
+    let final_present = tokio::fs::try_exists(&final_path).await.unwrap_or(false);
+    let outcome = {
+        let db = state.db.clone();
+        let sid = sync_id.clone();
+        let did = device_id.clone();
+        let mid = media_id_owned.clone();
+        let chash = content_hash_owned.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let oc = db::reserve_media_upload(
+                    &tx,
+                    &mid,
+                    &sid,
+                    &did,
+                    size_bytes,
+                    &chash,
+                    ttl_expires_at,
+                    quota,
+                    now,
+                    grace,
+                    final_present,
+                )?;
+                tx.commit()?;
+                Ok(oc)
+            })
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    };
+
+    use db::ReserveOutcome;
+    match outcome {
+        ReserveOutcome::ReservedPending | ReserveOutcome::RepairCommitted => {
+            // 13. Promote: atomically rename staging → final. Same-media_id
+            //     content is byte-identical (different hash is rejected in
+            //     reserve), so a benign concurrent rename writes identical bytes.
+            let promote = {
+                let staging_path = staging_path.clone();
+                let final_path = final_path.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+                    if let Some(parent) = final_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::rename(&staging_path, &final_path)?;
+                    Ok(())
+                })
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            };
+
+            if let Err(e) = promote {
+                let _ = tokio::fs::remove_file(&staging_path).await;
+                // Only a fresh reserve owns its row; drop it so it doesn't
+                // linger as pending. A repair leaves the pre-existing committed
+                // row untouched (the `committed_at IS NULL` guard enforces this).
+                if outcome == ReserveOutcome::ReservedPending {
+                    let db = state.db.clone();
+                    let mid = media_id_owned.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        db.with_conn(|conn| db::delete_pending_media_row(conn, &mid))
+                    })
+                    .await;
+                }
+                return Err(AppError::Internal(format!("Failed to promote media file: {e}")));
             }
 
-            db::insert_media_metadata(&tx, &mid, &sid, &did, size_bytes, &chash, None)?;
-            tx.commit()?;
-            Ok(true)
-        })
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| match &e {
-        rusqlite::Error::SqliteFailure(f, _)
-            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
-                || f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
-        {
-            AppError::Conflict("Media with this ID already exists")
+            // 14. Finalize: mark the row committed (servable).
+            let db = state.db.clone();
+            let mid = media_id_owned.clone();
+            tokio::task::spawn_blocking(move || db.with_conn(|conn| db::finalize_media(conn, &mid, now)))
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+
+            state.metrics.inc(&state.metrics.media_uploads);
+            state.metrics.inc_by(&state.metrics.media_bytes_uploaded, size_bytes as u64);
+            Ok((
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({ "media_id": media_id_owned })),
+            )
+                .into_response())
         }
-        _ => AppError::Internal(e.to_string()),
-    })?;
-
-    if !inserted {
-        return Err(AppError::StorageFull("Media quota exceeded for sync group"));
+        ReserveOutcome::AlreadyServable => {
+            // Pure idempotent re-upload of a present, committed blob: drop the
+            // staged copy, no promote. TTL was already refreshed in reserve.
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            state.metrics.inc(&state.metrics.media_uploads);
+            Ok((
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({ "media_id": media_id_owned })),
+            )
+                .into_response())
+        }
+        ReserveOutcome::PendingInFlight => {
+            // Another writer holds the reserve. 202 ≠ success: no metrics, no
+            // side effects. The caller backs off and re-checks batch-exists.
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "media_id": media_id_owned, "in_progress": true })),
+            )
+                .into_response())
+        }
+        ReserveOutcome::QuotaExceeded => {
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            Err(AppError::StorageFull("Media quota exceeded for sync group"))
+        }
+        ReserveOutcome::HashConflict => {
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            Err(AppError::Conflict("Media with this ID already exists"))
+        }
     }
-
-    // 10. Write to disk
-    let storage_path = state.config.media_storage_path.clone();
-    let file_path = media_file_path(&storage_path, &sync_id, &media_id_owned);
-
-    if let Some(parent) = file_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to create media dir: {e}")))?;
-    }
-
-    // Write via tempfile for atomicity
-    let parent_dir = file_path
-        .parent()
-        .ok_or_else(|| AppError::Internal("Invalid media path".into()))?
-        .to_path_buf();
-    let file_path_clone = file_path.clone();
-
-    let write_result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
-        let named_temp = tempfile::NamedTempFile::new_in(&parent_dir)?;
-        std::io::Write::write_all(&mut named_temp.as_file().try_clone()?, &body)?;
-        named_temp.persist(&file_path_clone)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // 11. On disk write failure: delete metadata row
-    if let Err(e) = write_result {
-        let db = state.db.clone();
-        let mid = media_id_owned.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| db::mark_media_deleted(conn, &mid))
-        })
-        .await;
-        return Err(AppError::Internal(format!("Failed to write media file: {e}")));
-    }
-
-    // 12. Increment metrics
-    state.metrics.inc(&state.metrics.media_uploads);
-    state.metrics.inc_by(&state.metrics.media_bytes_uploaded, size_bytes as u64);
-
-    // 13. Return JSON
-    Ok(Json(serde_json::json!({ "media_id": media_id_owned })))
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +364,12 @@ pub async fn download_media(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    // Servable predicate (metadata level): committed, not soft-deleted, and not
+    // past its per-blob TTL. File presence is verified below by the file-open
+    // (belt-and-suspenders for the brief promote window / legacy crash rows).
+    let now = db::now_secs();
     let metadata = match metadata {
-        Some(m) if m.sync_id == sync_id && m.deleted_at.is_none() => m,
+        Some(m) if m.sync_id == sync_id && m.is_servable_at(now) => m,
         _ => return Err(AppError::NotFound),
     };
 
@@ -440,10 +585,12 @@ mod tests {
         state
             .db
             .with_conn(|conn| {
-                // Insert media with old created_at by manipulating db directly
+                // Insert media with old created_at by manipulating db directly.
+                // committed_at mirrors the legacy backfill (= created_at) so the
+                // row is a committed, servable blob past retention.
                 conn.execute(
-                    "INSERT INTO media_metadata (media_id, sync_id, device_id, size_bytes, content_hash, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO media_metadata (media_id, sync_id, device_id, size_bytes, content_hash, created_at, committed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                     rusqlite::params![
                         "old-media",
                         "test-sync-id",

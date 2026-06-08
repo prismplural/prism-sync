@@ -354,17 +354,22 @@ Future<void> onResume({required PrismSyncHandle handle}) =>
 
 /// Upload an encrypted media blob to the relay.
 ///
+/// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
+/// push); the relay clamps it and an old relay ignores it (default retention).
+///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
-Future<void> uploadMedia({
+Future<MediaUploadOutcome> uploadMedia({
   required PrismSyncHandle handle,
   required String mediaId,
   required String contentHash,
   required List<int> data,
+  BigInt? ttlSecs,
 }) => RustLib.instance.api.crateApiUploadMedia(
   handle: handle,
   mediaId: mediaId,
   contentHash: contentHash,
   data: data,
+  ttlSecs: ttlSecs,
 );
 
 /// Download an encrypted media blob from the relay.
@@ -1123,6 +1128,30 @@ abstract class MemorySecureStore implements RustOpaqueInterface {
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>>
 abstract class PrismSyncHandle implements RustOpaqueInterface {}
+
+/// Outcome of a media upload surfaced to Dart.
+///
+/// `committed` ⇒ the blob is committed and servable (relay HTTP 200).
+/// `in_progress` ⇒ another writer holds the PENDING reserve (relay HTTP 202):
+/// this is **not** a success to act on — the caller (C4 responder) must back off
+/// and re-check batch-exists rather than broadcast `media_uploaded`.
+class MediaUploadOutcome {
+  final bool committed;
+  final bool inProgress;
+
+  const MediaUploadOutcome({required this.committed, required this.inProgress});
+
+  @override
+  int get hashCode => committed.hashCode ^ inProgress.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MediaUploadOutcome &&
+          runtimeType == other.runtimeType &&
+          committed == other.committed &&
+          inProgress == other.inProgress;
+}
 
 class SharingProcessPendingInputs {
   final List<String> existingRelationships;

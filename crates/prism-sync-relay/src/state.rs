@@ -170,6 +170,13 @@ pub struct AppState {
     pub sharing_fetch_rate_limiter: RateLimiter,
     pub sharing_init_rate_limiter: RateLimiter,
     pub media_upload_rate_limiter: RateLimiter,
+    /// Re-supply/heal upload limiter (C4). A separate lane from `media_upload_*`
+    /// so demand-driven heal can't starve fresh sends. Scaffolding: pruned here
+    /// but not yet consulted on upload (enforcement lands with C4).
+    pub media_resupply_rate_limiter: RateLimiter,
+    /// Pairing-push upload limiter (C5), keyed per pairing-event/device. Keeps a
+    /// joiner's burst off the group fresh-send bucket. Scaffolding (see above).
+    pub media_pairing_push_rate_limiter: RateLimiter,
     pub gif_request_rate_limiter: RateLimiter,
     pub gif_http_client: reqwest::Client,
 }
@@ -231,6 +238,8 @@ impl AppState {
             sharing_fetch_rate_limiter: RateLimiter::default(),
             sharing_init_rate_limiter: RateLimiter::default(),
             media_upload_rate_limiter: RateLimiter::default(),
+            media_resupply_rate_limiter: RateLimiter::default(),
+            media_pairing_push_rate_limiter: RateLimiter::default(),
             gif_request_rate_limiter: RateLimiter::default(),
             gif_http_client,
         }

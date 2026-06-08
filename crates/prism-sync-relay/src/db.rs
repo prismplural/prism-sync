@@ -94,6 +94,29 @@ pub struct MediaRow {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub deleted_at: Option<i64>,
+    /// Set once the staged file has been promoted to its final path. A row with
+    /// `committed_at IS NULL` is a non-servable PENDING reserve.
+    pub committed_at: Option<i64>,
+    /// When the PENDING reserve was taken. Used by the stale-pending reaper to
+    /// reclaim abandoned reserves; `NULL` marks a legacy pre-lifecycle row.
+    pub reserved_at: Option<i64>,
+}
+
+impl MediaRow {
+    /// Metadata-level servable predicate (everything but on-disk file presence):
+    /// committed, not soft-deleted, and not past its TTL. Shared by download,
+    /// quota accounting, and (later) batch-exists so they agree on "available."
+    pub fn is_servable_at(&self, now: i64) -> bool {
+        self.committed_at.is_some()
+            && self.deleted_at.is_none()
+            && self.expires_at.map(|exp| exp > now).unwrap_or(true)
+    }
+
+    /// True for an in-flight reserve: a row written by `reserve` whose file has
+    /// not been promoted yet. Such rows count toward quota but are never served.
+    pub fn is_pending(&self) -> bool {
+        self.committed_at.is_none() && self.deleted_at.is_none()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +524,11 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             ON sharing_id_mappings(sharing_id);
 
         -- Media blob metadata
+        -- Upload lifecycle (see media-resupply C1): a row is PENDING while its
+        -- staged file is being promoted (`committed_at IS NULL AND reserved_at`
+        -- set) and COMMITTED (servable) once `committed_at` is set. `reserved_at`
+        -- distinguishes a genuine in-flight reserve from a legacy pre-lifecycle
+        -- row (which has `reserved_at IS NULL` and is backfilled committed).
         CREATE TABLE IF NOT EXISTS media_metadata (
             media_id      TEXT PRIMARY KEY,
             sync_id       TEXT NOT NULL,
@@ -510,6 +538,8 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             created_at    INTEGER NOT NULL,
             expires_at    INTEGER,
             deleted_at    INTEGER,
+            committed_at  INTEGER,
+            reserved_at   INTEGER,
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
         CREATE INDEX IF NOT EXISTS idx_media_sync_id ON media_metadata(sync_id);
@@ -538,8 +568,72 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_sync_groups_pruned_floor_seq(conn)?;
     migrate_devices_ml_dsa_rotation(conn)?;
     migrate_pairing_session_consumed_columns(conn)?;
+    migrate_media_lifecycle_columns(conn)?;
 
     Ok(())
+}
+
+/// Add the upload-lifecycle columns (`committed_at`, `reserved_at`) to an
+/// existing `media_metadata` table and the per-group expired-sweep index.
+///
+/// Pre-lifecycle relays stored media as "metadata then file" with no notion of
+/// a pending reserve, so every legacy row is effectively committed. When the
+/// columns are first added we backfill `committed_at = created_at` for all
+/// existing rows in a **single set-based UPDATE** inside the migration
+/// transaction — never a per-row loop — so a crash mid-migration can't leave
+/// legacy media half-unservable. The backfill runs only on the one-time
+/// transition (guarded on the column being absent); afterwards genuine
+/// new-lifecycle PENDING rows (which carry `reserved_at`) are never touched.
+fn migrate_media_lifecycle_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_committed_at = media_metadata_has_column(conn, "committed_at")?;
+    let has_reserved_at = media_metadata_has_column(conn, "reserved_at")?;
+
+    if !has_committed_at || !has_reserved_at {
+        // Column-add(s) + legacy backfill must be ONE atomic unit: if the
+        // ALTER committed but the backfill didn't (crash in between), the next
+        // startup would see `committed_at` already present, skip the backfill,
+        // and leave every legacy row `committed_at IS NULL` → permanently
+        // unservable. Wrapping them in a single transaction makes it all-or-
+        // nothing, so a retried migration always backfills.
+        let tx = conn.unchecked_transaction()?;
+        if !has_committed_at {
+            tx.execute_batch("ALTER TABLE media_metadata ADD COLUMN committed_at INTEGER;")?;
+        }
+        if !has_reserved_at {
+            tx.execute_batch("ALTER TABLE media_metadata ADD COLUMN reserved_at INTEGER;")?;
+        }
+        if !has_committed_at {
+            // Backfill legacy rows exactly once. At this transition no
+            // new-lifecycle PENDING rows can exist yet, so this set-based
+            // UPDATE only ever promotes genuine pre-lifecycle media.
+            tx.execute(
+                "UPDATE media_metadata SET committed_at = created_at WHERE committed_at IS NULL",
+                [],
+            )?;
+        }
+        tx.commit()?;
+    }
+
+    // Composite partial index for the per-upload, sync-scoped expired sweep.
+    // `idx_media_expires(expires_at)` alone doesn't match the `sync_id`-scoped
+    // query.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_media_sync_expires
+             ON media_metadata (sync_id, expires_at) WHERE expires_at IS NOT NULL;",
+    )?;
+
+    Ok(())
+}
+
+fn media_metadata_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(media_metadata)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Add ephemeral snapshot columns to an existing `snapshots` table.
@@ -2514,6 +2608,12 @@ pub fn pairing_session_exists(
 // Media metadata
 // ---------------------------------------------------------------------------
 
+/// Insert an immediately-committed (servable) media row.
+///
+/// This is the legacy/convenience path used by tests to pre-seed servable
+/// media. The production upload route uses the pending→promote→finalize
+/// lifecycle ([`reserve_media`] + [`finalize_media`]) instead, so an in-flight
+/// upload is never servable before its file lands.
 pub fn insert_media_metadata(
     conn: &Connection,
     media_id: &str,
@@ -2525,11 +2625,29 @@ pub fn insert_media_metadata(
 ) -> Result<(), rusqlite::Error> {
     let now = now_secs();
     conn.execute(
-        "INSERT INTO media_metadata (media_id, sync_id, device_id, size_bytes, content_hash, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO media_metadata (media_id, sync_id, device_id, size_bytes, content_hash, created_at, expires_at, committed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6)",
         params![media_id, sync_id, device_id, size_bytes, content_hash, now, expires_at],
     )?;
     Ok(())
+}
+
+const MEDIA_ROW_COLUMNS: &str = "media_id, sync_id, device_id, size_bytes, content_hash, \
+     created_at, expires_at, deleted_at, committed_at, reserved_at";
+
+fn media_row_from(row: &rusqlite::Row<'_>) -> Result<MediaRow, rusqlite::Error> {
+    Ok(MediaRow {
+        media_id: row.get(0)?,
+        sync_id: row.get(1)?,
+        device_id: row.get(2)?,
+        size_bytes: row.get(3)?,
+        content_hash: row.get(4)?,
+        created_at: row.get(5)?,
+        expires_at: row.get(6)?,
+        deleted_at: row.get(7)?,
+        committed_at: row.get(8)?,
+        reserved_at: row.get(9)?,
+    })
 }
 
 pub fn get_media_metadata(
@@ -2537,31 +2655,220 @@ pub fn get_media_metadata(
     media_id: &str,
 ) -> Result<Option<MediaRow>, rusqlite::Error> {
     conn.query_row(
-        "SELECT media_id, sync_id, device_id, size_bytes, content_hash, created_at, expires_at, deleted_at
-         FROM media_metadata WHERE media_id = ?1",
+        &format!("SELECT {MEDIA_ROW_COLUMNS} FROM media_metadata WHERE media_id = ?1"),
         params![media_id],
-        |row| {
-            Ok(MediaRow {
-                media_id: row.get(0)?,
-                sync_id: row.get(1)?,
-                device_id: row.get(2)?,
-                size_bytes: row.get(3)?,
-                content_hash: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                deleted_at: row.get(7)?,
-            })
-        },
+        media_row_from,
     )
     .optional()
 }
 
-pub fn get_group_media_usage(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
+/// Sum of bytes that count against a group's quota: committed-and-servable rows
+/// (not soft-deleted, not past TTL) plus non-stale PENDING reserves (an
+/// in-flight upload still occupies space). Expired and stale-pending rows are
+/// excluded — they are about to be swept. `now`/`pending_grace_secs` define
+/// "stale pending"; pass the configured grace so this matches the reaper.
+pub fn get_group_media_usage_at(
+    conn: &Connection,
+    sync_id: &str,
+    now: i64,
+    pending_grace_secs: i64,
+) -> Result<i64, rusqlite::Error> {
+    let stale_pending_cutoff = now.saturating_sub(pending_grace_secs);
     conn.query_row(
-        "SELECT COALESCE(SUM(size_bytes), 0) FROM media_metadata WHERE sync_id = ?1 AND deleted_at IS NULL",
-        params![sync_id],
+        "SELECT COALESCE(SUM(size_bytes), 0) FROM media_metadata
+         WHERE sync_id = ?1
+           AND deleted_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?2)
+           AND (
+                 committed_at IS NOT NULL
+              OR reserved_at >= ?3
+           )",
+        params![sync_id, now, stale_pending_cutoff],
         |row| row.get(0),
     )
+}
+
+/// Back-compat wrapper: live-bytes for a group at the current time, treating
+/// any pending reserve as live (grace = i64::MAX keeps callers that only need a
+/// coarse "live bytes" figure working). Prefer [`get_group_media_usage_at`].
+pub fn get_group_media_usage(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite::Error> {
+    get_group_media_usage_at(conn, sync_id, now_secs(), i64::MAX)
+}
+
+/// The decision produced by [`reserve_media_upload`] inside the reserve txn.
+/// The route maps it to the on-disk action and the HTTP outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// A fresh PENDING reserve is in place (insert or resurrect). The staged
+    /// file must be promoted, then [`finalize_media`] called. Counts toward
+    /// quota now. → HTTP 200 (committed) once promoted.
+    ReservedPending,
+    /// Existing committed-live row whose final file is MISSING: repair. The row
+    /// stays committed (Δquota 0); promote the staged file then call
+    /// [`finalize_media`] (an idempotent re-commit). → HTTP 200 (committed).
+    RepairCommitted,
+    /// Existing committed-live row with its file present: pure idempotent. The
+    /// TTL was refreshed to max(old, new). Drop the staged file; do NOT promote.
+    /// → HTTP 200 (committed).
+    AlreadyServable,
+    /// Another writer holds a PENDING reserve for this `media_id`. Drop staging;
+    /// no success side effects. → HTTP 202 (in-progress).
+    PendingInFlight,
+    /// This insert/resurrect would exceed the group quota. → HTTP 507.
+    QuotaExceeded,
+    /// A different `content_hash` already exists for this `media_id`. → HTTP 409.
+    HashConflict,
+}
+
+/// Combine an existing TTL with a newly-requested one, keeping the
+/// longer-lived. `None` means "default retention" (no per-blob expiry), which
+/// outlives any concrete TTL, so it dominates.
+fn combine_ttl(old: Option<i64>, new: Option<i64>) -> Option<i64> {
+    match (old, new) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        _ => None,
+    }
+}
+
+/// Resolve the idempotent-upsert case table for a media upload and, for the
+/// insert/resurrect/repair cases, write the PENDING/TTL state. MUST run inside
+/// the caller's `IMMEDIATE` transaction so same-`media_id` writers serialize.
+///
+/// `final_file_present` is the route's disk check for this `media_id`'s final
+/// path; it only matters for the committed-live branch (idempotent vs repair).
+#[allow(clippy::too_many_arguments)]
+pub fn reserve_media_upload(
+    tx: &Connection,
+    media_id: &str,
+    sync_id: &str,
+    device_id: &str,
+    size_bytes: i64,
+    content_hash: &str,
+    new_expires_at: Option<i64>,
+    quota_bytes: i64,
+    now: i64,
+    pending_grace_secs: i64,
+    final_file_present: bool,
+) -> Result<ReserveOutcome, rusqlite::Error> {
+    let existing = get_media_metadata(tx, media_id)?;
+
+    let Some(row) = existing else {
+        // No row → fresh insert. Δquota +size.
+        let usage = get_group_media_usage_at(tx, sync_id, now, pending_grace_secs)?;
+        if usage + size_bytes > quota_bytes {
+            return Ok(ReserveOutcome::QuotaExceeded);
+        }
+        tx.execute(
+            "INSERT INTO media_metadata
+                 (media_id, sync_id, device_id, size_bytes, content_hash,
+                  created_at, expires_at, deleted_at, committed_at, reserved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?6)",
+            params![media_id, sync_id, device_id, size_bytes, content_hash, now, new_expires_at],
+        )?;
+        return Ok(ReserveOutcome::ReservedPending);
+    };
+
+    // A different content for the same id is a hard conflict in every state
+    // (the id⟺content bijection means this never happens in practice).
+    if row.content_hash != content_hash {
+        return Ok(ReserveOutcome::HashConflict);
+    }
+
+    // Same hash. An in-flight reserve owned by another writer ⇒ back off.
+    if row.is_pending() {
+        return Ok(ReserveOutcome::PendingInFlight);
+    }
+
+    let soft_deleted = row.deleted_at.is_some();
+    let expired = row.expires_at.map(|exp| exp <= now).unwrap_or(false);
+
+    if soft_deleted || expired {
+        // Resurrect: the row currently does NOT count toward quota, so this
+        // re-adds its bytes. Δquota +size.
+        let usage = get_group_media_usage_at(tx, sync_id, now, pending_grace_secs)?;
+        if usage + size_bytes > quota_bytes {
+            return Ok(ReserveOutcome::QuotaExceeded);
+        }
+        tx.execute(
+            "UPDATE media_metadata
+                 SET device_id = ?2, size_bytes = ?3, content_hash = ?4,
+                     created_at = ?5, expires_at = ?6,
+                     deleted_at = NULL, committed_at = NULL, reserved_at = ?5
+             WHERE media_id = ?1",
+            params![media_id, device_id, size_bytes, content_hash, now, new_expires_at],
+        )?;
+        return Ok(ReserveOutcome::ReservedPending);
+    }
+
+    // Committed-live, same hash: idempotent (file present) or repair (missing).
+    // Δquota 0 either way; refresh the TTL to the longer-lived value.
+    let refreshed = combine_ttl(row.expires_at, new_expires_at);
+    tx.execute(
+        "UPDATE media_metadata SET expires_at = ?2 WHERE media_id = ?1",
+        params![media_id, refreshed],
+    )?;
+    if final_file_present {
+        Ok(ReserveOutcome::AlreadyServable)
+    } else {
+        Ok(ReserveOutcome::RepairCommitted)
+    }
+}
+
+/// Mark a reserved row committed (servable) after its file has been promoted.
+/// Idempotent: re-running on an already-committed row just refreshes
+/// `committed_at`.
+pub fn finalize_media(conn: &Connection, media_id: &str, now: i64) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE media_metadata SET committed_at = ?2, reserved_at = NULL WHERE media_id = ?1",
+        params![media_id, now],
+    )?;
+    Ok(())
+}
+
+/// Delete a row ONLY if it is still an uncommitted reserve. Used on the upload
+/// error path to remove a [`ReserveOutcome::ReservedPending`] row whose promote
+/// or finalize failed. The `committed_at IS NULL` guard makes it impossible to
+/// drop a committed row (e.g. a repair that races a concurrent finalize).
+pub fn delete_pending_media_row(
+    conn: &Connection,
+    media_id: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM media_metadata WHERE media_id = ?1 AND committed_at IS NULL",
+        params![media_id],
+    )?;
+    Ok(())
+}
+
+/// Mark up to `limit` of a group's expired (committed, past-TTL) rows deleted in
+/// one set-based UPDATE and return their `media_id`s so the caller can unlink
+/// the files. Bounded so a single upload's always-sweep can't do unbounded
+/// work; the cleanup loop is the catch-all backstop. Excludes pending rows
+/// (`committed_at IS NULL`) so it never reaps an in-flight reserve.
+pub fn sweep_expired_media_for_group(
+    conn: &Connection,
+    sync_id: &str,
+    now: i64,
+    limit: u32,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "UPDATE media_metadata SET deleted_at = ?2
+         WHERE media_id IN (
+             SELECT media_id FROM media_metadata
+             WHERE sync_id = ?1
+               AND deleted_at IS NULL
+               AND committed_at IS NOT NULL
+               AND expires_at IS NOT NULL
+               AND expires_at <= ?2
+             LIMIT ?3
+         )
+         RETURNING media_id",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![sync_id, now, limit], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(ids)
 }
 
 pub fn mark_media_deleted(conn: &Connection, media_id: &str) -> Result<(), rusqlite::Error> {
@@ -2573,21 +2880,66 @@ pub fn mark_media_deleted(conn: &Connection, media_id: &str) -> Result<(), rusql
     Ok(())
 }
 
-/// Find media that has exceeded the retention period and mark it as deleted.
-/// Returns the (sync_id, media_id) pairs for disk cleanup.
+/// Find committed media that has exceeded retention — either the global
+/// `retention_days` floor (legacy `created_at` cutoff) OR its own per-blob
+/// `expires_at` TTL — and mark it deleted. Returns the (sync_id, media_id)
+/// pairs for disk cleanup. Only touches COMMITTED rows: in-flight/abandoned
+/// PENDING reserves are owned by [`reap_stale_pending_media`], so this can
+/// never race a live upload.
 pub fn cleanup_expired_media(
     conn: &Connection,
     retention_days: u64,
 ) -> Result<Vec<(String, String)>, rusqlite::Error> {
-    let cutoff = now_secs() - (retention_days * 86400) as i64;
     let now = now_secs();
+    let cutoff = now - (retention_days * 86400) as i64;
     let mut stmt = conn.prepare(
         "UPDATE media_metadata SET deleted_at = ?1
-         WHERE deleted_at IS NULL AND created_at < ?2
+         WHERE deleted_at IS NULL
+           AND committed_at IS NOT NULL
+           AND (created_at < ?2 OR (expires_at IS NOT NULL AND expires_at <= ?1))
          RETURNING sync_id, media_id",
     )?;
     let pairs: Vec<(String, String)> = stmt
         .query_map(params![now, cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(pairs)
+}
+
+/// Reap abandoned PENDING reserves: rows whose promote never finished
+/// (`committed_at IS NULL`) and whose reserve is older than the grace window
+/// (`reserved_at < now - grace`). Hard-deletes the rows and returns
+/// (sync_id, media_id) pairs so the caller can unlink any leftover staging
+/// AND final files. Grace must be ≫ a normal promote so a healthy in-flight
+/// upload is never reaped.
+pub fn reap_stale_pending_media(
+    conn: &Connection,
+    grace_secs: i64,
+) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    let cutoff = now_secs() - grace_secs;
+    let mut stmt = conn.prepare(
+        "DELETE FROM media_metadata
+         WHERE committed_at IS NULL
+           AND reserved_at IS NOT NULL
+           AND reserved_at < ?1
+         RETURNING sync_id, media_id",
+    )?;
+    let pairs: Vec<(String, String)> = stmt
+        .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(pairs)
+}
+
+/// Return the full set of `(sync_id, media_id)` for currently-staged
+/// (`committed_at IS NULL`) media in the DB. Used by the orphan-file sweep to
+/// decide which staging files still have a backing row. Also returns every
+/// known final-path key so the sweep can detect rows whose existence is real
+/// vs. files with no row at all.
+pub fn all_media_keys(conn: &Connection) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT sync_id, media_id FROM media_metadata")?;
+    let pairs: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
         .collect();
     Ok(pairs)
@@ -4508,6 +4860,354 @@ mod tests {
             assert_eq!(device.ml_dsa_65_public_key, new_ml_dsa_pk);
             assert_eq!(device.ml_dsa_key_generation, 1);
 
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ── Media upload lifecycle (C1) ──────────────────────────────────────────
+
+    /// Create a sync group so media FKs are satisfiable.
+    fn media_test_db() -> Database {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg", 0)?;
+            Ok(())
+        })
+        .unwrap();
+        db
+    }
+
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn servable_predicate_covers_all_states() {
+        let now = 1_000_000;
+        let base = MediaRow {
+            media_id: "m".into(),
+            sync_id: "sg".into(),
+            device_id: "d".into(),
+            size_bytes: 10,
+            content_hash: HASH_A.into(),
+            created_at: now,
+            expires_at: None,
+            deleted_at: None,
+            committed_at: Some(now),
+            reserved_at: None,
+        };
+        // committed, not deleted, no TTL → servable
+        assert!(base.is_servable_at(now));
+        // pending (committed_at NULL) → not servable, is_pending
+        let pending = MediaRow { committed_at: None, reserved_at: Some(now), ..base.clone() };
+        assert!(!pending.is_servable_at(now));
+        assert!(pending.is_pending());
+        // soft-deleted → not servable, not pending
+        let deleted = MediaRow { deleted_at: Some(now), ..base.clone() };
+        assert!(!deleted.is_servable_at(now));
+        assert!(!deleted.is_pending());
+        // expired → not servable
+        let expired = MediaRow { expires_at: Some(now - 1), ..base.clone() };
+        assert!(!expired.is_servable_at(now));
+        // future TTL → servable
+        let live = MediaRow { expires_at: Some(now + 1), ..base.clone() };
+        assert!(live.is_servable_at(now));
+    }
+
+    /// Open an IMMEDIATE txn and run `reserve_media_upload` against it.
+    fn reserve(
+        db: &Database,
+        media_id: &str,
+        hash: &str,
+        size: i64,
+        ttl: Option<i64>,
+        quota: i64,
+        now: i64,
+        file_present: bool,
+    ) -> ReserveOutcome {
+        db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let oc = reserve_media_upload(
+                &tx, media_id, "sg", "d", size, hash, ttl, quota, now, 300, file_present,
+            )?;
+            tx.commit()?;
+            Ok(oc)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn reserve_insert_then_finalize_is_servable() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        let oc = reserve(&db, "m1", HASH_A, 100, None, 10_000, now, false);
+        assert_eq!(oc, ReserveOutcome::ReservedPending);
+        // Pending → counts toward quota, not yet servable.
+        db.with_read_conn(|c| {
+            let row = get_media_metadata(c, "m1")?.unwrap();
+            assert!(row.is_pending());
+            assert!(!row.is_servable_at(now));
+            assert_eq!(get_group_media_usage_at(c, "sg", now, 300)?, 100);
+            Ok(())
+        })
+        .unwrap();
+        // Finalize → servable.
+        db.with_conn(|c| finalize_media(c, "m1", now)).unwrap();
+        db.with_read_conn(|c| {
+            let row = get_media_metadata(c, "m1")?.unwrap();
+            assert!(row.is_servable_at(now));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reserve_same_hash_file_present_is_idempotent_and_extends_ttl() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        // Commit a row with a short TTL.
+        reserve(&db, "m1", HASH_A, 100, Some(now + 3600), 10_000, now, false);
+        db.with_conn(|c| finalize_media(c, "m1", now)).unwrap();
+        // Re-upload identical content, file present, longer TTL.
+        let oc = reserve(&db, "m1", HASH_A, 100, Some(now + 7200), 10_000, now, true);
+        assert_eq!(oc, ReserveOutcome::AlreadyServable);
+        db.with_read_conn(|c| {
+            let row = get_media_metadata(c, "m1")?.unwrap();
+            // TTL extended to the later value; Δquota 0.
+            assert_eq!(row.expires_at, Some(now + 7200));
+            assert_eq!(get_group_media_usage_at(c, "sg", now, 300)?, 100);
+            Ok(())
+        })
+        .unwrap();
+        // A shorter re-upload TTL must NOT shorten the existing one (max).
+        reserve(&db, "m1", HASH_A, 100, Some(now + 60), 10_000, now, true);
+        db.with_read_conn(|c| {
+            assert_eq!(get_media_metadata(c, "m1")?.unwrap().expires_at, Some(now + 7200));
+            Ok(())
+        })
+        .unwrap();
+        // A default-retention (None) re-upload extends to "no expiry" (longest).
+        reserve(&db, "m1", HASH_A, 100, None, 10_000, now, true);
+        db.with_read_conn(|c| {
+            assert_eq!(get_media_metadata(c, "m1")?.unwrap().expires_at, None);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reserve_same_hash_file_missing_is_repair_zero_quota_delta() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        reserve(&db, "m1", HASH_A, 100, None, 10_000, now, false);
+        db.with_conn(|c| finalize_media(c, "m1", now)).unwrap();
+        let before = db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now, 300)).unwrap();
+        // File reported missing → repair (promote+finalize), Δquota 0.
+        let oc = reserve(&db, "m1", HASH_A, 100, None, 10_000, now, false);
+        assert_eq!(oc, ReserveOutcome::RepairCommitted);
+        let after = db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now, 300)).unwrap();
+        assert_eq!(before, after, "repair must not change quota");
+    }
+
+    #[test]
+    fn reserve_different_hash_is_conflict() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        reserve(&db, "m1", HASH_A, 100, None, 10_000, now, false);
+        db.with_conn(|c| finalize_media(c, "m1", now)).unwrap();
+        let oc = reserve(&db, "m1", HASH_B, 100, None, 10_000, now, true);
+        assert_eq!(oc, ReserveOutcome::HashConflict);
+    }
+
+    #[test]
+    fn reserve_pending_same_hash_is_in_progress() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        // First writer reserves (pending, not finalized).
+        assert_eq!(
+            reserve(&db, "m1", HASH_A, 100, None, 10_000, now, false),
+            ReserveOutcome::ReservedPending
+        );
+        // Second writer, same hash, while the first is in-flight → 202, no clobber.
+        assert_eq!(
+            reserve(&db, "m1", HASH_A, 100, None, 10_000, now, false),
+            ReserveOutcome::PendingInFlight
+        );
+        // The pending row is unchanged (still one row, still pending).
+        db.with_read_conn(|c| {
+            assert!(get_media_metadata(c, "m1")?.unwrap().is_pending());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reserve_resurrect_after_expiry_adds_quota() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        // Commit then expire (set expires_at into the past).
+        reserve(&db, "m1", HASH_A, 100, Some(now + 10), 10_000, now, false);
+        db.with_conn(|c| finalize_media(c, "m1", now)).unwrap();
+        let later = now + 100; // past the TTL
+        // Expired → excluded from usage, not servable.
+        db.with_read_conn(|c| {
+            assert_eq!(get_group_media_usage_at(c, "sg", later, 300)?, 0);
+            assert!(!get_media_metadata(c, "m1")?.unwrap().is_servable_at(later));
+            Ok(())
+        })
+        .unwrap();
+        // Re-upload → resurrect (pending), Δquota +size.
+        let oc = reserve(&db, "m1", HASH_A, 100, Some(later + 3600), 10_000, later, false);
+        assert_eq!(oc, ReserveOutcome::ReservedPending);
+        db.with_conn(|c| finalize_media(c, "m1", later)).unwrap();
+        db.with_read_conn(|c| {
+            assert!(get_media_metadata(c, "m1")?.unwrap().is_servable_at(later));
+            assert_eq!(get_group_media_usage_at(c, "sg", later, 300)?, 100);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reserve_insert_over_quota_is_rejected() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        reserve(&db, "m1", HASH_A, 900, None, 1000, now, false);
+        db.with_conn(|c| finalize_media(c, "m1", now)).unwrap();
+        // 900 + 200 > 1000 → rejected, no row written.
+        let oc = reserve(&db, "m2", HASH_B, 200, None, 1000, now, false);
+        assert_eq!(oc, ReserveOutcome::QuotaExceeded);
+        db.with_read_conn(|c| {
+            assert!(get_media_metadata(c, "m2")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn sweep_expired_ignores_pending_and_bounds_to_cap() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        // Two committed, expired rows.
+        for (id, h) in [("e1", HASH_A), ("e2", HASH_B)] {
+            db.with_conn(|c| {
+                reserve_media_upload(c, id, "sg", "d", 10, h, Some(now - 1), 10_000, now, 300, false)?;
+                finalize_media(c, id, now - 10)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        // A still-PENDING row that is "expired" by TTL but in-flight: the sweep
+        // must NOT touch it (reconciliation-vs-promote race guard).
+        db.with_conn(|c| {
+            reserve_media_upload(c, "p1", "sg", "d", 10, HASH_A, Some(now - 1), 10_000, now, 300, false)
+        })
+        .unwrap();
+
+        // Cap of 1 → only one expired row swept this call.
+        let swept = db.with_conn(|c| sweep_expired_media_for_group(c, "sg", now, 1)).unwrap();
+        assert_eq!(swept.len(), 1, "sweep bounded to cap");
+        // Pending row survives.
+        db.with_read_conn(|c| {
+            assert!(get_media_metadata(c, "p1")?.unwrap().is_pending());
+            Ok(())
+        })
+        .unwrap();
+        // Second call sweeps the remaining expired committed row; never the pending.
+        let swept2 = db.with_conn(|c| sweep_expired_media_for_group(c, "sg", now, 64)).unwrap();
+        assert_eq!(swept2.len(), 1);
+        db.with_read_conn(|c| {
+            assert!(get_media_metadata(c, "p1")?.unwrap().is_pending());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_pending_reaper_spares_fresh_reserves() {
+        let db = media_test_db();
+        let now = now_secs();
+        // A fresh, in-flight reserve (reserved_at = now): must NOT be reaped.
+        db.with_conn(|c| {
+            reserve_media_upload(c, "fresh", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)
+        })
+        .unwrap();
+        // An abandoned reserve (reserved_at far in the past).
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO media_metadata
+                     (media_id, sync_id, device_id, size_bytes, content_hash, created_at, reserved_at)
+                 VALUES ('stale','sg','d',10,?1,?2,?2)",
+                params![HASH_B, now - 10_000],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let reaped = db.with_conn(|c| reap_stale_pending_media(c, 300)).unwrap();
+        assert_eq!(reaped, vec![("sg".to_string(), "stale".to_string())]);
+        db.with_read_conn(|c| {
+            assert!(get_media_metadata(c, "fresh")?.is_some(), "fresh reserve must survive");
+            assert!(get_media_metadata(c, "stale")?.is_none(), "stale reserve reaped");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_expired_media_matches_per_blob_ttl_and_spares_pending() {
+        let db = media_test_db();
+        let now = now_secs();
+        // Committed row past its per-blob TTL → cleaned.
+        db.with_conn(|c| {
+            reserve_media_upload(c, "ttl", "sg", "d", 10, HASH_A, Some(now - 5), 10_000, now, 300, false)?;
+            finalize_media(c, "ttl", now - 100)?;
+            Ok(())
+        })
+        .unwrap();
+        // In-flight pending row (committed_at NULL) → never cleaned by this path.
+        db.with_conn(|c| {
+            reserve_media_upload(c, "pend", "sg", "d", 10, HASH_B, Some(now - 5), 10_000, now, 300, false)
+        })
+        .unwrap();
+
+        let cleaned = db.with_conn(|c| cleanup_expired_media(c, 90)).unwrap();
+        assert_eq!(cleaned, vec![("sg".to_string(), "ttl".to_string())]);
+        db.with_read_conn(|c| {
+            assert!(get_media_metadata(c, "ttl")?.unwrap().deleted_at.is_some());
+            assert!(get_media_metadata(c, "pend")?.unwrap().is_pending());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_backfill_marks_pre_lifecycle_rows_committed() {
+        // Simulate a pre-lifecycle table: drop the new columns, insert a row,
+        // then re-run the migration and assert committed_at backfilled.
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg", 0)?;
+            // Recreate the table without the lifecycle columns.
+            conn.execute_batch("DROP TABLE media_metadata;")?;
+            conn.execute_batch(
+                "CREATE TABLE media_metadata (
+                    media_id TEXT PRIMARY KEY, sync_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL, content_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, expires_at INTEGER, deleted_at INTEGER
+                );",
+            )?;
+            conn.execute(
+                "INSERT INTO media_metadata
+                     (media_id, sync_id, device_id, size_bytes, content_hash, created_at)
+                 VALUES ('legacy','sg','d',10,?1,?2)",
+                params![HASH_A, 12345],
+            )?;
+            // Re-run the lifecycle migration.
+            migrate_media_lifecycle_columns(conn)?;
+            let row = get_media_metadata(conn, "legacy")?.unwrap();
+            assert_eq!(row.committed_at, Some(12345), "backfill committed_at = created_at");
+            assert!(row.is_servable_at(99_999), "legacy row stays servable");
             Ok(())
         })
         .unwrap();

@@ -8,9 +8,9 @@ use futures_util::Stream;
 use tokio::sync::broadcast;
 
 use super::traits::{
-    DeviceInfo, DeviceRegistry, EpochManagement, MediaRelay, OutgoingBatch, PullResponse,
-    ReceivedBatch, RegisterRequest, RegisterResponse, RegistrationNonceResponse, RelayError,
-    RotateMlDsaResponse, SignedBatchEnvelope, SignedRegistryResponse, SnapshotExchange,
+    DeviceInfo, DeviceRegistry, EpochManagement, MediaRelay, MediaUploadOutcome, OutgoingBatch,
+    PullResponse, ReceivedBatch, RegisterRequest, RegisterResponse, RegistrationNonceResponse,
+    RelayError, RotateMlDsaResponse, SignedBatchEnvelope, SignedRegistryResponse, SnapshotExchange,
     SnapshotResponse, SnapshotUploadProgress, SyncNotification, SyncRelay, SyncTransport,
 };
 
@@ -567,9 +567,10 @@ impl MediaRelay for MockRelay {
         media_id: &str,
         _content_hash: &str,
         data: Vec<u8>,
-    ) -> Result<(), RelayError> {
+        _ttl_secs: Option<u64>,
+    ) -> Result<MediaUploadOutcome, RelayError> {
         self.state.lock().unwrap().media.insert(media_id.to_string(), data);
-        Ok(())
+        Ok(MediaUploadOutcome::COMMITTED)
     }
 
     async fn download_media(&self, media_id: &str) -> Result<Vec<u8>, RelayError> {
