@@ -2945,6 +2945,30 @@ pub fn all_media_keys(conn: &Connection) -> Result<Vec<(String, String)>, rusqli
     Ok(pairs)
 }
 
+/// List every row the relay currently considers servable at the metadata level
+/// (committed, not soft-deleted, not past TTL) — i.e. the rows download and
+/// batch-exists would claim are present. The reconciliation sweep cross-checks
+/// these against on-disk files to find legacy "metadata then file" crash rows.
+///
+/// PENDING reserves (`committed_at IS NULL`) are excluded, so reconciliation can
+/// never touch an in-flight upload (the reconciliation-vs-promote race guard).
+pub fn list_servable_committed_media(
+    conn: &Connection,
+    now: i64,
+) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT sync_id, media_id FROM media_metadata
+         WHERE committed_at IS NOT NULL
+           AND deleted_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?1)",
+    )?;
+    let pairs: Vec<(String, String)> = stmt
+        .query_map(params![now], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(pairs)
+}
+
 /// Delete all media metadata rows for a sync group.
 /// Returns the media_ids for disk cleanup.
 pub fn delete_media_for_sync_group(
@@ -5211,5 +5235,44 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn list_servable_committed_media_excludes_pending_deleted_expired() {
+        let db = media_test_db();
+        let now = 1_000_000;
+        db.with_conn(|c| {
+            // committed-live → listed
+            reserve_media_upload(c, "live", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            finalize_media(c, "live", now)?;
+            // committed-live with a future TTL → listed
+            reserve_media_upload(
+                c, "live-ttl", "sg", "d", 10, HASH_B, Some(now + 1000), 10_000, now, 300, false,
+            )?;
+            finalize_media(c, "live-ttl", now)?;
+            // pending (never finalized) → excluded (reconciliation must ignore it)
+            reserve_media_upload(c, "pending", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            // expired committed → excluded
+            reserve_media_upload(
+                c, "expired", "sg", "d", 10, HASH_B, Some(now - 1), 10_000, now, 300, false,
+            )?;
+            finalize_media(c, "expired", now)?;
+            // soft-deleted → excluded
+            reserve_media_upload(c, "del", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            finalize_media(c, "del", now)?;
+            mark_media_deleted(c, "del")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut listed = db.with_read_conn(|c| list_servable_committed_media(c, now)).unwrap();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                ("sg".to_string(), "live".to_string()),
+                ("sg".to_string(), "live-ttl".to_string()),
+            ]
+        );
     }
 }

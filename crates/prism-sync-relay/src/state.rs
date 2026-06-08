@@ -30,6 +30,12 @@ pub struct Metrics {
     pub media_uploads: AtomicU64,
     pub media_downloads: AtomicU64,
     pub media_bytes_uploaded: AtomicU64,
+    /// Gauge (not persisted): committed/servable media rows whose on-disk file
+    /// is missing, as found by the most recent reconciliation sweep. While the
+    /// sweep is in dry-run/log-only mode this is the count it *would* delete —
+    /// watch it to verify against the known crash-row population before enabling
+    /// deletion.
+    pub media_reconciliation_missing_files: AtomicU64,
     // Cached DB-state values refreshed after each cleanup cycle.
     // Avoids live DB queries on every Prometheus scrape.
     pub cached_stored_batches: AtomicU64,

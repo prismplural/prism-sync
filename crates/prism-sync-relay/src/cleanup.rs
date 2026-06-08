@@ -8,6 +8,10 @@ use tokio::time::{interval, Duration};
 pub fn spawn_cleanup_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     let interval_secs = state.config.cleanup_interval_secs;
     tokio::spawn(async move {
+        // Run the (dry-run) media reconciliation sweep once at startup so the
+        // crash-row count surfaces immediately, not only after the first full
+        // cleanup interval.
+        run_media_reconciliation(&state).await;
         let mut ticker = interval(Duration::from_secs(interval_secs));
         ticker.tick().await; // consume the immediate first tick; first cleanup fires after one full interval
         loop {
@@ -258,6 +262,10 @@ async fn run_cleanup(state: &AppState) {
         }
     }
 
+    // Dry-run reconciliation: surface (but do NOT delete) servable rows whose
+    // file is missing. See `run_media_reconciliation`.
+    run_media_reconciliation(state).await;
+
     // Refresh DB-state metric cache. Runs after the cleanup block regardless
     // of whether cleanup succeeded, so metrics don't go stale on cleanup errors.
     // Keeps previous cached values on query failure rather than storing 0.
@@ -455,6 +463,77 @@ fn file_older_than(path: &std::path::Path, now: i64, age_secs: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// Dry-run reconciliation sweep (media re-supply C1 follow-up).
+///
+/// Scans the rows the relay considers servable (committed, not deleted, not past
+/// TTL) and reports how many have **no on-disk file** — legacy "metadata then
+/// file" crash rows that would make a metadata-only batch-exists (C2) dishonest.
+///
+/// **This is intentionally LOG-ONLY: it never marks anything deleted.** The
+/// first run of the destructive form against a live relay's legacy crash-rows is
+/// risky, so we ship the observation first: the count is published as
+/// `prism_media_reconciliation_missing_files` (and logged with a bounded id
+/// sample). A later change enables the mark-deleted step only after this count
+/// is verified against the known crash-row population. PENDING reserves are
+/// excluded by the query, so this can never observe an in-flight upload.
+async fn run_media_reconciliation(state: &AppState) {
+    let db = state.db.clone();
+    let now = crate::db::now_secs();
+    let candidates = match tokio::task::spawn_blocking(move || {
+        db.with_read_conn(|conn| crate::db::list_servable_committed_media(conn, now))
+    })
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            tracing::error!("media reconciliation: list query failed: {e}");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("media reconciliation task panicked: {e}");
+            return;
+        }
+    };
+
+    let scanned = candidates.len();
+    let missing = find_missing_media_files(&state.config.media_storage_path, &candidates);
+    state
+        .metrics
+        .media_reconciliation_missing_files
+        .store(missing.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+    if missing.is_empty() {
+        tracing::debug!(scanned, "media reconciliation: all servable rows have files");
+    } else {
+        // A bounded id sample aids verification without flooding logs if the
+        // crash-row population is large.
+        let sample: Vec<String> =
+            missing.iter().take(20).map(|(s, m)| format!("{s}/{m}")).collect();
+        tracing::warn!(
+            scanned,
+            missing = missing.len(),
+            mode = "dry_run",
+            ?sample,
+            "media reconciliation: servable rows with no on-disk file (LOG-ONLY, nothing deleted)"
+        );
+    }
+}
+
+/// Return the subset of `candidates` (`(sync_id, media_id)`) whose final media
+/// file is absent on disk. Pure (filesystem + input) so it is unit-testable.
+fn find_missing_media_files(
+    storage_path: &str,
+    candidates: &[(String, String)],
+) -> Vec<(String, String)> {
+    candidates
+        .iter()
+        .filter(|(sync_id, media_id)| {
+            !std::path::Path::new(storage_path).join(sync_id).join(media_id).exists()
+        })
+        .cloned()
+        .collect()
+}
+
 /// Try to remove empty sync_id directories after media files have been cleaned up.
 fn cleanup_empty_media_dirs(storage_path: &str, items: &[(String, String)]) {
     let mut seen = std::collections::HashSet::new();
@@ -553,6 +632,25 @@ mod tests {
         assert!(sync_dir.join("keep").exists(), "backed final survives");
         assert!(!sync_dir.join("orphan").exists(), "unbacked final removed");
         assert!(!staging_dir.join("up.deadbeef").exists(), "staging removed");
+    }
+
+    #[test]
+    fn reconciliation_finds_only_rows_with_missing_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = tmp.path().to_str().unwrap();
+        let sync_dir = tmp.path().join("sg");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        // "present" has a file on disk; "gone" does not (legacy crash row).
+        std::fs::write(sync_dir.join("present"), b"x").unwrap();
+
+        let candidates = vec![
+            ("sg".to_string(), "present".to_string()),
+            ("sg".to_string(), "gone".to_string()),
+        ];
+        let missing = find_missing_media_files(storage, &candidates);
+        assert_eq!(missing, vec![("sg".to_string(), "gone".to_string())]);
+        // Dry-run: the finder never touches the filesystem rows it inspects.
+        assert!(sync_dir.join("present").exists());
     }
 
     #[test]
