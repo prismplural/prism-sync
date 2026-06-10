@@ -4837,7 +4837,7 @@ pub async fn complete_initiator_ceremony(
         inner.secure_store().get("device_secret").map_err(|e| e.to_string())?;
     drop(inner);
     let ml_dsa_key_generation =
-        load_device_ml_dsa_generation(storage, sync_id.clone(), device_id.clone()).await?;
+        load_device_ml_dsa_generation(storage.clone(), sync_id.clone(), device_id.clone()).await?;
 
     let relay = build_relay(
         &handle.relay_url,
@@ -4858,6 +4858,7 @@ pub async fn complete_initiator_ceremony(
             password_text,
             mnemonic_text,
             relay.as_ref(),
+            storage.as_ref(),
         )
         .await
     {

@@ -534,6 +534,21 @@ impl InitiatorCeremony {
     pub fn joiner_device_id(&self) -> &str {
         &self.bootstrap_record.device_id
     }
+
+    /// The joiner's bootstrap record, as fetched at ceremony start and
+    /// cross-checked against the out-of-band rendezvous commitment in
+    /// [`InitiatorCeremony::start`] (see the `verify_commitment` gate there).
+    ///
+    /// SECURITY: the commitment is a SHA-256 over the record's full canonical
+    /// bytes — including the V2 permanent ML-KEM-768 and X-Wing identity keys —
+    /// and is transferred out-of-band via the QR code / deep link, so the relay
+    /// cannot substitute any field of this record without the human-verified
+    /// commitment check failing. The initiator MUST author the joiner's signed
+    /// registry entry (and the post-pairing wrap target) from THIS record, not
+    /// from a fresh relay fetch, which carries no such binding.
+    pub fn joiner_bootstrap_record(&self) -> &JoinerBootstrapRecord {
+        &self.bootstrap_record
+    }
 }
 
 // ---------------------------------------------------------------------------

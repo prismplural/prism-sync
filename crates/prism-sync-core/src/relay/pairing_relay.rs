@@ -295,6 +295,16 @@ impl MockPairingRelay {
     pub fn new() -> Self {
         Self { sessions: Mutex::new(HashMap::new()), next_id_counter: Mutex::new(0) }
     }
+
+    /// Test hook: overwrite the stored joiner bootstrap record for a session,
+    /// simulating a malicious relay that serves tampered bootstrap bytes on a
+    /// post-ceremony fetch. Used to prove the initiator never re-trusts the
+    /// relay's bootstrap record for the joiner's identity keys.
+    pub fn tamper_bootstrap(&self, rendezvous_id: &str, joiner_bootstrap: Vec<u8>) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(rendezvous_id) {
+            session.joiner_bootstrap = joiner_bootstrap;
+        }
+    }
 }
 
 impl Default for MockPairingRelay {

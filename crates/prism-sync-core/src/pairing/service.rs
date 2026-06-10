@@ -9,15 +9,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bootstrap::{
-    CredentialBundle as BootstrapCredentialBundle, InitiatorCeremony, JoinerBootstrapRecord,
-    JoinerCeremony, RendezvousToken, SasDisplay,
+    CredentialBundle as BootstrapCredentialBundle, InitiatorCeremony, JoinerCeremony,
+    RendezvousToken, SasDisplay,
 };
 use crate::epoch::EpochManager;
 use crate::error::{CoreError, Result};
 use crate::pairing::models::*;
 use crate::relay::pairing_relay::{PairingRelay, PairingSlot};
 use crate::relay::traits::{
-    FirstDeviceAdmissionProof, ProofOfWorkChallenge, ProofOfWorkSolution,
+    DeviceInfo, FirstDeviceAdmissionProof, ProofOfWorkChallenge, ProofOfWorkSolution,
     RegistrationNonceResponse, RegistryApproval, SignedRegistryResponse,
 };
 use crate::relay::SyncRelay;
@@ -583,6 +583,7 @@ impl PairingService {
         password: &str,
         mnemonic: &str,
         sync_relay: &dyn SyncRelay,
+        storage: &dyn crate::storage::SyncStorage,
     ) -> Result<()> {
         let rendezvous_id = ceremony.rendezvous_id_hex();
         let transcript_prefix = diag_prefix(ceremony.transcript_hash());
@@ -636,13 +637,12 @@ impl PairingService {
         // bundle with "epoch_key_hashes missing entry for current_epoch".
         self.restore_persisted_epoch_keys(&mut key_hierarchy, current_epoch)?;
 
-        let bootstrap_bytes = pairing_relay
-            .get_bootstrap(&rendezvous_id)
-            .await
-            .map_err(|e| CoreError::from_relay_with_context(Some("fetching bootstrap"), e))?;
-        let bootstrap_record = JoinerBootstrapRecord::from_canonical_bytes(&bootstrap_bytes)
-            .ok_or_else(|| CoreError::Engine("failed to parse JoinerBootstrapRecord".into()))?;
-
+        // NOTE: the joiner's bootstrap record is NOT re-fetched from the relay
+        // here. A second fetch carries no binding to the out-of-band rendezvous
+        // commitment the human verified, so a malicious relay could swap the
+        // joiner's permanent keys on it. The joiner's identity keys are instead
+        // taken from `ceremony.joiner_bootstrap_record()` below, which was
+        // commitment-checked in `InitiatorCeremony::start`.
         let mut devices = sync_relay
             .list_devices()
             .await
@@ -725,21 +725,49 @@ impl PairingService {
         }
         let epoch_key = self.load_epoch_key(&key_hierarchy, current_epoch)?;
 
-        let mut snapshot_entries: Vec<RegistrySnapshotEntry> = devices
-            .into_iter()
-            .filter(|device| device.device_id != device_id)
-            .map(|device| RegistrySnapshotEntry {
-                sync_id: sync_id.clone(),
-                device_id: device.device_id,
-                ed25519_public_key: device.ed25519_public_key,
-                x25519_public_key: device.x25519_public_key,
-                ml_dsa_65_public_key: device.ml_dsa_65_public_key,
-                ml_kem_768_public_key: device.ml_kem_768_public_key,
-                x_wing_public_key: device.x_wing_public_key,
-                status: device.status,
-                ml_dsa_key_generation: device.ml_dsa_key_generation,
-            })
+        // SECURITY (C2): existing-device identity keys must come from a
+        // signature-verified source, never the raw `relay.list_devices()` — a
+        // relay that swaps a device's X-Wing key there would otherwise get the
+        // new epoch key wrapped to an attacker key. Source: the relay's latest
+        // signed registry, hybrid-verified against locally-pinned records (None
+        // → no existing peers, i.e. a first pairing).
+        let verified_existing: std::collections::HashMap<String, RegistrySnapshotEntry> =
+            match current_signed_registry.as_ref() {
+                Some(response) => {
+                    let verified = crate::device_registry::DeviceRegistryManager::verify_signed_registry_snapshot(
+                        storage,
+                        &sync_id,
+                        &response.artifact_blob,
+                    )
+                    .map_err(|e| {
+                        CoreError::Engine(format!(
+                            "failed to verify relay signed registry while authoring pairing snapshot: {e}"
+                        ))
+                    })?;
+                    verified
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.status == "active")
+                        .map(|entry| (entry.device_id.clone(), entry))
+                        .collect()
+                }
+                None => std::collections::HashMap::new(),
+            };
+
+        let joiner_device_id = ceremony.joiner_device_id().to_string();
+        // Author existing-device entries directly from the verified set, never
+        // `relay.list_devices()` — so a relay can neither inject a peer absent
+        // from any signed registry nor drop one by omission. A legit member not
+        // yet in the latest signed registry just isn't in THIS rekey (it gets the
+        // key at the next inclusive rotation); it never aborts the pairing.
+        let mut snapshot_entries: Vec<RegistrySnapshotEntry> = verified_existing
+            .values()
+            .filter(|entry| entry.device_id != device_id && entry.device_id != joiner_device_id)
+            .cloned()
             .collect();
+        // Deterministic ordering for a stable signed-snapshot byte layout
+        // (HashMap iteration order is otherwise unspecified).
+        snapshot_entries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         snapshot_entries.push(RegistrySnapshotEntry {
             sync_id: sync_id.clone(),
             device_id: device_id.clone(),
@@ -751,14 +779,28 @@ impl PairingService {
             status: "active".into(),
             ml_dsa_key_generation: current_ml_dsa_generation,
         });
+        // SECURITY (B): author the joiner entry from the bootstrap record that
+        // was cross-checked against the out-of-band rendezvous commitment in
+        // `InitiatorCeremony::start`, NOT from a fresh relay fetch. The
+        // commitment is a SHA-256 over the record's full canonical bytes —
+        // including the V2 permanent ML-KEM-768 and X-Wing identity keys — and is
+        // delivered via the QR code / deep link the human scanned, so the relay
+        // cannot swap the joiner's permanent X-Wing key without the
+        // verify_commitment check failing. Once full key-equality is enabled on
+        // the wrap below, this permanent X-Wing key becomes an encryption target,
+        // so its provenance must be the SAS/QR-bound record. (The joiner's
+        // verified permanent X-Wing equals the key it registers with — both are
+        // `device_secret.xwing_keypair(device_id)` — so legitimate joins still
+        // pass the wrap's byte-for-byte equality check.)
+        let joiner_record = ceremony.joiner_bootstrap_record();
         // Require V2 bootstrap records which carry the joiner's permanent
         // identity keys (ML-KEM-768 and X-Wing derived from DeviceSecret).
         // The ephemeral xwing_ek in the bootstrap record is for the KEM
         // handshake only — using it as the registry identity key causes a
         // device_identity_mismatch when the joiner registers with its
         // permanent keys.
-        if bootstrap_record.permanent_ml_kem_768_public_key.is_empty()
-            || bootstrap_record.permanent_xwing_public_key.is_empty()
+        if joiner_record.permanent_ml_kem_768_public_key.is_empty()
+            || joiner_record.permanent_xwing_public_key.is_empty()
         {
             return Err(CoreError::Engine(
                 "bootstrap record missing permanent identity keys (V2 required for pairing)".into(),
@@ -766,12 +808,12 @@ impl PairingService {
         }
         snapshot_entries.push(RegistrySnapshotEntry {
             sync_id: sync_id.clone(),
-            device_id: bootstrap_record.device_id.clone(),
-            ed25519_public_key: bootstrap_record.ed25519_public_key.to_vec(),
-            x25519_public_key: bootstrap_record.x25519_public_key.to_vec(),
-            ml_dsa_65_public_key: bootstrap_record.ml_dsa_65_public_key.clone(),
-            ml_kem_768_public_key: bootstrap_record.permanent_ml_kem_768_public_key.clone(),
-            x_wing_public_key: bootstrap_record.permanent_xwing_public_key.clone(),
+            device_id: joiner_record.device_id.clone(),
+            ed25519_public_key: joiner_record.ed25519_public_key.to_vec(),
+            x25519_public_key: joiner_record.x25519_public_key.to_vec(),
+            ml_dsa_65_public_key: joiner_record.ml_dsa_65_public_key.clone(),
+            ml_kem_768_public_key: joiner_record.permanent_ml_kem_768_public_key.clone(),
+            x_wing_public_key: joiner_record.permanent_xwing_public_key.clone(),
             status: "active".into(),
             ml_dsa_key_generation: 0,
         });
@@ -861,37 +903,48 @@ impl PairingService {
         })?;
 
         let next_epoch = current_epoch.saturating_add(1);
-        // TODO(security): unlike revoke_and_rekey, this wrap can't yet enforce
-        // pinned-vs-relay X-Wing key-equality — the relay list legitimately
-        // carries the just-joined device whose registered key diverges from the
-        // one authored into registry_snapshot.entries, so byte-equality would
-        // reject the join. Interim: restrict recipients to device_ids present in
-        // the signed snapshot (blocks an unknown injected recipient); full
-        // key-equality is deferred.
-        let known_device_ids: std::collections::HashSet<&str> =
-            registry_snapshot.entries.iter().map(|e| e.device_id.as_str()).collect();
-        let relay_devices = sync_relay.list_devices().await.map_err(|e| {
-            CoreError::Engine(format!("failed to list devices for pairing rekey: {e}"))
-        })?;
-        let pinned: Vec<crate::storage::DeviceRecord> = relay_devices
+        // SECURITY: the rekey wrap is driven entirely by the verified signed
+        // snapshot — both recipients and the `pinned` cross-check come from
+        // `registry_snapshot.entries`, so `relay.list_devices()` has no say in who
+        // is wrapped or to which key. Recipients == pinned by construction, so the
+        // byte-for-byte equality check in `prepare_wrapped_keys_for_devices` passes
+        // and the key is wrapped to exactly the verified set (incl. self).
+        let recipients: Vec<DeviceInfo> = registry_snapshot
+            .entries
             .iter()
-            .filter(|d| known_device_ids.contains(d.device_id.as_str()))
-            .map(|d| crate::storage::DeviceRecord {
-                sync_id: sync_id.clone(),
-                device_id: d.device_id.clone(),
-                ed25519_public_key: d.ed25519_public_key.clone(),
-                x25519_public_key: d.x25519_public_key.clone(),
-                ml_dsa_65_public_key: d.ml_dsa_65_public_key.clone(),
-                ml_kem_768_public_key: d.ml_kem_768_public_key.clone(),
-                x_wing_public_key: d.x_wing_public_key.clone(),
-                status: d.status.clone(),
+            .map(|e| DeviceInfo {
+                device_id: e.device_id.clone(),
+                // `epoch`/`permission` are unused by the wrap; synthesize them.
+                epoch: 0,
+                status: e.status.clone(),
+                ed25519_public_key: e.ed25519_public_key.clone(),
+                x25519_public_key: e.x25519_public_key.clone(),
+                ml_dsa_65_public_key: e.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: e.ml_kem_768_public_key.clone(),
+                x_wing_public_key: e.x_wing_public_key.clone(),
+                permission: None,
+                ml_dsa_key_generation: e.ml_dsa_key_generation,
+            })
+            .collect();
+        let pinned: Vec<crate::storage::DeviceRecord> = registry_snapshot
+            .entries
+            .iter()
+            .map(|e| crate::storage::DeviceRecord {
+                sync_id: e.sync_id.clone(),
+                device_id: e.device_id.clone(),
+                ed25519_public_key: e.ed25519_public_key.clone(),
+                x25519_public_key: e.x25519_public_key.clone(),
+                ml_dsa_65_public_key: e.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: e.ml_kem_768_public_key.clone(),
+                x_wing_public_key: e.x_wing_public_key.clone(),
+                status: e.status.clone(),
                 registered_at: chrono::Utc::now(),
                 revoked_at: None,
-                ml_dsa_key_generation: d.ml_dsa_key_generation,
+                ml_dsa_key_generation: e.ml_dsa_key_generation,
             })
             .collect();
         let (next_epoch_key, wrapped_keys) =
-            EpochManager::prepare_wrapped_keys(sync_relay, next_epoch, None, &pinned).await?;
+            EpochManager::prepare_wrapped_keys_for_devices(&recipients, next_epoch, None, &pinned)?;
         let next_epoch_key_array: [u8; 32] =
             next_epoch_key.as_slice().try_into().map_err(|_| {
                 CoreError::Engine(format!(
@@ -2051,6 +2104,47 @@ mod tests {
         store.set("epoch", b"0").unwrap();
     }
 
+    /// Build an in-memory `SyncStorage` pinned with the inviter's own device
+    /// record so that `complete_bootstrap_initiator` can verify the relay's
+    /// signed registry against a locally-trusted anchor (the inviter is the
+    /// signer of the snapshot it just authored). In production the inviter's own
+    /// record is always present locally; this mirrors that for tests.
+    fn initiator_storage_with_self(
+        sync_id: &str,
+        device_secret: &DeviceSecret,
+        device_id: &str,
+        ml_dsa_generation: u32,
+    ) -> Arc<dyn crate::storage::SyncStorage> {
+        let storage: Arc<dyn crate::storage::SyncStorage> =
+            Arc::new(crate::storage::RusqliteSyncStorage::in_memory().unwrap());
+        let signing_key = device_secret.ed25519_keypair(device_id).unwrap();
+        let exchange_key = device_secret.x25519_keypair(device_id).unwrap();
+        let pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(device_id, ml_dsa_generation).unwrap();
+        let pq_kem_key = device_secret.ml_kem_768_keypair(device_id).unwrap();
+        let xwing_key = device_secret.xwing_keypair(device_id).unwrap();
+        let record = crate::storage::DeviceRecord {
+            sync_id: sync_id.to_string(),
+            device_id: device_id.to_string(),
+            ed25519_public_key: signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
+            x_wing_public_key: xwing_key.encapsulation_key_bytes(),
+            status: "active".into(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: ml_dsa_generation,
+        };
+        crate::device_registry::DeviceRegistryManager::pin_device(
+            storage.as_ref(),
+            sync_id,
+            &record,
+        )
+        .unwrap();
+        storage
+    }
+
     async fn wait_for_slot(
         relay: &dyn PairingRelay,
         rendezvous_id: &str,
@@ -2411,6 +2505,12 @@ mod tests {
         let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
         let inviter_pq_signing_key =
             device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        // The inviter is itself a recipient of the post-pairing rekey wrap, so
+        // its relay-advertised X-Wing key must match the (real) key the initiator
+        // authors into the signed snapshot from its local DeviceSecret — otherwise
+        // the now-enforced byte-for-byte key-equality check correctly rejects it.
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
 
         let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
             device_id: device_id.clone(),
@@ -2419,8 +2519,8 @@ mod tests {
             ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
             x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
             ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
-            ml_kem_768_public_key: Vec::new(),
-            x_wing_public_key: Vec::new(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
         }]));
@@ -2493,6 +2593,8 @@ mod tests {
                 .unwrap()
         });
 
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
         initiator_service
             .complete_bootstrap_initiator(
                 &initiator,
@@ -2500,6 +2602,7 @@ mod tests {
                 password,
                 &mnemonic,
                 registry_relay.as_ref(),
+                initiator_storage.as_ref(),
             )
             .await
             .unwrap();
@@ -2566,6 +2669,438 @@ mod tests {
 
         let err = mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap_err();
         assert!(err.to_string().contains("session not found"));
+    }
+
+    /// NEGATIVE TEST 1 (C2 / existing-device X-Wing swap + relay injection).
+    ///
+    /// The pairing rekey is driven ENTIRELY by the verified signed registry, so
+    /// the relay's unsigned `list_devices()` has no influence on who is wrapped or
+    /// to which key. This test proves two relay manipulations are both neutralized
+    /// WITHOUT aborting the legitimate pairing:
+    ///   (a) SWAP: an existing peer (present in the signed registry + local store
+    ///       with its TRUE key) is returned by `list_devices()` with a SWAPPED
+    ///       X-Wing key → the peer is still wrapped, but to the TRUE key from the
+    ///       verified snapshot; the relay's swapped key is ignored.
+    ///   (b) INJECT: `list_devices()` includes an extra "active" device that is
+    ///       NOT in any signed registry → that device receives NO wrapped key (it
+    ///       is never a recipient).
+    /// Before this change the relay list drove the wrap; (a) would have been
+    /// wrapped to the attacker key (membership-only) or aborted the pairing
+    /// (relay-list-cross-checked), and (b) would have aborted the pairing.
+    #[tokio::test]
+    async fn bootstrap_initiator_ignores_relay_swapped_existing_device_xwing() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        // A pre-existing peer device, with its TRUE identity keys.
+        let peer_secret = DeviceSecret::generate();
+        let peer_device_id = crate::node_id::generate_node_id();
+        let peer_signing_key = peer_secret.ed25519_keypair(&peer_device_id).unwrap();
+        let peer_exchange_key = peer_secret.x25519_keypair(&peer_device_id).unwrap();
+        let peer_pq_signing_key = peer_secret.ml_dsa_65_keypair(&peer_device_id).unwrap();
+        let peer_pq_kem_key = peer_secret.ml_kem_768_keypair(&peer_device_id).unwrap();
+        let peer_xwing_key_true = peer_secret.xwing_keypair(&peer_device_id).unwrap();
+        let peer_xwing_true = peer_xwing_key_true.encapsulation_key_bytes();
+        // An attacker-controlled X-Wing key the relay tries to substitute (swap).
+        let attacker_secret = DeviceSecret::generate();
+        let attacker_xwing =
+            attacker_secret.xwing_keypair("attacker").unwrap().encapsulation_key_bytes();
+        assert_ne!(peer_xwing_true, attacker_xwing);
+
+        // A relay-injected device that exists in NO signed registry.
+        let injected_secret = DeviceSecret::generate();
+        let injected_device_id = crate::node_id::generate_node_id();
+        let injected_signing_key = injected_secret.ed25519_keypair(&injected_device_id).unwrap();
+        let injected_exchange_key = injected_secret.x25519_keypair(&injected_device_id).unwrap();
+        let injected_pq_signing_key =
+            injected_secret.ml_dsa_65_keypair(&injected_device_id).unwrap();
+        let injected_pq_kem_key = injected_secret.ml_kem_768_keypair(&injected_device_id).unwrap();
+        let injected_xwing =
+            injected_secret.xwing_keypair(&injected_device_id).unwrap().encapsulation_key_bytes();
+
+        let peer_true_entry = RegistrySnapshotEntry {
+            sync_id: sync_id.to_string(),
+            device_id: peer_device_id.clone(),
+            ed25519_public_key: peer_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: peer_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: peer_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: peer_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: peer_xwing_true.clone(),
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        };
+        let inviter_entry = RegistrySnapshotEntry {
+            sync_id: sync_id.to_string(),
+            device_id: device_id.clone(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            status: "active".to_string(),
+            ml_dsa_key_generation: current_generation,
+        };
+
+        // Relay's UNSIGNED device list: inviter (true), peer with a SWAPPED key,
+        // plus an INJECTED device absent from any signed registry.
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![
+            DeviceInfo {
+                device_id: device_id.clone(),
+                epoch: 0,
+                status: "active".to_string(),
+                ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+                permission: None,
+                ml_dsa_key_generation: current_generation,
+            },
+            DeviceInfo {
+                device_id: peer_device_id.clone(),
+                epoch: 0,
+                status: "active".to_string(),
+                ed25519_public_key: peer_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: peer_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: peer_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: peer_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: attacker_xwing.clone(), // SWAPPED
+                permission: None,
+                ml_dsa_key_generation: 0,
+            },
+            DeviceInfo {
+                device_id: injected_device_id.clone(),
+                epoch: 0,
+                status: "active".to_string(), // INJECTED: not in any signed registry
+                ed25519_public_key: injected_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: injected_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: injected_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: injected_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: injected_xwing.clone(),
+                permission: None,
+                ml_dsa_key_generation: 0,
+            },
+        ]));
+
+        // Relay's SIGNED registry: inviter + peer, both with TRUE keys, signed by
+        // the inviter. This is the trusted source the initiator authors from. The
+        // injected device is deliberately absent.
+        let mut epoch_key_hashes = std::collections::BTreeMap::new();
+        let epoch_0_key: [u8; 32] = key_hierarchy.epoch_key(0).unwrap().try_into().unwrap();
+        epoch_key_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
+        let signed = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![inviter_entry.clone(), peer_true_entry.clone()],
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            0,
+            epoch_key_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: signed.sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+
+        // Local pinned registry: inviter + peer, both TRUE. The verification of
+        // the relay's signed registry is anchored against these records.
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
+        crate::device_registry::DeviceRegistryManager::pin_device(
+            initiator_storage.as_ref(),
+            sync_id,
+            &crate::storage::DeviceRecord {
+                sync_id: sync_id.to_string(),
+                device_id: peer_device_id.clone(),
+                ed25519_public_key: peer_signing_key.public_key_bytes().to_vec(),
+                x25519_public_key: peer_exchange_key.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: peer_pq_signing_key.public_key_bytes(),
+                ml_kem_768_public_key: peer_pq_kem_key.public_key_bytes(),
+                x_wing_public_key: peer_xwing_true.clone(),
+                status: "active".into(),
+                registered_at: chrono::Utc::now(),
+                revoked_at: None,
+                ml_dsa_key_generation: 0,
+            },
+        )
+        .unwrap();
+
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let joiner_device_id = joiner.device_id().to_string();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service_task
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+                .unwrap()
+        });
+
+        // The pairing SUCCEEDS — the relay's swap and injection are simply ignored.
+        initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+                initiator_storage.as_ref(),
+            )
+            .await
+            .expect("pairing must succeed; relay list manipulations are ignored");
+
+        let _ = joiner_handle.await.unwrap();
+
+        let state = registry_relay.state.lock().unwrap();
+
+        // The posted signed snapshot carries the peer's TRUE X-Wing key, not the
+        // relay's swapped key.
+        let register_req = state.register_requests.last().expect("joiner registered");
+        let approval =
+            register_req.registry_approval.as_ref().expect("registry approval present");
+        let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &approval.signed_registry_snapshot,
+            &inviter_signing_key.public_key_bytes(),
+            &inviter_pq_signing_key.public_key_bytes(),
+        )
+        .unwrap();
+        let peer_entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.device_id == peer_device_id)
+            .expect("peer entry present in signed snapshot");
+        assert_eq!(
+            peer_entry.x_wing_public_key, peer_xwing_true,
+            "peer entry must carry the TRUE X-Wing key, not the relay-swapped one"
+        );
+        assert_ne!(peer_entry.x_wing_public_key, attacker_xwing);
+        // The injected device is NOT in the signed snapshot.
+        assert!(
+            !snapshot.entries.iter().any(|e| e.device_id == injected_device_id),
+            "relay-injected device must not appear in the signed snapshot"
+        );
+
+        // The rekey was posted, and wraps to exactly the verified set: the peer
+        // (TRUE key) and the joiner are recipients; the injected device is not.
+        let (_epoch, wrapped_keys) =
+            state.rekey_posts.as_ref().expect("rekey must have been posted");
+        assert!(
+            wrapped_keys.contains_key(&peer_device_id),
+            "peer must receive a wrapped epoch key (to its TRUE X-Wing key)"
+        );
+        assert!(
+            wrapped_keys.contains_key(&joiner_device_id),
+            "joiner must receive a wrapped epoch key"
+        );
+        assert!(
+            !wrapped_keys.contains_key(&injected_device_id),
+            "relay-injected device must NOT receive a wrapped epoch key"
+        );
+    }
+
+    /// NEGATIVE TEST 2 (joiner permanent X-Wing swap on the relay bootstrap).
+    ///
+    /// After the ceremony has bound the joiner's bootstrap record to the
+    /// out-of-band rendezvous commitment, the relay tampers the stored bootstrap
+    /// bytes, swapping the joiner's permanent X-Wing key. The initiator must
+    /// author the joiner's signed-registry entry (and therefore the wrap target)
+    /// from the commitment-verified ceremony record, NOT from the relay's
+    /// tampered bootstrap — so the posted snapshot carries the joiner's TRUE
+    /// permanent X-Wing key and the swap is ignored.
+    #[tokio::test]
+    async fn bootstrap_initiator_ignores_relay_tampered_joiner_bootstrap() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 0,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+        }]));
+
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let joiner_device_id = joiner.device_id().to_string();
+
+        // Capture the joiner's TRUE permanent X-Wing key from the genuine
+        // bootstrap record the relay holds before tampering.
+        let genuine_bootstrap_bytes =
+            mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap();
+        let genuine_record = crate::bootstrap::JoinerBootstrapRecord::from_canonical_bytes(
+            &genuine_bootstrap_bytes,
+        )
+        .unwrap();
+        let joiner_true_xwing = genuine_record.permanent_xwing_public_key.clone();
+        assert!(!joiner_true_xwing.is_empty());
+
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+
+        // The relay now tampers the stored bootstrap record, swapping the
+        // joiner's permanent X-Wing (and ML-KEM) keys for attacker-controlled
+        // ones. The commitment the human verified is NOT updated.
+        let attacker_secret = DeviceSecret::generate();
+        let attacker_xwing = attacker_secret
+            .xwing_keypair("attacker")
+            .unwrap()
+            .encapsulation_key_bytes();
+        let attacker_ml_kem =
+            attacker_secret.ml_kem_768_keypair("attacker").unwrap().public_key_bytes();
+        assert_ne!(joiner_true_xwing, attacker_xwing);
+        let mut tampered_record = genuine_record.clone();
+        tampered_record.permanent_xwing_public_key = attacker_xwing.clone();
+        tampered_record.permanent_ml_kem_768_public_key = attacker_ml_kem;
+        mailbox.tamper_bootstrap(&joiner_rendezvous_id, tampered_record.to_canonical_bytes());
+
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service_task
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+                .unwrap()
+        });
+
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
+        initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+                initiator_storage.as_ref(),
+            )
+            .await
+            .expect("pairing must succeed using the commitment-verified joiner record");
+
+        let _ = joiner_handle.await.unwrap();
+
+        // The posted signed registry must carry the joiner's TRUE permanent
+        // X-Wing key, proving the initiator ignored the relay's tampered
+        // bootstrap record.
+        let state = registry_relay.state.lock().unwrap();
+        let register_req = state.register_requests.last().expect("joiner registered");
+        let approval =
+            register_req.registry_approval.as_ref().expect("registry approval present");
+        let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &approval.signed_registry_snapshot,
+            &inviter_signing_key.public_key_bytes(),
+            &inviter_pq_signing_key.public_key_bytes(),
+        )
+        .unwrap();
+        let joiner_entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.device_id == joiner_device_id)
+            .expect("joiner entry present in signed snapshot");
+        assert_eq!(
+            joiner_entry.x_wing_public_key, joiner_true_xwing,
+            "joiner entry must use the commitment-verified key, not the relay-tampered one"
+        );
+        assert_ne!(joiner_entry.x_wing_public_key, attacker_xwing);
     }
 
     #[tokio::test]
@@ -2688,6 +3223,8 @@ mod tests {
                 .unwrap()
         });
 
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
         initiator_service
             .complete_bootstrap_initiator(
                 &initiator,
@@ -2695,6 +3232,7 @@ mod tests {
                 password,
                 &mnemonic,
                 registry_relay.as_ref(),
+                initiator_storage.as_ref(),
             )
             .await
             .unwrap();
@@ -2830,6 +3368,8 @@ mod tests {
             .await
             .unwrap();
 
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
         let err = initiator_service
             .complete_bootstrap_initiator(
                 &initiator,
@@ -2837,6 +3377,7 @@ mod tests {
                 password,
                 &mnemonic,
                 registry_relay.as_ref(),
+                initiator_storage.as_ref(),
             )
             .await
             .unwrap_err();
@@ -2968,6 +3509,8 @@ mod tests {
                 .unwrap()
         });
 
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
         let err = initiator_service
             .complete_bootstrap_initiator(
                 &initiator,
@@ -2975,6 +3518,7 @@ mod tests {
                 password,
                 &mnemonic,
                 registry_relay.as_ref(),
+                initiator_storage.as_ref(),
             )
             .await
             .unwrap_err();
@@ -3003,15 +3547,22 @@ mod tests {
 
         let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
         let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        // Real inviter identity keys: the inviter is a recipient of the
+        // post-pairing rekey wrap, so its relay-advertised X-Wing key must match
+        // the key the initiator authors into the signed snapshot (now enforced by
+        // byte-for-byte key-equality).
+        let inviter_pq_signing_key = device_secret.ml_dsa_65_keypair(&device_id).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
         let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
             device_id: device_id.clone(),
             epoch: 0,
             status: "active".to_string(),
             ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
             x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
-            ml_dsa_65_public_key: Vec::new(),
-            ml_kem_768_public_key: Vec::new(),
-            x_wing_public_key: Vec::new(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
         }]));
@@ -3069,6 +3620,8 @@ mod tests {
                 .unwrap()
         });
 
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, 0);
         initiator_service
             .complete_bootstrap_initiator(
                 &initiator,
@@ -3076,6 +3629,7 @@ mod tests {
                 password,
                 &mnemonic,
                 registry_relay.as_ref(),
+                initiator_storage.as_ref(),
             )
             .await
             .unwrap();
@@ -3806,6 +4360,8 @@ mod tests {
                 .unwrap()
         });
 
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
         initiator_service
             .complete_bootstrap_initiator(
                 &initiator,
@@ -3813,6 +4369,7 @@ mod tests {
                 password,
                 &mnemonic,
                 registry_relay.as_ref(),
+                initiator_storage.as_ref(),
             )
             .await
             .expect("post-revoke initiator must produce a valid bundle");
