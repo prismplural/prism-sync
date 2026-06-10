@@ -185,27 +185,24 @@ async fn rollback_returns_no_op_when_only_partial_credentials_present() {
 }
 
 #[tokio::test]
-async fn rollback_build_relay_failure_does_not_echo_relay_url() {
-    let handle = api::create_prism_sync(
+async fn insecure_non_localhost_relay_is_rejected_without_echoing_url() {
+    // SECURITY: with the `insecure-transport-dev` feature OFF (the default,
+    // including release builds), a cleartext http:// non-localhost relay is
+    // rejected at construction — the runtime `allow_insecure = true` cannot
+    // open a cleartext transport off the loopback. The error must not echo the
+    // secret-bearing URL back to Dart.
+    let err = api::create_prism_sync(
         "http://relay.example.com/private/path?token=super-secret".into(),
         ":memory:".into(),
         true,
         String::new(),
         None,
     )
-    .expect("create_prism_sync should succeed");
-    seed_rollback_credentials(&handle).await;
+    .expect_err("cleartext non-localhost relay must be rejected when insecure-transport-dev is off");
 
-    let json = api::rollback_first_device_registration(&handle).await.expect("FFI must not error");
-    let parsed = parse_outcome(&json);
-
-    assert_eq!(parsed["outcome"], "failed");
-    assert_eq!(parsed["stage"], "build_relay");
-    let reason = parsed["reason"].as_str().expect("reason should be a string");
-    assert!(reason.contains("invalid relay URL"));
-    assert!(!reason.contains("relay.example.com"));
-    assert!(!reason.contains("private/path"));
-    assert!(!reason.contains("super-secret"));
+    assert!(!err.contains("relay.example.com"), "error must not echo host, got: {err}");
+    assert!(!err.contains("private/path"), "error must not echo path, got: {err}");
+    assert!(!err.contains("super-secret"), "error must not echo token, got: {err}");
 }
 
 // ── 2. Deregistered on the happy path ───────────────────────────────────

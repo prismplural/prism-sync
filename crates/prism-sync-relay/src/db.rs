@@ -1434,17 +1434,28 @@ pub fn revoke_session(
 }
 
 /// Validate a session token. Returns `(sync_id, device_id)` if valid and not expired.
+///
+/// Enforces **two** independent deadlines:
+/// * the sliding `expires_at` window (refreshed on every request via
+///   [`touch_session`]), and
+/// * an absolute maximum age of `created_at + session_max_age_secs`,
+///   independent of activity. A token kept warm forever by traffic still dies
+///   `session_max_age_secs` after its last full re-authentication, forcing a
+///   re-auth and bounding the blast radius of a leaked-but-active token.
 pub fn validate_session(
     conn: &Connection,
     token: &str,
+    session_max_age_secs: i64,
 ) -> Result<Option<(String, String)>, rusqlite::Error> {
     let token_hash = hash_token(token);
     let now = now_secs();
     conn.query_row(
         "SELECT sync_id, device_id
          FROM device_sessions
-         WHERE session_token_hash = ?1 AND expires_at > ?2",
-        params![token_hash, now],
+         WHERE session_token_hash = ?1
+           AND expires_at > ?2
+           AND created_at + ?3 > ?2",
+        params![token_hash, now, session_max_age_secs],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
@@ -1469,19 +1480,26 @@ pub fn validate_revoked_session(
 }
 
 /// Extend the session expiry for a device (sliding window).
+///
+/// The sliding `expires_at` is clamped so it never extends past the absolute
+/// `created_at + session_max_age_secs` deadline — keeping the stored
+/// `expires_at` honest with the cap [`validate_session`] enforces, so expired
+/// sessions are still eligible for cleanup.
 pub fn touch_session(
     conn: &Connection,
     sync_id: &str,
     device_id: &str,
     session_expiry_secs: i64,
+    session_max_age_secs: i64,
 ) -> Result<(), rusqlite::Error> {
     let now = now_secs();
-    let expires_at = now + session_expiry_secs;
+    let sliding_expires_at = now + session_expiry_secs;
     conn.execute(
         "UPDATE device_sessions
-         SET last_active_at = ?1, expires_at = ?2
+         SET last_active_at = ?1,
+             expires_at = MIN(?2, created_at + ?5)
          WHERE sync_id = ?3 AND device_id = ?4",
-        params![now, expires_at, sync_id, device_id],
+        params![now, sliding_expires_at, sync_id, device_id, session_max_age_secs],
     )?;
     Ok(())
 }
@@ -3140,25 +3158,66 @@ mod tests {
             let token = create_session(conn, "sg1", "dev1", 3600)?;
             assert_eq!(token.len(), 64); // 32 bytes hex
 
+            // 90-day absolute cap (far larger than the sliding window below).
+            let max_age = 7_776_000;
+
             // Validate
-            let result = validate_session(conn, &token)?;
+            let result = validate_session(conn, &token, max_age)?;
             assert_eq!(result, Some(("sg1".to_string(), "dev1".to_string())));
 
             // Invalid token
-            let result = validate_session(conn, "invalid_token")?;
+            let result = validate_session(conn, "invalid_token", max_age)?;
             assert!(result.is_none());
 
             // Touch session
-            touch_session(conn, "sg1", "dev1", 7200)?;
+            touch_session(conn, "sg1", "dev1", 7200, max_age)?;
 
             // Still valid
-            let result = validate_session(conn, &token)?;
+            let result = validate_session(conn, &token, max_age)?;
             assert_eq!(result, Some(("sg1".to_string(), "dev1".to_string())));
 
             // Delete session
             delete_session(conn, "sg1", "dev1")?;
-            let result = validate_session(conn, &token)?;
+            let result = validate_session(conn, &token, max_age)?;
             assert!(result.is_none());
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_session_absolute_max_age_rejects_old_session() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+
+            // Create a session and force a far-in-the-past created_at while
+            // keeping a still-future sliding expires_at (the "kept warm
+            // forever" case the absolute cap is meant to catch).
+            let token = create_session(conn, "sg1", "dev1", 3600)?;
+            let now = now_secs();
+            conn.execute(
+                "UPDATE device_sessions
+                 SET created_at = ?1, expires_at = ?2
+                 WHERE sync_id = 'sg1' AND device_id = 'dev1'",
+                params![now - 100_000, now + 3600],
+            )?;
+
+            // Under a tiny absolute cap the session is rejected despite the
+            // sliding window still being open.
+            assert!(validate_session(conn, &token, 60)?.is_none());
+
+            // Under a large absolute cap it is still valid.
+            assert_eq!(
+                validate_session(conn, &token, 7_776_000)?,
+                Some(("sg1".to_string(), "dev1".to_string()))
+            );
+
+            // touch_session must not extend expires_at past created_at + cap.
+            touch_session(conn, "sg1", "dev1", 7200, 60)?;
+            assert!(validate_session(conn, &token, 60)?.is_none());
 
             Ok(())
         })
@@ -3175,7 +3234,7 @@ mod tests {
             let token = create_session(conn, "sg1", "dev1", 3600)?;
             revoke_session(conn, "sg1", "dev1", 3600)?;
 
-            assert!(validate_session(conn, &token)?.is_none());
+            assert!(validate_session(conn, &token, 7_776_000)?.is_none());
             assert_eq!(
                 validate_revoked_session(conn, &token)?,
                 Some(("sg1".to_string(), "dev1".to_string()))

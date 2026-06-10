@@ -32,6 +32,7 @@ fn base_test_config() -> Config {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,

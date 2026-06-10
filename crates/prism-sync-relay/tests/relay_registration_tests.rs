@@ -367,6 +367,7 @@ async fn test_registration_rejects_expired_nonce() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 0, // Expire immediately
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -500,6 +501,7 @@ async fn test_nonce_rate_limiting() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -657,6 +659,7 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -787,6 +790,7 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -968,6 +972,7 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -1135,6 +1140,7 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -1495,6 +1501,7 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -1899,6 +1906,7 @@ async fn test_nonce_rate_limiting_window_expiry() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
@@ -2337,7 +2345,7 @@ async fn test_revoked_device_token_is_invalidated_but_still_identifies_revocatio
     .unwrap();
 
     db.with_read_conn(|conn| {
-        assert!(db::validate_session(conn, &target_token)?.is_none());
+        assert!(db::validate_session(conn, &target_token, 7_776_000)?.is_none());
         assert_eq!(
             db::validate_revoked_session(conn, &target_token)?,
             Some((sync_id.clone(), target_id.clone()))
@@ -3045,6 +3053,7 @@ async fn test_revoke_rate_limiting() {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,
         stale_device_secs: 2_592_000,
@@ -4080,6 +4089,7 @@ fn default_test_config() -> Config {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,

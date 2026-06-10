@@ -48,6 +48,12 @@ pub struct Config {
     pub max_unpruned_batches: u64,
     pub metrics_token: Option<String>,
     pub session_expiry_secs: u64,
+    /// Absolute maximum lifetime of a session, measured from `created_at`
+    /// (the last full re-authentication), independent of the sliding
+    /// `session_expiry_secs` window. Once a session is older than this it is
+    /// rejected even if it has been kept warm by activity, forcing a re-auth.
+    /// Default: 7,776,000 (90 days).
+    pub session_max_age_secs: u64,
     pub nonce_expiry_secs: u64,
     /// Leading zero bits required for first-device PoW admission.
     /// Set to 0 to disable PoW gating.
@@ -287,6 +293,7 @@ impl Config {
             max_unpruned_batches: parse_env_with(&env, "MAX_UNPRUNED_BATCHES", 10_000),
             metrics_token: env("METRICS_TOKEN").filter(|s| !s.is_empty()),
             session_expiry_secs: parse_env_with(&env, "SESSION_EXPIRY_SECS", 2_592_000),
+            session_max_age_secs: parse_env_with(&env, "SESSION_MAX_AGE_SECS", 7_776_000),
             nonce_expiry_secs: parse_env_with(&env, "NONCE_EXPIRY_SECS", 60),
             first_device_pow_difficulty_bits: parse_env_with(
                 &env,
@@ -637,6 +644,7 @@ pub fn localhost_test_config() -> Config {
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
         session_expiry_secs: 3600,
+        session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
         invite_ttl_secs: 86400,
         sync_inactive_ttl_secs: 7_776_000,

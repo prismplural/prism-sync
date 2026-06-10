@@ -27,9 +27,12 @@ hybrid-array = { workspace = true }
 
 # Post-quantum cryptography (RustCrypto ecosystem)
 # SECURITY: PQ crate pins verified 2026-04-08. All versions are latest available.
-# x-wing =0.1.0-rc.0, ml-kem 0.3.0-rc.2, ml-dsa 0.1.0-rc.8.
-# Do not update without running cross-language vector tests:
-#   cargo test -p prism-sync-crypto --test cross_language_vectors -- --ignored
+# All three are exact (`=`) pinned in the workspace Cargo.toml so `cargo update`
+# cannot silently move to a later RC or the finalized release (which may change
+# the X-Wing combiner / encap-key checks): x-wing =0.1.0-rc.0,
+# ml-kem =0.3.0-rc.2, ml-dsa =0.1.0-rc.8.
+# Do not update without running the cross-language + draft vector tests:
+#   cargo test -p prism-sync-crypto --test cross_language_vectors
 ml-kem = { workspace = true }
 ml-dsa = { workspace = true }
 x-wing = { workspace = true }

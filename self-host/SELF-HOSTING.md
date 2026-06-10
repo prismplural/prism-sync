@@ -173,7 +173,8 @@ All environment variables with their defaults. Everything is production-ready ou
 | `CLEANUP_INTERVAL_SECS` | `3600` | Background cleanup frequency |
 | `SYNC_INACTIVE_TTL_SECS` | `7776000` | Auto-prune inactive groups (default: 90 days) |
 | `STALE_DEVICE_SECS` | `2592000` | Mark devices stale after inactivity (30 days) |
-| `SESSION_EXPIRY_SECS` | `2592000` | Session token lifetime (30 days) |
+| `SESSION_EXPIRY_SECS` | `2592000` | Session token sliding lifetime, refreshed on each request (30 days) |
+| `SESSION_MAX_AGE_SECS` | `7776000` | Absolute session lifetime from last re-auth; a token older than this is rejected even if kept active (90 days) |
 | `MAX_UNPRUNED_BATCHES` | `10000` | Max undelivered batches before rejecting pushes |
 | `SNAPSHOT_DEFAULT_TTL_SECS` | `86400` | Ephemeral snapshot retention (24 hours) |
 
@@ -224,7 +225,7 @@ apply.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `METRICS_TOKEN` | *(unset)* | Bearer token for `/metrics`. If unset, metrics are open |
+| `METRICS_TOKEN` | *(unset)* | Bearer token for `/metrics`. If unset, metrics are served **only to loopback peers** (localhost / `docker exec`); off-host scrapers get 401. Set a token to scrape remotely. |
 | `NODE_EXPORTER_URL` | *(unset)* | URL for node-exporter proxy at `/metrics/node` |
 
 ## Private Relay Tips
@@ -239,8 +240,10 @@ Running a relay for a single system? Simplify the config:
 > months, the relay will auto-delete your sync group. Set `SYNC_INACTIVE_TTL_SECS` to
 > `31536000` (1 year) or more for a private relay.
 
-Session tokens last 30 days by default. If you don't open the app for a month, your device
-will need to re-pair. Increase `SESSION_EXPIRY_SECS` for a private relay.
+Session tokens have a 30-day sliding window (refreshed on every request) and a 90-day
+absolute cap measured from the last full re-authentication. If you don't open the app for a
+month, or if a token has been alive for 90 days, your device will need to re-pair. Increase
+`SESSION_EXPIRY_SECS` and/or `SESSION_MAX_AGE_SECS` for a private relay.
 
 ## Kubernetes
 
@@ -286,7 +289,9 @@ alongside the database. Media is encrypted ciphertext — safe to store on any b
 ## Monitoring
 
 `GET /metrics` returns Prometheus-format metrics. If `METRICS_TOKEN` is set, requests need
-an `Authorization: Bearer <token>` header.
+an `Authorization: Bearer <token>` header. If it is **unset**, the endpoint fails closed and
+is served only to loopback peers (localhost / a sidecar Prometheus / `docker exec`); any
+off-host request gets 401. Set a token to scrape `/metrics` from another host.
 
 Key metrics:
 

@@ -21,6 +21,42 @@ use super::websocket::WebSocketClient;
 
 const SNAPSHOT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// Client-side ceiling on a `/changes` pull body, sized to comfortably EXCEED
+/// the legitimate worst-case page so it only ever catches a truly anomalous
+/// (relay-malicious, beyond-protocol) response — never a legal large pull.
+///
+/// The relay's `pull_changes` (`relay/src/routes/sync.rs`) does NOT bound the
+/// response by any byte budget — only by batch count. This client pulls with
+/// `DEFAULT_PULL_PAGE_LIMIT` (= 500, `engine::state`) batches per page, each up
+/// to the relay's `MAX_CHANGESET_SIZE` (= 1 MiB). So a single legitimate page
+/// can carry ~500 MiB of raw changeset bytes. On the wire those bytes are
+/// base64-encoded (~1.34×) and wrapped in a JSON envelope, so the legitimate
+/// body can reach ~670 MiB. We set the cap above that (768 MiB) so a normal
+/// large backlog page — e.g. a bulk inline-base64 avatar resupply (~750 KB
+/// each) — is never rejected. A smaller cap (e.g. the 150 MiB snapshot budget)
+/// would hard-`Protocol`-error a legal page, and the retry uses identical
+/// params (no page-halving) → a permanent sync stall.
+///
+/// Derivation: DEFAULT_PULL_PAGE_LIMIT (500) * MAX_CHANGESET_SIZE (1 MiB)
+///   = 512 MiB raw; * ~1.34 base64 + JSON overhead ≈ 686 MiB; round up to a
+///   clean 768 MiB.
+///
+/// TODO(perf/security): the proper fix is a relay-side per-page byte budget (so
+/// pages are bounded by bytes, not just batch count) and/or client page-halving
+/// on over-cap; this generous cap is an interim that prevents unbounded
+/// allocation without stalling legit large pulls.
+const MAX_PULL_RESPONSE_BYTES: usize = 768 * 1024 * 1024;
+
+/// Client-side ceiling on a `GET /snapshot` body, matching the relay's own
+/// `MAX_SNAPSHOT_WIRE_BYTES` upload limit (the largest legitimate body).
+const MAX_SNAPSHOT_RESPONSE_BYTES: usize = crate::snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES;
+
+/// Client-side ceiling on a `GET /media/<id>` body. The relay's default
+/// `MEDIA_MAX_FILE_BYTES` is 10 MiB; cap generously at 64 MiB so a tightened
+/// or relaxed relay config still leaves a hard client-side bound against a
+/// malicious relay streaming an unbounded media body.
+const MAX_MEDIA_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// HTTP relay client for the V2 sync API.
 ///
 /// Ported from Dart `lib/core/sync/server_relay.dart`.
@@ -296,6 +332,51 @@ impl ServerRelay {
         }
     }
 
+    /// Read a response body with a hard byte ceiling.
+    ///
+    /// `reqwest` imposes **no** default body-size limit, so a malicious or
+    /// buggy relay could stream an unbounded body and exhaust client memory.
+    /// This mirrors the `get_signed_registry` 512 KiB guard but applies it to
+    /// the large-body endpoints (`/changes`, `/snapshot`, `/media/*`):
+    ///
+    /// 1. If the relay advertises a `Content-Length` over `max_bytes`, reject
+    ///    before reading a single byte.
+    /// 2. Stream the body chunk-by-chunk with a running counter and abort the
+    ///    instant the accumulated size exceeds `max_bytes` — so a relay that
+    ///    lies about (or omits) `Content-Length` still cannot blow past the cap.
+    async fn read_body_capped(
+        resp: reqwest::Response,
+        max_bytes: usize,
+        endpoint: &str,
+    ) -> Result<Vec<u8>, RelayError> {
+        use futures_util::StreamExt;
+
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes as u64 {
+                return Err(RelayError::Protocol {
+                    message: format!(
+                        "{endpoint} response too large: Content-Length {len} bytes (max {max_bytes})"
+                    ),
+                });
+            }
+        }
+
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(Self::classify_reqwest_error)?;
+            if body.len() + chunk.len() > max_bytes {
+                return Err(RelayError::Protocol {
+                    message: format!(
+                        "{endpoint} response too large: exceeded {max_bytes} bytes mid-stream"
+                    ),
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
     /// Whether the WebSocket is currently authenticated and receiving messages.
     pub fn is_websocket_connected(&self) -> bool {
         // Use try_lock to avoid blocking — if the lock is held, assume disconnected.
@@ -373,12 +454,18 @@ impl ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
+        // Read the body under a hard cap before parsing — reqwest has no default
+        // body limit, so a malicious relay could otherwise stream an unbounded
+        // body into a `serde_json::Value` and exhaust client memory.
+        let body = Self::read_body_capped(resp, MAX_PULL_RESPONSE_BYTES, "/changes").await?;
+
         // A decode failure here is almost always a truncated body from a mid-flight
         // network drop — not a malformed payload from the relay. Route it through
         // the same classifier as the original send error so it lands as Network
         // (transient, retryable) instead of Protocol (hard error). The next sync
         // cycle re-pulls cleanly and the user never sees a spurious failure.
-        let json: serde_json::Value = resp.json().await.map_err(Self::classify_reqwest_error)?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| RelayError::Network { message: e.to_string() })?;
 
         let max_server_seq = json["max_server_seq"].as_i64().unwrap_or(0);
         let min_acked_seq = json["min_acked_seq"].as_i64();
@@ -849,9 +936,13 @@ impl SnapshotExchange for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let json: serde_json::Value = resp.json().await.map_err(|e| RelayError::Protocol {
-            message: format!("Failed to parse snapshot response: {e}"),
-        })?;
+        // Cap the snapshot body before buffering it — reqwest has no default
+        // body limit. Mirrors the relay's own MAX_SNAPSHOT_WIRE_BYTES bound.
+        let body = Self::read_body_capped(resp, MAX_SNAPSHOT_RESPONSE_BYTES, "/snapshot").await?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| RelayError::Protocol {
+                message: format!("Failed to parse snapshot response: {e}"),
+            })?;
 
         let epoch = json["epoch"].as_i64().unwrap_or(0) as i32;
         let server_seq_at = json["server_seq_at"].as_i64().unwrap_or(0);
@@ -1040,8 +1131,10 @@ impl MediaRelay for ServerRelay {
             return Err(Self::classify_error(status, &body_text));
         }
 
-        let bytes = resp.bytes().await.map_err(Self::classify_reqwest_error)?;
-        Ok(bytes.to_vec())
+        // Cap the media body before buffering — reqwest has no default body
+        // limit, so an oversized/unbounded body from a malicious relay would
+        // otherwise be read fully into memory.
+        Self::read_body_capped(resp, MAX_MEDIA_RESPONSE_BYTES, "/media").await
     }
 }
 

@@ -132,8 +132,51 @@ fn install_panic_hook_once() {
 /// panic payload + source location captured by the hook installed at engine
 /// creation. Returns `None` when no panic has been captured since the last
 /// call (the slot is cleared on read).
+///
+/// The payload is run through [`redact_sensitive_message`] before it leaves
+/// the FFI boundary: panic messages (e.g. an `assert_eq!` / `expect` on a
+/// secret-typed operand) can otherwise carry key material into the Dart logs.
 pub fn take_last_panic() -> Option<String> {
-    LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner()).take()
+    LAST_PANIC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map(|payload| redact_sensitive_message(&payload))
+}
+
+/// True when `url` points at a loopback host that is always safe to reach over
+/// cleartext (local development + the FFI test harness). Mirrors the
+/// `http://localhost` exception the FFI URL guards already used.
+fn is_localhost_url(url: &str) -> bool {
+    url.starts_with("http://localhost")
+        || url.starts_with("ws://localhost")
+        || url.starts_with("http://127.0.0.1")
+        || url.starts_with("ws://127.0.0.1")
+        || url.starts_with("http://[::1]")
+        || url.starts_with("ws://[::1]")
+}
+
+/// Resolve the *effective* insecure-transport flag for a given relay URL.
+///
+/// SECURITY: cleartext transport to a **non-localhost** relay is gated behind
+/// the compile-time `insecure-transport-dev` feature (default-off). A release
+/// build therefore physically cannot honor a runtime `allow_insecure = true`
+/// for an `http://` host on the open network — the flag is forced to `false`
+/// before it can reach `ServerRelay`/the core builder, so tokens, registry,
+/// and pairing material can never be sent in cleartext off-device.
+///
+/// `http://localhost` (and other loopback aliases) stay permitted regardless,
+/// because the core builder rejects even loopback cleartext unless insecure
+/// transport is allowed and the FFI test harness depends on it.
+fn effective_allow_insecure(requested: bool, url: &str) -> bool {
+    if !requested {
+        return false;
+    }
+    if is_localhost_url(url) {
+        return true;
+    }
+    // Non-localhost cleartext: only when explicitly compiled for dev.
+    cfg!(feature = "insecure-transport-dev")
 }
 
 /// Opaque handle wrapping PrismSync for FFI.
@@ -1378,7 +1421,11 @@ enum CeremonyGuardKind {
 ///
 /// - `relay_url`: The relay server URL.
 /// - `db_path`: SQLite database path, or ":memory:" for in-memory.
-/// - `allow_insecure`: Allow http:// relay URLs (dev only).
+/// - `allow_insecure`: Allow http:// relay URLs (dev only). For a
+///   **non-localhost** host this is honored only when the crate is built with
+///   the `insecure-transport-dev` feature; release builds force it to `false`
+///   so cleartext can never reach the open network. `http://localhost` stays
+///   allowed regardless.
 /// - `schema_json`: JSON schema definition (see `parse_schema_json` docs).
 ///   Pass an empty string or "{}" to use an empty schema.
 ///
@@ -1425,6 +1472,12 @@ pub fn create_prism_sync(
         RusqliteSyncStorage::new(conn)
     }
     .map_err(|e| format!("Failed to create storage: {e}"))?;
+
+    // SECURITY: gate cleartext non-localhost transport behind the compile-time
+    // `insecure-transport-dev` feature. In a release build this forces the
+    // runtime flag to `false` for any non-localhost http:// URL, so the handle
+    // (and every downstream relay it builds) can never accept cleartext.
+    let allow_insecure = effective_allow_insecure(allow_insecure, &relay_url);
 
     let mut builder =
         PrismSync::builder().schema(schema).storage(Arc::new(storage)).relay_url(&relay_url);
@@ -2638,7 +2691,11 @@ fn build_relay(
     // When allow_insecure is set we permit arbitrary http:// URLs by
     // converting to http://localhost temporarily is not feasible, so we
     // skip the check by using the URL as-is and relying on the caller.
+    // SECURITY: re-gate here so cleartext non-localhost is rejected even if a
+    // caller threads a raw `allow_insecure=true` that didn't pass through the
+    // handle's `create_prism_sync` gate (compile-time `insecure-transport-dev`).
     let url = relay_url.to_string();
+    let allow_insecure = effective_allow_insecure(allow_insecure, &url);
     if !allow_insecure && !url.starts_with("https://") && !url.starts_with("http://localhost") {
         return Err(
             "Relay URL must use https://. Set allow_insecure=true for development.".to_string()
@@ -4178,23 +4235,14 @@ pub async fn get_identity_public_key(handle: &PrismSyncHandle) -> Result<Vec<u8>
     Ok(exchange_key.public_key_bytes().to_vec())
 }
 
-/// Perform X25519 ECDH key agreement with a peer's public key.
-/// Returns the 32-byte shared secret.
-pub async fn perform_ecdh(
-    handle: &PrismSyncHandle,
-    peer_public_key: Vec<u8>,
-) -> Result<Vec<u8>, String> {
-    if peer_public_key.len() != 32 {
-        return Err(format!("peer public key must be 32 bytes, got {}", peer_public_key.len()));
-    }
-    let inner = handle.inner.lock().await;
-    let device_secret = inner.device_secret().ok_or("Device secret not initialized")?;
-    let device_id = inner.device_id().ok_or("Device ID not configured")?;
-    let exchange_key = device_secret.x25519_keypair(device_id).map_err(|e| e.to_string())?;
-    let mut peer_arr = [0u8; 32];
-    peer_arr.copy_from_slice(&peer_public_key);
-    Ok(exchange_key.diffie_hellman(&peer_arr))
-}
+// NOTE: `perform_ecdh` was removed (2026-06). It exposed a *standalone* X25519
+// ECDH that returned the raw shared secret with no contributory/all-zero check
+// and no public-key binding — a peer supplying a low-order point forces a known
+// all-zero secret. A workspace-wide audit (Rust + generated Dart bindings +
+// prism-app) found no production consumer, so the dead FFI surface was deleted
+// rather than hardened. The underlying `DeviceExchangeKey::diffie_hellman` was
+// removed with it. ECDH inside X-Wing (where the omission is intentionally
+// safe) is unaffected.
 
 /// Encrypt plaintext with XChaCha20-Poly1305. Returns `nonce || ciphertext+MAC`.
 pub fn encrypt_xchacha(key: Vec<u8>, plaintext: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -4304,7 +4352,11 @@ pub fn encode_image(
 /// Build a `ServerPairingRelay` from the handle's relay URL.
 fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, String> {
     let relay_url = &handle.relay_url;
-    if !handle.allow_insecure
+    // SECURITY: re-gate cleartext non-localhost behind the compile-time
+    // `insecure-transport-dev` feature (handle.allow_insecure was already gated
+    // at create_prism_sync; this keeps the guard correct at the choke point).
+    let allow_insecure = effective_allow_insecure(handle.allow_insecure, relay_url);
+    if !allow_insecure
         && !relay_url.starts_with("https://")
         && !relay_url.starts_with("http://localhost")
     {
@@ -5572,7 +5624,11 @@ mod tests {
         // Clear any residue from an unrelated earlier panic in this binary.
         let _ = take_last_panic();
 
-        let marker = "prism_resume_panic_marker_b41c7e";
+        // Keep the marker short / non-secret-shaped so it survives the
+        // redaction `take_last_panic` now applies (a 32+ char token with digits
+        // would be masked as a credential — see the secret-redaction assertion
+        // below).
+        let marker = "resume marker zk";
         let unwound = std::panic::catch_unwind(|| panic!("{marker}"));
         assert!(unwound.is_err(), "catch_unwind should observe the panic");
 
@@ -5587,6 +5643,51 @@ mod tests {
         );
         // Reading drains the slot so a stale panic can't be reported twice.
         assert!(take_last_panic().is_none(), "take_last_panic should clear the slot");
+    }
+
+    #[test]
+    fn take_last_panic_redacts_secret_shaped_payload() {
+        let _serial = PANIC_HOOK_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        install_panic_hook_once();
+        let _ = take_last_panic();
+
+        // A panic whose payload carries secret-shaped material (e.g. an
+        // assert_eq! on a session token) must not leak it through the FFI.
+        let unwound = std::panic::catch_unwind(|| {
+            panic!("session_token=deadbeefcafe0123deadbeefcafe0123");
+        });
+        assert!(unwound.is_err());
+
+        let captured = take_last_panic().expect("panic hook should capture the payload");
+        assert!(
+            !captured.contains("deadbeefcafe0123deadbeefcafe0123"),
+            "redaction must strip the secret-shaped payload, got: {captured}"
+        );
+        assert!(
+            captured.contains("[redacted"),
+            "redacted payload should carry a redaction marker, got: {captured}"
+        );
+        let _ = take_last_panic();
+    }
+
+    #[test]
+    fn effective_allow_insecure_always_permits_localhost() {
+        // Loopback cleartext is always allowed regardless of the compile flag
+        // (dev + the FFI test harness depend on it).
+        assert!(effective_allow_insecure(true, "http://localhost:8080"));
+        assert!(effective_allow_insecure(true, "http://127.0.0.1:8080"));
+        assert!(effective_allow_insecure(true, "ws://localhost:8080"));
+        // A request of `false` is honored verbatim.
+        assert!(!effective_allow_insecure(false, "http://localhost:8080"));
+    }
+
+    #[test]
+    fn effective_allow_insecure_gates_non_localhost_on_compile_feature() {
+        // Non-localhost cleartext is permitted iff built with the dev feature.
+        let permitted = effective_allow_insecure(true, "http://relay.example.com");
+        assert_eq!(permitted, cfg!(feature = "insecure-transport-dev"));
+        // https is unaffected (the flag is moot for already-secure transport).
+        assert!(!effective_allow_insecure(false, "https://relay.example.com"));
     }
 
     #[test]

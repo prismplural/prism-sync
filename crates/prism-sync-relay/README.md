@@ -16,13 +16,14 @@ All configuration via environment variables:
 |----------|---------|-------------|
 | PORT | 8080 | Server port |
 | DB_PATH | data/relay.db | SQLite database path |
-| SESSION_EXPIRY_SECS | 2592000 | Session token expiry (30 days) |
+| SESSION_EXPIRY_SECS | 2592000 | Session token sliding expiry, refreshed per request (30 days) |
+| SESSION_MAX_AGE_SECS | 7776000 | Absolute session lifetime from last re-auth (90 days) |
 | NONCE_EXPIRY_SECS | 60 | Registration nonce expiry |
 | STALE_DEVICE_SECS | 2592000 | Stale device threshold (30 days) |
 | SYNC_INACTIVE_TTL_SECS | 7776000 | Auto-revoke threshold (90 days) |
 | CLEANUP_INTERVAL_SECS | 3600 | Background cleanup interval |
 | MAX_UNPRUNED_BATCHES | 10000 | Max batches before rejecting push |
-| METRICS_TOKEN | (none) | Optional bearer token for /metrics |
+| METRICS_TOKEN | (none) | Bearer token for /metrics. Unset => loopback-only (fails closed) |
 | RUST_LOG | info | Tracing log level |
 | DEFAULT_REQUEST_TIMEOUT_SECS | 30 | Per-request timeout for light routes (408 on expiry) |
 | SNAPSHOT_REQUEST_TIMEOUT_SECS | 300 | Per-request timeout for `PUT /snapshot` (5 min for large uploads on slow connections) |

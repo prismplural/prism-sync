@@ -481,6 +481,7 @@ mod tests {
             max_unpruned_batches: 10_000,
             metrics_token: None,
             session_expiry_secs: 3600,
+            session_max_age_secs: 7_776_000,
             nonce_expiry_secs: 60,
             first_device_pow_difficulty_bits: 8,
             nonce_rate_limit: 100,

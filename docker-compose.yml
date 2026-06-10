@@ -10,6 +10,10 @@ services:
     environment:
       - DB_PATH=/data/relay.db
       - PORT=8080
+      # /metrics is served only to loopback peers when METRICS_TOKEN is empty
+      # (the relay fails closed — it is never world-readable). To scrape from
+      # an off-host Prometheus, set a real token: `export METRICS_TOKEN=$(openssl rand -hex 32)`
+      # before `docker compose up`, then send it as `Authorization: Bearer <token>`.
       - METRICS_TOKEN=${METRICS_TOKEN:-}
       - RUST_LOG=${RUST_LOG:-info}
     restart: unless-stopped

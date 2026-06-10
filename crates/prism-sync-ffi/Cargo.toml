@@ -9,6 +9,15 @@ description = "FFI layer for prism-sync, bridging to Dart/Flutter via flutter_ru
 name = "prism_sync_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+default = []
+# Permit cleartext (http://) transport to a NON-localhost relay when the caller
+# passes `allow_insecure = true`. OFF by default so release builds physically
+# cannot accept a cleartext non-localhost relay no matter what the runtime flag
+# says. `http://localhost` / `ws://localhost` stay permitted without this
+# feature (loopback dev + the FFI test harness rely on it).
+insecure-transport-dev = []
+
 [dependencies]
 prism-sync-core = { workspace = true }
 prism-sync-crypto = { workspace = true }

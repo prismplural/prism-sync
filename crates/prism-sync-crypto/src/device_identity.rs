@@ -160,10 +160,10 @@ impl DeviceExchangeKey {
         *self.public_key.as_bytes()
     }
 
-    pub fn diffie_hellman(&self, peer_public_key: &[u8; 32]) -> Vec<u8> {
-        let peer = X25519PublicKey::from(*peer_public_key);
-        self.secret_key.diffie_hellman(&peer).to_bytes().to_vec()
-    }
+    // NOTE: a standalone `diffie_hellman` was removed alongside the dead
+    // `perform_ecdh` FFI export (2026-06). It returned the raw X25519 shared
+    // secret with no contributory/all-zero check; it had no production consumer
+    // outside the removed FFI surface. X25519 inside X-Wing is unaffected.
 }
 
 /// ML-DSA-65 signing key for post-quantum signatures.
@@ -312,18 +312,6 @@ mod tests {
         let kp1 = secret.x25519_keypair("device_abc").unwrap();
         let kp2 = secret.x25519_keypair("device_abc").unwrap();
         assert_eq!(kp1.public_key_bytes(), kp2.public_key_bytes());
-    }
-
-    #[test]
-    fn x25519_diffie_hellman() {
-        let secret_a = DeviceSecret::generate();
-        let secret_b = DeviceSecret::generate();
-        let kp_a = secret_a.x25519_keypair("device_a").unwrap();
-        let kp_b = secret_b.x25519_keypair("device_b").unwrap();
-        let shared_a = kp_a.diffie_hellman(&kp_b.public_key_bytes());
-        let shared_b = kp_b.diffie_hellman(&kp_a.public_key_bytes());
-        assert_eq!(shared_a, shared_b);
-        assert_eq!(shared_a.len(), 32);
     }
 
     #[test]

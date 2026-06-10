@@ -918,15 +918,10 @@ Future<String> sharingUnwrapKeys({
 Future<Uint8List> getIdentityPublicKey({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiGetIdentityPublicKey(handle: handle);
 
-/// Perform X25519 ECDH key agreement with a peer's public key.
-/// Returns the 32-byte shared secret.
-Future<Uint8List> performEcdh({
-  required PrismSyncHandle handle,
-  required List<int> peerPublicKey,
-}) => RustLib.instance.api.crateApiPerformEcdh(
-  handle: handle,
-  peerPublicKey: peerPublicKey,
-);
+// performEcdh removed: dead FFI (no production consumer). The standalone X25519
+// ECDH it exposed returned a raw shared secret with no contributory check. The
+// remaining `crateApiPerformEcdh` plumbing below is dead and will be dropped on
+// the next `flutter_rust_bridge_codegen generate`.
 
 /// Encrypt plaintext with XChaCha20-Poly1305. Returns `nonce || ciphertext+MAC`.
 Future<Uint8List> encryptXchacha({

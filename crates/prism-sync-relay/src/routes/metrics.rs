@@ -1,4 +1,11 @@
-use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::{ConnectInfo, State},
+    http::HeaderMap,
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
 use crate::{auth, errors::AppError, state::AppState};
@@ -9,26 +16,50 @@ pub fn routes() -> Router<AppState> {
         .route("/metrics/node", get(node_metrics))
 }
 
-/// Expose Prometheus-format metrics.
+/// Authorize a metrics request, failing closed when no token is configured.
 ///
-/// If `METRICS_TOKEN` is configured, the request must include a matching
-/// `Authorization: Bearer <token>` header. If no token is configured the
-/// endpoint is open (suitable for internal / firewalled deployments).
-async fn prometheus_metrics(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    // Optional bearer-token gate.
-    if let Some(expected_token) = state.config.metrics_token.as_deref() {
-        let provided = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !auth::timing_safe_eq(provided, expected_token) {
-            return Err(AppError::Unauthorized);
+/// * If `METRICS_TOKEN` is set, require a matching `Authorization: Bearer
+///   <token>` header (timing-safe compare).
+/// * If no token is configured, the endpoint is **not** world-readable: it is
+///   served only to loopback peers (localhost / same host, e.g. a sidecar
+///   Prometheus or `docker exec`). Any non-loopback peer gets 401. This keeps
+///   the common internal/firewalled deployment working while closing the
+///   default-open hole an empty/unset `METRICS_TOKEN` previously left.
+fn authorize_metrics(state: &AppState, headers: &HeaderMap, peer_addr: SocketAddr) -> Result<(), AppError> {
+    match state.config.metrics_token.as_deref() {
+        Some(expected_token) => {
+            let provided = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or("");
+            if !auth::timing_safe_eq(provided, expected_token) {
+                return Err(AppError::Unauthorized);
+            }
+            Ok(())
+        }
+        None => {
+            // Fail closed: no token => loopback only.
+            if peer_addr.ip().is_loopback() {
+                Ok(())
+            } else {
+                Err(AppError::Unauthorized)
+            }
         }
     }
+}
+
+/// Expose Prometheus-format metrics.
+///
+/// See [`authorize_metrics`] for the access model. When `METRICS_TOKEN` is set
+/// a matching bearer token is required; otherwise only loopback peers are
+/// served (the endpoint is never world-readable by default).
+async fn prometheus_metrics(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_metrics(&state, &headers, peer_addr)?;
 
     let m = &state.metrics;
     let connected = state.connected_device_count().await;
@@ -71,23 +102,15 @@ async fn prometheus_metrics(
     Ok(([("content-type", "text/plain; version=0.0.4; charset=utf-8")], output))
 }
 
-/// Reverse-proxy to node-exporter, gated by the same METRICS_TOKEN.
+/// Reverse-proxy to node-exporter, gated by the same access model as
+/// [`prometheus_metrics`] (token if configured, else loopback-only).
 /// Returns 404 if NODE_EXPORTER_URL is not configured.
 async fn node_metrics(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    // Same bearer-token gate as /metrics.
-    if let Some(expected_token) = state.config.metrics_token.as_deref() {
-        let provided = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !auth::timing_safe_eq(provided, expected_token) {
-            return Err(AppError::Unauthorized);
-        }
-    }
+    authorize_metrics(&state, &headers, peer_addr)?;
 
     let base_url = state.config.node_exporter_url.as_deref().ok_or(AppError::NotFound)?;
 
@@ -100,4 +123,69 @@ async fn node_metrics(
         .map_err(|e| AppError::Internal(format!("node-exporter read failed: {e}")))?;
 
     Ok(([("content-type", "text/plain; version=0.0.4; charset=utf-8")], body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::localhost_test_config;
+    use crate::db::Database;
+    use axum::http::HeaderValue;
+
+    fn state_with_token(token: Option<&str>) -> AppState {
+        let mut config = localhost_test_config();
+        config.metrics_token = token.map(|t| t.to_string());
+        let db = Database::in_memory().expect("in-memory db");
+        AppState::new(db, config)
+    }
+
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:54321".parse().unwrap()
+    }
+
+    fn external() -> SocketAddr {
+        "203.0.113.7:54321".parse().unwrap()
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn no_token_allows_loopback() {
+        let state = state_with_token(None);
+        assert!(authorize_metrics(&state, &HeaderMap::new(), loopback()).is_ok());
+    }
+
+    #[test]
+    fn no_token_rejects_external_peer_fails_closed() {
+        // The key regression: an unset/empty METRICS_TOKEN must NOT leave
+        // /metrics world-readable. Off-host peers are refused.
+        let state = state_with_token(None);
+        assert!(matches!(
+            authorize_metrics(&state, &HeaderMap::new(), external()),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn token_required_for_external_peer() {
+        let state = state_with_token(Some("s3cr3t"));
+        // Correct token from anywhere is accepted.
+        assert!(authorize_metrics(&state, &bearer("s3cr3t"), external()).is_ok());
+        // Wrong/absent token is rejected even from loopback.
+        assert!(matches!(
+            authorize_metrics(&state, &bearer("nope"), loopback()),
+            Err(AppError::Unauthorized)
+        ));
+        assert!(matches!(
+            authorize_metrics(&state, &HeaderMap::new(), loopback()),
+            Err(AppError::Unauthorized)
+        ));
+    }
 }

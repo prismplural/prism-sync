@@ -538,13 +538,16 @@ async fn auth_middleware(
 
     let token_owned = token.to_string();
     let session_expiry = state.config.session_expiry_secs as i64;
+    let session_max_age = state.config.session_max_age_secs as i64;
 
     // Phase 1 — Read (blocking, must complete): validate session + device status
     let db_read = state.db.clone();
     let auth_result = tokio::task::spawn_blocking(move || -> Result<AuthResult, AppError> {
         db_read
             .with_read_conn(|conn| {
-                if let Some((sync_id, device_id)) = db::validate_session(conn, &token_owned)? {
+                if let Some((sync_id, device_id)) =
+                    db::validate_session(conn, &token_owned, session_max_age)?
+                {
                     let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
                         return Ok(AuthResult::Invalid);
                     };
@@ -594,7 +597,7 @@ async fn auth_middleware(
             tokio::spawn(async move {
                 let _ = tokio::task::spawn_blocking(move || {
                     db_write.with_conn(|conn| {
-                        db::touch_session(conn, &sid, &did, session_expiry)?;
+                        db::touch_session(conn, &sid, &did, session_expiry, session_max_age)?;
                         db::touch_device(conn, &sid, &did)
                     })
                 })

@@ -191,6 +191,7 @@ pub async fn post_atomic_revoke(
     let requester = auth.device_id.clone();
     let target = target_device_id.clone();
     let db = state.db.clone();
+    let session_max_age = state.config.session_max_age_secs as i64;
 
     tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
@@ -202,6 +203,7 @@ pub async fn post_atomic_revoke(
                 new_epoch,
                 remote_wipe,
                 &wrapped_keys,
+                session_max_age,
             ))
         })
     })
@@ -244,6 +246,7 @@ fn do_atomic_revoke(
     new_epoch: i64,
     remote_wipe: bool,
     wrapped_keys: &[(String, Vec<u8>)],
+    session_max_age_secs: i64,
 ) -> Result<i64, AppError> {
     if target_device_id == requester_device_id {
         return Err(AppError::BadRequest("Self-deregister must use DELETE /devices/{device_id}"));
@@ -281,7 +284,7 @@ fn do_atomic_revoke(
         return Err(AppError::Conflict("Target device is not active"));
     }
 
-    let _ = db::touch_session(&tx, sync_id, target_device_id, THIRTY_DAYS_SECS);
+    let _ = db::touch_session(&tx, sync_id, target_device_id, THIRTY_DAYS_SECS, session_max_age_secs);
     db::update_sync_group_epoch(&tx, sync_id, new_epoch)
         .map_err(|e| AppError::Internal(e.to_string()))?;
     db::set_needs_rekey(&tx, sync_id, false).map_err(|e| AppError::Internal(e.to_string()))?;

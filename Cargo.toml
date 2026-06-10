@@ -35,8 +35,8 @@ hmac = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 bip39 = { version = "2", features = ["rand"] }
-ml-kem = { version = "0.3.0-rc.2", features = ["zeroize"] }
-ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize", "rand_core"] }
+ml-kem = { version = "=0.3.0-rc.2", features = ["zeroize"] }
+ml-dsa = { version = "=0.1.0-rc.8", features = ["zeroize", "rand_core"] }
 x-wing = { version = "=0.1.0-rc.0", features = ["zeroize"] }
 subtle = "2"
 

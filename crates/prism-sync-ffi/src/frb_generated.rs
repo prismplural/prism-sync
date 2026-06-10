@@ -2316,66 +2316,9 @@ fn wire__crate__api__on_resume_impl(
         },
     )
 }
-fn wire__crate__api__perform_ecdh_impl(
-    port_: flutter_rust_bridge::for_generated::MessagePort,
-    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
-    rust_vec_len_: i32,
-    data_len_: i32,
-) {
-    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
-        flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "perform_ecdh",
-            port: Some(port_),
-            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
-        },
-        move || {
-            let message = unsafe {
-                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
-                    ptr_,
-                    rust_vec_len_,
-                    data_len_,
-                )
-            };
-            let mut deserializer =
-                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_handle = <RustOpaqueMoi<
-                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
-            >>::sse_decode(&mut deserializer);
-            let api_peer_public_key = <Vec<u8>>::sse_decode(&mut deserializer);
-            deserializer.end();
-            move |context| async move {
-                transform_result_sse::<_, String>(
-                    (move || async move {
-                        let mut api_handle_guard = None;
-                        let decode_indices_ =
-                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
-                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
-                                    &api_handle,
-                                    0,
-                                    false,
-                                )],
-                            );
-                        for i in decode_indices_ {
-                            match i {
-                                0 => {
-                                    api_handle_guard =
-                                        Some(api_handle.lockable_decode_async_ref().await)
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        let api_handle_guard = api_handle_guard.unwrap();
-                        let output_ok =
-                            crate::api::perform_ecdh(&*api_handle_guard, api_peer_public_key)
-                                .await?;
-                        Ok(output_ok)
-                    })()
-                    .await,
-                )
-            }
-        },
-    )
-}
+// wire__crate__api__perform_ecdh_impl removed: `perform_ecdh` was dead FFI
+// (no production consumer) and was deleted. Dispatch index 44 now falls through
+// to the `_ => unreachable!()` arm; the matching Dart binding was removed too.
 fn wire__crate__api__poll_event_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -5092,7 +5035,7 @@ fn pde_ffi_dispatcher_primary_impl(
         41 => wire__crate__api__lock_impl(port, ptr, rust_vec_len, data_len),
         42 => wire__crate__api__mnemonic_to_bytes_impl(port, ptr, rust_vec_len, data_len),
         43 => wire__crate__api__on_resume_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__perform_ecdh_impl(port, ptr, rust_vec_len, data_len),
+        // 44 (perform_ecdh) removed — dead FFI; index intentionally left as a gap.
         45 => wire__crate__api__poll_event_impl(port, ptr, rust_vec_len, data_len),
         46 => wire__crate__api__prepare_pending_device_identity_impl(
             port,
