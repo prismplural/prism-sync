@@ -401,6 +401,24 @@ pub struct RegistrySnapshotEntry {
     pub status: String,
     #[serde(default)]
     pub ml_dsa_key_generation: u32,
+    /// Admin-authenticated wipe intent (H3 Layer B).
+    ///
+    /// Bound into the SIGNED registry alongside `status` so the wipe bit can
+    /// no longer be flipped by an untrusted relay frame. Only meaningful on a
+    /// `status == "revoked"` entry: when an admin revokes a device with a
+    /// remote wipe requested, it authors this entry with `remote_wipe == true`
+    /// and signs it. Active entries always author it `false`.
+    ///
+    /// `#[serde(default)]` makes the field byte-safe across the fleet exactly
+    /// like `ml_dsa_key_generation` / the epoch-binding fields: verification
+    /// reconstructs the signing payload from the transmitted JSON bytes, not a
+    /// re-canonicalization, so old↔new signatures stay cross-verifiable. A
+    /// snapshot that omits the key (an older producer, or any active entry that
+    /// elides it) decodes to `false` — the safe no-wipe default. A relay can
+    /// never make a device wipe without an admin signature that explicitly
+    /// covers `remote_wipe == true` for that exact `device_id`.
+    #[serde(default)]
+    pub remote_wipe: bool,
 }
 
 /// A signed, typed snapshot of the device registry.
@@ -836,6 +854,7 @@ mod tests {
                 x_wing_public_key: Vec::new(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
+                remote_wipe: false,
             }],
             0,
         );
@@ -860,6 +879,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
                 RegistrySnapshotEntry {
                     sync_id: "sync-1".into(),
@@ -871,6 +891,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
             ],
             0,
@@ -895,6 +916,7 @@ mod tests {
                 x_wing_public_key: Vec::new(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
+                remote_wipe: false,
             }],
             0,
         );
@@ -951,6 +973,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
                 RegistrySnapshotEntry {
                     sync_id: "sync-1".into(),
@@ -962,6 +985,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
             ],
             0,
@@ -996,6 +1020,72 @@ mod tests {
         assert_eq!(decoded.entries.len(), 2);
         assert_eq!(decoded.entries[0].device_id, "dev-a");
         assert_eq!(decoded.entries[1].device_id, "dev-b");
+    }
+
+    #[test]
+    fn entry_missing_remote_wipe_key_decodes_to_false() {
+        // H3 Layer B back-compat: a `RegistrySnapshotEntry` JSON produced by an
+        // OLDER device that has no `remote_wipe` key at all must decode to
+        // `remote_wipe: false` (serde default) — the safe no-wipe default.
+        let json = r#"{
+            "sync_id": "sync-1",
+            "device_id": "dev-a",
+            "ed25519_public_key": [],
+            "x25519_public_key": [],
+            "status": "revoked"
+        }"#;
+        let entry: RegistrySnapshotEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.status, "revoked");
+        assert!(!entry.remote_wipe, "absent remote_wipe key must default to false (no wipe)");
+    }
+
+    #[test]
+    fn old_shape_v3_signed_blob_verifies_and_defaults_remote_wipe_false() {
+        // H3 Layer B back-compat at the SIGNATURE layer: an old producer signs a
+        // V3 blob whose entries omit `remote_wipe`. Because verification
+        // reconstructs the signing payload from the TRANSMITTED bytes (not a
+        // re-canonicalization), the new binary must still verify it AND decode
+        // the missing bit to `false`. We forge the old-shape canonical JSON by
+        // hand and sign over it with the same V3 domain + context.
+        let secret = prism_sync_crypto::DeviceSecret::generate();
+        let signing_key = secret.ed25519_keypair("test-device").unwrap();
+        let ed_pk = signing_key.public_key_bytes();
+        let pq_signing_key = secret.ml_dsa_65_keypair("test-device").unwrap();
+        let pq_pk = pq_signing_key.public_key_bytes();
+
+        // Old-shape entry: a `revoked` device with NO `remote_wipe` member.
+        let epoch_key = [7u8; 32];
+        let hash = compute_epoch_key_hash(&epoch_key);
+        let old_json = format!(
+            "{{\"registry_version\":1,\"current_epoch\":1,\"epoch_key_hashes\":{{\"1\":{:?}}},\"entries\":[{{\"sync_id\":\"sync-1\",\"device_id\":\"dev-a\",\"ed25519_public_key\":[],\"x25519_public_key\":[],\"ml_dsa_65_public_key\":[],\"ml_kem_768_public_key\":[],\"x_wing_public_key\":[],\"status\":\"revoked\",\"ml_dsa_key_generation\":0}}]}}",
+            hash.to_vec()
+        );
+
+        let mut signing_data = Vec::new();
+        signing_data.extend_from_slice(REGISTRY_SNAPSHOT_DOMAIN_V3);
+        signing_data.extend_from_slice(old_json.as_bytes());
+        let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
+            hybrid_signature_contexts::REGISTRY_SNAPSHOT,
+            &signing_data,
+        )
+        .unwrap();
+        let hybrid_sig = HybridSignature {
+            ed25519_sig: signing_key.sign(&m_prime),
+            ml_dsa_65_sig: pq_signing_key.sign(&m_prime),
+        };
+        let mut signed = Vec::new();
+        signed.push(HYBRID_SIGNATURE_VERSION_V3);
+        signed.extend_from_slice(&hybrid_sig.to_bytes());
+        signed.extend_from_slice(old_json.as_bytes());
+
+        let decoded =
+            SignedRegistrySnapshot::verify_and_decode_hybrid(&signed, &ed_pk, &pq_pk).unwrap();
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].status, "revoked");
+        assert!(
+            !decoded.entries[0].remote_wipe,
+            "old-shape signed blob with no remote_wipe key must decode to no-wipe"
+        );
     }
 
     #[test]
@@ -1099,6 +1189,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
                 RegistrySnapshotEntry {
                     sync_id: "s".into(),
@@ -1110,6 +1201,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
             ],
             0,
@@ -1126,6 +1218,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
                 RegistrySnapshotEntry {
                     sync_id: "s".into(),
@@ -1137,6 +1230,7 @@ mod tests {
                     x_wing_public_key: Vec::new(),
                     status: "active".into(),
                     ml_dsa_key_generation: 0,
+                    remote_wipe: false,
                 },
             ],
             0,
@@ -1232,6 +1326,7 @@ mod tests {
             x_wing_public_key: Vec::new(),
             status: "active".into(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         };
         let json = serde_json::to_vec(&entry).unwrap();
         let decoded: RegistrySnapshotEntry = serde_json::from_slice(&json).unwrap();

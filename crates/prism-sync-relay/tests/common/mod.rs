@@ -459,6 +459,7 @@ pub fn registry_snapshot_entry(
         x_wing_public_key: Vec::new(),
         ml_dsa_key_generation: 0,
         status: status.to_string(),
+        remote_wipe: false,
     }
 }
 
@@ -479,6 +480,7 @@ pub fn registry_snapshot_entry_hybrid(
         x_wing_public_key: Vec::new(),
         ml_dsa_key_generation: 0,
         status: status.to_string(),
+        remote_wipe: false,
     }
 }
 

@@ -3613,6 +3613,296 @@ async fn test_late_joiner_with_pruned_ops_and_no_snapshot() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// H3 Layer B: full-stack revoke → signed-registry post → victim reads wipe bit
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Seed a pinned device record with REAL identity keys (incl. x_wing) so the
+/// admin's `revoke_and_rekey` survivor-wrap authority cross-check passes.
+fn pin_full_device_record(
+    storage: &RusqliteSyncStorage,
+    sync_id: &str,
+    device_id: &str,
+    keys: &TestDeviceKeys,
+) {
+    let xwing = keys.device_secret.xwing_keypair(device_id).unwrap();
+    let mut tx = storage.begin_tx().unwrap();
+    tx.upsert_device_record(&DeviceRecord {
+        sync_id: sync_id.to_string(),
+        device_id: device_id.to_string(),
+        ed25519_public_key: keys.ed25519_signing_key.verifying_key().to_bytes().to_vec(),
+        x25519_public_key: keys.x25519_pk.to_vec(),
+        ml_dsa_65_public_key: keys.ml_dsa_pk.clone(),
+        ml_kem_768_public_key: keys.ml_kem_pk.clone(),
+        x_wing_public_key: xwing.encapsulation_key_bytes(),
+        status: "active".to_string(),
+        registered_at: chrono::Utc::now(),
+        revoked_at: None,
+        ml_dsa_key_generation: 0,
+    })
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// A registry snapshot entry carrying the device's REAL x_wing key (the shared
+/// `registry_snapshot_entry_hybrid` helper omits x_wing). The relay's
+/// registry-approval cross-check requires the entries to match the registered
+/// devices' stored x_wing, and `revoke_and_rekey`'s survivor wrap requires a
+/// real x_wing — so this test registers + approves with full keys.
+fn entry_with_xwing(
+    sync_id: &str,
+    device_id: &str,
+    keys: &TestDeviceKeys,
+    status: &str,
+) -> prism_sync_core::pairing::models::RegistrySnapshotEntry {
+    let xwing = keys.device_secret.xwing_keypair(device_id).unwrap();
+    prism_sync_core::pairing::models::RegistrySnapshotEntry {
+        sync_id: sync_id.to_string(),
+        device_id: device_id.to_string(),
+        ed25519_public_key: keys.ed25519_signing_key.verifying_key().to_bytes().to_vec(),
+        x25519_public_key: keys.x25519_pk.to_vec(),
+        ml_dsa_65_public_key: keys.ml_dsa_pk.clone(),
+        ml_kem_768_public_key: keys.ml_kem_pk.clone(),
+        x_wing_public_key: xwing.encapsulation_key_bytes(),
+        status: status.to_string(),
+        ml_dsa_key_generation: 0,
+        remote_wipe: false,
+    }
+}
+
+/// Register the FIRST device with a real x_wing key (the shared
+/// `register_device` helper omits x_wing).
+async fn register_first_with_xwing(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    keys: &TestDeviceKeys,
+) -> String {
+    let ml_dsa_kp = keys.device_secret.ml_dsa_65_keypair(device_id).unwrap();
+    let xwing = keys.device_secret.xwing_keypair(device_id).unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
+    let nonce_json: serde_json::Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
+    let pow_solution = pow_solution_from_nonce_json(sync_id, device_id, &nonce_json);
+    let challenge_sig =
+        sign_hybrid_challenge(&keys.ed25519_signing_key, &ml_dsa_kp, sync_id, device_id, &nonce);
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "signing_public_key": hex::encode(keys.ed25519_signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(keys.x25519_pk),
+            "ml_dsa_65_public_key": hex::encode(&keys.ml_dsa_pk),
+            "ml_kem_768_public_key": hex::encode(&keys.ml_kem_pk),
+            "x_wing_public_key": hex::encode(xwing.encapsulation_key_bytes()),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "pow_solution": pow_solution,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "first-device registration failed: {status} - {json}");
+    json["device_session_token"].as_str().unwrap().to_string()
+}
+
+/// Register a JOINER device with a real x_wing key, approved by `approver`.
+#[allow(clippy::too_many_arguments)]
+async fn register_joiner_with_xwing(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    joiner_device_id: &str,
+    joiner_keys: &TestDeviceKeys,
+    approver_device_id: &str,
+    approver_keys: &TestDeviceKeys,
+    all_entries: Vec<prism_sync_core::pairing::models::RegistrySnapshotEntry>,
+) -> String {
+    let ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(joiner_device_id).unwrap();
+    let xwing = joiner_keys.device_secret.xwing_keypair(joiner_device_id).unwrap();
+    let nonce_resp =
+        client.get(format!("{url}/v1/sync/{sync_id}/register-nonce")).send().await.unwrap();
+    let nonce_json: serde_json::Value = nonce_resp.json().await.unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap().to_string();
+    let challenge_sig = sign_hybrid_challenge(
+        &joiner_keys.ed25519_signing_key,
+        &ml_dsa_kp,
+        sync_id,
+        joiner_device_id,
+        &nonce,
+    );
+    let registry_approval =
+        build_registry_approval(sync_id, approver_device_id, approver_keys, all_entries);
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": joiner_device_id,
+            "signing_public_key": hex::encode(joiner_keys.ed25519_signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(joiner_keys.x25519_pk),
+            "ml_dsa_65_public_key": hex::encode(&joiner_keys.ml_dsa_pk),
+            "ml_kem_768_public_key": hex::encode(&joiner_keys.ml_kem_pk),
+            "x_wing_public_key": hex::encode(xwing.encapsulation_key_bytes()),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "registry_approval": registry_approval,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "joiner registration failed: {status} - {json}");
+    json["device_session_token"].as_str().unwrap().to_string()
+}
+
+/// End-to-end, through the REAL HTTP relay: the admin drives
+/// `PrismSync::revoke_and_rekey` (which both revokes on the relay AND authors +
+/// posts the H3 Layer B signed revocation registry), then a SECOND PrismSync
+/// (the victim) reads that signed registry back via `confirm_self_revocation`
+/// and surfaces the admin-signed wipe intent. The relay frame's `remote_wipe`
+/// bit is NEVER consulted on this Rust path — the verdict comes only from the
+/// signature-verified registry.
+async fn run_e2e_revoke_signed_wipe(remote_wipe: bool) {
+    let (url, _server, _db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let epoch0_key = vec![0x5Au8; 32];
+
+    // ── Register admin A and victim C (C joins, approved by A), both with
+    //    real x_wing keys so the survivor-wrap authority cross-check passes. ──
+    let admin_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&admin_id);
+    let token_a = register_first_with_xwing(&client, &url, &sync_id, &admin_id, &keys_a).await;
+
+    let victim_id = generate_device_id();
+    let keys_c = TestDeviceKeys::generate(&victim_id);
+    let token_c = register_joiner_with_xwing(
+        &client,
+        &url,
+        &sync_id,
+        &victim_id,
+        &keys_c,
+        &admin_id,
+        &keys_a,
+        vec![
+            entry_with_xwing(&sync_id, &admin_id, &keys_a, "active"),
+            entry_with_xwing(&sync_id, &victim_id, &keys_c, "active"),
+        ],
+    )
+    .await;
+
+    // ── Admin PrismSync wired to the REAL relay, pinned registry = {A, C}. ──
+    let storage_a = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    pin_full_device_record(&storage_a, &sync_id, &admin_id, &keys_a);
+    pin_full_device_record(&storage_a, &sync_id, &victim_id, &keys_c);
+    setup_sync_metadata(&storage_a, &sync_id, &admin_id);
+
+    let relay_a = Arc::new(make_server_relay(&localhost_url, &sync_id, &admin_id, &token_a, &keys_a));
+    let mut admin = PrismSync::builder()
+        .schema(fronting_test_schema())
+        .storage(storage_a.clone())
+        .secure_store(Arc::new(MemorySecureStore::new()))
+        .entity(fronting_test_entity())
+        .build()
+        .unwrap();
+    admin.initialize("test-password", &[7u8; 16]).unwrap();
+    let dek_a = admin.export_dek().unwrap();
+    admin.restore_runtime_keys(&dek_a, keys_a.device_secret.as_bytes()).unwrap();
+    admin.key_hierarchy_mut().store_epoch_key(0, zeroize::Zeroizing::new(epoch0_key.clone()));
+    admin.configure_engine(relay_a.clone(), sync_id.clone(), admin_id.clone(), 0, 0);
+
+    // ── Drive the REAL revoke. This posts the signed registry over HTTP. ──
+    let committed_epoch =
+        admin.revoke_and_rekey(relay_a.clone(), &victim_id, remote_wipe).await.unwrap();
+    assert_eq!(committed_epoch, 1, "admin should rotate to epoch 1");
+
+    // ── Victim PrismSync for C, pinning A (the signer) and itself, against the
+    //    SAME real relay. ──
+    let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    pin_full_device_record(&storage_c, &sync_id, &admin_id, &keys_a);
+    pin_full_device_record(&storage_c, &sync_id, &victim_id, &keys_c);
+    setup_sync_metadata(&storage_c, &sync_id, &victim_id);
+
+    let relay_c = Arc::new(make_server_relay(&localhost_url, &sync_id, &victim_id, &token_c, &keys_c));
+    let mut victim = PrismSync::builder()
+        .schema(fronting_test_schema())
+        .storage(storage_c.clone())
+        .secure_store(Arc::new(MemorySecureStore::new()))
+        .entity(fronting_test_entity())
+        .build()
+        .unwrap();
+    victim.initialize("test-password", &[9u8; 16]).unwrap();
+    let dek_c = victim.export_dek().unwrap();
+    victim.restore_runtime_keys(&dek_c, keys_c.device_secret.as_bytes()).unwrap();
+    victim.key_hierarchy_mut().store_epoch_key(0, zeroize::Zeroizing::new(epoch0_key.clone()));
+    victim.configure_engine(relay_c.clone(), sync_id.clone(), victim_id.clone(), 0, 0);
+
+    // ── Producer side over the real relay: the admin posted a signed
+    //    revocation registry; read it back (as the non-revoked admin) and verify
+    //    the target is marked revoked with the admin-signed wipe intent bound
+    //    into the signature. ──
+    {
+        use prism_sync_core::relay::traits::DeviceRegistry;
+        let resp = relay_a
+            .get_signed_registry()
+            .await
+            .expect("admin can fetch the signed registry")
+            .expect("admin posted a signed registry");
+        let snapshot = prism_sync_core::DeviceRegistryManager::verify_signed_registry_snapshot(
+            storage_a.as_ref(),
+            &sync_id,
+            &resp.artifact_blob,
+        )
+        .expect("posted signed revocation registry must verify against pinned admin keys");
+        let target_entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.device_id == victim_id)
+            .expect("posted registry must include the revoked victim entry");
+        assert_eq!(target_entry.status, "revoked", "victim must be marked revoked");
+        assert_eq!(
+            target_entry.remote_wipe, remote_wipe,
+            "victim's signed remote_wipe must equal the admin's revoke intent ({remote_wipe})"
+        );
+    }
+
+    // ── FULL CHAIN, end-to-end over the REAL relay: the now-REVOKED victim's
+    //    `confirm_self_revocation` must return `ConfirmedRevoked { remote_wipe }`
+    //    with the admin-signed wipe bit. This exercises the entire H3 chain
+    //    against the real HTTP relay:
+    //      admin `revoke_and_rekey` → signed `revoked`+wipe registry posted →
+    //      revoked victim does `GET /registry` (now allowlisted for revoked
+    //      devices) → signature-verifies → ConfirmedRevoked with the correct
+    //      signed wipe bit.
+    //    The relay's narrow read-only allowlist (GET /registry only) is what
+    //    lets the revoked device read its own revocation; every OTHER route
+    //    stays rejected (proved by `revoked_device_registry_read_allowlist_is_tight`
+    //    in relay_registration_tests.rs). ──
+    let verdict = victim.confirm_self_revocation().await;
+    assert_eq!(
+        verdict,
+        prism_sync_core::SelfRevocationStatus::ConfirmedRevoked { remote_wipe },
+        "the revoked victim must read its admin-signed revocation (wipe={remote_wipe}) \
+         from GET /registry over the real relay; got {verdict:?}"
+    );
+    let _ = relay_c; // keep the victim's relay handle alive for clarity.
+}
+
+#[tokio::test]
+async fn e2e_revoke_posts_signed_wipe_true_intent() {
+    run_e2e_revoke_signed_wipe(true).await;
+}
+
+#[tokio::test]
+async fn e2e_revoke_posts_signed_wipe_false_intent() {
+    run_e2e_revoke_signed_wipe(false).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Helper: write_len_prefixed_utf8 (matches batch_signature format)
 // ═══════════════════════════════════════════════════════════════════════════
 

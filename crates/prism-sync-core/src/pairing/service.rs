@@ -200,6 +200,7 @@ impl PairingService {
                 x_wing_public_key: xwing_key.encapsulation_key_bytes(),
                 status: "active".into(),
                 ml_dsa_key_generation: 0,
+                remote_wipe: false,
             }],
             registry_version,
             0,
@@ -778,6 +779,7 @@ impl PairingService {
             x_wing_public_key: xwing_key.encapsulation_key_bytes(),
             status: "active".into(),
             ml_dsa_key_generation: current_ml_dsa_generation,
+            remote_wipe: false,
         });
         // SECURITY (B): author the joiner entry from the bootstrap record that
         // was cross-checked against the out-of-band rendezvous commitment in
@@ -816,6 +818,7 @@ impl PairingService {
             x_wing_public_key: joiner_record.permanent_xwing_public_key.clone(),
             status: "active".into(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         });
 
         // Bind the local epoch ratchet into the signed registry: the
@@ -2244,6 +2247,7 @@ mod tests {
                 x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: 0,
+                remote_wipe: false,
             },
             RegistrySnapshotEntry {
                 sync_id: sync_id.to_string(),
@@ -2255,6 +2259,7 @@ mod tests {
                 x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: 0,
+                remote_wipe: false,
             },
         ];
 
@@ -2388,6 +2393,7 @@ mod tests {
                 x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: 0,
+                remote_wipe: false,
             },
             RegistrySnapshotEntry {
                 sync_id: sync_id.to_string(),
@@ -2399,6 +2405,7 @@ mod tests {
                 x_wing_public_key: joiner_xwing_key.encapsulation_key_bytes(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: 0,
+                remote_wipe: false,
             },
         ];
 
@@ -2744,6 +2751,7 @@ mod tests {
             x_wing_public_key: peer_xwing_true.clone(),
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         };
         let inviter_entry = RegistrySnapshotEntry {
             sync_id: sync_id.to_string(),
@@ -2755,6 +2763,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             status: "active".to_string(),
             ml_dsa_key_generation: current_generation,
+            remote_wipe: false,
         };
 
         // Relay's UNSIGNED device list: inviter (true), peer with a SWAPPED key,
@@ -3166,6 +3175,7 @@ mod tests {
                 x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: current_generation,
+                remote_wipe: false,
             }],
             SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             2,
@@ -3323,6 +3333,7 @@ mod tests {
                 x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: current_generation,
+                remote_wipe: false,
             }],
             SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             2,
@@ -3453,6 +3464,7 @@ mod tests {
                 x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: current_generation,
+                remote_wipe: false,
             }],
             SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             2,
@@ -4315,6 +4327,7 @@ mod tests {
                 x_wing_public_key: inviter_info.x_wing_public_key.clone(),
                 status: inviter_info.status.clone(),
                 ml_dsa_key_generation: inviter_info.ml_dsa_key_generation,
+                remote_wipe: false,
             }],
             4,
             1,

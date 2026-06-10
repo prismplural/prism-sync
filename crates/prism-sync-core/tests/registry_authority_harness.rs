@@ -54,6 +54,7 @@ fn registry_entry(device: &DeviceRecord) -> RegistrySnapshotEntry {
         x_wing_public_key: device.x_wing_public_key.clone(),
         status: device.status.clone(),
         ml_dsa_key_generation: device.ml_dsa_key_generation,
+        remote_wipe: false,
     }
 }
 

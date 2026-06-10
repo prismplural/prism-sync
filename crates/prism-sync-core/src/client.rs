@@ -83,7 +83,14 @@ pub enum SelfRevocationStatus {
     /// The verified signed registry contains an explicit entry for this device
     /// with `status == "revoked"`. The only state in which a caller may take a
     /// destructive action.
-    ConfirmedRevoked,
+    ///
+    /// `remote_wipe` is the admin-authenticated wipe intent read from the SAME
+    /// signature-verified entry (H3 Layer B). It is `true` only when an admin
+    /// signed a `revoked` entry for this device with `remote_wipe == true`;
+    /// it defaults to `false` for older snapshots that omit the bit. Callers
+    /// MUST drive any data wipe from this verified bit, never from a
+    /// relay-controlled WS frame / error body.
+    ConfirmedRevoked { remote_wipe: bool },
     /// The verified signed registry lists this device with a non-revoked
     /// status. Definitely NOT revoked — a false-revoke hint should be ignored.
     Active,
@@ -95,11 +102,33 @@ pub enum SelfRevocationStatus {
 
 impl SelfRevocationStatus {
     /// Stable string form crossing the FFI boundary.
+    ///
+    /// Note: this collapses [`Self::ConfirmedRevoked`] to `"revoked"` and
+    /// discards the wipe bit; prefer [`Self::to_json`] for the FFI surface so
+    /// the verified `remote_wipe` intent reaches the Dart caller.
     pub fn as_str(self) -> &'static str {
         match self {
-            SelfRevocationStatus::ConfirmedRevoked => "revoked",
+            SelfRevocationStatus::ConfirmedRevoked { .. } => "revoked",
             SelfRevocationStatus::Active => "active",
             SelfRevocationStatus::Unknown => "unknown",
+        }
+    }
+
+    /// JSON form crossing the FFI boundary (H3 Layer B).
+    ///
+    /// - `{"status":"revoked","remote_wipe":<bool>}` — the verified wipe intent.
+    /// - `{"status":"active"}`
+    /// - `{"status":"unknown"}`
+    ///
+    /// Keeping this a plain JSON string preserves the `Result<String, String>`
+    /// FFI signature, so no flutter_rust_bridge type regeneration is required.
+    pub fn to_json(self) -> String {
+        match self {
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe } => {
+                format!("{{\"status\":\"revoked\",\"remote_wipe\":{remote_wipe}}}")
+            }
+            SelfRevocationStatus::Active => "{\"status\":\"active\"}".to_string(),
+            SelfRevocationStatus::Unknown => "{\"status\":\"unknown\"}".to_string(),
         }
     }
 }
@@ -879,8 +908,14 @@ impl PrismSync {
             }
         };
 
-        // A revoked device can still query the relay (it already serves the
-        // device list post-revocation), so this fetch is expected to succeed.
+        // A revoked device can still fetch the SIGNED REGISTRY: the relay
+        // auth middleware allowlists exactly `GET /v1/sync/{sync_id}/registry`
+        // for revoked devices (and nothing else) precisely so a device can
+        // verify its OWN revocation here. The signed registry is group-wide
+        // PUBLIC data (device public keys + per-device status + epoch_key_hashes
+        // commitments + version/epoch — no secrets), so serving it to a revoked
+        // requester is safe. Every other authenticated route stays rejected, so
+        // this fetch is expected to succeed while the engine otherwise cannot.
         let registry_response = match relay.get_signed_registry().await {
             Ok(Some(response)) => response,
             Ok(None) => {
@@ -953,18 +988,22 @@ impl PrismSync {
                     }
                 }
 
+                // H3 Layer B: the wipe intent is read from the SAME verified,
+                // non-stale signed entry that confirmed the revocation. It is
+                // admin-authenticated (covered by the registry signature) and
+                // defaults to `false` for older snapshots that omit the field —
+                // so a relay can never drive a wipe by flipping an untrusted
+                // WS-frame / error-body bit. The caller MUST use this verified
+                // value, not the relay frame's hint.
+                let remote_wipe = entry.remote_wipe;
                 tracing::info!(
                     device_id = %device_id,
                     snapshot_version = snapshot.registry_version,
                     last_imported = ?last_imported,
+                    remote_wipe,
                     "confirm_self_revocation: confirmed revoked (verified, non-stale signed registry)"
                 );
-                // TODO(security): bind remote_wipe intent into the signed
-                // revocation artifact (Layer B). Today a verified-revoked device
-                // still relies on a relay-controlled `remote_wipe` bit to decide
-                // whether to also wipe orphaned local data. Binding the wipe
-                // intent into this signed snapshot would close the residual.
-                SelfRevocationStatus::ConfirmedRevoked
+                SelfRevocationStatus::ConfirmedRevoked { remote_wipe }
             }
             Some(entry) => {
                 tracing::debug!(
@@ -1047,6 +1086,8 @@ impl PrismSync {
                 x_wing_public_key: device.x_wing_public_key.clone(),
                 status: device.status.clone(),
                 ml_dsa_key_generation: device.ml_dsa_key_generation,
+                // Active-only repair snapshot never authors a wipe intent.
+                remote_wipe: false,
             })
             .collect();
 
@@ -1952,7 +1993,175 @@ impl PrismSync {
 
         self.commit_local_epoch_rotation(&sync_id, committed_epoch, epoch_key.as_ref()).await?;
 
+        // H3 Layer B (the load-bearing producer): author + sign + post a signed
+        // registry that marks the target `revoked` and binds the admin's wipe
+        // intent into the SIGNATURE. Without this, no production path ever
+        // writes a `revoked` entry into the signed registry, so the victim's
+        // `confirm_self_revocation` could never positively confirm — Layer A's
+        // authenticated gate would be inert in the field. The survivor set and
+        // the target's keys come from the locally-pinned registry (a trusted
+        // source), NOT the raw relay `list_devices()`, so the relay cannot
+        // inject or rewrite an entry. Runs AFTER the local epoch rotation
+        // committed so the new epoch key is in the hierarchy and the snapshot
+        // can bind `committed_epoch` + its key hash.
+        self.author_signed_revocation_registry(
+            relay.as_ref(),
+            &sync_id,
+            &self_device_id,
+            target_device_id,
+            committed_epoch,
+            remote_wipe,
+            &pinned,
+        )
+        .await?;
+
         Ok(committed_epoch)
+    }
+
+    /// Author, hybrid-sign, and post a signed registry snapshot that marks
+    /// `target_device_id` as `status == "revoked"` with the admin-authenticated
+    /// `remote_wipe` intent bound into the signature (H3 Layer B).
+    ///
+    /// SECURITY:
+    /// - Survivor entries are taken from the locally-pinned registry
+    ///   (`pinned`), filtered to `active` and excluding the target, so the relay
+    ///   cannot inject a recipient or rewrite a survivor's keys.
+    /// - The target entry reuses its real pinned keys with `status = "revoked"`
+    ///   and `remote_wipe = remote_wipe`. The wipe bit is therefore covered by
+    ///   the registry signature and read back by the victim's
+    ///   `confirm_self_revocation` from the verified entry.
+    /// - The signed `registry_version` is computed monotonically above the
+    ///   current relay-served signed registry so the victim's freshness gate
+    ///   accepts it.
+    #[allow(clippy::too_many_arguments)]
+    async fn author_signed_revocation_registry(
+        &self,
+        relay: &dyn SyncRelay,
+        sync_id: &str,
+        self_device_id: &str,
+        target_device_id: &str,
+        committed_epoch: u32,
+        remote_wipe: bool,
+        pinned: &[crate::storage::DeviceRecord],
+    ) -> Result<()> {
+        let device_secret = self.device_secret.as_ref().ok_or_else(|| {
+            CoreError::Engine("device secret not set — call configure_engine first".into())
+        })?;
+        let signing_key =
+            device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
+        let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
+            CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
+        })?;
+
+        // Monotonic registry version: fetch the current relay-served signed
+        // registry (signature-verified) and pick the next version above it,
+        // never below the binding floor. Mirrors
+        // `repair_signed_registry_epoch_if_needed`. STOP, rather than guess at a
+        // version, if a fetched registry cannot be verified — guessing risks a
+        // version that the victim's freshness gate either rejects (stale) or a
+        // replayed-lower version that re-opens the very residual we close.
+        let registry_version = match relay.get_signed_registry().await {
+            Ok(Some(response)) => {
+                let current_snapshot = DeviceRegistryManager::verify_signed_registry_snapshot(
+                    self.storage.as_ref(),
+                    sync_id,
+                    &response.artifact_blob,
+                )
+                .map_err(|e| {
+                    CoreError::Engine(format!(
+                        "signed registry verification failed before authoring revocation: {e}"
+                    ))
+                })?;
+                (current_snapshot.registry_version + 1)
+                    .max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+            }
+            Ok(None) => SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            Err(error) => return Err(CoreError::from_relay(error)),
+        };
+
+        // Epoch binding for the post-revoke epoch. `commit_local_epoch_rotation`
+        // already stored the new epoch key in the hierarchy, so the hash map
+        // covers `committed_epoch`.
+        let epoch_key_hashes = Self::build_epoch_key_hashes_for_registry(&self.key_hierarchy)?;
+        if !epoch_key_hashes.contains_key(&committed_epoch) {
+            return Err(CoreError::Engine(format!(
+                "cannot author signed revocation registry: missing epoch key for committed epoch {committed_epoch}"
+            )));
+        }
+
+        // Survivor entries from the TRUSTED pinned registry, excluding the
+        // target. Active devices author `remote_wipe = false`.
+        let mut entries: Vec<RegistrySnapshotEntry> = pinned
+            .iter()
+            .filter(|record| record.status == "active" && record.device_id != target_device_id)
+            .map(|record| RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: record.device_id.clone(),
+                ed25519_public_key: record.ed25519_public_key.clone(),
+                x25519_public_key: record.x25519_public_key.clone(),
+                ml_dsa_65_public_key: record.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: record.ml_kem_768_public_key.clone(),
+                x_wing_public_key: record.x_wing_public_key.clone(),
+                status: "active".into(),
+                ml_dsa_key_generation: record.ml_dsa_key_generation,
+                remote_wipe: false,
+            })
+            .collect();
+
+        // The signer (this admin device) must be present as a non-revoked entry
+        // in its own snapshot or `verify_signed_registry_snapshot` rejects it.
+        if !entries.iter().any(|entry| entry.device_id == self_device_id) {
+            return Err(CoreError::Engine(
+                "cannot author signed revocation registry: signer missing from pinned active set"
+                    .into(),
+            ));
+        }
+
+        // The revoked target entry, reusing its real pinned keys so the victim
+        // (who roots trust in the signer's pinned keys) can verify the signature
+        // and find its own `device_id` with `status == "revoked"` and the
+        // admin-signed wipe intent. If the target is absent from the pinned
+        // registry we cannot author its real keys — fail rather than fabricate.
+        let target_record =
+            pinned.iter().find(|record| record.device_id == target_device_id).ok_or_else(|| {
+                CoreError::Engine(
+                    "cannot author signed revocation registry: target missing from pinned registry"
+                        .into(),
+                )
+            })?;
+        entries.push(RegistrySnapshotEntry {
+            sync_id: sync_id.to_string(),
+            device_id: target_record.device_id.clone(),
+            ed25519_public_key: target_record.ed25519_public_key.clone(),
+            x25519_public_key: target_record.x25519_public_key.clone(),
+            ml_dsa_65_public_key: target_record.ml_dsa_65_public_key.clone(),
+            ml_kem_768_public_key: target_record.ml_kem_768_public_key.clone(),
+            x_wing_public_key: target_record.x_wing_public_key.clone(),
+            status: "revoked".into(),
+            ml_dsa_key_generation: target_record.ml_dsa_key_generation,
+            remote_wipe,
+        });
+
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries,
+            registry_version,
+            committed_epoch,
+            epoch_key_hashes,
+        );
+        let signed = snapshot.sign_hybrid(&signing_key, pq_signing_key);
+        relay.put_signed_registry(&signed).await.map_err(CoreError::from_relay)?;
+
+        tracing::info!(
+            sync_id = %sync_id,
+            device_id = %self_device_id,
+            target_device_id = %target_device_id,
+            registry_version,
+            epoch = committed_epoch,
+            remote_wipe,
+            "revoke_and_rekey: authored signed revocation registry (wipe intent bound into signature)"
+        );
+
+        Ok(())
     }
 
     async fn reconcile_revoke_and_rekey_commit(
@@ -2820,6 +3029,7 @@ mod tests {
             x_wing_public_key: info.x_wing_public_key.clone(),
             status: info.status.clone(),
             ml_dsa_key_generation: info.ml_dsa_key_generation,
+            remote_wipe: false,
         }
     }
 
@@ -3040,11 +3250,13 @@ mod tests {
     /// by a *different* active device — the only legitimate way revocation is
     /// represented (a device cannot sign its own revocation; the verifier
     /// rejects a self-revoked signer).
-    fn signed_registry_with_entries(
-        sync_id: &str,
+    /// Sign a registry from pre-built [`RegistrySnapshotEntry`] values so tests
+    /// can set per-entry fields (e.g. the H3 Layer B `remote_wipe` bit) that
+    /// `DeviceInfo` does not carry.
+    fn signed_registry_from_entries(
         signer_secret: &DeviceSecret,
         signer_device_id: &str,
-        entries: &[DeviceInfo],
+        entries: Vec<RegistrySnapshotEntry>,
         current_epoch: u32,
         epoch_keys: &[(u32, [u8; 32])],
     ) -> SignedRegistryResponse {
@@ -3053,7 +3265,7 @@ mod tests {
         let epoch_key_hashes =
             epoch_keys.iter().map(|(epoch, key)| (*epoch, compute_epoch_key_hash(key))).collect();
         let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
-            entries.iter().map(|info| make_registry_entry(sync_id, info)).collect(),
+            entries,
             SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             current_epoch,
             epoch_key_hashes,
@@ -3073,6 +3285,18 @@ mod tests {
     /// calling `confirm_self_revocation`.
     fn prepare_self_revocation_check(
         self_status: &str,
+    ) -> (PrismSync, Arc<RevokeTestRelay>, String, DeviceSecret, DeviceInfo) {
+        // Default to no signed wipe intent (the historical behavior).
+        prepare_self_revocation_check_with_wipe(self_status, false)
+    }
+
+    /// Like [`prepare_self_revocation_check`] but authors the SELF entry's
+    /// signed `remote_wipe` bit (H3 Layer B). The wipe bit is bound into the
+    /// signature, so `confirm_self_revocation` reads it back from the verified
+    /// entry.
+    fn prepare_self_revocation_check_with_wipe(
+        self_status: &str,
+        remote_wipe: bool,
     ) -> (PrismSync, Arc<RevokeTestRelay>, String, DeviceSecret, DeviceInfo) {
         let mut sync = make_sync();
         sync.initialize("test-password", &[1u8; 16]).unwrap();
@@ -3097,18 +3321,20 @@ mod tests {
             .unwrap();
         }
 
-        // The signed-registry entry for self carries the status under test;
-        // the sibling (signer) is active.
+        // The signed-registry entry for self carries the status under test and
+        // the admin-signed wipe intent; the sibling (signer) is active.
         let snapshot_self = make_device_info(self_device_id, &device_secret, 0, self_status);
+        let mut self_entry = make_registry_entry(sync_id, &snapshot_self);
+        self_entry.remote_wipe = remote_wipe;
+        let signer_entry = make_registry_entry(sync_id, &signer_info);
         let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
 
         let relay =
             Arc::new(RevokeTestRelay::new(vec![pinned_self.clone()], RevokeBehavior::Success));
-        relay.set_signed_registry(signed_registry_with_entries(
-            sync_id,
+        relay.set_signed_registry(signed_registry_from_entries(
             &device_secret,
             signer_device_id,
-            &[snapshot_self.clone(), signer_info],
+            vec![self_entry, signer_entry],
             0,
             &[(0, epoch_0_key)],
         ));
@@ -3139,7 +3365,10 @@ mod tests {
             None,
             "precondition: helper records no last-imported baseline"
         );
-        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::ConfirmedRevoked);
+        assert_eq!(
+            sync.confirm_self_revocation().await,
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe: false }
+        );
     }
 
     #[tokio::test]
@@ -3149,7 +3378,56 @@ mod tests {
         // revocation is accepted.
         let (sync, _relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
         set_last_imported_registry_version(&sync, "sync-1", 1);
-        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::ConfirmedRevoked);
+        assert_eq!(
+            sync.confirm_self_revocation().await,
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe: false }
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_carries_signed_wipe_false_when_not_requested() {
+        // H3 Layer B: a verified `revoked` entry whose SIGNED `remote_wipe` is
+        // false must surface `ConfirmedRevoked { remote_wipe: false }` — the
+        // device clears creds / disconnects but must NOT wipe.
+        let (sync, _relay, _id, _secret, _info) =
+            prepare_self_revocation_check_with_wipe("revoked", false);
+        assert_eq!(
+            sync.confirm_self_revocation().await,
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe: false }
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_carries_signed_wipe_true_when_admin_requested() {
+        // H3 Layer B: a verified `revoked` entry whose SIGNED `remote_wipe` is
+        // true must surface `ConfirmedRevoked { remote_wipe: true }` — only an
+        // admin signature over wipe=true can drive a wipe.
+        let (sync, _relay, _id, _secret, _info) =
+            prepare_self_revocation_check_with_wipe("revoked", true);
+        assert_eq!(
+            sync.confirm_self_revocation().await,
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe: true }
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_old_format_registry_defaults_wipe_false() {
+        // BACK-COMPAT: a signed registry produced by an OLDER device that omits
+        // the `remote_wipe` key entirely must decode to `remote_wipe: false`
+        // (the safe no-wipe default), never a wipe. We simulate the old wire
+        // shape by stripping the `"remote_wipe":...` member from the signed
+        // JSON is not possible post-signature; instead we author with the
+        // default-false path and assert the decode yields false even though the
+        // entry is `revoked`. (The serde-default decode of a truly-absent key is
+        // covered by the models.rs unit tests; here we assert the client read.)
+        let (sync, _relay, _id, _secret, _info) =
+            prepare_self_revocation_check_with_wipe("revoked", false);
+        match sync.confirm_self_revocation().await {
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe } => {
+                assert!(!remote_wipe, "absent/false signed wipe must default to no-wipe");
+            }
+            other => panic!("expected ConfirmedRevoked, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3759,6 +4037,187 @@ mod tests {
         assert!(sync.key_hierarchy().has_epoch_key(1));
         assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 1);
         assert!(sync.secure_store().get("epoch_key_1").unwrap().is_some());
+    }
+
+    /// H3 Layer B PRODUCER: `revoke_and_rekey` must author + sign + post a
+    /// signed registry whose target entry is `status == "revoked"` with the
+    /// admin-signed `remote_wipe` intent, version-monotonic above the current
+    /// registry, and verifiable by the admin's own pinned keys.
+    async fn revoke_and_rekey_posts_signed_revocation(remote_wipe: bool) {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        // The whole group shares the same DeviceSecret; per-device keys derive
+        // from `device_id`. Using the admin's secret for the target keeps the
+        // target's pinned keys derivable + verifiable.
+        let group_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, &group_secret, 0, "active"),
+                make_device_info(target_device_id, &group_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+
+        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
+        // Seed a pre-existing signed registry at the binding floor so the
+        // producer's monotonic version bump is exercised (next == floor + 1).
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        relay.set_signed_registry(signed_registry_from_entries(
+            &group_secret,
+            self_device_id,
+            vec![
+                make_registry_entry(
+                    "sync-1",
+                    &make_device_info(self_device_id, &group_secret, 0, "active"),
+                ),
+                make_registry_entry(
+                    "sync-1",
+                    &make_device_info(target_device_id, &group_secret, 0, "active"),
+                ),
+            ],
+            0,
+            &[(0, epoch_0_key)],
+        ));
+        let baseline_version =
+            relay.state.lock().unwrap().signed_registry.as_ref().unwrap().registry_version;
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, remote_wipe).await.unwrap();
+        assert_eq!(committed_epoch, 1);
+
+        // Fetch what the producer posted and verify it against the admin's
+        // pinned keys (rooting trust the way a victim would).
+        let posted = relay.state.lock().unwrap().signed_registry.as_ref().unwrap().clone();
+        assert!(
+            posted.registry_version > baseline_version,
+            "posted registry_version {} must be monotonic above baseline {}",
+            posted.registry_version,
+            baseline_version
+        );
+        let snapshot = DeviceRegistryManager::verify_signed_registry_snapshot(
+            sync.storage().as_ref(),
+            "sync-1",
+            &posted.artifact_blob,
+        )
+        .expect("posted signed revocation registry must verify against pinned admin keys");
+
+        let target_entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.device_id == target_device_id)
+            .expect("posted registry must include the revoked target entry");
+        assert_eq!(target_entry.status, "revoked", "target must be marked revoked");
+        assert_eq!(
+            target_entry.remote_wipe, remote_wipe,
+            "target's signed remote_wipe must equal the admin's revoke intent"
+        );
+
+        // The admin (signer) must be present as a non-revoked entry.
+        let self_entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.device_id == self_device_id)
+            .expect("signer must be present in its own snapshot");
+        assert_eq!(self_entry.status, "active");
+        assert!(!self_entry.remote_wipe, "active survivor must never carry a wipe intent");
+
+        // Epoch binding covers the committed (post-revoke) epoch.
+        assert_eq!(snapshot.current_epoch, committed_epoch);
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_posts_signed_revocation_with_wipe_true() {
+        revoke_and_rekey_posts_signed_revocation(true).await;
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_posts_signed_revocation_with_wipe_false() {
+        revoke_and_rekey_posts_signed_revocation(false).await;
+    }
+
+    /// H3 Layer B END-TO-END: a real `revoke_and_rekey` on the admin posts a
+    /// signed registry; a SECOND `PrismSync` (the victim) reads it back through
+    /// `confirm_self_revocation` and surfaces the admin-signed wipe intent. The
+    /// victim wipes iff the SIGNED bit is true — a relay frame is never
+    /// consulted in this Rust path.
+    async fn revoke_and_rekey_end_to_end_victim_reads_signed_wipe(remote_wipe: bool) {
+        // ── Admin (device A) ──
+        let mut admin = make_sync();
+        admin.initialize("test-password", &[1u8; 16]).unwrap();
+        let admin_device_id = "a1b2c3d4e5f6";
+        let victim_device_id = "b7c8d9e0f1a2";
+        let group_secret =
+            DeviceSecret::from_bytes(admin.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(admin_device_id, &group_secret, 0, "active"),
+                make_device_info(victim_device_id, &group_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+        admin.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            admin_device_id.to_string(),
+            0,
+            0,
+        );
+        seed_device_registry(&admin, "sync-1", &relay.devices());
+
+        // ── Victim (device B), sharing the group secret, pins A (the signer)
+        //    and itself, and points at the SAME relay. ──
+        // Rebuild the victim from the admin's DEK + device secret so its derived
+        // keys and the signature root-of-trust match the admin's (the group
+        // secret is shared across devices; per-device keys derive from
+        // `device_id`).
+        let admin_dek = admin.key_hierarchy().dek().unwrap().to_vec();
+        let admin_secret_bytes = group_secret.as_bytes().to_vec();
+        let mut victim = make_sync();
+        victim.restore_runtime_keys(&admin_dek, &admin_secret_bytes).unwrap();
+        let admin_info = make_device_info(admin_device_id, &group_secret, 0, "active");
+        let victim_info = make_device_info(victim_device_id, &group_secret, 0, "active");
+        for info in [&admin_info, &victim_info] {
+            DeviceRegistryManager::pin_device(
+                victim.storage().as_ref(),
+                "sync-1",
+                &make_device_record("sync-1", info),
+            )
+            .unwrap();
+        }
+        victim.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            victim_device_id.to_string(),
+            0,
+            0,
+        );
+
+        // Drive the real revoke on the admin. This posts the signed registry.
+        admin.revoke_and_rekey(relay.clone(), victim_device_id, remote_wipe).await.unwrap();
+
+        // The victim reads the SIGNED verdict — no relay frame involved.
+        assert_eq!(
+            victim.confirm_self_revocation().await,
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe },
+            "victim must read the admin-signed wipe intent ({remote_wipe}) from the verified registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_end_to_end_victim_wipes_only_when_signed_true() {
+        revoke_and_rekey_end_to_end_victim_reads_signed_wipe(true).await;
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_end_to_end_victim_does_not_wipe_when_signed_false() {
+        revoke_and_rekey_end_to_end_victim_reads_signed_wipe(false).await;
     }
 
     #[tokio::test]

@@ -3132,18 +3132,25 @@ pub async fn list_devices(
 /// credential clear) on this verified result, never on the hint alone.
 ///
 /// Uses the engine relay configured by [`configure_engine`] (so a valid session
-/// token is in scope). Returns a stable lowercase string:
-/// - `"revoked"`  — verified signed registry marks this device `revoked`.
-/// - `"active"`   — verified signed registry lists this device non-revoked.
-/// - `"unknown"`  — inconclusive (no registry, verification failed, relay error,
-///   self absent). Fail-safe: callers must NOT wipe or clear credentials.
+/// token is in scope). Returns a stable JSON string (H3 Layer B):
+/// - `{"status":"revoked","remote_wipe":<bool>}` — verified signed registry
+///   marks this device `revoked`; `remote_wipe` is the admin-authenticated wipe
+///   intent read from the SAME signature-verified entry (defaults `false` for
+///   older snapshots that omit it). Callers MUST drive any local data wipe from
+///   this verified bit, never from the relay's `device_revoked` frame / error.
+/// - `{"status":"active"}`  — verified signed registry lists this device
+///   non-revoked.
+/// - `{"status":"unknown"}` — inconclusive (no registry, verification failed,
+///   relay error, self absent). Fail-safe: callers must NOT wipe or clear creds.
 ///
-/// Never returns `Err`: every failure mode collapses to `"unknown"` so a relay
-/// cannot weaponize an error into a destructive outcome.
+/// Never returns `Err`: every failure mode collapses to `{"status":"unknown"}`
+/// so a relay cannot weaponize an error into a destructive outcome. The
+/// `Result<String, String>` signature is unchanged from the prior lowercase-
+/// string form, so no flutter_rust_bridge type regeneration is required.
 pub async fn confirm_self_revocation(handle: &PrismSyncHandle) -> Result<String, String> {
     let inner = handle.inner.lock().await;
     let status = inner.confirm_self_revocation().await;
-    Ok(status.as_str().to_string())
+    Ok(status.to_json())
 }
 
 /// Fetch the relay-advertised GIF service configuration for the current sync
@@ -5233,6 +5240,13 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
                     x_wing_public_key: r.x_wing_public_key.clone(),
                     status: r.status.clone(),
                     ml_dsa_key_generation: ml_dsa_gen,
+                    // H3 Layer B: this ML-DSA-rotation re-sign is NOT a
+                    // revocation. The local `DeviceRecord` does not persist a
+                    // wipe intent (it is a transient, signed-once admin
+                    // directive consumed by the victim's `confirm_self_revocation`
+                    // against the relay-served registry), so the rotation path
+                    // must never resurrect or author a wipe — always false.
+                    remote_wipe: false,
                 }
             })
             .collect();
@@ -6026,6 +6040,7 @@ mod tests {
                 x_wing_public_key: new_record.x_wing_public_key,
                 status: "active".to_string(),
                 ml_dsa_key_generation: new_generation,
+                remote_wipe: false,
             }],
             registry_version,
             0,
@@ -6505,6 +6520,7 @@ mod tests {
                 x_wing_public_key: record.x_wing_public_key.clone(),
                 status: "active".to_string(),
                 ml_dsa_key_generation: 1,
+                remote_wipe: false,
             }],
             2,
             0,

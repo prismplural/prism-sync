@@ -166,6 +166,7 @@ async fn registry_verification_verified_import_happy_path() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
         RegistrySnapshotEntry {
             sync_id: SYNC_ID.to_string(),
@@ -177,6 +178,7 @@ async fn registry_verification_verified_import_happy_path() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
     ];
 
@@ -334,6 +336,7 @@ async fn registry_verification_same_version_artifact_repairs_missing_device_reco
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
         RegistrySnapshotEntry {
             sync_id: SYNC_ID.to_string(),
@@ -345,6 +348,7 @@ async fn registry_verification_same_version_artifact_repairs_missing_device_reco
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
     ];
 
@@ -472,6 +476,7 @@ fn registry_verification_same_version_artifact_rejects_existing_key_change() {
         x_wing_public_key: vec![],
         status: "active".to_string(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     }];
     let signed_blob = build_signed_registry_blob_with_version(
         entries,
@@ -543,6 +548,7 @@ fn registry_verification_same_version_artifact_rejects_existing_status_or_genera
         x_wing_public_key: vec![],
         status: "active".to_string(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     };
     let changed_peer = RegistrySnapshotEntry {
         sync_id: SYNC_ID.to_string(),
@@ -554,6 +560,7 @@ fn registry_verification_same_version_artifact_rejects_existing_status_or_genera
         x_wing_public_key: vec![],
         status: "revoked".to_string(),
         ml_dsa_key_generation: 1,
+        remote_wipe: false,
     };
     let signed_blob = build_signed_registry_blob_with_version(
         vec![unchanged_signer, changed_peer],
@@ -695,6 +702,7 @@ fn registry_verification_verified_import_preserves_generation() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
         RegistrySnapshotEntry {
             sync_id: SYNC_ID.to_string(),
@@ -706,6 +714,7 @@ fn registry_verification_verified_import_preserves_generation() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 3,
+            remote_wipe: false,
         },
     ];
 
@@ -770,6 +779,7 @@ fn registry_verification_tampered_artifact_rejected() {
         x_wing_public_key: vec![],
         status: "active".to_string(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     }];
 
     let mut signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
@@ -1025,6 +1035,7 @@ async fn generation_mismatch_triggers_registry_fetch() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
         RegistrySnapshotEntry {
             sync_id: SYNC_ID.to_string(),
@@ -1036,6 +1047,7 @@ async fn generation_mismatch_triggers_registry_fetch() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 1,
+            remote_wipe: false,
         },
     ];
 
@@ -1194,6 +1206,7 @@ async fn generation_mismatch_registry_still_stale_returns_local() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
         RegistrySnapshotEntry {
             sync_id: SYNC_ID.to_string(),
@@ -1205,6 +1218,7 @@ async fn generation_mismatch_registry_still_stale_returns_local() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
     ];
 
@@ -1282,6 +1296,7 @@ fn revoked_signer_rejected() {
         x_wing_public_key: vec![],
         status: "active".to_string(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     }];
     let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
 
@@ -1345,6 +1360,7 @@ fn signer_self_revoked_in_snapshot_rejected() {
         // Self-contradictory: signing but claiming to be revoked
         status: "revoked".to_string(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     }];
     let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
 
@@ -1406,6 +1422,7 @@ fn signer_missing_from_own_snapshot_rejected() {
         x_wing_public_key: vec![],
         status: "active".to_string(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     }];
     // Sign with device A's keys (A is absent from the snapshot itself)
     let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
@@ -1485,6 +1502,7 @@ fn stale_registry_version_rejected() {
         x_wing_public_key: Vec::new(),
         status: "active".into(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     }];
 
     // Build a signed blob at version 5
@@ -1570,6 +1588,7 @@ fn signed_registry_import_requires_epoch_binding_at_version_floor() {
         x_wing_public_key: Vec::new(),
         status: "active".into(),
         ml_dsa_key_generation: 0,
+        remote_wipe: false,
     }];
 
     let signing_key = device_secret_a.ed25519_keypair(device_a_id).unwrap();
@@ -1732,6 +1751,7 @@ async fn hybrid_batch_roundtrip_with_verified_registry() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
         RegistrySnapshotEntry {
             sync_id: SYNC_ID.to_string(),
@@ -1743,6 +1763,7 @@ async fn hybrid_batch_roundtrip_with_verified_registry() {
             x_wing_public_key: vec![],
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         },
     ];
 

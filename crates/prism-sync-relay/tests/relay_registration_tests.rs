@@ -2295,6 +2295,7 @@ async fn test_reregister_existing_device_with_changed_x25519_key_is_rejected() {
             x_wing_public_key: Vec::new(),
             ml_dsa_key_generation: 0,
             status: "active".into(),
+            remote_wipe: false,
         }],
     );
     let nonce = fetch_nonce(&client, &url, &sync_id).await;
@@ -4381,4 +4382,196 @@ async fn test_nonce_endpoint_checks_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "nonce with correct token should be 200");
+}
+
+/// H3 Layer B: the auth middleware's read-only allowlist for revoked devices
+/// must be TIGHT — a revoked device can `GET /registry` (to verify its own
+/// revocation) but is still rejected with `device_revoked` on EVERY other
+/// authenticated route/method.
+#[tokio::test]
+async fn revoked_device_registry_read_allowlist_is_tight() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+
+    // Register (active) and grab the session token.
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // Seed a registry artifact so the allowed GET returns a clean 200 (not 404).
+    let registry_blob = b"signed-registry-artifact-bytes".to_vec();
+    db.with_conn(|conn| {
+        db::upsert_registry_state(conn, &sync_id, 1, "deadbeef")?;
+        db::store_registry_artifact(
+            conn,
+            &sync_id,
+            1,
+            "deadbeef",
+            "signed_registry_snapshot",
+            &registry_blob,
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Now REVOKE this device. The session stays valid, but the device row is
+    // revoked, so the middleware classifies it `DeviceRevoked`.
+    db.with_conn(|conn| {
+        let revoked = db::revoke_device(conn, &sync_id, &device_id, true)?;
+        assert!(revoked, "revoke_device should mark the row as revoked");
+        Ok(())
+    })
+    .unwrap();
+
+    // ── ALLOWED: GET /registry returns 200 with the artifact. The narrow
+    //    allowlist let the revoked device through specifically for this read. ──
+    let registry_path = format!("/v1/sync/{sync_id}/registry");
+    let resp = apply_signed_headers(
+        client
+            .get(format!("{url}{registry_path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id),
+        &keys,
+        "GET",
+        &registry_path,
+        &sync_id,
+        &device_id,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a revoked device MUST be allowed to GET /registry (self-revocation check)"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["registry_version"].as_i64(),
+        Some(1),
+        "the allowed registry read must return the signed artifact, got: {body}"
+    );
+
+    // Helper: assert a request from the revoked device is rejected with the
+    // structured `device_revoked` 401 (proving the allowlist did NOT widen).
+    async fn assert_rejected_device_revoked(resp: reqwest::Response, route: &str) {
+        assert_eq!(
+            resp.status(),
+            401,
+            "revoked device must be rejected (401) on {route}"
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["error"].as_str(),
+            Some("device_revoked"),
+            "rejection on {route} must be the structured device_revoked error, got: {body}"
+        );
+    }
+
+    // ── REJECTED: every OTHER authenticated route/method still gets
+    //    device_revoked. This is what makes the allowlist tight. ──
+
+    // PUT /registry (write to the SAME path) — must NOT be allowed.
+    let put_resp = apply_signed_headers(
+        client
+            .put(format!("{url}{registry_path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &keys,
+        "PUT",
+        &registry_path,
+        &sync_id,
+        &device_id,
+        b"{}",
+    )
+    .body("{}")
+    .send()
+    .await
+    .unwrap();
+    assert_rejected_device_revoked(put_resp, "PUT /registry").await;
+
+    // GET /changes
+    let changes_path = format!("/v1/sync/{sync_id}/changes");
+    let get_changes = apply_signed_headers(
+        client
+            .get(format!("{url}{changes_path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id),
+        &keys,
+        "GET",
+        &changes_path,
+        &sync_id,
+        &device_id,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_rejected_device_revoked(get_changes, "GET /changes").await;
+
+    // PUT /changes
+    let envelope = make_test_envelope(&sync_id, &device_id, "batch-000", 0);
+    let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+    let put_changes = apply_signed_headers(
+        client
+            .put(format!("{url}{changes_path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &keys,
+        "PUT",
+        &changes_path,
+        &sync_id,
+        &device_id,
+        &envelope_bytes,
+    )
+    .body(envelope_bytes)
+    .send()
+    .await
+    .unwrap();
+    assert_rejected_device_revoked(put_changes, "PUT /changes").await;
+
+    // GET /devices
+    let devices_path = format!("/v1/sync/{sync_id}/devices");
+    let get_devices = apply_signed_headers(
+        client
+            .get(format!("{url}{devices_path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id),
+        &keys,
+        "GET",
+        &devices_path,
+        &sync_id,
+        &device_id,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_rejected_device_revoked(get_devices, "GET /devices").await;
+
+    // POST /ack
+    let ack_path = format!("/v1/sync/{sync_id}/ack");
+    let ack_body = serde_json::to_vec(&serde_json::json!({ "server_seq": 1 })).unwrap();
+    let post_ack = apply_signed_headers(
+        client
+            .post(format!("{url}{ack_path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Device-Id", &device_id)
+            .header("Content-Type", "application/json"),
+        &keys,
+        "POST",
+        &ack_path,
+        &sync_id,
+        &device_id,
+        &ack_body,
+    )
+    .body(ack_body)
+    .send()
+    .await
+    .unwrap();
+    assert_rejected_device_revoked(post_ack, "POST /ack").await;
 }

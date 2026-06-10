@@ -219,6 +219,7 @@ async fn approve_flow_produces_verifiable_pairing_response() {
             x_wing_public_key: Vec::new(),
             ml_dsa_key_generation: 0,
             status: "active".into(),
+            remote_wipe: false,
         }],
         SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
         0,
@@ -386,6 +387,7 @@ async fn join_from_approval_roundtrip() {
                 x_wing_public_key: vec![],
                 ml_dsa_key_generation: 0,
                 status: "active".into(),
+                remote_wipe: false,
             },
             RegistrySnapshotEntry {
                 sync_id: sync_id.clone(),
@@ -397,6 +399,7 @@ async fn join_from_approval_roundtrip() {
                 x_wing_public_key: vec![],
                 ml_dsa_key_generation: 0,
                 status: "active".into(),
+                remote_wipe: false,
             },
         ],
         SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,

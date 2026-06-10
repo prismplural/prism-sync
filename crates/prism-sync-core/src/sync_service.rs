@@ -2033,6 +2033,7 @@ mod tests {
             x_wing_public_key: xwing.encapsulation_key_bytes(),
             status: "active".to_string(),
             ml_dsa_key_generation: 0,
+            remote_wipe: false,
         };
         let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
             vec![entry],

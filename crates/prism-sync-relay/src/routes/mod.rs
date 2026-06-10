@@ -487,12 +487,44 @@ pub fn router(state: AppState) -> Router {
 /// Result of auth validation — distinguishes "no session" from "device revoked".
 enum AuthResult {
     Ok(AuthIdentity),
-    /// Valid session but device is revoked; includes remote_wipe flag.
+    /// Valid session but device is revoked; includes remote_wipe flag and the
+    /// revoked device's identity so the middleware can inject it on the narrow
+    /// read-only allowlist (a revoked device may still `GET /registry` to verify
+    /// its OWN revocation — see `auth_middleware`).
     DeviceRevoked {
         remote_wipe: bool,
+        identity: AuthIdentity,
     },
     /// Session not found, expired, or device missing.
     Invalid,
+}
+
+/// Is this request the one read-only call a REVOKED device is still allowed to
+/// make: `GET /v1/sync/{sync_id}/registry`?
+///
+/// SECURITY: the signed registry is the group's device PUBLIC keys + per-device
+/// status + epoch_key_hashes (commitments, NOT keys) + registry version/epoch —
+/// no secrets, read-only, and rate-limited like any other route. A revoked
+/// device already held all of this before revocation. Allowing exactly this one
+/// call lets `confirm_self_revocation` fetch the signed registry and
+/// signature-verify its OWN revocation (incl. the admin-signed `remote_wipe`
+/// intent, H3 Layer B) instead of trusting an unauthenticated relay frame.
+///
+/// The match is deliberately TIGHT: method == GET AND the path is exactly
+/// `/v1/sync/<id>/registry` (three fixed segments around a single id segment,
+/// no trailing extra). It must NOT match writes (PUT /registry) or any other
+/// authenticated route.
+fn is_revoked_device_registry_read(method: &Method, path: &str) -> bool {
+    if method != Method::GET {
+        return false;
+    }
+    // Expect exactly: ["v1", "sync", "<id>", "registry"] — no more, no fewer,
+    // and a non-empty id segment.
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    matches!(
+        (segments.next(), segments.next(), segments.next(), segments.next(), segments.next()),
+        (Some("v1"), Some("sync"), Some(id), Some("registry"), None) if !id.is_empty()
+    )
 }
 
 /// Auth middleware: extracts Bearer token, validates session, injects AuthIdentity.
@@ -554,7 +586,16 @@ async fn auth_middleware(
                     if device.status != "active" {
                         let wipe = db::get_device_wipe_status(conn, &sync_id, &device_id)?
                             .unwrap_or(false);
-                        return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
+                        return Ok(AuthResult::DeviceRevoked {
+                            remote_wipe: wipe,
+                            identity: AuthIdentity {
+                                sync_id,
+                                device_id,
+                                signing_public_key: device.signing_public_key,
+                                ml_dsa_65_public_key: device.ml_dsa_65_public_key,
+                                prev_ml_dsa_65_public_key: None,
+                            },
+                        });
                     }
                     let prev_ml_dsa_65_public_key = if !device.prev_ml_dsa_65_public_key.is_empty()
                         && device.prev_ml_dsa_65_expires_at.is_some_and(|exp| exp > db::now_secs())
@@ -577,7 +618,27 @@ async fn auth_middleware(
                 {
                     let wipe =
                         db::get_device_wipe_status(conn, &sync_id, &device_id)?.unwrap_or(false);
-                    return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe });
+                    // Build the identity from the (revoked) device record so the
+                    // narrow registry-read allowlist can inject it. The registry
+                    // GET handler only reads `sync_id`, but we populate the keys
+                    // faithfully. If the record is gone, fall back to empty keys
+                    // — the read is on group-wide PUBLIC data and the handler
+                    // re-checks `path_sync_id == auth.sync_id`.
+                    let device = db::get_device(conn, &sync_id, &device_id)?;
+                    let identity = AuthIdentity {
+                        sync_id: sync_id.clone(),
+                        device_id: device_id.clone(),
+                        signing_public_key: device
+                            .as_ref()
+                            .map(|d| d.signing_public_key.clone())
+                            .unwrap_or_default(),
+                        ml_dsa_65_public_key: device
+                            .as_ref()
+                            .map(|d| d.ml_dsa_65_public_key.clone())
+                            .unwrap_or_default(),
+                        prev_ml_dsa_65_public_key: None,
+                    };
+                    return Ok(AuthResult::DeviceRevoked { remote_wipe: wipe, identity });
                 }
 
                 Ok(AuthResult::Invalid)
@@ -614,7 +675,25 @@ async fn auth_middleware(
             req.extensions_mut().insert(identity);
             Ok(next.run(req).await)
         }
-        AuthResult::DeviceRevoked { remote_wipe } => {
+        AuthResult::DeviceRevoked { remote_wipe, identity } => {
+            // Narrow read-only allowlist: a revoked device may still issue the
+            // single call `GET /v1/sync/{sync_id}/registry` so it can fetch the
+            // signed registry and verify its OWN revocation (H3). Every other
+            // route/method is rejected exactly as before. The allowed read is on
+            // group-wide PUBLIC data (no secrets) and is rate-limited like any
+            // other route. See `is_revoked_device_registry_read`.
+            if is_revoked_device_registry_read(req.method(), req.uri().path()) {
+                tracing::debug!(
+                    sync_id = %trunc_id(&identity.sync_id),
+                    device_id = %trunc_id(&identity.device_id),
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                    remote_wipe,
+                    "Auth OK (revoked device: read-only registry self-revocation check allowed)"
+                );
+                req.extensions_mut().insert(identity);
+                return Ok(next.run(req).await);
+            }
             tracing::warn!(
                 method = %req.method(),
                 path = %req.uri().path(),
@@ -632,6 +711,62 @@ async fn auth_middleware(
             );
             state.metrics.inc(&state.metrics.auth_failures);
             Err(AppError::Unauthorized.into_response())
+        }
+    }
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::is_revoked_device_registry_read;
+    use axum::http::Method;
+
+    #[test]
+    fn allows_only_get_registry_exact_path() {
+        // The single allowed read.
+        assert!(is_revoked_device_registry_read(
+            &Method::GET,
+            "/v1/sync/abc123/registry"
+        ));
+        // Tolerate a trailing slash (router-normalized variant).
+        assert!(is_revoked_device_registry_read(
+            &Method::GET,
+            "/v1/sync/abc123/registry/"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_get_methods_on_registry() {
+        for m in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH, Method::HEAD] {
+            assert!(
+                !is_revoked_device_registry_read(&m, "/v1/sync/abc123/registry"),
+                "method {m} on /registry must NOT be allowlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_other_paths_and_subpaths() {
+        for path in [
+            "/v1/sync/abc123/changes",
+            "/v1/sync/abc123/devices",
+            "/v1/sync/abc123/ack",
+            "/v1/sync/abc123/snapshot",
+            // No id segment.
+            "/v1/sync/registry",
+            // Extra trailing segment after registry.
+            "/v1/sync/abc123/registry/extra",
+            // registry as the id, wrong shape.
+            "/v1/sync/registry/registry/more",
+            // Loose substring that must NOT match.
+            "/v1/sync/abc123/registry-export",
+            "/v1/sync/abc123/devices/registry",
+            // Empty id.
+            "/v1/sync//registry",
+        ] {
+            assert!(
+                !is_revoked_device_registry_read(&Method::GET, path),
+                "path {path} must NOT be allowlisted"
+            );
         }
     }
 }
