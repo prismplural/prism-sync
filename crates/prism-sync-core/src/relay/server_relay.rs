@@ -1148,6 +1148,15 @@ impl MediaRelay for ServerRelay {
 
         let status = resp.status().as_u16();
         if status >= 400 {
+            // Map a media 404 to NotFound LOCALLY (not in the shared
+            // `classify_error`): a missing blob is the C4 heal's trigger, not a
+            // protocol error. The shared classifier serves many sync routes
+            // where a 404 is terminal, and `NotFound` maps to the retryable
+            // `Server` category (error.rs / sync_service.rs) — making it generic
+            // would turn terminal sync-route 404s into retried-forever errors.
+            if status == 404 {
+                return Err(RelayError::NotFound);
+            }
             let body_text = resp.text().await.unwrap_or_default();
             return Err(Self::classify_error(status, &body_text));
         }
@@ -1428,6 +1437,23 @@ mod tests {
         assert!(in_progress.in_progress);
         // An old relay's 204/other 2xx ⇒ committed (back-compat).
         assert_eq!(ServerRelay::upload_outcome_for_status(204), MediaUploadOutcome::COMMITTED);
+    }
+
+    #[test]
+    fn shared_classify_error_keeps_404_as_protocol() {
+        // 404 → NotFound is mapped LOCALLY in `download_media` only (C4). The
+        // shared classifier must keep 404 → Protocol so terminal sync-route 404s
+        // don't become the retryable Server category that NotFound maps to —
+        // which would retry them forever.
+        assert!(matches!(
+            ServerRelay::classify_error(404, "not found"),
+            RelayError::Protocol { .. }
+        ));
+        // 405 (old relay, feature absent) likewise stays Protocol.
+        assert!(matches!(
+            ServerRelay::classify_error(405, "method not allowed"),
+            RelayError::Protocol { .. }
+        ));
     }
 
     fn test_relay(initial_session_token: &str) -> ServerRelay {

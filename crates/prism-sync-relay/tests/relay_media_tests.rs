@@ -824,6 +824,165 @@ async fn upload_with_ttl_sets_clamped_expires_at() {
     assert_eq!(row.expires_at, Some(row.created_at + 7_776_000), "clamped to retention ceiling");
 }
 
+// ───────────────────── C4: re-supply rate lane + byte ceiling ─────────────────
+
+/// A TTL-bearing (re-supply / heal) upload rides a SEPARATE rate bucket from a
+/// fresh send, so demand-driven heal can neither starve fresh user sends nor be
+/// starved by them. Exhausting one lane leaves the other free.
+#[tokio::test]
+async fn resupply_uploads_ride_a_separate_rate_lane() {
+    let mut config = base_test_config();
+    config.media_upload_rate_limit = 1; // fresh-send lane: one per window
+    config.media_upload_rate_window_secs = 60;
+    config.media_resupply_rate_limit = 1; // re-supply lane: independently one
+    config.media_resupply_rate_window_secs = 60;
+
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![7u8; 64];
+
+    // Fresh-send lane: first ok, second exhausts it (429).
+    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "fresh-1", &data).await;
+    assert_eq!(r.status(), 200, "first fresh send ok");
+    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "fresh-2", &data).await;
+    assert_eq!(r.status(), 429, "second fresh send exhausts the fresh lane");
+
+    // Re-supply lane is untouched by the exhausted fresh lane: first ok.
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "resup-1", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "re-supply rides its own lane despite a full fresh lane");
+
+    // ...and the re-supply lane has its OWN independent limit (429 on the 2nd).
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "resup-2", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 429, "second re-supply exhausts the (separate) re-supply lane");
+}
+
+/// The re-supply byte ceiling caps the live TTL-bearing bytes of a group, but a
+/// fresh send (default retention) is governed only by the main quota — it is
+/// exempt from the ceiling.
+#[tokio::test]
+async fn resupply_byte_ceiling_caps_ephemeral_bytes_only() {
+    let mut config = base_test_config();
+    config.media_resupply_byte_ceiling_bytes = 128; // room for two 64-byte blobs
+
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![8u8; 64];
+
+    // Two re-supply blobs fit exactly at the ceiling (64 + 64 == 128).
+    let r =
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "rc-a", &data, 7200)
+            .await;
+    assert_eq!(r.status(), 200, "first re-supply within ceiling");
+    let r =
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "rc-b", &data, 7200)
+            .await;
+    assert_eq!(r.status(), 200, "second re-supply lands exactly at the ceiling");
+
+    // The third re-supply would push live ephemeral bytes over the ceiling → 507.
+    let r =
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "rc-c", &data, 7200)
+            .await;
+    assert_eq!(r.status(), 507, "third re-supply exceeds the byte ceiling");
+
+    // A fresh send (no X-Media-TTL) is NOT counted against the re-supply ceiling
+    // and still succeeds — only the main quota (1 GB here) governs it.
+    let r =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "rc-fresh", &data).await;
+    assert_eq!(r.status(), 200, "fresh send is exempt from the re-supply ceiling");
+}
+
+/// Re-sending a TTL-bearing blob as a FRESH send clears its TTL
+/// (`combine_ttl(Some, None) → None`), dropping it out of the ephemeral subset
+/// and freeing room under the re-supply byte ceiling. This guards the subtlest
+/// accounting claim: the ceiling tracks only blobs whose `expires_at` is still
+/// set.
+#[tokio::test]
+async fn clearing_a_ttl_frees_resupply_ceiling_room() {
+    let mut config = base_test_config();
+    config.media_resupply_byte_ceiling_bytes = 128; // exactly two 64-byte blobs
+
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![9u8; 64];
+
+    // Fill the ceiling with two ephemeral blobs.
+    upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "tc-a", &data, 7200)
+        .await;
+    upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "tc-b", &data, 7200)
+        .await;
+    // A third ephemeral blob is over the ceiling.
+    let r =
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "tc-c", &data, 7200)
+            .await;
+    assert_eq!(r.status(), 507, "ceiling full → third ephemeral rejected");
+
+    // Re-send tc-a as a FRESH upload (no X-Media-TTL): same bytes ⇒ idempotent,
+    // but `combine_ttl` clears its expires_at to NULL, dropping it from the
+    // ephemeral subset.
+    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "tc-a", &data).await;
+    assert_eq!(r.status(), 200, "fresh re-send of tc-a succeeds and clears its TTL");
+    let row = db.with_conn(|c| db::get_media_metadata(c, "tc-a")).unwrap().unwrap();
+    assert!(row.expires_at.is_none(), "fresh re-send cleared tc-a's TTL");
+
+    // tc-a no longer counts against the ceiling, so tc-c now fits.
+    let r =
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "tc-c", &data, 7200)
+            .await;
+    assert_eq!(r.status(), 200, "freed ceiling room lets the third ephemeral through");
+}
+
+/// An idempotent re-upload of an already-committed ephemeral blob adds no bytes
+/// (Δquota 0), so it is exempt from the re-supply ceiling even when the group is
+/// exactly at the cap. Guards the `would_add_bytes` gate on the ceiling check.
+#[tokio::test]
+async fn idempotent_resupply_reupload_is_exempt_from_ceiling() {
+    let mut config = base_test_config();
+    config.media_resupply_byte_ceiling_bytes = 128; // exactly two 64-byte blobs
+
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![10u8; 64];
+
+    // Fill the ceiling exactly.
+    upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "ix-a", &data, 7200)
+        .await;
+    upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "ix-b", &data, 7200)
+        .await;
+
+    // Re-upload ix-a (same bytes, still TTL-bearing) while at the cap: it adds no
+    // bytes, so the ceiling must NOT reject it.
+    let r =
+        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "ix-a", &data, 7200)
+            .await;
+    assert_eq!(r.status(), 200, "idempotent re-upload at the cap is ceiling-exempt");
+}
+
 #[tokio::test]
 async fn download_404_after_ttl_expiry() {
     let mut config = base_test_config();

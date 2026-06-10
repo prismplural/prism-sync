@@ -110,13 +110,44 @@ pub async fn upload_media(
         ));
     }
 
-    // 5. Rate limit
-    let rate_key = format!("media_upload:{}", auth.sync_id);
-    if !state.media_upload_rate_limiter.check(
-        &rate_key,
-        state.config.media_upload_rate_limit,
-        state.config.media_upload_rate_window_secs,
-    ) {
+    // Capture the request-receipt time once, up front: it stamps the TTL, the
+    // quota preflight, and the reserve txn, and it also classifies the rate lane
+    // below. (A plain wall-clock read; it does not feed signature verification.)
+    let now = db::now_secs();
+    let ttl_expires_at = parse_media_ttl(&headers, &state.config, now);
+    // A TTL-bearing upload (`X-Media-TTL` present + parseable) is a re-supply /
+    // heal blob — the C4 responder and the pairing-snapshot push. It rides a
+    // SEPARATE rate lane + byte ceiling so demand-driven heal can neither starve
+    // fresh user sends (rate) nor fill the group quota faster than the short TTL
+    // sheds it (bytes). `X-Media-TTL` is unsigned, but that grants no evasion:
+    // claiming "re-supply" only subjects the caller to the STRICTER lane (and an
+    // early-expiring blob); omitting it is just a normal fresh send (default
+    // retention, main quota). The two lanes are independent buckets, so a
+    // member's total per-group upload budget is their SUM — intended, so heal and
+    // fresh-send never contend for one bucket.
+    let is_resupply = ttl_expires_at.is_some();
+
+    // 5. Rate limit — fresh-send and re-supply ride independent buckets.
+    let (rate_prefix, rate_limit, rate_window) = if is_resupply {
+        (
+            "media_resupply",
+            state.config.media_resupply_rate_limit,
+            state.config.media_resupply_rate_window_secs,
+        )
+    } else {
+        (
+            "media_upload",
+            state.config.media_upload_rate_limit,
+            state.config.media_upload_rate_window_secs,
+        )
+    };
+    let rate_key = format!("{}:{}", rate_prefix, auth.sync_id);
+    let rate_limiter = if is_resupply {
+        &state.media_resupply_rate_limiter
+    } else {
+        &state.media_upload_rate_limiter
+    };
+    if !rate_limiter.check(&rate_key, rate_limit, rate_window) {
         return Err(AppError::TooManyRequests);
     }
 
@@ -137,10 +168,7 @@ pub async fn upload_media(
     let path = format!("/v1/sync/{}/media", auth.sync_id);
     verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
 
-    // 9. Resolve the per-upload TTL (clamped) → absolute expires_at.
-    let now = db::now_secs();
-    let ttl_expires_at = parse_media_ttl(&headers, &state.config, now);
-
+    // 9. (TTL + `now` were resolved up front, before the rate-limit lane split.)
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();
     let media_id_owned = media_id.to_string();
@@ -160,32 +188,41 @@ pub async fn upload_media(
     //     the obvious "would add bytes over quota" case to avoid staging a body
     //     that's doomed. Idempotent/repair re-uploads of an existing committed
     //     blob (Δquota 0) are NOT rejected here.
+    let resupply_ceiling = state.config.media_resupply_byte_ceiling_bytes as i64;
     {
         let db = state.db.clone();
         let sid = sync_id.clone();
         let mid = media_id_owned.clone();
-        let (swept, usage, would_add_bytes) = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let tx = rusqlite::Transaction::new_unchecked(
-                    conn,
-                    rusqlite::TransactionBehavior::Immediate,
-                )?;
-                let swept = db::sweep_expired_media_for_group(&tx, &sid, now, sweep_cap)?;
-                let usage = db::get_group_media_usage_at(&tx, &sid, now, grace)?;
-                let would_add_bytes = match db::get_media_metadata(&tx, &mid)? {
-                    // No row, or an expired/soft-deleted row (resurrect) adds
-                    // its bytes back. A committed-live row (idempotent/repair)
-                    // or a pending reserve (→ 202) adds nothing.
-                    None => true,
-                    Some(row) => !row.is_servable_at(now) && !row.is_pending(),
-                };
-                tx.commit()?;
-                Ok((swept, usage, would_add_bytes))
+        let (swept, usage, resupply_usage, would_add_bytes) =
+            tokio::task::spawn_blocking(move || {
+                db.with_conn(|conn| {
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        conn,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )?;
+                    let swept = db::sweep_expired_media_for_group(&tx, &sid, now, sweep_cap)?;
+                    let usage = db::get_group_media_usage_at(&tx, &sid, now, grace)?;
+                    // Only summed when it will be enforced (a re-supply upload),
+                    // so a fresh send pays nothing for the extra query.
+                    let resupply_usage = if is_resupply {
+                        db::get_group_resupply_usage_at(&tx, &sid, now, grace)?
+                    } else {
+                        0
+                    };
+                    let would_add_bytes = match db::get_media_metadata(&tx, &mid)? {
+                        // No row, or an expired/soft-deleted row (resurrect) adds
+                        // its bytes back. A committed-live row (idempotent/repair)
+                        // or a pending reserve (→ 202) adds nothing.
+                        None => true,
+                        Some(row) => !row.is_servable_at(now) && !row.is_pending(),
+                    };
+                    tx.commit()?;
+                    Ok((swept, usage, resupply_usage, would_add_bytes))
+                })
             })
-        })
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
         // Unlink swept expired files (best-effort; the cleanup loop backstops).
         for swept_id in &swept {
@@ -194,6 +231,27 @@ pub async fn upload_media(
 
         if would_add_bytes && usage + size_bytes > quota {
             return Err(AppError::StorageFull("Media quota exceeded for sync group"));
+        }
+        // The re-supply ceiling is a tighter, ephemeral-only sub-cap of the
+        // quota: it bounds the live TTL-bearing bytes alone. Transient by design
+        // — the short TTL sheds bytes, so a rejected responder simply retries on
+        // its next cadence (and the relay still holds the blob via another
+        // responder once space frees). An idempotent/repair re-upload (Δquota 0)
+        // is already counted and never rejected here.
+        //
+        // Unlike the main quota — which is re-checked authoritatively inside the
+        // reserve txn — this ceiling is a PREFLIGHT-ONLY soft cap: it is not
+        // re-checked in `reserve_media_upload`, so N concurrent re-supply uploads
+        // can each clear the preflight and overshoot by up to
+        // (concurrency − 1) × media_max_file_bytes. That overshoot is bounded by
+        // the re-supply rate lane (which gates concurrency), shed by the short
+        // TTL, and further damped by responders' own client-side self-limit — so
+        // a soft cap is sufficient here; a hard cap would have to move into the
+        // reserve txn beside the quota re-check.
+        if is_resupply && would_add_bytes && resupply_usage + size_bytes > resupply_ceiling {
+            return Err(AppError::StorageFull(
+                "Re-supply byte ceiling exceeded for sync group",
+            ));
         }
     }
 

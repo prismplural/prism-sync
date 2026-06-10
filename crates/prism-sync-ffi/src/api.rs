@@ -2453,6 +2453,56 @@ pub struct MediaUploadOutcome {
     pub in_progress: bool,
 }
 
+/// Why a media download failed, surfaced typed to Dart so the C4 heal can act
+/// on it (today every failure collapses to `null`). `decrypt` is never produced
+/// by the relay download itself — the Dart/FFI decrypt step raises it — but it
+/// is part of the unified type the app's `MediaFetchError` mirrors.
+pub enum MediaFetchErrorKind {
+    /// The relay returned 404 — the blob is missing (the C4 heal's trigger).
+    NotFound,
+    /// Transport-level failure (connect/request/no status).
+    Network,
+    /// Auth / forbidden / revoked / upgrade-required.
+    Auth,
+    /// Request timed out (or relay 408/504).
+    Timeout,
+    /// Relay 5xx (retryable server error).
+    Server,
+    /// Local decrypt / integrity failure (set on the Dart side, not here).
+    Decrypt,
+    /// Anything else (protocol, epoch rotation, unexpected status).
+    Other,
+}
+
+/// The result of a media download: exactly one of `bytes` / `error` is `Some`.
+/// A `Some(error)` is a *normal*, typed failure the caller (C4) handles; the
+/// outer `Result`'s `Err(String)` is reserved for misconfiguration (no relay).
+pub struct MediaDownloadOutcome {
+    pub bytes: Option<Vec<u8>>,
+    pub error: Option<MediaFetchErrorKind>,
+}
+
+fn map_media_fetch_error_kind(
+    error: &prism_sync_core::relay::traits::RelayError,
+) -> MediaFetchErrorKind {
+    use prism_sync_core::relay::traits::RelayErrorKind as K;
+    match error.kind() {
+        K::NotFound => MediaFetchErrorKind::NotFound,
+        K::Network => MediaFetchErrorKind::Network,
+        K::Timeout => MediaFetchErrorKind::Timeout,
+        K::Server => MediaFetchErrorKind::Server,
+        K::Auth
+        | K::Forbidden
+        | K::DeviceRevoked
+        | K::DeviceIdentityMismatch
+        | K::UpgradeRequired => MediaFetchErrorKind::Auth,
+        // Protocol / EpochRotation / ClockSkew / KeyChanged /
+        // MustBootstrapFromSnapshot / SnapshotStale / Http: not meaningful for a
+        // media download, treat as a generic failure.
+        _ => MediaFetchErrorKind::Other,
+    }
+}
+
 /// Upload an encrypted media blob to the relay.
 ///
 /// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
@@ -2484,8 +2534,17 @@ pub async fn upload_media(
 
 /// Download an encrypted media blob from the relay.
 ///
+/// Returns a typed [`MediaDownloadOutcome`] (`bytes` xor `error`) so the C4 heal
+/// can distinguish a missing blob (`NotFound` → request a re-supply) from a
+/// transient transport error (retry) from auth. A relay 404 surfaces as
+/// `NotFound` (mapped locally in `ServerRelay::download_media`, not the shared
+/// classifier). The outer `Err(String)` is only "relay not configured".
+///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
-pub async fn download_media(handle: &PrismSyncHandle, media_id: String) -> Result<Vec<u8>, String> {
+pub async fn download_media(
+    handle: &PrismSyncHandle,
+    media_id: String,
+) -> Result<MediaDownloadOutcome, String> {
     let relay = handle
         .relay
         .lock()
@@ -2494,8 +2553,26 @@ pub async fn download_media(handle: &PrismSyncHandle, media_id: String) -> Resul
         .ok_or_else(|| "Relay not configured".to_string())?;
 
     match relay.download_media(&media_id).await {
-        Ok(data) => Ok(data),
-        Err(error) => Err(format_handle_relay_error(handle, "download_media", error).await),
+        Ok(data) => Ok(MediaDownloadOutcome { bytes: Some(data), error: None }),
+        Err(error) => {
+            // Preserve the min-signature-version ratchet side-effect that
+            // `format_handle_relay_error` performed for an UpgradeRequired error.
+            if let prism_sync_core::relay::traits::RelayError::UpgradeRequired {
+                min_signature_version,
+                ..
+            } = &error
+            {
+                let _ = ratchet_handle_min_signature_version_floor(
+                    handle,
+                    Some(*min_signature_version),
+                )
+                .await;
+            }
+            Ok(MediaDownloadOutcome {
+                bytes: None,
+                error: Some(map_media_fetch_error_kind(&error)),
+            })
+        }
     }
 }
 
@@ -5752,6 +5829,49 @@ mod tests {
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
     use std::sync::Arc;
+
+    #[test]
+    fn media_fetch_error_kind_mapping() {
+        use prism_sync_core::relay::traits::RelayError;
+        assert!(matches!(
+            map_media_fetch_error_kind(&RelayError::NotFound),
+            MediaFetchErrorKind::NotFound
+        ));
+        assert!(matches!(
+            map_media_fetch_error_kind(&RelayError::Network { message: String::new() }),
+            MediaFetchErrorKind::Network
+        ));
+        assert!(matches!(
+            map_media_fetch_error_kind(&RelayError::Timeout { message: String::new() }),
+            MediaFetchErrorKind::Timeout
+        ));
+        assert!(matches!(
+            map_media_fetch_error_kind(&RelayError::Server {
+                status_code: 500,
+                message: String::new()
+            }),
+            MediaFetchErrorKind::Server
+        ));
+        // Auth-family errors all collapse to Auth.
+        for e in [
+            RelayError::Auth { message: String::new() },
+            RelayError::Forbidden { message: String::new() },
+            RelayError::DeviceRevoked { remote_wipe: false },
+            RelayError::DeviceIdentityMismatch { message: String::new() },
+            RelayError::UpgradeRequired { min_signature_version: 3, message: String::new() },
+        ] {
+            assert!(matches!(map_media_fetch_error_kind(&e), MediaFetchErrorKind::Auth));
+        }
+        // Everything not meaningful for a media download → Other.
+        assert!(matches!(
+            map_media_fetch_error_kind(&RelayError::Protocol { message: String::new() }),
+            MediaFetchErrorKind::Other
+        ));
+        assert!(matches!(
+            map_media_fetch_error_kind(&RelayError::EpochRotation { new_epoch: 1 }),
+            MediaFetchErrorKind::Other
+        ));
+    }
 
     /// Serializes the tests that exercise the process-global panic hook and the
     /// shared `LAST_PANIC` slot. Without this, a panic from another test in the

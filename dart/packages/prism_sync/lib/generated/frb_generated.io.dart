@@ -89,7 +89,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_box_autoadd_bool(dynamic raw);
 
   @protected
+  MediaFetchErrorKind dco_decode_box_autoadd_media_fetch_error_kind(
+    dynamic raw,
+  );
+
+  @protected
   BigInt dco_decode_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  int dco_decode_i_32(dynamic raw);
 
   @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
@@ -115,6 +123,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<(String, String)> dco_decode_list_record_string_string(dynamic raw);
 
   @protected
+  MediaDownloadOutcome dco_decode_media_download_outcome(dynamic raw);
+
+  @protected
+  MediaFetchErrorKind dco_decode_media_fetch_error_kind(dynamic raw);
+
+  @protected
   MediaUploadOutcome dco_decode_media_upload_outcome(dynamic raw);
 
   @protected
@@ -122,6 +136,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   bool? dco_decode_opt_box_autoadd_bool(dynamic raw);
+
+  @protected
+  MediaFetchErrorKind? dco_decode_opt_box_autoadd_media_fetch_error_kind(
+    dynamic raw,
+  );
 
   @protected
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
@@ -238,7 +257,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_box_autoadd_bool(SseDeserializer deserializer);
 
   @protected
+  MediaFetchErrorKind sse_decode_box_autoadd_media_fetch_error_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
@@ -268,6 +295,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  MediaDownloadOutcome sse_decode_media_download_outcome(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MediaFetchErrorKind sse_decode_media_fetch_error_kind(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MediaUploadOutcome sse_decode_media_upload_outcome(
     SseDeserializer deserializer,
   );
@@ -277,6 +314,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   bool? sse_decode_opt_box_autoadd_bool(SseDeserializer deserializer);
+
+  @protected
+  MediaFetchErrorKind? sse_decode_opt_box_autoadd_media_fetch_error_kind(
+    SseDeserializer deserializer,
+  );
 
   @protected
   BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
@@ -327,9 +369,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt sse_decode_usize(SseDeserializer deserializer);
-
-  @protected
-  int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
   void sse_encode_AnyhowException(
@@ -413,7 +452,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_box_autoadd_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_media_fetch_error_kind(
+    MediaFetchErrorKind self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_i_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
@@ -449,6 +497,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_media_download_outcome(
+    MediaDownloadOutcome self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_media_fetch_error_kind(
+    MediaFetchErrorKind self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_media_upload_outcome(
     MediaUploadOutcome self,
     SseSerializer serializer,
@@ -459,6 +519,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_box_autoadd_bool(bool? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_media_fetch_error_kind(
+    MediaFetchErrorKind? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
@@ -519,9 +585,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_usize(BigInt self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer);
 }
 
 // Section: wire_class

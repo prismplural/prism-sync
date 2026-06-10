@@ -4901,6 +4901,13 @@ impl SseDecode for bool {
     }
 }
 
+impl SseDecode for i32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_i32::<NativeEndian>().unwrap()
+    }
+}
+
 impl SseDecode for i64 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -4968,6 +4975,32 @@ impl SseDecode for Vec<(String, String)> {
     }
 }
 
+impl SseDecode for crate::api::MediaDownloadOutcome {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_bytes = <Option<Vec<u8>>>::sse_decode(deserializer);
+        let mut var_error = <Option<crate::api::MediaFetchErrorKind>>::sse_decode(deserializer);
+        return crate::api::MediaDownloadOutcome { bytes: var_bytes, error: var_error };
+    }
+}
+
+impl SseDecode for crate::api::MediaFetchErrorKind {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::MediaFetchErrorKind::NotFound,
+            1 => crate::api::MediaFetchErrorKind::Network,
+            2 => crate::api::MediaFetchErrorKind::Auth,
+            3 => crate::api::MediaFetchErrorKind::Timeout,
+            4 => crate::api::MediaFetchErrorKind::Server,
+            5 => crate::api::MediaFetchErrorKind::Decrypt,
+            6 => crate::api::MediaFetchErrorKind::Other,
+            _ => unreachable!("Invalid variant for MediaFetchErrorKind: {}", inner),
+        };
+    }
+}
+
 impl SseDecode for crate::api::MediaUploadOutcome {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -4996,6 +5029,17 @@ impl SseDecode for Option<bool> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<bool>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<crate::api::MediaFetchErrorKind> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::MediaFetchErrorKind>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -5122,13 +5166,6 @@ impl SseDecode for usize {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         deserializer.cursor.read_u64::<NativeEndian>().unwrap() as _
-    }
-}
-
-impl SseDecode for i32 {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        deserializer.cursor.read_i32::<NativeEndian>().unwrap()
     }
 }
 
@@ -5296,6 +5333,50 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<PrismSyncHandle>> for PrismSyn
 }
 
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::MediaDownloadOutcome {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [self.bytes.into_into_dart().into_dart(), self.error.into_into_dart().into_dart()]
+            .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::MediaDownloadOutcome
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::MediaDownloadOutcome>
+    for crate::api::MediaDownloadOutcome
+{
+    fn into_into_dart(self) -> crate::api::MediaDownloadOutcome {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::MediaFetchErrorKind {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::NotFound => 0.into_dart(),
+            Self::Network => 1.into_dart(),
+            Self::Auth => 2.into_dart(),
+            Self::Timeout => 3.into_dart(),
+            Self::Server => 4.into_dart(),
+            Self::Decrypt => 5.into_dart(),
+            Self::Other => 6.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::MediaFetchErrorKind
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::MediaFetchErrorKind>
+    for crate::api::MediaFetchErrorKind
+{
+    fn into_into_dart(self) -> crate::api::MediaFetchErrorKind {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::MediaUploadOutcome {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [self.committed.into_into_dart().into_dart(), self.in_progress.into_into_dart().into_dart()]
@@ -5443,6 +5524,13 @@ impl SseEncode for bool {
     }
 }
 
+impl SseEncode for i32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_i32::<NativeEndian>(self).unwrap();
+    }
+}
+
 impl SseEncode for i64 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -5500,6 +5588,35 @@ impl SseEncode for Vec<(String, String)> {
     }
 }
 
+impl SseEncode for crate::api::MediaDownloadOutcome {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Option<Vec<u8>>>::sse_encode(self.bytes, serializer);
+        <Option<crate::api::MediaFetchErrorKind>>::sse_encode(self.error, serializer);
+    }
+}
+
+impl SseEncode for crate::api::MediaFetchErrorKind {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::MediaFetchErrorKind::NotFound => 0,
+                crate::api::MediaFetchErrorKind::Network => 1,
+                crate::api::MediaFetchErrorKind::Auth => 2,
+                crate::api::MediaFetchErrorKind::Timeout => 3,
+                crate::api::MediaFetchErrorKind::Server => 4,
+                crate::api::MediaFetchErrorKind::Decrypt => 5,
+                crate::api::MediaFetchErrorKind::Other => 6,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
 impl SseEncode for crate::api::MediaUploadOutcome {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -5524,6 +5641,16 @@ impl SseEncode for Option<bool> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <bool>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<crate::api::MediaFetchErrorKind> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::MediaFetchErrorKind>::sse_encode(value, serializer);
         }
     }
 }
@@ -5631,13 +5758,6 @@ impl SseEncode for usize {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         serializer.cursor.write_u64::<NativeEndian>(self as _).unwrap();
-    }
-}
-
-impl SseEncode for i32 {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        serializer.cursor.write_i32::<NativeEndian>(self).unwrap();
     }
 }
 

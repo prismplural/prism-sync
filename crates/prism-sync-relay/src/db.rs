@@ -2749,6 +2749,36 @@ pub fn get_group_media_usage(conn: &Connection, sync_id: &str) -> Result<i64, ru
     get_group_media_usage_at(conn, sync_id, now_secs(), i64::MAX)
 }
 
+/// Live bytes of the group's *ephemeral* (TTL-bearing) media — the re-supply /
+/// heal lane (media-resupply C4). Identical accounting to
+/// [`get_group_media_usage_at`] but restricted to rows with a finite
+/// `expires_at`, i.e. blobs uploaded with an `X-Media-TTL`. A fresh send
+/// (default retention) stores `expires_at IS NULL` and is excluded; a blob later
+/// re-sent fresh has its TTL cleared (see `combine_ttl`) and correctly drops out
+/// of this subset. The route uses this to enforce
+/// `media_resupply_byte_ceiling_bytes` so demand-driven heal can't fill the
+/// group quota faster than the short TTL sheds it.
+pub fn get_group_resupply_usage_at(
+    conn: &Connection,
+    sync_id: &str,
+    now: i64,
+    pending_grace_secs: i64,
+) -> Result<i64, rusqlite::Error> {
+    let stale_pending_cutoff = now.saturating_sub(pending_grace_secs);
+    conn.query_row(
+        "SELECT COALESCE(SUM(size_bytes), 0) FROM media_metadata
+         WHERE sync_id = ?1
+           AND deleted_at IS NULL
+           AND expires_at IS NOT NULL
+           AND (
+                 (committed_at IS NOT NULL AND expires_at > ?2)
+              OR (committed_at IS NULL AND reserved_at >= ?3)
+           )",
+        params![sync_id, now, stale_pending_cutoff],
+        |row| row.get(0),
+    )
+}
+
 /// The decision produced by [`reserve_media_upload`] inside the reserve txn.
 /// The route maps it to the on-disk action and the HTTP outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
