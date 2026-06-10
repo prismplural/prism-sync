@@ -168,21 +168,23 @@ pub struct Config {
     /// the quota preflight. Bounds per-upload work; the cleanup loop is the
     /// catch-all backstop.
     pub media_expired_sweep_cap: u32,
-    /// (Scaffolding for C4/C5 — inert in C1.) Per-group ceiling, in bytes, on
-    /// live re-supply/heal media so demand-driven heal can't fill the quota
-    /// faster than the TTL sheds it.
+    /// Per-group ceiling, in bytes, on live EPHEMERAL (TTL-bearing) media —
+    /// both re-supply/heal (C4) and pairing-push (C5) — so demand-driven heal
+    /// and pairing bursts can't fill the quota faster than the short TTL sheds
+    /// it. Enforced as a preflight soft cap in the media upload route.
     pub media_resupply_byte_ceiling_bytes: u64,
-    /// (Scaffolding.) Re-supply/heal uploads allowed per group within
+    /// Re-supply/heal uploads allowed per group within
     /// `media_resupply_rate_window_secs` — a separate lane from fresh-send so
     /// heal can't starve normal sends.
     pub media_resupply_rate_limit: u32,
-    /// (Scaffolding.) Sliding window in seconds for the re-supply rate limiter.
+    /// Sliding window in seconds for the re-supply rate limiter.
     pub media_resupply_rate_window_secs: u64,
-    /// (Scaffolding.) Pairing-push uploads allowed per pairing-event/device
-    /// within `media_pairing_push_rate_window_secs` — a separate bucket so a
-    /// joiner's burst can't consume the group's fresh-send budget.
+    /// Pairing-push uploads (C5) allowed per group within
+    /// `media_pairing_push_rate_window_secs` — a separate, more generous bucket
+    /// (vs re-supply) so a joiner-bootstrap burst can't consume the group's
+    /// fresh-send budget and heal/pairing don't contend.
     pub media_pairing_push_rate_limit: u32,
-    /// (Scaffolding.) Sliding window in seconds for the pairing-push limiter.
+    /// Sliding window in seconds for the pairing-push limiter.
     pub media_pairing_push_rate_window_secs: u64,
     /// Ephemeral signal lane / device-message mailbox (C3): TTL in seconds for a
     /// stored mailbox message (default 7 days). Short, so the mailbox sheds fast.

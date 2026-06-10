@@ -357,6 +357,11 @@ Future<void> onResume({required PrismSyncHandle handle}) =>
 /// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
 /// push); the relay clamps it and an old relay ignores it (default retention).
 ///
+/// `pairing_push` tags the upload as a pairing-bootstrap push (media re-supply
+/// C5) so the relay meters it on the dedicated pairing-push rate lane rather
+/// than the re-supply lane. Only meaningful with a `ttl_secs`; a fresh send
+/// passes `false`.
+///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 Future<MediaUploadOutcome> uploadMedia({
   required PrismSyncHandle handle,
@@ -364,12 +369,14 @@ Future<MediaUploadOutcome> uploadMedia({
   required String contentHash,
   required List<int> data,
   BigInt? ttlSecs,
+  required bool pairingPush,
 }) => RustLib.instance.api.crateApiUploadMedia(
   handle: handle,
   mediaId: mediaId,
   contentHash: contentHash,
   data: data,
   ttlSecs: ttlSecs,
+  pairingPush: pairingPush,
 );
 
 /// Download an encrypted media blob from the relay.

@@ -2508,6 +2508,11 @@ fn map_media_fetch_error_kind(
 /// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
 /// push); the relay clamps it and an old relay ignores it (default retention).
 ///
+/// `pairing_push` tags the upload as a pairing-bootstrap push (media re-supply
+/// C5) so the relay meters it on the dedicated pairing-push rate lane rather
+/// than the re-supply lane. Only meaningful with a `ttl_secs`; a fresh send
+/// passes `false`.
+///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 pub async fn upload_media(
     handle: &PrismSyncHandle,
@@ -2515,6 +2520,7 @@ pub async fn upload_media(
     content_hash: String,
     data: Vec<u8>,
     ttl_secs: Option<u64>,
+    pairing_push: bool,
 ) -> Result<MediaUploadOutcome, String> {
     let relay = handle
         .relay
@@ -2523,7 +2529,10 @@ pub async fn upload_media(
         .and_then(|guard| guard.clone())
         .ok_or_else(|| "Relay not configured".to_string())?;
 
-    match relay.upload_media(&media_id, &content_hash, data, ttl_secs).await {
+    match relay
+        .upload_media_classified(&media_id, &content_hash, data, ttl_secs, pairing_push)
+        .await
+    {
         Ok(outcome) => Ok(MediaUploadOutcome {
             committed: outcome.committed,
             in_progress: outcome.in_progress,

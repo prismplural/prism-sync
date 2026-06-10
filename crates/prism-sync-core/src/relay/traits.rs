@@ -667,6 +667,33 @@ pub trait MediaRelay: Send + Sync {
         ttl_secs: Option<u64>,
     ) -> std::result::Result<MediaUploadOutcome, RelayError>;
 
+    /// Upload an encrypted media blob, optionally tagged as a **pairing push**
+    /// (media re-supply C5) so the relay meters it on the dedicated pairing-push
+    /// rate lane (a joiner-bootstrap burst) instead of the re-supply lane.
+    ///
+    /// `pairing_push` only has meaning alongside a `ttl_secs` (an ephemeral
+    /// upload); a fresh send ignores it. The default impl ignores the tag and
+    /// delegates to [`upload_media`], so mocks and alternate relays need no
+    /// change — only the real server relay sets the classifying header.
+    ///
+    /// CONTRACT: an impl overrides exactly ONE of these two methods with the
+    /// real upload. The real server relay overrides `upload_media_classified`
+    /// (and points `upload_media` at it); everything else implements only
+    /// `upload_media`. If you override `upload_media` to delegate *here*, you
+    /// MUST also override this method — otherwise this default delegates back to
+    /// `upload_media`, an infinite recursion.
+    async fn upload_media_classified(
+        &self,
+        media_id: &str,
+        content_hash: &str,
+        data: Vec<u8>,
+        ttl_secs: Option<u64>,
+        pairing_push: bool,
+    ) -> std::result::Result<MediaUploadOutcome, RelayError> {
+        let _ = pairing_push;
+        self.upload_media(media_id, content_hash, data, ttl_secs).await
+    }
+
     /// Download an encrypted media blob from the relay.
     async fn download_media(&self, media_id: &str) -> std::result::Result<Vec<u8>, RelayError>;
 

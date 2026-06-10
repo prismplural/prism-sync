@@ -446,6 +446,7 @@ abstract class RustLibApi extends BaseApi {
     required String contentHash,
     required List<int> data,
     BigInt? ttlSecs,
+    required bool pairingPush,
   });
 
   Future<void> crateApiUploadPairingSnapshot({
@@ -3515,6 +3516,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required String contentHash,
     required List<int> data,
     BigInt? ttlSecs,
+    required bool pairingPush,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -3528,6 +3530,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(contentHash, serializer);
           sse_encode_list_prim_u_8_loose(data, serializer);
           sse_encode_opt_box_autoadd_u_64(ttlSecs, serializer);
+          sse_encode_bool(pairingPush, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -3540,7 +3543,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiUploadMediaConstMeta,
-        argValues: [handle, mediaId, contentHash, data, ttlSecs],
+        argValues: [handle, mediaId, contentHash, data, ttlSecs, pairingPush],
         apiImpl: this,
       ),
     );
@@ -3548,7 +3551,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiUploadMediaConstMeta => const TaskConstMeta(
     debugName: "upload_media",
-    argNames: ["handle", "mediaId", "contentHash", "data", "ttlSecs"],
+    argNames: [
+      "handle",
+      "mediaId",
+      "contentHash",
+      "data",
+      "ttlSecs",
+      "pairingPush",
+    ],
   );
 
   @override

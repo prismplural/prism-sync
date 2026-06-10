@@ -756,6 +756,38 @@ async fn upload_media_with_ttl(
         .unwrap()
 }
 
+/// Upload helper for a C5 pairing push: TTL-bearing AND tagged
+/// `X-Media-Upload-Class: pairing`, so the relay meters it on the pairing-push
+/// lane. Like the TTL header, the class header is unsigned.
+#[allow(clippy::too_many_arguments)]
+async fn upload_media_pairing_push(
+    client: &Client,
+    url: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    sync_id: &str,
+    device_id: &str,
+    media_id: &str,
+    data: &[u8],
+    ttl_secs: u64,
+) -> reqwest::Response {
+    let hash = sha256_hex(data);
+    let path = format!("/v1/sync/{sync_id}/media");
+    let builder = client
+        .post(format!("{url}{path}"))
+        .bearer_auth(token)
+        .header("X-Media-Id", media_id)
+        .header("X-Content-Hash", &hash)
+        .header("X-Media-TTL", ttl_secs.to_string())
+        .header("X-Media-Upload-Class", "pairing")
+        .body(data.to_vec());
+
+    apply_signed_headers(builder, keys, "POST", &path, sync_id, device_id, data)
+        .send()
+        .await
+        .unwrap()
+}
+
 fn config_with_storage(path: &str) -> Config {
     let mut c = base_test_config();
     c.media_storage_path = path.to_string();
@@ -981,6 +1013,134 @@ async fn idempotent_resupply_reupload_is_exempt_from_ceiling() {
         upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "ix-a", &data, 7200)
             .await;
     assert_eq!(r.status(), 200, "idempotent re-upload at the cap is ceiling-exempt");
+}
+
+// ───────────────────── C5: pairing-push rate lane ─────────────────────────────
+
+/// A pairing push (`X-Media-Upload-Class: pairing` + TTL) rides a THIRD,
+/// independent rate bucket — distinct from both fresh-send and re-supply — so a
+/// joiner-bootstrap burst can't starve heal traffic and vice-versa. Exhausting
+/// any one lane leaves the other two free.
+#[tokio::test]
+async fn pairing_push_uploads_ride_a_separate_rate_lane() {
+    let mut config = base_test_config();
+    config.media_upload_rate_limit = 1;
+    config.media_upload_rate_window_secs = 60;
+    config.media_resupply_rate_limit = 1;
+    config.media_resupply_rate_window_secs = 60;
+    config.media_pairing_push_rate_limit = 1;
+    config.media_pairing_push_rate_window_secs = 60;
+
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![5u8; 64];
+
+    // Fresh lane: first ok, second exhausts it.
+    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "p-fresh-1", &data).await;
+    assert_eq!(r.status(), 200);
+    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "p-fresh-2", &data).await;
+    assert_eq!(r.status(), 429, "fresh lane exhausted");
+
+    // Re-supply lane (TTL, no class): untouched by the full fresh lane.
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "p-resup-1", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "re-supply lane independent of fresh");
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "p-resup-2", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 429, "re-supply lane exhausted");
+
+    // Pairing-push lane (TTL + class=pairing): independent of BOTH the others.
+    let r = upload_media_pairing_push(
+        &client, &url, &token, &keys, &sync_id, &device_id, "p-pair-1", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "pairing lane independent of fresh + re-supply");
+    let r = upload_media_pairing_push(
+        &client, &url, &token, &keys, &sync_id, &device_id, "p-pair-2", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 429, "pairing lane has its own independent limit");
+}
+
+/// Pairing-push blobs are TTL-bearing, so they count against the shared
+/// ephemeral byte ceiling alongside re-supply blobs.
+#[tokio::test]
+async fn pairing_push_counts_against_the_ephemeral_ceiling() {
+    let mut config = base_test_config();
+    config.media_resupply_byte_ceiling_bytes = 128; // two 64-byte blobs
+
+    let (url, _h, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    let data = vec![6u8; 64];
+
+    // One re-supply blob + one pairing-push blob fill the shared ceiling…
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "ec-resup", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = upload_media_pairing_push(
+        &client, &url, &token, &keys, &sync_id, &device_id, "ec-pair", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "pairing blob lands at the ceiling");
+
+    // …so a further pairing push is rejected — the ceiling spans both classes.
+    let r = upload_media_pairing_push(
+        &client, &url, &token, &keys, &sync_id, &device_id, "ec-pair-2", &data, 7200,
+    )
+    .await;
+    assert_eq!(r.status(), 507, "ephemeral ceiling spans re-supply + pairing");
+}
+
+/// A pairing class header WITHOUT a TTL is NOT ephemeral: `is_pairing_push`
+/// requires `is_ephemeral`, so the upload falls through to a plain fresh send
+/// (default retention, fresh lane). Guards the `is_ephemeral &&` precondition.
+#[tokio::test]
+async fn pairing_class_without_ttl_is_a_fresh_send() {
+    let (url, _h, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    setup_group(&db, &sync_id).await;
+    let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
+
+    // `X-Media-Upload-Class: pairing` but NO `X-Media-TTL`.
+    let data = vec![4u8; 64];
+    let hash = sha256_hex(&data);
+    let path = format!("/v1/sync/{sync_id}/media");
+    let builder = client
+        .post(format!("{url}{path}"))
+        .bearer_auth(&token)
+        .header("X-Media-Id", "fc-nottl")
+        .header("X-Content-Hash", &hash)
+        .header("X-Media-Upload-Class", "pairing")
+        .body(data.to_vec());
+    let resp = apply_signed_headers(builder, &keys, "POST", &path, &sync_id, &device_id, &data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let row = db.with_conn(|c| db::get_media_metadata(c, "fc-nottl")).unwrap().unwrap();
+    assert!(
+        row.expires_at.is_none(),
+        "class header without a TTL ⇒ fresh send (default retention), not ephemeral",
+    );
 }
 
 #[tokio::test]

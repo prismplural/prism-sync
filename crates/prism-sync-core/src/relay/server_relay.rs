@@ -1104,13 +1104,26 @@ impl MediaRelay for ServerRelay {
         data: Vec<u8>,
         ttl_secs: Option<u64>,
     ) -> Result<MediaUploadOutcome, RelayError> {
+        self.upload_media_classified(media_id, content_hash, data, ttl_secs, false)
+            .await
+    }
+
+    async fn upload_media_classified(
+        &self,
+        media_id: &str,
+        content_hash: &str,
+        data: Vec<u8>,
+        ttl_secs: Option<u64>,
+        pairing_push: bool,
+    ) -> Result<MediaUploadOutcome, RelayError> {
         let url = format!("{}/media", self.base_path());
         let path = self.canonical_path("/media");
-        debug!("upload_media media_id={media_id} ttl_secs={ttl_secs:?}");
+        debug!("upload_media media_id={media_id} ttl_secs={ttl_secs:?} pairing_push={pairing_push}");
 
-        // X-Media-TTL is NOT part of the signed request bytes (signing covers
-        // body/path/device/timestamp/nonce), so an old relay simply ignores it
-        // and applies its default retention — back-compat both ways.
+        // X-Media-TTL / X-Media-Upload-Class are NOT part of the signed request
+        // bytes (signing covers body/path/device/timestamp/nonce), so an old
+        // relay simply ignores them and applies its default retention + lane —
+        // back-compat both ways.
         let mut req = self
             .apply_signed_auth(self.client.post(&url), "POST", &path, &data)
             .header("X-Media-Id", media_id)
@@ -1118,6 +1131,11 @@ impl MediaRelay for ServerRelay {
             .header("Content-Type", "application/octet-stream");
         if let Some(ttl) = ttl_secs {
             req = req.header("X-Media-TTL", ttl.to_string());
+        }
+        // Only meaningful on an ephemeral (TTL-bearing) upload; the relay treats
+        // the pairing class as a no-op without a TTL.
+        if pairing_push {
+            req = req.header("X-Media-Upload-Class", "pairing");
         }
 
         let resp = req

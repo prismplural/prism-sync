@@ -4627,6 +4627,7 @@ fn wire__crate__api__upload_media_impl(
             let api_content_hash = <String>::sse_decode(&mut deserializer);
             let api_data = <Vec<u8>>::sse_decode(&mut deserializer);
             let api_ttl_secs = <Option<u64>>::sse_decode(&mut deserializer);
+            let api_pairing_push = <bool>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, String>(
@@ -4656,6 +4657,7 @@ fn wire__crate__api__upload_media_impl(
                             api_content_hash,
                             api_data,
                             api_ttl_secs,
+                            api_pairing_push,
                         )
                         .await?;
                         Ok(output_ok)

@@ -2749,10 +2749,11 @@ pub fn get_group_media_usage(conn: &Connection, sync_id: &str) -> Result<i64, ru
     get_group_media_usage_at(conn, sync_id, now_secs(), i64::MAX)
 }
 
-/// Live bytes of the group's *ephemeral* (TTL-bearing) media — the re-supply /
-/// heal lane (media-resupply C4). Identical accounting to
-/// [`get_group_media_usage_at`] but restricted to rows with a finite
-/// `expires_at`, i.e. blobs uploaded with an `X-Media-TTL`. A fresh send
+/// Live bytes of the group's *ephemeral* (TTL-bearing) media — both the
+/// re-supply / heal lane (C4) and the pairing-push lane (C5), since the byte
+/// ceiling spans both. Identical accounting to [`get_group_media_usage_at`] but
+/// restricted to rows with a finite `expires_at`, i.e. blobs uploaded with an
+/// `X-Media-TTL` (regardless of upload class). A fresh send
 /// (default retention) stores `expires_at IS NULL` and is excluded; a blob later
 /// re-sent fresh has its TTL cleared (see `combine_ttl`) and correctly drops out
 /// of this subset. The route uses this to enforce
