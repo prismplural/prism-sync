@@ -39,6 +39,28 @@ Out of scope:
 - **CRDT soundness** — tombstone resurrection, HLC ordering bugs that enable rollback, merge states the relay can force
 - **Relay server flaws** — authz/quota bypass, cross-tenant data access, SQL injection, protocol confusion
 
+## Known limitations
+
+These are properties we do **not** currently defend against. They are accepted
+tradeoffs, not bugs — reports of them are welcome but won't be treated as
+vulnerabilities unless paired with a break of confidentiality or authenticity.
+
+- **No fork / selective-withholding detection (SUNDR fork-consistency gap).**
+  Batch signatures give authenticity of every batch that *is* delivered, but
+  there is no per-(device, epoch) sequence chain or signed receipt, so they say
+  nothing about *completeness*. An untrusted relay can therefore selectively
+  withhold, reorder, or censor specific signed batches to a target device
+  **undetectably** — e.g. hiding a delete/tombstone, a member update, or a
+  device revocation from one device while still delivering it to others. The
+  result is silent state divergence between devices. Because pruning makes
+  sequence gaps legitimate, a censorship gap is indistinguishable from a prune
+  gap, and no client-side signal is raised. This is a consistency/availability
+  limitation, **not** a confidentiality or authenticity break: the relay can
+  always censor or deny service, and per-batch authenticity and end-to-end
+  confidentiality are unaffected. We do not yet implement fork detection (e.g. a
+  signed per-(device, epoch) sequence or periodic signed high-water statements
+  that peers cross-check).
+
 ## Coordinated disclosure
 
 We'll work with you on a fix and a disclosure timeline. Please give us a

@@ -7,13 +7,19 @@ use subtle::ConstantTimeEq;
 const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 
-/// Constant-time comparison for fixed-length values (SHA-256 hex digests).
+/// Constant-time comparison for **fixed-length** values (e.g. SHA-256 hex
+/// digests).
 ///
 /// Uses `subtle::ConstantTimeEq` for the canonical, miswriting-resistant
 /// implementation. Note that `ConstantTimeEq for [u8]` still short-circuits
-/// on length mismatch (returns `Choice(0)` immediately for unequal lengths);
-/// in practice both inputs are 64-char hex-encoded SHA-256 hashes, so the
-/// length check does not leak meaningful information.
+/// on length mismatch (returns `Choice(0)` immediately for unequal lengths),
+/// so this leaks the length of one operand via timing when the inputs may
+/// differ in length. Only use it on values that are already a fixed,
+/// non-secret length (e.g. two hex-encoded SHA-256 hashes). For secrets whose
+/// length is itself sensitive (bearer/registration tokens), hash both sides to
+/// a fixed digest first and compare those — see `routes::register` and
+/// `routes::metrics`.
+#[allow(dead_code)] // retained as a fixed-length compare utility; token paths hash first
 pub(crate) fn timing_safe_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }

@@ -5,10 +5,12 @@ use axum::{
     routing::get,
     Router,
 };
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+use subtle::ConstantTimeEq;
 
-use crate::{auth, errors::AppError, state::AppState};
+use crate::{errors::AppError, state::AppState};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -19,7 +21,7 @@ pub fn routes() -> Router<AppState> {
 /// Authorize a metrics request, failing closed when no token is configured.
 ///
 /// * If `METRICS_TOKEN` is set, require a matching `Authorization: Bearer
-///   <token>` header (timing-safe compare).
+///   <token>` header (constant-time compare).
 /// * If no token is configured, the endpoint is **not** world-readable: it is
 ///   served only to loopback peers (localhost / same host, e.g. a sidecar
 ///   Prometheus or `docker exec`). Any non-loopback peer gets 401. This keeps
@@ -33,7 +35,15 @@ fn authorize_metrics(state: &AppState, headers: &HeaderMap, peer_addr: SocketAdd
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .unwrap_or("");
-            if !auth::timing_safe_eq(provided, expected_token) {
+            // Hash both sides to fixed 32-byte SHA-256 digests before the
+            // constant-time compare, so the token LENGTH is never compared
+            // variably. `subtle`'s slice `ct_eq` short-circuits on length
+            // mismatch, which would otherwise leak the configured token's
+            // length via timing — this mirrors the registration-token path
+            // in `routes/register.rs::check_registration_access`.
+            let provided_hash = Sha256::digest(provided.as_bytes());
+            let expected_hash = Sha256::digest(expected_token.as_bytes());
+            if !bool::from(provided_hash.ct_eq(&expected_hash)) {
                 return Err(AppError::Unauthorized);
             }
             Ok(())
@@ -187,5 +197,30 @@ mod tests {
             authorize_metrics(&state, &HeaderMap::new(), loopback()),
             Err(AppError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn token_compare_handles_length_mismatch_without_leaking() {
+        // The compare hashes both sides to fixed 32-byte SHA-256 digests before
+        // the constant-time check, so a token of the WRONG LENGTH is rejected
+        // just like any other mismatch — the configured token's length is never
+        // compared variably. (Behavioural assertion; the constant-time property
+        // lives in the digest-then-`ct_eq` construction.)
+        let state = state_with_token(Some("s3cr3t"));
+        // Shorter, longer, and empty provided tokens are all rejected.
+        assert!(matches!(
+            authorize_metrics(&state, &bearer("s3"), external()),
+            Err(AppError::Unauthorized)
+        ));
+        assert!(matches!(
+            authorize_metrics(&state, &bearer("s3cr3t-and-then-some-more"), external()),
+            Err(AppError::Unauthorized)
+        ));
+        assert!(matches!(
+            authorize_metrics(&state, &bearer(""), external()),
+            Err(AppError::Unauthorized)
+        ));
+        // The exact-length, correct token still passes.
+        assert!(authorize_metrics(&state, &bearer("s3cr3t"), external()).is_ok());
     }
 }

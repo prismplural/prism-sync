@@ -144,16 +144,63 @@ pub fn take_last_panic() -> Option<String> {
         .map(|payload| redact_sensitive_message(&payload))
 }
 
+/// Extract the lowercased host component of an `http(s)`/`ws(s)` URL.
+///
+/// Returns `None` when the scheme is not one of those four or the URL has no
+/// authority. Handles optional `userinfo@`, an explicit `:port`, bracketed
+/// IPv6 literals (`[::1]`), and path/query/fragment terminators — so the host
+/// is the EXACT authority host, never a prefix of the rest of the URL.
+fn url_host(url: &str) -> Option<String> {
+    // Strip the scheme; only loopback-eligible transports are considered.
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("ws://"))
+        .or_else(|| url.strip_prefix("wss://"))?;
+
+    // The authority ends at the first '/', '?', or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+
+    // Drop any `userinfo@` prefix (everything up to the LAST '@' in authority).
+    let host_port = match authority.rsplit_once('@') {
+        Some((_userinfo, host_port)) => host_port,
+        None => authority,
+    };
+
+    // Bracketed IPv6 literal: host is the contents of `[...]`, port (if any)
+    // follows the closing bracket.
+    let host = if let Some(after_open) = host_port.strip_prefix('[') {
+        let close = after_open.find(']')?;
+        &after_open[..close]
+    } else {
+        // Plain host:port — host is everything before the first ':'.
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
 /// True when `url` points at a loopback host that is always safe to reach over
-/// cleartext (local development + the FFI test harness). Mirrors the
-/// `http://localhost` exception the FFI URL guards already used.
+/// cleartext (local development + the FFI test harness).
+///
+/// SECURITY: the host component is parsed out and compared **exactly** against
+/// the loopback names — `localhost`, `127.0.0.1`, and the IPv6 loopback `::1`
+/// (which appears as `[::1]` in a URL authority). A prefix match (the previous
+/// behaviour) would wrongly treat `http://localhost.evil.com` or
+/// `http://127.0.0.1.evil.com` as loopback and let cleartext reach a non-local
+/// host.
 fn is_localhost_url(url: &str) -> bool {
-    url.starts_with("http://localhost")
-        || url.starts_with("ws://localhost")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("ws://127.0.0.1")
-        || url.starts_with("http://[::1]")
-        || url.starts_with("ws://[::1]")
+    match url_host(url) {
+        Some(host) => host == "localhost" || host == "127.0.0.1" || host == "::1",
+        None => false,
+    }
 }
 
 /// Resolve the *effective* insecure-transport flag for a given relay URL.
@@ -2696,7 +2743,7 @@ fn build_relay(
     // handle's `create_prism_sync` gate (compile-time `insecure-transport-dev`).
     let url = relay_url.to_string();
     let allow_insecure = effective_allow_insecure(allow_insecure, &url);
-    if !allow_insecure && !url.starts_with("https://") && !url.starts_with("http://localhost") {
+    if !allow_insecure && !url.starts_with("https://") && !is_localhost_url(&url) {
         return Err(
             "Relay URL must use https://. Set allow_insecure=true for development.".to_string()
         );
@@ -4358,7 +4405,7 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
     let allow_insecure = effective_allow_insecure(handle.allow_insecure, relay_url);
     if !allow_insecure
         && !relay_url.starts_with("https://")
-        && !relay_url.starts_with("http://localhost")
+        && !is_localhost_url(relay_url)
     {
         return Err(format!(
             "PairingRelay requires HTTPS (got {relay_url:?}). \
@@ -5688,6 +5735,53 @@ mod tests {
         assert_eq!(permitted, cfg!(feature = "insecure-transport-dev"));
         // https is unaffected (the flag is moot for already-secure transport).
         assert!(!effective_allow_insecure(false, "https://relay.example.com"));
+    }
+
+    #[test]
+    fn is_localhost_url_matches_real_loopback() {
+        // Real loopback authorities, with and without ports / paths.
+        assert!(is_localhost_url("http://localhost"));
+        assert!(is_localhost_url("http://localhost:8080"));
+        assert!(is_localhost_url("ws://localhost:8080/sync"));
+        assert!(is_localhost_url("http://LOCALHOST:8080")); // case-insensitive host
+        assert!(is_localhost_url("http://127.0.0.1"));
+        assert!(is_localhost_url("http://127.0.0.1:9/path?x=1"));
+        assert!(is_localhost_url("ws://127.0.0.1:8080"));
+        assert!(is_localhost_url("http://[::1]"));
+        assert!(is_localhost_url("http://[::1]:8080/sync"));
+        assert!(is_localhost_url("ws://[::1]:8080"));
+    }
+
+    #[test]
+    fn is_localhost_url_rejects_prefix_spoofs() {
+        // SECURITY: a host that merely *starts with* a loopback name must NOT
+        // be treated as loopback — otherwise cleartext would reach a non-local
+        // attacker-controlled host. These are the exact spoofs from the review.
+        assert!(!is_localhost_url("http://localhost.evil.com"));
+        assert!(!is_localhost_url("http://localhost.evil.com:8080/sync"));
+        assert!(!is_localhost_url("ws://localhost.evil.com"));
+        assert!(!is_localhost_url("http://127.0.0.1.evil.com"));
+        assert!(!is_localhost_url("http://127.0.0.1.evil.com:8080"));
+        // userinfo trick: the *host* is evil.com, not localhost.
+        assert!(!is_localhost_url("http://localhost@evil.com"));
+        assert!(!is_localhost_url("http://127.0.0.1@evil.com"));
+        // Unrelated hosts.
+        assert!(!is_localhost_url("https://relay.example.com"));
+        assert!(!is_localhost_url("http://notlocalhost"));
+    }
+
+    #[test]
+    fn effective_allow_insecure_refuses_loopback_prefix_spoofs() {
+        // The spoofed hosts must be gated exactly like any other non-localhost
+        // host: cleartext is refused unless the dev feature is compiled in. In a
+        // default/release build (feature off) these resolve to `false`.
+        let spoof_localhost = effective_allow_insecure(true, "http://localhost.evil.com");
+        let spoof_ip = effective_allow_insecure(true, "http://127.0.0.1.evil.com");
+        assert_eq!(spoof_localhost, cfg!(feature = "insecure-transport-dev"));
+        assert_eq!(spoof_ip, cfg!(feature = "insecure-transport-dev"));
+        // Real loopback stays permitted when requested.
+        assert!(effective_allow_insecure(true, "http://localhost:8080"));
+        assert!(effective_allow_insecure(true, "http://127.0.0.1:8080"));
     }
 
     #[test]
