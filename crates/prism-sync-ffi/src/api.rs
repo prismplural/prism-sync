@@ -3014,6 +3014,34 @@ pub async fn list_devices(
     serde_json::to_string(&json).map_err(|e| format!("JSON serialization failed: {e}"))
 }
 
+/// Determine whether THIS device has been revoked, using a
+/// **signature-verified** signed registry.
+///
+/// # Security (H3)
+///
+/// This is the single authenticated answer to "has this device been revoked?".
+/// Unlike [`list_devices`], it does NOT trust the relay's plaintext device list:
+/// it fetches the signed registry artifact, verifies its hybrid signature
+/// against the device's pinned/SAS-anchored registry, and only then reads this
+/// device's entry. A relay `device_revoked` WebSocket frame or error string is
+/// an untrusted HINT — callers must gate any destructive action (local wipe or
+/// credential clear) on this verified result, never on the hint alone.
+///
+/// Uses the engine relay configured by [`configure_engine`] (so a valid session
+/// token is in scope). Returns a stable lowercase string:
+/// - `"revoked"`  — verified signed registry marks this device `revoked`.
+/// - `"active"`   — verified signed registry lists this device non-revoked.
+/// - `"unknown"`  — inconclusive (no registry, verification failed, relay error,
+///   self absent). Fail-safe: callers must NOT wipe or clear credentials.
+///
+/// Never returns `Err`: every failure mode collapses to `"unknown"` so a relay
+/// cannot weaponize an error into a destructive outcome.
+pub async fn confirm_self_revocation(handle: &PrismSyncHandle) -> Result<String, String> {
+    let inner = handle.inner.lock().await;
+    let status = inner.confirm_self_revocation().await;
+    Ok(status.as_str().to_string())
+}
+
 /// Fetch the relay-advertised GIF service configuration for the current sync
 /// server. Returns JSON: `{"enabled": bool, "api_base_url": "...", "media_proxy_enabled": bool}`.
 pub async fn fetch_gif_service_config(handle: &PrismSyncHandle) -> Result<String, String> {

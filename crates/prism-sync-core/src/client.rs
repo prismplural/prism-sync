@@ -72,6 +72,38 @@ pub enum KeyMode {
     },
 }
 
+/// Result of a **signature-verified** self-revocation check.
+///
+/// Produced by [`PrismSync::confirm_self_revocation`]. This is the single
+/// authenticated answer to "has THIS device been revoked?" — derived only from
+/// a verified signed registry, never from a relay WebSocket frame or error
+/// string (those are untrusted hints; see H3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfRevocationStatus {
+    /// The verified signed registry contains an explicit entry for this device
+    /// with `status == "revoked"`. The only state in which a caller may take a
+    /// destructive action.
+    ConfirmedRevoked,
+    /// The verified signed registry lists this device with a non-revoked
+    /// status. Definitely NOT revoked — a false-revoke hint should be ignored.
+    Active,
+    /// Inconclusive: no signed registry could be fetched or verified, the relay
+    /// errored, or this device was absent from the verified snapshot. Fail-safe
+    /// — callers must NOT wipe or clear credentials.
+    Unknown,
+}
+
+impl SelfRevocationStatus {
+    /// Stable string form crossing the FFI boundary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SelfRevocationStatus::ConfirmedRevoked => "revoked",
+            SelfRevocationStatus::Active => "active",
+            SelfRevocationStatus::Unknown => "unknown",
+        }
+    }
+}
+
 /// Snapshot of the current sync status.
 pub struct SyncStatus {
     /// Whether a sync engine is configured and ready.
@@ -778,6 +810,181 @@ impl PrismSync {
         }
 
         Ok(())
+    }
+
+    /// Determine whether THIS device has been revoked, according to a
+    /// **signature-verified** signed registry snapshot.
+    ///
+    /// # Security (H3)
+    ///
+    /// The relay's `device_revoked` WebSocket frame and any relay error string
+    /// are UNTRUSTED HINTS. They must never, on their own, drive a destructive
+    /// action (local-data wipe or credential clear). This method is the single
+    /// authenticated source of truth for self-revocation: it fetches the signed
+    /// registry, verifies its hybrid signature against the device's
+    /// pinned/SAS-anchored registry (the same machinery the epoch catch-up
+    /// uses), and only then inspects this device's entry.
+    ///
+    /// ## Freshness gate (replay defense)
+    ///
+    /// Signature verification alone does not prove a snapshot is *current* — a
+    /// malicious relay can replay an OLD, validly-signed snapshot in which this
+    /// device was marked `revoked` (relevant after a revoke → re-pair under the
+    /// same `device_id`). Before returning `ConfirmedRevoked` we therefore
+    /// compare the verified snapshot's `registry_version` against this device's
+    /// locally-recorded last-imported version
+    /// (`SyncMetadata::last_imported_registry_version`, the SAME baseline
+    /// `verify_and_import_signed_registry` checks). A snapshot strictly older
+    /// than that baseline is treated as stale/replayed → `Unknown`
+    /// (non-destructive). When no baseline is recorded (the device never
+    /// imported a registry) staleness cannot be proven, so we proceed — the
+    /// signature + explicit-`revoked`-entry gate still applies. This is a
+    /// read-only check: it never imports.
+    ///
+    /// Returns:
+    /// - [`SelfRevocationStatus::ConfirmedRevoked`] only when the verified,
+    ///   non-stale snapshot contains an explicit entry for this device with
+    ///   `status == "revoked"`. We deliberately require an explicit revoked
+    ///   entry rather than treating absence as removal: a relay that omits our
+    ///   entry, or serves a stale snapshot from before we joined, must not be
+    ///   able to fabricate a revocation.
+    /// - [`SelfRevocationStatus::Active`] when the verified snapshot lists this
+    ///   device with a non-revoked status.
+    /// - [`SelfRevocationStatus::Unknown`] in every fail-safe case: no relay
+    ///   configured, no device_id/sync_id, no signed registry available,
+    ///   signature verification failed, a relay error, a stale/replayed
+    ///   snapshot, or our entry is simply absent. `Unknown` is non-destructive
+    ///   — callers preserve credentials and relay config so the engine can
+    ///   self-heal from transient blips.
+    pub async fn confirm_self_revocation(&self) -> SelfRevocationStatus {
+        let relay = match self.sync_service.relay() {
+            Some(r) => r.clone(),
+            None => {
+                tracing::debug!("confirm_self_revocation: unknown (no relay configured)");
+                return SelfRevocationStatus::Unknown;
+            }
+        };
+        let device_id = match self.device_id.as_deref() {
+            Some(d) => d.to_string(),
+            None => {
+                tracing::debug!("confirm_self_revocation: unknown (no device_id)");
+                return SelfRevocationStatus::Unknown;
+            }
+        };
+        let sync_id = match self.sync_service.sync_id() {
+            Some(s) => s.to_string(),
+            None => {
+                tracing::debug!("confirm_self_revocation: unknown (no sync_id)");
+                return SelfRevocationStatus::Unknown;
+            }
+        };
+
+        // A revoked device can still query the relay (it already serves the
+        // device list post-revocation), so this fetch is expected to succeed.
+        let registry_response = match relay.get_signed_registry().await {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                tracing::warn!(
+                    "confirm_self_revocation: unknown (no signed registry available)"
+                );
+                return SelfRevocationStatus::Unknown;
+            }
+            Err(e) => {
+                // A relay error is inconclusive, never positive confirmation.
+                tracing::warn!(
+                    error = %e,
+                    "confirm_self_revocation: unknown (failed to fetch signed registry)"
+                );
+                return SelfRevocationStatus::Unknown;
+            }
+        };
+
+        let storage = self.storage.clone();
+        let sid = sync_id.clone();
+        let blob = registry_response.artifact_blob.clone();
+        let snapshot = match tokio::task::spawn_blocking(move || {
+            DeviceRegistryManager::verify_signed_registry_snapshot(&*storage, &sid, &blob)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "confirm_self_revocation: unknown (signed registry verification failed)"
+                );
+                return SelfRevocationStatus::Unknown;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "confirm_self_revocation: unknown (verification task failed)"
+                );
+                return SelfRevocationStatus::Unknown;
+            }
+        };
+
+        match snapshot.entries.iter().find(|entry| entry.device_id == device_id) {
+            Some(entry) if entry.status == "revoked" => {
+                // Freshness gate (replay defense): a signature-valid but stale
+                // snapshot must not drive a wipe. Reject versions older than our
+                // last-imported baseline; no baseline → proceed (the signature +
+                // revoked-entry gate still stands).
+                let storage = self.storage.clone();
+                let sid = sync_id.clone();
+                let last_imported = tokio::task::spawn_blocking(move || {
+                    storage.get_sync_metadata(&sid)
+                })
+                .await
+                .ok()
+                .and_then(|res| res.ok())
+                .flatten()
+                .and_then(|meta| meta.last_imported_registry_version);
+
+                if let Some(baseline) = last_imported {
+                    if snapshot.registry_version < baseline {
+                        tracing::warn!(
+                            device_id = %device_id,
+                            snapshot_version = snapshot.registry_version,
+                            last_imported = baseline,
+                            "confirm_self_revocation: unknown (stale/replayed signed registry marks self revoked)"
+                        );
+                        return SelfRevocationStatus::Unknown;
+                    }
+                }
+
+                tracing::info!(
+                    device_id = %device_id,
+                    snapshot_version = snapshot.registry_version,
+                    last_imported = ?last_imported,
+                    "confirm_self_revocation: confirmed revoked (verified, non-stale signed registry)"
+                );
+                // TODO(security): bind remote_wipe intent into the signed
+                // revocation artifact (Layer B). Today a verified-revoked device
+                // still relies on a relay-controlled `remote_wipe` bit to decide
+                // whether to also wipe orphaned local data. Binding the wipe
+                // intent into this signed snapshot would close the residual.
+                SelfRevocationStatus::ConfirmedRevoked
+            }
+            Some(entry) => {
+                tracing::debug!(
+                    device_id = %device_id,
+                    status = %entry.status,
+                    "confirm_self_revocation: active (verified signed registry lists us non-revoked)"
+                );
+                SelfRevocationStatus::Active
+            }
+            None => {
+                // Self absent from the verified snapshot. We do NOT treat this
+                // as confirmation of removal — a stale or partial snapshot
+                // could omit us. Fail safe.
+                tracing::warn!(
+                    device_id = %device_id,
+                    "confirm_self_revocation: unknown (self absent from verified snapshot)"
+                );
+                SelfRevocationStatus::Unknown
+            }
+        }
     }
 
     async fn repair_signed_registry_epoch_if_needed(
@@ -2260,6 +2467,9 @@ mod tests {
         devices: Vec<DeviceInfo>,
         artifacts: HashMap<(i32, String), Vec<u8>>,
         signed_registry: Option<SignedRegistryResponse>,
+        /// When set, `get_signed_registry` returns a relay error instead of the
+        /// stored snapshot. Used to exercise the H3 `Unknown` fail-safe.
+        signed_registry_error: bool,
         behavior: RevokeBehavior,
         revoke_calls: u32,
     }
@@ -2275,6 +2485,7 @@ mod tests {
                     devices,
                     artifacts: HashMap::new(),
                     signed_registry: None,
+                    signed_registry_error: false,
                     behavior,
                     revoke_calls: 0,
                 }),
@@ -2295,6 +2506,10 @@ mod tests {
 
         fn set_signed_registry(&self, signed_registry: SignedRegistryResponse) {
             self.state.lock().unwrap().signed_registry = Some(signed_registry);
+        }
+
+        fn set_signed_registry_error(&self, errored: bool) {
+            self.state.lock().unwrap().signed_registry_error = errored;
         }
 
         fn commit_revoke(
@@ -2428,7 +2643,13 @@ mod tests {
         async fn get_signed_registry(
             &self,
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
-            Ok(self.state.lock().unwrap().signed_registry.clone())
+            let state = self.state.lock().unwrap();
+            if state.signed_registry_error {
+                return Err(RelayError::Protocol {
+                    message: "device_revoked".to_string(),
+                });
+            }
+            Ok(state.signed_registry.clone())
         }
         async fn put_signed_registry(
             &self,
@@ -2809,6 +3030,201 @@ mod tests {
         assert!(sync.secure_store().get("epoch_key_2").unwrap().is_none());
         assert_eq!(sync.secure_store().get("epoch").unwrap().unwrap().as_slice(), b"1");
         assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 1);
+    }
+
+    // ── H3: signature-verified self-revocation check ──
+
+    /// Sign a registry snapshot over an arbitrary set of entries using an
+    /// ACTIVE signer device. Unlike [`signed_registry_response`] (single
+    /// entry), this lets a test mark THIS device `revoked` in a snapshot signed
+    /// by a *different* active device — the only legitimate way revocation is
+    /// represented (a device cannot sign its own revocation; the verifier
+    /// rejects a self-revoked signer).
+    fn signed_registry_with_entries(
+        sync_id: &str,
+        signer_secret: &DeviceSecret,
+        signer_device_id: &str,
+        entries: &[DeviceInfo],
+        current_epoch: u32,
+        epoch_keys: &[(u32, [u8; 32])],
+    ) -> SignedRegistryResponse {
+        let signing_key = signer_secret.ed25519_keypair(signer_device_id).unwrap();
+        let pq_signing_key = signer_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
+        let epoch_key_hashes =
+            epoch_keys.iter().map(|(epoch, key)| (*epoch, compute_epoch_key_hash(key))).collect();
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries.iter().map(|info| make_registry_entry(sync_id, info)).collect(),
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            current_epoch,
+            epoch_key_hashes,
+        );
+        SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: snapshot.sign_hybrid(&signing_key, &pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        }
+    }
+
+    /// Build a `PrismSync` whose engine relay serves a SIGNED registry listing
+    /// THIS device with `self_status`, signed by an ACTIVE sibling. Mirrors a
+    /// real device that pinned its own (and the sibling's) registry entry and
+    /// configured the engine. The relay is returned so tests can mutate the
+    /// served registry (e.g. swap to a tampered blob or force an error) before
+    /// calling `confirm_self_revocation`.
+    fn prepare_self_revocation_check(
+        self_status: &str,
+    ) -> (PrismSync, Arc<RevokeTestRelay>, String, DeviceSecret, DeviceInfo) {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let sync_id = "sync-1";
+        let self_device_id = "a1b2c3d4e5f6";
+        let signer_device_id = "bbbbbbbbbbbb";
+        let device_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+
+        // Pin self (always active locally — local status is metadata) and the
+        // active sibling that signs the snapshot. The verifier roots trust in
+        // these pinned public keys.
+        let pinned_self = make_device_info(self_device_id, &device_secret, 0, "active");
+        let signer_info = make_device_info(signer_device_id, &device_secret, 0, "active");
+        for info in [&pinned_self, &signer_info] {
+            DeviceRegistryManager::pin_device(
+                sync.storage().as_ref(),
+                sync_id,
+                &make_device_record(sync_id, info),
+            )
+            .unwrap();
+        }
+
+        // The signed-registry entry for self carries the status under test;
+        // the sibling (signer) is active.
+        let snapshot_self = make_device_info(self_device_id, &device_secret, 0, self_status);
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+
+        let relay =
+            Arc::new(RevokeTestRelay::new(vec![pinned_self.clone()], RevokeBehavior::Success));
+        relay.set_signed_registry(signed_registry_with_entries(
+            sync_id,
+            &device_secret,
+            signer_device_id,
+            &[snapshot_self.clone(), signer_info],
+            0,
+            &[(0, epoch_0_key)],
+        ));
+
+        sync.configure_engine(relay.clone(), sync_id.to_string(), self_device_id.to_string(), 0, 0);
+
+        (sync, relay, self_device_id.to_string(), device_secret, snapshot_self)
+    }
+
+    /// Set the device's last-imported registry baseline. The helper-built sync
+    /// has no `sync_metadata` row yet and `update_last_imported_registry_version`
+    /// is a plain UPDATE (no-op without a row), so seed the row via
+    /// `update_current_epoch` (UPSERT) first.
+    fn set_last_imported_registry_version(sync: &PrismSync, sync_id: &str, version: i64) {
+        let mut tx = sync.storage().begin_tx().unwrap();
+        tx.update_current_epoch(sync_id, 0).unwrap();
+        tx.update_last_imported_registry_version(sync_id, version).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_returns_revoked_when_verified_registry_marks_self_revoked() {
+        // No last-imported baseline recorded → staleness cannot be proven, so
+        // the verified + explicit-`revoked`-entry gate stands → ConfirmedRevoked.
+        let (sync, _relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
+        assert_eq!(
+            sync.storage().get_sync_metadata("sync-1").unwrap().and_then(|m| m.last_imported_registry_version),
+            None,
+            "precondition: helper records no last-imported baseline"
+        );
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::ConfirmedRevoked);
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_returns_revoked_when_snapshot_at_or_above_baseline() {
+        // Snapshot registry_version (== SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+        // i.e. 1) is >= the recorded baseline → the legitimate, current
+        // revocation is accepted.
+        let (sync, _relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
+        set_last_imported_registry_version(&sync, "sync-1", 1);
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::ConfirmedRevoked);
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_is_unknown_when_stale_snapshot_marks_self_revoked() {
+        // REPLAY DEFENSE: a validly-signed but STALE snapshot
+        // (registry_version 1) that marks self `revoked`, served when the device
+        // has already imported a NEWER registry (baseline 5), must NOT wipe.
+        // This is the re-pair-under-same-device_id replay residual.
+        let (sync, _relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
+        set_last_imported_registry_version(&sync, "sync-1", 5);
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_returns_active_when_verified_registry_lists_self_active() {
+        let (sync, _relay, _id, _secret, _info) = prepare_self_revocation_check("active");
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_is_unknown_when_no_signed_registry_available() {
+        let (sync, relay, _id, _secret, _info) = prepare_self_revocation_check("active");
+        // Relay serves no signed registry at all → fail-safe Unknown.
+        relay.state.lock().unwrap().signed_registry = None;
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_is_unknown_when_signature_invalid() {
+        let (sync, relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
+        // Tamper the signed blob so hybrid verification fails. A forged/corrupt
+        // registry MUST NOT be able to drive a destructive outcome — Unknown.
+        {
+            let mut state = relay.state.lock().unwrap();
+            let registry = state.signed_registry.as_mut().unwrap();
+            let last = registry.artifact_blob.len() - 1;
+            registry.artifact_blob[last] ^= 0xFF;
+        }
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_is_unknown_when_relay_errors() {
+        let (sync, relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
+        // A relay erroring the registry fetch is INCONCLUSIVE, never positive
+        // confirmation — even when the (untrusted) error body says
+        // "device_revoked". This removes the former spoofable heuristic.
+        relay.set_signed_registry_error(true);
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn confirm_self_revocation_is_unknown_when_self_absent_from_verified_snapshot() {
+        // A VERIFIED snapshot that simply OMITS this device is NOT treated as
+        // confirmation of removal (a stale/partial snapshot could omit us) —
+        // fail-safe Unknown. We deliberately require an explicit revoked entry.
+        let (sync, relay, _id, device_secret, _info) = prepare_self_revocation_check("active");
+
+        // The sibling `bbbb...` is already pinned by the helper. Serve a
+        // snapshot signed by the sibling that lists ONLY the sibling — self
+        // `a1b2...` is omitted entirely.
+        let sibling = make_device_info("bbbbbbbbbbbb", &device_secret, 0, "active");
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        relay.set_signed_registry(signed_registry_response(
+            "sync-1",
+            &device_secret,
+            "bbbbbbbbbbbb",
+            &sibling,
+            0,
+            &[(0, epoch_0_key)],
+        ));
+
+        // Verification succeeds (signer = sibling, present in its own snapshot),
+        // but self `a1b2...` is absent → Unknown, NOT ConfirmedRevoked.
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::Unknown);
     }
 
     #[test]

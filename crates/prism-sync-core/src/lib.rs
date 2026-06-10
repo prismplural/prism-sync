@@ -35,7 +35,7 @@ pub mod sync_aad;
 pub mod sync_service;
 pub mod syncable_entity;
 
-pub use client::{KeyMode, PrismSync, PrismSyncBuilder, SyncStatus};
+pub use client::{KeyMode, PrismSync, PrismSyncBuilder, SelfRevocationStatus, SyncStatus};
 pub use crdt_change::{CrdtChange, BULK_RESET_FIELD};
 pub use debug_log::SyncDebugLog;
 pub use device_registry::DeviceRegistryManager;

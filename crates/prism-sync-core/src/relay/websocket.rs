@@ -296,8 +296,18 @@ impl WebSocketClient {
                 Some(SyncNotification::NewData { server_seq })
             }
             "device_revoked" => {
+                // SECURITY (H3): this frame is an UNTRUSTED HINT — it carries no
+                // signature. Consumers MUST NOT take any destructive action on
+                // it alone; they gate wipes/credential-clears on
+                // `PrismSync::confirm_self_revocation` (a signature-verified
+                // signed-registry check). Do NOT add trust to this parser.
                 let device_id = parsed["device_id"].as_str().unwrap_or("").to_string();
                 let new_epoch = parsed["new_epoch"].as_i64().unwrap_or(0) as i32;
+                // TODO(security): bind remote_wipe intent into the signed
+                // revocation artifact (Layer B). This bool is relay-controlled
+                // here; after Layer A only a verifiably-revoked device can wipe,
+                // but the wipe *intent* is still unauthenticated. Binding it into
+                // the signed revocation would close the residual.
                 let remote_wipe = parsed["remote_wipe"].as_bool().unwrap_or(false);
                 Some(SyncNotification::DeviceRevoked { device_id, new_epoch, remote_wipe })
             }
