@@ -69,6 +69,14 @@ async fn cleanup_failed_setup_removes_partial_state() {
     store.set("mnemonic", b"word1 word2 ...").unwrap();
     store.set("device_id", b"dev-123").unwrap();
     store.set("device_secret", &[0u8; 32]).unwrap();
+    // A failed join also persists `epoch` and `epoch_key_{N}` (directly at the
+    // bundle epoch, and via catch_up up to the relay epoch). Seed epoch 3 with
+    // keys at every epoch 1..=3 so cleanup must read `epoch` to learn N=3 and
+    // sweep all of them.
+    store.set("epoch", b"3").unwrap();
+    store.set("epoch_key_1", b"k1").unwrap();
+    store.set("epoch_key_2", b"k2").unwrap();
+    store.set("epoch_key_3", b"k3").unwrap();
 
     // Verify marker is present
     assert!(store.get("setup_rollback_marker").unwrap().is_some());
@@ -85,6 +93,11 @@ async fn cleanup_failed_setup_removes_partial_state() {
     assert!(store.get("mnemonic").unwrap().is_none());
     assert!(store.get("device_id").unwrap().is_none());
     assert!(store.get("device_secret").unwrap().is_none());
+    // No stale epoch material may remain.
+    assert!(store.get("epoch").unwrap().is_none(), "stale epoch must be cleared");
+    assert!(store.get("epoch_key_1").unwrap().is_none(), "stale epoch_key_1 must be cleared");
+    assert!(store.get("epoch_key_2").unwrap().is_none(), "stale epoch_key_2 must be cleared");
+    assert!(store.get("epoch_key_3").unwrap().is_none(), "stale epoch_key_3 must be cleared");
 }
 
 /// When no rollback marker is present, `cleanup_failed_setup` is a no-op.

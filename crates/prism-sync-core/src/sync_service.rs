@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 use rand::Rng;
 
 use crate::client::PrismSync;
+use crate::device_registry::DeviceRegistryManager;
 use crate::engine::{BootstrapReport, SeedRecord, SyncEngine, SyncResult};
 use crate::epoch::EpochManager;
 use crate::error::{CoreError, RelayErrorCategory, Result};
@@ -338,9 +339,64 @@ async fn recover_epoch_key(
         }
     };
 
+    // Needed to signature-verify the signed registry; capture before the lock drop.
+    let sync_id = match guard.sync_service().sync_id().map(|s| s.to_string()) {
+        Some(id) => id,
+        None => {
+            tracing::warn!(epoch = new_epoch, "epoch recovery: sync_id not set; cannot verify");
+            return;
+        }
+    };
+    let storage = guard.storage().clone();
+
     // Drop the lock before network I/O. We'll re-acquire it for
     // handle_rotation which mutates key_hierarchy.
     drop(guard);
+
+    // Fail-closed: the WS notification is only an untrusted hint. Install nothing
+    // and don't advance unless a signature-verified registry commits this epoch's
+    // hash; otherwise defer — catch_up_epoch_keys adopts it once the registry lands.
+    let registry = match relay.get_signed_registry().await {
+        Ok(Some(response)) => {
+            match DeviceRegistryManager::verify_signed_registry_snapshot(
+                storage.as_ref(),
+                &sync_id,
+                &response.artifact_blob,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    tracing::warn!(
+                        epoch = new_epoch,
+                        error = %e,
+                        "epoch recovery: signed registry failed verification; refusing to install"
+                    );
+                    return;
+                }
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                epoch = new_epoch,
+                "epoch recovery: no signed registry available yet; refusing to install via WS hint"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                epoch = new_epoch,
+                error = %e,
+                "epoch recovery: failed to fetch signed registry; refusing to install"
+            );
+            return;
+        }
+    };
+    if !registry.epoch_key_hashes.contains_key(&new_epoch) {
+        tracing::warn!(
+            epoch = new_epoch,
+            "epoch recovery: signed registry has no epoch_key_hash for this epoch; refusing"
+        );
+        return;
+    }
 
     // Re-acquire the lock for key_hierarchy mutation
     let mut guard = inner.lock().await;
@@ -350,15 +406,15 @@ async fn recover_epoch_key(
         return;
     }
 
-    // With X-Wing KEM the artifact is self-contained — no need to loop over
-    // active devices to find the sender. The receiver just decapsulates with
-    // its own DK.
+    // X-Wing artifacts are self-contained: the receiver decapsulates with its
+    // own DK. handle_rotation verifies the key against the registry before install.
     let recovered = match EpochManager::handle_rotation(
         relay.as_ref(),
         guard.key_hierarchy_mut(),
         new_epoch,
         my_device_id,
         &xwing_key,
+        &registry,
     )
     .await
     {
@@ -984,7 +1040,23 @@ impl SyncService {
                     Ok(key_bytes) => key_bytes,
                     Err(error) => return RecoveryControl::ReturnErr(error),
                 };
-                state.key_hierarchy.store_epoch_key(epoch, Zeroizing::new(key_bytes.to_vec()));
+
+                // Fail-closed: bind the relay-derived key to the verified
+                // registry hash BEFORE install or commit, so a poisoned key is
+                // never persisted (closing the crash-window before AEAD rollback).
+                let registry = match recoverer.verified_registry().await {
+                    Ok(registry) => registry,
+                    Err(error) => return RecoveryControl::ReturnErr(error),
+                };
+                let vk = match crate::epoch::VerifiedEpochKey::verify(
+                    epoch,
+                    Zeroizing::new(key_bytes.to_vec()),
+                    &registry,
+                ) {
+                    Ok(vk) => vk,
+                    Err(error) => return RecoveryControl::ReturnErr(error),
+                };
+                crate::epoch::install_epoch_key(state.key_hierarchy, vk);
 
                 match recoverer.commit_recovered_epoch(epoch, &key_bytes).await {
                     Ok(token) => {
@@ -1681,6 +1753,374 @@ mod tests {
             err_ev.code.as_deref(),
             Some("device_revoked"),
             "Error event code must come from terminal error, not stashed result"
+        );
+    }
+
+    // ── Reactive-recovery chokepoint regression tests ──
+    //
+    // The reactive `MissingEpochKey` path must route relay-derived epoch keys
+    // through `VerifiedEpochKey::verify` before installing — a poisoned key
+    // bound to the wrong registry hash must be refused with NO install and NO
+    // commit (no current_epoch advance / persisted key).
+
+    use crate::pairing::{compute_epoch_key_hash, SignedRegistrySnapshot};
+    use crate::recovery::{EpochRecoverer, RecoveryCommitToken};
+    use prism_sync_crypto::KeyHierarchy;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use zeroize::Zeroizing;
+
+    /// Mock recoverer: serves a chosen (possibly poisoned) key and a fixed
+    /// signed registry, and records whether a commit ever happened.
+    struct MockRecoverer {
+        served_key: [u8; 32],
+        registry: SignedRegistrySnapshot,
+        committed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl EpochRecoverer for MockRecoverer {
+        async fn recover(&self, _epoch: u32) -> Result<Zeroizing<Vec<u8>>> {
+            Ok(Zeroizing::new(self.served_key.to_vec()))
+        }
+
+        async fn verified_registry(&self) -> Result<SignedRegistrySnapshot> {
+            Ok(self.registry.clone())
+        }
+
+        async fn commit_recovered_epoch(
+            &self,
+            _epoch: u32,
+            _key_bytes: &[u8],
+        ) -> Result<RecoveryCommitToken> {
+            self.committed.store(true, Ordering::SeqCst);
+            Ok(RecoveryCommitToken { previous_epoch: 0 })
+        }
+
+        async fn rollback_recovered_epoch(
+            &self,
+            _epoch: u32,
+            _token: RecoveryCommitToken,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// NEGATIVE: relay serves a poisoned key while the signed registry commits
+    /// the REAL key's hash. Reactive recovery must refuse — nothing installed,
+    /// nothing committed, and the error surfaces.
+    #[tokio::test]
+    async fn reactive_recovery_refuses_poisoned_key() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let real_key = [0x11u8; 32];
+        let attacker_key = [0x41u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![],
+            0,
+            5,
+            BTreeMap::from([(5u32, compute_epoch_key_hash(&real_key))]),
+        );
+        let committed = Arc::new(AtomicBool::new(false));
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: attacker_key,
+            registry,
+            committed: committed.clone(),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(CoreError::MissingEpochKey { epoch: 5 }, Some(&mut state))
+            .await;
+
+        match control {
+            RecoveryControl::ReturnErr(err) => {
+                assert!(err.to_string().contains("hash mismatch"), "unexpected error: {err}");
+            }
+            _ => panic!("expected ReturnErr on poisoned key"),
+        }
+        let high_water = state.recovered_high_water;
+        drop(state); // release the &mut borrow on `kh` before inspecting it
+        assert!(!kh.has_epoch_key(5), "poisoned key must NOT be installed");
+        assert!(!committed.load(Ordering::SeqCst), "no commit may happen on refusal");
+        assert!(high_water.is_none(), "no epoch may be marked recovered");
+    }
+
+    /// POSITIVE control: relay serves the REAL key matching the registry hash —
+    /// reactive recovery installs it and commits.
+    #[tokio::test]
+    async fn reactive_recovery_accepts_registry_bound_key() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let real_key = [0x11u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![],
+            0,
+            5,
+            BTreeMap::from([(5u32, compute_epoch_key_hash(&real_key))]),
+        );
+        let committed = Arc::new(AtomicBool::new(false));
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            committed: committed.clone(),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(CoreError::MissingEpochKey { epoch: 5 }, Some(&mut state))
+            .await;
+
+        assert!(
+            matches!(control, RecoveryControl::Retry),
+            "registry-bound key should recover and retry"
+        );
+        let high_water = state.recovered_high_water;
+        drop(state); // release the &mut borrow on `kh` before inspecting it
+        assert!(kh.has_epoch_key(5), "real key must be installed");
+        assert_eq!(kh.epoch_key(5).unwrap(), &real_key);
+        assert!(committed.load(Ordering::SeqCst), "successful recovery must commit");
+        assert_eq!(high_water, Some(5));
+    }
+
+    /// NEGATIVE: registry has no hash committed for the epoch at all — refuse.
+    #[tokio::test]
+    async fn reactive_recovery_refuses_when_registry_lacks_epoch_hash() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        // Registry commits epoch 7, but we recover epoch 5 → no hash for 5.
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![],
+            0,
+            7,
+            BTreeMap::from([(7u32, compute_epoch_key_hash(&[0x22u8; 32]))]),
+        );
+        let committed = Arc::new(AtomicBool::new(false));
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: [0x11u8; 32],
+            registry,
+            committed: committed.clone(),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(CoreError::MissingEpochKey { epoch: 5 }, Some(&mut state))
+            .await;
+
+        assert!(
+            matches!(control, RecoveryControl::ReturnErr(_)),
+            "missing epoch hash must be refused"
+        );
+        drop(state); // release the &mut borrow on `kh` before inspecting it
+        assert!(!kh.has_epoch_key(5), "no key may be installed");
+        assert!(!committed.load(Ordering::SeqCst), "no commit on refusal");
+    }
+
+    // ── LEGIT end-to-end reactive recovery through the REAL stack ──
+    //
+    // The negative tests above use a `MockRecoverer`. This test proves the
+    // fail-closed gate does NOT break a legitimate reactive recovery: it wires
+    // a REAL `KeyHierarchyRecoverer` against a relay that serves a real X-Wing
+    // rekey artifact AND a real signature-verified registry committing the new
+    // epoch's hash — the exact shape a legitimately-rotating device produces.
+    // `handle_reactive_recovery` must: decapsulate the real artifact, fetch +
+    // verify the real signed registry, bind the key to the committed hash,
+    // install it, and commit the new epoch.
+
+    use crate::device_registry::DeviceRegistryManager;
+    use crate::recovery::KeyHierarchyRecoverer;
+    use crate::relay::traits::{DeviceInfo, SignedRegistryResponse};
+    use crate::relay::MockRelay;
+    use crate::storage::{DeviceRecord, RusqliteSyncStorage, SyncStorage};
+    use prism_sync_crypto::DeviceSecret;
+
+    /// Build a real v2 rekey artifact wrapping `epoch_key` to `device`'s X-Wing
+    /// key, replicating the prepare_wrapped_keys_for_devices steps.
+    fn build_real_v2_artifact(
+        device_secret: &DeviceSecret,
+        device_id: &str,
+        epoch_key: &[u8],
+        epoch: u32,
+    ) -> Vec<u8> {
+        use prism_sync_crypto::pq::hybrid_kem::XWingKem;
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let ek = XWingKem::encapsulation_key_from_bytes(&xwing.encapsulation_key_bytes()).unwrap();
+        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+        let (ciphertext, shared_secret_raw) = XWingKem::encapsulate(&ek, &mut rng);
+        let shared_secret = Zeroizing::new(shared_secret_raw);
+        let mut salt = Vec::with_capacity(4 + device_id.len());
+        salt.extend_from_slice(&epoch.to_le_bytes());
+        salt.extend_from_slice(device_id.as_bytes());
+        let wrap_key =
+            prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+                .unwrap();
+        let aad = format!("prism_epoch_rekey_v2|{epoch}|{device_id}").into_bytes();
+        let encrypted =
+            prism_sync_crypto::aead::xchacha_encrypt_aead(&wrap_key, epoch_key, &aad).unwrap();
+        let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted.len());
+        artifact.push(0x02);
+        artifact.extend_from_slice(&ciphertext);
+        artifact.extend_from_slice(&encrypted);
+        artifact
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_succeeds_end_to_end_with_real_recoverer() {
+        use crate::pairing::RegistrySnapshotEntry;
+
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let real_epoch_1_key = [0x11u8; 32];
+
+        // Storage with the signer device pinned so signature verification of
+        // the signed registry succeeds (it checks against a local device record).
+        let storage: Arc<dyn SyncStorage> =
+            Arc::new(RusqliteSyncStorage::in_memory().expect("in-memory storage"));
+        let ed = device_secret.ed25519_keypair(device_id).unwrap();
+        let x25519 = device_secret.x25519_keypair(device_id).unwrap();
+        let ml_dsa = device_secret.ml_dsa_65_keypair(device_id).unwrap();
+        let ml_kem = device_secret.ml_kem_768_keypair(device_id).unwrap();
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let record = DeviceRecord {
+            sync_id: sync_id.to_string(),
+            device_id: device_id.to_string(),
+            ed25519_public_key: ed.public_key_bytes().to_vec(),
+            x25519_public_key: x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem.public_key_bytes(),
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            status: "active".to_string(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+        DeviceRegistryManager::pin_device(storage.as_ref(), sync_id, &record).unwrap();
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.update_current_epoch(sync_id, 0).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Relay serves a REAL artifact for epoch 1 plus a REAL signed registry
+        // committing epoch_key_hashes[1] = hash(real key).
+        let relay = Arc::new(MockRelay::new());
+        relay.insert_rekey_artifact(
+            1,
+            device_id,
+            build_real_v2_artifact(&device_secret, device_id, &real_epoch_1_key, 1),
+        );
+        let entry = RegistrySnapshotEntry {
+            sync_id: sync_id.to_string(),
+            device_id: device_id.to_string(),
+            ed25519_public_key: ed.public_key_bytes().to_vec(),
+            x25519_public_key: x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem.public_key_bytes(),
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+        };
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![entry],
+            crate::pairing::SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            1,
+            BTreeMap::from([(1u32, compute_epoch_key_hash(&real_epoch_1_key))]),
+        );
+        relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: crate::pairing::SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: snapshot.sign_hybrid(&ed, &ml_dsa),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+        // (device record present so list_devices / metadata are coherent)
+        relay.add_device(DeviceInfo {
+            device_id: device_id.to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: ed.public_key_bytes().to_vec(),
+            x25519_public_key: x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem.public_key_bytes(),
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        });
+
+        // Real recoverer + secure store.
+        let secure_store: Arc<dyn crate::secure_store::SecureStore> = {
+            #[derive(Default)]
+            struct S(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+            impl crate::secure_store::SecureStore for S {
+                fn get(&self, k: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(self.0.lock().unwrap().get(k).cloned())
+                }
+                fn set(&self, k: &str, v: &[u8]) -> Result<()> {
+                    self.0.lock().unwrap().insert(k.to_string(), v.to_vec());
+                    Ok(())
+                }
+                fn delete(&self, k: &str) -> Result<()> {
+                    self.0.lock().unwrap().remove(k);
+                    Ok(())
+                }
+                fn clear(&self) -> Result<()> {
+                    self.0.lock().unwrap().clear();
+                    Ok(())
+                }
+            }
+            Arc::new(S::default())
+        };
+        let recoverer = KeyHierarchyRecoverer::new(
+            relay.clone(),
+            storage.clone(),
+            secure_store.clone(),
+            &device_secret,
+            sync_id.to_string(),
+            device_id.to_string(),
+        )
+        .unwrap();
+
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+        service.set_recoverer(Arc::new(recoverer));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(CoreError::MissingEpochKey { epoch: 1 }, Some(&mut state))
+            .await;
+
+        assert!(
+            matches!(control, RecoveryControl::Retry),
+            "legit reactive recovery must succeed and request a retry"
+        );
+        let high_water = state.recovered_high_water;
+        drop(state); // release &mut borrow before inspecting kh
+
+        // Key installed (and is the REAL key recovered via real decapsulation).
+        assert!(kh.has_epoch_key(1), "real epoch-1 key must be installed");
+        assert_eq!(kh.epoch_key(1).unwrap(), &real_epoch_1_key);
+        // Epoch advanced + persisted (committed) through the real recoverer.
+        assert_eq!(high_water, Some(1));
+        assert!(secure_store.get("epoch_key_1").unwrap().is_some(), "key persisted");
+        assert_eq!(
+            storage.get_sync_metadata(sync_id).unwrap().unwrap().current_epoch,
+            1,
+            "current_epoch advanced to 1"
         );
     }
 }

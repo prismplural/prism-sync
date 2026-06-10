@@ -861,8 +861,37 @@ impl PairingService {
         })?;
 
         let next_epoch = current_epoch.saturating_add(1);
+        // TODO(security): unlike revoke_and_rekey, this wrap can't yet enforce
+        // pinned-vs-relay X-Wing key-equality — the relay list legitimately
+        // carries the just-joined device whose registered key diverges from the
+        // one authored into registry_snapshot.entries, so byte-equality would
+        // reject the join. Interim: restrict recipients to device_ids present in
+        // the signed snapshot (blocks an unknown injected recipient); full
+        // key-equality is deferred.
+        let known_device_ids: std::collections::HashSet<&str> =
+            registry_snapshot.entries.iter().map(|e| e.device_id.as_str()).collect();
+        let relay_devices = sync_relay.list_devices().await.map_err(|e| {
+            CoreError::Engine(format!("failed to list devices for pairing rekey: {e}"))
+        })?;
+        let pinned: Vec<crate::storage::DeviceRecord> = relay_devices
+            .iter()
+            .filter(|d| known_device_ids.contains(d.device_id.as_str()))
+            .map(|d| crate::storage::DeviceRecord {
+                sync_id: sync_id.clone(),
+                device_id: d.device_id.clone(),
+                ed25519_public_key: d.ed25519_public_key.clone(),
+                x25519_public_key: d.x25519_public_key.clone(),
+                ml_dsa_65_public_key: d.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: d.ml_kem_768_public_key.clone(),
+                x_wing_public_key: d.x_wing_public_key.clone(),
+                status: d.status.clone(),
+                registered_at: chrono::Utc::now(),
+                revoked_at: None,
+                ml_dsa_key_generation: d.ml_dsa_key_generation,
+            })
+            .collect();
         let (next_epoch_key, wrapped_keys) =
-            EpochManager::prepare_wrapped_keys(sync_relay, next_epoch, None).await?;
+            EpochManager::prepare_wrapped_keys(sync_relay, next_epoch, None, &pinned).await?;
         let next_epoch_key_array: [u8; 32] =
             next_epoch_key.as_slice().try_into().map_err(|_| {
                 CoreError::Engine(format!(
@@ -1383,6 +1412,19 @@ pub async fn cleanup_failed_setup(
         ] {
             let _ = secure_store.delete(key);
         }
+        // A failed join may have written `epoch` + `epoch_key_{1..N}`; clear them
+        // too. The persisted `epoch` is the highest N written (0 if missing).
+        let highest_epoch = secure_store
+            .get("epoch")
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        for epoch in 1..=highest_epoch {
+            let _ = secure_store.delete(&format!("epoch_key_{epoch}"));
+        }
+        let _ = secure_store.delete("epoch");
         return Ok(true);
     }
     Ok(false)

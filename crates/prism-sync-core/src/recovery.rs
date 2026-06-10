@@ -5,8 +5,10 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use prism_sync_crypto::DeviceSecret;
 use zeroize::Zeroizing;
 
+use crate::device_registry::DeviceRegistryManager;
 use crate::epoch::decapsulate_and_decrypt_artifact;
 use crate::error::{CoreError, Result};
+use crate::pairing::SignedRegistrySnapshot;
 use crate::relay::SyncRelay;
 use crate::secure_store::SecureStore;
 use crate::storage::{StorageError, SyncStorage};
@@ -19,6 +21,14 @@ pub(crate) struct RecoveryCommitToken {
 #[async_trait]
 pub(crate) trait EpochRecoverer: Send + Sync {
     async fn recover(&self, epoch: u32) -> Result<Zeroizing<Vec<u8>>>;
+
+    /// Fetch and signature-verify the relay's current signed device registry.
+    ///
+    /// Fail-closed: returns `Err` if there is no signed registry, or if the
+    /// fetched artifact fails signature verification. A reactively-recovered
+    /// epoch key MUST be bound to a hash committed by the value returned here
+    /// before it is installed.
+    async fn verified_registry(&self) -> Result<SignedRegistrySnapshot>;
 
     async fn commit_recovered_epoch(
         &self,
@@ -71,6 +81,28 @@ impl EpochRecoverer for KeyHierarchyRecoverer {
                 },
             )?;
         decapsulate_and_decrypt_artifact(&artifact, &xwing, epoch, &self.device_id)
+    }
+
+    async fn verified_registry(&self) -> Result<SignedRegistrySnapshot> {
+        let response = match self.relay.get_signed_registry().await {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                return Err(CoreError::Engine(
+                    "reactive epoch recovery: no signed registry available — refusing to install"
+                        .into(),
+                ));
+            }
+            Err(error) => return Err(CoreError::from_relay(error)),
+        };
+
+        let storage = self.storage.clone();
+        let sync_id = self.sync_id.clone();
+        let blob = response.artifact_blob.clone();
+        tokio::task::spawn_blocking(move || {
+            DeviceRegistryManager::verify_signed_registry_snapshot(storage.as_ref(), &sync_id, &blob)
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
     }
 
     async fn commit_recovered_epoch(
@@ -190,4 +222,82 @@ pub(crate) async fn rollback_recovered_epoch_material(
     .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::MockRelay;
+    use crate::storage::RusqliteSyncStorage;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemStore(Mutex<HashMap<String, Vec<u8>>>);
+
+    impl SecureStore for MemStore {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        fn set(&self, key: &str, value: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
+        fn clear(&self) -> Result<()> {
+            self.0.lock().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    fn make_recoverer(relay: Arc<dyn SyncRelay>) -> KeyHierarchyRecoverer {
+        let storage: Arc<dyn SyncStorage> =
+            Arc::new(RusqliteSyncStorage::in_memory().expect("in-memory storage"));
+        let secure_store: Arc<dyn SecureStore> = Arc::new(MemStore::default());
+        let device_secret = DeviceSecret::generate();
+        KeyHierarchyRecoverer::new(
+            relay,
+            storage,
+            secure_store,
+            &device_secret,
+            "test-sync".to_string(),
+            "test-device".to_string(),
+        )
+        .expect("recoverer construction")
+    }
+
+    /// Fail-closed: no signed registry available (`Ok(None)`) → Err, never an
+    /// empty/forged snapshot.
+    #[tokio::test]
+    async fn verified_registry_refuses_when_relay_has_no_registry() {
+        // MockRelay defaults `get_signed_registry` to Ok(None).
+        let relay = Arc::new(MockRelay::new());
+        let recoverer = make_recoverer(relay);
+
+        let err = recoverer
+            .verified_registry()
+            .await
+            .expect_err("missing signed registry must be refused");
+        assert!(
+            err.to_string().contains("no signed registry available"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Fail-closed: relay errors on `get_signed_registry` → Err.
+    #[tokio::test]
+    async fn verified_registry_refuses_when_relay_errors() {
+        let relay = Arc::new(MockRelay::new());
+        relay.fail_get_signed_registry("relay exploded");
+        let recoverer = make_recoverer(relay);
+
+        let err = recoverer
+            .verified_registry()
+            .await
+            .expect_err("relay error fetching signed registry must be refused");
+        assert!(err.to_string().contains("relay exploded"), "unexpected error: {err}");
+    }
 }

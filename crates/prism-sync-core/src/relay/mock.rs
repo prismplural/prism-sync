@@ -54,6 +54,13 @@ struct MockRelayState {
     media: HashMap<String, Vec<u8>>,
     /// Signed registry artifact to return from get_signed_registry.
     signed_registry: Option<SignedRegistryResponse>,
+    /// If set, `get_signed_registry` returns a `Network` error with this
+    /// message instead of the stored registry. Used to exercise fail-closed
+    /// epoch-recovery branches.
+    signed_registry_error: Option<String>,
+    /// Per-(epoch, device_id) rekey artifacts served from
+    /// `get_rekey_artifact`. Used by epoch-recovery tests.
+    rekey_artifacts: HashMap<(i32, String), Vec<u8>>,
     /// Batch IDs that should fail with HTTP 413 `PayloadTooLarge` when
     /// pushed. Used by Phase 1B push-quarantine tests to simulate relay
     /// rejection of an oversized envelope without crafting a real
@@ -116,6 +123,8 @@ impl MockRelay {
                 ml_dsa_generations: HashMap::new(),
                 media: HashMap::new(),
                 signed_registry: None,
+                signed_registry_error: None,
+                rekey_artifacts: HashMap::new(),
                 push_413_batch_ids: HashSet::new(),
                 push_call_batch_ids: Vec::new(),
                 next_put_snapshot_stale: None,
@@ -247,6 +256,21 @@ impl MockRelay {
     /// Set the signed registry artifact to return from get_signed_registry.
     pub fn set_signed_registry(&self, resp: SignedRegistryResponse) {
         self.state.lock().unwrap().signed_registry = Some(resp);
+    }
+
+    /// Make `get_signed_registry` fail with a retryable network error. Used to
+    /// exercise the fail-closed branch of epoch recovery.
+    pub fn fail_get_signed_registry(&self, message: &str) {
+        self.state.lock().unwrap().signed_registry_error = Some(message.to_string());
+    }
+
+    /// Seed a rekey artifact served from `get_rekey_artifact(epoch, device_id)`.
+    pub fn insert_rekey_artifact(&self, epoch: i32, device_id: &str, artifact: Vec<u8>) {
+        self.state
+            .lock()
+            .unwrap()
+            .rekey_artifacts
+            .insert((epoch, device_id.to_string()), artifact);
     }
 }
 
@@ -434,7 +458,11 @@ impl DeviceRegistry for MockRelay {
     }
 
     async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
-        Ok(self.state.lock().unwrap().signed_registry.clone())
+        let state = self.state.lock().unwrap();
+        if let Some(message) = &state.signed_registry_error {
+            return Err(RelayError::Network { message: message.clone() });
+        }
+        Ok(state.signed_registry.clone())
     }
 
     async fn put_signed_registry(
@@ -464,10 +492,16 @@ impl EpochManagement for MockRelay {
 
     async fn get_rekey_artifact(
         &self,
-        _epoch: i32,
-        _device_id: &str,
+        epoch: i32,
+        device_id: &str,
     ) -> Result<Option<Vec<u8>>, RelayError> {
-        Ok(None)
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .rekey_artifacts
+            .get(&(epoch, device_id.to_string()))
+            .cloned())
     }
 }
 

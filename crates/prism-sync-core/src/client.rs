@@ -1697,13 +1697,17 @@ impl PrismSync {
         }
         let new_epoch = self_device.epoch.max(0) as u32 + 1;
 
-        // 2. Generate wrapped keys for surviving devices, then perform the
-        //    atomic revoke+epoch-rotation request against the relay.
+        // 2. Wrap the new epoch key for surviving devices. The locally-pinned
+        //    registry — not the relay device list — is the authority for who
+        //    may receive a wrapped key, so the relay cannot inject a recipient.
+        let pinned =
+            crate::device_registry::DeviceRegistryManager::list_devices(&*self.storage, &sync_id)?;
         let (epoch_key, wrapped_keys) =
             crate::epoch::EpochManager::prepare_wrapped_keys_for_devices(
                 &devices,
                 new_epoch,
                 Some(target_device_id),
+                &pinned,
             )?;
 
         let committed_epoch = match relay
@@ -2281,6 +2285,10 @@ mod tests {
             self.state.lock().unwrap().revoke_calls
         }
 
+        fn devices(&self) -> Vec<DeviceInfo> {
+            self.state.lock().unwrap().devices.clone()
+        }
+
         fn insert_artifact(&self, epoch: i32, device_id: &str, artifact: Vec<u8>) {
             self.state.lock().unwrap().artifacts.insert((epoch, device_id.to_string()), artifact);
         }
@@ -2567,6 +2575,17 @@ mod tests {
             revoked_at: None,
             ml_dsa_key_generation: info.ml_dsa_key_generation,
         }
+    }
+
+    /// Seed the local pinned device registry so `revoke_and_rekey`'s wrap
+    /// intersection (pinned vs relay-listed) has a matching authority. Mirrors
+    /// what a real device would hold after importing a signed registry.
+    fn seed_device_registry(sync: &PrismSync, sync_id: &str, infos: &[DeviceInfo]) {
+        let mut tx = sync.storage().begin_tx().unwrap();
+        for info in infos {
+            tx.upsert_device_record(&make_device_record(sync_id, info)).unwrap();
+        }
+        tx.commit().unwrap();
     }
 
     fn make_registry_entry(sync_id: &str, info: &DeviceInfo) -> RegistrySnapshotEntry {
@@ -3272,6 +3291,8 @@ mod tests {
             0,
         );
 
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
         let committed_epoch =
             sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
 
@@ -3311,6 +3332,8 @@ mod tests {
             0,
         );
 
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
         let committed_epoch =
             sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
 
@@ -3345,6 +3368,8 @@ mod tests {
             0,
             0,
         );
+
+        seed_device_registry(&sync, "sync-1", &relay.devices());
 
         let committed_epoch =
             sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
@@ -3388,6 +3413,8 @@ mod tests {
             0,
         );
 
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
         let committed_epoch =
             sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
 
@@ -3423,6 +3450,8 @@ mod tests {
             0,
         );
 
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
         let error =
             sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap_err();
 
@@ -3457,6 +3486,8 @@ mod tests {
             0,
             0,
         );
+
+        seed_device_registry(&sync, "sync-1", &relay.devices());
 
         let error =
             sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap_err();

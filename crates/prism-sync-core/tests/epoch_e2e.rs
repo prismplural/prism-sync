@@ -4,15 +4,88 @@
 //! atomic revoke using X-Wing KEM, Device B recovers it via `handle_rotation`,
 //! and both can encrypt/decrypt with the same epoch key.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use futures_util::Stream;
 use prism_sync_core::epoch::EpochManager;
+use prism_sync_core::pairing::{compute_epoch_key_hash, SignedRegistrySnapshot};
 use prism_sync_core::relay::traits::*;
-use prism_sync_crypto::{aead, DeviceSecret, KeyHierarchy};
+use prism_sync_core::storage::DeviceRecord;
+use prism_sync_crypto::{aead, DeviceSecret, DeviceXWingKey, KeyHierarchy};
+use zeroize::Zeroizing;
+
+/// Mirror a relay `DeviceInfo` list into pinned `DeviceRecord`s so the wrap
+/// intersection in `prepare_wrapped_keys` is satisfied when the pinned registry
+/// agrees with the relay.
+fn pinned_from_devices(devices: &[DeviceInfo]) -> Vec<DeviceRecord> {
+    devices
+        .iter()
+        .map(|d| DeviceRecord {
+            sync_id: "test-sync".to_string(),
+            device_id: d.device_id.clone(),
+            ed25519_public_key: d.ed25519_public_key.clone(),
+            x25519_public_key: d.x25519_public_key.clone(),
+            ml_dsa_65_public_key: d.ml_dsa_65_public_key.clone(),
+            ml_kem_768_public_key: d.ml_kem_768_public_key.clone(),
+            x_wing_public_key: d.x_wing_public_key.clone(),
+            status: d.status.clone(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: d.ml_dsa_key_generation,
+        })
+        .collect()
+}
+
+/// Build a signed-registry snapshot committing a single epoch's key hash.
+/// `EpochManager::handle_rotation` only checks the hash, not the signature, so
+/// tests construct this directly with no signing key required.
+fn single_epoch_snapshot(epoch: u32, key: &[u8; 32]) -> SignedRegistrySnapshot {
+    SignedRegistrySnapshot::new_with_epoch_binding(
+        vec![],
+        0,
+        epoch,
+        BTreeMap::from([(epoch, compute_epoch_key_hash(key))]),
+    )
+}
+
+/// Wrap a CHOSEN epoch key into a valid v2 rekey artifact for `receiver_xwing`,
+/// replicating the encapsulate → derive_subkey → xchacha_encrypt_aead steps of
+/// `EpochManager::prepare_wrapped_keys_for_devices`. Lets a test fabricate an
+/// honest-looking artifact that wraps an attacker-chosen key.
+fn build_v2_artifact(
+    receiver_xwing: &DeviceXWingKey,
+    epoch_key: &[u8],
+    epoch: u32,
+    device_id: &str,
+) -> Vec<u8> {
+    use prism_sync_crypto::pq::hybrid_kem::XWingKem;
+
+    let ek_bytes = receiver_xwing.encapsulation_key_bytes();
+    let ek = XWingKem::encapsulation_key_from_bytes(&ek_bytes).unwrap();
+    let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+    let (ciphertext, shared_secret_raw) = XWingKem::encapsulate(&ek, &mut rng);
+    let shared_secret = Zeroizing::new(shared_secret_raw);
+
+    let mut salt = Vec::with_capacity(4 + device_id.len());
+    salt.extend_from_slice(&epoch.to_le_bytes());
+    salt.extend_from_slice(device_id.as_bytes());
+    let wrap_key =
+        prism_sync_crypto::kdf::derive_subkey(&shared_secret, &salt, b"prism_epoch_rekey_v2")
+            .unwrap();
+    // AAD must match epoch::build_rekey_artifact_aad (pub(crate), replicated here).
+    let aad = format!("prism_epoch_rekey_v2|{epoch}|{device_id}").into_bytes();
+    let encrypted_epoch_key =
+        prism_sync_crypto::aead::xchacha_encrypt_aead(&wrap_key, epoch_key, &aad).unwrap();
+
+    let mut artifact = Vec::with_capacity(1 + ciphertext.len() + encrypted_epoch_key.len());
+    artifact.push(0x02);
+    artifact.extend_from_slice(&ciphertext);
+    artifact.extend_from_slice(&encrypted_epoch_key);
+    artifact
+}
 
 // ── MockRelay that stores and retrieves rekey artifacts ──
 
@@ -25,6 +98,12 @@ struct RekeyMockRelay {
 impl RekeyMockRelay {
     fn new(devices: Vec<DeviceInfo>) -> Self {
         Self { devices, artifacts: Mutex::new(HashMap::new()) }
+    }
+
+    /// Directly seed a rekey artifact for an (epoch, device) — used to serve a
+    /// poisoned or honest artifact to `handle_rotation`.
+    fn insert_artifact(&self, epoch: i32, device_id: &str, artifact: Vec<u8>) {
+        self.artifacts.lock().unwrap().insert((epoch, device_id.to_string()), artifact);
     }
 }
 
@@ -224,6 +303,7 @@ async fn epoch_rotation_full_cycle() {
         },
     ];
 
+    let pinned = pinned_from_devices(&devices);
     let relay = RekeyMockRelay::new(devices);
 
     // Both A and B have key hierarchies at epoch 0
@@ -236,7 +316,7 @@ async fn epoch_rotation_full_cycle() {
     // ── Step 1: Device A generates a new epoch key and performs atomic revoke ──
     // Device C is revoked (excluded) — X-Wing wraps for A and B only.
     let (epoch_key_a, wrapped_keys) =
-        EpochManager::prepare_wrapped_keys(&relay, 1, Some("device-c"))
+        EpochManager::prepare_wrapped_keys(&relay, 1, Some("device-c"), &pinned)
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
@@ -269,7 +349,10 @@ async fn epoch_rotation_full_cycle() {
 
     // ── Step 2: Device B recovers the epoch key via handle_rotation ──
     // With X-Wing KEM, B only needs its own DK — no sender identity needed.
-    EpochManager::handle_rotation(&relay, &mut kh_b, 1, "device-b", &xwing_b)
+    // The signed registry commits the hash of the real epoch-1 key.
+    let epoch_key_a_arr: [u8; 32] = epoch_key_a.as_slice().try_into().unwrap();
+    let signed_registry = single_epoch_snapshot(1, &epoch_key_a_arr);
+    EpochManager::handle_rotation(&relay, &mut kh_b, 1, "device-b", &xwing_b, &signed_registry)
         .await
         .expect("handle_rotation should succeed");
 
@@ -337,6 +420,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
         },
     ];
 
+    let pinned = pinned_from_devices(&devices);
     let relay = RekeyMockRelay::new(devices);
 
     let mut kh_a = KeyHierarchy::new();
@@ -344,7 +428,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
 
     // Device A excludes device-c from wrapped keys
     let (_epoch_key, wrapped_keys) =
-        EpochManager::prepare_wrapped_keys(&relay, 1, Some("device-c"))
+        EpochManager::prepare_wrapped_keys(&relay, 1, Some("device-c"), &pinned)
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
@@ -356,9 +440,73 @@ async fn revoked_device_cannot_recover_epoch_key() {
     let mut kh_c = KeyHierarchy::new();
     kh_c.initialize("password", &[3u8; 16]).unwrap();
 
-    let result = EpochManager::handle_rotation(&relay, &mut kh_c, 1, "device-c", &xwing_c).await;
+    // Any snapshot suffices — the missing-artifact error fires before the hash check.
+    let signed_registry = single_epoch_snapshot(1, &[0u8; 32]);
+    let result =
+        EpochManager::handle_rotation(&relay, &mut kh_c, 1, "device-c", &xwing_c, &signed_registry)
+            .await;
 
     assert!(result.is_err(), "revoked device should fail to recover epoch key");
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("no rekey artifact"), "error should mention missing artifact, got: {msg}");
+}
+
+/// A malicious relay must not be able to inject an attacker-chosen epoch key via
+/// the live rotation path. `handle_rotation` only installs a key that is
+/// byte-for-byte bound to the signature-verified registry hash.
+#[tokio::test]
+async fn relay_injected_epoch_key_is_refused() {
+    let victim_secret = DeviceSecret::generate();
+    let victim_xwing = victim_secret.xwing_keypair("victim").unwrap();
+
+    // The REAL epoch-1 key and the signed registry committing its hash.
+    let real_key = [0x11u8; 32];
+    let signed_registry = single_epoch_snapshot(1, &real_key);
+
+    // ── ATTACK: relay serves an artifact wrapping an attacker-chosen key ──
+    // The artifact is cryptographically valid (it decapsulates with the
+    // victim's own DK and decrypts cleanly), but the key inside is NOT the one
+    // the signed registry committed.
+    let attacker_key = [0x41u8; 32];
+    let poisoned_artifact = build_v2_artifact(&victim_xwing, &attacker_key, 1, "victim");
+
+    let relay = RekeyMockRelay::new(vec![DeviceInfo {
+        device_id: "victim".to_string(),
+        epoch: 0,
+        status: "active".to_string(),
+        ed25519_public_key: vec![],
+        x25519_public_key: vec![],
+        ml_dsa_65_public_key: vec![],
+        ml_kem_768_public_key: vec![],
+        x_wing_public_key: victim_xwing.encapsulation_key_bytes(),
+        ml_dsa_key_generation: 0,
+        permission: None,
+    }]);
+    relay.insert_artifact(1, "victim", poisoned_artifact);
+
+    let mut kh = KeyHierarchy::new();
+    kh.initialize("password", &[1u8; 16]).unwrap();
+
+    let result =
+        EpochManager::handle_rotation(&relay, &mut kh, 1, "victim", &victim_xwing, &signed_registry)
+            .await;
+
+    assert!(result.is_err(), "relay-injected attacker key must be refused");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("hash mismatch"), "error should be a hash mismatch, got: {msg}");
+    assert!(
+        !kh.has_epoch_key(1),
+        "attacker key must NOT be installed into the key hierarchy"
+    );
+
+    // ── POSITIVE CONTROL: serving the REAL key installs cleanly ──
+    let honest_artifact = build_v2_artifact(&victim_xwing, &real_key, 1, "victim");
+    relay.insert_artifact(1, "victim", honest_artifact);
+
+    EpochManager::handle_rotation(&relay, &mut kh, 1, "victim", &victim_xwing, &signed_registry)
+        .await
+        .expect("honest key bound to the signed registry hash should install");
+
+    assert!(kh.has_epoch_key(1), "honest key must be installed");
+    assert_eq!(kh.epoch_key(1).unwrap(), &real_key);
 }

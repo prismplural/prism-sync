@@ -17,13 +17,59 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{CoreError, Result};
-use crate::pairing::compute_epoch_key_hash;
+use crate::pairing::{compute_epoch_key_hash, SignedRegistrySnapshot};
 use crate::recovery::{persist_epoch_cache, persist_epoch_key};
 use crate::relay::{DeviceInfo, SyncRelay};
 use crate::secure_store::SecureStore;
-use crate::storage::StorageError;
+use crate::storage::{DeviceRecord, StorageError};
 use prism_sync_crypto::{DeviceSecret, DeviceXWingKey, KeyHierarchy};
 use zeroize::Zeroizing;
+
+/// Proof that an epoch key is safe to install. Private fields → the only ways
+/// to construct one are the two constructors below.
+pub(crate) struct VerifiedEpochKey {
+    epoch: u32,
+    key: Zeroizing<Vec<u8>>,
+}
+
+impl VerifiedEpochKey {
+    /// Locally generated — trusted by origin.
+    pub(crate) fn generated(epoch: u32, key: Zeroizing<Vec<u8>>) -> Self {
+        Self { epoch, key }
+    }
+
+    /// Adopted from a relay artifact — MUST match a signature-verified registry hash.
+    /// `snapshot` MUST be a value the caller already obtained via
+    /// `DeviceRegistryManager::verify_signed_registry_snapshot` (signature-checked).
+    pub(crate) fn verify(
+        epoch: u32,
+        key: Zeroizing<Vec<u8>>,
+        snapshot: &SignedRegistrySnapshot,
+    ) -> Result<Self> {
+        let arr: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+            CoreError::Crypto(prism_sync_crypto::CryptoError::InvalidKeyMaterial(format!(
+                "epoch {epoch} key has unexpected length {}",
+                key.len()
+            )))
+        })?;
+        let expected = snapshot.epoch_key_hashes.get(&epoch).ok_or_else(|| {
+            CoreError::Engine(format!(
+                "signed registry has no epoch_key_hash for epoch {epoch}"
+            ))
+        })?;
+        if compute_epoch_key_hash(&arr) != *expected {
+            return Err(CoreError::Engine(format!(
+                "epoch {epoch} key hash mismatch vs signed registry — refusing to install"
+            )));
+        }
+        Ok(Self { epoch, key })
+    }
+}
+
+/// The ONLY core installer for epoch>0 keys.
+pub(crate) fn install_epoch_key(kh: &mut KeyHierarchy, vk: VerifiedEpochKey) {
+    kh.store_epoch_key(vk.epoch, vk.key);
+}
 
 /// X-Wing ciphertext size in bytes.
 const XWING_CT_LEN: usize = 1120;
@@ -112,12 +158,19 @@ impl EpochManager {
     /// `DeviceRevoked` notification. The relay holds a per-device wrapped
     /// epoch key (v2 format) that was posted by the device that initiated the
     /// revocation.
+    ///
+    /// `registry` MUST be a signature-verified [`SignedRegistrySnapshot`]
+    /// (obtained via `DeviceRegistryManager::verify_signed_registry_snapshot`).
+    /// The decapsulated key is installed only if it is byte-for-byte bound to
+    /// `registry.epoch_key_hashes[new_epoch]` — otherwise this returns `Err`
+    /// and nothing is installed.
     pub async fn handle_rotation(
         relay: &dyn SyncRelay,
         key_hierarchy: &mut KeyHierarchy,
         new_epoch: u32,
         device_id: &str,
         xwing_key: &DeviceXWingKey,
+        registry: &SignedRegistrySnapshot,
     ) -> Result<()> {
         let artifact =
             relay.get_rekey_artifact(new_epoch as i32, device_id).await?.ok_or_else(|| {
@@ -128,8 +181,11 @@ impl EpochManager {
         let epoch_key_bytes =
             decapsulate_and_decrypt_artifact(&artifact, xwing_key, new_epoch, device_id)?;
 
-        // 7. Store the epoch key
-        key_hierarchy.store_epoch_key(new_epoch, epoch_key_bytes);
+        // 7. Verify the decapsulated key against the signature-verified
+        //    registry hash before installing — a malicious relay must not be
+        //    able to inject an attacker-chosen epoch key via this path.
+        let vk = VerifiedEpochKey::verify(new_epoch, epoch_key_bytes, registry)?;
+        install_epoch_key(key_hierarchy, vk);
         Ok(())
     }
 
@@ -143,20 +199,31 @@ impl EpochManager {
         relay: &dyn SyncRelay,
         new_epoch: u32,
         excluded_device_id: Option<&str>,
+        pinned: &[DeviceRecord],
     ) -> Result<(Zeroizing<Vec<u8>>, HashMap<String, Vec<u8>>)> {
         // 1. List active devices from relay
         let devices = relay.list_devices().await.map_err(|e| {
             CoreError::Storage(StorageError::Logic(format!("failed to list devices: {e}")))
         })?;
 
-        Self::prepare_wrapped_keys_for_devices(&devices, new_epoch, excluded_device_id)
+        Self::prepare_wrapped_keys_for_devices(&devices, new_epoch, excluded_device_id, pinned)
     }
 
+    /// Wrap a fresh epoch key for each surviving relay-listed device, but only
+    /// after cross-checking every recipient against the locally-pinned device
+    /// registry `pinned` (obtained via `DeviceRegistryManager::list_devices`).
+    ///
+    /// A device is wrapped to ONLY if it is present in `pinned` AND its pinned
+    /// `x_wing_public_key` matches the relay-supplied one byte-for-byte. Any
+    /// active recipient that is unknown to `pinned`, or whose key differs, is a
+    /// hard `Err` — an injected/swapped recipient must abort the whole rotation
+    /// rather than being silently skipped.
     #[allow(clippy::type_complexity)]
     pub fn prepare_wrapped_keys_for_devices(
         devices: &[DeviceInfo],
         new_epoch: u32,
         excluded_device_id: Option<&str>,
+        pinned: &[DeviceRecord],
     ) -> Result<(Zeroizing<Vec<u8>>, HashMap<String, Vec<u8>>)> {
         // 1. Generate a random 32-byte epoch key
         let mut epoch_key_bytes = Zeroizing::new([0u8; 32]);
@@ -171,6 +238,24 @@ impl EpochManager {
             if excluded_device_id.is_some_and(|excluded| excluded == device.device_id) {
                 continue;
             }
+
+            // Reject any recipient the pinned registry never committed.
+            let pinned_device = pinned
+                .iter()
+                .find(|p| p.device_id == device.device_id)
+                .ok_or_else(|| {
+                    CoreError::Engine(format!(
+                        "refusing rekey: relay-listed device {} is not in the pinned registry",
+                        device.device_id
+                    ))
+                })?;
+            if pinned_device.x_wing_public_key != device.x_wing_public_key {
+                return Err(CoreError::Engine(format!(
+                    "refusing rekey: x_wing_public_key for device {} differs from pinned registry",
+                    device.device_id
+                )));
+            }
+
             if device.x_wing_public_key.is_empty() {
                 tracing::warn!(
                     device_id = %device.device_id,
@@ -241,8 +326,10 @@ impl EpochManager {
         key_hierarchy: &mut KeyHierarchy,
         device_id: &str,
         new_epoch: u32,
+        pinned: &[DeviceRecord],
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let (epoch_key, wrapped_keys) = Self::prepare_wrapped_keys(relay, new_epoch, None).await?;
+        let (epoch_key, wrapped_keys) =
+            Self::prepare_wrapped_keys(relay, new_epoch, None, pinned).await?;
         Self::post_prepared_rekey(
             relay,
             key_hierarchy,
@@ -292,7 +379,10 @@ impl EpochManager {
             }
         };
 
-        key_hierarchy.store_epoch_key(committed_epoch, Zeroizing::new(epoch_key.to_vec()));
+        // Locally generated key — trusted by origin, installed via the
+        // core chokepoint.
+        let vk = VerifiedEpochKey::generated(committed_epoch, Zeroizing::new(epoch_key.to_vec()));
+        install_epoch_key(key_hierarchy, vk);
 
         Ok(epoch_key)
     }
@@ -795,6 +885,40 @@ mod tests {
         entries.iter().map(|(epoch, key)| (*epoch, compute_epoch_key_hash(key))).collect()
     }
 
+    /// Build a signed-registry snapshot committing a single epoch's key hash.
+    /// `verify` does not re-check the signature, so tests construct the snapshot
+    /// directly with no signing needed.
+    fn single_epoch_snapshot(epoch: u32, key: &[u8; 32]) -> SignedRegistrySnapshot {
+        SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![],
+            0,
+            epoch,
+            BTreeMap::from([(epoch, compute_epoch_key_hash(key))]),
+        )
+    }
+
+    /// Mirror a relay `DeviceInfo` list into pinned `DeviceRecord`s. Tests where
+    /// the pinned registry agrees with the relay use this to satisfy the wrap
+    /// intersection.
+    fn pinned_from_devices(devices: &[DeviceInfo]) -> Vec<DeviceRecord> {
+        devices
+            .iter()
+            .map(|d| DeviceRecord {
+                sync_id: "test-sync".to_string(),
+                device_id: d.device_id.clone(),
+                ed25519_public_key: d.ed25519_public_key.clone(),
+                x25519_public_key: d.x25519_public_key.clone(),
+                ml_dsa_65_public_key: d.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: d.ml_kem_768_public_key.clone(),
+                x_wing_public_key: d.x_wing_public_key.clone(),
+                status: d.status.clone(),
+                registered_at: chrono::Utc::now(),
+                revoked_at: None,
+                ml_dsa_key_generation: d.ml_dsa_key_generation,
+            })
+            .collect()
+    }
+
     fn make_devices(
         sender_secret: &DeviceSecret,
         receiver_secret: &DeviceSecret,
@@ -851,13 +975,15 @@ mod tests {
 
         // Sender builds v2 artifact for receiver at epoch 5
         let epoch_key = vec![0xABu8; 32];
+        let key_arr: [u8; 32] = epoch_key.as_slice().try_into().unwrap();
         let artifact = build_v2_artifact(&receiver_xwing, &epoch_key, 5, "receiver");
+        let snapshot = single_epoch_snapshot(5, &key_arr);
 
         let relay = MockRelay::new_with_artifact(Some(artifact));
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        EpochManager::handle_rotation(&relay, &mut kh, 5, "receiver", &receiver_xwing)
+        EpochManager::handle_rotation(&relay, &mut kh, 5, "receiver", &receiver_xwing, &snapshot)
             .await
             .unwrap();
 
@@ -893,8 +1019,10 @@ mod tests {
 
         let secret = DeviceSecret::generate();
         let xwing = secret.xwing_keypair("dev-a").unwrap();
+        let snapshot = single_epoch_snapshot(5, &[0u8; 32]);
 
-        let result = EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing).await;
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing, &snapshot).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("no rekey artifact"), "got: {msg}");
@@ -912,8 +1040,10 @@ mod tests {
 
         let secret = DeviceSecret::generate();
         let xwing = secret.xwing_keypair("dev-a").unwrap();
+        let snapshot = single_epoch_snapshot(5, &[0u8; 32]);
 
-        let result = EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing).await;
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing, &snapshot).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unsupported rekey artifact version"), "got: {msg}");
@@ -930,8 +1060,10 @@ mod tests {
 
         let secret = DeviceSecret::generate();
         let xwing = secret.xwing_keypair("dev-a").unwrap();
+        let snapshot = single_epoch_snapshot(5, &[0u8; 32]);
 
-        let result = EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing).await;
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing, &snapshot).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("rekey artifact too short"), "got: {msg}");
@@ -944,12 +1076,13 @@ mod tests {
         let receiver_xwing = receiver_secret.xwing_keypair("receiver").unwrap();
 
         let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
         let relay = MockRelay::new_with_devices(devices);
 
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await.unwrap();
+        EpochManager::post_rekey(&relay, &mut kh, "sender", 2, &pinned).await.unwrap();
 
         let posted = relay.posted_artifacts.lock().unwrap();
         let (epoch, keys) = posted.as_ref().unwrap();
@@ -991,6 +1124,7 @@ mod tests {
         let sender_secret = DeviceSecret::generate();
         let receiver_secret = DeviceSecret::generate();
         let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
         let relay = MockRelay::new_with_devices_and_behavior(
             devices,
             PostRekeyBehavior::CommitThenNetworkError,
@@ -999,7 +1133,7 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        let returned_key = EpochManager::post_rekey(&relay, &mut kh, "sender", 2)
+        let returned_key = EpochManager::post_rekey(&relay, &mut kh, "sender", 2, &pinned)
             .await
             .expect("committed relay state should reconcile lost response");
 
@@ -1012,6 +1146,7 @@ mod tests {
         let sender_secret = DeviceSecret::generate();
         let receiver_secret = DeviceSecret::generate();
         let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
         let relay = MockRelay::new_with_devices_and_behavior(
             devices,
             PostRekeyBehavior::NetworkErrorBeforeCommit,
@@ -1020,7 +1155,7 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        let result = EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await;
+        let result = EpochManager::post_rekey(&relay, &mut kh, "sender", 2, &pinned).await;
 
         assert!(result.is_err(), "uncommitted ambiguous failure must remain an error");
         assert!(!kh.has_epoch_key(2), "uncommitted epoch key should not be stored locally");
@@ -1031,6 +1166,7 @@ mod tests {
         let sender_secret = DeviceSecret::generate();
         let receiver_secret = DeviceSecret::generate();
         let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
         let relay = MockRelay::new_with_devices_and_behavior(
             devices,
             PostRekeyBehavior::AdvanceWithoutArtifactThenNetworkError,
@@ -1039,7 +1175,7 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        let result = EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await;
+        let result = EpochManager::post_rekey(&relay, &mut kh, "sender", 2, &pinned).await;
 
         assert!(result.is_err(), "advanced epoch without artifact must not reconcile");
         assert!(!kh.has_epoch_key(2), "unconfirmed epoch key should not be stored locally");
@@ -1246,8 +1382,10 @@ mod tests {
 
         let secret = DeviceSecret::generate();
         let xwing = secret.xwing_keypair("dev-a").unwrap();
+        let snapshot = single_epoch_snapshot(5, &[0u8; 32]);
 
-        let result = EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing).await;
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "dev-a", &xwing, &snapshot).await;
         assert!(result.is_err(), "corrupted ciphertext should fail decapsulation");
     }
 
@@ -1260,14 +1398,18 @@ mod tests {
         let xwing_c = secret_c.xwing_keypair("device-c").unwrap();
 
         let epoch_key = vec![0xCDu8; 32];
+        let key_arr: [u8; 32] = epoch_key.as_slice().try_into().unwrap();
         let artifact = build_v2_artifact(&xwing_b, &epoch_key, 5, "device-b");
+        let snapshot = single_epoch_snapshot(5, &key_arr);
 
         let relay = MockRelay::new_with_artifact(Some(artifact));
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
         // Device C tries to use device B's artifact
-        let result = EpochManager::handle_rotation(&relay, &mut kh, 5, "device-c", &xwing_c).await;
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "device-c", &xwing_c, &snapshot)
+                .await;
         assert!(result.is_err(), "wrong DK should fail to recover epoch key");
     }
 
@@ -1303,9 +1445,12 @@ mod tests {
                 ml_dsa_key_generation: 0,
             },
         ];
+        // Pinned registry agrees with the relay (same keys) so the intersection
+        // passes; the bad device is then skipped on the EK-parse failure.
+        let pinned = pinned_from_devices(&devices);
         let relay = MockRelay::new_with_devices(devices);
 
-        let (_, wrapped_keys) = EpochManager::prepare_wrapped_keys(&relay, 1, None)
+        let (_, wrapped_keys) = EpochManager::prepare_wrapped_keys(&relay, 1, None, &pinned)
             .await
             .expect("should succeed despite one bad device");
 
@@ -1320,6 +1465,7 @@ mod tests {
         let receiver_secret = DeviceSecret::generate();
 
         let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
         let relay = MockRelay::new_with_devices(devices);
 
         let mut kh = KeyHierarchy::new();
@@ -1328,12 +1474,164 @@ mod tests {
         // Epoch 2 key should not exist yet
         assert!(!kh.has_epoch_key(2));
 
-        let returned_key = EpochManager::post_rekey(&relay, &mut kh, "sender", 2).await.unwrap();
+        let returned_key =
+            EpochManager::post_rekey(&relay, &mut kh, "sender", 2, &pinned).await.unwrap();
 
         // Epoch 2 key should now be stored in the hierarchy
         assert!(kh.has_epoch_key(2));
         let stored_key = kh.epoch_key(2).unwrap();
         assert_eq!(stored_key, &*returned_key);
         assert_eq!(stored_key.len(), 32);
+    }
+
+    /// A relay that injects an extra "active" recipient absent from the pinned
+    /// registry must abort the whole rotation — never silently wrap to it.
+    #[test]
+    fn prepare_wrapped_keys_rejects_injected_recipient_absent_from_pinned() {
+        let pinned_secret = DeviceSecret::generate();
+        let pinned_xwing = pinned_secret.xwing_keypair("pinned-dev").unwrap();
+        let injected_secret = DeviceSecret::generate();
+        let injected_xwing = injected_secret.xwing_keypair("injected-dev").unwrap();
+
+        let pinned_device = DeviceInfo {
+            device_id: "pinned-dev".to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: vec![],
+            x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: pinned_xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        };
+        // Pinned registry knows only the legitimate device.
+        let pinned = pinned_from_devices(std::slice::from_ref(&pinned_device));
+
+        // Relay list adds an attacker-controlled "active" device.
+        let relay_devices = vec![
+            pinned_device,
+            DeviceInfo {
+                device_id: "injected-dev".to_string(),
+                epoch: 1,
+                status: "active".to_string(),
+                ed25519_public_key: vec![],
+                x25519_public_key: vec![],
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
+                x_wing_public_key: injected_xwing.encapsulation_key_bytes(),
+                permission: None,
+                ml_dsa_key_generation: 0,
+            },
+        ];
+
+        let result = EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
+        let err = result.expect_err("injected recipient must abort the rotation");
+        assert!(
+            err.to_string().contains("not in the pinned registry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A relay that swaps a known device's X-Wing key (key differs from the
+    /// pinned record) must abort the rotation, not wrap to the swapped key.
+    #[test]
+    fn prepare_wrapped_keys_rejects_swapped_xwing_key() {
+        let real_secret = DeviceSecret::generate();
+        let real_xwing = real_secret.xwing_keypair("dev").unwrap();
+        let attacker_secret = DeviceSecret::generate();
+        let attacker_xwing = attacker_secret.xwing_keypair("dev").unwrap();
+
+        // Pinned record holds the REAL key.
+        let pinned = pinned_from_devices(&[DeviceInfo {
+            device_id: "dev".to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: vec![],
+            x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: real_xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        }]);
+
+        // Relay swaps in the attacker's X-Wing key for the same device_id.
+        let relay_devices = vec![DeviceInfo {
+            device_id: "dev".to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: vec![],
+            x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: attacker_xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        }];
+
+        let result = EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
+        let err = result.expect_err("swapped X-Wing key must abort the rotation");
+        assert!(
+            err.to_string().contains("differs from pinned registry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Positive control: when the relay list matches the pinned registry, the
+    /// wrap succeeds and produces an artifact for the surviving device.
+    #[test]
+    fn prepare_wrapped_keys_accepts_relay_list_matching_pinned() {
+        let secret = DeviceSecret::generate();
+        let xwing = secret.xwing_keypair("dev").unwrap();
+
+        let device = DeviceInfo {
+            device_id: "dev".to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: vec![],
+            x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+        };
+        let pinned = pinned_from_devices(std::slice::from_ref(&device));
+        let relay_devices = vec![device];
+
+        let (_key, wrapped) =
+            EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned)
+                .expect("matching relay/pinned should wrap");
+        assert!(wrapped.contains_key("dev"), "surviving device should get a wrapped key");
+    }
+
+    /// `handle_rotation` must refuse and install nothing when the signed
+    /// registry carries NO `epoch_key_hashes` entry for the epoch — distinct
+    /// from the hash-mismatch case (here there is no committed hash at all).
+    #[tokio::test]
+    async fn handle_rotation_rejects_when_registry_lacks_epoch_hash() {
+        let receiver_secret = DeviceSecret::generate();
+        let receiver_xwing = receiver_secret.xwing_keypair("receiver").unwrap();
+
+        // Real artifact wrapping a valid key, but the signed registry commits a
+        // DIFFERENT epoch (7), so there is no epoch_key_hashes[5] to bind to.
+        let epoch_key = vec![0xABu8; 32];
+        let artifact = build_v2_artifact(&receiver_xwing, &epoch_key, 5, "receiver");
+        let snapshot = single_epoch_snapshot(7, &[0x22u8; 32]);
+
+        let relay = MockRelay::new_with_artifact(Some(artifact));
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let result =
+            EpochManager::handle_rotation(&relay, &mut kh, 5, "receiver", &receiver_xwing, &snapshot)
+                .await;
+        let err = result.expect_err("missing epoch hash must be refused");
+        assert!(
+            err.to_string().contains("no epoch_key_hash for epoch 5"),
+            "unexpected error: {err}"
+        );
+        assert!(!kh.has_epoch_key(5), "no key may be installed when the hash is uncommitted");
     }
 }
