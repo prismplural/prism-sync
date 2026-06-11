@@ -457,7 +457,7 @@ mod tests {
             device_message_max_payload_bytes: 4096,
             device_message_send_rate_limit: 100,
             device_message_send_rate_window_secs: 60,
-            device_message_max_pending: 256,
+            device_message_max_pending: 2048,
             device_message_fetch_limit: 256,
             gif_provider_mode: crate::config::GifProviderMode::Disabled,
             gif_public_base_url: None,

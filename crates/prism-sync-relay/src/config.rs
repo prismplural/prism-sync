@@ -199,7 +199,13 @@ pub struct Config {
     /// Sliding window in seconds for the mailbox send rate limiter.
     pub device_message_send_rate_window_secs: u64,
     /// Max non-expired mailbox messages a single sender may hold outstanding
-    /// (per-sender pending cap), bounding stored bytes.
+    /// (per-sender pending cap), bounding stored bytes + recipient drain work.
+    /// Sized for the C4 heal: a chronically-missing blob re-requests on backoff
+    /// (≈1 coalesced row per dedup window) and each row lives
+    /// `device_message_ttl_secs`, so a few genuinely-no-holder blobs would
+    /// otherwise saturate a tight cap and 429 even `media_uploaded` announces.
+    /// 2048 gives ample headroom (<1 MB/sender); if real saturation appears,
+    /// exempt announces from the cap rather than raising it further.
     pub device_message_max_pending: u32,
     /// Max messages returned by one GET-pending mailbox drain (clients page).
     pub device_message_fetch_limit: u32,
@@ -465,7 +471,7 @@ impl Config {
                 "DEVICE_MESSAGE_SEND_RATE_WINDOW_SECS",
                 60,
             ),
-            device_message_max_pending: parse_env_with(&env, "DEVICE_MESSAGE_MAX_PENDING", 256),
+            device_message_max_pending: parse_env_with(&env, "DEVICE_MESSAGE_MAX_PENDING", 2048),
             device_message_fetch_limit: parse_env_with(&env, "DEVICE_MESSAGE_FETCH_LIMIT", 256),
             default_request_timeout_secs: parse_env_with(&env, "DEFAULT_REQUEST_TIMEOUT_SECS", 30),
             snapshot_request_timeout_secs: parse_env_with(
@@ -802,7 +808,7 @@ pub fn localhost_test_config() -> Config {
         device_message_max_payload_bytes: 4096,
         device_message_send_rate_limit: 100,
         device_message_send_rate_window_secs: 60,
-        device_message_max_pending: 256,
+        device_message_max_pending: 2048,
         device_message_fetch_limit: 256,
         default_request_timeout_secs: 30,
         snapshot_request_timeout_secs: 300,
