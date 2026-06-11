@@ -168,10 +168,8 @@ pub struct Config {
     /// the quota preflight. Bounds per-upload work; the cleanup loop is the
     /// catch-all backstop.
     pub media_expired_sweep_cap: u32,
-    /// Per-group ceiling, in bytes, on live EPHEMERAL (TTL-bearing) media —
-    /// both re-supply/heal (C4) and pairing-push (C5) — so demand-driven heal
-    /// and pairing bursts can't fill the quota faster than the short TTL sheds
-    /// it. Enforced as a preflight soft cap in the media upload route.
+    /// Per-group ceiling, in bytes, on live EPHEMERAL (TTL-bearing) media.
+    /// Covers re-supply/heal and pairing-push uploads as a preflight soft cap.
     pub media_resupply_byte_ceiling_bytes: u64,
     /// Re-supply/heal uploads allowed per group within
     /// `media_resupply_rate_window_secs` — a separate lane from fresh-send so
@@ -179,14 +177,14 @@ pub struct Config {
     pub media_resupply_rate_limit: u32,
     /// Sliding window in seconds for the re-supply rate limiter.
     pub media_resupply_rate_window_secs: u64,
-    /// Pairing-push uploads (C5) allowed per group within
+    /// Pairing-push uploads allowed per group within
     /// `media_pairing_push_rate_window_secs` — a separate, more generous bucket
     /// (vs re-supply) so a joiner-bootstrap burst can't consume the group's
     /// fresh-send budget and heal/pairing don't contend.
     pub media_pairing_push_rate_limit: u32,
     /// Sliding window in seconds for the pairing-push limiter.
     pub media_pairing_push_rate_window_secs: u64,
-    /// Ephemeral signal lane / device-message mailbox (C3): TTL in seconds for a
+    /// Device-message mailbox TTL in seconds for a
     /// stored mailbox message (default 7 days). Short, so the mailbox sheds fast.
     pub device_message_ttl_secs: u64,
     /// Max size in bytes of a mailbox payload BLOB. Clients send a fixed-size
@@ -200,12 +198,8 @@ pub struct Config {
     pub device_message_send_rate_window_secs: u64,
     /// Max non-expired mailbox messages a single sender may hold outstanding
     /// (per-sender pending cap), bounding stored bytes + recipient drain work.
-    /// Sized for the C4 heal: a chronically-missing blob re-requests on backoff
-    /// (≈1 coalesced row per dedup window) and each row lives
-    /// `device_message_ttl_secs`, so a few genuinely-no-holder blobs would
-    /// otherwise saturate a tight cap and 429 even `media_uploaded` announces.
-    /// 2048 gives ample headroom (<1 MB/sender); if real saturation appears,
-    /// exempt announces from the cap rather than raising it further.
+    /// Sized so a few genuinely-missing blobs can retry across the full mailbox
+    /// TTL without blocking `media_uploaded` announces.
     pub device_message_max_pending: u32,
     /// Max messages returned by one GET-pending mailbox drain (clients page).
     pub device_message_fetch_limit: u32,

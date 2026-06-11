@@ -452,9 +452,7 @@ impl SyncEngine {
             }
         }
 
-        // Phase 3: drain the ephemeral device-message mailbox (media re-supply
-        // C3). Best-effort and non-fatal — runs only after a successful
-        // pull/push so a failed cycle (which returns early above) just retries.
+        // Drain the ephemeral mailbox after a successful pull/push.
         self.drain_ephemeral_messages(sync_id, key_hierarchy).await;
 
         result.duration = start.elapsed();
@@ -478,7 +476,7 @@ impl SyncEngine {
         let _ = self.state_tx.send(state);
     }
 
-    /// Drain the relay's ephemeral device-message mailbox (media re-supply C3):
+    /// Drain the relay's ephemeral device-message mailbox:
     /// decrypt each pending message, surface the readable ones as
     /// [`SyncEvent::EphemeralMessage`], and ACK every drained id (decryptable or
     /// not — see [`crate::ephemeral::process_ephemeral_drain`]).
@@ -2553,7 +2551,7 @@ mod tests {
         assert!(should_suppress_stale_snapshot(Some("joiner-A"), Some("joiner-A"), 42, 42));
     }
 
-    // -- Ephemeral mailbox drain (media re-supply C3) ----------------------
+    // -- Ephemeral mailbox drain -------------------------------------------
 
     fn drain_test_engine(relay: Arc<crate::relay::MockRelay>) -> (SyncEngine, broadcast::Receiver<SyncEvent>) {
         let storage = Arc::new(crate::storage::RusqliteSyncStorage::in_memory().unwrap());

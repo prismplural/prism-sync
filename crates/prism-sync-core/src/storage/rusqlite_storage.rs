@@ -2867,8 +2867,7 @@ mod tests {
         assert_eq!(snapshot.applied_ops.len(), 2);
     }
 
-    /// Regression for the P1 from the third codex review pass: push ordering
-    /// across multi-batch partitions used to invert in a boundary case.
+    /// Regression for push ordering across multi-batch partitions.
     ///
     /// **Background:** `to_rfc3339()` strips trailing zeros, so an exact-
     /// millisecond timestamp emits `12:34:56.123Z` while the very next +1µs

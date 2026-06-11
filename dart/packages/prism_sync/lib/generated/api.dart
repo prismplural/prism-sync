@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `map_media_fetch_error_kind`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `effective_allow_insecure`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_localhost_url`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `map_media_fetch_error_kind`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `url_host`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `RollbackCredentialSnapshot`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -17,13 +17,21 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 /// panic payload + source location captured by the hook installed at engine
 /// creation. Returns `None` when no panic has been captured since the last
 /// call (the slot is cleared on read).
+///
+/// The payload is run through [`redact_sensitive_message`] before it leaves
+/// the FFI boundary: panic messages (e.g. an `assert_eq!` / `expect` on a
+/// secret-typed operand) can otherwise carry key material into the Dart logs.
 Future<String?> takeLastPanic() => RustLib.instance.api.crateApiTakeLastPanic();
 
 /// Build and configure a PrismSync instance.
 ///
 /// - `relay_url`: The relay server URL.
 /// - `db_path`: SQLite database path, or ":memory:" for in-memory.
-/// - `allow_insecure`: Allow http:// relay URLs (dev only).
+/// - `allow_insecure`: Allow http:// relay URLs (dev only). For a
+///   **non-localhost** host this is honored only when the crate is built with
+///   the `insecure-transport-dev` feature; release builds force it to `false`
+///   so cleartext can never reach the open network. `http://localhost` stays
+///   allowed regardless.
 /// - `schema_json`: JSON schema definition (see `parse_schema_json` docs).
 ///   Pass an empty string or "{}" to use an empty schema.
 ///
@@ -357,10 +365,8 @@ Future<void> onResume({required PrismSyncHandle handle}) =>
 /// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
 /// push); the relay clamps it and an old relay ignores it (default retention).
 ///
-/// `pairing_push` tags the upload as a pairing-bootstrap push (media re-supply
-/// C5) so the relay meters it on the dedicated pairing-push rate lane rather
-/// than the re-supply lane. Only meaningful with a `ttl_secs`; a fresh send
-/// passes `false`.
+/// `pairing_push` tags the upload for the dedicated pairing-push rate lane.
+/// Only meaningful with a `ttl_secs`; a fresh send passes `false`.
 ///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 Future<MediaUploadOutcome> uploadMedia({
@@ -381,11 +387,8 @@ Future<MediaUploadOutcome> uploadMedia({
 
 /// Download an encrypted media blob from the relay.
 ///
-/// Returns a typed [`MediaDownloadOutcome`] (`bytes` xor `error`) so the C4 heal
-/// can distinguish a missing blob (`NotFound` → request a re-supply) from a
-/// transient transport error (retry) from auth. A relay 404 surfaces as
-/// `NotFound` (mapped locally in `ServerRelay::download_media`, not the shared
-/// classifier). The outer `Err(String)` is only "relay not configured".
+/// Returns a typed [`MediaDownloadOutcome`] (`bytes` xor `error`). A relay 404
+/// surfaces as `NotFound`; the outer `Err(String)` is only "relay not configured".
 ///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 Future<MediaDownloadOutcome> downloadMedia({
@@ -396,9 +399,7 @@ Future<MediaDownloadOutcome> downloadMedia({
   mediaId: mediaId,
 );
 
-/// Return the subset of `media_ids` the relay currently holds and can serve
-/// (C2 batch-exists). Lets the caller skip blobs the relay already has before
-/// requesting (C4) or pushing (C5) them.
+/// Return the subset of `media_ids` the relay currently holds and can serve.
 ///
 /// Requires `configure_engine`. Against an old relay without the endpoint this
 /// returns an error string; the caller treats "feature absent" as a no-op
@@ -411,14 +412,10 @@ Future<List<String>> mediaExists({
   mediaIds: mediaIds,
 );
 
-/// Send one sealed ephemeral message to the relay's device-message mailbox
-/// (media re-supply C3). `kind` is an app-level label (e.g. `"media_request"` /
-/// `"media_uploaded"`); `recipient_device_id` targets a single device or `None`
-/// broadcasts to the group. The envelope is sealed with this client's current
-/// epoch key under the state lock, then transported.
+/// Send one sealed ephemeral message to the relay's device-message mailbox.
 ///
 /// Requires `configure_engine`. Against an old relay without the endpoint this
-/// returns an error string; the caller (C4) treats "feature absent" as a no-op.
+/// returns an error string; callers treat "feature absent" as a no-op.
 Future<void> sendEphemeral({
   required PrismSyncHandle handle,
   required String kind,
@@ -616,14 +613,21 @@ Future<String> listDevices({
 /// credential clear) on this verified result, never on the hint alone.
 ///
 /// Uses the engine relay configured by [`configure_engine`] (so a valid session
-/// token is in scope). Returns a stable lowercase string:
-/// - `"revoked"`  — verified signed registry marks this device `revoked`.
-/// - `"active"`   — verified signed registry lists this device non-revoked.
-/// - `"unknown"`  — inconclusive (no registry, verification failed, relay error,
-///   self absent). Fail-safe: callers must NOT wipe or clear credentials.
+/// token is in scope). Returns a stable JSON string (H3 Layer B):
+/// - `{"status":"revoked","remote_wipe":<bool>}` — verified signed registry
+///   marks this device `revoked`; `remote_wipe` is the admin-authenticated wipe
+///   intent read from the SAME signature-verified entry (defaults `false` for
+///   older snapshots that omit it). Callers MUST drive any local data wipe from
+///   this verified bit, never from the relay's `device_revoked` frame / error.
+/// - `{"status":"active"}`  — verified signed registry lists this device
+///   non-revoked.
+/// - `{"status":"unknown"}` — inconclusive (no registry, verification failed,
+///   relay error, self absent). Fail-safe: callers must NOT wipe or clear creds.
 ///
-/// Never returns `Err`: every failure mode collapses to `"unknown"` so a relay
-/// cannot weaponize an error into a destructive outcome.
+/// Never returns `Err`: every failure mode collapses to `{"status":"unknown"}`
+/// so a relay cannot weaponize an error into a destructive outcome. The
+/// `Result<String, String>` signature is unchanged from the prior lowercase-
+/// string form, so no flutter_rust_bridge type regeneration is required.
 Future<String> confirmSelfRevocation({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiConfirmSelfRevocation(handle: handle);
 
@@ -971,11 +975,6 @@ Future<String> sharingUnwrapKeys({
 Future<Uint8List> getIdentityPublicKey({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiGetIdentityPublicKey(handle: handle);
 
-// performEcdh removed: dead FFI (no production consumer). The standalone X25519
-// ECDH it exposed returned a raw shared secret with no contributory check. The
-// remaining `crateApiPerformEcdh` plumbing below is dead and will be dropped on
-// the next `flutter_rust_bridge_codegen generate`.
-
 /// Encrypt plaintext with XChaCha20-Poly1305. Returns `nonce || ciphertext+MAC`.
 Future<Uint8List> encryptXchacha({
   required List<int> key,
@@ -1178,7 +1177,7 @@ abstract class MemorySecureStore implements RustOpaqueInterface {
 abstract class PrismSyncHandle implements RustOpaqueInterface {}
 
 /// The result of a media download: exactly one of `bytes` / `error` is `Some`.
-/// A `Some(error)` is a *normal*, typed failure the caller (C4) handles; the
+/// A `Some(error)` is a normal typed failure; the
 /// outer `Result`'s `Err(String)` is reserved for misconfiguration (no relay).
 class MediaDownloadOutcome {
   final Uint8List? bytes;
@@ -1198,12 +1197,9 @@ class MediaDownloadOutcome {
           error == other.error;
 }
 
-/// Why a media download failed, surfaced typed to Dart so the C4 heal can act
-/// on it (today every failure collapses to `null`). `decrypt` is never produced
-/// by the relay download itself — the Dart/FFI decrypt step raises it — but it
-/// is part of the unified type the app's `MediaFetchError` mirrors.
+/// Why a media download failed, surfaced typed to Dart.
 enum MediaFetchErrorKind {
-  /// The relay returned 404 — the blob is missing (the C4 heal's trigger).
+  /// The relay returned 404; the blob is missing.
   notFound,
 
   /// Transport-level failure (connect/request/no status).
@@ -1229,7 +1225,7 @@ enum MediaFetchErrorKind {
 ///
 /// `committed` ⇒ the blob is committed and servable (relay HTTP 200).
 /// `in_progress` ⇒ another writer holds the PENDING reserve (relay HTTP 202):
-/// this is **not** a success to act on — the caller (C4 responder) must back off
+/// this is not a success to act on; the caller must back off
 /// and re-check batch-exists rather than broadcast `media_uploaded`.
 class MediaUploadOutcome {
   final bool committed;

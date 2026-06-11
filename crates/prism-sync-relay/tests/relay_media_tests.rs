@@ -723,7 +723,7 @@ async fn media_upload_completes_past_default_timeout() {
     );
 }
 
-// ───────────────────────── C1: lifecycle / TTL / idempotent upsert ─────────────
+// ───────────────────── Lifecycle / TTL / idempotent upsert ─────────────────
 
 /// Upload helper that also sends an `X-Media-TTL` header (re-supply variant).
 /// The header is intentionally NOT covered by the request signature, so a
@@ -756,7 +756,7 @@ async fn upload_media_with_ttl(
         .unwrap()
 }
 
-/// Upload helper for a C5 pairing push: TTL-bearing AND tagged
+/// Upload helper for a pairing push: TTL-bearing AND tagged
 /// `X-Media-Upload-Class: pairing`, so the relay meters it on the pairing-push
 /// lane. Like the TTL header, the class header is unsigned.
 #[allow(clippy::too_many_arguments)]
@@ -856,7 +856,7 @@ async fn upload_with_ttl_sets_clamped_expires_at() {
     assert_eq!(row.expires_at, Some(row.created_at + 7_776_000), "clamped to retention ceiling");
 }
 
-// ───────────────────── C4: re-supply rate lane + byte ceiling ─────────────────
+// ───────────────────── Re-supply rate lane + byte ceiling ──────────────────
 
 /// A TTL-bearing (re-supply / heal) upload rides a SEPARATE rate bucket from a
 /// fresh send, so demand-driven heal can neither starve fresh user sends nor be
@@ -1015,7 +1015,7 @@ async fn idempotent_resupply_reupload_is_exempt_from_ceiling() {
     assert_eq!(r.status(), 200, "idempotent re-upload at the cap is ceiling-exempt");
 }
 
-// ───────────────────── C5: pairing-push rate lane ─────────────────────────────
+// ───────────────────── Pairing-push rate lane ──────────────────────────────
 
 /// A pairing push (`X-Media-Upload-Class: pairing` + TTL) rides a THIRD,
 /// independent rate bucket — distinct from both fresh-send and re-supply — so a
@@ -1421,7 +1421,7 @@ async fn always_sweep_keeps_disk_near_quota() {
     assert!(final_media_path(&storage, &sync_id, "c-fresh").exists());
 }
 
-// ───────────────────────── C2: batch-exists ─────────────────────────
+// ───────────────────── Batch-exists ────────────────────────────────────────
 
 async fn batch_exists(
     client: &Client,

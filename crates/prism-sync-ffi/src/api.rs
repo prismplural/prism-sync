@@ -2446,19 +2446,16 @@ pub async fn on_resume(handle: &PrismSyncHandle) -> Result<(), String> {
 ///
 /// `committed` ⇒ the blob is committed and servable (relay HTTP 200).
 /// `in_progress` ⇒ another writer holds the PENDING reserve (relay HTTP 202):
-/// this is **not** a success to act on — the caller (C4 responder) must back off
+/// this is not a success to act on; the caller must back off
 /// and re-check batch-exists rather than broadcast `media_uploaded`.
 pub struct MediaUploadOutcome {
     pub committed: bool,
     pub in_progress: bool,
 }
 
-/// Why a media download failed, surfaced typed to Dart so the C4 heal can act
-/// on it (today every failure collapses to `null`). `decrypt` is never produced
-/// by the relay download itself — the Dart/FFI decrypt step raises it — but it
-/// is part of the unified type the app's `MediaFetchError` mirrors.
+/// Why a media download failed, surfaced typed to Dart.
 pub enum MediaFetchErrorKind {
-    /// The relay returned 404 — the blob is missing (the C4 heal's trigger).
+    /// The relay returned 404; the blob is missing.
     NotFound,
     /// Transport-level failure (connect/request/no status).
     Network,
@@ -2475,7 +2472,7 @@ pub enum MediaFetchErrorKind {
 }
 
 /// The result of a media download: exactly one of `bytes` / `error` is `Some`.
-/// A `Some(error)` is a *normal*, typed failure the caller (C4) handles; the
+/// A `Some(error)` is a normal typed failure; the
 /// outer `Result`'s `Err(String)` is reserved for misconfiguration (no relay).
 pub struct MediaDownloadOutcome {
     pub bytes: Option<Vec<u8>>,
@@ -2505,13 +2502,11 @@ fn map_media_fetch_error_kind(
 
 /// Upload an encrypted media blob to the relay.
 ///
-/// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
-/// push); the relay clamps it and an old relay ignores it (default retention).
+/// `ttl_secs` optionally requests a short per-blob TTL; the relay clamps it and
+/// an old relay ignores it.
 ///
-/// `pairing_push` tags the upload as a pairing-bootstrap push (media re-supply
-/// C5) so the relay meters it on the dedicated pairing-push rate lane rather
-/// than the re-supply lane. Only meaningful with a `ttl_secs`; a fresh send
-/// passes `false`.
+/// `pairing_push` tags the upload for the dedicated pairing-push rate lane.
+/// Only meaningful with a `ttl_secs`; a fresh send passes `false`.
 ///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 pub async fn upload_media(
@@ -2543,11 +2538,8 @@ pub async fn upload_media(
 
 /// Download an encrypted media blob from the relay.
 ///
-/// Returns a typed [`MediaDownloadOutcome`] (`bytes` xor `error`) so the C4 heal
-/// can distinguish a missing blob (`NotFound` → request a re-supply) from a
-/// transient transport error (retry) from auth. A relay 404 surfaces as
-/// `NotFound` (mapped locally in `ServerRelay::download_media`, not the shared
-/// classifier). The outer `Err(String)` is only "relay not configured".
+/// Returns a typed [`MediaDownloadOutcome`] (`bytes` xor `error`). A relay 404
+/// surfaces as `NotFound`; the outer `Err(String)` is only "relay not configured".
 ///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
 pub async fn download_media(
@@ -2585,9 +2577,7 @@ pub async fn download_media(
     }
 }
 
-/// Return the subset of `media_ids` the relay currently holds and can serve
-/// (C2 batch-exists). Lets the caller skip blobs the relay already has before
-/// requesting (C4) or pushing (C5) them.
+/// Return the subset of `media_ids` the relay currently holds and can serve.
 ///
 /// Requires `configure_engine`. Against an old relay without the endpoint this
 /// returns an error string; the caller treats "feature absent" as a no-op
@@ -2609,14 +2599,10 @@ pub async fn media_exists(
     }
 }
 
-/// Send one sealed ephemeral message to the relay's device-message mailbox
-/// (media re-supply C3). `kind` is an app-level label (e.g. `"media_request"` /
-/// `"media_uploaded"`); `recipient_device_id` targets a single device or `None`
-/// broadcasts to the group. The envelope is sealed with this client's current
-/// epoch key under the state lock, then transported.
+/// Send one sealed ephemeral message to the relay's device-message mailbox.
 ///
 /// Requires `configure_engine`. Against an old relay without the endpoint this
-/// returns an error string; the caller (C4) treats "feature absent" as a no-op.
+/// returns an error string; callers treat "feature absent" as a no-op.
 pub async fn send_ephemeral(
     handle: &PrismSyncHandle,
     kind: String,

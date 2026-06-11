@@ -1,5 +1,4 @@
-//! Ephemeral signal lane (media re-supply C3): crypto for the relay-blind
-//! store-and-forward mailbox.
+//! Crypto for the relay-blind ephemeral media mailbox.
 //!
 //! A device that needs a missing blob (or has just uploaded one) posts a small,
 //! fixed-size **opaque** message to the relay's `device_messages` mailbox; peers
@@ -65,9 +64,8 @@ const PAYLOAD_AAD_DOMAIN: &[u8] = b"PRISM_MEDIA_EPHEMERAL_PAYLOAD_V1";
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
 /// Dedup window granularity (seconds): the same request issued by any device in
-/// the group within one window maps to the same `message_id`. Matches the C4
-/// requester's per-media cooldown. MUST be identical across all clients in a
-/// group or the relay can't coalesce duplicates.
+/// the group within one window maps to the same `message_id`. Must be identical
+/// across all clients in a group or the relay can't coalesce duplicates.
 pub const EPHEMERAL_DEDUP_WINDOW_SECS: u64 = 300;
 
 /// Fixed plaintext length (bytes) every ephemeral payload is padded to BEFORE
@@ -101,7 +99,7 @@ pub struct EphemeralEnvelope {
     /// Sender device id. Set by the relay from the *authenticated* identity on
     /// fetch (so it's a real group member), but **not bound by the payload
     /// AAD** — it is untrusted transport metadata, not cryptographically tied to
-    /// the sealed contents. A malicious relay could misattribute it. C4 must NOT
+    /// the sealed contents. A malicious relay could misattribute it. Heal callers must not
     /// use it for any security decision (e.g. only-respond-to-device-X logic);
     /// fold it into the AAD if that ever becomes a requirement. **Ignored on
     /// send** (left empty by `seal_envelope`; the relay stamps it).
@@ -323,7 +321,7 @@ pub struct DecodedEphemeral {
 /// surfaced `SyncEvent::EphemeralMessage` finds a subscriber (the engine's emit
 /// is best-effort and drops on a zero-receiver channel). A momentarily
 /// unsubscribed app can therefore miss one delivery — fine for this lane: the
-/// C4 requester re-issues on its next cadence tick.
+/// heal requester re-issues on its next cadence tick.
 pub fn process_ephemeral_drain(
     key_hierarchy: &prism_sync_crypto::KeyHierarchy,
     sync_id: &str,

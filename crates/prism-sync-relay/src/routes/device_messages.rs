@@ -1,4 +1,4 @@
-//! Ephemeral signal lane (media re-supply C3): the relay-blind device-message
+//! Ephemeral signal lane (ephemeral media mailbox): the relay-blind device-message
 //! mailbox HTTP surface — send / pending / ack.
 //!
 //! All three routes are bearer-authenticated **and** request-signed (a stolen
@@ -92,11 +92,7 @@ pub async fn send_device_message(
         return Err(AppError::PayloadTooLarge("Device message payload too large"));
     }
 
-    // Per-sender-device send rate limit — the request-storm bound. Note this is
-    // consumed before the DB dedup runs, so an in-window re-send of an
-    // already-stored message_id (which would coalesce harmlessly at the PK)
-    // still costs a token; the limiter is a coarse storm backstop, and the C4
-    // requester's per-media cooldown keeps honest senders well under it.
+    // Count sends before DB dedup so repeated requests still hit the storm cap.
     let rate_key = format!("device_msg_send:{}:{}", auth.sync_id, auth.device_id);
     if !state.device_message_send_rate_limiter.check(
         &rate_key,

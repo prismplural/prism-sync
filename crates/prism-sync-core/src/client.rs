@@ -2432,8 +2432,8 @@ impl PrismSync {
         self.device_secret.as_ref()
     }
 
-    /// Build a sealed ephemeral-message envelope for the device-message mailbox
-    /// (media re-supply C3), keyed by this client's current epoch key. Pure
+    /// Build a sealed ephemeral-message envelope for the device-message mailbox,
+    /// keyed by this client's current epoch key. Pure
     /// (no I/O) so the FFI can construct it under the state lock and then
     /// transport it via [`MediaRelay::send_ephemeral`](crate::relay::traits::MediaRelay::send_ephemeral)
     /// without holding the lock across the network call.

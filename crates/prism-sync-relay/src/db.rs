@@ -524,7 +524,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             ON sharing_id_mappings(sharing_id);
 
         -- Media blob metadata
-        -- Upload lifecycle (see media-resupply C1): a row is PENDING while its
+        -- Upload lifecycle: a row is PENDING while its
         -- staged file is being promoted (`committed_at IS NULL AND reserved_at`
         -- set) and COMMITTED (servable) once `committed_at` is set. `reserved_at`
         -- distinguishes a genuine in-flight reserve from a legacy pre-lifecycle
@@ -545,7 +545,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_media_sync_id ON media_metadata(sync_id);
         CREATE INDEX IF NOT EXISTS idx_media_expires ON media_metadata(expires_at) WHERE expires_at IS NOT NULL;
 
-        -- Ephemeral signal lane (media re-supply C3): a relay-blind
+        -- Ephemeral signal lane: a relay-blind
         -- store-and-forward mailbox. A sender posts a small fixed-size opaque
         -- `payload` (kind + media_id live encrypted under the group epoch key);
         -- recipients drain it on their next sync. `recipient_device_id IS NULL`
@@ -2339,7 +2339,7 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<Vec<String>
     tx.execute("DELETE FROM batches WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM snapshots WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM media_metadata WHERE sync_id = ?1", params![sync_id])?;
-    // Ephemeral mailbox (C3): acks first, then messages (FK to sync_groups).
+    // Ephemeral mailbox: acks first, then messages (FK to sync_groups).
     tx.execute("DELETE FROM device_message_acks WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM device_messages WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM registration_nonces WHERE sync_id = ?1", params![sync_id])?;
@@ -2749,9 +2749,8 @@ pub fn get_group_media_usage(conn: &Connection, sync_id: &str) -> Result<i64, ru
     get_group_media_usage_at(conn, sync_id, now_secs(), i64::MAX)
 }
 
-/// Live bytes of the group's *ephemeral* (TTL-bearing) media — both the
-/// re-supply / heal lane (C4) and the pairing-push lane (C5), since the byte
-/// ceiling spans both. Identical accounting to [`get_group_media_usage_at`] but
+/// Live bytes of the group's *ephemeral* (TTL-bearing) media. Identical
+/// accounting to [`get_group_media_usage_at`] but
 /// restricted to rows with a finite `expires_at`, i.e. blobs uploaded with an
 /// `X-Media-TTL` (regardless of upload class). A fresh send
 /// (default retention) stores `expires_at IS NULL` and is excluded; a blob later
@@ -3085,9 +3084,9 @@ pub fn all_media_keys(conn: &Connection) -> Result<Vec<(String, String)>, rusqli
 
 /// Return the subset of `media_ids` (scoped to `sync_id`) that the relay
 /// considers servable at the metadata level — committed, not soft-deleted, not
-/// past TTL — for the C2 `batch-exists` endpoint. Metadata-only is sound after
-/// the reconciliation sweep (C1) repairs legacy file-missing crash rows; C4
-/// tolerates residual divergence (download-404 ⇒ request anyway).
+/// past TTL — for the `batch-exists` endpoint. Metadata-only is sound after
+/// the reconciliation sweep repairs legacy file-missing crash rows; heal callers
+/// tolerate residual divergence by retrying after download 404s.
 ///
 /// `media_ids` MUST be bounded by the caller (the route caps the request size).
 pub fn servable_media_subset(
@@ -3541,7 +3540,7 @@ pub fn cleanup_expired_sharing_init_payloads(conn: &Connection) -> Result<usize,
 }
 
 // ---------------------------------------------------------------------------
-// Ephemeral signal lane / device-message mailbox (media re-supply C3)
+// Ephemeral signal lane / device-message mailbox
 // ---------------------------------------------------------------------------
 
 /// One pending mailbox message returned to a draining recipient.
@@ -5291,7 +5290,7 @@ mod tests {
         .unwrap();
     }
 
-    // ── Media upload lifecycle (C1) ──────────────────────────────────────────
+    // ── Media upload lifecycle ───────────────────────────────────────────
 
     /// Create a sync group so media FKs are satisfiable.
     fn media_test_db() -> Database {
@@ -5720,7 +5719,7 @@ mod tests {
     fn reserve_cross_sync_same_media_id_is_conflict_and_leaves_other_group_untouched() {
         // media_id is a GLOBAL primary key. A row owned by another sync group
         // must never be mutated/promoted by this group's upload — even on the
-        // same content hash (the cross-tenant hole codex flagged).
+        // same content hash (the cross-tenant hole).
         let db = media_test_db();
         db.with_conn(|c| create_sync_group(c, "sg2", 0)).unwrap();
         let now = 1_000_000;
@@ -5859,7 +5858,7 @@ mod tests {
         assert_eq!(db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now + 10_000, 300)).unwrap(), 0);
     }
 
-    // -- Ephemeral mailbox (C3) --------------------------------------------
+    // -- Ephemeral mailbox ---------------------------------------------
 
     /// Create a group `g` with `devices` registered active.
     fn mailbox_group(db: &Database, devices: &[&str]) {

@@ -1,5 +1,4 @@
-//! Integration tests for the ephemeral device-message mailbox (media re-supply
-//! C3): `POST /v1/sync/{sync_id}/device-messages`, `GET …/pending`, `POST …/ack`.
+//! Integration tests for the ephemeral device-message mailbox.
 
 mod common;
 

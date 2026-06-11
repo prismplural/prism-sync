@@ -1167,7 +1167,7 @@ impl MediaRelay for ServerRelay {
         let status = resp.status().as_u16();
         if status >= 400 {
             // Map a media 404 to NotFound LOCALLY (not in the shared
-            // `classify_error`): a missing blob is the C4 heal's trigger, not a
+            // `classify_error`): a missing blob is the media heal's trigger, not a
             // protocol error. The shared classifier serves many sync routes
             // where a 404 is terminal, and `NotFound` maps to the retryable
             // `Server` category (error.rs / sync_service.rs) — making it generic
@@ -1199,17 +1199,15 @@ impl MediaRelay for ServerRelay {
 
         let status = resp.status().as_u16();
         if status >= 400 {
-            // 404/405 from an old relay surfaces here; C4 treats that as
+            // 404/405 from an old relay surfaces here; heal callers treat that as
             // "feature absent", distinct from a successful empty result.
             let body_text = resp.text().await.unwrap_or_default();
             return Err(Self::classify_error(status, &body_text));
         }
 
         let body: serde_json::Value = resp.json().await.map_err(Self::classify_reqwest_error)?;
-        // A 200 that lacks a `present` array is a malformed response (e.g. a
-        // misbehaving proxy) — surface it as an error rather than silently
-        // reading it as "all absent", which C4 would misinterpret as "request
-        // everything".
+        // A 200 without `present` is malformed; "all absent" would request
+        // every missing blob.
         match body.get("present").and_then(|p| p.as_array()) {
             Some(arr) => {
                 Ok(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -1459,7 +1457,7 @@ mod tests {
 
     #[test]
     fn shared_classify_error_keeps_404_as_protocol() {
-        // 404 → NotFound is mapped LOCALLY in `download_media` only (C4). The
+        // 404 → NotFound is mapped LOCALLY in `download_media` only. The
         // shared classifier must keep 404 → Protocol so terminal sync-route 404s
         // don't become the retryable Server category that NotFound maps to —
         // which would retry them forever.

@@ -631,7 +631,7 @@ pub trait SnapshotExchange: Send + Sync {
 /// The relay's idempotent upsert returns HTTP 200 when the blob is committed
 /// (insert / idempotent / repair / resurrect) and HTTP 202 when a concurrent
 /// writer already holds the PENDING reserve. **Only a `committed` outcome is a
-/// success the caller may act on** — e.g. C4's responder may broadcast
+/// success the caller may act on** — e.g. the heal responder may broadcast
 /// `media_uploaded` only on `committed`; on `in_progress` it must back off and
 /// re-check batch-exists (the in-flight writer may still fail, in which case the
 /// blob heals on the next demand after the stale-pending reap).
@@ -667,21 +667,14 @@ pub trait MediaRelay: Send + Sync {
         ttl_secs: Option<u64>,
     ) -> std::result::Result<MediaUploadOutcome, RelayError>;
 
-    /// Upload an encrypted media blob, optionally tagged as a **pairing push**
-    /// (media re-supply C5) so the relay meters it on the dedicated pairing-push
-    /// rate lane (a joiner-bootstrap burst) instead of the re-supply lane.
+    /// Upload an encrypted blob, optionally tagged as a **pairing push** so
+    /// the relay meters it on the dedicated pairing-push lane (a joiner burst)
+    /// instead of the re-supply lane. Only meaningful with a `ttl_secs`.
     ///
-    /// `pairing_push` only has meaning alongside a `ttl_secs` (an ephemeral
-    /// upload); a fresh send ignores it. The default impl ignores the tag and
-    /// delegates to [`upload_media`], so mocks and alternate relays need no
-    /// change — only the real server relay sets the classifying header.
-    ///
-    /// CONTRACT: an impl overrides exactly ONE of these two methods with the
-    /// real upload. The real server relay overrides `upload_media_classified`
-    /// (and points `upload_media` at it); everything else implements only
-    /// `upload_media`. If you override `upload_media` to delegate *here*, you
-    /// MUST also override this method — otherwise this default delegates back to
-    /// `upload_media`, an infinite recursion.
+    /// The default delegates to [`upload_media`] (ignoring the tag), so mocks
+    /// need no change — only the server relay overrides this to set the header.
+    /// Override exactly one of the two methods with the real upload; pointing
+    /// `upload_media` here without also overriding this recurses forever.
     async fn upload_media_classified(
         &self,
         media_id: &str,
@@ -698,12 +691,12 @@ pub trait MediaRelay: Send + Sync {
     async fn download_media(&self, media_id: &str) -> std::result::Result<Vec<u8>, RelayError>;
 
     /// Return the subset of `media_ids` the relay currently holds and can serve
-    /// (committed, not deleted, not past TTL) — the C2 batch-exists query. Lets
-    /// the C4 requester skip blobs the relay already has and the C5 pairing push
+    /// (committed, not deleted, not past TTL) — the batch-exists query. Lets
+    /// the heal requester skip blobs the relay already has and the pairing push
     /// skip present ones.
     ///
     /// An old relay without this endpoint returns a transport error (404/405)
-    /// rather than an empty list; the caller (C4) must treat that as "feature
+    /// rather than an empty list; callers must treat that as "feature
     /// absent ⇒ no-op", never as "all blobs absent".
     async fn batch_exists(
         &self,
@@ -711,7 +704,7 @@ pub trait MediaRelay: Send + Sync {
     ) -> std::result::Result<Vec<String>, RelayError>;
 
     /// Post one sealed ephemeral message to the relay's device-message mailbox
-    /// (media re-supply C3). The relay stamps the authenticated sender; the
+    /// The relay stamps the authenticated sender; the
     /// envelope's `sender_device_id` is ignored on send. An old relay without
     /// the endpoint returns a transport error (404/405) the caller treats as
     /// "feature absent ⇒ no-op".

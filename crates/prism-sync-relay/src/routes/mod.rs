@@ -398,7 +398,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/{sync_id}/rekey/{device_id}", get(devices::get_rekey_artifact))
         .route("/v1/sync/{sync_id}/ack", post(devices::post_ack))
         .route("/v1/sync/{sync_id}/capabilities", get(gifs::get_capabilities))
-        // Media batch-exists (C2): small JSON read. A tight per-route body cap
+        // Media batch-exists : small JSON read. A tight per-route body cap
         // (≤1024 ids × ≤36 chars ≈ 41 KiB; 64 KiB is ample) overrides the shared
         // 10 MiB authenticated cap, so an authed caller can't force large JSON
         // buffering/parsing here before the id-count check runs.
@@ -406,7 +406,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/sync/{sync_id}/media/exists",
             post(media::media_exists).layer(DefaultBodyLimit::max(64 * 1024)),
         )
-        // Ephemeral signal lane / device-message mailbox (C3). Small bodies:
+        // Ephemeral signal lane / device-message mailbox . Small bodies:
         // send carries one ≤4 KiB padded payload (base64'd) + envelope, ack a
         // bounded id list. Tight per-route caps override the shared 10 MiB
         // authenticated cap so an authed caller can't force large-body buffering

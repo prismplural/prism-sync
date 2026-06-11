@@ -102,7 +102,7 @@ async fn run_cleanup(state: &AppState) {
             let expired_media =
                 crate::db::cleanup_expired_media(conn, config.media_retention_days)?;
 
-            // 14b. Sweep the ephemeral device-message mailbox (C3): rows past
+            // 14b. Sweep the ephemeral device-message mailbox : rows past
             // their short TTL or already fully acked by every eligible recipient.
             let expired_device_messages = crate::db::cleanup_expired_device_messages(conn)?;
 
@@ -354,7 +354,7 @@ async fn run_cleanup(state: &AppState) {
     state.pairing_rate_limiter.prune_stale(60);
     state.media_upload_rate_limiter.prune_stale(state.config.media_upload_rate_window_secs);
     // Re-supply / pairing-push limiters are scaffolding (enforcement lands with
-    // C4/C5) but are pruned here so their windows don't accumulate.
+    // media-heal/pairing-push) but are pruned here so their windows don't accumulate.
     state.media_resupply_rate_limiter.prune_stale(state.config.media_resupply_rate_window_secs);
     state
         .media_pairing_push_rate_limiter
@@ -493,11 +493,11 @@ fn file_older_than(path: &std::path::Path, now: i64, age_secs: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// Dry-run reconciliation sweep (media re-supply C1 follow-up).
+/// Dry-run media reconciliation sweep.
 ///
 /// Scans the rows the relay considers servable (committed, not deleted, not past
 /// TTL) and reports how many have **no on-disk file** — legacy "metadata then
-/// file" crash rows that would make a metadata-only batch-exists (C2) dishonest.
+/// file" crash rows that would make a metadata-only batch-exists  dishonest.
 ///
 /// **This is intentionally LOG-ONLY: it never marks anything deleted.** The
 /// first run of the destructive form against a live relay's legacy crash-rows is

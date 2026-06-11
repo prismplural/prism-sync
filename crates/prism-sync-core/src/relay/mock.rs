@@ -71,7 +71,7 @@ struct MockRelayState {
     /// If set, the next `put_snapshot` call returns `SnapshotStale`
     /// with these values and clears the slot.
     next_put_snapshot_stale: Option<(i64, Option<String>)>,
-    /// Ephemeral mailbox (C3). Tests seed `ephemeral_inbox`; `fetch` returns its
+    /// Ephemeral mailbox . Tests seed `ephemeral_inbox`; `fetch` returns its
     /// entries minus those in `ephemeral_acked`; `send` appends to
     /// `ephemeral_sent`. When `ephemeral_feature_absent` is set, all three
     /// methods return a 404-like error to model an old relay (feature-detection).
@@ -145,7 +145,7 @@ impl MockRelay {
         }
     }
 
-    /// Seed the ephemeral mailbox inbox with a message a drain will fetch (C3).
+    /// Seed the ephemeral mailbox inbox with a message a drain will fetch .
     pub fn seed_ephemeral(&self, envelope: crate::ephemeral::EphemeralEnvelope) {
         self.state.lock().unwrap().ephemeral_inbox.push(envelope);
     }

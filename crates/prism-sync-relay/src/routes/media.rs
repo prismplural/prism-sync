@@ -110,38 +110,18 @@ pub async fn upload_media(
         ));
     }
 
-    // Capture the request-receipt time once, up front: it stamps the TTL, the
-    // quota preflight, and the reserve txn, and it also classifies the rate lane
-    // below. (A plain wall-clock read; it does not feed signature verification.)
+    // Single request-receipt timestamp for the TTL, quota preflight, reserve
+    // txn, and the rate-lane classification below.
     let now = db::now_secs();
     let ttl_expires_at = parse_media_ttl(&headers, &state.config, now);
-    // A TTL-bearing upload (`X-Media-TTL` present + parseable) is *ephemeral*:
-    // it rides a metered lane + the ephemeral byte ceiling so it can neither
-    // starve fresh user sends (rate) nor fill the group quota faster than the
-    // short TTL sheds it (bytes). Two ephemeral lanes exist:
-    //   - re-supply / heal (C4 responder): the default ephemeral class.
-    //   - pairing push (C5): a joiner-bootstrap burst, opted in via the
-    //     `X-Media-Upload-Class: pairing` header — a SEPARATE, more generous
-    //     bucket so a paired-device's burst can't starve heal and vice-versa.
-    // Both headers are unsigned, but that grants no evasion: any ephemeral class
-    // only subjects the caller to a metered lane + the ceiling (and an
-    // early-expiring blob); omitting the TTL is just a normal fresh send. The
-    // three lanes are independent buckets, so a member's total per-group budget
-    // is their SUM — intended, so the classes never contend for one bucket.
+    // TTL-bearing uploads use a metered lane and the ephemeral byte ceiling.
+    // The class headers are unsigned, but neither grants evasion:
+    // any ephemeral upload still counts against the ceiling + quota and self-
+    // expires, so the most a forger gains is a more generous rate lane for their
+    // own group. Closing it later means gating pairing on a tracked session.
     let is_ephemeral = ttl_expires_at.is_some();
-    // NOTE: the pairing class is rate-only-generous and intentionally
-    // UNVERIFIED — there is no server-side check that a pairing is actually in
-    // progress. A member can therefore claim it to ride the more generous lane
-    // outside a pairing event, but that only raises their own request rate
-    // (per-`sync_id`); every such upload still counts against the ephemeral byte
-    // ceiling + the group quota and carries a short TTL, so it cannot fill or
-    // evade storage caps, nor affect another group. If that ever needs closing,
-    // gate it on a tracked active pairing session.
     let is_pairing_push = is_ephemeral
-        && headers
-            .get("X-Media-Upload-Class")
-            .and_then(|v| v.to_str().ok())
-            == Some("pairing");
+        && headers.get("X-Media-Upload-Class").and_then(|v| v.to_str().ok()) == Some("pairing");
 
     // 5. Rate limit — fresh-send, re-supply, and pairing-push ride independent
     //    buckets.
@@ -255,22 +235,12 @@ pub async fn upload_media(
         if would_add_bytes && usage + size_bytes > quota {
             return Err(AppError::StorageFull("Media quota exceeded for sync group"));
         }
-        // The ephemeral ceiling is a tighter, TTL-bearing-only sub-cap of the
-        // quota: it bounds the live re-supply + pairing-push bytes alone.
-        // Transient by design — the short TTL sheds bytes, so a rejected uploader
-        // simply retries on its next cadence (and the relay still holds the blob
-        // via another uploader once space frees). An idempotent/repair re-upload
-        // (Δquota 0) is already counted and never rejected here.
-        //
-        // Unlike the main quota — which is re-checked authoritatively inside the
-        // reserve txn — this ceiling is a PREFLIGHT-ONLY soft cap: it is not
-        // re-checked in `reserve_media_upload`, so N concurrent ephemeral uploads
-        // can each clear the preflight and overshoot by up to
-        // (concurrency − 1) × media_max_file_bytes. That overshoot is bounded by
-        // the ephemeral rate lanes (which gate concurrency), shed by the short
-        // TTL, and further damped by clients' own self-limit — so a soft cap is
-        // sufficient here; a hard cap would have to move into the reserve txn
-        // beside the quota re-check.
+        // Ephemeral-only sub-cap of the quota, bounding live re-supply +
+        // pairing-push bytes. A PREFLIGHT-ONLY soft cap (not re-checked in the
+        // reserve txn like the quota is), so concurrent uploads can overshoot by
+        // up to (concurrency − 1) × media_max_file_bytes — acceptable here since
+        // the rate lanes gate concurrency, the short TTL sheds it, and clients
+        // self-limit. Idempotent/repair re-uploads (Δquota 0) are never rejected.
         if is_ephemeral && would_add_bytes && ephemeral_usage + size_bytes > ephemeral_ceiling {
             return Err(AppError::StorageFull(
                 "Ephemeral (re-supply/pairing) byte ceiling exceeded for sync group",
@@ -419,7 +389,7 @@ pub async fn upload_media(
 }
 
 // ---------------------------------------------------------------------------
-// media_exists — POST /v1/sync/{sync_id}/media/exists   (batch-exists, C2)
+// media_exists — POST /v1/sync/{sync_id}/media/exists   (batch-exists)
 // ---------------------------------------------------------------------------
 
 /// Maximum media_ids accepted in one batch-exists request. Clients chunk larger
@@ -433,7 +403,7 @@ pub struct MediaExistsRequest {
 
 /// Return the subset of the requested media_ids that are servable (metadata
 /// level) for this sync group: committed, not deleted, not past TTL. Lets a
-/// client (C4 requester / C5 pairing push) avoid re-requesting blobs the relay
+/// client (heal requester / pairing push) avoid re-requesting blobs the relay
 /// already holds. Read-only ⇒ bearer auth (no request-body signature needed; the
 /// query is scoped to the authenticated sync_id).
 pub async fn media_exists(

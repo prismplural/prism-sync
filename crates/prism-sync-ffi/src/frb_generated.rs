@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -14648726;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1730525150;
 
 // Section: executor
 
@@ -779,6 +779,64 @@ fn wire__crate__api__configure_engine_impl(
                         }
                         let api_handle_guard = api_handle_guard.unwrap();
                         let output_ok = crate::api::configure_engine(&*api_handle_guard).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__confirm_self_revocation_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "confirm_self_revocation",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_handle = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, String>(
+                    (move || async move {
+                        let mut api_handle_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_handle,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_handle_guard =
+                                        Some(api_handle.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_handle_guard = api_handle_guard.unwrap();
+                        let output_ok =
+                            crate::api::confirm_self_revocation(&*api_handle_guard).await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -2309,66 +2367,6 @@ fn wire__crate__api__on_resume_impl(
                         }
                         let api_handle_guard = api_handle_guard.unwrap();
                         let output_ok = crate::api::on_resume(&*api_handle_guard).await?;
-                        Ok(output_ok)
-                    })()
-                    .await,
-                )
-            }
-        },
-    )
-}
-fn wire__crate__api__perform_ecdh_impl(
-    port_: flutter_rust_bridge::for_generated::MessagePort,
-    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
-    rust_vec_len_: i32,
-    data_len_: i32,
-) {
-    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
-        flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "perform_ecdh",
-            port: Some(port_),
-            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
-        },
-        move || {
-            let message = unsafe {
-                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
-                    ptr_,
-                    rust_vec_len_,
-                    data_len_,
-                )
-            };
-            let mut deserializer =
-                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_handle = <RustOpaqueMoi<
-                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>,
-            >>::sse_decode(&mut deserializer);
-            let api_peer_public_key = <Vec<u8>>::sse_decode(&mut deserializer);
-            deserializer.end();
-            move |context| async move {
-                transform_result_sse::<_, String>(
-                    (move || async move {
-                        let mut api_handle_guard = None;
-                        let decode_indices_ =
-                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
-                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
-                                    &api_handle,
-                                    0,
-                                    false,
-                                )],
-                            );
-                        for i in decode_indices_ {
-                            match i {
-                                0 => {
-                                    api_handle_guard =
-                                        Some(api_handle.lockable_decode_async_ref().await)
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        let api_handle_guard = api_handle_guard.unwrap();
-                        let output_ok =
-                            crate::api::perform_ecdh(&*api_handle_guard, api_peer_public_key)
-                                .await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -5194,36 +5192,36 @@ fn pde_ffi_dispatcher_primary_impl(
         12 => wire__crate__api__complete_initiator_ceremony_impl(port, ptr, rust_vec_len, data_len),
         13 => wire__crate__api__complete_joiner_ceremony_impl(port, ptr, rust_vec_len, data_len),
         14 => wire__crate__api__configure_engine_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__create_prism_sync_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__create_sync_group_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__database_key_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__decrypt_xchacha_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__delete_sync_group_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__deregister_device_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__download_media_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__drain_secure_store_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__encode_image_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__encrypt_xchacha_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__export_dek_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__fetch_gif_service_config_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__generate_secret_key_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__get_identity_public_key_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__get_joiner_sas_impl(port, ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__get_ml_dsa_key_generation_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__get_node_id_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__hex_decode_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__hex_encode_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__initialize_impl(port, ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__is_unlocked_impl(port, ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__is_websocket_connected_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__list_devices_impl(port, ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__list_quarantined_batches_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__local_storage_key_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__lock_impl(port, ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__media_exists_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__mnemonic_to_bytes_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__on_resume_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__perform_ecdh_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__confirm_self_revocation_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__create_prism_sync_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__create_sync_group_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__database_key_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__decrypt_xchacha_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__delete_sync_group_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__deregister_device_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__download_media_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__drain_secure_store_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__encode_image_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__encrypt_xchacha_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__export_dek_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__fetch_gif_service_config_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__generate_secret_key_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__get_identity_public_key_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__get_joiner_sas_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__get_ml_dsa_key_generation_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__get_node_id_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__hex_decode_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__hex_encode_impl(port, ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__initialize_impl(port, ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__is_unlocked_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__is_websocket_connected_impl(port, ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__list_devices_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__list_quarantined_batches_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__local_storage_key_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__lock_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__media_exists_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__mnemonic_to_bytes_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__on_resume_impl(port, ptr, rust_vec_len, data_len),
         45 => wire__crate__api__poll_event_impl(port, ptr, rust_vec_len, data_len),
         46 => wire__crate__api__prepare_pending_device_identity_impl(
             port,
