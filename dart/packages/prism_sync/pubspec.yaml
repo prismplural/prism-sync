@@ -5,25 +5,12 @@ version: 0.1.1
 environment:
   sdk: ^3.11.1
 
-flutter:
-  plugin:
-    platforms:
-      ios:
-        ffiPlugin: true
-      macos:
-        ffiPlugin: true
-      android:
-        ffiPlugin: true
-      linux:
-        ffiPlugin: true
-      windows:
-        ffiPlugin: true
-
 dependencies:
-  flutter:
-    sdk: flutter
   flutter_rust_bridge: 2.12.0
+  hooks: ^2.0.2
   meta: ^1.11.0
+  native_toolchain_rust: ^1.0.4+0
+
 dev_dependencies:
   integration_test:
     sdk: flutter

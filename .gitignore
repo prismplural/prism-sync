@@ -3,6 +3,11 @@
 *.swo
 .DS_Store
 
+# Dart / Flutter generated state
+dart/packages/*/.dart_tool/
+dart/packages/*/.flutter-plugins-dependencies
+dart/packages/*/build/
+
 # Never commit SQLite databases or backup artifacts
 backups/
 *.db

@@ -146,10 +146,16 @@ flutter_rust_bridge_codegen generate
 
 ## Platform Setup
 
-This package requires the native Rust library to be compiled for your target platform. The compilation is handled by:
+This package requires the native Rust library to be compiled for your target platform. The compilation is handled by Dart build hooks and native assets:
 
-- **iOS/macOS:** Xcode build phase that compiles the Rust `cdylib`/`staticlib`
-- **Android:** Gradle task that invokes `cargo build` for each ABI
+- `hook/build.dart` invokes `native_toolchain_rust`
+- `native_toolchain_rust` runs `cargo build` for the active target triple
+- Flutter bundles the resulting native asset with the app
+
+Consumers need `rustup` available so the hook can install and use the pinned Rust toolchain declared in `crates/prism-sync-ffi/rust-toolchain.toml`.
+
+- **iOS/macOS:** Flutter packages the Rust dynamic library as an app-bundled framework
+- **Android:** Flutter packages the Rust dynamic library into the app's native library bundle
 - **Web:** Not currently supported (requires wasm target)
 
 The `prism_sync_flutter` package provides the platform-specific setup and a real `SecureStore` backed by platform Keychain/Keystore. Use `MemorySecureStore` only for testing.
@@ -157,6 +163,7 @@ The `prism_sync_flutter` package provides the platform-specific setup and a real
 ## Dependencies
 
 - `flutter_rust_bridge: 2.12.0` -- FFI bridge runtime
+- `hooks` and `native_toolchain_rust` -- build hook and Rust native asset integration
 - `meta: ^1.11.0` -- Dart annotations
 
 ## Related Packages
