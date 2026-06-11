@@ -172,6 +172,18 @@ async fn run_cleanup(state: &AppState) {
             let stale_media_cleaned =
                 cleanup_media_files(&state.config.media_storage_path, &stale_media_items);
 
+            // Re-check just before unlinking: a concurrent heal could have
+            // RESURRECTED an expired row (cleared deleted_at + promoted a fresh
+            // file) in the gap since the soft-delete txn committed. Drop those
+            // so we never delete a freshly-committed file; a stale one we
+            // conservatively keep is reclaimed by the orphan sweep.
+            let expired_media = match state.db.with_conn(|conn| {
+                Ok::<_, rusqlite::Error>(crate::db::retain_unlinkable_media(conn, &expired_media))
+            }) {
+                Ok(filtered) => filtered,
+                Err(_) => expired_media,
+            };
+
             // Clean up expired media files from disk
             let expired_media_cleaned =
                 cleanup_media_files(&state.config.media_storage_path, &expired_media);

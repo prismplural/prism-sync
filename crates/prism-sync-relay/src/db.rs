@@ -3011,6 +3011,36 @@ pub fn cleanup_expired_media(
     Ok(pairs)
 }
 
+/// Filter a soft-delete sweep's `(sync_id, media_id)` pairs down to those still
+/// safe to unlink — the row is gone, or still `deleted_at IS NOT NULL`. Drops
+/// any pair a concurrent heal RESURRECTED (`reserve_media_upload` cleared
+/// `deleted_at` and promoted a fresh file) in the gap between the soft-delete
+/// txn ([`cleanup_expired_media`]) and the actual unlink, so cleanup can never
+/// delete a freshly-committed file. A genuinely-stale file we conservatively
+/// skip (e.g. on a transient query error) is reclaimed later by the orphan
+/// sweep. Best-effort; the race window is tiny.
+pub fn retain_unlinkable_media(
+    conn: &Connection,
+    pairs: &[(String, String)],
+) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter(|(_, media_id)| {
+            match conn.query_row(
+                "SELECT deleted_at FROM media_metadata WHERE media_id = ?1",
+                params![media_id],
+                |row| row.get::<_, Option<i64>>(0),
+            ) {
+                Ok(Some(_)) => true,  // still soft-deleted → safe to unlink
+                Ok(None) => false,    // resurrected (deleted_at NULL) → keep the file
+                Err(rusqlite::Error::QueryReturnedNoRows) => true, // row gone → unlink
+                Err(_) => false,      // unknown → skip; the orphan sweep backstops
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 /// Reap abandoned PENDING reserves: rows whose promote never finished
 /// (`committed_at IS NULL`) and whose reserve is older than the grace window
 /// (`reserved_at < now - grace`). Hard-deletes the rows and returns
@@ -5575,6 +5605,44 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn retain_unlinkable_media_spares_resurrected_rows() {
+        let db = media_test_db();
+        let now = now_secs();
+        db.with_conn(|c| {
+            // Committed then soft-deleted → still safe to unlink.
+            reserve_media_upload(c, "still-del", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            finalize_media(c, "still-del", now)?;
+            c.execute(
+                "UPDATE media_metadata SET deleted_at = ?1 WHERE media_id = 'still-del'",
+                params![now],
+            )?;
+            // Committed-live (a heal resurrected + re-promoted it in the gap) →
+            // must be spared so its fresh file is never unlinked.
+            reserve_media_upload(c, "resurrected", "sg", "d", 10, HASH_B, None, 10_000, now, 300, false)?;
+            finalize_media(c, "resurrected", now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let pairs = vec![
+            ("sg".to_string(), "still-del".to_string()),
+            ("sg".to_string(), "resurrected".to_string()),
+            ("sg".to_string(), "absent".to_string()), // no row → safe to unlink
+        ];
+        let unlinkable =
+            db.with_read_conn(|c| Ok(retain_unlinkable_media(c, &pairs))).unwrap();
+
+        assert_eq!(
+            unlinkable,
+            vec![
+                ("sg".to_string(), "still-del".to_string()),
+                ("sg".to_string(), "absent".to_string()),
+            ],
+            "resurrected committed-live row is spared; soft-deleted + absent are unlinkable",
+        );
     }
 
     #[test]
