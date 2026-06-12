@@ -457,7 +457,26 @@ impl SyncEngine {
                     )),
                     Ok((_snapshot_entities, snapshot_changes)) => {
                         result.entity_changes.extend(snapshot_changes);
-                        self.pull_phase(sync_id, key_hierarchy, device_id).await
+                        let retry = self.pull_phase(sync_id, key_hierarchy, device_id).await;
+                        // The retry pull re-tripped must_bootstrap even though we
+                        // just imported the snapshot at its server_seq_at. With the
+                        // relay's snapshot-aware prune tail guard this is
+                        // unreachable for a live pairing snapshot, so a recurrence
+                        // means the tail above the snapshot was lost some other way
+                        // (e.g. an un-clamped older relay). Surface both seqs from
+                        // the bootstrap cursor and the relay floor so the loop is
+                        // diagnosable rather than an opaque second error.
+                        match retry {
+                            Err(e) if is_must_bootstrap_from_snapshot(&e) => {
+                                Err(CoreError::Engine(format!(
+                                    "snapshot bootstrap did not resolve must_bootstrap: the relay \
+                                     still reports the post-bootstrap cursor predates retained \
+                                     history ({e}) — the snapshot tail was pruned out from under \
+                                     this device"
+                                )))
+                            }
+                            other => other,
+                        }
                     }
                     Err(bootstrap_err) => Err(bootstrap_err),
                 }

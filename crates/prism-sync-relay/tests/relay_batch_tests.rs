@@ -682,3 +682,105 @@ async fn test_ack_rejects_unsigned_request() {
         .unwrap();
     assert_eq!(resp.status(), 400, "ack without signature headers should be rejected");
 }
+
+/// PUT a targeted snapshot with signed headers, returning the response.
+#[allow(clippy::too_many_arguments)]
+async fn put_targeted_snapshot(
+    client: &Client,
+    url: &str,
+    sync_id: &str,
+    device_id: &str,
+    token: &str,
+    keys: &TestDeviceKeys,
+    server_seq_at: i64,
+    for_device_id: &str,
+    data: Vec<u8>,
+) -> reqwest::Response {
+    let path = format!("/v1/sync/{sync_id}/snapshot");
+    let builder = client
+        .put(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", device_id)
+        .header("X-Server-Seq-At", server_seq_at.to_string())
+        .header("X-For-Device-Id", for_device_id);
+    apply_signed_headers(builder, keys, "PUT", &path, sync_id, device_id, &data)
+        .body(data)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Full pairing-window: the initiator uploads a TARGETED snapshot for a
+/// joiner that has NOT registered yet (so it is invisible to the ack floor),
+/// then a registered device pushes and acks a tail batch above the snapshot
+/// seq, and the hourly cleanup fires inside that window. The snapshot-aware
+/// tail guard must keep `(S, head]` retained so that when the joiner finally
+/// registers and pulls `since=S`, it receives the tail batch instead of a
+/// `must_bootstrap_from_snapshot` loop that would brick it.
+#[tokio::test]
+async fn targeted_snapshot_tail_survives_cleanup_before_joiner_registers() {
+    let (url, _server, db, state) = start_test_relay_with_state(test_config()).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // Initiator registers and pushes the baseline batch that the snapshot is cut at.
+    let init_id = generate_device_id();
+    let init_keys = TestDeviceKeys::generate(&init_id);
+    let init_token = register_device(&client, &url, &sync_id, &init_id, &init_keys).await;
+
+    let base_env = make_test_envelope(&sync_id, &init_id, "base", 0);
+    let base_resp =
+        push_signed(&client, &url, &sync_id, &init_id, &init_token, &init_keys, &base_env).await;
+    let snapshot_seq = base_resp.json::<Value>().await.unwrap()["server_seq"].as_i64().unwrap();
+
+    // Upload a TARGETED snapshot at S for a joiner that hasn't registered yet.
+    let joiner_id = generate_device_id();
+    let snap_resp = put_targeted_snapshot(
+        &client,
+        &url,
+        &sync_id,
+        &init_id,
+        &init_token,
+        &init_keys,
+        snapshot_seq,
+        &joiner_id,
+        b"pair-snapshot".to_vec(),
+    )
+    .await;
+    assert!(snap_resp.status().is_success(), "targeted snapshot upload failed");
+
+    // A tail batch lands above S; the initiator (the only registered device) acks it.
+    let tail_env = make_test_envelope(&sync_id, &init_id, "tail", 0);
+    let tail_resp =
+        push_signed(&client, &url, &sync_id, &init_id, &init_token, &init_keys, &tail_env).await;
+    let tail_seq = tail_resp.json::<Value>().await.unwrap()["server_seq"].as_i64().unwrap();
+    assert!(tail_seq > snapshot_seq);
+    let ack_resp =
+        ack_signed(&client, &url, &sync_id, &init_id, &init_token, &init_keys, tail_seq).await;
+    assert!(ack_resp.status().is_success());
+
+    // Hourly cleanup fires inside the pairing window. Without the tail guard,
+    // ack-only pruning would delete the tail (the joiner is invisible to the floor).
+    prism_sync_relay::cleanup::run_cleanup(&state).await;
+
+    // The tail batch is still retained and the floor never passed S.
+    let floor = db.with_read_conn(|conn| db::get_pruned_floor_seq(conn, &sync_id)).unwrap();
+    assert!(floor <= snapshot_seq, "floor must not advance past the targeted snapshot seq");
+
+    // The joiner registers (its 0-pinned receipt appears only now) and bootstraps
+    // at cursor=S: the pull must deliver the tail batch, NOT a
+    // must_bootstrap_from_snapshot error.
+    let (joiner_token, _joiner_keys) = prepare_device(&db, &sync_id, &joiner_id).await;
+    let pull = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since={snapshot_seq}"))
+        .header("Authorization", format!("Bearer {joiner_token}"))
+        .header("X-Device-Id", &joiner_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pull.status(), 200, "joiner pull since=S must not trip must_bootstrap");
+    let pull_json: Value = pull.json().await.unwrap();
+    let batches = pull_json["batches"].as_array().unwrap();
+    assert_eq!(batches.len(), 1, "the tail batch above the snapshot must be delivered");
+    assert_eq!(batches[0]["envelope"]["batch_id"].as_str().unwrap(), "tail");
+}

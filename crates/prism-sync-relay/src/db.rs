@@ -2223,6 +2223,31 @@ pub fn cleanup_expired_snapshots(conn: &Connection) -> Result<usize, rusqlite::E
     Ok(rows)
 }
 
+/// Lowest `server_seq_at` across this group's unexpired snapshot rows of EVERY
+/// audience — group-wide (NULL target) and targeted alike. `None` when the group
+/// has no live snapshot.
+///
+/// This is the snapshot-aware prune tail guard: any unexpired snapshot is
+/// a bootstrap source pinned at its `server_seq_at`, so no batch above that seq
+/// may be pruned while the snapshot is alive, or a device bootstrapping at that
+/// cursor could never pull the `(seq_at, head]` tail. Targeted pair-time rows
+/// matter here in particular: the initiator uploads one BEFORE the joiner
+/// registers, so the joiner is invisible to the ack floor during that window and
+/// only this guard protects its tail. Pruning BELOW the seq still proceeds
+/// (expiring-buffer rule); protection is bounded by the snapshot's TTL / ACK.
+pub fn get_min_unexpired_snapshot_seq(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT MIN(server_seq_at) FROM snapshots
+         WHERE sync_id = ?1
+           AND (expires_at IS NULL OR expires_at >= unixepoch())",
+        params![sync_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+}
+
 /// Count the group's unexpired *targeted* snapshot rows (NULL group-wide rows
 /// excluded), optionally skipping one audience (`exclude_target`). Bounds
 /// concurrent pairings: each targeted row can hold up to `MAX_SNAPSHOT_WIRE_BYTES`,
@@ -2325,12 +2350,27 @@ pub fn get_safe_prune_seq(
 /// DELETE removes 0 rows — so a historically crash-stale floor self-heals on
 /// the next cleanup cycle that targets the same range, instead of waiting for a
 /// future prune to delete a fresh row.
+///
+/// The snapshot-aware tail guard is applied CENTRALLY here, inside the
+/// writer transaction: `before_seq` is clamped to `S + 1` where `S` is the
+/// lowest unexpired snapshot seq of any audience. Doing it here means neither
+/// caller — the snapshot-gated path nor the ack-only path — can ever delete a
+/// seq above a live snapshot, and reading the guard in the same tx that does the
+/// DELETE closes the race with `cleanup_expired_snapshots` (a snapshot the guard
+/// observed can't be expired out from under the prune mid-transaction).
 pub fn prune_batches_before(
     conn: &Connection,
     sync_id: &str,
     before_seq: i64,
 ) -> Result<usize, rusqlite::Error> {
     let tx = conn.unchecked_transaction()?;
+    // Clamp to one past the lowest live snapshot seq: a batch at or below S is
+    // already captured by the snapshot, but everything above S must survive so a
+    // device bootstrapping at cursor S can still pull `(S, head]`.
+    let before_seq = match get_min_unexpired_snapshot_seq(&tx, sync_id)? {
+        Some(s) => before_seq.min(s + 1),
+        None => before_seq,
+    };
     let n = tx.execute(
         "DELETE FROM batches WHERE sync_id = ?1 AND id < ?2",
         params![sync_id, before_seq],
@@ -5660,6 +5700,110 @@ mod tests {
             let snap_pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
             assert_eq!(snap_pruned, 9, "snapshot path caps pruning at the snapshot seq");
             assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 6);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Tail guard: a group with ONLY a TARGETED pair-time snapshot at seq S
+    /// is processed by the ack-only path (it has no group-wide row), but the
+    /// central clamp in `prune_batches_before` still protects the snapshot's
+    /// tail. Even with all registered devices acked past S, ack-only pruning
+    /// deletes only seqs <= S, so a joiner bootstrapping at cursor S can still
+    /// pull `(S, head]`.
+    #[test]
+    fn ack_prune_protects_targeted_snapshot_tail() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
+            touch_device(conn, "sg1", "dev1")?;
+            touch_device(conn, "sg1", "dev2")?;
+
+            let mut seqs = Vec::new();
+            for i in 1..=6 {
+                seqs.push(insert_batch(conn, "sg1", 0, "dev1", &format!("b{i}"), b"d")?);
+            }
+            // Targeted pair-time snapshot for a joiner that has NOT registered yet.
+            let snap_seq = seqs[2]; // S = 3rd batch's seq
+            upsert_snapshot(conn, "sg1", 0, snap_seq, b"snap", None, Some("joiner"), Some("dev1"))?;
+
+            // Both registered devices have acked S+3 (the head). Without the
+            // guard, ack-only pruning would delete everything up to the head.
+            let head = *seqs.last().unwrap();
+            upsert_device_receipt(conn, "sg1", "dev1", head)?;
+            upsert_device_receipt(conn, "sg1", "dev2", head)?;
+
+            let pruned = prune_batches_by_acks(conn)?;
+            // Only seqs < S+1 (i.e. <= S) are removed; the 3 batches above the
+            // targeted snapshot survive for the not-yet-registered joiner.
+            assert_eq!(pruned, 3, "ack prune must stop at the targeted snapshot seq");
+            let remaining: Vec<i64> =
+                get_batches_since(conn, "sg1", 0, 100)?.iter().map(|b| b.server_seq).collect();
+            assert!(
+                remaining.iter().all(|&s| s > snap_seq),
+                "no surviving batch may sit at or below S"
+            );
+            assert_eq!(remaining.len(), 3);
+            assert!(
+                get_pruned_floor_seq(conn, "sg1")? <= snap_seq,
+                "floor must not advance past the targeted snapshot seq"
+            );
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Tail guard: with both a group-wide snapshot at the higher seq and a targeted
+    /// pair-time snapshot at a lower seq, the central clamp caps pruning at the
+    /// LOWER (targeted) seq — `MIN(server_seq_at)` over all audiences. Once the
+    /// targeted row is ACK-deleted, the next prune advances to the group-wide
+    /// seq, proving the relay stays an expiring buffer and the protection window
+    /// is bounded by the live snapshot set.
+    #[test]
+    fn prune_caps_at_lowest_unexpired_snapshot_across_audiences() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            touch_device(conn, "sg1", "dev1")?;
+
+            let mut seqs = Vec::new();
+            for i in 1..=15 {
+                seqs.push(insert_batch(conn, "sg1", 0, "dev1", &format!("b{i}"), b"d")?);
+            }
+            let group_wide = seqs[11]; // "120": 12th batch's seq
+            let targeted = seqs[9]; // "100": 10th batch's seq
+
+            upsert_snapshot(conn, "sg1", 0, group_wide, b"gw", None, None, Some("dev1"))?;
+            upsert_snapshot(conn, "sg1", 0, targeted, b"tg", None, Some("joiner"), Some("dev1"))?;
+            upsert_device_receipt(conn, "sg1", "dev1", *seqs.last().unwrap())?;
+
+            // Snapshot-gated path: safe seq is the group-wide cap, but the central
+            // clamp lowers it to the targeted seq. The clamp is `S + 1` because the
+            // batch AT seq S is already captured by the snapshot — so seqs <= S go,
+            // the tail (S, head] stays, and the floor lands exactly at S.
+            let pruned = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned, 10, "must cap at the lower (targeted) snapshot seq, not group-wide");
+            assert_eq!(get_pruned_floor_seq(conn, "sg1")?, targeted);
+            let remaining = get_batches_since(conn, "sg1", 0, 100)?;
+            assert!(remaining.iter().all(|b| b.server_seq > targeted));
+
+            // The joiner ACK-deletes its targeted row; the group-wide row alone
+            // now caps pruning. The snapshot-gated path keeps the batch AT the
+            // group-wide seq (it deletes id < group_wide), so the floor advances
+            // to just below it — the relay no longer holds the formerly-protected
+            // targeted tail, proving the protection window is bounded by the live
+            // snapshot set.
+            assert!(delete_snapshot(conn, "sg1", "joiner")?);
+            let pruned2 = prune_batches_with_unexpired_snapshots(conn, 3600)?;
+            assert_eq!(pruned2, 1, "next prune advances to just below the group-wide seq");
+            assert_eq!(get_pruned_floor_seq(conn, "sg1")?, group_wide - 1);
+            let remaining2 = get_batches_since(conn, "sg1", 0, 100)?;
+            assert!(remaining2.iter().all(|b| b.server_seq >= group_wide));
 
             Ok(())
         })
