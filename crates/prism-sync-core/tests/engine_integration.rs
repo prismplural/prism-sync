@@ -13,6 +13,7 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 
 use prism_sync_core::engine::{SyncConfig, SyncEngine, SyncResult};
+use prism_sync_core::events::SyncEvent;
 use prism_sync_core::relay::{
     InjectedPullError, MockRelay, SignedBatchEnvelope, SnapshotExchange, SyncTransport,
 };
@@ -155,6 +156,60 @@ async fn pull_injected_sender_batch(
     ops: Vec<CrdtChange>,
 ) -> (SyncResult, Arc<RusqliteSyncStorage>, Arc<MockTaskEntity>) {
     pull_injected_sender_batch_with_config(ops, SyncConfig::default()).await
+}
+
+/// Like [`pull_injected_sender_batch`], but wires an event sink and drains every
+/// emitted [`SyncEvent`] so quarantine/stall assertions can inspect them.
+async fn pull_injected_sender_batch_capturing_events(
+    ops: Vec<CrdtChange>,
+) -> (SyncResult, Arc<RusqliteSyncStorage>, Arc<MockTaskEntity>, Vec<SyncEvent>) {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let envelope = make_encrypted_batch(
+        &ops,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-attribution",
+        sender_id,
+    );
+    relay.inject_batch(envelope);
+
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<SyncEvent>(64);
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity_ref], test_schema(), SyncConfig::default())
+            .with_event_sink(event_tx.clone());
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        events.push(event);
+    }
+
+    (result, storage, entity, events)
 }
 
 async fn pull_injected_sender_batch_with_config(
@@ -384,8 +439,12 @@ async fn pull_to_head_stops_at_per_cycle_page_budget() {
 // Attribution binding regressions
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// A batch whose op device_id mismatches the envelope sender is a poison
+/// batch — fail-closed on apply, but it must NOT wedge pull (whole-batch
+/// quarantine + cursor advance + event), unlike the older hard-Err that froze
+/// the cursor and the push phase on the same seq forever.
 #[tokio::test]
-async fn rejects_entire_batch_when_op_device_id_differs_from_envelope_sender() {
+async fn quarantines_entire_batch_when_op_device_id_differs_from_envelope_sender() {
     let sender_id = "device-sender";
     let good = task_title_op("op-good", sender_id, sender_id);
     let bad = CrdtChange {
@@ -395,35 +454,744 @@ async fn rejects_entire_batch_when_op_device_id_differs_from_envelope_sender() {
         ..task_title_op("op-bad-device", "device-forged", "device-forged")
     };
 
-    let (result, storage, entity) = pull_injected_sender_batch(vec![good, bad]).await;
+    let (result, storage, entity, events) =
+        pull_injected_sender_batch_capturing_events(vec![good, bad]).await;
 
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(err.contains("CRDT op attribution mismatch"), "{err}");
-    assert_eq!(result.merged, 0);
+    assert!(result.error.is_none(), "poison batch must not surface a terminal error: {:?}", result.error);
+    assert_eq!(result.merged, 0, "no op from the tainted batch may be applied");
     assert_eq!(entity.get_field("task-attribution", "title"), None);
     assert_eq!(entity.get_field("task-attribution", "done"), None);
     assert_eq!(
         storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
-        0,
-        "bad-attribution batch must not advance the pull cursor"
+        1,
+        "quarantined batch must advance the pull cursor so the group is not wedged"
+    );
+
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].reason, "attribution_mismatch");
+    assert_eq!(quarantined[0].server_seq, 1);
+    assert_eq!(quarantined[0].sender_device_id, sender_id);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SyncEvent::PullBatchQuarantined { reason, .. } if reason == "attribution_mismatch"
+        )),
+        "expected a PullBatchQuarantined event for the attribution mismatch"
     );
 }
 
+/// Same fail-open-on-availability discipline for an HLC-node mismatch.
 #[tokio::test]
-async fn rejects_batch_when_op_hlc_node_differs_from_envelope_sender() {
+async fn quarantines_batch_when_op_hlc_node_differs_from_envelope_sender() {
     let sender_id = "device-sender";
     let op = task_title_op("op-bad-hlc", sender_id, "device-forged");
 
-    let (result, storage, entity) = pull_injected_sender_batch(vec![op]).await;
+    let (result, storage, entity, events) =
+        pull_injected_sender_batch_capturing_events(vec![op]).await;
 
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(err.contains("CRDT op HLC attribution mismatch"), "{err}");
+    assert!(result.error.is_none(), "{:?}", result.error);
     assert_eq!(result.merged, 0);
     assert_eq!(entity.get_field("task-attribution", "title"), None);
     assert_eq!(
         storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        1,
+        "quarantined batch must advance the pull cursor"
+    );
+
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].reason, "attribution_mismatch");
+
+    assert!(events.iter().any(|e| matches!(
+        e,
+        SyncEvent::PullBatchQuarantined { reason, .. } if reason == "attribution_mismatch"
+    )));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Poison pull batches quarantine-and-advance (never wedge pull or push)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: build a validly-signed envelope whose declared payload_hash does not
+/// match the encrypted plaintext (a poison/tampered batch).
+fn make_hash_mismatched_batch(
+    ops: &[CrdtChange],
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    signing_key: &SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    batch_id: &str,
+    sender_device_id: &str,
+) -> SignedBatchEnvelope {
+    let plaintext = CrdtChange::encode_batch(ops).unwrap();
+    let mut wrong_hash = batch_signature::compute_payload_hash(&plaintext);
+    wrong_hash[0] ^= 0xff; // corrupt the declared hash
+    let epoch_key = key_hierarchy.epoch_key(0).unwrap();
+    let aad = sync_aad::build_sync_aad(SYNC_ID, sender_device_id, 0, batch_id, "ops");
+    let (ciphertext, nonce) =
+        prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &plaintext, &aad).unwrap();
+    batch_signature::sign_batch(
+        signing_key,
+        ml_dsa_signing_key,
+        SYNC_ID,
         0,
-        "bad-attribution batch must not advance the pull cursor"
+        batch_id,
+        "ops",
+        sender_device_id,
+        0,
+        &wrong_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap()
+}
+
+/// Helper: build a validly-signed envelope whose decrypted plaintext is correct
+/// against the declared payload_hash but is NOT a decodable CRDT batch (garbage
+/// bytes). Models cross-version wire skew: signature + hash verify, but this
+/// build's `decode_batch` cannot parse the plaintext.
+fn make_undecodable_batch(
+    plaintext: &[u8],
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    signing_key: &SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    batch_id: &str,
+    sender_device_id: &str,
+) -> SignedBatchEnvelope {
+    // Hash is computed over the actual (garbage) plaintext, so verify_payload_hash
+    // passes and the failure lands specifically on decode_batch.
+    let payload_hash = batch_signature::compute_payload_hash(plaintext);
+    let epoch_key = key_hierarchy.epoch_key(0).unwrap();
+    let aad = sync_aad::build_sync_aad(SYNC_ID, sender_device_id, 0, batch_id, "ops");
+    let (ciphertext, nonce) =
+        prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, plaintext, &aad).unwrap();
+    batch_signature::sign_batch(
+        signing_key,
+        ml_dsa_signing_key,
+        SYNC_ID,
+        0,
+        batch_id,
+        "ops",
+        sender_device_id,
+        0,
+        &payload_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap()
+}
+
+/// An undecodable batch (valid signature, valid payload_hash over garbage that
+/// `decode_batch` rejects — the cross-version-skew case) is quarantined with
+/// reason `decode_failed`, the cursor advances, the event fires, and a queued
+/// local op still pushes (push not starved). Repeated immediate cycles do NOT
+/// churn the cursor and bump retry_count exactly once per eligible replay.
+///
+/// NOTE: the plan's "replay applies after decoder upgrade" half is not covered
+/// here — `CrdtChange::decode_batch` is a free static fn with no decoder seam, so
+/// swapping in a decoder that accepts the garbage is impractical in a Rust unit
+/// test. Tracked as a declared deviation; the quarantine half (the safety net
+/// the commit message leans on) is what is exercised.
+#[tokio::test]
+async fn undecodable_batch_quarantined_with_decode_failed_reason() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let ml_dsa_key_receiver = make_ml_dsa_keypair();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        receiver_id,
+        &signing_key_receiver.verifying_key(),
+        &ml_dsa_key_receiver.public_key_bytes(),
+    );
+
+    // Seq 1: undecodable batch (binary garbage, not JSON).
+    let garbage = b"\xff\xfe\x00\x01 this is not a CRDT batch \x80\x81";
+    let poison = make_undecodable_batch(
+        garbage,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-undecodable",
+        sender_id,
+    );
+    let poison_seq = relay.inject_batch(poison);
+
+    // Seq 2: good batch — must apply past the poison one.
+    let good_op = make_op(sender_id, "batch-good-remote", 0, "good-remote");
+    let good = make_encrypted_batch(
+        std::slice::from_ref(&good_op),
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-good-remote",
+        sender_id,
+    );
+    let good_seq = relay.inject_batch(good);
+
+    // A local op queued to push this same cycle (push-not-starved assertion).
+    let local_op = make_op(receiver_id, "batch-local", 0, "local");
+    insert_pending_ops(&storage, std::slice::from_ref(&local_op), "batch-local");
+
+    let (event_tx, mut event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(32);
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    )
+    .with_event_sink(event_tx.clone());
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "no terminal error: {:?}", result.error);
+    assert_eq!(result.merged, 1, "only the good batch applies");
+    assert_eq!(
+        entity.get_field("task-good-remote", "title"),
+        Some(SyncValue::String("hello".into()))
+    );
+
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        good_seq,
+        "cursor must advance past the undecodable batch to the good one"
+    );
+
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].reason, "decode_failed");
+    assert_eq!(quarantined[0].server_seq, poison_seq);
+    assert_eq!(quarantined[0].retry_count, 0, "no replay has run yet");
+
+    // Push not starved.
+    assert_eq!(result.pushed, 1, "queued local op must still push despite the poison batch");
+    assert!(relay.push_call_batch_ids().contains(&"batch-local".to_string()));
+
+    let mut saw_event = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::PullBatchQuarantined { reason, server_seq, .. } =
+            event
+        {
+            if reason == "decode_failed" && server_seq == poison_seq {
+                saw_event = true;
+            }
+        }
+    }
+    assert!(saw_event, "expected PullBatchQuarantined(decode_failed) event");
+
+    // Cursor after cycle 1: at least the good batch's seq. (It may sit higher
+    // because the receiver echoes back its own just-pushed local batch on a later
+    // pull — that is not the poison batch being re-consumed.)
+    let cursor_after_c1 =
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq;
+    assert!(cursor_after_c1 >= good_seq);
+
+    // Second cycle (immediate, default backoff). The first Phase 0b replay is
+    // always eligible, attempts decode, fails identically, and bumps retry_count
+    // to 1 — without re-applying anything and without rewinding past the poison
+    // batch (its quarantine row keeps its original server_seq).
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    let q2 = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(q2.len(), 1, "still undecodable -> stays quarantined");
+    assert_eq!(q2[0].retry_count, 1, "first replay bumps retry_count once");
+    assert_eq!(q2[0].server_seq, poison_seq, "poison row's seq is unchanged");
+    assert_eq!(entity.get_field("task-undecodable", "title"), None, "poison op never applies");
+    let cursor_after_c2 =
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq;
+    assert!(cursor_after_c2 >= cursor_after_c1, "cursor must be monotonic, never rewound");
+
+    // Third cycle (still immediate): now within the backoff window (retry_count=1
+    // -> 60s @ 30s base), so the row is SKIPPED — retry_count stays at 1, proving
+    // the gate prevents per-cycle decode churn (and, structurally, any per-row
+    // sender-resolution network fetch the replay would otherwise issue).
+    let r3 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r3.error.is_none(), "{:?}", r3.error);
+    let q3 = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(q3.len(), 1);
+    assert_eq!(
+        q3[0].retry_count, 1,
+        "backoff gate must skip the replay within the window (no retry_count bump)"
+    );
+}
+
+/// A poison batch (hash mismatch) at seq N followed by a good batch at N+1: the
+/// good batch applies, the cursor reaches N+1, the poison envelope is
+/// quarantined with reason payload_hash_mismatch, the event fires, AND a queued
+/// local op is still pushed in the same cycle (push is not starved by the poison
+/// batch — the older hard-wedge would have returned before the push phase).
+#[tokio::test]
+async fn poison_batch_quarantined_good_batch_applies_and_push_not_starved() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let ml_dsa_key_receiver = make_ml_dsa_keypair();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        receiver_id,
+        &signing_key_receiver.verifying_key(),
+        &ml_dsa_key_receiver.public_key_bytes(),
+    );
+
+    // Seq 1: poison batch.
+    let poison_op = make_op(sender_id, "batch-poison", 0, "poison");
+    let poison = make_hash_mismatched_batch(
+        std::slice::from_ref(&poison_op),
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-poison",
+        sender_id,
+    );
+    let poison_seq = relay.inject_batch(poison);
+
+    // Seq 2: good batch.
+    let good_op = make_op(sender_id, "batch-good-remote", 0, "good-remote");
+    let good = make_encrypted_batch(
+        std::slice::from_ref(&good_op),
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-good-remote",
+        sender_id,
+    );
+    let good_seq = relay.inject_batch(good);
+
+    // A local op queued to push this same cycle.
+    let local_op = make_op(receiver_id, "batch-local", 0, "local");
+    insert_pending_ops(&storage, std::slice::from_ref(&local_op), "batch-local");
+
+    let (event_tx, mut event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(32);
+    let engine =
+        SyncEngine::new(storage.clone(), relay.clone(), vec![entity_ref], test_schema(), SyncConfig::default())
+            .with_event_sink(event_tx.clone());
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "no terminal error: {:?}", result.error);
+    assert_eq!(result.merged, 1, "only the good batch applies");
+    assert_eq!(entity.get_field("task-good-remote", "title"), Some(SyncValue::String("hello".into())));
+    assert_eq!(entity.get_field("task-poison", "title"), None, "poison op must not apply");
+
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        good_seq,
+        "cursor must reach the good batch past the poison one"
+    );
+
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].reason, "payload_hash_mismatch");
+    assert_eq!(quarantined[0].server_seq, poison_seq);
+
+    // Push not starved: the local op was pushed in the same cycle.
+    assert_eq!(result.pushed, 1, "the queued local op must still push despite the poison batch");
+    assert!(relay.push_call_batch_ids().contains(&"batch-local".to_string()));
+
+    let mut saw_event = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::PullBatchQuarantined { reason, server_seq, .. } =
+            event
+        {
+            if reason == "payload_hash_mismatch" && server_seq == poison_seq {
+                saw_event = true;
+            }
+        }
+    }
+    assert!(saw_event, "expected PullBatchQuarantined(payload_hash_mismatch) event");
+}
+
+/// Mid-page stall ack discipline. A page of three batches where batch 2 is
+/// from an unresolvable (unknown, no-registry) sender: batch 1 (known sender)
+/// applies and advances the cursor to seq1; batch 2's transient verdict STALLS,
+/// breaking the page loop so batches 2 and 3 are left unconsumed; and crucially
+/// the device acks seq1 — NOT the page-max seq3 — so the relay can never prune
+/// batches 2 or 3. The push phase still runs.
+#[tokio::test]
+async fn mid_page_stall_acks_cursor_not_page_max() {
+    let key_hierarchy = init_key_hierarchy();
+    let known_signing = make_signing_key();
+    let known_ml_dsa = make_ml_dsa_keypair();
+    let unknown_signing = make_signing_key();
+    let unknown_ml_dsa = make_ml_dsa_keypair();
+    let receiver_signing = make_signing_key();
+    let receiver_ml_dsa = make_ml_dsa_keypair();
+
+    let known_id = "device-known";
+    let unknown_id = "device-unknown";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        receiver_id,
+        &receiver_signing.verifying_key(),
+        &receiver_ml_dsa.public_key_bytes(),
+    );
+    // The known sender IS in the local registry; the unknown sender is NOT, and
+    // there is no signed registry artifact -> resolving it returns Ok(None), a
+    // transient verdict.
+    register_device_with_pq(
+        &relay,
+        &storage,
+        known_id,
+        &known_signing.verifying_key(),
+        &known_ml_dsa.public_key_bytes(),
+    );
+
+    // Seq 1: good batch from the known sender (applies).
+    let op1 = make_op(known_id, "batch-1", 0, "one");
+    let b1 = make_encrypted_batch(
+        std::slice::from_ref(&op1),
+        &key_hierarchy,
+        &known_signing,
+        &known_ml_dsa,
+        "batch-1",
+        known_id,
+    );
+    let seq1 = relay.inject_batch(b1);
+
+    // Seq 2: batch from the unknown sender (stalls the page).
+    let op2 = make_op(unknown_id, "batch-2", 0, "two");
+    let b2 = make_encrypted_batch(
+        std::slice::from_ref(&op2),
+        &key_hierarchy,
+        &unknown_signing,
+        &unknown_ml_dsa,
+        "batch-2",
+        unknown_id,
+    );
+    let seq2 = relay.inject_batch(b2);
+
+    // Seq 3: another good batch from the known sender — must remain unconsumed
+    // because the page loop breaks at the seq-2 stall.
+    let op3 = make_op(known_id, "batch-3", 0, "three");
+    let b3 = make_encrypted_batch(
+        std::slice::from_ref(&op3),
+        &key_hierarchy,
+        &known_signing,
+        &known_ml_dsa,
+        "batch-3",
+        known_id,
+    );
+    // Injected so the page is genuinely longer than the applied prefix; its seq
+    // is not asserted directly (the `acks == vec![seq1]` check below already
+    // proves nothing past seq1 is acked).
+    let _seq3 = relay.inject_batch(b3);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &receiver_signing, Some(&receiver_ml_dsa), receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(result.error.is_none(), "stall is non-fatal: {:?}", result.error);
+
+    // Only batch 1 applied; batch 3 is past the stall and never reached.
+    assert_eq!(entity.get_field("task-one", "title"), Some(SyncValue::String("hello".into())));
+    assert_eq!(entity.get_field("task-two", "title"), None, "stalled batch not applied");
+    assert_eq!(entity.get_field("task-three", "title"), None, "post-stall batch unconsumed");
+
+    // Cursor sits at seq1: advanced past the applied batch, frozen behind the
+    // stall.
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        seq1,
+        "cursor must stop at the applied batch, behind the stalled one"
+    );
+
+    // Yield so the fire-and-forget ack task runs before we read ack_calls();
+    // otherwise the negative assertion below could pass simply because the ack
+    // task never got polled on the current-thread test runtime.
+    tokio::task::yield_now().await;
+
+    // Ack discipline: ack EXACTLY seq1 (the local cursor), never the page max
+    // (seq3) and never the stalled seq2. This is what stops the relay from
+    // pruning the unconsumed batches 2 and 3. A positive equality check (not just
+    // "not greater than seq1") so a regression back to page-max acking fails
+    // deterministically rather than depending on ack-task timing.
+    let acks = relay.ack_calls();
+    assert_eq!(
+        acks,
+        vec![seq1],
+        "must ack exactly the local cursor seq1, not the stalled seq2 or page max seq3"
+    );
+
+    // The unknown sender's batch is the stall row; batch 3 is not (loop broke).
+    let stalls = storage.list_pull_stalls(SYNC_ID).unwrap();
+    assert_eq!(stalls.len(), 1, "one stall row");
+    assert_eq!(stalls[0].server_seq, seq2);
+    assert_eq!(stalls[0].reason, "sender_unresolved");
+    assert!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "within budget -> stall, not quarantine"
+    );
+}
+
+/// A batch quarantined because its signature did not verify under the sender's
+/// (then-wrong) registered key. The cursor advances; repeated sync cycles bump
+/// retry_count with backoff and do NOT churn the cursor. Once the correct key is
+/// imported, Phase 0b replay verifies, applies the ops, and deletes the row.
+#[tokio::test]
+async fn invalid_signature_batch_quarantines_then_replays_after_key_import() {
+    use prism_sync_core::storage::DeviceRecord;
+
+    let key_hierarchy = init_key_hierarchy();
+    let real_sender_signing = make_signing_key();
+    let real_sender_ml_dsa = make_ml_dsa_keypair();
+    let wrong_ml_dsa = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    // Register the sender with the WRONG ML-DSA key so verification fails first.
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &real_sender_signing.verifying_key(),
+        &wrong_ml_dsa.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    // The batch is signed with the sender's REAL ML-DSA key.
+    let op = make_op(sender_id, "batch-rotate", 0, "rotate");
+    let envelope = make_encrypted_batch(
+        std::slice::from_ref(&op),
+        &key_hierarchy,
+        &real_sender_signing,
+        &real_sender_ml_dsa,
+        "batch-rotate",
+        sender_id,
+    );
+    let seq = relay.inject_batch(envelope);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        // Disable replay backoff so the three back-to-back cycles each attempt a
+        // replay; the backoff gate itself is pinned by
+        // `quarantine_replay_backoff_skips_within_window`.
+        SyncConfig { quarantine_replay_backoff_base_ms: 0, ..SyncConfig::default() },
+    );
+
+    // Cycle 1: signature fails under the wrong key -> quarantine + advance.
+    let r1 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r1.error.is_none(), "{:?}", r1.error);
+    assert_eq!(entity.get_field("task-rotate", "title"), None);
+    assert_eq!(storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq, seq);
+    let q1 = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(q1.len(), 1);
+    assert_eq!(q1[0].reason, "invalid_signature");
+    assert_eq!(q1[0].retry_count, 0);
+
+    // Cycle 2: still wrong key -> replay fails, retry_count bumps, no churn.
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    let q2 = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(q2.len(), 1, "still quarantined while the key is wrong");
+    assert_eq!(q2[0].retry_count, 1, "retry_count must bump on identical failure");
+    assert!(q2[0].last_retry_at.is_some());
+    assert_eq!(storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq, seq);
+
+    // Import the correct ML-DSA key (simulating registry propagation).
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_device_record(&DeviceRecord {
+            sync_id: SYNC_ID.to_string(),
+            device_id: sender_id.to_string(),
+            ed25519_public_key: real_sender_signing.verifying_key().to_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: real_sender_ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: Vec::new(),
+            x_wing_public_key: Vec::new(),
+            status: "active".to_string(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Cycle 3: Phase 0b replay verifies under the correct key and applies.
+    let r3 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r3.error.is_none(), "{:?}", r3.error);
+    assert_eq!(entity.get_field("task-rotate", "title"), Some(SyncValue::String("hello".into())));
+    assert!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "replayed batch's quarantine row must be deleted"
+    );
+    // Cursor never rewound below the live-pull seq.
+    assert_eq!(storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq, seq);
+}
+
+/// Revoking the poison sender after quarantine: the next Phase 0b replay
+/// terminally discards the row (fail-closed) and applies nothing.
+#[tokio::test]
+async fn quarantined_batch_from_revoked_sender_is_discarded() {
+    use prism_sync_core::storage::DeviceRecord;
+
+    let key_hierarchy = init_key_hierarchy();
+    let real_sender_signing = make_signing_key();
+    let real_sender_ml_dsa = make_ml_dsa_keypair();
+    let wrong_ml_dsa = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &real_sender_signing.verifying_key(),
+        &wrong_ml_dsa.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let op = make_op(sender_id, "batch-revoke", 0, "revoke");
+    let envelope = make_encrypted_batch(
+        std::slice::from_ref(&op),
+        &key_hierarchy,
+        &real_sender_signing,
+        &real_sender_ml_dsa,
+        "batch-revoke",
+        sender_id,
+    );
+    relay.inject_batch(envelope);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Cycle 1: invalid signature -> quarantine.
+    engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(storage.list_quarantined_pull_batches(SYNC_ID).unwrap().len(), 1);
+
+    // Revoke the sender locally.
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_device_record(&DeviceRecord {
+            sync_id: SYNC_ID.to_string(),
+            device_id: sender_id.to_string(),
+            ed25519_public_key: real_sender_signing.verifying_key().to_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: real_sender_ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: Vec::new(),
+            x_wing_public_key: Vec::new(),
+            status: "revoked".to_string(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: Some(chrono::Utc::now()),
+            ml_dsa_key_generation: 0,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Cycle 2: replay sees the revoked sender -> terminal discard, nothing applies.
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    assert_eq!(entity.get_field("task-revoke", "title"), None, "revoked sender's op must not apply");
+    assert!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "quarantine row from a revoked sender must be terminally discarded"
     );
 }
 
@@ -510,6 +1278,187 @@ async fn quarantined_op_replays_when_schema_adds_field() {
     );
     assert!(storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty());
     assert!(storage.is_op_applied("op-future-field").unwrap());
+}
+
+/// A `future_hlc` quarantined op whose field is ALSO schema-unknown must NOT be
+/// replayed-and-deleted once drift decays: the replay loop skips schema-unknown
+/// ops (so it cannot apply this one), and Phase C must therefore leave its
+/// quarantine row intact rather than delete it. Deleting it would be permanent
+/// data loss — the pull cursor is already past the batch, so the relay can no
+/// longer redeliver it. Regression guard for the `is_replay_eligible` future_hlc
+/// arm's `schema_known` requirement (and the Phase C applied-only deletion).
+#[tokio::test]
+async fn future_hlc_op_with_unknown_field_is_not_replayed_or_deleted() {
+    use prism_sync_core::storage::QuarantinedOp;
+
+    let receiver_id = "device-receiver";
+    let sender_id = "device-sender";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let signing_key_receiver = make_signing_key();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    // HLC at "now" so the future-drift check is well within tolerance — the only
+    // thing that should keep this op quarantined is its schema-unknown field.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let in_tolerance_hlc = Hlc::new(now_ms, 0, sender_id);
+    let quarantined_op = CrdtChange {
+        op_id: "op-future-unknown".to_string(),
+        batch_id: Some("batch-future-unknown".to_string()),
+        entity_id: "task-future".to_string(),
+        // `future_note` is absent from `test_schema()` — schema-unknown.
+        entity_table: "tasks".to_string(),
+        field_name: "future_note".to_string(),
+        encoded_value: "\"Deferred edit\"".to_string(),
+        client_hlc: in_tolerance_hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_op(&QuarantinedOp {
+            sync_id: SYNC_ID.to_string(),
+            op_id: quarantined_op.op_id.clone(),
+            op: quarantined_op.clone(),
+            reason: "future_hlc".to_string(),
+            server_seq: 1,
+            quarantined_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(storage.list_quarantined_ops(SYNC_ID).unwrap().len(), 1);
+
+    // Engine schema does NOT know `future_note`.
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity_ref], test_schema(), SyncConfig::default());
+    let result = engine
+        .sync(SYNC_ID, &init_key_hierarchy(), &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.merged, 0, "schema-unknown op must not be applied");
+    assert!(
+        !storage.is_op_applied("op-future-unknown").unwrap(),
+        "op was never applied, so applied_ops must not record it",
+    );
+    let remaining = storage.list_quarantined_ops(SYNC_ID).unwrap();
+    assert_eq!(remaining.len(), 1, "quarantine row must survive replay (no silent drop)");
+    assert_eq!(remaining[0].op_id, "op-future-unknown");
+    assert_eq!(remaining[0].reason, "future_hlc");
+    assert_eq!(
+        entity.get_field("task-future", "future_note"),
+        None,
+        "no consumer-side effect from a non-replayed op",
+    );
+}
+
+/// A pulled batch carrying a `_bulk_reset` sentinel (for which this build has
+/// no handler) plus replacement rows: the replacement rows apply, the sentinel
+/// is quarantined per-op with reason `unsupported_bulk_reset` and is NOT marked
+/// applied, the cursor advances, and repeated sync cycles never apply, delete,
+/// or re-insert the quarantine row (no replay churn). Marking it applied
+/// as a no-op (the pre-fix behaviour) would silently and unrecoverably diverge
+/// the moment any peer emits a bulk reset.
+#[tokio::test]
+async fn bulk_reset_op_quarantined_replacement_rows_apply_no_replay_churn() {
+    use prism_sync_core::BULK_RESET_FIELD;
+
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let reset_op = CrdtChange {
+        op_id: "op-bulk-reset".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-bulk".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: BULK_RESET_FIELD.to_string(),
+        encoded_value: "null".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_000, 0, sender_id).to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    let replacement_op = CrdtChange {
+        op_id: "op-replacement".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-bulk".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Fresh\"".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_001, 0, sender_id).to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (result, storage, entity) =
+        pull_injected_sender_batch(vec![reset_op, replacement_op]).await;
+
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.merged, 1, "only the replacement row wins; the reset is quarantined");
+    assert_eq!(
+        entity.get_field("task-bulk", "title"),
+        Some(SyncValue::String("Fresh".to_string())),
+        "replacement row applies"
+    );
+    assert!(
+        storage.is_op_applied("op-replacement").unwrap(),
+        "replacement row is recorded applied"
+    );
+    assert!(
+        !storage.is_op_applied("op-bulk-reset").unwrap(),
+        "bulk reset must NOT be marked applied (the no-op-apply trap)"
+    );
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        1,
+        "cursor advances past the consumed batch"
+    );
+
+    let quarantined = storage.list_quarantined_ops(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].op_id, "op-bulk-reset");
+    assert_eq!(quarantined[0].reason, "unsupported_bulk_reset");
+    assert_eq!(quarantined[0].server_seq, 1);
+
+    // Ten more sync cycles must not churn: no apply, no delete, no re-insert,
+    // no error. `unsupported_bulk_reset` is never replay-eligible in this build.
+    let relay = Arc::new(MockRelay::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay,
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+    for cycle in 0..10 {
+        let r = engine
+            .sync(SYNC_ID, &init_key_hierarchy(), &make_signing_key(), None, receiver_id, 0)
+            .await
+            .unwrap();
+        assert!(r.error.is_none(), "cycle {cycle}: {:?}", r.error);
+        assert_eq!(r.merged, 0, "cycle {cycle}: nothing new applies");
+        let q = storage.list_quarantined_ops(SYNC_ID).unwrap();
+        assert_eq!(q.len(), 1, "cycle {cycle}: quarantine row neither deleted nor duplicated");
+        assert_eq!(q[0].op_id, "op-bulk-reset");
+        assert!(
+            !storage.is_op_applied("op-bulk-reset").unwrap(),
+            "cycle {cycle}: reset still not applied"
+        );
+    }
 }
 
 #[tokio::test]
@@ -618,6 +1567,568 @@ async fn snapshot_import_accepts_rows_from_trusted_non_uploader_device() {
     assert!(storage.is_op_applied("op-source-snapshot").unwrap());
     assert_eq!(entity_changes.len(), 1);
     assert_eq!(entity_changes[0].fields.get("title"), Some(&"\"Source snapshot row\"".to_string()));
+}
+
+/// A snapshot auto-bootstrap (the relay-history-pruned path that runs
+/// `bootstrap_from_snapshot`) must preserve the device's existing
+/// `last_imported_registry_version` freshness baseline. The snapshot blob carries
+/// no baseline, so without the importer's preserve-on-REPLACE fix the bootstrap
+/// would NULL it and re-arm the stale-registry false-wipe on exactly the devices
+/// that just bootstrapped.
+#[tokio::test]
+async fn bootstrap_from_snapshot_preserves_last_imported_registry_version() {
+    use prism_sync_core::storage::SyncStorage as _;
+
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 42;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    // The device has already imported registry version 17 (its freshness
+    // baseline). This is the value the snapshot import must not clobber.
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_imported_registry_version(SYNC_ID, 17).unwrap();
+        tx.commit().unwrap();
+    }
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let alive_hlc = Hlc::new(1_710_500_000_000, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-alive".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: alive_hlc.clone(),
+            winning_device_id: source_id.to_string(),
+            winning_op_id: "op-alive".to_string(),
+            winning_encoded_value: Some("\"Still here\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        applied_ops: vec![AppliedOpEntry {
+            op_id: "op-alive".to_string(),
+            sync_id: SYNC_ID.to_string(),
+            epoch: 0,
+            device_id: source_id.to_string(),
+            client_hlc: alive_hlc,
+            server_seq: server_seq_at,
+            applied_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        // The snapshot's metadata names the SENDER as local_device_id — the
+        // importer must keep the RECEIVER's local id AND its baseline.
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-baseline",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+
+    let meta = storage.get_sync_metadata(SYNC_ID).unwrap().unwrap();
+    assert_eq!(
+        meta.last_imported_registry_version,
+        Some(17),
+        "snapshot bootstrap must preserve the freshness baseline"
+    );
+    assert_eq!(
+        meta.local_device_id, receiver_id,
+        "snapshot bootstrap must keep the local device id, not adopt the snapshot's"
+    );
+    assert_eq!(meta.last_pulled_server_seq, server_seq_at, "transport cursor still advances");
+}
+
+/// Snapshot import writes the consumer-delivery journal in the SAME tx as
+/// the import + cursor advance, so a kill between import-commit and Dart apply
+/// still finds the full accepted set listed for the startup drain. A normal
+/// field journals a value delivery; an `is_deleted=true` field journals a
+/// delete delivery.
+#[tokio::test]
+async fn bootstrap_from_snapshot_journals_accepted_field_versions() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 42;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let alive_hlc = Hlc::new(1_710_500_000_000, 0, source_id).to_string();
+    let dead_hlc = Hlc::new(1_710_500_000_001, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![
+            FieldVersionEntry {
+                entity_table: "tasks".to_string(),
+                entity_id: "task-alive".to_string(),
+                field_name: "title".to_string(),
+                winning_hlc: alive_hlc.clone(),
+                winning_device_id: source_id.to_string(),
+                winning_op_id: "op-alive".to_string(),
+                winning_encoded_value: Some("\"Still here\"".to_string()),
+                updated_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+            FieldVersionEntry {
+                entity_table: "tasks".to_string(),
+                entity_id: "task-dead".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_hlc: dead_hlc.clone(),
+                winning_device_id: source_id.to_string(),
+                winning_op_id: "op-dead".to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+        ],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        applied_ops: vec![
+            AppliedOpEntry {
+                op_id: "op-alive".to_string(),
+                sync_id: SYNC_ID.to_string(),
+                epoch: 0,
+                device_id: source_id.to_string(),
+                client_hlc: alive_hlc,
+                server_seq: server_seq_at,
+                applied_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+            AppliedOpEntry {
+                op_id: "op-dead".to_string(),
+                sync_id: SYNC_ID.to_string(),
+                epoch: 0,
+                device_id: source_id.to_string(),
+                client_hlc: dead_hlc,
+                server_seq: server_seq_at,
+                applied_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+        ],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-journal",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    let (count, _changes) = engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+    assert_eq!(count, 2);
+
+    // Cursor advanced to the snapshot's server_seq, and the journal lists both
+    // accepted field versions — committed in the same tx as the import.
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        server_seq_at
+    );
+
+    let journal = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    assert_eq!(journal.len(), 2, "two accepted field versions -> two journal rows");
+
+    let alive = journal.iter().find(|r| r.entity_id == "task-alive").expect("alive row");
+    assert_eq!(alive.field_name.as_deref(), Some("title"));
+    assert_eq!(alive.encoded_value.as_deref(), Some("\"Still here\""));
+    assert!(!alive.is_delete);
+    assert_eq!(alive.server_seq, server_seq_at);
+
+    let dead = journal.iter().find(|r| r.entity_id == "task-dead").expect("dead row");
+    assert!(dead.is_delete, "is_deleted=true field -> delete delivery");
+    assert_eq!(dead.field_name, None);
+    assert_eq!(dead.encoded_value, None);
+}
+
+/// Regression for the bootstrap half of the delete-absorbing journal blocker: a
+/// tombstoned entity whose accepted `is_deleted=true` field is ordered BEFORE its
+/// other accepted fields in the snapshot vec must still journal a SINGLE delete
+/// delivery — never the surviving sparse fields. Import retains the non-is_deleted
+/// fields in field_versions (it is per-field), so without the absorbing drop a
+/// freshly paired device would deliver the entity live-with-fields and resurrect
+/// it (the old event path handled this via the absorbing snapshot builder).
+#[tokio::test]
+async fn bootstrap_from_snapshot_journal_is_delete_absorbing_when_is_deleted_ordered_first() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 7;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let del_hlc = Hlc::new(1_710_500_000_000, 0, source_id).to_string();
+    let title_hlc = Hlc::new(1_710_500_000_001, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        // `is_deleted` ordered FIRST, then `title` for the SAME entity.
+        field_versions: vec![
+            FieldVersionEntry {
+                entity_table: "tasks".to_string(),
+                entity_id: "task-zombie".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_hlc: del_hlc.clone(),
+                winning_device_id: source_id.to_string(),
+                winning_op_id: "op-del".to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+            FieldVersionEntry {
+                entity_table: "tasks".to_string(),
+                entity_id: "task-zombie".to_string(),
+                field_name: "title".to_string(),
+                winning_hlc: title_hlc.clone(),
+                winning_device_id: source_id.to_string(),
+                winning_op_id: "op-title".to_string(),
+                winning_encoded_value: Some("\"Ghost\"".to_string()),
+                updated_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+        ],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        applied_ops: vec![
+            AppliedOpEntry {
+                op_id: "op-del".to_string(),
+                sync_id: SYNC_ID.to_string(),
+                epoch: 0,
+                device_id: source_id.to_string(),
+                client_hlc: del_hlc,
+                server_seq: server_seq_at,
+                applied_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+            AppliedOpEntry {
+                op_id: "op-title".to_string(),
+                sync_id: SYNC_ID.to_string(),
+                epoch: 0,
+                device_id: source_id.to_string(),
+                client_hlc: title_hlc,
+                server_seq: server_seq_at,
+                applied_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+        ],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-zombie",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+
+    // Both fields are retained in field_versions by import (per-field), but the
+    // journal carries ONLY the delete delivery — the surviving `title` is dropped.
+    let journal = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    let rows: Vec<_> = journal.iter().filter(|r| r.entity_id == "task-zombie").collect();
+    assert_eq!(rows.len(), 1, "tombstoned entity journals one delete row, not its fields");
+    assert!(rows[0].is_delete);
+    assert_eq!(rows[0].field_name, None);
+    assert_eq!(rows[0].encoded_value, None);
+}
+
+/// Conflict C8 auto-exclusion property: a snapshot field that import decides
+/// SkipStale (the receiver already holds a newer local winner) must produce NO
+/// consumer_deliveries row — the in-tx post-import equality re-read excludes it
+/// automatically, so later import gates (tombstone/snapshot) get the same exclusion for
+/// free. Pins the property the plan requires (the all-accepted test alone does
+/// not exercise it).
+#[tokio::test]
+async fn bootstrap_from_snapshot_journal_excludes_skipstale_fields() {
+    use prism_sync_core::storage::FieldVersion;
+
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 9;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    // The receiver already holds a NEWER local winner for task-stale/title, so
+    // the snapshot's older row imports as SkipStale.
+    let local_newer_hlc = Hlc::new(1_710_500_999_999, 0, receiver_id).to_string();
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: SYNC_ID.to_string(),
+            entity_table: "tasks".to_string(),
+            entity_id: "task-stale".to_string(),
+            field_name: "title".to_string(),
+            winning_op_id: "op-local".to_string(),
+            winning_device_id: receiver_id.to_string(),
+            winning_hlc: local_newer_hlc,
+            winning_encoded_value: Some("\"Local wins\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let stale_hlc = Hlc::new(1_710_500_000_000, 0, source_id).to_string();
+    let fresh_hlc = Hlc::new(1_710_500_000_001, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![
+            // SkipStale: older than the receiver's local winner -> NOT journaled.
+            FieldVersionEntry {
+                entity_table: "tasks".to_string(),
+                entity_id: "task-stale".to_string(),
+                field_name: "title".to_string(),
+                winning_hlc: stale_hlc.clone(),
+                winning_device_id: source_id.to_string(),
+                winning_op_id: "op-stale".to_string(),
+                winning_encoded_value: Some("\"Snapshot loses\"".to_string()),
+                updated_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+            // Accepted (no local winner) -> journaled.
+            FieldVersionEntry {
+                entity_table: "tasks".to_string(),
+                entity_id: "task-fresh".to_string(),
+                field_name: "title".to_string(),
+                winning_hlc: fresh_hlc.clone(),
+                winning_device_id: source_id.to_string(),
+                winning_op_id: "op-fresh".to_string(),
+                winning_encoded_value: Some("\"Snapshot wins\"".to_string()),
+                updated_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+        ],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        applied_ops: vec![
+            AppliedOpEntry {
+                op_id: "op-stale".to_string(),
+                sync_id: SYNC_ID.to_string(),
+                epoch: 0,
+                device_id: source_id.to_string(),
+                client_hlc: stale_hlc,
+                server_seq: server_seq_at,
+                applied_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+            AppliedOpEntry {
+                op_id: "op-fresh".to_string(),
+                sync_id: SYNC_ID.to_string(),
+                epoch: 0,
+                device_id: source_id.to_string(),
+                client_hlc: fresh_hlc,
+                server_seq: server_seq_at,
+                applied_at: "2024-03-15T00:00:00Z".to_string(),
+            },
+        ],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-skipstale",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+
+    let journal = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    assert!(
+        journal.iter().all(|r| r.entity_id != "task-stale"),
+        "SkipStale snapshot field must not be journaled"
+    );
+    assert_eq!(
+        journal.iter().filter(|r| r.entity_id == "task-fresh").count(),
+        1,
+        "accepted snapshot field is journaled"
+    );
 }
 
 #[tokio::test]
@@ -847,12 +2358,66 @@ async fn drops_malformed_hlc_op_without_blocking_good_ops_in_same_batch() {
     );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Future-HLC ops are quarantined (not silently dropped) and replayed with
+// their ORIGINAL HLC once the receiver's clock is within tolerance.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Wire up a receiver engine over an explicit storage/relay so a test can run
+/// multiple sync passes (e.g. quarantine at a tight drift bound, then replay at
+/// a looser one) against the same persisted state. `inject_seq1_batch=false`
+/// runs a Phase-0-only cycle (no relay redelivery) to exercise quarantine
+/// replay.
+async fn f07_sync_once(
+    storage: &Arc<RusqliteSyncStorage>,
+    relay: &Arc<MockRelay>,
+    receiver_id: &str,
+    signing_key_receiver: &SigningKey,
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    config: SyncConfig,
+    entity: Arc<dyn SyncableEntity>,
+) -> SyncResult {
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        config,
+    );
+    engine
+        .sync(SYNC_ID, key_hierarchy, signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
-async fn drops_future_drifted_op_without_blocking_good_ops_in_same_batch() {
+async fn future_drifted_op_is_quarantined_then_replayed_with_original_hlc() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
     let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
     let now_ms = current_time_ms();
     let good_hlc = Hlc::new(now_ms - 1_000, 0, sender_id);
-    let future_hlc = Hlc::new(now_ms + 120_000, 0, sender_id);
+    // 90s into the future — beyond the 1s tolerance for the first pass, but well
+    // within the 200s tolerance used for the replay pass.
+    let future_hlc = Hlc::new(now_ms + 90_000, 0, sender_id);
 
     let good = CrdtChange {
         op_id: "op-good-hlc".to_string(),
@@ -881,35 +2446,362 @@ async fn drops_future_drifted_op_without_blocking_good_ops_in_same_batch() {
         server_seq: None,
     };
 
-    let (result, storage, entity) = pull_injected_sender_batch_with_config(
-        vec![good, future_drifted],
+    let envelope = make_encrypted_batch(
+        &[good, future_drifted],
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-attribution",
+        sender_id,
+    );
+    relay.inject_batch(envelope);
+
+    // Pass 1: tight tolerance — the future op is quarantined, not dropped.
+    let result = f07_sync_once(
+        &storage,
+        &relay,
+        receiver_id,
+        &signing_key_receiver,
+        &key_hierarchy,
         SyncConfig { max_clock_drift_ms: 1_000, ..Default::default() },
+        entity.clone(),
     )
     .await;
 
-    assert!(result.error.is_none(), "future-drifted op should be dropped: {:?}", result.error);
+    assert!(result.error.is_none(), "live pull should succeed: {:?}", result.error);
     assert_eq!(result.pulled, 1);
-    assert_eq!(result.merged, 1);
+    assert_eq!(result.merged, 1, "only the in-tolerance op applies on pass 1");
     assert_eq!(
         entity.get_field("task-hlc-drift", "title"),
         Some(SyncValue::String("Accepted title".to_string()))
     );
     assert_eq!(entity.get_field("task-hlc-drift", "done"), None);
     assert!(storage.is_op_applied("op-good-hlc").unwrap());
-    assert!(!storage.is_op_applied("op-future-hlc").unwrap());
+    assert!(
+        !storage.is_op_applied("op-future-hlc").unwrap(),
+        "future-HLC op must NOT be marked applied",
+    );
     assert_eq!(
         storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
         1,
-        "batch cursor should advance after applying the non-drifted ops"
+        "cursor advances after applying the in-tolerance ops",
+    );
+    let quarantined = storage.list_quarantined_ops(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1, "future-HLC op is durably quarantined, not dropped");
+    assert_eq!(quarantined[0].op_id, "op-future-hlc");
+    assert_eq!(quarantined[0].reason, "future_hlc");
+    let original_hlc = quarantined[0].op.client_hlc.clone();
+    assert_eq!(original_hlc, future_hlc.to_string(), "the ORIGINAL HLC is preserved for replay");
+
+    // Pass 2: loosen tolerance so the 90s drift is in-bounds; Phase 0 replays it.
+    let result = f07_sync_once(
+        &storage,
+        &relay,
+        receiver_id,
+        &signing_key_receiver,
+        &key_hierarchy,
+        SyncConfig { max_clock_drift_ms: 200_000, ..Default::default() },
+        entity.clone(),
+    )
+    .await;
+    assert!(result.error.is_none(), "replay pass should succeed: {:?}", result.error);
+
+    assert_eq!(
+        entity.get_field("task-hlc-drift", "done"),
+        Some(SyncValue::Bool(true)),
+        "the quarantined op is applied on replay once drift is within tolerance",
+    );
+    assert!(storage.is_op_applied("op-future-hlc").unwrap());
+    let fv = storage
+        .get_field_version(SYNC_ID, "tasks", "task-hlc-drift", "done")
+        .unwrap()
+        .expect("done has a field_version after replay");
+    assert_eq!(
+        fv.winning_hlc, original_hlc,
+        "replay applies with the op's ORIGINAL HLC so LWW converges across peers",
+    );
+    assert!(
+        storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty(),
+        "the quarantine row is deleted after a successful replay",
     );
 }
 
+/// A future-HLC op that is still beyond tolerance must NOT be replayed: no
+/// applied_ops insert, no quarantine churn, the row is left untouched.
 #[tokio::test]
-async fn skips_batch_when_envelope_generation_differs_from_registry_generation() {
+async fn future_drifted_op_still_beyond_tolerance_is_not_replayed() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let now_ms = current_time_ms();
+    let future_hlc = Hlc::new(now_ms + 300_000, 0, sender_id); // 5 min ahead
+    let future_drifted = CrdtChange {
+        op_id: "op-far-future".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-far".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "done".to_string(),
+        encoded_value: "true".to_string(),
+        client_hlc: future_hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    let envelope = make_encrypted_batch(
+        &[future_drifted],
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-attribution",
+        sender_id,
+    );
+    relay.inject_batch(envelope);
+
+    // Quarantine, then run several more cycles at the default 60s tolerance —
+    // the op stays 5 min ahead the whole time, so nothing should change.
+    for _ in 0..3 {
+        let result = f07_sync_once(
+            &storage,
+            &relay,
+            receiver_id,
+            &signing_key_receiver,
+            &key_hierarchy,
+            SyncConfig::default(),
+            entity.clone(),
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+    }
+
+    let quarantined = storage.list_quarantined_ops(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1, "row must persist (no churn, no drop) while still far-future");
+    assert_eq!(quarantined[0].reason, "future_hlc");
+    assert!(!storage.is_op_applied("op-far-future").unwrap());
+    assert_eq!(entity.get_field("task-far", "done"), None);
+}
+
+/// Convergence: a peer that quarantines a future op then replays it must reach
+/// the SAME field_version as a peer that accepted it immediately — even when the
+/// quarantining peer makes an interleaved local edit at a LOWER HLC. The future
+/// op wins LWW on both, and the C2 supersede rule must NOT fire (the interleaved
+/// winner is from a DIFFERENT device).
+#[tokio::test]
+async fn future_drifted_op_wins_lww_over_lower_interleaved_local_edit_on_replay() {
+    use prism_sync_core::storage::{FieldVersion, QuarantinedOp};
+
+    let receiver_id = "device-receiver";
+    let sender_id = "device-sender";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let signing_key_receiver = make_signing_key();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let now_ms = current_time_ms();
+    let future_hlc = Hlc::new(now_ms, 5, sender_id); // in-tolerance "now" for replay
+    let quarantined_op = CrdtChange {
+        op_id: "op-future-conv".to_string(),
+        batch_id: Some("batch-conv".to_string()),
+        entity_id: "task-conv".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Sender wins\"".to_string(),
+        client_hlc: future_hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    // The receiver already has a LOWER-HLC local edit to the same field from its
+    // OWN device — the future op must beat it on replay (and the supersede rule
+    // must not evict the quarantined op, since the winner is a different device).
+    let local_hlc = Hlc::new(now_ms - 10_000, 0, receiver_id);
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: SYNC_ID.to_string(),
+            entity_table: "tasks".to_string(),
+            entity_id: "task-conv".to_string(),
+            field_name: "title".to_string(),
+            winning_op_id: "op-local".to_string(),
+            winning_device_id: receiver_id.to_string(),
+            winning_hlc: local_hlc.to_string(),
+            winning_encoded_value: Some("\"Local edit\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.insert_quarantined_op(&QuarantinedOp {
+            sync_id: SYNC_ID.to_string(),
+            op_id: quarantined_op.op_id.clone(),
+            op: quarantined_op.clone(),
+            reason: "future_hlc".to_string(),
+            server_seq: 1,
+            quarantined_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let result = f07_sync_once(
+        &storage,
+        &relay,
+        receiver_id,
+        &signing_key_receiver,
+        &init_key_hierarchy(),
+        SyncConfig::default(),
+        entity_ref,
+    )
+    .await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+
+    let fv = storage
+        .get_field_version(SYNC_ID, "tasks", "task-conv", "title")
+        .unwrap()
+        .expect("title field_version exists");
+    assert_eq!(
+        fv.winning_op_id, "op-future-conv",
+        "the higher-HLC future op wins LWW over the lower-HLC interleaved local edit",
+    );
+    assert_eq!(fv.winning_hlc, future_hlc.to_string(), "replay keeps the op's ORIGINAL HLC");
+    assert!(storage.is_op_applied("op-future-conv").unwrap());
+    assert!(
+        storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty(),
+        "quarantine row deleted after the replay applied it",
+    );
+}
+
+/// C2 supersede eviction: once a LATER op from the SAME device wins the same
+/// field, the quarantined future-HLC op can never win LWW, so it is EVICTED
+/// (deleted) — never replayed — bounding the quarantine backlog.
+#[tokio::test]
+async fn superseded_future_drifted_op_is_evicted_not_replayed() {
+    use prism_sync_core::storage::{FieldVersion, QuarantinedOp};
+
+    let receiver_id = "device-receiver";
+    let sender_id = "device-sender";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let signing_key_receiver = make_signing_key();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let now_ms = current_time_ms();
+    // The quarantined future op is in tolerance ("now"), so absent the supersede
+    // rule it WOULD replay — proving eviction is what suppresses it.
+    let future_hlc = Hlc::new(now_ms, 1, sender_id);
+    let quarantined_op = CrdtChange {
+        op_id: "op-superseded".to_string(),
+        batch_id: Some("batch-sup".to_string()),
+        entity_id: "task-sup".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Stale future value\"".to_string(),
+        client_hlc: future_hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    // A LATER op from the SAME sender already won this field (higher HLC).
+    let later_hlc = Hlc::new(now_ms + 5_000, 0, sender_id);
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: SYNC_ID.to_string(),
+            entity_table: "tasks".to_string(),
+            entity_id: "task-sup".to_string(),
+            field_name: "title".to_string(),
+            winning_op_id: "op-later".to_string(),
+            winning_device_id: sender_id.to_string(),
+            winning_hlc: later_hlc.to_string(),
+            winning_encoded_value: Some("\"Newer value\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.insert_quarantined_op(&QuarantinedOp {
+            sync_id: SYNC_ID.to_string(),
+            op_id: quarantined_op.op_id.clone(),
+            op: quarantined_op.clone(),
+            reason: "future_hlc".to_string(),
+            server_seq: 1,
+            quarantined_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(storage.list_quarantined_ops(SYNC_ID).unwrap().len(), 1);
+
+    let result = f07_sync_once(
+        &storage,
+        &relay,
+        receiver_id,
+        &signing_key_receiver,
+        &init_key_hierarchy(),
+        SyncConfig::default(),
+        entity_ref,
+    )
+    .await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+
+    assert!(
+        storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty(),
+        "the superseded future-HLC row must be EVICTED (deleted), not held forever",
+    );
+    assert!(
+        !storage.is_op_applied("op-superseded").unwrap(),
+        "the superseded op must never be applied (it can't win LWW)",
+    );
+    let fv = storage
+        .get_field_version(SYNC_ID, "tasks", "task-sup", "title")
+        .unwrap()
+        .unwrap();
+    assert_eq!(fv.winning_op_id, "op-later", "the later winner is untouched");
+}
+
+
+/// An envelope declaring a newer ML-DSA generation than the receiver knows
+/// (a not-yet-propagated rotation) must STALL — cursor frozen, nothing applied,
+/// no advance, push still runs — instead of the old skip-and-advance that
+/// permanently lost the batch. Once the receiver imports the gen-1 key, the
+/// stalled batch verifies under it and applies.
+#[tokio::test]
+async fn stale_generation_stalls_then_applies_after_key_import() {
+    use prism_sync_core::storage::DeviceRecord;
+
     let key_hierarchy = init_key_hierarchy();
     let signing_key_local = make_signing_key();
     let signing_key_remote = make_signing_key();
-    let ml_dsa_key_remote = make_ml_dsa_keypair();
+    // The remote rotated to a gen-1 ML-DSA key; the receiver only knows gen 0.
+    let ml_dsa_key_remote_gen1 = make_ml_dsa_keypair();
     let local_device = "device-local";
     let remote_device = "device-remote";
 
@@ -920,12 +2812,14 @@ async fn skips_batch_when_envelope_generation_differs_from_registry_generation()
 
     setup_sync_metadata(&storage, local_device);
     register_device(&relay, &storage, local_device, &signing_key_local.verifying_key());
+    // Receiver's local record for the remote is gen 0 with a different key — it
+    // has not yet learned the rotation.
     register_device_with_pq(
         &relay,
         &storage,
         remote_device,
         &signing_key_remote.verifying_key(),
-        &ml_dsa_key_remote.public_key_bytes(),
+        &make_ml_dsa_keypair().public_key_bytes(),
     );
 
     let hlc = Hlc::new(current_time_ms() - 1_000, 0, remote_device);
@@ -935,7 +2829,7 @@ async fn skips_batch_when_envelope_generation_differs_from_registry_generation()
         entity_id: "task-generation-mismatch".to_string(),
         entity_table: "tasks".to_string(),
         field_name: "title".to_string(),
-        encoded_value: "\"Should not merge\"".to_string(),
+        encoded_value: "\"Rotated edit\"".to_string(),
         client_hlc: hlc.to_string(),
         is_delete: false,
         device_id: remote_device.to_string(),
@@ -943,16 +2837,17 @@ async fn skips_batch_when_envelope_generation_differs_from_registry_generation()
         server_seq: None,
     }];
 
+    // Batch is signed at generation 1 with the rotated key.
     let envelope = make_encrypted_batch_with_generation(
         &ops,
         &key_hierarchy,
         &signing_key_remote,
-        &ml_dsa_key_remote,
+        &ml_dsa_key_remote_gen1,
         "batch-generation-mismatch",
         remote_device,
         1,
     );
-    relay.inject_batch(envelope);
+    let seq = relay.inject_batch(envelope);
 
     let engine = SyncEngine::new(
         storage.clone(),
@@ -961,19 +2856,68 @@ async fn skips_batch_when_envelope_generation_differs_from_registry_generation()
         test_schema(),
         SyncConfig::default(),
     );
-    let result = engine
+
+    // Cycle 1: gen 1 > local gen 0, no registry to refresh from -> STALL.
+    let r1 = engine
         .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
-
-    assert!(result.error.is_none(), "generation mismatch should skip batch: {:?}", result.error);
-    assert_eq!(result.pulled, 1);
-    assert_eq!(result.merged, 0);
+    assert!(r1.error.is_none(), "stall is non-fatal: {:?}", r1.error);
+    assert_eq!(r1.merged, 0, "nothing applied while stalled");
     assert_eq!(entity.get_field("task-generation-mismatch", "title"), None);
     assert_eq!(
         storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
-        1,
-        "bad-generation batch should be skipped and acknowledged like other bad signatures"
+        0,
+        "cursor must stay behind the stale-generation batch (no skip-and-advance)"
+    );
+    let stalls = storage.list_pull_stalls(SYNC_ID).unwrap();
+    assert_eq!(stalls.len(), 1, "the batch must be recorded as stalled");
+    assert_eq!(stalls[0].server_seq, seq);
+    assert_eq!(stalls[0].reason, "stale_key_generation");
+    assert!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "a stall within budget must not quarantine yet"
+    );
+
+    // Import the gen-1 key (simulating registry propagation).
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_device_record(&DeviceRecord {
+            sync_id: SYNC_ID.to_string(),
+            device_id: remote_device.to_string(),
+            ed25519_public_key: signing_key_remote.verifying_key().to_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: ml_dsa_key_remote_gen1.public_key_bytes(),
+            ml_kem_768_public_key: Vec::new(),
+            x_wing_public_key: Vec::new(),
+            status: "active".to_string(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 1,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Cycle 2: the gen-1 key resolves -> the stalled batch verifies and applies.
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    assert_eq!(
+        entity.get_field("task-generation-mismatch", "title"),
+        Some(SyncValue::String("Rotated edit".to_string())),
+        "the rotated sender's batch must converge once the gen-1 key propagates"
+    );
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        seq,
+        "cursor advances after the batch applies"
+    );
+    assert!(
+        storage.list_pull_stalls(SYNC_ID).unwrap().is_empty(),
+        "the stall row must clear once the batch resolves"
     );
 }
 
@@ -1386,28 +3330,48 @@ async fn test_payload_hash_verification() {
     )
     .unwrap();
 
-    relay.inject_batch(envelope);
+    let seq = relay.inject_batch(envelope);
 
+    let (event_tx, mut event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(32);
     let engine = SyncEngine::new(
         storage.clone(),
         relay.clone(),
         vec![entity],
         test_schema(),
         SyncConfig::default(),
-    );
+    )
+    .with_event_sink(event_tx.clone());
 
     let result = engine
         .sync(SYNC_ID, &key_hierarchy, &signing_key_local, None, local_device, 0)
         .await
         .unwrap();
 
-    // The pull phase should have failed due to payload hash mismatch
-    assert!(result.error.is_some(), "Expected an error from payload hash mismatch, got success");
-    let err_msg = result.error.unwrap();
-    assert!(
-        err_msg.contains("hash") || err_msg.contains("Hash") || err_msg.contains("payload"),
-        "Error should mention payload hash mismatch: {err_msg}"
+    // A payload-hash mismatch quarantines the whole envelope and advances
+    // the cursor rather than hard-wedging pull (and the push phase) forever.
+    assert!(result.error.is_none(), "poison batch must not surface a terminal error: {:?}", result.error);
+    assert_eq!(result.merged, 0, "no op from the tampered batch may be applied");
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        seq,
+        "quarantined batch must advance the pull cursor"
     );
+
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].reason, "payload_hash_mismatch");
+    assert_eq!(quarantined[0].server_seq, seq);
+
+    let mut saw_event = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::PullBatchQuarantined { reason, .. } = event {
+            if reason == "payload_hash_mismatch" {
+                saw_event = true;
+            }
+        }
+    }
+    assert!(saw_event, "expected a PullBatchQuarantined event with reason payload_hash_mismatch");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1479,10 +3443,11 @@ async fn test_sync_sends_ack_after_pull() {
     // Yield to let the fire-and-forget ack task complete
     tokio::task::yield_now().await;
 
-    // Verify ack was called with the injected batch's server_seq
+    // Ack reports the local pull cursor (ack-equals-cursor). With the single
+    // batch fully applied the cursor equals the injected seq, so the ack matches.
     let acks = relay.ack_calls();
     assert_eq!(acks.len(), 1, "expected exactly 1 ack call");
-    assert_eq!(acks[0], injected_seq, "ack should report the max_server_seq from pull");
+    assert_eq!(acks[0], injected_seq, "ack should report the local pull cursor after applying the batch");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2262,4 +4227,204 @@ async fn push_quarantines_batch_when_client_guard_trips() {
         }
     }
     assert!(saw_event, "expected SyncEvent::QuarantinedBatch with client_guard code");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Consumer-delivery journal
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A pulled winning op is journaled into `consumer_deliveries` in the SAME tx as
+/// the cursor advance — the at-least-once delivery guarantee. The journal row
+/// carries the field winner; the cursor moved; both are durable after the cycle.
+#[tokio::test]
+async fn apply_remote_batch_journals_winning_op_with_cursor() {
+    let sender_id = "device-sender";
+    let op = CrdtChange {
+        op_id: "op-journal-1".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-journal".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Hello\"".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_000, 0, sender_id).to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (result, storage, _entity) = pull_injected_sender_batch(vec![op]).await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.merged, 1);
+
+    // Cursor advanced.
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        1
+    );
+
+    // Exactly one journal row, carrying the winner's payload, at the batch seq.
+    let journal = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    assert_eq!(journal.len(), 1, "one winning op -> one journal row");
+    assert_eq!(journal[0].entity_table, "tasks");
+    assert_eq!(journal[0].entity_id, "task-journal");
+    assert_eq!(journal[0].field_name.as_deref(), Some("title"));
+    assert_eq!(journal[0].encoded_value.as_deref(), Some("\"Hello\""));
+    assert!(!journal[0].is_delete);
+    assert_eq!(journal[0].server_seq, 1);
+}
+
+/// A pulled delete winner journals a delete delivery (`field_name = None`,
+/// `is_delete = true`) so the Dart drain tombstones the entity.
+#[tokio::test]
+async fn apply_remote_batch_journals_delete_winner() {
+    let sender_id = "device-sender";
+    let op = CrdtChange {
+        op_id: "op-journal-del".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-gone".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "is_deleted".to_string(),
+        encoded_value: "true".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_000, 0, sender_id).to_string(),
+        is_delete: true,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (result, storage, _entity) = pull_injected_sender_batch(vec![op]).await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+
+    let journal = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    assert_eq!(journal.len(), 1);
+    assert!(journal[0].is_delete, "delete op -> delete delivery");
+    assert_eq!(journal[0].field_name, None);
+    assert_eq!(journal[0].encoded_value, None);
+    assert_eq!(journal[0].entity_id, "task-gone");
+}
+
+/// Regression for the delete-absorbing journal blocker: a single batch carrying
+/// an edit AND a delete for ONE entity yields BOTH ops as winners (merge keeps
+/// the earlier edit when it is processed before the in-batch tombstone is
+/// established — verified in merge.rs determine_winners). The journal must
+/// deliver ONLY the delete row for that entity, never the subsumed field row,
+/// so a `take_undelivered_changes` chunk boundary can never split [delete, field]
+/// and resurrect the row at-least-once between acks (board-delete-resurrection
+/// class). Independent of the HashMap winner iteration order.
+#[tokio::test]
+async fn apply_remote_batch_journal_drops_field_subsumed_by_same_batch_delete() {
+    let sender_id = "device-sender";
+    // Edit has the lower HLC and is listed first, so the merge processes it
+    // before the tombstone and keeps it as a winner alongside the delete.
+    let edit = CrdtChange {
+        op_id: "op-edit".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-edel".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Edited\"".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_000, 0, sender_id).to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    let delete = CrdtChange {
+        op_id: "op-del".to_string(),
+        batch_id: Some("batch-attribution".to_string()),
+        entity_id: "task-edel".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "is_deleted".to_string(),
+        encoded_value: "true".to_string(),
+        client_hlc: Hlc::new(1_710_500_000_001, 0, sender_id).to_string(),
+        is_delete: true,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    let (result, storage, _entity) = pull_injected_sender_batch(vec![edit, delete]).await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    // Both ops merged (the edit is a winner too — that is the whole point), but
+    // only the delete is journaled.
+    assert_eq!(result.merged, 2, "edit and delete both win the merge");
+
+    let journal = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    let for_entity: Vec<_> = journal.iter().filter(|r| r.entity_id == "task-edel").collect();
+    assert_eq!(
+        for_entity.len(),
+        1,
+        "only the delete row is journaled for a same-batch edit+delete entity"
+    );
+    assert!(for_entity[0].is_delete, "the single journaled row is the delete");
+    assert_eq!(for_entity[0].field_name, None);
+}
+
+/// Re-pulling the same batch (idempotent replay) must not duplicate already
+/// committed winners as fresh journal rows beyond the at-least-once contract:
+/// a batch whose op is already applied produces no new winner, so no new row.
+#[tokio::test]
+async fn apply_remote_batch_journal_is_idempotent_on_replayed_batch() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let op = task_title_op("op-journal-idem", sender_id, sender_id);
+    let envelope = make_encrypted_batch(
+        &[op],
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-attribution",
+        sender_id,
+    );
+    relay.inject_batch(envelope);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    let after_first = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    assert_eq!(after_first.len(), 1, "first pull journals the winner");
+
+    // The MockRelay's pull cursor advanced past the batch; a second sync sees an
+    // empty page, so no new journal rows. (Idempotency at the apply level is
+    // covered by the storage `is_op_applied` gate even if redelivered.)
+    engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+    let after_second = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
+    assert_eq!(
+        after_second.len(),
+        1,
+        "replayed/empty cycle must not add journal rows"
+    );
 }

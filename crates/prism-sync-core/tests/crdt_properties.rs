@@ -126,9 +126,6 @@ fn merge_outcome(
 
     let mut outcome: HashMap<(String, String), (String, String, String, String)> = HashMap::new();
     for winner in winners.values() {
-        if winner.is_bulk_reset {
-            continue;
-        }
         let op = &winner.op;
         let key = (op.entity_id.clone(), op.field_name.clone());
         outcome.insert(
@@ -161,9 +158,6 @@ fn merge_sequential(
     // Build field versions from winners_a
     let mut field_versions: HashMap<String, FieldVersion> = HashMap::new();
     for winner in winners_a.values() {
-        if winner.is_bulk_reset {
-            continue;
-        }
         let op = &winner.op;
         let key = format!("{}:{}:{}", op.entity_table, op.entity_id, op.field_name);
         field_versions.insert(
@@ -203,9 +197,6 @@ fn merge_sequential(
     // Build final outcome: start from winners_a, overwrite with winners_b
     let mut outcome: HashMap<(String, String), (String, String, String, String)> = HashMap::new();
     for winner in winners_a.values().chain(winners_b.values()) {
-        if winner.is_bulk_reset {
-            continue;
-        }
         let op = &winner.op;
         let key = (op.entity_id.clone(), op.field_name.clone());
         // For the combined result, the latest winner for each field is correct
@@ -452,9 +443,6 @@ proptest! {
         // For each winning (entity_id, field_name), verify it beats all
         // other ops targeting the same field.
         for winner in winners.values() {
-            if winner.is_bulk_reset {
-                continue;
-            }
             let w = &winner.op;
             for op in &ops {
                 if op.entity_id == w.entity_id

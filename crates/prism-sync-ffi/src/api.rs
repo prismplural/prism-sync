@@ -29,7 +29,7 @@ use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
 use prism_sync_core::schema::{parse_datetime_utc, SyncSchema, SyncType, SyncValue};
-use prism_sync_core::storage::{RusqliteSyncStorage, SyncMetadata, SyncStorage};
+use prism_sync_core::storage::{ConsumerDelivery, RusqliteSyncStorage, SyncMetadata, SyncStorage};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
     background_runtime, spawn_notification_handler, DeviceRegistryManager,
@@ -916,6 +916,28 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
                 "epoch_id": epoch_id,
             })
         }
+        SyncEvent::PullBatchQuarantined {
+            server_seq,
+            batch_id,
+            sender_device_id,
+            reason,
+        } => serde_json::json!({
+            "type": "PullBatchQuarantined",
+            "server_seq": server_seq,
+            "batch_id": batch_id,
+            "sender_device_id": sender_device_id,
+            "reason": reason,
+        }),
+        SyncEvent::PullStalled {
+            server_seq,
+            reason,
+            attempt,
+        } => serde_json::json!({
+            "type": "PullStalled",
+            "server_seq": server_seq,
+            "reason": reason,
+            "attempt": attempt,
+        }),
     }
 }
 
@@ -928,6 +950,16 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
         "ml_dsa_key_generation": info.ml_dsa_key_generation,
     })
 }
+
+/// Hard cap on the consumer-delivery journal backlog. The journal grows when
+/// the Dart drain falls behind or wedges; the cap bounds engine-DB growth so a
+/// permanently-stuck drain cannot inflate storage unboundedly. When the backlog
+/// exceeds this, `take_undelivered_changes` flags the oldest `count - cap` rows
+/// as spill so the Dart drain routes THEM to its payload-bearing quarantine lane
+/// (and acks them) instead of applying — never silently dropped in Rust. The
+/// retention rule is device-local (the relay-as-expiring-buffer rule does not
+/// apply to local engine state).
+const CONSUMER_DELIVERY_JOURNAL_CAP: i64 = 50_000;
 
 const SHARING_ID_CACHE_KEY: &str = "sharing_id_cache";
 const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
@@ -2732,6 +2764,204 @@ pub async fn quarantined_batch_count(handle: &PrismSyncHandle) -> Result<i64, St
 
     tokio::task::spawn_blocking(move || {
         storage.quarantined_batch_count(&sync_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Compute the highest journal id in `chunk` that must SPILL into the Dart
+/// quarantine lane because the total backlog (`total`) exceeds `cap`. The oldest
+/// `total - cap` rows are over-cap; since the chunk is the oldest rows in id
+/// order, the spill set is a prefix of `chunk`. Rows with `id <= threshold` are
+/// spill; rows above are normal applies. Returns `0` when under cap (no spill).
+/// Only rows present in THIS chunk can spill; subsequent drain passes spill the
+/// next prefix until the backlog is back under cap — bounded, never silent loss.
+fn consumer_delivery_spill_threshold(chunk: &[ConsumerDelivery], total: i64, cap: i64) -> i64 {
+    let spill_count = (total - cap).max(0);
+    if spill_count == 0 || chunk.is_empty() {
+        return 0;
+    }
+    let idx = (spill_count as usize).min(chunk.len());
+    chunk[idx - 1].id
+}
+
+fn empty_undelivered_changes_json() -> String {
+    serde_json::json!({
+        "deliveries": [],
+        "max_id": 0,
+        "spill_up_to_id": 0,
+        "over_cap": false,
+    })
+    .to_string()
+}
+
+/// Coalesce per-field journal rows into per-entity changesets, mirroring the
+/// `RemoteChanges` shape Dart already applies. Rows are processed in `id` order
+/// (the journal's commit order). The delete is ABSORBING (matching the engine's
+/// `entity_changes_from_winning_ops` and `build_entity_changes_from_snapshot_field_versions`,
+/// and the merge tombstone semantics — merge.rs:186 "Tombstone is absorbing"):
+/// once an entity has seen a delete in this chunk, later field rows for it do NOT
+/// resurrect it as a live sparse update. This holds in BOTH orders — a field row
+/// before or after the delete still collapses to a delete delivery — because the
+/// sequential Phase B apply (soft_delete then write_fields) ends tombstoned
+/// regardless, and Rust's `field_versions` carries the tombstone. Were it not
+/// absorbing, a [delete, field] order (~50% likely given the HashMap-order winner
+/// journal loops) would deliver the entity live while Rust says tombstoned —
+/// permanent Rust<->Drift divergence (board-delete-resurrection class). The
+/// emitted `id` is the highest journal id that contributed to the entity
+/// (diagnostics only; acking is by chunk `max_id`).
+fn coalesce_consumer_deliveries(rows: &[ConsumerDelivery]) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+
+    // (highest contributing journal id, is_delete, field -> natural JSON value).
+    // Field values are decoded to natural JSON types (via `encoded_value_to_json`)
+    // so a journal delivery has the SAME `fields` shape as a `RemoteChanges`
+    // changeset — the Dart drain feeds both through one apply pipeline, which
+    // expects decoded values (e.g. `"Alice"`, not the wire string `"\"Alice\""`).
+    type EntityAccum = (i64, bool, HashMap<String, serde_json::Value>);
+
+    // Preserve first-seen entity order for deterministic output.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut acc: HashMap<(String, String), EntityAccum> = HashMap::new();
+
+    for row in rows {
+        let key = (row.entity_table.clone(), row.entity_id.clone());
+        let entry = acc.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (row.id, false, HashMap::new())
+        });
+        entry.0 = entry.0.max(row.id);
+        if row.is_delete {
+            entry.1 = true;
+            entry.2.clear();
+        } else if !entry.1 {
+            // Delete is absorbing: never reset `is_delete` on a non-delete row.
+            if let Some(field) = &row.field_name {
+                let value = match &row.encoded_value {
+                    Some(encoded) => encoded_value_to_json(encoded),
+                    None => serde_json::Value::Null,
+                };
+                entry.2.insert(field.clone(), value);
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|key| {
+            let (max_id, is_delete, fields) = acc.remove(&key).expect("entity in order map");
+            serde_json::json!({
+                "id": max_id,
+                "table": key.0,
+                "entity_id": key.1,
+                "is_delete": is_delete,
+                "fields": fields,
+            })
+        })
+        .collect()
+}
+
+/// Drain up to `limit` rows from the durable consumer-delivery journal — the
+/// at-least-once delivery channel that replaces applying directly from the
+/// fire-and-forget `RemoteChanges` event. The Dart drain loops
+/// take -> apply (or quarantine) -> ack, where the ack
+/// ([`ack_consumer_deliveries`]) fires only AFTER the consumer-DB transaction
+/// commits, so a pulled winner survives process death.
+///
+/// Returns a JSON object:
+/// ```json
+/// {
+///   "deliveries": [
+///     {"id": 42, "table": "members", "entity_id": "...", "is_delete": false,
+///      "fields": {"name": "Alex"}}
+///   ],
+///   "max_id": 42,
+///   "spill_up_to_id": 0,
+///   "over_cap": false
+/// }
+/// ```
+/// - `deliveries` coalesces the chunk's journal rows per `(table, entity_id)`
+///   (like a `RemoteChanges` changeset); a delete row clears the fields and sets
+///   `is_delete`. The `id` on each coalesced entry is the highest journal id that
+///   contributed to it (diagnostics only — acking is by `max_id`).
+/// - `max_id` is the highest journal id in the chunk; the drain passes it to
+///   [`ack_consumer_deliveries`] after its commit. Acking by chunk high-water is
+///   safe because the journal is append-only and read in `id` order.
+/// - `over_cap` is true when the total backlog exceeds the retention cap;
+///   `spill_up_to_id` is then the highest id that must be ROUTED TO QUARANTINE
+///   rather than applied (the oldest `backlog - cap` rows). Rows with
+///   `id <= spill_up_to_id` are spill (quarantine them, full payload is present);
+///   rows above are normal applies. The drain still acks the whole chunk by
+///   `max_id` after both the applies and the quarantine writes commit, so the
+///   spill is bounded without silent loss.
+///
+/// Returns an empty `deliveries` array (and `max_id = 0`) if the engine is not
+/// configured or the journal is empty.
+pub async fn take_undelivered_changes(
+    handle: &PrismSyncHandle,
+    limit: i64,
+) -> Result<String, String> {
+    let (storage, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let Some(sync_id) = inner.sync_service().sync_id() else {
+            return Ok(empty_undelivered_changes_json());
+        };
+        (inner.storage().clone(), sync_id.to_string())
+    };
+
+    let limit = limit.max(0);
+    tokio::task::spawn_blocking(move || {
+        if limit == 0 {
+            return Ok::<_, String>(empty_undelivered_changes_json());
+        }
+
+        let rows = storage
+            .list_consumer_deliveries(&sync_id, 0, limit)
+            .map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(empty_undelivered_changes_json());
+        }
+
+        let total = storage.count_consumer_deliveries(&sync_id).map_err(|e| e.to_string())?;
+        let over_cap = total > CONSUMER_DELIVERY_JOURNAL_CAP;
+        let spill_up_to_id =
+            consumer_delivery_spill_threshold(&rows, total, CONSUMER_DELIVERY_JOURNAL_CAP);
+
+        let max_id = rows.iter().map(|r| r.id).max().unwrap_or(0);
+        let deliveries = coalesce_consumer_deliveries(&rows);
+
+        let json = serde_json::json!({
+            "deliveries": deliveries,
+            "max_id": max_id,
+            "spill_up_to_id": spill_up_to_id,
+            "over_cap": over_cap,
+        });
+        Ok(json.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Acknowledge consumer-delivery journal rows up to (and including) `up_to_id`,
+/// deleting them in one storage transaction. Called by the Dart drain ONLY after
+/// the chunk's consumer-DB transaction (apply and/or durable quarantine) has
+/// committed. No-op if the engine is not configured.
+pub async fn ack_consumer_deliveries(
+    handle: &PrismSyncHandle,
+    up_to_id: i64,
+) -> Result<(), String> {
+    let (storage, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let Some(sync_id) = inner.sync_service().sync_id() else {
+            return Ok(());
+        };
+        (inner.storage().clone(), sync_id.to_string())
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut tx = storage.begin_tx().map_err(|e| e.to_string())?;
+        tx.delete_consumer_deliveries_up_to(&sync_id, up_to_id).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -4890,6 +5120,19 @@ pub async fn complete_joiner_ceremony(
     })?;
     ensure_local_sync_metadata(inner.storage().as_ref(), &sync_id, &device_id, current_epoch)?;
 
+    // Record the bundle's registry version as the replay-freshness baseline.
+    // `registry_snapshot` is the SAS-authenticated pairing bundle whose
+    // device records we just imported and whose epoch we already trust, so its
+    // `registry_version` carries identical trust. Without this, the joiner row
+    // ensured above stays at a NULL baseline and a stale-registry replay could
+    // drive a false `confirm_self_revocation` on a device that just paired.
+    prism_sync_core::registry_publish::ratchet_last_imported_registry_version(
+        inner.storage().as_ref(),
+        &sync_id,
+        registry_snapshot.registry_version,
+    )
+    .map_err(|e| e.to_string())?;
+
     // Restore runtime keys so configureEngine etc. work
     let dek = key_hierarchy.dek().map_err(|e| e.to_string())?;
     let device_secret_bytes = inner
@@ -5116,7 +5359,7 @@ pub async fn complete_initiator_ceremony(
     )?;
 
     let pairing = PairingService::new(secure_store);
-    if let Err(error) = pairing
+    let published_registry_version = match pairing
         .complete_bootstrap_initiator(
             &ceremony,
             &pairing_relay,
@@ -5127,7 +5370,37 @@ pub async fn complete_initiator_ceremony(
         )
         .await
     {
-        return Err(encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await);
+        Ok(version) => version,
+        Err(error) => {
+            return Err(
+                encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await,
+            );
+        }
+    };
+
+    // Ratchet this (long-lived inviter) device's freshness baseline to the
+    // registry version it just published during the ceremony — the
+    // PairingService has no storage handle, so the ratchet happens here. The
+    // pairing already committed, so a ratchet failure is logged, not fatal.
+    {
+        let storage = storage.clone();
+        let sid = sync_id.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            prism_sync_core::registry_publish::ratchet_last_imported_registry_version(
+                storage.as_ref(),
+                &sid,
+                published_registry_version,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|res| res.map_err(|e| e.to_string()))
+        {
+            tracing::warn!(
+                error = %e,
+                "complete_bootstrap_initiator: failed to ratchet registry baseline after pairing"
+            );
+        }
     }
 
     // Align the live client with the post-rekey epoch. complete_bootstrap_initiator
@@ -5477,6 +5750,32 @@ pub async fn rotate_ml_dsa_key(handle: &PrismSyncHandle) -> Result<String, Strin
             }
         }
     };
+
+    // The rotation published `signed_snapshot` at `next_registry_version`, so
+    // ratchet our own freshness baseline forward — a long-lived rotating
+    // device must not keep sitting at a NULL baseline. Use the locally-computed
+    // version, never a relay-returned one. Best-effort: the rotation itself has
+    // already committed, so a baseline ratchet failure must not unwind it.
+    {
+        let storage = storage.clone();
+        let sid = sync_id.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            prism_sync_core::registry_publish::ratchet_last_imported_registry_version(
+                storage.as_ref(),
+                &sid,
+                next_registry_version,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|res| res.map_err(|e| e.to_string()))
+        {
+            tracing::warn!(
+                error = %e,
+                "rotate_ml_dsa_key: failed to ratchet registry baseline after rotation"
+            );
+        }
+    }
 
     // After successful rotation, refresh the cached ML-DSA signing key in PrismSync
     // so that subsequent hybrid batch signing uses the new key without requiring
@@ -6502,6 +6801,36 @@ mod tests {
     }
 
     #[test]
+    fn pull_batch_quarantined_event_json_serializes_all_fields() {
+        let event = prism_sync_core::events::SyncEvent::PullBatchQuarantined {
+            server_seq: 42,
+            batch_id: "batch-poison".to_string(),
+            sender_device_id: "device-sender".to_string(),
+            reason: "payload_hash_mismatch".to_string(),
+        };
+        let json = sync_event_to_json(&event);
+        assert_eq!(json["type"], "PullBatchQuarantined");
+        assert_eq!(json["server_seq"], 42);
+        assert_eq!(json["batch_id"], "batch-poison");
+        assert_eq!(json["sender_device_id"], "device-sender");
+        assert_eq!(json["reason"], "payload_hash_mismatch");
+    }
+
+    #[test]
+    fn pull_stalled_event_json_serializes_all_fields() {
+        let event = prism_sync_core::events::SyncEvent::PullStalled {
+            server_seq: 42,
+            reason: "sender_unresolved".to_string(),
+            attempt: 3,
+        };
+        let json = sync_event_to_json(&event);
+        assert_eq!(json["type"], "PullStalled");
+        assert_eq!(json["server_seq"], 42);
+        assert_eq!(json["reason"], "sender_unresolved");
+        assert_eq!(json["attempt"], 3);
+    }
+
+    #[test]
     fn quarantined_batch_event_json_supports_client_guard_code() {
         let event = prism_sync_core::events::SyncEvent::QuarantinedBatch {
             batch_id: "batch-xyz".to_string(),
@@ -7455,5 +7784,161 @@ mod tests {
             .await
             .expect_err("invalid password should fail before ceremony guard");
         assert_eq!(err, "password must be valid UTF-8");
+    }
+
+    // ── Consumer-delivery journal helpers ──
+
+    fn delivery(id: i64, entity: &str, field: Option<&str>, value: Option<&str>) -> ConsumerDelivery {
+        ConsumerDelivery {
+            id,
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: entity.to_string(),
+            field_name: field.map(|f| f.to_string()),
+            encoded_value: value.map(|v| v.to_string()),
+            is_delete: field.is_none(),
+            server_seq: id,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn coalesce_groups_rows_per_entity_with_highest_contributing_id() {
+        let rows = vec![
+            delivery(1, "ent-a", Some("name"), Some("\"A\"")),
+            delivery(2, "ent-a", Some("color"), Some("\"red\"")),
+            delivery(3, "ent-b", Some("name"), Some("\"B\"")),
+        ];
+        let out = coalesce_consumer_deliveries(&rows);
+        assert_eq!(out.len(), 2);
+
+        // First-seen order preserved: ent-a then ent-b.
+        assert_eq!(out[0]["entity_id"], "ent-a");
+        assert_eq!(out[0]["id"], 2, "id is the highest contributing journal id");
+        // Field values are DECODED to natural JSON (same shape as RemoteChanges),
+        // so the wire string "\"A\"" surfaces as the JSON string "A".
+        assert_eq!(out[0]["fields"]["name"], "A");
+        assert_eq!(out[0]["fields"]["color"], "red");
+        assert_eq!(out[0]["is_delete"], false);
+
+        assert_eq!(out[1]["entity_id"], "ent-b");
+        assert_eq!(out[1]["fields"]["name"], "B");
+    }
+
+    /// Pin the round-trip: a journal delivery's `fields` decode to the SAME
+    /// natural JSON types a `RemoteChanges` changeset produces (ints, bools,
+    /// strings, null), so the Dart drain can feed both through one apply path.
+    #[test]
+    fn coalesce_decodes_field_values_like_remote_changes() {
+        let rows = vec![
+            delivery(1, "ent-a", Some("name"), Some("\"Alice\"")),
+            delivery(2, "ent-a", Some("age"), Some("42")),
+            delivery(3, "ent-a", Some("active"), Some("true")),
+            delivery(4, "ent-a", Some("missing"), None),
+        ];
+        let out = coalesce_consumer_deliveries(&rows);
+        assert_eq!(out.len(), 1);
+        let fields = &out[0]["fields"];
+        assert_eq!(fields["name"], serde_json::json!("Alice"));
+        assert_eq!(fields["age"], serde_json::json!(42));
+        assert_eq!(fields["active"], serde_json::json!(true));
+        assert_eq!(fields["missing"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn coalesce_delete_clears_earlier_fields_for_same_entity() {
+        // A delete after field writes for the same entity collapses to a delete
+        // delivery (the delete clears the accumulated fields).
+        let rows = vec![
+            delivery(1, "ent-a", Some("name"), Some("\"A\"")),
+            delivery(2, "ent-a", None, None),
+        ];
+        let out = coalesce_consumer_deliveries(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["is_delete"], true);
+        assert!(out[0]["fields"].as_object().unwrap().is_empty(), "delete clears fields");
+    }
+
+    /// Regression: the delete is ABSORBING in BOTH orders. A non-delete field row
+    /// AFTER a delete row for the same entity must NOT reset `is_delete` and
+    /// resurrect the entity as a live sparse update — that would diverge from
+    /// Rust's tombstoned `field_versions` (board-delete-resurrection class). This
+    /// order is reachable because the journal write loops iterate
+    /// `outcome.winners.into_values()` (HashMap, randomized order), so ~50% of
+    /// edit-then-delete batches journal [delete, field]. (The engine also drops
+    /// the subsumed field rows now, but the coalescer must be safe on its own.)
+    #[test]
+    fn coalesce_field_after_delete_stays_deleted() {
+        let rows = vec![
+            delivery(1, "ent-a", None, None),
+            delivery(2, "ent-a", Some("name"), Some("\"A\"")),
+        ];
+        let out = coalesce_consumer_deliveries(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["is_delete"], true, "field after delete must not resurrect");
+        assert!(
+            out[0]["fields"].as_object().unwrap().is_empty(),
+            "no fields delivered for a tombstoned entity"
+        );
+        // The highest contributing id is still tracked for diagnostics.
+        assert_eq!(out[0]["id"], 2);
+    }
+
+    /// Delete interleaved between field rows for one entity is absorbing for the
+    /// fields written both before AND after it.
+    #[test]
+    fn coalesce_delete_absorbs_fields_on_both_sides() {
+        let rows = vec![
+            delivery(1, "ent-a", Some("name"), Some("\"A\"")),
+            delivery(2, "ent-a", None, None),
+            delivery(3, "ent-a", Some("color"), Some("\"red\"")),
+        ];
+        let out = coalesce_consumer_deliveries(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["is_delete"], true);
+        assert!(out[0]["fields"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spill_threshold_zero_when_under_cap() {
+        let rows = vec![delivery(1, "a", Some("n"), Some("\"x\"")), delivery(2, "b", Some("n"), Some("\"y\""))];
+        // total == cap -> not over, no spill.
+        assert_eq!(consumer_delivery_spill_threshold(&rows, 2, 2), 0);
+        // total < cap -> no spill.
+        assert_eq!(consumer_delivery_spill_threshold(&rows, 1, 2), 0);
+    }
+
+    #[test]
+    fn spill_threshold_marks_oldest_prefix_over_cap() {
+        let rows = vec![
+            delivery(10, "a", Some("n"), Some("\"x\"")),
+            delivery(11, "b", Some("n"), Some("\"y\"")),
+            delivery(12, "c", Some("n"), Some("\"z\"")),
+        ];
+        // Backlog 5, cap 3 -> oldest 2 spill. Chunk holds them, so threshold is
+        // the 2nd row's id (11): rows with id <= 11 spill, 12 applies normally.
+        assert_eq!(consumer_delivery_spill_threshold(&rows, 5, 3), 11);
+    }
+
+    #[test]
+    fn spill_threshold_capped_at_chunk_when_spill_exceeds_chunk() {
+        let rows = vec![
+            delivery(10, "a", Some("n"), Some("\"x\"")),
+            delivery(11, "b", Some("n"), Some("\"y\"")),
+        ];
+        // Backlog 100, cap 3 -> 97 must eventually spill, but this chunk only has
+        // 2 rows; spill is bounded to the whole chunk (threshold = last id).
+        // The next drain pass spills the next prefix until back under cap.
+        assert_eq!(consumer_delivery_spill_threshold(&rows, 100, 3), 11);
+    }
+
+    #[test]
+    fn empty_undelivered_changes_json_shape() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&empty_undelivered_changes_json()).unwrap();
+        assert_eq!(parsed["deliveries"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["max_id"], 0);
+        assert_eq!(parsed["spill_up_to_id"], 0);
+        assert_eq!(parsed["over_cap"], false);
     }
 }

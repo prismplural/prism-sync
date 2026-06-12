@@ -58,6 +58,13 @@ struct MockRelayState {
     /// message instead of the stored registry. Used to exercise fail-closed
     /// epoch-recovery branches.
     signed_registry_error: Option<String>,
+    /// Number of consecutive `get_signed_registry` calls that should return a
+    /// retryable network error before falling back to the stored registry.
+    /// Decremented on each failure. Used by stall tests where a transient
+    /// outage must clear after a bounded number of cycles.
+    signed_registry_failures_remaining: u32,
+    /// Total `get_signed_registry` call count (for test assertions).
+    signed_registry_call_count: u32,
     /// Per-(epoch, device_id) rekey artifacts served from
     /// `get_rekey_artifact`. Used by epoch-recovery tests.
     rekey_artifacts: HashMap<(i32, String), Vec<u8>>,
@@ -132,6 +139,8 @@ impl MockRelay {
                 media: HashMap::new(),
                 signed_registry: None,
                 signed_registry_error: None,
+                signed_registry_failures_remaining: 0,
+                signed_registry_call_count: 0,
                 rekey_artifacts: HashMap::new(),
                 push_413_batch_ids: HashSet::new(),
                 push_call_batch_ids: Vec::new(),
@@ -299,6 +308,19 @@ impl MockRelay {
     /// exercise the fail-closed branch of epoch recovery.
     pub fn fail_get_signed_registry(&self, message: &str) {
         self.state.lock().unwrap().signed_registry_error = Some(message.to_string());
+    }
+
+    /// Schedule the next `n` `get_signed_registry` calls to fail with a
+    /// retryable network error, then succeed (serving the stored registry, if
+    /// any). Used by stall tests where a transient registry outage must
+    /// clear after a bounded number of sync cycles.
+    pub fn fail_next_get_signed_registry(&self, n: u32) {
+        self.state.lock().unwrap().signed_registry_failures_remaining = n;
+    }
+
+    /// Number of times `get_signed_registry` has been called.
+    pub fn signed_registry_call_count(&self) -> u32 {
+        self.state.lock().unwrap().signed_registry_call_count
     }
 
     /// Seed a rekey artifact served from `get_rekey_artifact(epoch, device_id)`.
@@ -495,9 +517,16 @@ impl DeviceRegistry for MockRelay {
     }
 
     async fn get_signed_registry(&self) -> Result<Option<SignedRegistryResponse>, RelayError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.signed_registry_call_count += 1;
         if let Some(message) = &state.signed_registry_error {
             return Err(RelayError::Network { message: message.clone() });
+        }
+        if state.signed_registry_failures_remaining > 0 {
+            state.signed_registry_failures_remaining -= 1;
+            return Err(RelayError::Network {
+                message: "mock injected signed-registry network error".into(),
+            });
         }
         Ok(state.signed_registry.clone())
     }

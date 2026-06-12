@@ -110,6 +110,23 @@ impl DeviceRegistryManager {
 
     fn write_device_record(storage: &dyn SyncStorage, device: &DeviceRecord) -> Result<()> {
         let mut tx = storage.begin_tx()?;
+        // Archive the superseded ML-DSA key BEFORE overwriting it, in the same tx
+        // as the upsert, so a straggling pre-rotation batch can still be verified
+        // against the exact generation it was signed with. Only a strictly-
+        // forward ML-DSA rotation (the only case where the stored key is about to
+        // be lost) archives; status/metadata-only writes do not touch history.
+        if let Some(existing) = tx.get_device_record(&device.sync_id, &device.device_id)? {
+            if device.ml_dsa_key_generation > existing.ml_dsa_key_generation
+                && !existing.ml_dsa_65_public_key.is_empty()
+            {
+                tx.archive_device_key(
+                    &existing.sync_id,
+                    &existing.device_id,
+                    existing.ml_dsa_key_generation,
+                    &existing.ml_dsa_65_public_key,
+                )?;
+            }
+        }
         tx.upsert_device_record(device)?;
         tx.commit()
     }
@@ -416,10 +433,20 @@ impl DeviceRegistryManager {
         let updated = DeviceRecord {
             ml_dsa_65_public_key: new_ml_dsa_pk.to_vec(),
             ml_dsa_key_generation: new_generation,
-            ..existing
+            ..existing.clone()
         };
 
         let mut tx = storage.begin_tx()?;
+        // Archive the outgoing key alongside the rotation so a still-unpulled
+        // pre-rotation batch verifies after this device record advances.
+        if !existing.ml_dsa_65_public_key.is_empty() {
+            tx.archive_device_key(
+                sync_id,
+                device_id,
+                existing.ml_dsa_key_generation,
+                &existing.ml_dsa_65_public_key,
+            )?;
+        }
         tx.upsert_device_record(&updated)?;
         tx.commit()
     }
@@ -991,6 +1018,68 @@ mod tests {
         let stored = storage.get_device_record("sync-1", device_id).unwrap().unwrap();
         assert_eq!(stored.ml_dsa_key_generation, 1);
         assert_eq!(stored.ml_dsa_65_public_key, ml_dsa_1.public_key_bytes());
+
+        // The superseded gen-0 key is archived so a straggling pre-rotation
+        // batch can still verify after the record advanced to gen 1.
+        assert_eq!(
+            storage.get_archived_device_key("sync-1", device_id, 0).unwrap(),
+            Some(ml_dsa_0.public_key_bytes()),
+            "rotation must archive the outgoing gen-0 key"
+        );
+    }
+
+    #[test]
+    fn verified_import_rotation_archives_superseded_key() {
+        // pin_device (the verified-import write path) archives the existing
+        // ML-DSA key when a higher generation supersedes it.
+        let storage = make_storage();
+        let secret = prism_sync_crypto::DeviceSecret::from_bytes(vec![7u8; 32]).unwrap();
+        let device_id = "dev-import-rotate";
+        let ed25519 = secret.ed25519_keypair(device_id).unwrap();
+        let ml_dsa_0 = secret.ml_dsa_65_keypair_v(device_id, 0).unwrap();
+        let ml_dsa_1 = secret.ml_dsa_65_keypair_v(device_id, 1).unwrap();
+
+        let gen0 = DeviceRecord {
+            sync_id: "sync-1".into(),
+            device_id: device_id.into(),
+            ed25519_public_key: ed25519.public_key_bytes().to_vec(),
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: ml_dsa_0.public_key_bytes(),
+            ml_kem_768_public_key: vec![0u8; 1184],
+            x_wing_public_key: vec![],
+            status: "active".into(),
+            registered_at: Utc::now(),
+            revoked_at: None,
+            ml_dsa_key_generation: 0,
+        };
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &gen0).unwrap();
+        assert!(
+            storage.get_archived_device_key("sync-1", device_id, 0).unwrap().is_none(),
+            "no history before any rotation"
+        );
+
+        let gen1 = DeviceRecord {
+            ml_dsa_65_public_key: ml_dsa_1.public_key_bytes(),
+            ml_dsa_key_generation: 1,
+            ..gen0.clone()
+        };
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &gen1).unwrap();
+
+        let stored = storage.get_device_record("sync-1", device_id).unwrap().unwrap();
+        assert_eq!(stored.ml_dsa_key_generation, 1);
+        assert_eq!(
+            storage.get_archived_device_key("sync-1", device_id, 0).unwrap(),
+            Some(ml_dsa_0.public_key_bytes()),
+            "the superseded gen-0 key must be archived on a verified-import rotation"
+        );
+
+        // A metadata-only re-pin at the same generation must not touch history.
+        DeviceRegistryManager::pin_device(&storage, "sync-1", &gen1).unwrap();
+        assert_eq!(
+            storage.get_archived_device_key("sync-1", device_id, 1).unwrap(),
+            None,
+            "no archival when the generation does not advance"
+        );
     }
 
     #[test]

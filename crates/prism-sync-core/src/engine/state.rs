@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::clock_drift::MAX_CLOCK_DRIFT_MS;
 use crate::events::{EntityChange, SyncErrorKind};
 
 /// The current state of the sync engine.
@@ -111,11 +112,34 @@ pub const DEFAULT_PUSH_BATCH_CAP: usize = 256;
 /// so the next trigger resumes. At the default page size this is ~20k batches.
 pub const DEFAULT_PULL_PAGES_PER_CYCLE: usize = 40;
 
+/// Default base interval (30s) for Phase 0b quarantined-pull-batch replay
+/// backoff. With the exponent capped at
+/// [`crate::engine::QUARANTINE_REPLAY_BACKOFF_MAX_EXP`] (6), the longest wait
+/// between replay attempts is ~32 minutes — small enough that a transient
+/// condition (registry import, app upgrade) still recovers promptly, large
+/// enough that a permanently-poison row stops churning crypto/network work.
+pub const DEFAULT_QUARANTINE_REPLAY_BACKOFF_BASE_MS: i64 = 30_000;
+
+/// Maximum number of sync cycles a transient pull stall (unresolvable
+/// sender, stale ML-DSA generation) may hold the cursor before the batch
+/// converts to quarantine-and-advance. The chosen bound is
+/// "8 sync cycles or 24h wall clock, whichever first": this is the cycle half.
+/// It bounds how long a flaky registry endpoint — or a malicious enrolled
+/// device claiming a bogus future generation — can freeze a peer's pull cursor.
+pub const DEFAULT_PULL_STALL_MAX_ATTEMPTS: i64 = 8;
+
+/// Wall-clock ceiling (24h) on a transient pull stall, the other half of the
+/// stall budget. Even if a device syncs only rarely (fewer than
+/// [`DEFAULT_PULL_STALL_MAX_ATTEMPTS`] cycles in a day), a stall older than this
+/// converts to quarantine-and-advance so the relay is not held off its prune
+/// floor indefinitely.
+pub const DEFAULT_PULL_STALL_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// Configuration for the sync engine.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     /// Maximum clock drift allowed before halting sync (milliseconds).
-    /// Default: 60_000 (60 seconds).
+    /// Default: [`crate::clock_drift::MAX_CLOCK_DRIFT_MS`] (60 seconds).
     pub max_clock_drift_ms: i64,
     /// Number of batches the client requests per `pull_changes` call while
     /// draining to head. See [`DEFAULT_PULL_PAGE_LIMIT`]. The relay clamps the
@@ -127,15 +151,37 @@ pub struct SyncConfig {
     /// Maximum batches pushed in a single cycle before yielding back to the
     /// pull phase. See [`DEFAULT_PUSH_BATCH_CAP`]. `0` disables the cap.
     pub push_batch_cap: usize,
+    /// Base interval (milliseconds) for Phase 0b quarantined-pull-batch replay
+    /// backoff. A quarantined batch is re-eligible for replay only once
+    /// `now >= last_retry_at + base * 2^min(retry_count, cap)`, so a permanently
+    /// poison row (e.g. attribution mismatch, or an unresolvable/deregistered
+    /// sender whose resolution triggers a relay registry fetch) does not re-run
+    /// the full verify/decrypt/decode pipeline — or hit the network — every
+    /// cycle forever. The first replay (no `last_retry_at` yet) always runs.
+    /// `0` disables backoff (replay every cycle); used by tests that need an
+    /// immediate retry. See [`DEFAULT_QUARANTINE_REPLAY_BACKOFF_BASE_MS`].
+    pub quarantine_replay_backoff_base_ms: i64,
+    /// Maximum sync cycles a transient pull stall holds the cursor
+    /// before converting to quarantine-and-advance. See
+    /// [`DEFAULT_PULL_STALL_MAX_ATTEMPTS`]. Configurable so tests can drive the
+    /// budget-exhaustion conversion without running 8 cycles.
+    pub pull_stall_max_attempts: i64,
+    /// Wall-clock ceiling (ms) on a transient pull stall, the other half of the
+    /// stall budget — whichever bound trips first wins. See
+    /// [`DEFAULT_PULL_STALL_MAX_AGE_MS`].
+    pub pull_stall_max_age_ms: i64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            max_clock_drift_ms: 60_000,
+            max_clock_drift_ms: MAX_CLOCK_DRIFT_MS,
             pull_page_limit: DEFAULT_PULL_PAGE_LIMIT,
             max_pull_pages_per_cycle: DEFAULT_PULL_PAGES_PER_CYCLE,
             push_batch_cap: DEFAULT_PUSH_BATCH_CAP,
+            quarantine_replay_backoff_base_ms: DEFAULT_QUARANTINE_REPLAY_BACKOFF_BASE_MS,
+            pull_stall_max_attempts: DEFAULT_PULL_STALL_MAX_ATTEMPTS,
+            pull_stall_max_age_ms: DEFAULT_PULL_STALL_MAX_AGE_MS,
         }
     }
 }

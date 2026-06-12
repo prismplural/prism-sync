@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::clock_drift::MAX_CLOCK_DRIFT_MS;
 use crate::error::{CoreError, Result};
 use crate::hlc::Hlc;
 use crate::schema::{encode_value, SyncValue};
@@ -13,10 +14,11 @@ pub const DELETED_FIELD: &str = "is_deleted";
 
 /// Match the default engine drift tolerance for remote batches.
 ///
-/// Remote ops further in the future than this are dropped before they reach
-/// `field_versions`. Near-future remote HLCs are accepted, so the local emitter
-/// must inherit them to preserve causality for the next local mutation.
-const MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS: i64 = 60_000;
+/// Remote ops further in the future than this are deferred (quarantined) before
+/// they reach `field_versions`. Near-future remote HLCs are accepted, so the
+/// local emitter must inherit them to preserve causality for the next local
+/// mutation. Shares the single drift bound in [`crate::clock_drift`].
+const MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS: i64 = MAX_CLOCK_DRIFT_MS;
 
 /// Records field-level ops into pending_ops at mutation time.
 ///
@@ -61,6 +63,11 @@ impl OpEmitter {
     /// The epoch currently stamped on emitted ops.
     pub fn epoch(&self) -> i32 {
         self.epoch
+    }
+
+    /// The sync group this emitter writes ops for.
+    pub fn sync_id(&self) -> &str {
+        &self.sync_id
     }
 
     /// Update the epoch used for new ops.
@@ -1652,6 +1659,10 @@ mod tests {
 
         fn update_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
             self.inner.update_last_pulled_seq(sync_id, seq)
+        }
+
+        fn reset_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
+            self.inner.reset_last_pulled_seq(sync_id, seq)
         }
 
         fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {

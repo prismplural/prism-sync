@@ -64,6 +64,31 @@ pub enum SyncEvent {
         /// The epoch the message was sealed under.
         epoch_id: u32,
     },
+    /// A received remote pull batch failed a deterministic check (payload-hash
+    /// mismatch, undecodable plaintext, op attribution mismatch, or an invalid
+    /// signature under a generation-matched key) and was durably quarantined.
+    /// The cursor advanced past it so the group is not wedged; the full envelope
+    /// is kept locally for Phase 0b replay once the blocking condition clears.
+    /// `reason` is the persisted `quarantined_pull_batches.reason` string.
+    PullBatchQuarantined {
+        server_seq: i64,
+        batch_id: String,
+        sender_device_id: String,
+        reason: String,
+    },
+    /// A received remote pull batch could not be processed *yet* because the
+    /// sender's keys or ML-DSA generation were transiently unresolvable (a
+    /// network/5xx registry fetch, a stale registry that has not yet imported
+    /// the sender, or a not-yet-propagated key rotation). The pull cursor is
+    /// held *behind* the batch (no advance, no ack past it, push still runs) and
+    /// the batch is retried next cycle, bounded by the stall budget — after
+    /// which it converts to a `PullBatchQuarantined`. `attempt` is the running
+    /// `pull_stall.attempts` count; `reason` is the persisted stall reason.
+    PullStalled {
+        server_seq: i64,
+        reason: String,
+        attempt: i64,
+    },
 }
 
 /// A single entity change with full field data, for consumer DB application.
@@ -175,6 +200,11 @@ pub(crate) fn classify_core_error(e: &crate::error::CoreError) -> SyncErrorKind 
         | CoreError::EpochMismatch { .. }
         | CoreError::EpochKeyMismatch { .. }
         | CoreError::DecryptFailed { .. }
+        // A generation mismatch is normally intercepted by the pull path's stall
+        // route before it reaches classification; if it ever propagates as
+        // a flat error it is a local-resolution failure, not a relay/transport
+        // one — surface it as Protocol (non-retryable in the inner loop).
+        | CoreError::StaleKeyGeneration { .. }
         | CoreError::Engine(_)
         | CoreError::Storage(_) => SyncErrorKind::Protocol,
         CoreError::Schema(_)

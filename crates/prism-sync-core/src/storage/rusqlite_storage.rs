@@ -237,6 +237,123 @@ fn query_quarantined_ops(conn: &Connection, sync_id: &str) -> Result<Vec<Quarant
     Ok(out)
 }
 
+fn row_to_quarantined_pull_batch(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<QuarantinedPullBatch> {
+    let envelope_json: String = row.get("envelope_json")?;
+    let envelope = serde_json::from_str(&envelope_json)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?;
+    let quarantined_at: String = row.get("quarantined_at")?;
+    let last_retry_at: Option<String> = row.get("last_retry_at")?;
+    Ok(QuarantinedPullBatch {
+        sync_id: row.get("sync_id")?,
+        batch_id: row.get("batch_id")?,
+        server_seq: row.get("server_seq")?,
+        epoch: row.get::<_, Option<i32>>("epoch")?,
+        sender_device_id: row.get("sender_device_id")?,
+        envelope,
+        reason: row.get("reason")?,
+        retry_count: row.get("retry_count")?,
+        quarantined_at: DateTime::parse_from_rfc3339(&quarantined_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        last_retry_at: last_retry_at
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+    })
+}
+
+fn query_quarantined_pull_batches(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Vec<QuarantinedPullBatch>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM quarantined_pull_batches \
+         WHERE sync_id = ?1 \
+         ORDER BY server_seq ASC, quarantined_at ASC, batch_id ASC",
+    )?;
+    let rows = stmt.query_map(params![sync_id], row_to_quarantined_pull_batch)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn row_to_pull_stall(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullStall> {
+    let first_seen_at: String = row.get("first_seen_at")?;
+    let last_seen_at: String = row.get("last_seen_at")?;
+    Ok(PullStall {
+        sync_id: row.get("sync_id")?,
+        server_seq: row.get("server_seq")?,
+        reason: row.get("reason")?,
+        attempts: row.get("attempts")?,
+        first_seen_at: DateTime::parse_from_rfc3339(&first_seen_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        last_seen_at: DateTime::parse_from_rfc3339(&last_seen_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+fn query_pull_stalls(conn: &Connection, sync_id: &str) -> Result<Vec<PullStall>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM pull_stall WHERE sync_id = ?1 ORDER BY server_seq ASC",
+    )?;
+    let rows = stmt.query_map(params![sync_id], row_to_pull_stall)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn row_to_consumer_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConsumerDelivery> {
+    let created_at: String = row.get("created_at")?;
+    Ok(ConsumerDelivery {
+        id: row.get("id")?,
+        sync_id: row.get("sync_id")?,
+        entity_table: row.get("entity_table")?,
+        entity_id: row.get("entity_id")?,
+        field_name: row.get("field_name")?,
+        encoded_value: row.get("encoded_value")?,
+        is_delete: row.get::<_, i64>("is_delete")? != 0,
+        server_seq: row.get("server_seq")?,
+        created_at: DateTime::parse_from_rfc3339(&created_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+fn query_list_consumer_deliveries(
+    conn: &Connection,
+    sync_id: &str,
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<ConsumerDelivery>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM consumer_deliveries \
+         WHERE sync_id = ?1 AND id > ?2 \
+         ORDER BY id ASC \
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![sync_id, after_id, limit], row_to_consumer_delivery)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn query_count_consumer_deliveries(conn: &Connection, sync_id: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM consumer_deliveries WHERE sync_id = ?1",
+        params![sync_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 fn query_device_record(
     conn: &Connection,
     sync_id: &str,
@@ -330,6 +447,24 @@ fn exec_upsert_sync_metadata(conn: &Connection, meta: &SyncMetadata) -> Result<(
 
 fn exec_update_last_pulled_seq(conn: &Connection, sync_id: &str, seq: i64) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    // MAX-monotonic: never rewind. Quarantine replay (Phase 0b) re-applies past
+    // batches without their server_seq, so the cursor must not move backwards
+    // here. Legitimate rewinds go through `exec_reset_last_pulled_seq`.
+    conn.execute(
+        "INSERT INTO sync_metadata \
+         (sync_id, local_device_id, current_epoch, last_pulled_server_seq, created_at, updated_at) \
+         VALUES (?1, '', 0, ?2, ?3, ?3) \
+         ON CONFLICT(sync_id) DO UPDATE SET \
+         last_pulled_server_seq = MAX(last_pulled_server_seq, ?2), updated_at = ?3",
+        params![sync_id, seq, now],
+    )?;
+    Ok(())
+}
+
+fn exec_reset_last_pulled_seq(conn: &Connection, sync_id: &str, seq: i64) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    // Unconditional set (may rewind). Escape hatch for bootstrap/reset and the
+    // relay-log lineage change, where the server-seq space itself changed.
     conn.execute(
         "INSERT INTO sync_metadata \
          (sync_id, local_device_id, current_epoch, last_pulled_server_seq, created_at, updated_at) \
@@ -371,8 +506,20 @@ fn exec_update_last_imported_registry_version(
     sync_id: &str,
     version: i64,
 ) -> Result<()> {
+    // MAX-monotonic in SQL so the replay-freshness baseline can never rewind,
+    // even when two ratchets race (pairing-initiator publish vs the sync-loop
+    // repair publisher, or a catch-up import once the baseline ratchet is wired in — storage
+    // is a shared Arc<dyn SyncStorage> and the FFI ceremonies run outside the
+    // Mutex<PrismSync>). The helper's read-side early-out is only an
+    // optimization; this clamp is the actual atomic guarantee, mirroring
+    // exec_update_last_pulled_seq. A NULL baseline (COALESCE) is treated as
+    // below everything, so the first write lands.
     conn.execute(
-        "UPDATE sync_metadata SET last_imported_registry_version = ?2, updated_at = ?3 WHERE sync_id = ?1",
+        "UPDATE sync_metadata \
+         SET last_imported_registry_version = \
+                 MAX(COALESCE(last_imported_registry_version, ?2), ?2), \
+             updated_at = ?3 \
+         WHERE sync_id = ?1",
         params![sync_id, version, Utc::now().to_rfc3339()],
     )
     ?;
@@ -518,6 +665,123 @@ fn exec_delete_quarantined_op(conn: &Connection, sync_id: &str, op_id: &str) -> 
     Ok(())
 }
 
+fn exec_insert_consumer_delivery(conn: &Connection, delivery: &ConsumerDelivery) -> Result<()> {
+    // `id` is AUTOINCREMENT — never supplied on insert, so the journal preserves
+    // strict append order even across re-applies of the same op.
+    conn.execute(
+        "INSERT INTO consumer_deliveries \
+         (sync_id, entity_table, entity_id, field_name, encoded_value, is_delete, \
+          server_seq, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            delivery.sync_id,
+            delivery.entity_table,
+            delivery.entity_id,
+            delivery.field_name,
+            delivery.encoded_value,
+            delivery.is_delete as i64,
+            delivery.server_seq,
+            delivery.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_delete_consumer_deliveries_up_to(
+    conn: &Connection,
+    sync_id: &str,
+    up_to_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM consumer_deliveries WHERE sync_id = ?1 AND id <= ?2",
+        params![sync_id, up_to_id],
+    )?;
+    Ok(())
+}
+
+fn exec_insert_quarantined_pull_batch(
+    conn: &Connection,
+    batch: &QuarantinedPullBatch,
+) -> Result<()> {
+    let envelope_json = serde_json::to_string(&batch.envelope)
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO quarantined_pull_batches \
+         (sync_id, batch_id, server_seq, epoch, sender_device_id, envelope_json, \
+          reason, retry_count, quarantined_at, last_retry_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            batch.sync_id,
+            batch.batch_id,
+            batch.server_seq,
+            batch.epoch,
+            batch.sender_device_id,
+            envelope_json,
+            batch.reason,
+            batch.retry_count,
+            batch.quarantined_at.to_rfc3339(),
+            batch.last_retry_at.map(|d| d.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_delete_quarantined_pull_batch(
+    conn: &Connection,
+    sync_id: &str,
+    sender_device_id: &str,
+    batch_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM quarantined_pull_batches \
+         WHERE sync_id = ?1 AND sender_device_id = ?2 AND batch_id = ?3",
+        params![sync_id, sender_device_id, batch_id],
+    )?;
+    Ok(())
+}
+
+fn exec_bump_quarantined_pull_batch_retry(
+    conn: &Connection,
+    sync_id: &str,
+    sender_device_id: &str,
+    batch_id: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE quarantined_pull_batches \
+         SET retry_count = retry_count + 1, last_retry_at = ?4 \
+         WHERE sync_id = ?1 AND sender_device_id = ?2 AND batch_id = ?3",
+        params![sync_id, sender_device_id, batch_id, now],
+    )?;
+    Ok(())
+}
+
+fn exec_record_pull_stall(
+    conn: &Connection,
+    sync_id: &str,
+    server_seq: i64,
+    reason: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO pull_stall \
+         (sync_id, server_seq, reason, attempts, first_seen_at, last_seen_at) \
+         VALUES (?1, ?2, ?3, 1, ?4, ?4) \
+         ON CONFLICT(sync_id, server_seq) DO UPDATE SET \
+         attempts = attempts + 1, reason = excluded.reason, last_seen_at = excluded.last_seen_at",
+        params![sync_id, server_seq, reason, now],
+    )?;
+    Ok(())
+}
+
+fn exec_clear_pull_stall(conn: &Connection, sync_id: &str, server_seq: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pull_stall WHERE sync_id = ?1 AND server_seq = ?2",
+        params![sync_id, server_seq],
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exec_quarantine_batch(
     conn: &Connection,
@@ -615,13 +879,67 @@ fn exec_remove_device_record(conn: &Connection, sync_id: &str, device_id: &str) 
     Ok(())
 }
 
+fn query_archived_device_key(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    generation: u32,
+) -> Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT ml_dsa_65_public_key FROM device_key_history \
+         WHERE sync_id = ?1 AND device_id = ?2 AND ml_dsa_key_generation = ?3",
+        params![sync_id, device_id, generation as i64],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(CoreError::from)
+}
+
+fn exec_archive_device_key(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    generation: u32,
+    ml_dsa_65_public_key: &[u8],
+) -> Result<()> {
+    // INSERT OR IGNORE: re-archiving the same (device, generation) keeps the
+    // first key seen. A device's key for a given generation is fixed, so a
+    // collision is a re-import of the same artifact, not a key change.
+    conn.execute(
+        "INSERT OR IGNORE INTO device_key_history \
+         (sync_id, device_id, ml_dsa_key_generation, ml_dsa_65_public_key, archived_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            sync_id,
+            device_id,
+            generation as i64,
+            ml_dsa_65_public_key,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn exec_clear_sync_state(conn: &Connection, sync_id: &str) -> Result<()> {
     conn.execute("DELETE FROM pending_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM applied_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM field_versions WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM quarantined_ops WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM push_quarantine WHERE sync_id = ?1", params![sync_id])?;
+    // Pull-failure discipline tables are server-seq-scoped to the group's log;
+    // a reset/re-pair gives the group a fresh seq space, so leftover envelopes
+    // and stalls must not survive (they would replay batches from a wiped group).
+    conn.execute("DELETE FROM quarantined_pull_batches WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM pull_stall WHERE sync_id = ?1", params![sync_id])?;
+    // The consumer-delivery journal is group-scoped: a reset/re-pair wipes
+    // field_versions and gives the group a fresh state, so any undrained rows
+    // would replay deletes/edits for entities that no longer exist. Clear them
+    // here for the same lineage reason as quarantined_pull_batches above.
+    conn.execute("DELETE FROM consumer_deliveries WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM device_registry WHERE sync_id = ?1", params![sync_id])?;
+    // Archived verification keys are scoped to this group's device registry; a
+    // reset/re-pair rebuilds the registry, so superseded-key history must go too.
+    conn.execute("DELETE FROM device_key_history WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM sync_metadata WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
 }
@@ -815,7 +1133,21 @@ fn snapshot_field_import_decision(
     conn: &Connection,
     sync_id: &str,
     fv: &FieldVersionEntry,
+    locally_tombstoned: &HashSet<(String, String)>,
 ) -> Result<SnapshotFieldImportDecision> {
+    // Per-ENTITY absorbing rule, mirroring engine::merge: a delete
+    // subsumes every other field, so no non-`is_deleted` snapshot field may
+    // import into an entity that is locally tombstoned — even at a higher HLC,
+    // and even when the entity's other field_versions were already pruned away
+    // (the pruner keeps only `is_deleted=true`, so a plain HLC compare would
+    // find no existing row and blind-recreate the live field). `is_deleted`
+    // itself still flows through the field-level absorbing branch below.
+    if fv.field_name != "is_deleted"
+        && locally_tombstoned.contains(&(fv.entity_table.clone(), fv.entity_id.clone()))
+    {
+        return Ok(SnapshotFieldImportDecision::SkipStale);
+    }
+
     let snapshot_hlc = Hlc::from_string(&fv.winning_hlc)?;
     let existing: Option<(String, Option<String>)> = conn
         .query_row(
@@ -836,7 +1168,7 @@ fn snapshot_field_import_decision(
     // could resurrect a tombstone via bootstrap. NULL local value = tombstone.
     if fv.field_name == "is_deleted" {
         let incoming_true = fv.winning_encoded_value.as_deref() == Some("true");
-        let existing_true = existing_value.as_deref() != Some("false");
+        let existing_true = is_tombstone_value(existing_value.as_deref());
         match (incoming_true, existing_true) {
             (true, false) => return Ok(SnapshotFieldImportDecision::InsertOrUpdate),
             (false, true) => return Ok(SnapshotFieldImportDecision::SkipStale),
@@ -872,14 +1204,64 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
 
     // Track unique entities for the return count
     let mut entities: HashSet<(String, String)> = HashSet::new();
+    // Preserve local-only row values across the INSERT OR REPLACE below: the
+    // snapshot blob carries no replay-freshness baseline, so a naive REPLACE
+    // would NULL `last_imported_registry_version` on every auto-bootstrap and
+    // hand a stale-registry replay a fail-open `confirm_self_revocation`.
+    let existing_metadata = query_sync_metadata(conn, sync_id)?;
     let existing_local_device_id =
-        query_sync_metadata(conn, sync_id)?.map(|meta| meta.local_device_id);
+        existing_metadata.as_ref().map(|meta| meta.local_device_id.clone());
+    let existing_last_imported_registry_version =
+        existing_metadata.as_ref().and_then(|meta| meta.last_imported_registry_version);
 
     // 3. Insert field_versions only when the snapshot row is newer than the
     //    existing local winner. HLC ordering must stay typed; SQL string
     //    comparisons are wrong for counters such as ":9" vs ":10".
+    //
+    //    First snapshot the LOCAL tombstone state for every entity the snapshot
+    //    touches (single query over `is_deleted` field_versions), so the
+    //    per-field decision can enforce the same per-ENTITY absorbing rule as
+    //    engine::merge before any field write. Uses the shared
+    //    `is_tombstone_value` rule (NULL/absent → tombstoned).
+    //
+    //    This set is captured ONCE, before the loop, and is deliberately NOT
+    //    updated when a snapshot's own `is_deleted = true` imports mid-loop: a
+    //    new tombstone arriving in the snapshot may legitimately import alongside
+    //    that same entity's residual live fields (they match the uploader's
+    //    pre-delete state), and the field-level `is_deleted` absorbing branch
+    //    already converges them. The downstream journal/EntityChange derivation
+    //    (engine::mod) absorbs those residual fields via its own
+    //    accepted-`is_deleted` set, so they are never delivered live. Folding
+    //    mid-loop tombstones in here would be a behavior change, not a fix.
+    let snapshot_entities: HashSet<(String, String)> = snapshot
+        .field_versions
+        .iter()
+        .map(|fv| (fv.entity_table.clone(), fv.entity_id.clone()))
+        .collect();
+    let mut locally_tombstoned: HashSet<(String, String)> = HashSet::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT entity_table, entity_id, winning_encoded_value FROM field_versions \
+             WHERE sync_id = ?1 AND field_name = 'is_deleted'",
+        )?;
+        let rows = stmt.query_map(params![sync_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (entity_table, entity_id, value) = row?;
+            let key = (entity_table, entity_id);
+            if snapshot_entities.contains(&key) && is_tombstone_value(value.as_deref()) {
+                locally_tombstoned.insert(key);
+            }
+        }
+    }
+
     for fv in &snapshot.field_versions {
-        match snapshot_field_import_decision(conn, sync_id, fv)? {
+        match snapshot_field_import_decision(conn, sync_id, fv, &locally_tombstoned)? {
             SnapshotFieldImportDecision::InsertOrUpdate => {
                 conn.execute(
                     "INSERT OR REPLACE INTO field_versions \
@@ -1011,16 +1393,28 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
         )?;
     }
 
-    // 6. Update sync_metadata (last_pulled_server_seq, current_epoch)
+    // 6. Update sync_metadata (last_pulled_server_seq, current_epoch).
+    //    Preserve `last_imported_registry_version` across the REPLACE (NULL only
+    //    if it was already NULL) — same pattern as `local_device_id` above. The
+    //    snapshot blob never carries this baseline, so dropping it would re-arm
+    //    the stale-registry false-wipe on exactly the devices that just
+    //    auto-bootstrapped.
     let sm = &snapshot.sync_metadata;
     let local_device_id = existing_local_device_id.unwrap_or_else(|| sm.local_device_id.clone());
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT OR REPLACE INTO sync_metadata \
          (sync_id, local_device_id, current_epoch, last_pulled_server_seq, \
-          needs_rekey, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
-        params![sync_id, local_device_id, sm.current_epoch, sm.last_pulled_server_seq, now,],
+          last_imported_registry_version, needs_rekey, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
+        params![
+            sync_id,
+            local_device_id,
+            sm.current_epoch,
+            sm.last_pulled_server_seq,
+            existing_last_imported_registry_version,
+            now,
+        ],
     )?;
 
     // 7. Return count of unique entities
@@ -1136,6 +1530,34 @@ impl SyncStorage for RusqliteSyncStorage {
         query_quarantined_ops(&conn, sync_id)
     }
 
+    fn list_quarantined_pull_batches(
+        &self,
+        sync_id: &str,
+    ) -> Result<Vec<QuarantinedPullBatch>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_quarantined_pull_batches(&conn, sync_id)
+    }
+
+    fn list_pull_stalls(&self, sync_id: &str) -> Result<Vec<PullStall>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_pull_stalls(&conn, sync_id)
+    }
+
+    fn list_consumer_deliveries(
+        &self,
+        sync_id: &str,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ConsumerDelivery>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_list_consumer_deliveries(&conn, sync_id, after_id, limit)
+    }
+
+    fn count_consumer_deliveries(&self, sync_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_count_consumer_deliveries(&conn, sync_id)
+    }
+
     fn list_quarantined_batches(&self, sync_id: &str) -> Result<Vec<QuarantinedBatchInfo>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_list_quarantined_batches(&conn, sync_id)
@@ -1154,6 +1576,16 @@ impl SyncStorage for RusqliteSyncStorage {
     fn list_device_records(&self, sync_id: &str) -> Result<Vec<DeviceRecord>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_list_device_records(&conn, sync_id)
+    }
+
+    fn get_archived_device_key(
+        &self,
+        sync_id: &str,
+        device_id: &str,
+        ml_dsa_key_generation: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_archived_device_key(&conn, sync_id, device_id, ml_dsa_key_generation)
     }
 
     fn count_prunable_applied_ops(&self, sync_id: &str, below_seq: i64) -> Result<usize> {
@@ -1279,6 +1711,10 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_update_last_pulled_seq(&self.conn, sync_id, seq)
     }
 
+    fn reset_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
+        exec_reset_last_pulled_seq(&self.conn, sync_id, seq)
+    }
+
     fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {
         exec_update_last_successful_sync(&self.conn, sync_id)
     }
@@ -1341,6 +1777,50 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_delete_quarantined_op(&self.conn, sync_id, op_id)
     }
 
+    // ── Consumer delivery journal ──
+
+    fn insert_consumer_delivery(&mut self, delivery: &ConsumerDelivery) -> Result<()> {
+        exec_insert_consumer_delivery(&self.conn, delivery)
+    }
+
+    fn delete_consumer_deliveries_up_to(&mut self, sync_id: &str, up_to_id: i64) -> Result<()> {
+        exec_delete_consumer_deliveries_up_to(&self.conn, sync_id, up_to_id)
+    }
+
+    // ── Quarantined remote pull batches (replayable) ──
+
+    fn insert_quarantined_pull_batch(&mut self, batch: &QuarantinedPullBatch) -> Result<()> {
+        exec_insert_quarantined_pull_batch(&self.conn, batch)
+    }
+
+    fn delete_quarantined_pull_batch(
+        &mut self,
+        sync_id: &str,
+        sender_device_id: &str,
+        batch_id: &str,
+    ) -> Result<()> {
+        exec_delete_quarantined_pull_batch(&self.conn, sync_id, sender_device_id, batch_id)
+    }
+
+    fn bump_quarantined_pull_batch_retry(
+        &mut self,
+        sync_id: &str,
+        sender_device_id: &str,
+        batch_id: &str,
+    ) -> Result<()> {
+        exec_bump_quarantined_pull_batch_retry(&self.conn, sync_id, sender_device_id, batch_id)
+    }
+
+    // ── Pull stall budget ──
+
+    fn record_pull_stall(&mut self, sync_id: &str, server_seq: i64, reason: &str) -> Result<()> {
+        exec_record_pull_stall(&self.conn, sync_id, server_seq, reason)
+    }
+
+    fn clear_pull_stall(&mut self, sync_id: &str, server_seq: i64) -> Result<()> {
+        exec_clear_pull_stall(&self.conn, sync_id, server_seq)
+    }
+
     // ── Quarantined local push batches ──
 
     fn quarantine_batch(
@@ -1377,6 +1857,31 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn remove_device_record(&mut self, sync_id: &str, device_id: &str) -> Result<()> {
         exec_remove_device_record(&self.conn, sync_id, device_id)
+    }
+
+    fn archive_device_key(
+        &mut self,
+        sync_id: &str,
+        device_id: &str,
+        ml_dsa_key_generation: u32,
+        ml_dsa_65_public_key: &[u8],
+    ) -> Result<()> {
+        exec_archive_device_key(
+            &self.conn,
+            sync_id,
+            device_id,
+            ml_dsa_key_generation,
+            ml_dsa_65_public_key,
+        )
+    }
+
+    fn get_archived_device_key(
+        &self,
+        sync_id: &str,
+        device_id: &str,
+        ml_dsa_key_generation: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        query_archived_device_key(&self.conn, sync_id, device_id, ml_dsa_key_generation)
     }
 
     // ── Cleanup ──
@@ -1440,6 +1945,7 @@ impl SyncStorageTx for RusqliteTx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::traits::SignedBatchEnvelope;
 
     fn make_storage() -> RusqliteSyncStorage {
         RusqliteSyncStorage::in_memory().expect("in_memory storage should succeed")
@@ -1859,6 +2365,51 @@ mod tests {
     }
 
     #[test]
+    fn update_last_imported_registry_version_is_max_monotonic_in_sql() {
+        // Exercises the storage primitive directly (not the ratchet helper's
+        // read-side early-out) so the SQL-level MAX clamp is what's under test:
+        // an interleaved lower-version write must never rewind a higher stored
+        // baseline. This is the atomic guarantee the false-wipe gate relies on
+        // when two ratchets race outside the engine Mutex.
+        let storage = make_storage();
+        let mut meta = sample_metadata("sync-1");
+        meta.last_imported_registry_version = None;
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&meta).unwrap();
+        tx.commit().unwrap();
+
+        // First write from NULL baseline lands (COALESCE treats NULL as below).
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_imported_registry_version("sync-1", 5).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            storage.get_sync_metadata("sync-1").unwrap().unwrap().last_imported_registry_version,
+            Some(5)
+        );
+
+        // A lower-version write (e.g. a slower racing ratchet for an older
+        // registry) must be clamped to the existing higher baseline.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_imported_registry_version("sync-1", 3).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            storage.get_sync_metadata("sync-1").unwrap().unwrap().last_imported_registry_version,
+            Some(5),
+            "lower-version write must not rewind the baseline"
+        );
+
+        // Equal writes are no-ops; strictly-greater writes advance.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_imported_registry_version("sync-1", 5).unwrap();
+        tx.update_last_imported_registry_version("sync-1", 9).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            storage.get_sync_metadata("sync-1").unwrap().unwrap().last_imported_registry_version,
+            Some(9)
+        );
+    }
+
+    #[test]
     fn tx_reads_within_transaction() {
         let storage = make_storage();
 
@@ -2236,6 +2787,65 @@ mod tests {
     }
 
     #[test]
+    fn import_snapshot_preserves_last_imported_registry_version() {
+        // The snapshot blob carries no replay-freshness baseline, so the
+        // importer's INSERT OR REPLACE must preserve the destination's existing
+        // `last_imported_registry_version` (and `local_device_id`) rather than
+        // NULL it. A NULLed baseline would hand a stale-registry replay a
+        // fail-open `confirm_self_revocation` on every auto-bootstrap.
+        let src = make_storage();
+        populate_for_snapshot(&src);
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        // Destination already has a baseline and its own local_device_id.
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            let mut meta = sample_metadata("sync-1");
+            meta.local_device_id = "local-device-xyz".to_string();
+            tx.upsert_sync_metadata(&meta).unwrap();
+            tx.update_last_imported_registry_version("sync-1", 10).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut tx = dst.begin_tx().unwrap();
+        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.commit().unwrap();
+
+        let meta = dst.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(
+            meta.last_imported_registry_version,
+            Some(10),
+            "baseline must survive snapshot import unchanged"
+        );
+        assert_eq!(
+            meta.local_device_id, "local-device-xyz",
+            "local_device_id must survive snapshot import (importer must not adopt the snapshot's)"
+        );
+        // The snapshot's transport fields still land.
+        assert_eq!(meta.current_epoch, 1);
+        assert_eq!(meta.last_pulled_server_seq, 42);
+    }
+
+    #[test]
+    fn import_snapshot_leaves_null_baseline_null_when_destination_has_none() {
+        // The complement of the preservation test: a fresh auto-bootstrap with
+        // no prior baseline stays NULL (the fail-safe state) rather than picking
+        // up some value from the snapshot, which carries none.
+        let src = make_storage();
+        populate_for_snapshot(&src);
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        let mut tx = dst.begin_tx().unwrap();
+        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.commit().unwrap();
+
+        let meta = dst.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(meta.last_imported_registry_version, None);
+    }
+
+    #[test]
     fn import_snapshot_is_deleted_is_absorbing() {
         // The snapshot channel must honor the same absorbing tombstone rule as
         // engine::merge: a snapshot's is_deleted=false must NOT overwrite a local
@@ -2311,6 +2921,207 @@ mod tests {
             Some("true".to_string()),
             "a snapshot tombstone must win over a local higher-HLC is_deleted=false"
         );
+    }
+
+    #[test]
+    fn import_snapshot_skips_live_field_on_pruned_local_tombstone() {
+        // After the TombstonePruner removed an entity's non-tombstone
+        // field_versions (keeping only is_deleted=true), a snapshot carrying a
+        // live field for that entity must NOT recreate it. Mirrors the
+        // per-ENTITY absorbing rule engine::merge applies on the live channel.
+        let live_name_fv = |entity_id: &str| FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: entity_id.to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: format!("op-name-{entity_id}"),
+            winning_device_id: "src".to_string(),
+            winning_hlc: "5000:0:src".to_string(),
+            winning_encoded_value: Some("\"Alice\"".to_string()),
+            updated_at: Utc::now(),
+        };
+
+        // Source snapshot: a live name field for e1 (no is_deleted row — the
+        // uploader never deleted it).
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&live_name_fv("e1")).unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        // Destination: a PRUNED tombstone — only is_deleted='true' survives.
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "del-op".to_string(),
+                winning_device_id: "dst".to_string(),
+                winning_hlc: "1000:0:dst".to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let count = {
+            let mut tx = dst.begin_tx().unwrap();
+            let count = tx.import_snapshot("sync-1", &blob).unwrap();
+            tx.commit().unwrap();
+            count
+        };
+
+        // The live name field must not have been recreated under the tombstone.
+        assert!(
+            dst.get_field_version("sync-1", "members", "e1", "name").unwrap().is_none(),
+            "a live snapshot field must not import into a locally-tombstoned entity"
+        );
+        // ...and the tombstone is untouched.
+        let tomb = dst.get_field_version("sync-1", "members", "e1", "is_deleted").unwrap().unwrap();
+        assert_eq!(tomb.winning_encoded_value, Some("true".to_string()));
+        // The entity contributed nothing to the import count.
+        assert_eq!(count, 0, "a fully-skipped tombstoned entity is not counted");
+    }
+
+    #[test]
+    fn import_snapshot_newer_hlc_snapshot_field_loses_to_tombstone() {
+        // Second-order tombstone hole: a NON-pruned tombstoned entity (still holding an
+        // older local `name` fv) must reject a newer-HLC snapshot `name` field.
+        // The per-ENTITY rule beats the plain HLC compare that would otherwise
+        // let the newer snapshot field win.
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-name-new".to_string(),
+                winning_device_id: "src".to_string(),
+                winning_hlc: "9000:0:src".to_string(), // newer than dst's
+                winning_encoded_value: Some("\"NewName\"".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            // Tombstone + an older local name fv (NOT pruned).
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "del-op".to_string(),
+                winning_device_id: "dst".to_string(),
+                winning_hlc: "1000:0:dst".to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-name-old".to_string(),
+                winning_device_id: "dst".to_string(),
+                winning_hlc: "2000:0:dst".to_string(), // older than the snapshot's
+                winning_encoded_value: Some("\"OldName\"".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.import_snapshot("sync-1", &blob).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let name = dst.get_field_version("sync-1", "members", "e1", "name").unwrap().unwrap();
+        assert_eq!(
+            name.winning_encoded_value,
+            Some("\"OldName\"".to_string()),
+            "the entity tombstone must beat a newer-HLC snapshot field (not plain HLC LWW)"
+        );
+    }
+
+    #[test]
+    fn import_snapshot_tombstone_for_live_local_entity_still_absorbs() {
+        // Regression on the existing is_deleted absorbing branch: a snapshot
+        // is_deleted=true for a LOCALLY-LIVE entity must still import (the
+        // per-entity gate keys off LOCAL tombstone state, so a live local entity
+        // is not skipped — the delete flows through and tombstones it).
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "del-op".to_string(),
+                winning_device_id: "src".to_string(),
+                winning_hlc: "9000:0:src".to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "live-op".to_string(),
+                winning_device_id: "dst".to_string(),
+                winning_hlc: "1000:0:dst".to_string(),
+                winning_encoded_value: Some("false".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let count = {
+            let mut tx = dst.begin_tx().unwrap();
+            let count = tx.import_snapshot("sync-1", &blob).unwrap();
+            tx.commit().unwrap();
+            count
+        };
+
+        let tomb = dst.get_field_version("sync-1", "members", "e1", "is_deleted").unwrap().unwrap();
+        assert_eq!(
+            tomb.winning_encoded_value,
+            Some("true".to_string()),
+            "a snapshot tombstone for a locally-live entity must still import"
+        );
+        assert_eq!(count, 1, "the absorbing delete still counts the entity");
     }
 
     #[test]
@@ -2664,6 +3475,500 @@ mod tests {
         tx.commit().unwrap();
 
         assert!(storage.list_quarantined_ops("sync-1").unwrap().is_empty());
+    }
+
+    // ── Pull-failure discipline: monotonic cursor + reset escape hatch ──
+
+    #[test]
+    fn update_last_pulled_seq_is_max_monotonic() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+        tx.commit().unwrap();
+
+        // Advance forward.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_pulled_seq("sync-1", 100).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 100);
+
+        // A lower value (e.g. a Phase 0b replay re-applying an old batch) must
+        // NOT rewind the cursor.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_pulled_seq("sync-1", 40).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 100);
+
+        // A higher value still advances.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_pulled_seq("sync-1", 150).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 150);
+    }
+
+    #[test]
+    fn reset_last_pulled_seq_can_rewind() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+        tx.update_last_pulled_seq("sync-1", 500).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 500);
+
+        // The explicit reset escape hatch (bootstrap / relay-log lineage change) is
+        // allowed to move the cursor backwards.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.reset_last_pulled_seq("sync-1", 0).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 0);
+    }
+
+    #[test]
+    fn reset_last_pulled_seq_creates_metadata_when_missing() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.reset_last_pulled_seq("sync-1", 7).unwrap();
+        tx.commit().unwrap();
+        let m = storage.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(m.last_pulled_server_seq, 7);
+    }
+
+    // ── Pull-failure discipline: quarantined_pull_batches + pull_stall ──
+
+    fn sample_pull_envelope(sync_id: &str, batch_id: &str, sender: &str) -> SignedBatchEnvelope {
+        SignedBatchEnvelope {
+            protocol_version: 3,
+            sync_id: sync_id.to_string(),
+            epoch: 2,
+            batch_id: batch_id.to_string(),
+            batch_kind: "ops".to_string(),
+            sender_device_id: sender.to_string(),
+            sender_ml_dsa_key_generation: 1,
+            payload_hash: [7u8; 32],
+            signature: vec![1, 2, 3, 4],
+            nonce: [9u8; 24],
+            ciphertext: vec![5, 6, 7, 8, 9],
+        }
+    }
+
+    fn sample_quarantined_pull_batch(
+        sync_id: &str,
+        batch_id: &str,
+        server_seq: i64,
+        reason: &str,
+    ) -> QuarantinedPullBatch {
+        sample_quarantined_pull_batch_from(sync_id, batch_id, server_seq, reason, "dev-c")
+    }
+
+    fn sample_quarantined_pull_batch_from(
+        sync_id: &str,
+        batch_id: &str,
+        server_seq: i64,
+        reason: &str,
+        sender: &str,
+    ) -> QuarantinedPullBatch {
+        QuarantinedPullBatch {
+            sync_id: sync_id.to_string(),
+            batch_id: batch_id.to_string(),
+            server_seq,
+            epoch: Some(2),
+            sender_device_id: sender.to_string(),
+            envelope: sample_pull_envelope(sync_id, batch_id, sender),
+            reason: reason.to_string(),
+            retry_count: 0,
+            quarantined_at: Utc::now(),
+            last_retry_at: None,
+        }
+    }
+
+    #[test]
+    fn quarantined_pull_batch_round_trip_preserves_envelope() {
+        let storage = make_storage();
+        assert!(storage.list_quarantined_pull_batches("sync-1").unwrap().is_empty());
+
+        let batch = sample_quarantined_pull_batch("sync-1", "batch-poison", 12, "payload_hash_mismatch");
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_pull_batch(&batch).unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_quarantined_pull_batches("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.batch_id, "batch-poison");
+        assert_eq!(r.server_seq, 12);
+        assert_eq!(r.epoch, Some(2));
+        assert_eq!(r.sender_device_id, "dev-c");
+        assert_eq!(r.reason, "payload_hash_mismatch");
+        assert_eq!(r.retry_count, 0);
+        assert!(r.last_retry_at.is_none());
+        // Envelope survives the JSON round-trip intact.
+        assert_eq!(r.envelope.batch_id, "batch-poison");
+        assert_eq!(r.envelope.sender_ml_dsa_key_generation, 1);
+        assert_eq!(r.envelope.payload_hash, [7u8; 32]);
+        assert_eq!(r.envelope.ciphertext, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn quarantined_pull_batches_list_ordered_by_server_seq() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-1", "b-high", 30, "decode_failed",
+        ))
+        .unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-1", "b-low", 10, "decode_failed",
+        ))
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_quarantined_pull_batches("sync-1").unwrap();
+        let seqs: Vec<i64> = rows.iter().map(|r| r.server_seq).collect();
+        assert_eq!(seqs, vec![10, 30]);
+    }
+
+    #[test]
+    fn bump_and_delete_quarantined_pull_batch() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-1", "b", 5, "sender_unresolved",
+        ))
+        .unwrap();
+        tx.commit().unwrap();
+
+        // Bump retry twice; retry_count increments and last_retry_at is stamped.
+        // (sample_quarantined_pull_batch stamps sender_device_id = "dev-c".)
+        let mut tx = storage.begin_tx().unwrap();
+        tx.bump_quarantined_pull_batch_retry("sync-1", "dev-c", "b").unwrap();
+        tx.bump_quarantined_pull_batch_retry("sync-1", "dev-c", "b").unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_quarantined_pull_batches("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].retry_count, 2);
+        assert!(rows[0].last_retry_at.is_some());
+
+        // Delete (replay succeeded or sender revoked) removes the row.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.delete_quarantined_pull_batch("sync-1", "dev-c", "b").unwrap();
+        tx.commit().unwrap();
+        assert!(storage.list_quarantined_pull_batches("sync-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn quarantined_pull_batches_scoped_by_sync_id() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-1", "b1", 1, "decode_failed",
+        ))
+        .unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-other", "b2", 1, "decode_failed",
+        ))
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(storage.list_quarantined_pull_batches("sync-1").unwrap().len(), 1);
+        assert_eq!(storage.list_quarantined_pull_batches("sync-other").unwrap().len(), 1);
+        assert_eq!(storage.list_quarantined_pull_batches("sync-1").unwrap()[0].batch_id, "b1");
+    }
+
+    /// Two different senders sharing the same `batch_id` (legal on the wire — the
+    /// relay dedups on `(sync_id, sender_device_id, batch_id)`) must NOT evict
+    /// each other: the second insert keeps the first sender's envelope intact and
+    /// deleting one leaves the other. This pins the cross-sender custody invariant
+    /// that the `(sync_id, sender_device_id, batch_id)` PK exists to protect.
+    #[test]
+    fn same_batch_id_from_different_senders_coexist() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch_from(
+            "sync-1", "shared-id", 10, "invalid_signature", "honest-h",
+        ))
+        .unwrap();
+        // A compromised device pushes a deliberately-failing batch under the SAME
+        // batch_id; with batch_id alone as the key this REPLACE would destroy H's
+        // durably-stored envelope.
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch_from(
+            "sync-1", "shared-id", 11, "attribution_mismatch", "compromised-m",
+        ))
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_quarantined_pull_batches("sync-1").unwrap();
+        assert_eq!(rows.len(), 2, "both senders' envelopes must be retained");
+        assert!(rows.iter().any(|r| r.sender_device_id == "honest-h"));
+        assert!(rows.iter().any(|r| r.sender_device_id == "compromised-m"));
+
+        // Deleting M's row leaves H's intact, and vice versa.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.delete_quarantined_pull_batch("sync-1", "compromised-m", "shared-id").unwrap();
+        tx.commit().unwrap();
+        let rows = storage.list_quarantined_pull_batches("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender_device_id, "honest-h");
+        assert_eq!(rows[0].reason, "invalid_signature");
+    }
+
+    #[test]
+    fn record_pull_stall_increments_attempts_and_preserves_first_seen() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.record_pull_stall("sync-1", 42, "sender_unresolved").unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_pull_stalls("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server_seq, 42);
+        assert_eq!(rows[0].attempts, 1);
+        assert_eq!(rows[0].reason, "sender_unresolved");
+        let first_seen = rows[0].first_seen_at;
+
+        // Bumping the same seq increments attempts, refreshes the reason, and
+        // preserves first_seen_at.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.record_pull_stall("sync-1", 42, "stale_key_generation").unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_pull_stalls("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].attempts, 2);
+        assert_eq!(rows[0].reason, "stale_key_generation");
+        assert_eq!(rows[0].first_seen_at, first_seen);
+    }
+
+    #[test]
+    fn clear_pull_stall_removes_only_the_target_seq() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.record_pull_stall("sync-1", 10, "sender_unresolved").unwrap();
+        tx.record_pull_stall("sync-1", 20, "sender_unresolved").unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_pull_stall("sync-1", 10).unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_pull_stalls("sync-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server_seq, 20);
+    }
+
+    #[test]
+    fn clear_sync_state_empties_pull_failure_tables() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-1", "b", 5, "decode_failed",
+        ))
+        .unwrap();
+        tx.record_pull_stall("sync-1", 5, "sender_unresolved").unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_sync_state("sync-1").unwrap();
+        tx.commit().unwrap();
+
+        assert!(storage.list_quarantined_pull_batches("sync-1").unwrap().is_empty());
+        assert!(storage.list_pull_stalls("sync-1").unwrap().is_empty());
+    }
+
+    // ── Consumer-delivery journal tests ──
+
+    fn sample_consumer_delivery(
+        sync_id: &str,
+        entity_id: &str,
+        field: Option<&str>,
+        server_seq: i64,
+    ) -> ConsumerDelivery {
+        let is_delete = field.is_none();
+        ConsumerDelivery {
+            id: 0,
+            sync_id: sync_id.to_string(),
+            entity_table: "members".to_string(),
+            entity_id: entity_id.to_string(),
+            field_name: field.map(|f| f.to_string()),
+            encoded_value: field.map(|f| format!("\"{f}-val\"")),
+            is_delete,
+            server_seq,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn consumer_delivery_journal_lists_in_id_order_and_filters_after_id() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-1", "ent-1", Some("name"), 1))
+            .unwrap();
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-1", "ent-2", Some("name"), 2))
+            .unwrap();
+        // A different group's row must never leak into sync-1's drain.
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-2", "ent-x", Some("name"), 9))
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(storage.count_consumer_deliveries("sync-1").unwrap(), 2);
+        assert_eq!(storage.count_consumer_deliveries("sync-2").unwrap(), 1);
+
+        let rows = storage.list_consumer_deliveries("sync-1", 0, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].id < rows[1].id, "rows must come back in id order");
+        assert_eq!(rows[0].entity_id, "ent-1");
+        assert_eq!(rows[0].field_name.as_deref(), Some("name"));
+        assert!(!rows[0].is_delete);
+
+        // after_id excludes already-drained rows.
+        let after_first = storage.list_consumer_deliveries("sync-1", rows[0].id, 100).unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].entity_id, "ent-2");
+
+        // limit caps the chunk.
+        let capped = storage.list_consumer_deliveries("sync-1", 0, 1).unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].entity_id, "ent-1");
+    }
+
+    #[test]
+    fn consumer_delivery_delete_row_roundtrips_with_null_field() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-1", "ent-1", None, 5))
+            .unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_consumer_deliveries("sync-1", 0, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_delete);
+        assert_eq!(rows[0].field_name, None);
+        assert_eq!(rows[0].encoded_value, None);
+        assert_eq!(rows[0].server_seq, 5);
+    }
+
+    #[test]
+    fn ack_consumer_deliveries_removes_rows_up_to_id_inclusive() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        for i in 0..5 {
+            tx.insert_consumer_delivery(&sample_consumer_delivery(
+                "sync-1",
+                &format!("ent-{i}"),
+                Some("name"),
+                i,
+            ))
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let rows = storage.list_consumer_deliveries("sync-1", 0, 100).unwrap();
+        assert_eq!(rows.len(), 5);
+        let third_id = rows[2].id;
+
+        // Ack up to the third row's id.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.delete_consumer_deliveries_up_to("sync-1", third_id).unwrap();
+        tx.commit().unwrap();
+
+        let remaining = storage.list_consumer_deliveries("sync-1", 0, 100).unwrap();
+        assert_eq!(remaining.len(), 2, "only rows with id > up_to_id survive");
+        assert!(remaining.iter().all(|r| r.id > third_id));
+    }
+
+    #[test]
+    fn consumer_delivery_journal_aborted_tx_leaves_no_rows() {
+        // Crash-sim: the journal write shares its transaction with the cursor /
+        // bookkeeping write, so a rolled-back tx must leave neither.
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_last_pulled_seq("sync-1", 7).unwrap();
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-1", "ent-1", Some("name"), 7))
+            .unwrap();
+        tx.rollback().unwrap();
+
+        // Neither the cursor advance nor the journal row survived the abort.
+        assert!(storage.list_consumer_deliveries("sync-1", 0, 100).unwrap().is_empty());
+        assert!(storage.get_sync_metadata("sync-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_sync_state_empties_consumer_delivery_journal() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-1", "ent-1", Some("name"), 1))
+            .unwrap();
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-2", "ent-2", Some("name"), 1))
+            .unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_sync_state("sync-1").unwrap();
+        tx.commit().unwrap();
+
+        assert!(storage.list_consumer_deliveries("sync-1", 0, 100).unwrap().is_empty());
+        // The other group's journal is untouched.
+        assert_eq!(storage.count_consumer_deliveries("sync-2").unwrap(), 1);
+    }
+
+    #[test]
+    fn archive_device_key_roundtrips_and_is_generation_scoped() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.archive_device_key("sync-1", "dev-a", 0, &[0xAAu8; 16]).unwrap();
+        tx.archive_device_key("sync-1", "dev-a", 1, &[0xBBu8; 16]).unwrap();
+        tx.commit().unwrap();
+
+        // Exact-generation lookup returns the matching archived key.
+        assert_eq!(
+            storage.get_archived_device_key("sync-1", "dev-a", 0).unwrap(),
+            Some(vec![0xAAu8; 16])
+        );
+        assert_eq!(
+            storage.get_archived_device_key("sync-1", "dev-a", 1).unwrap(),
+            Some(vec![0xBBu8; 16])
+        );
+        // A generation never archived (and a different device) returns None.
+        assert_eq!(storage.get_archived_device_key("sync-1", "dev-a", 2).unwrap(), None);
+        assert_eq!(storage.get_archived_device_key("sync-1", "dev-b", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn archive_device_key_keeps_first_archived_on_conflict() {
+        let storage = make_storage();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.archive_device_key("sync-1", "dev-a", 0, &[0x11u8; 8]).unwrap();
+        // Re-archiving the same (device, generation) is a no-op (INSERT OR IGNORE):
+        // a device's key for a given generation is fixed.
+        tx.archive_device_key("sync-1", "dev-a", 0, &[0x22u8; 8]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            storage.get_archived_device_key("sync-1", "dev-a", 0).unwrap(),
+            Some(vec![0x11u8; 8])
+        );
+    }
+
+    #[test]
+    fn clear_sync_state_empties_device_key_history() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.archive_device_key("sync-1", "dev-a", 0, &[0xAAu8; 8]).unwrap();
+        tx.commit().unwrap();
+        assert!(storage.get_archived_device_key("sync-1", "dev-a", 0).unwrap().is_some());
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_sync_state("sync-1").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(storage.get_archived_device_key("sync-1", "dev-a", 0).unwrap(), None);
     }
 
     #[test]

@@ -577,6 +577,12 @@ impl PairingService {
     /// backup) and pass it through. The phrase is included in the encrypted
     /// credential bundle shipped to the joiner so the joiner can Argon2-
     /// unlock, and is zeroized once that bundle has been constructed.
+    /// On success returns the `registry_version` of the signed registry this
+    /// device just published to the relay during the ceremony. The FFI caller
+    /// uses it to ratchet this (long-lived inviter) device's
+    /// `last_imported_registry_version` freshness baseline forward — the
+    /// `PairingService` itself has no `SyncStorage` handle, so the ratchet lives
+    /// at the call site where storage is available.
     pub async fn complete_bootstrap_initiator(
         &self,
         ceremony: &InitiatorCeremony,
@@ -585,7 +591,7 @@ impl PairingService {
         mnemonic: &str,
         sync_relay: &dyn SyncRelay,
         storage: &dyn crate::storage::SyncStorage,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let rendezvous_id = ceremony.rendezvous_id_hex();
         let transcript_prefix = diag_prefix(ceremony.transcript_hash());
 
@@ -987,7 +993,11 @@ impl PairingService {
         self.secure_store.delete("bootstrap_joiner_bundle")?;
         self.secure_store.delete("bootstrap_joiner_device_id")?;
 
-        Ok(())
+        // The published registry's version — the caller ratchets the inviter's
+        // freshness baseline to it. `post_rekey_registry_snapshot` carries
+        // the same `registry_version` as the bundle registry, which is
+        // `next_registry_version`.
+        Ok(next_registry_version)
     }
 
     /// Access the underlying secure store.

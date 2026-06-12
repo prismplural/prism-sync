@@ -31,6 +31,7 @@ use crate::pairing::{
     SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
 };
 use crate::recovery::{commit_recovered_epoch_material, KeyHierarchyRecoverer};
+use crate::registry_publish;
 use crate::relay::SyncRelay;
 use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::secure_store::SecureStore;
@@ -733,6 +734,26 @@ impl PrismSync {
             }
         };
 
+        // Ratchet-on-verified-read: the registry just verified, so advance
+        // our freshness baseline to its embedded `registry_version` regardless of
+        // whether the epoch catch-up below succeeds. This covers the relay-ahead
+        // path (relay_epoch > local_epoch); the steady-state path ratchets in
+        // repair_signed_registry_epoch_if_needed. Best-effort and non-fatal, and
+        // uses the VERIFIED embedded version, never the relay response's claimed
+        // version. (Sub-floor versions are no-oped by the helper, so this is safe
+        // to call before the floor check below.)
+        if let Err(error) = registry_publish::ratchet_last_imported_registry_version(
+            self.storage.as_ref(),
+            &sync_id,
+            snapshot.registry_version,
+        ) {
+            tracing::warn!(
+                error = %error,
+                registry_version = snapshot.registry_version,
+                "catch_up_epoch_keys: failed to ratchet baseline on verified read"
+            );
+        }
+
         if snapshot.registry_version < SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING {
             tracing::warn!(
                 registry_version = snapshot.registry_version,
@@ -865,9 +886,14 @@ impl PrismSync {
     /// (`SyncMetadata::last_imported_registry_version`, the SAME baseline
     /// `verify_and_import_signed_registry` checks). A snapshot strictly older
     /// than that baseline is treated as stale/replayed → `Unknown`
-    /// (non-destructive). When no baseline is recorded (the device never
-    /// imported a registry) staleness cannot be proven, so we proceed — the
-    /// signature + explicit-`revoked`-entry gate still applies. This is a
+    /// (non-destructive). When no baseline is recorded (a freshly paired or
+    /// snapshot-restored device that has not yet imported/published a registry)
+    /// staleness cannot be proven, so we ALSO fail safe to `Unknown` and refuse
+    /// the destructive confirmation — a stale validly-signed replay must never
+    /// wipe a device that merely lacks a baseline. A genuine revocation
+    /// still confirms because the revoke publisher emits a positive `revoked`-self entry at a
+    /// version above any prior artifact, and the baseline self-heals (monotonic
+    /// ratchet) on the device's next registry import or publish. This is a
     /// read-only check: it never imports.
     ///
     /// Returns:
@@ -963,8 +989,9 @@ impl PrismSync {
             Some(entry) if entry.status == "revoked" => {
                 // Freshness gate (replay defense): a signature-valid but stale
                 // snapshot must not drive a wipe. Reject versions older than our
-                // last-imported baseline; no baseline → proceed (the signature +
-                // revoked-entry gate still stands).
+                // last-imported baseline; a missing baseline (None) also fails
+                // safe to Unknown — staleness is unprovable, so we refuse the
+                // destructive confirmation. See the three-way match below.
                 let storage = self.storage.clone();
                 let sid = sync_id.clone();
                 let last_imported = tokio::task::spawn_blocking(move || {
@@ -976,8 +1003,10 @@ impl PrismSync {
                 .flatten()
                 .and_then(|meta| meta.last_imported_registry_version);
 
-                if let Some(baseline) = last_imported {
-                    if snapshot.registry_version < baseline {
+                match last_imported {
+                    Some(baseline) if snapshot.registry_version < baseline => {
+                        // Verified but stale: a version below our baseline is a
+                        // replay. Never destructive.
                         tracing::warn!(
                             device_id = %device_id,
                             snapshot_version = snapshot.registry_version,
@@ -986,6 +1015,24 @@ impl PrismSync {
                         );
                         return SelfRevocationStatus::Unknown;
                     }
+                    None => {
+                        // No baseline recorded → staleness is unprovable. With
+                        // the revoke publisher emitting a positive revoked-self entry from every
+                        // genuine revoke, an unprovable case must stay fail-safe
+                        // Unknown rather than wipe: a malicious/faulty relay
+                        // could replay an old validly-signed registry that marks
+                        // a freshly-paired/restored (NULL-baseline) device
+                        // revoked, and proceeding here would drive a false wipe.
+                        // Baselines self-heal as soon as the device
+                        // imports or publishes any registry.
+                        tracing::warn!(
+                            device_id = %device_id,
+                            snapshot_version = snapshot.registry_version,
+                            "confirm_self_revocation: unknown (no registry baseline recorded — cannot prove freshness, refusing destructive confirmation)"
+                        );
+                        return SelfRevocationStatus::Unknown;
+                    }
+                    Some(_) => {}
                 }
 
                 // H3 Layer B: the wipe intent is read from the SAME verified,
@@ -1058,6 +1105,27 @@ impl PrismSync {
                         "signed registry verification failed before epoch repair: {e}"
                     ))
                 })?;
+                // Ratchet-on-verified-read: a signature-verified registry is
+                // proof of a real published version, so advance our freshness
+                // baseline to its embedded `registry_version` even when no repair
+                // is needed. This is the steady-state preflight path (relay_epoch
+                // == local_epoch), so without this a NULL-baseline device (the
+                // whole upgrading 0.12.x fleet, plus the creator until its first
+                // publish) would never populate a baseline and could never confirm
+                // a genuine revocation. Best-effort and non-fatal — a ratchet
+                // failure must not block epoch repair — and uses the VERIFIED
+                // embedded version, never the relay response's claimed version.
+                if let Err(error) = registry_publish::ratchet_last_imported_registry_version(
+                    self.storage.as_ref(),
+                    sync_id,
+                    current_snapshot.registry_version,
+                ) {
+                    tracing::warn!(
+                        error = %error,
+                        registry_version = current_snapshot.registry_version,
+                        "repair_signed_registry_epoch_if_needed: failed to ratchet baseline on verified read"
+                    );
+                }
                 if current_snapshot.current_epoch >= target_epoch {
                     return Ok(());
                 }
@@ -1073,28 +1141,70 @@ impl PrismSync {
             return Ok(());
         }
 
+        // Revoked-absorbing republish: emit EVERY relay-listed device, not
+        // just active ones, so a survivor's epoch repair carries forward the
+        // tombstone even if the revoker crashed before publishing. The pinned
+        // record is authoritative for revocation: a device is emitted as
+        // "revoked" if EITHER the relay reports it revoked OR our locally-pinned
+        // record is revoked — a malicious relay cannot un-revoke a device this
+        // way. We prefer locally-pinned key bytes when a pin exists so the
+        // republished entry matches what peers already verified against.
+        let pinned = DeviceRegistryManager::list_devices(self.storage.as_ref(), sync_id)?;
         let entries: Vec<RegistrySnapshotEntry> = devices
             .iter()
-            .filter(|device| device.status == "active")
-            .map(|device| RegistrySnapshotEntry {
-                sync_id: sync_id.to_string(),
-                device_id: device.device_id.clone(),
-                ed25519_public_key: device.ed25519_public_key.clone(),
-                x25519_public_key: device.x25519_public_key.clone(),
-                ml_dsa_65_public_key: device.ml_dsa_65_public_key.clone(),
-                ml_kem_768_public_key: device.ml_kem_768_public_key.clone(),
-                x_wing_public_key: device.x_wing_public_key.clone(),
-                status: device.status.clone(),
-                ml_dsa_key_generation: device.ml_dsa_key_generation,
-                // Active-only repair snapshot never authors a wipe intent.
-                remote_wipe: false,
+            .map(|device| {
+                let pin = pinned.iter().find(|p| p.device_id == device.device_id);
+                let locally_revoked = pin.is_some_and(|p| p.status == "revoked");
+                let status = if locally_revoked || device.status == "revoked" {
+                    "revoked"
+                } else {
+                    "active"
+                };
+                let (ed25519, x25519, ml_dsa, ml_kem, x_wing, generation) = match pin {
+                    Some(p) => (
+                        p.ed25519_public_key.clone(),
+                        p.x25519_public_key.clone(),
+                        p.ml_dsa_65_public_key.clone(),
+                        p.ml_kem_768_public_key.clone(),
+                        p.x_wing_public_key.clone(),
+                        p.ml_dsa_key_generation,
+                    ),
+                    None => (
+                        device.ed25519_public_key.clone(),
+                        device.x25519_public_key.clone(),
+                        device.ml_dsa_65_public_key.clone(),
+                        device.ml_kem_768_public_key.clone(),
+                        device.x_wing_public_key.clone(),
+                        device.ml_dsa_key_generation,
+                    ),
+                };
+                RegistrySnapshotEntry {
+                    sync_id: sync_id.to_string(),
+                    device_id: device.device_id.clone(),
+                    ed25519_public_key: ed25519,
+                    x25519_public_key: x25519,
+                    ml_dsa_65_public_key: ml_dsa,
+                    ml_kem_768_public_key: ml_kem,
+                    x_wing_public_key: x_wing,
+                    status: status.to_string(),
+                    ml_dsa_key_generation: generation,
+                    // The repair backstop republishes tombstones but never authors
+                    // a wipe intent (wipe intent isn't pinned locally); H3 wipe
+                    // durability is a known follow-up.
+                    remote_wipe: false,
+                }
             })
             .collect();
 
-        if !entries.iter().any(|entry| entry.device_id == device_id) {
+        // The publishing device must be present AND active in the artifact it
+        // signs: a registry that omits or revokes its own signer is never
+        // legitimate and would strand survivors.
+        if !entries
+            .iter()
+            .any(|entry| entry.device_id == device_id && entry.status == "active")
+        {
             return Err(CoreError::Engine(
-                "cannot repair signed registry: current device missing from active relay list"
-                    .into(),
+                "cannot repair signed registry: current device missing or non-active".into(),
             ));
         }
 
@@ -1107,6 +1217,15 @@ impl PrismSync {
         let signed = snapshot.sign_hybrid(&signing_key, pq_signing_key);
         let _ = relay.put_signed_registry(&signed).await.map_err(CoreError::from_relay)?;
 
+        // Ratchet our own freshness baseline to the version we just published so
+        // this long-lived survivor stops sitting at a NULL baseline. Use
+        // the locally-computed `registry_version`, never a relay-returned value.
+        registry_publish::ratchet_last_imported_registry_version(
+            self.storage.as_ref(),
+            sync_id,
+            registry_version,
+        )?;
+
         tracing::info!(
             epoch = target_epoch,
             sync_id = %sync_id,
@@ -1117,6 +1236,14 @@ impl PrismSync {
         Ok(())
     }
 
+    // TODO: collapse this into
+    // `registry_publish::build_signed_registry_from_pinned`'s
+    // `epoch_key_hashes_from_hierarchy`. The revoke-time publisher already
+    // uses the shared helper; `repair_signed_registry_epoch_if_needed` still
+    // builds its entries from the relay device list (cross-checked against local
+    // pins for revoked-absorption) rather than pins-only, so it can't switch to
+    // the pins-only builder until the epoch-key-lifecycle work rebuilds
+    // it. Keep the two byte-identical until then.
     fn build_epoch_key_hashes_for_registry(
         key_hierarchy: &KeyHierarchy,
     ) -> Result<BTreeMap<u32, [u8; 32]>> {
@@ -1263,18 +1390,21 @@ impl PrismSync {
         if self.op_emitter.is_none() {
             return Err(CoreError::Engine("sync not configured".into()));
         }
-        // Strip a phantom `is_deleted = false` (would resurrect a re-created
-        // deleted id; see [`without_phantom_undelete`]).
-        let stripped = Self::without_phantom_undelete(fields);
-        let fields = stripped.as_ref().unwrap_or(fields);
-        self.validate_mutation_fields(table, fields)?;
-        let (device_id, epoch) = {
+        let (device_id, epoch, sync_id) = {
             let emitter = self
                 .op_emitter
                 .as_ref()
                 .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-            (emitter.last_hlc().node_id.clone(), emitter.epoch())
+            (emitter.last_hlc().node_id.clone(), emitter.epoch(), emitter.sync_id().to_string())
         };
+        // Strip a phantom `is_deleted = false` only when this exact id is already
+        // tombstoned (would resurrect a re-created deleted id); a fresh
+        // incarnation id keeps its explicit live marker. See
+        // [`without_phantom_undelete`].
+        let stripped =
+            Self::without_phantom_undelete(&*self.storage, &sync_id, table, entity_id, fields);
+        let fields = stripped.as_ref().unwrap_or(fields);
+        self.validate_mutation_fields(table, fields)?;
         let partitions =
             Self::partition_fields_into_batches(fields, table, entity_id, &device_id, epoch);
         let emitter = self
@@ -1305,21 +1435,28 @@ impl PrismSync {
         if self.op_emitter.is_none() {
             return Err(CoreError::Engine("sync not configured".into()));
         }
+        let (device_id, epoch, sync_id) = {
+            let emitter = self
+                .op_emitter
+                .as_ref()
+                .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+            (emitter.last_hlc().node_id.clone(), emitter.epoch(), emitter.sync_id().to_string())
+        };
         // Strip before the empty check so an update of only `is_deleted = false`
-        // is a no-op (see [`without_phantom_undelete`]).
-        let stripped = Self::without_phantom_undelete(changed_fields);
+        // on an already-tombstoned id is a no-op; on a live/fresh id the explicit
+        // `false` survives (see [`without_phantom_undelete`]).
+        let stripped = Self::without_phantom_undelete(
+            &*self.storage,
+            &sync_id,
+            table,
+            entity_id,
+            changed_fields,
+        );
         let changed_fields = stripped.as_ref().unwrap_or(changed_fields);
         if changed_fields.is_empty() {
             return Ok(());
         }
         self.validate_mutation_fields(table, changed_fields)?;
-        let (device_id, epoch) = {
-            let emitter = self
-                .op_emitter
-                .as_ref()
-                .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-            (emitter.last_hlc().node_id.clone(), emitter.epoch())
-        };
         let partitions = Self::partition_fields_into_batches(
             changed_fields,
             table,
@@ -1340,17 +1477,45 @@ impl PrismSync {
         result
     }
 
-    /// Drop a phantom `is_deleted = false` from a mutation's fields.
+    /// Drop a phantom `is_deleted = false` from a mutation's fields when the
+    /// entity is already locally tombstoned.
     ///
-    /// `is_deleted` is write-once-true: a create/update carrying `false` stamps a
-    /// fresh-HLC live-marker that, on a re-create of a deleted id, beats the older
-    /// tombstone under per-field LWW and resurrects the entity.
-    /// [`MergeEngine`](crate::engine::merge) enforces the same on receive. Returns
-    /// `Some` only when a strip was needed (otherwise allocation-free).
+    /// `is_deleted` is absorbing: a create/update carrying `false` stamps a
+    /// fresh-HLC live-marker that, on a re-create of an *already-tombstoned* id,
+    /// beats the older tombstone under per-field LWW and resurrects the entity on
+    /// every peer — so we strip it. But the app deliberately reuses deterministic
+    /// ids (`pk-group-g<N>:<uuid>`, gen-suffixed entry shas) and a *fresh*
+    /// incarnation id has no local tombstone; that id's explicit `false` must
+    /// travel so peers see it as a live new entity (the sanctioned-revive path).
+    ///
+    /// The strip is therefore conditional on a LOCAL tombstone for the exact
+    /// `(table, entity_id)`: an `is_deleted` field version whose winning value is
+    /// anything other than `"false"` (mirrors merge.rs — a `None`/missing value
+    /// counts as a tombstone). [`MergeEngine`](crate::engine::merge) keeps its own
+    /// receiver backstop (`false` never beats a tombstone) so a stale peer can
+    /// never be resurrected even when this device emits an explicit `false`.
+    ///
+    /// Returns `Some` only when a strip was needed (otherwise allocation-free).
     fn without_phantom_undelete(
+        storage: &dyn SyncStorage,
+        sync_id: &str,
+        table: &str,
+        entity_id: &str,
         fields: &HashMap<String, SyncValue>,
     ) -> Option<HashMap<String, SyncValue>> {
         if !matches!(fields.get(DELETED_FIELD), Some(SyncValue::Bool(false))) {
+            return None;
+        }
+        // Only strip when this exact id is already tombstoned locally; a fresh
+        // incarnation carries its explicit live marker.
+        let tombstoned = match storage.get_field_version(sync_id, table, entity_id, DELETED_FIELD) {
+            Ok(Some(fv)) => fv.winning_encoded_value.as_deref() != Some("false"),
+            Ok(None) => false,
+            // On a read error, fail safe: behave as 0.12.x did and strip, so a
+            // transient storage fault cannot leak a phantom undelete.
+            Err(_) => true,
+        };
+        if !tombstoned {
             return None;
         }
         Some(
@@ -1993,48 +2158,101 @@ impl PrismSync {
 
         self.commit_local_epoch_rotation(&sync_id, committed_epoch, epoch_key.as_ref()).await?;
 
-        // H3 Layer B (the load-bearing producer): author + sign + post a signed
-        // registry that marks the target `revoked` and binds the admin's wipe
-        // intent into the SIGNATURE. Without this, no production path ever
-        // writes a `revoked` entry into the signed registry, so the victim's
-        // `confirm_self_revocation` could never positively confirm — Layer A's
-        // authenticated gate would be inert in the field. The survivor set and
-        // the target's keys come from the locally-pinned registry (a trusted
-        // source), NOT the raw relay `list_devices()`, so the relay cannot
-        // inject or rewrite an entry. Runs AFTER the local epoch rotation
-        // committed so the new epoch key is in the hierarchy and the snapshot
-        // can bind `committed_epoch` + its key hash.
-        self.author_signed_revocation_registry(
-            relay.as_ref(),
+        // Revoke-publish + wipe-intent binding: pin the local tombstone, then publish a signed
+        // registry that carries the target as an explicit status=="revoked"
+        // entry — binding the admin's `remote_wipe` intent into the SIGNATURE so
+        // the revoked device can both confirm its own revocation and read the
+        // wipe bit from the verified entry. Both steps run strictly AFTER the
+        // relay-side revocation committed (above), so a signed revoked-claim can
+        // never precede the actual revocation.
+        //
+        // The pin is the gate for the publish: the publisher builds from local
+        // pins, so without a successful revoked pin it would emit a
+        // tombstone-LESS artifact at the new epoch (omitting an unpinned target,
+        // or re-asserting an active target after a storage write error). Such a
+        // publish is worse than no publish: it makes the served artifact
+        // epoch-current, so the revoked-absorbing epoch repair backstop
+        // (repair_signed_registry_epoch_if_needed early-returns once the served
+        // epoch catches up) never republishes the tombstone — permanently
+        // disarming the revoke-publish backstop. So if the pin fails we deliberately do NOT publish: the
+        // served artifact stays epoch-stale and any survivor's next
+        // catch_up_epoch_keys repair re-derives the tombstone from the relay
+        // list (the revoker's revoke_device call already moved the relay row to
+        // revoked). publish_revocation_registry additionally re-checks the built
+        // snapshot carries the target as revoked before PUT (belt-and-braces).
+        match DeviceRegistryManager::revoke_device(
+            self.storage.as_ref(),
             &sync_id,
-            &self_device_id,
             target_device_id,
-            committed_epoch,
-            remote_wipe,
-            &pinned,
-        )
-        .await?;
+        ) {
+            Ok(()) => {
+                // Publish failure is non-fatal: the revoke itself already
+                // committed, and any survivor's next catch_up_epoch_keys epoch
+                // repair republishes the tombstone-bearing registry (the
+                // revoked-absorbing backstop).
+                if let Err(error) = self
+                    .publish_revocation_registry(
+                        relay.as_ref(),
+                        &sync_id,
+                        &self_device_id,
+                        target_device_id,
+                        committed_epoch,
+                        remote_wipe,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        target_device_id = %target_device_id,
+                        epoch = committed_epoch,
+                        "revoke_and_rekey: failed to publish revocation registry (epoch repair will backstop)"
+                    );
+                }
+            }
+            Err(error) => {
+                // The relay-side revoke already committed, so the revocation is
+                // real and durable. Skip the publish entirely (see above): the
+                // epoch-stale served artifact makes the epoch repair backstop
+                // fire on the next survivor's catch_up_epoch_keys, which derives
+                // the tombstone from the relay's revoked row.
+                tracing::warn!(
+                    error = %error,
+                    target_device_id = %target_device_id,
+                    epoch = committed_epoch,
+                    "revoke_and_rekey: failed to pin local revocation tombstone — skipping revocation-registry publish so the epoch repair backstop re-derives it"
+                );
+            }
+        }
 
         Ok(committed_epoch)
     }
 
-    /// Author, hybrid-sign, and post a signed registry snapshot that marks
-    /// `target_device_id` as `status == "revoked"` with the admin-authenticated
-    /// `remote_wipe` intent bound into the signature (H3 Layer B).
+    /// Publish a signed registry carrying the locally-pinned revocation state
+    /// (explicit revoked entries) so a genuinely revoked device can fetch it and
+    /// reach `ConfirmedRevoked` via `confirm_self_revocation`.
     ///
-    /// SECURITY:
-    /// - Survivor entries are taken from the locally-pinned registry
-    ///   (`pinned`), filtered to `active` and excluding the target, so the relay
-    ///   cannot inject a recipient or rewrite a survivor's keys.
-    /// - The target entry reuses its real pinned keys with `status = "revoked"`
-    ///   and `remote_wipe = remote_wipe`. The wipe bit is therefore covered by
-    ///   the registry signature and read back by the victim's
-    ///   `confirm_self_revocation` from the verified entry.
-    /// - The signed `registry_version` is computed monotonically above the
-    ///   current relay-served signed registry so the victim's freshness gate
-    ///   accepts it.
-    #[allow(clippy::too_many_arguments)]
-    async fn author_signed_revocation_registry(
+    /// Built from local pins via the shared revoked-absorbing
+    /// [`build_signed_registry_from_pinned`] helper, signed with this device's
+    /// Ed25519 + ML-DSA keys, and published with a version strictly above the
+    /// currently-served artifact. The built snapshot is re-checked to carry
+    /// `target_device_id` as `status == "revoked"` before the PUT — a
+    /// tombstone-less artifact at the current epoch must never be published, as
+    /// it would silently disarm the epoch-repair backstop. After a successful
+    /// publish the device's own freshness baseline is ratcheted to the
+    /// locally-computed version (never the relay's PUT response, which a
+    /// malicious relay could inflate to wedge future imports).
+    ///
+    /// H3 Layer B: `remote_wipe` is the admin's authenticated wipe intent. It is
+    /// passed through to the builder as the wipe target, so the target's revoked
+    /// entry binds the wipe bit into the registry SIGNATURE and the victim reads
+    /// it back from the verified entry in `confirm_self_revocation`.
+    ///
+    /// Composition seam: this is the publish-after path. The later
+    /// epoch-key-lifecycle work refactors revocation
+    /// publication to atomic-attach (signed_registry_snapshot attached to the
+    /// revoke call) reusing this same helper; it rebases on this function rather
+    /// than duplicating the content rules.
+    async fn publish_revocation_registry(
         &self,
         relay: &dyn SyncRelay,
         sync_id: &str,
@@ -2042,123 +2260,93 @@ impl PrismSync {
         target_device_id: &str,
         committed_epoch: u32,
         remote_wipe: bool,
-        pinned: &[crate::storage::DeviceRecord],
     ) -> Result<()> {
         let device_secret = self.device_secret.as_ref().ok_or_else(|| {
             CoreError::Engine("device secret not set — call configure_engine first".into())
         })?;
-        let signing_key =
-            device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
+        let signing_key = device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
         let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
             CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
         })?;
 
-        // Monotonic registry version: fetch the current relay-served signed
-        // registry (signature-verified) and pick the next version above it,
-        // never below the binding floor. Mirrors
-        // `repair_signed_registry_epoch_if_needed`. STOP, rather than guess at a
-        // version, if a fetched registry cannot be verified — guessing risks a
-        // version that the victim's freshness gate either rejects (stale) or a
-        // replayed-lower version that re-opens the very residual we close.
-        let registry_version = match relay.get_signed_registry().await {
+        // Choose a version strictly above the currently-served artifact (same
+        // pattern as the epoch repair publisher), floored at the epoch-binding
+        // minimum. A fetch failure is treated as "no served artifact yet".
+        let new_version = match relay.get_signed_registry().await {
             Ok(Some(response)) => {
-                let current_snapshot = DeviceRegistryManager::verify_signed_registry_snapshot(
+                let current = DeviceRegistryManager::verify_signed_registry_snapshot(
                     self.storage.as_ref(),
                     sync_id,
                     &response.artifact_blob,
                 )
                 .map_err(|e| {
                     CoreError::Engine(format!(
-                        "signed registry verification failed before authoring revocation: {e}"
+                        "signed registry verification failed before revocation publish: {e}"
                     ))
                 })?;
-                (current_snapshot.registry_version + 1)
-                    .max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+                (current.registry_version + 1).max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
             }
             Ok(None) => SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             Err(error) => return Err(CoreError::from_relay(error)),
         };
 
-        // Epoch binding for the post-revoke epoch. `commit_local_epoch_rotation`
-        // already stored the new epoch key in the hierarchy, so the hash map
-        // covers `committed_epoch`.
-        let epoch_key_hashes = Self::build_epoch_key_hashes_for_registry(&self.key_hierarchy)?;
-        if !epoch_key_hashes.contains_key(&committed_epoch) {
+        // H3 composition: when the admin requested a remote wipe, name the target
+        // as the builder's `wipe_target` so its (pinned-revoked) entry binds
+        // `remote_wipe = true` into the registry signature. The repair backstop
+        // republish passes `None`, so only this explicit revocation carries the
+        // bit. The builder draws the target's keys + revoked status from the
+        // local pins (set just above by `DeviceRegistryManager::revoke_device`),
+        // never the raw relay list.
+        let snapshot = registry_publish::build_signed_registry_from_pinned(
+            self.storage.as_ref(),
+            sync_id,
+            self_device_id,
+            new_version,
+            committed_epoch,
+            &self.key_hierarchy,
+            if remote_wipe { Some(target_device_id) } else { None },
+        )?;
+
+        // Belt-and-braces: refuse to publish a tombstone-LESS artifact at the
+        // new epoch. The caller only reaches here after a successful local
+        // revoked pin, so the builder should already carry the target as
+        // revoked — but verifying it here closes the gap if the pin were ever
+        // racing/partial, since a tombstone-less publish at the current epoch
+        // would silently disarm the epoch-repair backstop (which only fires
+        // while the served artifact's epoch lags).
+        let target_revoked = snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.device_id == target_device_id && entry.status == "revoked");
+        if !target_revoked {
             return Err(CoreError::Engine(format!(
-                "cannot author signed revocation registry: missing epoch key for committed epoch {committed_epoch}"
+                "refusing to publish revocation registry: built snapshot does not carry target {target_device_id} as revoked"
             )));
         }
 
-        // Survivor entries from the TRUSTED pinned registry, excluding the
-        // target. Active devices author `remote_wipe = false`.
-        let mut entries: Vec<RegistrySnapshotEntry> = pinned
-            .iter()
-            .filter(|record| record.status == "active" && record.device_id != target_device_id)
-            .map(|record| RegistrySnapshotEntry {
-                sync_id: sync_id.to_string(),
-                device_id: record.device_id.clone(),
-                ed25519_public_key: record.ed25519_public_key.clone(),
-                x25519_public_key: record.x25519_public_key.clone(),
-                ml_dsa_65_public_key: record.ml_dsa_65_public_key.clone(),
-                ml_kem_768_public_key: record.ml_kem_768_public_key.clone(),
-                x_wing_public_key: record.x_wing_public_key.clone(),
-                status: "active".into(),
-                ml_dsa_key_generation: record.ml_dsa_key_generation,
-                remote_wipe: false,
-            })
-            .collect();
-
-        // The signer (this admin device) must be present as a non-revoked entry
-        // in its own snapshot or `verify_signed_registry_snapshot` rejects it.
-        if !entries.iter().any(|entry| entry.device_id == self_device_id) {
-            return Err(CoreError::Engine(
-                "cannot author signed revocation registry: signer missing from pinned active set"
-                    .into(),
-            ));
-        }
-
-        // The revoked target entry, reusing its real pinned keys so the victim
-        // (who roots trust in the signer's pinned keys) can verify the signature
-        // and find its own `device_id` with `status == "revoked"` and the
-        // admin-signed wipe intent. If the target is absent from the pinned
-        // registry we cannot author its real keys — fail rather than fabricate.
-        let target_record =
-            pinned.iter().find(|record| record.device_id == target_device_id).ok_or_else(|| {
-                CoreError::Engine(
-                    "cannot author signed revocation registry: target missing from pinned registry"
-                        .into(),
-                )
-            })?;
-        entries.push(RegistrySnapshotEntry {
-            sync_id: sync_id.to_string(),
-            device_id: target_record.device_id.clone(),
-            ed25519_public_key: target_record.ed25519_public_key.clone(),
-            x25519_public_key: target_record.x25519_public_key.clone(),
-            ml_dsa_65_public_key: target_record.ml_dsa_65_public_key.clone(),
-            ml_kem_768_public_key: target_record.ml_kem_768_public_key.clone(),
-            x_wing_public_key: target_record.x_wing_public_key.clone(),
-            status: "revoked".into(),
-            ml_dsa_key_generation: target_record.ml_dsa_key_generation,
-            remote_wipe,
-        });
-
-        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
-            entries,
-            registry_version,
-            committed_epoch,
-            epoch_key_hashes,
-        );
         let signed = snapshot.sign_hybrid(&signing_key, pq_signing_key);
         relay.put_signed_registry(&signed).await.map_err(CoreError::from_relay)?;
 
+        // Ratchet our own baseline forward so we never treat our just-published
+        // registry as stale, and so this long-lived device stops sitting at a
+        // NULL freshness baseline. Ratchet to the LOCALLY-computed new_version,
+        // never the relay's PutRegistryResponse value: a malicious relay could
+        // return an absurdly high registry_version to inflate the baseline and
+        // wedge every future genuine artifact as "stale" (fail-safe direction —
+        // no false wipe — but a needless relay-driven local DoS).
+        registry_publish::ratchet_last_imported_registry_version(
+            self.storage.as_ref(),
+            sync_id,
+            new_version,
+        )?;
+
         tracing::info!(
+            epoch = committed_epoch,
+            registry_version = new_version,
             sync_id = %sync_id,
             device_id = %self_device_id,
-            target_device_id = %target_device_id,
-            registry_version,
-            epoch = committed_epoch,
             remote_wipe,
-            "revoke_and_rekey: authored signed revocation registry (wipe intent bound into signature)"
+            "revoke_and_rekey: published revocation registry with explicit revoked entry"
         );
 
         Ok(())
@@ -3305,6 +3493,88 @@ mod tests {
         assert!(snapshot.epoch_key_hashes.contains_key(&2));
     }
 
+    /// Force the recorded freshness baseline back to NULL. The MAX-monotonic
+    /// `update_last_imported_registry_version` cannot rewind to NULL, so reset
+    /// via a full metadata upsert — modelling a 0.12.x device that upgraded
+    /// with the column populated but the baseline never set.
+    fn clear_last_imported_registry_version(sync: &PrismSync, sync_id: &str) {
+        let mut meta = sync.storage().get_sync_metadata(sync_id).unwrap().unwrap();
+        meta.last_imported_registry_version = None;
+        let mut tx = sync.storage().begin_tx().unwrap();
+        tx.upsert_sync_metadata(&meta).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_preflight_ratchets_null_baseline_on_verified_read_when_relay_ahead() {
+        // Ratchet-on-verified-read: the relay-ahead catch-up path verifies a
+        // signed registry; a NULL-baseline device (the upgrading 0.12.x fleet)
+        // must populate its freshness baseline from the VERIFIED embedded
+        // registry_version so it can later confirm a genuine revocation — without
+        // this, the flipped fail-safe gate leaves remote_wipe permanently inert
+        // for that population.
+        let (mut sync, _relay, _device_id, _epoch_1_key, _epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+        // Model the upgrading 0.12.x device: a sync_metadata row exists (the
+        // column is present from the migration) but the baseline was never set.
+        // The ratchet helper deliberately never fabricates a metadata row — row
+        // creation belongs to the pairing/join/configure paths — so seed the row
+        // here exactly as a real device would have one by catch-up time.
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.update_current_epoch("sync-1", 0).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            sync.storage()
+                .get_sync_metadata("sync-1")
+                .unwrap()
+                .and_then(|m| m.last_imported_registry_version),
+            None,
+            "precondition: row exists but no freshness baseline is recorded"
+        );
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        // The relay serves registry_version 1 (the floor); the relay-ahead verify
+        // ratchets the NULL baseline up to it.
+        assert_eq!(
+            sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().last_imported_registry_version,
+            Some(1),
+            "verified relay-ahead read must populate a NULL baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_preflight_ratchets_null_baseline_on_verified_read_when_no_repair_needed() {
+        // Ratchet-on-verified-read, steady-state path: once local_epoch ==
+        // relay_epoch, the preflight routes through
+        // repair_signed_registry_epoch_if_needed, which verifies the served
+        // registry and EARLY-RETURNS because no epoch repair is needed
+        // (current_snapshot.current_epoch >= target_epoch). That no-repair branch
+        // must still ratchet the baseline — this is the dominant steady-state
+        // sync cycle, so it is what actually self-heals the NULL-baseline fleet.
+        let (mut sync, _relay, _device_id, _epoch_1_key, _epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+
+        // First catch-up advances local epoch to 2 (== relay epoch).
+        sync.catch_up_epoch_keys().await.unwrap();
+        assert_eq!(sync.epoch(), Some(2));
+
+        // Reset the baseline to NULL to model the upgrade hole, then run the
+        // steady-state preflight: relay_epoch == local_epoch == 2 so the served
+        // registry (current_epoch 2) needs no repair and the publisher branch is
+        // never reached — only the verified-read ratchet can populate the baseline.
+        clear_last_imported_registry_version(&sync, "sync-1");
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        assert_eq!(
+            sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().last_imported_registry_version,
+            Some(1),
+            "verified no-repair-needed catch-up must populate a NULL baseline"
+        );
+    }
+
     #[tokio::test]
     async fn sync_preflight_advances_only_verified_prefix_when_artifact_missing() {
         let (mut sync, _relay, _device_id, epoch_1_key, _epoch_2_key) =
@@ -3345,6 +3615,34 @@ mod tests {
             epoch_keys.iter().map(|(epoch, key)| (*epoch, compute_epoch_key_hash(key))).collect();
         let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
             entries,
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            current_epoch,
+            epoch_key_hashes,
+        );
+        SignedRegistryResponse {
+            registry_version: SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: snapshot.sign_hybrid(&signing_key, &pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        }
+    }
+
+    /// Sign a registry from `DeviceInfo` entries (the revoke-publish
+    /// test helper). Takes a `sync_id` + `DeviceInfo` slice and maps each through
+    /// `make_registry_entry` before signing at the binding floor version.
+    fn signed_registry_with_entries(
+        sync_id: &str,
+        signer_secret: &DeviceSecret,
+        signer_device_id: &str,
+        entries: &[DeviceInfo],
+        current_epoch: u32,
+        epoch_keys: &[(u32, [u8; 32])],
+    ) -> SignedRegistryResponse {
+        let signing_key = signer_secret.ed25519_keypair(signer_device_id).unwrap();
+        let pq_signing_key = signer_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
+        let epoch_key_hashes =
+            epoch_keys.iter().map(|(epoch, key)| (*epoch, compute_epoch_key_hash(key))).collect();
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            entries.iter().map(|info| make_registry_entry(sync_id, info)).collect(),
             SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
             current_epoch,
             epoch_key_hashes,
@@ -3435,19 +3733,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_self_revocation_returns_revoked_when_verified_registry_marks_self_revoked() {
-        // No last-imported baseline recorded → staleness cannot be proven, so
-        // the verified + explicit-`revoked`-entry gate stands → ConfirmedRevoked.
+    async fn confirm_self_revocation_is_unknown_when_no_baseline_recorded() {
+        // Freshness gate: with NO last-imported baseline recorded, staleness
+        // cannot be proven, so even a verified snapshot with an explicit
+        // `revoked` self-entry must fail safe to Unknown — never wipe a device
+        // (e.g. freshly paired / snapshot-restored) that merely lacks a baseline.
+        // A genuine revocation still confirms via the revoke publisher because the baseline
+        // self-heals on the device's next registry import/publish (see
+        // confirm_self_revocation_returns_revoked_when_snapshot_at_or_above_baseline).
         let (sync, _relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
         assert_eq!(
             sync.storage().get_sync_metadata("sync-1").unwrap().and_then(|m| m.last_imported_registry_version),
             None,
             "precondition: helper records no last-imported baseline"
         );
-        assert_eq!(
-            sync.confirm_self_revocation().await,
-            SelfRevocationStatus::ConfirmedRevoked { remote_wipe: false }
-        );
+        assert_eq!(sync.confirm_self_revocation().await, SelfRevocationStatus::Unknown);
     }
 
     #[tokio::test]
@@ -3470,6 +3770,10 @@ mod tests {
         // device clears creds / disconnects but must NOT wipe.
         let (sync, _relay, _id, _secret, _info) =
             prepare_self_revocation_check_with_wipe("revoked", false);
+        // The helper authors the snapshot at the binding floor (version 1);
+        // seed a baseline at or below it so the legitimate current revocation
+        // passes the freshness gate and the wipe-bit read path is exercised.
+        set_last_imported_registry_version(&sync, "sync-1", 1);
         assert_eq!(
             sync.confirm_self_revocation().await,
             SelfRevocationStatus::ConfirmedRevoked { remote_wipe: false }
@@ -3483,6 +3787,8 @@ mod tests {
         // admin signature over wipe=true can drive a wipe.
         let (sync, _relay, _id, _secret, _info) =
             prepare_self_revocation_check_with_wipe("revoked", true);
+        // Freshness baseline seed (see the wipe-false test above).
+        set_last_imported_registry_version(&sync, "sync-1", 1);
         assert_eq!(
             sync.confirm_self_revocation().await,
             SelfRevocationStatus::ConfirmedRevoked { remote_wipe: true }
@@ -3501,6 +3807,8 @@ mod tests {
         // covered by the models.rs unit tests; here we assert the client read.)
         let (sync, _relay, _id, _secret, _info) =
             prepare_self_revocation_check_with_wipe("revoked", false);
+        // Freshness baseline seed (see confirm_self_revocation_carries_signed_wipe_false).
+        set_last_imported_registry_version(&sync, "sync-1", 1);
         match sync.confirm_self_revocation().await {
             SelfRevocationStatus::ConfirmedRevoked { remote_wipe } => {
                 assert!(!remote_wipe, "absent/false signed wipe must default to no-wipe");
@@ -3781,12 +4089,13 @@ mod tests {
     }
 
     #[test]
-    fn record_create_strips_phantom_is_deleted_false() {
-        // Regression: a create carrying is_deleted=false must NOT emit an
-        // is_deleted op. On a re-create of a deleted id that fresh-HLC `false`
-        // beats the older tombstone under per-field LWW and resurrects the
-        // entity on every peer. See prism-app
-        // test/e2e/board_post_delete_resurrection_test.dart.
+    fn record_create_emits_explicit_false_on_fresh_id() {
+        // A create carrying is_deleted=false on a FRESH (never-tombstoned) id
+        // must EMIT the explicit false: this is the sanctioned-revive path where
+        // the app re-creates a logical entity under a new incarnation id that no
+        // peer holds a tombstone for, and that explicit live marker has to travel
+        // so peers display it. The receiver backstop in merge.rs keeps a real
+        // stale tombstone safe.
         let mut sync = make_sync();
         configure(&mut sync);
 
@@ -3796,25 +4105,86 @@ mod tests {
 
         sync.record_create("members", "ent-1", &fields).unwrap();
 
-        // Only the real field was emitted; the phantom is_deleted=false is gone.
+        // Both the name op AND the explicit is_deleted=false op were emitted.
         let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
-        let ops = sync.storage.load_batch_ops(&batch_ids[0]).unwrap();
-        assert_eq!(ops.len(), 1, "only the name op should be emitted, not is_deleted");
-        assert_eq!(ops[0].field_name, "name");
-        assert!(
+        let mut ops: Vec<_> =
+            batch_ids.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
+        ops.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+        assert_eq!(ops.len(), 2, "fresh id must emit both name and the explicit is_deleted=false");
+        assert_eq!(ops[0].field_name, DELETED_FIELD);
+        assert_eq!(ops[0].encoded_value, "false");
+        assert_eq!(ops[1].field_name, "name");
+        assert_eq!(
             sync.storage
                 .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
                 .unwrap()
-                .is_none(),
-            "create must not write an is_deleted=false field version"
+                .and_then(|fv| fv.winning_encoded_value)
+                .as_deref(),
+            Some("false"),
+            "fresh-id create writes an explicit is_deleted=false field version"
         );
     }
 
     #[test]
-    fn record_update_strips_phantom_is_deleted_false() {
-        // A field update carrying is_deleted=false must also drop it; an update
-        // of ONLY is_deleted=false becomes a no-op rather than a phantom
-        // un-delete that would resurrect a tombstoned entity.
+    fn record_create_strips_phantom_is_deleted_false_on_tombstoned_id() {
+        // Regression: a re-create carrying is_deleted=false against a LOCALLY
+        // TOMBSTONED id must NOT emit an is_deleted op. That fresh-HLC `false`
+        // would beat the older tombstone under per-field LWW and resurrect the
+        // entity on every peer. See prism-app
+        // test/e2e/board_post_delete_resurrection_test.dart.
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // Tombstone the id first so a later re-create has a local tombstone.
+        sync.record_delete("members", "ent-1").unwrap();
+        assert_eq!(
+            sync.storage
+                .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
+                .unwrap()
+                .and_then(|fv| fv.winning_encoded_value)
+                .as_deref(),
+            Some("true"),
+            "delete must write an is_deleted=true field version"
+        );
+
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        fields.insert(DELETED_FIELD.to_string(), SyncValue::Bool(false));
+        sync.record_create("members", "ent-1", &fields).unwrap();
+
+        // The re-create emits only the real field; the phantom is_deleted=false
+        // was stripped and the tombstone field version is intact.
+        let ops: Vec<_> = sync
+            .storage
+            .get_unpushed_batch_ids("sync-1")
+            .unwrap()
+            .iter()
+            .flat_map(|b| sync.storage.load_batch_ops(b).unwrap())
+            .filter(|op| op.entity_id == "ent-1")
+            .collect();
+        assert!(
+            ops.iter().any(|op| op.field_name == "name"),
+            "the name op should still be emitted"
+        );
+        assert!(
+            !ops.iter().any(|op| op.field_name == DELETED_FIELD && op.encoded_value == "false"),
+            "no is_deleted=false op may be emitted for a tombstoned id"
+        );
+        assert_eq!(
+            sync.storage
+                .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
+                .unwrap()
+                .and_then(|fv| fv.winning_encoded_value)
+                .as_deref(),
+            Some("true"),
+            "re-create must not flip the tombstone back to false"
+        );
+    }
+
+    #[test]
+    fn record_update_emits_explicit_false_on_live_id() {
+        // An update carrying is_deleted=false on a live (never-tombstoned) id
+        // must emit the explicit false — the entity is alive, no strip applies.
         let mut sync = make_sync();
         configure(&mut sync);
 
@@ -3827,17 +4197,52 @@ mod tests {
         changed.insert(DELETED_FIELD.to_string(), SyncValue::Bool(false));
         sync.record_update("members", "ent-1", &changed).unwrap();
 
-        assert_eq!(
-            sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len(),
-            batches_after_create,
-            "an update of only is_deleted=false must emit nothing"
-        );
         assert!(
+            sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len() > batches_after_create,
+            "an explicit is_deleted=false on a live id must emit"
+        );
+        assert_eq!(
             sync.storage
                 .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
                 .unwrap()
-                .is_none(),
-            "a phantom un-delete must not write an is_deleted field version"
+                .and_then(|fv| fv.winning_encoded_value)
+                .as_deref(),
+            Some("false"),
+            "update writes an explicit is_deleted=false field version on a live id"
+        );
+    }
+
+    #[test]
+    fn record_update_strips_phantom_is_deleted_false_on_tombstoned_id() {
+        // A field update carrying is_deleted=false against a tombstoned id must
+        // drop it; an update of ONLY is_deleted=false becomes a no-op rather than
+        // a phantom un-delete that would resurrect a tombstoned entity.
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let mut create = HashMap::new();
+        create.insert("name".to_string(), SyncValue::String("Alice".to_string()));
+        sync.record_create("members", "ent-1", &create).unwrap();
+        sync.record_delete("members", "ent-1").unwrap();
+        let batches_after_delete = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+
+        let mut changed = HashMap::new();
+        changed.insert(DELETED_FIELD.to_string(), SyncValue::Bool(false));
+        sync.record_update("members", "ent-1", &changed).unwrap();
+
+        assert_eq!(
+            sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len(),
+            batches_after_delete,
+            "an update of only is_deleted=false on a tombstoned id must emit nothing"
+        );
+        assert_eq!(
+            sync.storage
+                .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
+                .unwrap()
+                .and_then(|fv| fv.winning_encoded_value)
+                .as_deref(),
+            Some("true"),
+            "a phantom un-delete must not flip the tombstone back to false"
         );
     }
 
@@ -4281,6 +4686,13 @@ mod tests {
         // Drive the real revoke on the admin. This posts the signed registry.
         admin.revoke_and_rekey(relay.clone(), victim_device_id, remote_wipe).await.unwrap();
 
+        // Freshness baseline: the victim was an active member that had
+        // imported the group's registry before being revoked. Seed a baseline at
+        // or below the admin's just-published revocation registry (authored at
+        // the binding floor, version 1) so the genuine current revocation clears
+        // the never-rewind gate; without it the victim fails safe to Unknown.
+        set_last_imported_registry_version(&victim, "sync-1", 1);
+
         // The victim reads the SIGNED verdict — no relay frame involved.
         assert_eq!(
             victim.confirm_self_revocation().await,
@@ -4453,6 +4865,386 @@ mod tests {
         assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
         assert!(sync.secure_store().get("epoch").unwrap().is_none());
         assert!(sync.secure_store().get("epoch_key_1").unwrap().is_none());
+    }
+
+    // ── Revoke-time signed-registry publication ──
+
+    /// Decode the artifact the relay currently serves, verifying it against the
+    /// given signer's permanent Ed25519 + ML-DSA keys.
+    fn decode_served_registry(
+        relay: &RevokeTestRelay,
+        signer_secret: &DeviceSecret,
+        signer_device_id: &str,
+    ) -> SignedRegistrySnapshot {
+        let served = relay.state.lock().unwrap().signed_registry.clone().expect(
+            "revoke_and_rekey must have published a signed registry",
+        );
+        let signing_key = signer_secret.ed25519_keypair(signer_device_id).unwrap();
+        let pq_signing_key = signer_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
+        SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &served.artifact_blob,
+            &signing_key.public_key_bytes(),
+            &pq_signing_key.public_key_bytes(),
+        )
+        .expect("published registry must verify against the survivor's signer keys")
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_publishes_signed_registry_with_explicit_revoked_entry() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let self_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, &self_secret, 0, "active"),
+                make_device_info(target_device_id, &target_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+
+        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, true).await.unwrap();
+        assert_eq!(committed_epoch, 1);
+
+        // The published artifact carries the target as an EXPLICIT revoked entry
+        // (not omitted, the way the old active-only publisher would have) and the
+        // survivor as active, bound to the new epoch.
+        let snapshot = decode_served_registry(&relay, &self_secret, self_device_id);
+        let target_entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.device_id == target_device_id)
+            .expect("revoked target must be present in the published registry");
+        assert_eq!(target_entry.status, "revoked");
+        let self_entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.device_id == self_device_id)
+            .expect("survivor must be present");
+        assert_eq!(self_entry.status, "active");
+        assert_eq!(snapshot.current_epoch, committed_epoch);
+        // First publish: relay served nothing, so version is the epoch-binding
+        // floor.
+        assert_eq!(snapshot.registry_version, SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING);
+
+        // The local pinned record for the target is now revoked.
+        let pinned_target =
+            sync.storage().get_device_record("sync-1", target_device_id).unwrap().unwrap();
+        assert_eq!(pinned_target.status, "revoked");
+
+        // The survivor ratcheted its own freshness baseline to the published
+        // version, so it stops sitting at a NULL baseline forever.
+        assert_eq!(
+            sync.storage()
+                .get_sync_metadata("sync-1")
+                .unwrap()
+                .and_then(|m| m.last_imported_registry_version),
+            Some(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_publishes_version_above_served_artifact() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let self_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, &self_secret, 0, "active"),
+                make_device_info(target_device_id, &target_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+
+        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
+        // Pre-seed a served artifact at the floor version so the publisher must
+        // choose floor+1.
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        relay.set_signed_registry(signed_registry_with_entries(
+            "sync-1",
+            &self_secret,
+            self_device_id,
+            &[make_device_info(self_device_id, &self_secret, 0, "active")],
+            0,
+            &[(0, epoch_0_key)],
+        ));
+
+        sync.revoke_and_rekey(relay.clone(), target_device_id, true).await.unwrap();
+
+        let snapshot = decode_served_registry(&relay, &self_secret, self_device_id);
+        assert_eq!(
+            snapshot.registry_version,
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING + 1,
+            "publish must supersede the served artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_skips_publish_when_local_tombstone_pin_fails() {
+        // Realistic case: revoking a device that paired via another survivor and
+        // never pushed, so no registry import ever pinned it locally. The relay
+        // lists it active (so the relay-side revoke commits), but the local
+        // DeviceRegistryManager::revoke_device errors ("device not in
+        // registry"). The publisher builds from local pins, so publishing here
+        // would emit a tombstone-LESS artifact at the new epoch — making the
+        // served artifact epoch-current and permanently disarming the
+        // epoch-repair backstop. The fix: skip the publish, leaving the served
+        // artifact epoch-STALE so any survivor's next catch_up_epoch_keys repair
+        // re-derives the tombstone from the relay's revoked row.
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let self_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, &self_secret, 0, "active"),
+                make_device_info(target_device_id, &target_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+
+        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        // Pin ONLY the survivor — the target was never imported, so the local
+        // tombstone pin will fail. The survivor must be pinned so the rekey wrap
+        // step still succeeds.
+        seed_device_registry(
+            &sync,
+            "sync-1",
+            &[make_device_info(self_device_id, &self_secret, 0, "active")],
+        );
+
+        // Pre-seed a served artifact at the PRE-revoke epoch (0), so the served
+        // artifact is epoch-stale relative to the post-revoke committed epoch
+        // (1). The repair backstop fires exactly while the served epoch lags.
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        relay.set_signed_registry(signed_registry_with_entries(
+            "sync-1",
+            &self_secret,
+            self_device_id,
+            &[make_device_info(self_device_id, &self_secret, 0, "active")],
+            0,
+            &[(0, epoch_0_key)],
+        ));
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, true).await.unwrap();
+        assert_eq!(committed_epoch, 1);
+
+        // The relay-side revoke committed (the revocation is real).
+        assert_eq!(relay.revoke_calls(), 1);
+        assert!(
+            relay
+                .devices()
+                .iter()
+                .any(|d| d.device_id == target_device_id && d.status == "revoked"),
+            "relay-side revoke must have committed"
+        );
+
+        // The local pin still failed: the target is absent from local storage.
+        assert!(
+            sync.storage().get_device_record("sync-1", target_device_id).unwrap().is_none(),
+            "unpinned target must remain absent — the pin failed"
+        );
+
+        // CRITICAL: the served artifact is UNCHANGED — no tombstone-less publish
+        // happened — so it stays at epoch 0 < committed epoch 1. The
+        // epoch-repair backstop (which early-returns once served_epoch >=
+        // target_epoch) therefore still fires for any survivor.
+        let served = decode_served_registry(&relay, &self_secret, self_device_id);
+        assert_eq!(
+            served.current_epoch, 0,
+            "served artifact must stay epoch-stale so the epoch-repair backstop still fires"
+        );
+        assert!(
+            served.entries.iter().all(|e| e.device_id != target_device_id || e.status != "active"),
+            "no fresh artifact should re-assert the revoked target as active"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_then_target_confirms_self_revocation_round_trip() {
+        // A revokes B; A publishes a signed registry carrying B as revoked. B,
+        // verifying that artifact against its pin of A, reaches ConfirmedRevoked.
+        // A stale pre-revoke replay served to a re-paired B with a higher
+        // baseline yields Unknown (ties to the freshness gate).
+        let mut a = make_sync();
+        a.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let a_id = "a1b2c3d4e5f6";
+        let b_id = "b7c8d9e0f1a2";
+        let a_secret = DeviceSecret::from_bytes(a.device_secret().unwrap().as_bytes().to_vec())
+            .unwrap();
+        let b_secret = DeviceSecret::generate();
+        let a_relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(a_id, &a_secret, 0, "active"),
+                make_device_info(b_id, &b_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+
+        a.configure_engine(a_relay.clone(), "sync-1".to_string(), a_id.to_string(), 0, 0);
+        seed_device_registry(&a, "sync-1", &a_relay.devices());
+        a.revoke_and_rekey(a_relay.clone(), b_id, true).await.unwrap();
+
+        // The artifact A just published, captured to drive B's verification.
+        let revoked_artifact =
+            a_relay.state.lock().unwrap().signed_registry.clone().unwrap();
+
+        // Build B: pins A (active, the signer) and itself, served the revoked
+        // artifact A published. With a baseline at or below the artifact version
+        // B confirms its own revocation. After the freshness gate flip a NULL baseline
+        // is fail-safe Unknown (see
+        // confirm_self_revocation_is_unknown_when_no_baseline_recorded), so a
+        // genuinely-revoked device confirms once it has a baseline — which it
+        // acquires by importing/publishing any registry; here we seed one at the
+        // artifact version (the equal boundary, which `>=` accepts).
+        // confirm_self_revocation reads the pinned signer keys and the served
+        // artifact only — B needs no DeviceSecret of its own.
+        let mut b = make_sync();
+        let b_relay = Arc::new(RevokeTestRelay::new(
+            vec![make_device_info(b_id, &b_secret, 1, "revoked")],
+            RevokeBehavior::Success,
+        ));
+        for info in [
+            make_device_info(a_id, &a_secret, 1, "active"),
+            make_device_info(b_id, &b_secret, 1, "revoked"),
+        ] {
+            DeviceRegistryManager::pin_device(
+                b.storage().as_ref(),
+                "sync-1",
+                &make_device_record("sync-1", &info),
+            )
+            .unwrap();
+        }
+        b.configure_engine(b_relay.clone(), "sync-1".to_string(), b_id.to_string(), 1, 0);
+        b_relay.set_signed_registry(revoked_artifact.clone());
+        set_last_imported_registry_version(&b, "sync-1", revoked_artifact.registry_version);
+
+        assert_eq!(
+            b.confirm_self_revocation().await,
+            // A revoked with remote_wipe=true (line above), and the H3 graft binds
+            // that wipe intent into the published registry's signature, so the
+            // victim reads it back as ConfirmedRevoked { remote_wipe: true }.
+            SelfRevocationStatus::ConfirmedRevoked { remote_wipe: true },
+            "B must confirm its own revocation (with the admin-signed wipe bit) from A's published artifact"
+        );
+
+        // Replay defense: a re-paired B with a fresh higher baseline served the
+        // SAME (now stale) artifact must not wipe.
+        set_last_imported_registry_version(&b, "sync-1", revoked_artifact.registry_version + 5);
+        assert_eq!(
+            b.confirm_self_revocation().await,
+            SelfRevocationStatus::Unknown,
+            "a stale pre-baseline artifact must never drive a wipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_signed_registry_emits_explicit_revoked_entry_absorbing() {
+        // The epoch-repair publisher (the survivor backstop) emits EVERY listed
+        // device, forcing revoked status from either the relay list or the local
+        // pin (revoked-absorbing).
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let relay_revoked_id = "b7c8d9e0f1a2"; // relay says revoked
+        let pin_revoked_id = "c8d9e0f1a2b3"; // relay says active, local pin revoked
+        let self_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let relay_revoked_secret = DeviceSecret::generate();
+        let pin_revoked_secret = DeviceSecret::generate();
+
+        let relay = Arc::new(RevokeTestRelay::new(vec![], RevokeBehavior::Success));
+        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+
+        // Local pins: self active, one device pinned revoked even though the
+        // relay will report it active.
+        for (id, secret, status) in [
+            (self_device_id, &self_secret, "active"),
+            (relay_revoked_id, &relay_revoked_secret, "active"),
+            (pin_revoked_id, &pin_revoked_secret, "revoked"),
+        ] {
+            let mut record =
+                make_device_record("sync-1", &make_device_info(id, secret, 0, status));
+            record.status = status.to_string();
+            DeviceRegistryManager::pin_device(sync.storage().as_ref(), "sync-1", &record).unwrap();
+        }
+
+        // Relay device list: self active, relay_revoked revoked, pin_revoked
+        // ACTIVE (the absorbing test — the local pin must win).
+        let devices = vec![
+            make_device_info(self_device_id, &self_secret, 0, "active"),
+            make_device_info(relay_revoked_id, &relay_revoked_secret, 0, "revoked"),
+            make_device_info(pin_revoked_id, &pin_revoked_secret, 0, "active"),
+        ];
+
+        sync.repair_signed_registry_epoch_if_needed(relay.as_ref(), "sync-1", self_device_id, 0, &devices)
+            .await
+            .unwrap();
+
+        let snapshot = decode_served_registry(&relay, &self_secret, self_device_id);
+        let status_of = |id: &str| {
+            snapshot.entries.iter().find(|e| e.device_id == id).map(|e| e.status.clone())
+        };
+        assert_eq!(status_of(self_device_id).as_deref(), Some("active"));
+        assert_eq!(
+            status_of(relay_revoked_id).as_deref(),
+            Some("revoked"),
+            "relay-revoked device must be emitted revoked, not dropped"
+        );
+        assert_eq!(
+            status_of(pin_revoked_id).as_deref(),
+            Some("revoked"),
+            "locally-pinned revoked must win over a relay-active claim (absorbing)"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_signed_registry_refuses_when_self_non_active() {
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let self_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let relay = Arc::new(RevokeTestRelay::new(vec![], RevokeBehavior::Success));
+        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+
+        let mut self_record =
+            make_device_record("sync-1", &make_device_info(self_device_id, &self_secret, 0, "active"));
+        self_record.status = "active".to_string();
+        DeviceRegistryManager::pin_device(sync.storage().as_ref(), "sync-1", &self_record).unwrap();
+
+        // Relay marks THIS device revoked → the publisher must refuse rather than
+        // sign a registry that revokes its own signer.
+        let devices = vec![make_device_info(self_device_id, &self_secret, 0, "revoked")];
+        let err = sync
+            .repair_signed_registry_epoch_if_needed(relay.as_ref(), "sync-1", self_device_id, 0, &devices)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Engine(_)));
+        assert!(relay.state.lock().unwrap().signed_registry.is_none(), "nothing published");
     }
 
     // ── reset_sync_state ──
@@ -5586,6 +6378,10 @@ mod tests {
 
         fn update_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
             self.inner.update_last_pulled_seq(sync_id, seq)
+        }
+
+        fn reset_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
+            self.inner.reset_last_pulled_seq(sync_id, seq)
         }
 
         fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {

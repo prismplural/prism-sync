@@ -132,6 +132,97 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_applied_ops_sync_seq
         ON applied_ops(sync_id, server_seq);
     ",
+    "-- V8: Pull-failure discipline (replayable batch-level quarantine + stall budget).
+    --
+    -- `quarantined_pull_batches` durably holds the FULL SignedBatchEnvelope of an
+    -- inbound batch that failed a deterministic pull-side check (payload-hash,
+    -- decode, attribution, invalid signature, missing epoch key, ...). The cursor
+    -- advances past it (relay stays an expiring transport buffer), but the device
+    -- keeps custody so Phase 0b replay can re-run the full verify->decrypt->decode
+    -- ->filter->apply pipeline once the blocking condition clears (schema upgrade,
+    -- registry import, epoch key arrival). `reason` drives reason-aware replay
+    -- eligibility; `epoch` is captured for the missing-epoch-key arm so replay can
+    -- check whether the key is now in the hierarchy. Device-local, never
+    -- replicated, never included in snapshots.
+    -- PK is (sync_id, sender_device_id, batch_id), matching the relay's push
+    -- dedup key (prism-sync-relay db.rs ~1601): two DIFFERENT senders can legally
+    -- occupy the same batch_id in the log, so keying only on batch_id would let a
+    -- compromised device evict an honest device's quarantined envelope via an
+    -- INSERT OR REPLACE collision — silently destroying the only durable copy of a
+    -- batch the cursor has already advanced past. sender_device_id is part of the
+    -- key (not server_seq) so the row stays seq-independent for the C6 lineage
+    -- reset, while still being collision-proof across senders.
+    CREATE TABLE IF NOT EXISTS quarantined_pull_batches (
+        sync_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        server_seq INTEGER NOT NULL,
+        epoch INTEGER,
+        sender_device_id TEXT NOT NULL,
+        envelope_json TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        quarantined_at TEXT NOT NULL,
+        last_retry_at TEXT,
+        PRIMARY KEY (sync_id, sender_device_id, batch_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_quarantined_pull_batches_sync_seq
+        ON quarantined_pull_batches(sync_id, server_seq, quarantined_at);
+
+    -- `pull_stall` is the transient-retry budget: a batch whose sender keys or
+    -- registry generation cannot be resolved *yet* (network/5xx, stale registry,
+    -- not-yet-propagated rotation) freezes the cursor without advancing while we
+    -- retry. One row per stalled server_seq; `attempts` counts cycles so a flaky
+    -- endpoint (or a device claiming a bogus future generation) is bounded before
+    -- conversion to quarantine-and-advance. Device-local.
+    CREATE TABLE IF NOT EXISTS pull_stall (
+        sync_id TEXT NOT NULL,
+        server_seq INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        PRIMARY KEY (sync_id, server_seq)
+    );
+
+    -- `device_key_history` archives superseded ML-DSA verification keys so an
+    -- in-flight pre-rotation batch still verifies after the receiver has already
+    -- imported the rotated registry. When verify_and_import_signed_registry
+    -- replaces a device record with a higher generation, the prior
+    -- (generation, ml_dsa_65_public_key) is archived here; pull looks the key up
+    -- by envelope.sender_ml_dsa_key_generation, matching the current record or
+    -- this history exactly. Device-local, never replicated, never snapshotted.
+    CREATE TABLE IF NOT EXISTS device_key_history (
+        sync_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        ml_dsa_key_generation INTEGER NOT NULL,
+        ml_dsa_65_public_key BLOB NOT NULL,
+        archived_at TEXT NOT NULL,
+        PRIMARY KEY (sync_id, device_id, ml_dsa_key_generation)
+    );
+
+    -- `consumer_deliveries` is the durable at-least-once delivery journal: one
+    -- row per winning op, written in the SAME transaction as Phase C bookkeeping
+    -- (applied_ops/field_versions/cursor) and the snapshot import, so a pulled
+    -- winner survives process death between Rust apply and Dart consumer-DB
+    -- write. Dart drains in id order and acks (deletes up to id) only after its
+    -- own transaction commits. Local AUTOINCREMENT id (not a server seq), so a
+    -- relay-log lineage reset leaves it untouched. Device-local.
+    CREATE TABLE IF NOT EXISTS consumer_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sync_id TEXT NOT NULL,
+        entity_table TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        field_name TEXT,
+        encoded_value TEXT,
+        is_delete INTEGER NOT NULL DEFAULT 0,
+        server_seq INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_consumer_deliveries_sync_id
+        ON consumer_deliveries(sync_id, id);
+    ",
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), String> {
@@ -200,6 +291,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(push_quarantine_table_count, 1);
+
+        // The combined V8 migration carries all four
+        // tables: the two pull-failure tables plus device_key_history and
+        // consumer_deliveries. They must all land in this single
+        // version because `apply()` never re-runs a migration on a DB already
+        // stamped at its version — folding them avoids a broken upgrade path.
+        for table in [
+            "quarantined_pull_batches",
+            "pull_stall",
+            "device_key_history",
+            "consumer_deliveries",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} table should exist after migrations");
+        }
+
+        // `quarantined_pull_batches` carries the epoch column so
+        // the missing-epoch-key replay arm can check the key hierarchy.
+        let epoch_column_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('quarantined_pull_batches') WHERE name = 'epoch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch_column_count, 1);
     }
 
     #[test]

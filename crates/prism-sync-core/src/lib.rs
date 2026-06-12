@@ -10,6 +10,7 @@
 
 pub mod batch_signature;
 pub mod bootstrap;
+pub mod clock_drift;
 pub mod client;
 pub mod crdt_change;
 pub mod debug_log;
@@ -25,6 +26,7 @@ pub mod op_emitter;
 pub mod pairing;
 pub mod pruning;
 mod recovery;
+pub mod registry_publish;
 pub mod relay;
 pub mod runtime;
 pub mod runtime_keys;

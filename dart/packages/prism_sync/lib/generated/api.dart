@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `compute_registration_key_bundle_hash`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `effective_allow_insecure`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_localhost_url`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `map_media_fetch_error_kind`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `url_host`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `coalesce_consumer_deliveries`, `compute_registration_key_bundle_hash`, `consumer_delivery_spill_threshold`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `effective_allow_insecure`, `empty_undelivered_changes_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_localhost_url`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `map_media_fetch_error_kind`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `url_host`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `RollbackCredentialSnapshot`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -488,6 +488,62 @@ Future<String> listQuarantinedBatches({required PrismSyncHandle handle}) =>
 Future<PlatformInt64> quarantinedBatchCount({
   required PrismSyncHandle handle,
 }) => RustLib.instance.api.crateApiQuarantinedBatchCount(handle: handle);
+
+/// Drain up to `limit` rows from the durable consumer-delivery journal — the
+/// at-least-once delivery channel that replaces applying directly from the
+/// fire-and-forget `RemoteChanges` event. The Dart drain loops
+/// take -> apply (or quarantine) -> ack, where the ack
+/// ([`ack_consumer_deliveries`]) fires only AFTER the consumer-DB transaction
+/// commits, so a pulled winner survives process death.
+///
+/// Returns a JSON object:
+/// ```json
+/// {
+///   "deliveries": [
+///     {"id": 42, "table": "members", "entity_id": "...", "is_delete": false,
+///      "fields": {"name": "Alex"}}
+///   ],
+///   "max_id": 42,
+///   "spill_up_to_id": 0,
+///   "over_cap": false
+/// }
+/// ```
+/// - `deliveries` coalesces the chunk's journal rows per `(table, entity_id)`
+///   (like a `RemoteChanges` changeset); a delete row clears the fields and sets
+///   `is_delete`. The `id` on each coalesced entry is the highest journal id that
+///   contributed to it (diagnostics only — acking is by `max_id`).
+/// - `max_id` is the highest journal id in the chunk; the drain passes it to
+///   [`ack_consumer_deliveries`] after its commit. Acking by chunk high-water is
+///   safe because the journal is append-only and read in `id` order.
+/// - `over_cap` is true when the total backlog exceeds the retention cap;
+///   `spill_up_to_id` is then the highest id that must be ROUTED TO QUARANTINE
+///   rather than applied (the oldest `backlog - cap` rows). Rows with
+///   `id <= spill_up_to_id` are spill (quarantine them, full payload is present);
+///   rows above are normal applies. The drain still acks the whole chunk by
+///   `max_id` after both the applies and the quarantine writes commit, so the
+///   spill is bounded without silent loss.
+///
+/// Returns an empty `deliveries` array (and `max_id = 0`) if the engine is not
+/// configured or the journal is empty.
+Future<String> takeUndeliveredChanges({
+  required PrismSyncHandle handle,
+  required PlatformInt64 limit,
+}) => RustLib.instance.api.crateApiTakeUndeliveredChanges(
+  handle: handle,
+  limit: limit,
+);
+
+/// Acknowledge consumer-delivery journal rows up to (and including) `up_to_id`,
+/// deleting them in one storage transaction. Called by the Dart drain ONLY after
+/// the chunk's consumer-DB transaction (apply and/or durable quarantine) has
+/// committed. No-op if the engine is not configured.
+Future<void> ackConsumerDeliveries({
+  required PrismSyncHandle handle,
+  required PlatformInt64 upToId,
+}) => RustLib.instance.api.crateApiAckConsumerDeliveries(
+  handle: handle,
+  upToId: upToId,
+);
 
 /// Read the current LWW-winning encoded value of a single field, or `None` if
 /// no `field_version` row exists yet. This is the engine's merged state read

@@ -45,6 +45,46 @@ pub trait SyncStorage: Send + Sync {
         Ok(vec![])
     }
 
+    /// List remote batches durably quarantined after a deterministic pull-side
+    /// failure, ordered by `server_seq` ascending. Phase 0b replay walks this
+    /// list and re-runs the full pipeline per envelope.
+    ///
+    /// Default: empty (no-op for in-memory impls).
+    fn list_quarantined_pull_batches(
+        &self,
+        _sync_id: &str,
+    ) -> Result<Vec<QuarantinedPullBatch>> {
+        Ok(vec![])
+    }
+
+    /// List the current pull-stall budget rows for this sync group, ordered by
+    /// `server_seq` ascending. Default: empty (no-op for in-memory impls).
+    fn list_pull_stalls(&self, _sync_id: &str) -> Result<Vec<PullStall>> {
+        Ok(vec![])
+    }
+
+    /// List up to `limit` undrained consumer-delivery journal rows for this sync
+    /// group with `id > after_id`, ordered by `id` ascending. The drain walks
+    /// the journal in `id` order; `after_id = 0` returns from the start. Returns
+    /// at most `limit` rows (the chunk the Dart drain applies before acking).
+    ///
+    /// Default: empty (no-op for in-memory impls).
+    fn list_consumer_deliveries(
+        &self,
+        _sync_id: &str,
+        _after_id: i64,
+        _limit: i64,
+    ) -> Result<Vec<ConsumerDelivery>> {
+        Ok(vec![])
+    }
+
+    /// Count the consumer-delivery journal rows for this sync group. Used by the
+    /// retention cap to decide whether the oldest rows must spill into the Dart
+    /// quarantine lane. Default: 0 (no-op for in-memory impls).
+    fn count_consumer_deliveries(&self, _sync_id: &str) -> Result<i64> {
+        Ok(0)
+    }
+
     /// List local push batches that were quarantined because their envelope
     /// exceeded the relay's body cap. Returns rows in `quarantined_at`
     /// insertion order.
@@ -68,6 +108,24 @@ pub trait SyncStorage: Send + Sync {
 
     /// List all device records for a sync group.
     fn list_device_records(&self, sync_id: &str) -> Result<Vec<DeviceRecord>>;
+
+    /// Look up an archived ML-DSA verification key for a device at an exact
+    /// generation. Returns the superseded public key bytes if a rotation past
+    /// that generation has been imported, or `None` if no such history exists
+    /// (the generation is current, never-seen, or unrotated). Used by the pull
+    /// path so a straggling pre-rotation batch verifies against the key it
+    /// was signed with rather than being dropped once the receiver learns the
+    /// rotated key.
+    ///
+    /// Default: `None` (no-op for in-memory impls).
+    fn get_archived_device_key(
+        &self,
+        _sync_id: &str,
+        _device_id: &str,
+        _ml_dsa_key_generation: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 
     // ── Pruning reads (default no-op implementations) ──
 
@@ -165,7 +223,23 @@ pub trait SyncStorageTx {
 
     // ── Sync metadata ──
     fn upsert_sync_metadata(&mut self, meta: &SyncMetadata) -> Result<()>;
+    /// Advance the pull cursor **monotonically**: stores
+    /// `MAX(last_pulled_server_seq, seq)`, never rewinds. Quarantine replay
+    /// (Phase 0b) re-applies past batches without their `server_seq`, so it must
+    /// never be able to pull the cursor backwards. Legitimate rewinds (bootstrap,
+    /// relay-log lineage reset) go through [`reset_last_pulled_seq`] instead.
+    ///
+    /// [`reset_last_pulled_seq`]: Self::reset_last_pulled_seq
     fn update_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()>;
+    /// Explicitly set the pull cursor to `seq`, allowing a rewind. The escape
+    /// hatch for legitimate resets — first-device bootstrap and the
+    /// relay-log lineage change — where the cursor must move backwards because
+    /// the server-seq space itself changed. Distinct from
+    /// [`update_last_pulled_seq`]'s MAX-monotonic semantics so a reset cannot be
+    /// silently no-op'd by a higher stored value.
+    ///
+    /// [`update_last_pulled_seq`]: Self::update_last_pulled_seq
+    fn reset_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()>;
     fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()>;
     fn update_current_epoch(&mut self, sync_id: &str, epoch: i32) -> Result<()>;
     fn update_last_imported_registry_version(&mut self, sync_id: &str, version: i64) -> Result<()>;
@@ -222,6 +296,87 @@ pub trait SyncStorageTx {
         Ok(())
     }
 
+    // ── Consumer delivery journal ──
+
+    /// Append one winning op to the durable consumer-delivery journal. MUST be
+    /// called in the SAME transaction as the Phase C bookkeeping / snapshot
+    /// import that committed the op to engine state, so the Rust cursor and the
+    /// journal advance atomically — a pulled winner is then delivered
+    /// at-least-once across process death. The impl assigns the AUTOINCREMENT
+    /// `id` (the passed `delivery.id` is ignored on insert).
+    /// Default: no-op for in-memory impls.
+    fn insert_consumer_delivery(&mut self, _delivery: &ConsumerDelivery) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete every consumer-delivery row with `id <= up_to_id` for this sync
+    /// group — the Dart drain's ack, fired only AFTER its own consumer-DB
+    /// transaction (apply or durable quarantine) commits. Default: no-op.
+    fn delete_consumer_deliveries_up_to(&mut self, _sync_id: &str, _up_to_id: i64) -> Result<()> {
+        Ok(())
+    }
+
+    // ── Quarantined remote pull batches (replayable) ──
+
+    /// Insert (upsert) a quarantined pull batch, keyed by
+    /// `(sync_id, sender_device_id, batch_id)`. The impl serializes the envelope
+    /// to JSON and stores `batch.quarantined_at` / `batch.retry_count` verbatim.
+    /// Re-quarantining an existing batch (same sender + `batch_id`) must preserve
+    /// its accumulated `retry_count` and original `quarantined_at` rather than
+    /// reset them — the caller re-reads the row and re-inserts with the existing
+    /// values, or uses [`bump_quarantined_pull_batch_retry`] for the retry path.
+    /// The key includes `sender_device_id` so one sender's poison batch can never
+    /// REPLACE another sender's durably-stored envelope at the same `batch_id`.
+    /// Default: no-op for in-memory impls.
+    ///
+    /// [`bump_quarantined_pull_batch_retry`]: Self::bump_quarantined_pull_batch_retry
+    fn insert_quarantined_pull_batch(&mut self, _batch: &QuarantinedPullBatch) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete a quarantined pull batch (Phase 0b replay succeeded, or the sender
+    /// was revoked and the batch is terminally discarded). Keyed by
+    /// `(sync_id, sender_device_id, batch_id)`.
+    /// Default: no-op for in-memory impls.
+    fn delete_quarantined_pull_batch(
+        &mut self,
+        _sync_id: &str,
+        _sender_device_id: &str,
+        _batch_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Bump `retry_count` and stamp `last_retry_at = now` for a quarantined pull
+    /// batch whose replay attempt failed identically. Used to back off so a
+    /// permanently-unapplicable batch does not churn every cycle. Keyed by
+    /// `(sync_id, sender_device_id, batch_id)`.
+    /// Default: no-op for in-memory impls.
+    fn bump_quarantined_pull_batch_retry(
+        &mut self,
+        _sync_id: &str,
+        _sender_device_id: &str,
+        _batch_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // ── Pull stall budget ──
+
+    /// Record (or bump) a stall on `server_seq`. On first insert `attempts`
+    /// starts at 1 and both timestamps are now; on conflict `attempts` is
+    /// incremented, `reason` and `last_seen_at` refreshed, `first_seen_at`
+    /// preserved. Default: no-op for in-memory impls.
+    fn record_pull_stall(&mut self, _sync_id: &str, _server_seq: i64, _reason: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear the stall row for `server_seq` once it resolves (keys imported,
+    /// batch applied or quarantined). Default: no-op for in-memory impls.
+    fn clear_pull_stall(&mut self, _sync_id: &str, _server_seq: i64) -> Result<()> {
+        Ok(())
+    }
+
     // ── Quarantined local push batches ──
 
     /// Insert (or replace) a row recording that a local batch was quarantined
@@ -253,6 +408,38 @@ pub trait SyncStorageTx {
     // ── Device registry ──
     fn upsert_device_record(&mut self, device: &DeviceRecord) -> Result<()>;
     fn remove_device_record(&mut self, sync_id: &str, device_id: &str) -> Result<()>;
+
+    /// Archive a superseded ML-DSA verification key so a pre-rotation batch can
+    /// still be verified after the device record advanced to a higher generation.
+    /// Idempotent (keyed on `(sync_id, device_id, generation)`); archiving
+    /// the same generation twice keeps the first-archived key. Must be called in
+    /// the SAME transaction as the rotating `upsert_device_record` so the new key
+    /// and the archived old key commit atomically.
+    ///
+    /// Default: no-op for in-memory impls.
+    fn archive_device_key(
+        &mut self,
+        _sync_id: &str,
+        _device_id: &str,
+        _ml_dsa_key_generation: u32,
+        _ml_dsa_65_public_key: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read an archived device key from within the transaction (the import path
+    /// reads the existing record and archives in the same tx). Returns the
+    /// superseded public-key bytes or `None`.
+    ///
+    /// Default: `None` for in-memory impls.
+    fn get_archived_device_key(
+        &self,
+        _sync_id: &str,
+        _device_id: &str,
+        _ml_dsa_key_generation: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 
     // ── Cleanup ──
     fn clear_sync_state(&mut self, sync_id: &str) -> Result<()>;

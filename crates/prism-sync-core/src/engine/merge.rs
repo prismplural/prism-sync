@@ -3,20 +3,39 @@ use std::collections::HashMap;
 use crate::crdt_change::CrdtChange;
 use crate::error::Result;
 use crate::schema::SyncSchema;
-use crate::storage::FieldVersion;
+use crate::storage::{is_tombstone_value, FieldVersion};
 
 /// A winning operation from the merge process.
 #[derive(Debug, Clone)]
 pub struct WinningOp {
     pub op: CrdtChange,
-    pub is_bulk_reset: bool,
 }
 
-/// Reason an op could not be merged with the client's current schema.
+/// Reason an op was quarantined into `quarantined_ops` (the per-op, replayable
+/// lane) rather than applied.
+///
+/// The first two are schema-driven (the client doesn't know the table/field
+/// yet). `FutureHlc` and `UnsupportedBulkReset` are added by the
+/// pull-failure discipline so the per-op quarantine lane carries every
+/// deferrable op-level failure, not only schema-unknown ones; both have a
+/// canonical `as_str()` reason string that round-trips through the
+/// `quarantined_ops.reason` TEXT column and drives reason-aware replay
+/// eligibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaQuarantineReason {
     UnknownTable(String),
     UnknownField { table: String, field: String },
+    /// The op's HLC is further in the future than the receiver's drift
+    /// tolerance. Deferred (not dropped) and replayed with its ORIGINAL HLC
+    /// once the local clock catches up — convergence must not depend on which
+    /// peer pulled when. Canonical reason string: `future_hlc` (shared by the
+    /// pull filter and the snapshot gate).
+    FutureHlc,
+    /// A `_bulk_reset` sentinel op that this build has no handler for. Held
+    /// durably so a future build that implements the table-clear can replay it,
+    /// instead of recording it applied as a no-op. Reason string:
+    /// `unsupported_bulk_reset`.
+    UnsupportedBulkReset,
 }
 
 impl SchemaQuarantineReason {
@@ -24,6 +43,8 @@ impl SchemaQuarantineReason {
         match self {
             Self::UnknownTable(_) => "unknown_table",
             Self::UnknownField { .. } => "unknown_field",
+            Self::FutureHlc => "future_hlc",
+            Self::UnsupportedBulkReset => "unsupported_bulk_reset",
         }
     }
 }
@@ -33,6 +54,119 @@ impl SchemaQuarantineReason {
 pub struct QuarantinedChange {
     pub op: CrdtChange,
     pub reason: SchemaQuarantineReason,
+}
+
+/// The current `field_versions` winner for a quarantined op's target field,
+/// needed to evaluate the future-HLC supersede rule. Carries only the two
+/// columns the rule reads.
+#[derive(Debug, Clone)]
+pub struct ReplayWinnerContext {
+    pub winning_device_id: String,
+    pub winning_hlc: String,
+}
+
+/// Reason-aware replay eligibility for a per-op quarantine row, replacing the
+/// blanket "schema now knows it" filter.
+///
+/// `reason` is the persisted `quarantined_ops.reason` string; `schema_known` is
+/// the caller's precomputed `schema_quarantine_reason(op).is_none()`. The other
+/// inputs are only consulted by the arms that need them, so callers that only
+/// have schema info can pass conservative defaults for the rest.
+///
+/// - `unknown_table` / `unknown_field` (and any legacy/unrecognized reason):
+///   eligible iff the schema now knows the op's table+field.
+/// - `future_hlc`: eligible once the op's HLC is within `max_clock_drift_ms` of
+///   local wall-clock time AND the schema knows the op's table+field — *unless*
+///   it was superseded. A later-applied op from the SAME device
+///   targeting the SAME field evicts the quarantined future-HLC op (it can never
+///   win LWW, so replaying it would only resurrect stale state);
+///   `superseding_winner` carries that current winner. Returns `false` while
+///   still beyond tolerance (no replay churn). The `schema_known` requirement is
+///   load-bearing: a future-HLC op whose field is also schema-unknown would
+///   otherwise pass this gate once drift decays, then be skipped by
+///   `replay_quarantined_ops`'s checked-apply loop (which filters on
+///   `schema_quarantine_reason(op).is_some()`) yet still have its quarantine row
+///   deleted in Phase C — permanently losing the op (the cursor is already past
+///   its batch). Gating on `schema_known` keeps every gate-passing op applicable.
+/// - `unsupported_bulk_reset`: never eligible in this build (no handler exists);
+///   a future build that implements the table-clear flips this.
+pub fn is_replay_eligible(
+    reason: &str,
+    op: &CrdtChange,
+    schema_known: bool,
+    max_clock_drift_ms: i64,
+    superseding_winner: Option<&ReplayWinnerContext>,
+) -> bool {
+    match reason {
+        "future_hlc" => {
+            // A future-HLC op whose table/field is still schema-unknown cannot be
+            // applied by the replay loop; admitting it would only delete its
+            // quarantine row without applying it. Keep it quarantined until BOTH
+            // conditions (schema-known + within drift) hold.
+            if !schema_known {
+                return false;
+            }
+            // Supersede: a later op from this same device already won this
+            // field, so the quarantined op is dead on arrival — evict it.
+            if let Some(winner) = superseding_winner {
+                if winner.winning_device_id == op.device_id {
+                    if let (Ok(winner_hlc), Ok(op_hlc)) = (
+                        crate::hlc::Hlc::from_string(&winner.winning_hlc),
+                        crate::hlc::Hlc::from_string(&op.client_hlc),
+                    ) {
+                        if winner_hlc > op_hlc {
+                            return false;
+                        }
+                    }
+                }
+            }
+            match crate::hlc::Hlc::from_string(&op.client_hlc) {
+                Ok(hlc) => hlc.future_drift_ms() <= max_clock_drift_ms.max(0),
+                // An unparseable HLC can never merge; leave it quarantined.
+                Err(_) => false,
+            }
+        }
+        "unsupported_bulk_reset" => false,
+        // unknown_table / unknown_field / legacy reasons: replay once the
+        // schema knows the op's table+field.
+        _ => schema_known,
+    }
+}
+
+/// Whether a quarantined `future_hlc` op has been permanently superseded and
+/// should be evicted (deleted) from `quarantined_ops` rather than held.
+///
+/// A later-applied op from the SAME device targeting the SAME
+/// field beats the quarantined future-HLC op under LWW (a higher HLC always
+/// wins, and HLCs from one device advance monotonically), so the quarantined op
+/// can never become the winner — replaying it once the clock catches up would
+/// only churn the merge engine to lose. Evicting it bounds the quarantine
+/// backlog (a clock-excursion device can otherwise pile up rows that are
+/// re-evaluated, never applied, every cycle) and matches the 00db70a
+/// drop-superseded precedent. Returns `false` for any non-future-HLC reason and
+/// when there is no current winner or it came from a different device / has a
+/// lower HLC.
+pub fn future_hlc_superseded(
+    reason: &str,
+    op: &CrdtChange,
+    superseding_winner: Option<&ReplayWinnerContext>,
+) -> bool {
+    if reason != "future_hlc" {
+        return false;
+    }
+    let Some(winner) = superseding_winner else {
+        return false;
+    };
+    if winner.winning_device_id != op.device_id {
+        return false;
+    }
+    match (
+        crate::hlc::Hlc::from_string(&winner.winning_hlc),
+        crate::hlc::Hlc::from_string(&op.client_hlc),
+    ) {
+        (Ok(winner_hlc), Ok(op_hlc)) => winner_hlc > op_hlc,
+        _ => false,
+    }
 }
 
 /// Result of merge winner selection, including schema-unknown ops that should
@@ -106,10 +240,18 @@ impl MergeEngine {
             return Some(SchemaQuarantineReason::UnknownTable(op.entity_table.clone()));
         };
 
-        if op.field_name != "is_deleted"
-            && !op.is_bulk_reset()
-            && entity_def.field_by_name(&op.field_name).is_none()
-        {
+        // `_bulk_reset` is documented always-allowed wire vocabulary, but this
+        // build has no handler that performs the table-clear. Route it
+        // through the per-op quarantine lane so it is held durably (replayable
+        // by a future build) instead of recorded applied as a no-op. This check
+        // is ahead of the unknown-field check so every existing
+        // `schema_quarantine_reason(op).is_some()` gate (ops_checked builders,
+        // replay filter) excludes it automatically.
+        if op.is_bulk_reset() {
+            return Some(SchemaQuarantineReason::UnsupportedBulkReset);
+        }
+
+        if op.field_name != "is_deleted" && entity_def.field_by_name(&op.field_name).is_none() {
             return Some(SchemaQuarantineReason::UnknownField {
                 table: op.entity_table.clone(),
                 field: op.field_name.clone(),
@@ -169,6 +311,16 @@ impl MergeEngine {
                     SchemaQuarantineReason::UnknownField { table, field } => {
                         tracing::warn!("Quarantining op for unknown field: {table}.{field}");
                     }
+                    // FutureHlc / UnsupportedBulkReset are not produced by
+                    // `schema_quarantine_reason` in this (infra-only) build —
+                    // the future-HLC / bulk-reset routing that returns them lands later. The
+                    // arms exist so the enum match stays exhaustive.
+                    SchemaQuarantineReason::FutureHlc => {
+                        tracing::warn!("Quarantining future-HLC op: {}", op.op_id);
+                    }
+                    SchemaQuarantineReason::UnsupportedBulkReset => {
+                        tracing::warn!("Quarantining unsupported _bulk_reset op: {}", op.op_id);
+                    }
                 }
                 quarantined.push(QuarantinedChange { op: op.clone(), reason });
                 continue;
@@ -179,11 +331,9 @@ impl MergeEngine {
                 continue;
             }
 
-            // Bulk reset is handled specially by the caller
-            if op.is_bulk_reset() {
-                winners.insert(op.op_id.clone(), WinningOp { op: op.clone(), is_bulk_reset: true });
-                continue;
-            }
+            // `_bulk_reset` ops never reach here: `schema_quarantine_reason`
+            // returns `UnsupportedBulkReset` for them above, so they were
+            // quarantined and `continue`d. No build-side handler exists yet.
 
             // `is_deleted` is ABSORBING, not HLC-LWW: an incoming `true` always
             // beats `false` and `false` never overrides `true`, so a delete is
@@ -204,8 +354,10 @@ impl MergeEngine {
                 };
             // NULL/absent counts as a tombstone (defensive default); only an
             // explicit "false" is live.
-            let is_tombstoned =
-                current_deleted.as_ref().map(|c| c.encoded_value != "false").unwrap_or(false);
+            let is_tombstoned = current_deleted
+                .as_ref()
+                .map(|c| is_tombstone_value(Some(c.encoded_value.as_str())))
+                .unwrap_or(false);
 
             // A delete subsumes every other field: drop non-`is_deleted` ops on a
             // tombstoned entity.
@@ -220,7 +372,7 @@ impl MergeEngine {
                     None => true,
                     Some(cur) => {
                         let incoming_true = op.encoded_value == "true";
-                        let current_true = cur.encoded_value != "false";
+                        let current_true = is_tombstone_value(Some(cur.encoded_value.as_str()));
                         match (incoming_true, current_true) {
                             (true, false) => true,  // true absorbs false, any HLC
                             (false, true) => false, // false never beats a tombstone
@@ -260,10 +412,268 @@ impl MergeEngine {
             }
 
             // Record this op as the new winner
-            winners.insert(op.op_id.clone(), WinningOp { op: op.clone(), is_bulk_reset: false });
+            winners.insert(op.op_id.clone(), WinningOp { op: op.clone() });
             batch_winners.insert(field_key, op.clone());
         }
 
         Ok(MergeOutcome { winners, quarantined })
+    }
+}
+
+#[cfg(test)]
+mod replay_eligibility_tests {
+    use super::*;
+    use crate::hlc::Hlc;
+
+    const DRIFT_MS: i64 = 60_000;
+
+    /// Build an op whose HLC is `offset_ms` relative to local wall clock
+    /// (positive = future), authored by `device`.
+    fn op_with_drift(device: &str, offset_ms: i64) -> CrdtChange {
+        let ts = Hlc::now_ms() + offset_ms;
+        CrdtChange::new(
+            Some("op-1".to_string()),
+            None,
+            "ent-1".to_string(),
+            "members".to_string(),
+            "name".to_string(),
+            Some("\"v\"".to_string()),
+            Some(format!("{ts}:0:{device}")),
+            false,
+            Some(device.to_string()),
+            Some(0),
+            None,
+        )
+    }
+
+    fn winner(device: &str, hlc_ts_ms: i64) -> ReplayWinnerContext {
+        ReplayWinnerContext {
+            winning_device_id: device.to_string(),
+            winning_hlc: format!("{hlc_ts_ms}:0:{device}"),
+        }
+    }
+
+    #[test]
+    fn future_hlc_eligible_once_within_tolerance() {
+        // 10s in the past relative to local clock → drift is negative → eligible.
+        // A real future_hlc op always targets a schema-known field (that is how
+        // the sender emitted it), so pass schema_known=true for these arms.
+        let op = op_with_drift("dev-a", -10_000);
+        assert!(is_replay_eligible("future_hlc", &op, true, DRIFT_MS, None));
+    }
+
+    #[test]
+    fn future_hlc_not_eligible_while_beyond_tolerance() {
+        // 5 minutes in the future → still beyond the 60s bound → no replay churn.
+        let op = op_with_drift("dev-a", 300_000);
+        assert!(!is_replay_eligible("future_hlc", &op, true, DRIFT_MS, None));
+    }
+
+    #[test]
+    fn future_hlc_with_unknown_field_stays_quarantined() {
+        // Even within tolerance, a future_hlc op whose field is schema-unknown
+        // must NOT be eligible: the replay loop would skip it (schema-unknown)
+        // yet Phase C would delete its quarantine row → permanent loss. The
+        // schema_known guard prevents that.
+        let op = op_with_drift("dev-a", -10_000);
+        assert!(!is_replay_eligible("future_hlc", &op, false, DRIFT_MS, None));
+    }
+
+    #[test]
+    fn future_hlc_boundary_at_tolerance_is_eligible() {
+        // Just inside the bound (drift <= max). Subtract a slop so the wall-clock
+        // tick between op construction and the check can't push it over.
+        let op = op_with_drift("dev-a", DRIFT_MS - 5_000);
+        assert!(is_replay_eligible("future_hlc", &op, true, DRIFT_MS, None));
+    }
+
+    #[test]
+    fn future_hlc_superseded_by_later_same_device_op_is_evicted() {
+        // The op is within tolerance, but the same device already won this field
+        // with a strictly-later HLC → the quarantined op can never win LWW, so it
+        // is evicted (supersede rule).
+        let op = op_with_drift("dev-a", -10_000);
+        let op_ts: i64 = op.client_hlc.split(':').next().unwrap().parse().unwrap();
+        let later = winner("dev-a", op_ts + 1_000);
+        assert!(!is_replay_eligible("future_hlc", &op, true, DRIFT_MS, Some(&later)));
+    }
+
+    #[test]
+    fn future_hlc_not_superseded_by_other_device_winner() {
+        // A later winner from a DIFFERENT device does not evict: the quarantined
+        // op may still legitimately win LWW once its clock-drift decays.
+        let op = op_with_drift("dev-a", -10_000);
+        let op_ts: i64 = op.client_hlc.split(':').next().unwrap().parse().unwrap();
+        let other = winner("dev-b", op_ts + 1_000);
+        assert!(is_replay_eligible("future_hlc", &op, true, DRIFT_MS, Some(&other)));
+    }
+
+    #[test]
+    fn future_hlc_not_superseded_when_winner_hlc_is_lower() {
+        // Same device, but the recorded winner predates the quarantined op → not
+        // actually superseding → the op stays eligible.
+        let op = op_with_drift("dev-a", -10_000);
+        let op_ts: i64 = op.client_hlc.split(':').next().unwrap().parse().unwrap();
+        let earlier = winner("dev-a", op_ts - 1_000);
+        assert!(is_replay_eligible("future_hlc", &op, true, DRIFT_MS, Some(&earlier)));
+    }
+
+    #[test]
+    fn future_hlc_unparseable_stays_quarantined() {
+        let mut op = op_with_drift("dev-a", -10_000);
+        op.client_hlc = "not-an-hlc".to_string();
+        assert!(!is_replay_eligible("future_hlc", &op, true, DRIFT_MS, None));
+    }
+
+    #[test]
+    fn unsupported_bulk_reset_never_eligible() {
+        let op = op_with_drift("dev-a", -10_000);
+        // Even with schema known, this build has no handler → never replays.
+        assert!(!is_replay_eligible("unsupported_bulk_reset", &op, true, DRIFT_MS, None));
+    }
+
+    #[test]
+    fn schema_reasons_gate_on_schema_known() {
+        let op = op_with_drift("dev-a", -10_000);
+        for reason in ["unknown_table", "unknown_field"] {
+            assert!(
+                is_replay_eligible(reason, &op, true, DRIFT_MS, None),
+                "{reason} should replay once schema knows it"
+            );
+            assert!(
+                !is_replay_eligible(reason, &op, false, DRIFT_MS, None),
+                "{reason} should stay quarantined while schema unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_reason_falls_back_to_schema_known() {
+        // A legacy/unknown reason string is treated like the schema arms so an
+        // older quarantine row can never wedge replay.
+        let op = op_with_drift("dev-a", -10_000);
+        assert!(is_replay_eligible("some_future_reason", &op, true, DRIFT_MS, None));
+        assert!(!is_replay_eligible("some_future_reason", &op, false, DRIFT_MS, None));
+    }
+
+    #[test]
+    fn schema_quarantine_reason_strings_round_trip() {
+        assert_eq!(SchemaQuarantineReason::FutureHlc.as_str(), "future_hlc");
+        assert_eq!(
+            SchemaQuarantineReason::UnsupportedBulkReset.as_str(),
+            "unsupported_bulk_reset"
+        );
+    }
+
+    #[test]
+    fn future_hlc_superseded_only_for_later_same_device_winner() {
+        let op = op_with_drift("dev-a", -10_000);
+        let op_ts: i64 = op.client_hlc.split(':').next().unwrap().parse().unwrap();
+
+        // Later op from the SAME device → superseded (evict).
+        let later = winner("dev-a", op_ts + 1_000);
+        assert!(future_hlc_superseded("future_hlc", &op, Some(&later)));
+
+        // Later op from a DIFFERENT device → not superseded.
+        let other = winner("dev-b", op_ts + 1_000);
+        assert!(!future_hlc_superseded("future_hlc", &op, Some(&other)));
+
+        // Same device but earlier HLC → not superseding.
+        let earlier = winner("dev-a", op_ts - 1_000);
+        assert!(!future_hlc_superseded("future_hlc", &op, Some(&earlier)));
+
+        // No current winner → not superseded.
+        assert!(!future_hlc_superseded("future_hlc", &op, None));
+
+        // Non-future-HLC reasons never report superseded (eviction is a
+        // future-HLC-only policy).
+        assert!(!future_hlc_superseded("unknown_field", &op, Some(&later)));
+    }
+}
+
+#[cfg(test)]
+mod bulk_reset_tests {
+    use super::*;
+    use crate::crdt_change::BULK_RESET_FIELD;
+    use crate::schema::SyncType;
+
+    fn members_schema() -> SyncSchema {
+        SyncSchema::builder()
+            .entity("members", |e| e.field("name", SyncType::String))
+            .build()
+    }
+
+    fn op(op_id: &str, field: &str, hlc_ts: i64) -> CrdtChange {
+        CrdtChange::new(
+            Some(op_id.to_string()),
+            Some("batch-1".to_string()),
+            "ent-1".to_string(),
+            "members".to_string(),
+            field.to_string(),
+            Some("\"v\"".to_string()),
+            Some(format!("{hlc_ts}:0:dev-a")),
+            false,
+            Some("dev-a".to_string()),
+            Some(0),
+            None,
+        )
+    }
+
+    fn no_field_versions(_: &str, _: &str, _: &str, _: &str) -> Result<Option<FieldVersion>> {
+        Ok(None)
+    }
+    fn no_ops_applied(_: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// A `_bulk_reset` op for a known table is routed to per-op quarantine with
+    /// reason `unsupported_bulk_reset` rather than marked applied as a no-op.
+    /// The `schema_quarantine_reason` gate is what every applied/replay
+    /// path keys off, so it must report the op as quarantine-worthy.
+    #[test]
+    fn schema_quarantine_reason_flags_bulk_reset() {
+        let engine = MergeEngine::new(members_schema());
+        let reset = op("op-reset", BULK_RESET_FIELD, 1_000);
+        assert_eq!(
+            engine.schema_quarantine_reason(&reset),
+            Some(SchemaQuarantineReason::UnsupportedBulkReset)
+        );
+        // A normal field on the same known table is not quarantined.
+        let normal = op("op-name", "name", 1_000);
+        assert_eq!(engine.schema_quarantine_reason(&normal), None);
+    }
+
+    /// `determine_winners_with_quarantine` puts the `_bulk_reset` op in
+    /// `outcome.quarantined` (never `winners`), while accompanying replacement
+    /// rows still win normally.
+    #[test]
+    fn determine_winners_quarantines_bulk_reset_and_keeps_replacement_rows() {
+        let engine = MergeEngine::new(members_schema());
+        let reset = op("op-reset", BULK_RESET_FIELD, 1_000);
+        let replacement = op("op-name", "name", 2_000);
+
+        let outcome = engine
+            .determine_winners_with_quarantine(
+                &[reset, replacement],
+                &no_field_versions,
+                &no_ops_applied,
+                "sync-1",
+            )
+            .unwrap();
+
+        assert!(
+            !outcome.winners.contains_key("op-reset"),
+            "bulk reset must never enter the winners map"
+        );
+        assert!(
+            outcome.winners.contains_key("op-name"),
+            "replacement rows still win"
+        );
+        assert_eq!(outcome.quarantined.len(), 1);
+        assert_eq!(outcome.quarantined[0].op.op_id, "op-reset");
+        assert_eq!(
+            outcome.quarantined[0].reason,
+            SchemaQuarantineReason::UnsupportedBulkReset
+        );
     }
 }

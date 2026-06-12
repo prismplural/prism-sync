@@ -37,6 +37,21 @@ pub enum CoreError {
     #[error("device {device_id} key changed")]
     DeviceKeyChanged { device_id: String },
 
+    /// The envelope declares an ML-DSA key generation that does not match any
+    /// verification key the receiver can resolve (current record or archived
+    /// history). Distinct from a genuine cryptographic verification failure: a
+    /// generation mismatch alone is almost always a not-yet-propagated rotation
+    /// (the receiver's registry is stale), which is TRANSIENT — the pull path
+    /// stalls and retries rather than treating it as a forgery. Carries
+    /// both generations so the caller can decide whether the registry is behind
+    /// (`envelope_gen > registry_gen`) or whether an older key was never archived
+    /// (`envelope_gen < registry_gen`).
+    #[error(
+        "stale ML-DSA key generation for device {device_id}: envelope={envelope_gen}, \
+         registry={registry_gen}"
+    )]
+    StaleKeyGeneration { device_id: String, envelope_gen: u32, registry_gen: u32 },
+
     #[error("missing epoch key for epoch {epoch}")]
     MissingEpochKey { epoch: u32 },
 

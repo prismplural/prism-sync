@@ -990,3 +990,189 @@ async fn test_bootstrap_rejects_snapshot_batch_id_aad_mismatch() {
         "error should mention decryption failure, got: {err_msg}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Per-ENTITY absorbing-delete on the snapshot bootstrap channel
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A device that already holds a local tombstone for an entity must not have it
+/// revived by a snapshot that still carries the entity live. This guards the
+/// whole import → accepted-set re-read → `build_entity_changes_from_snapshot_field_versions`
+/// chain end-to-end: the skipped fields never reach the EntityChange builder, so
+/// `entity_changes` carries no live upsert for the tombstoned entity (a live
+/// peer entity in the same snapshot still bootstraps normally).
+#[tokio::test]
+async fn test_bootstrap_skips_locally_tombstoned_entity() {
+    use prism_sync_core::storage::{FieldVersion, SyncStorage};
+
+    let (relay, key_hierarchy, _sk_a, sk_b, _ml_a, ml_b, _storage_b) =
+        push_and_create_snapshot(vec![
+            ("task-doomed", "doomed", false, "batch-1"),
+            ("task-alive", "alive", false, "batch-2"),
+        ])
+        .await;
+
+    // --- Device C: pre-seed a LOCAL tombstone for task-doomed, then bootstrap ---
+    let key_hierarchy_c = shared_key_hierarchy(&key_hierarchy);
+    let device_c_id = "device-ccc";
+    let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage_c, device_c_id);
+    // Register the snapshot sender (device B) so signature verification passes.
+    register_device_with_pq(
+        &relay,
+        &storage_c,
+        "device-bbb",
+        &sk_b.verifying_key(),
+        &ml_b.public_key_bytes(),
+    );
+
+    {
+        let mut tx = storage_c.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: SYNC_ID.to_string(),
+            entity_table: "tasks".to_string(),
+            entity_id: "task-doomed".to_string(),
+            field_name: "is_deleted".to_string(),
+            winning_op_id: "local-del".to_string(),
+            winning_device_id: device_c_id.to_string(),
+            winning_hlc: "1000:0:device-ccc".to_string(),
+            winning_encoded_value: Some("true".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let engine_c = SyncEngine::new(
+        storage_c.clone(),
+        relay.clone(),
+        vec![entity_c],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let (_count, entity_changes) =
+        engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await.unwrap();
+
+    // The live peer entity bootstraps as usual.
+    let alive = entity_changes.iter().find(|c| c.entity_id == "task-alive");
+    assert!(alive.is_some(), "a non-tombstoned snapshot entity must still bootstrap");
+    assert!(!alive.unwrap().is_delete);
+
+    // The locally-tombstoned entity yields no live upsert.
+    let doomed = entity_changes.iter().find(|c| c.entity_id == "task-doomed");
+    assert!(
+        doomed.map_or(true, |c| c.is_delete && c.fields.is_empty()),
+        "a locally-tombstoned entity must not be revived as a live upsert by bootstrap, got: {doomed:?}"
+    );
+
+    // Storage parity: the snapshot's live title field never imported under the tombstone.
+    assert!(
+        storage_c.get_field_version(SYNC_ID, "tasks", "task-doomed", "title").unwrap().is_none(),
+        "no live field may import into the locally-tombstoned entity"
+    );
+}
+
+/// Second-order tombstone hole (the COMMON recent-delete-before-bootstrap state): the
+/// device is locally tombstoned but NOT pruned, so it still holds the pre-delete
+/// `title`/`done` field_versions — byte-identical to the delete-unaware
+/// uploader's snapshot (a delete writes only `is_deleted`). The import gate
+/// correctly SkipStale's those fields (no write), but the residual rows already
+/// match post-import storage, so the accepted-set re-read would re-accept
+/// them and journal a live consumer-delivery + emit a live EntityChange upsert —
+/// recreating the entity on the Dart side via insertOnConflictUpdate. The
+/// tombstone set must therefore key off LOCAL is_deleted state, not only the
+/// snapshot's own (absent here) is_deleted rows. This asserts no live journal
+/// row and no live EntityChange; it FAILS against the pre-fix commit.
+#[tokio::test]
+async fn test_bootstrap_skips_residual_fields_of_unpruned_local_tombstone() {
+    use prism_sync_core::storage::{FieldVersion, SyncStorage};
+
+    let (relay, key_hierarchy, _sk_a, sk_b, _ml_a, ml_b, storage_b) = push_and_create_snapshot(
+        vec![("task-doomed", "doomed", false, "batch-1"), ("task-alive", "alive", false, "batch-2")],
+    )
+    .await;
+
+    // --- Device C: replicate device B's (== the snapshot's) task-doomed fields
+    //     byte-for-byte so the residuals are identical to what the snapshot
+    //     carries, then layer a LOCAL tombstone on top (the "deleted but not yet
+    //     pruned" state). ---
+    let key_hierarchy_c = shared_key_hierarchy(&key_hierarchy);
+    let device_c_id = "device-ccc";
+    let storage_c = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity_c: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage_c, device_c_id);
+    register_device_with_pq(
+        &relay,
+        &storage_c,
+        "device-bbb",
+        &sk_b.verifying_key(),
+        &ml_b.public_key_bytes(),
+    );
+
+    {
+        let mut tx = storage_c.begin_tx().unwrap();
+        // Copy the snapshot's exact winning field rows for task-doomed.
+        for field in ["title", "done"] {
+            let fv = storage_b
+                .get_field_version(SYNC_ID, "tasks", "task-doomed", field)
+                .unwrap()
+                .expect("device B holds the doomed task's field");
+            tx.upsert_field_version(&fv).unwrap();
+        }
+        // ...and tombstone it locally (recent delete, not yet pruned).
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: SYNC_ID.to_string(),
+            entity_table: "tasks".to_string(),
+            entity_id: "task-doomed".to_string(),
+            field_name: "is_deleted".to_string(),
+            winning_op_id: "local-del".to_string(),
+            winning_device_id: device_c_id.to_string(),
+            winning_hlc: "9999999999:0:device-ccc".to_string(),
+            winning_encoded_value: Some("true".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let engine_c = SyncEngine::new(
+        storage_c.clone(),
+        relay.clone(),
+        vec![entity_c],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let (_count, entity_changes) =
+        engine_c.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy_c).await.unwrap();
+
+    // The live peer entity still bootstraps.
+    let alive = entity_changes.iter().find(|c| c.entity_id == "task-alive");
+    assert!(alive.is_some(), "a non-tombstoned snapshot entity must still bootstrap");
+    assert!(!alive.unwrap().is_delete);
+
+    // No live EntityChange upsert for the tombstoned entity — its residual fields
+    // are absorbed even though they byte-match post-import storage.
+    let doomed = entity_changes.iter().find(|c| c.entity_id == "task-doomed");
+    assert!(
+        doomed.map_or(true, |c| c.is_delete && c.fields.is_empty()),
+        "an unpruned locally-tombstoned entity must not be revived as a live upsert, got: {doomed:?}"
+    );
+
+    // No live consumer-delivery journal row for any non-delete field of the
+    // tombstoned entity (C8: the journal must not deliver gated rows).
+    let deliveries = storage_c.list_consumer_deliveries(SYNC_ID, 0, 1000).unwrap();
+    for d in &deliveries {
+        if d.entity_id == "task-doomed" {
+            assert!(
+                d.is_delete,
+                "a tombstoned entity's only deliverable row may be a delete, got live field {:?}",
+                d.field_name
+            );
+        }
+    }
+}

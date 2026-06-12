@@ -63,6 +63,42 @@ fn make_encrypted_batch(
     .unwrap()
 }
 
+/// Like [`make_encrypted_batch`] but signs the envelope at an explicit ML-DSA
+/// generation (the rotation tests need batches signed under gen 0 and gen 1
+/// of the same device).
+#[allow(clippy::too_many_arguments)]
+fn make_encrypted_batch_at_generation(
+    ops: &[CrdtChange],
+    key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+    signing_key: &ed25519_dalek::SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    batch_id: &str,
+    sender_device_id: &str,
+    generation: u32,
+) -> SignedBatchEnvelope {
+    let plaintext = CrdtChange::encode_batch(ops).unwrap();
+    let payload_hash = batch_signature::compute_payload_hash(&plaintext);
+    let epoch_key = key_hierarchy.epoch_key(0).unwrap();
+    let aad = sync_aad::build_sync_aad(SYNC_ID, sender_device_id, 0, batch_id, "ops");
+    let (ciphertext, nonce) =
+        prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &plaintext, &aad).unwrap();
+
+    batch_signature::sign_batch(
+        signing_key,
+        ml_dsa_signing_key,
+        SYNC_ID,
+        0,
+        batch_id,
+        "ops",
+        sender_device_id,
+        generation,
+        &payload_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap()
+}
+
 /// Build a signed registry snapshot artifact blob using hybrid signing.
 ///
 /// Returns the signed artifact blob suitable for `set_signed_registry`.
@@ -798,17 +834,23 @@ fn registry_verification_tampered_artifact_rejected() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test 5: Fail closed when no signed registry is available
+// Test 5: Stall (don't skip) when no signed registry is available
 //
-// When MockRelay returns None for get_signed_registry and a batch arrives
-// from an unknown sender, the engine must skip that batch (fail closed)
-// rather than falling back to the unverified list_devices endpoint.
-// The sync should complete without error, but no data from the unknown
-// sender should be merged.
+// When MockRelay returns None for get_signed_registry and a batch arrives from
+// an unknown sender, the engine must remain fail-closed on APPLY (no data from
+// the unknown sender is merged, and it never falls back to the unverified
+// list_devices endpoint) — but the disposition is now a transient STALL, not a
+// skip-and-advance. `Ok(None)` is ambiguous (the registry may simply not be
+// uploaded yet, or this peer is racing a behind publisher), so advancing past
+// the batch and acking it would let the relay prune it and lose the data
+// permanently. Instead the cursor is held behind the batch, a pull_stall row is
+// recorded, a PullStalled event fires, and the sync still completes without
+// error. The batch resolves on a later cycle once the registry imports the
+// sender (covered by the e2e/budget tests in engine_integration.rs).
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn registry_verification_fallback_when_no_artifact() {
+async fn unknown_sender_with_no_artifact_stalls_without_advancing() {
     let key_hierarchy = init_key_hierarchy();
 
     let device_a_id = "device-local";
@@ -883,36 +925,534 @@ async fn registry_verification_fallback_when_no_artifact() {
         "batch-b1",
         device_b_id,
     );
-    relay.inject_batch(envelope);
+    let batch_seq = relay.inject_batch(envelope);
 
     let entity = Arc::new(MockTaskEntity::new());
     let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
 
+    let (event_tx, mut event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(32);
     let engine = SyncEngine::new(
         storage.clone(),
         relay.clone(),
         vec![entity_ref],
         test_schema(),
         SyncConfig::default(),
-    );
+    )
+    .with_event_sink(event_tx.clone());
 
     let result =
         engine.sync(SYNC_ID, &key_hierarchy, &signing_key_a, None, device_a_id, 0).await.unwrap();
 
-    // Sync must succeed overall (fail closed = skip batch, not abort sync)
+    // Sync must succeed overall (a stall is non-fatal: cursor frozen, push still
+    // runs, retry next cycle).
     assert!(
         result.error.is_none(),
-        "sync should complete even when unknown sender batch is skipped: {:?}",
+        "sync should complete even when unknown sender batch stalls: {:?}",
         result.error
     );
-    assert!(result.pulled > 0, "expected at least 1 batch pulled");
 
-    // The unknown sender's batch must be SKIPPED — no ops merged
+    // Fail-closed on APPLY: nothing from the unknown sender is merged.
     assert_eq!(result.merged, 0, "expected 0 ops merged from unknown sender (fail closed)");
-
-    // Verify that the injected data did NOT arrive
     let title = entity.get_field("task-1", "title");
-    assert_eq!(title, None, "data from unknown sender should not be present (fail closed)");
+    assert_eq!(title, None, "data from unknown sender must not be applied (fail closed)");
+
+    // The batch is NOT consumed: the cursor is held behind it so the relay can
+    // never prune it, and nothing is acked past it. (Old behaviour was
+    // skip-and-advance to batch_seq + an ack of batch_seq — the data-losing bug
+    // the stall discipline fixes.)
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor must stay behind the stalled batch (not advance to {batch_seq})"
+    );
+    // The cursor never left 0, so the engine spawns NO ack at all
+    // (`acked_cursor > 0` gates the ack). Assert the ack list is empty — a
+    // deterministic positive check that does not depend on the fire-and-forget
+    // ack task being polled, and that fails if a regression acks the stalled or
+    // page-max seq.
+    tokio::task::yield_now().await;
+    assert!(
+        relay.ack_calls().is_empty(),
+        "a stall at the head of the page must not ack anything, acks were: {:?}",
+        relay.ack_calls()
+    );
+
+    // A pull_stall row records the transient verdict under the budget.
+    let stalls = storage.list_pull_stalls(SYNC_ID).unwrap();
+    assert_eq!(stalls.len(), 1, "expected exactly one stall row");
+    assert_eq!(stalls[0].server_seq, batch_seq);
+    assert_eq!(stalls[0].reason, "sender_unresolved");
+    assert_eq!(stalls[0].attempts, 1, "first stall = attempt 1");
+
+    // PullStalled event surfaced for the app.
+    let mut saw_stalled = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::PullStalled { server_seq, reason, attempt } =
+            event
+        {
+            if server_seq == batch_seq && reason == "sender_unresolved" && attempt == 1 {
+                saw_stalled = true;
+            }
+        }
+    }
+    assert!(saw_stalled, "expected PullStalled(sender_unresolved, attempt 1) event");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Transient sender-key resolution failures STALL (don't skip-and-advance)
+//
+// These exercise the unknown-sender path where the older code conflated a
+// permanent revocation with a transient registry-fetch failure and durably
+// advanced the cursor past the batch, then acked it — letting the relay prune
+// the batch and lose the data forever. The fix: a transient verdict stalls (no
+// cursor advance, no ack past, push still runs) and retries under a budget; only
+// a genuine revocation skips-and-advances.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Shared A+B fixture: device A (local verifier/approver) plus an unknown sender
+/// B whose single ops batch is injected on the relay. The signed registry
+/// containing both is built and returned but NOT set on the relay — the caller
+/// decides when (or whether) to make it resolvable. Returns the pieces the test
+/// needs to drive the engine and assert.
+struct F13Fixture {
+    key_hierarchy: prism_sync_crypto::KeyHierarchy,
+    relay: Arc<MockRelay>,
+    storage: Arc<RusqliteSyncStorage>,
+    entity: Arc<MockTaskEntity>,
+    engine: SyncEngine,
+    signing_key_a: ed25519_dalek::SigningKey,
+    device_a_id: &'static str,
+    device_b_id: &'static str,
+    signed_blob: Vec<u8>,
+    batch_seq: i64,
+    event_rx: tokio::sync::broadcast::Receiver<prism_sync_core::events::SyncEvent>,
+}
+
+fn setup_f13_fixture() -> F13Fixture {
+    setup_f13_fixture_with_config(SyncConfig::default())
+}
+
+fn setup_f13_fixture_with_config(config: SyncConfig) -> F13Fixture {
+    let key_hierarchy = init_key_hierarchy();
+
+    let device_a_id = "device-aaa";
+    let device_secret_a = DeviceSecret::generate();
+    let ed25519_a = device_secret_a.ed25519_keypair(device_a_id).unwrap();
+    let x25519_a = device_secret_a.x25519_keypair(device_a_id).unwrap();
+    let ml_dsa_a = device_secret_a.ml_dsa_65_keypair(device_a_id).unwrap();
+    let ml_kem_a = device_secret_a.ml_kem_768_keypair(device_a_id).unwrap();
+
+    let device_b_id = "device-bbb";
+    let device_secret_b = DeviceSecret::generate();
+    let ed25519_b = device_secret_b.ed25519_keypair(device_b_id).unwrap();
+    let x25519_b = device_secret_b.x25519_keypair(device_b_id).unwrap();
+    let ml_dsa_b = device_secret_b.ml_dsa_65_keypair(device_b_id).unwrap();
+    let ml_kem_b = device_secret_b.ml_kem_768_keypair(device_b_id).unwrap();
+
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: device_a_id.to_string(),
+            ed25519_public_key: ed25519_a.public_key_bytes().to_vec(),
+            x25519_public_key: x25519_a.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa_a.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem_a.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+            remote_wipe: false,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: device_b_id.to_string(),
+            ed25519_public_key: ed25519_b.public_key_bytes().to_vec(),
+            x25519_public_key: x25519_b.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa_b.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem_b.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+            remote_wipe: false,
+        },
+    ];
+    let signed_blob = build_signed_registry_blob(entries, &device_secret_a, device_a_id);
+
+    let relay = Arc::new(MockRelay::new());
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, device_a_id);
+    register_device_in_storage(
+        &storage,
+        device_a_id,
+        &ed25519_a.public_key_bytes(),
+        &x25519_a.public_key_bytes(),
+        &ml_dsa_a.public_key_bytes(),
+        &ml_kem_a.public_key_bytes(),
+        0,
+    );
+    // DO NOT register device B locally — it is the unknown sender.
+
+    // Inject B's batch.
+    let signing_key_b = ed25519_b.into_signing_key();
+    let ml_dsa_key_b = device_secret_b.ml_dsa_65_keypair(device_b_id).unwrap();
+    let hlc = Hlc::now(device_b_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-1:title:{}:{}", hlc, device_b_id),
+        batch_id: Some("batch-b1".to_string()),
+        entity_id: "task-1".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Hello from B\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: device_b_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+    let envelope = make_encrypted_batch(
+        &ops,
+        &key_hierarchy,
+        &signing_key_b,
+        &ml_dsa_key_b,
+        "batch-b1",
+        device_b_id,
+    );
+    let batch_seq = relay.inject_batch(envelope);
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    let (event_tx, event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(64);
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        config,
+    )
+    .with_event_sink(event_tx);
+
+    let signing_key_a = device_secret_a.ed25519_keypair(device_a_id).unwrap().into_signing_key();
+
+    F13Fixture {
+        key_hierarchy,
+        relay,
+        storage,
+        entity,
+        engine,
+        signing_key_a,
+        device_a_id,
+        device_b_id,
+        signed_blob,
+        batch_seq,
+        event_rx,
+    }
+}
+
+fn drain_pull_stalled(
+    rx: &mut tokio::sync::broadcast::Receiver<prism_sync_core::events::SyncEvent>,
+) -> Vec<(i64, String, i64)> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::PullStalled { server_seq, reason, attempt } =
+            event
+        {
+            out.push((server_seq, reason, attempt));
+        }
+    }
+    out
+}
+
+/// A retryable registry-fetch failure on the cycle that first sees an unknown
+/// sender's batch must STALL — cursor frozen, no ack past, push still runs — and
+/// the batch must apply on the next cycle once the fetch succeeds. The data is
+/// never lost.
+#[tokio::test]
+async fn f13_transient_registry_outage_stalls_then_applies() {
+    let mut f = setup_f13_fixture();
+
+    // The registry IS resolvable, but the first get_signed_registry call 503s.
+    f.relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: f.signed_blob.clone(),
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+    f.relay.fail_next_get_signed_registry(1);
+
+    // Cycle 1: the fetch fails -> stall.
+    let r1 = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r1.error.is_none(), "stall is non-fatal: {:?}", r1.error);
+    assert_eq!(r1.merged, 0, "nothing applied while stalled");
+
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor must stay behind the stalled batch"
+    );
+    // Cursor never left 0 -> no ack spawned at all. Deterministic empty-ack
+    // assertion (independent of the fire-and-forget ack task's scheduling).
+    tokio::task::yield_now().await;
+    assert!(
+        f.relay.ack_calls().is_empty(),
+        "a head-of-page stall must not ack anything: {:?}",
+        f.relay.ack_calls()
+    );
+    let stalls = f.storage.list_pull_stalls(SYNC_ID).unwrap();
+    assert_eq!(stalls.len(), 1);
+    assert_eq!(stalls[0].server_seq, f.batch_seq);
+    assert_eq!(stalls[0].reason, "sender_unresolved");
+    assert_eq!(stalls[0].attempts, 1);
+    let events = drain_pull_stalled(&mut f.event_rx);
+    assert!(
+        events.iter().any(|(s, r, a)| *s == f.batch_seq && r == "sender_unresolved" && *a == 1),
+        "expected PullStalled attempt 1, got {events:?}"
+    );
+    assert_eq!(f.entity.get_field("task-1", "title"), None, "no data applied yet");
+
+    // Cycle 2: the fetch succeeds -> batch resolves and applies.
+    let r2 = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    assert!(r2.merged >= 1, "batch must apply once the registry resolves");
+    assert_eq!(
+        f.entity.get_field("task-1", "title"),
+        Some(SyncValue::String("Hello from B".to_string())),
+        "B's data must converge after the outage clears"
+    );
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        f.batch_seq,
+        "cursor advances to the batch once applied"
+    );
+    assert!(
+        f.storage.list_pull_stalls(SYNC_ID).unwrap().is_empty(),
+        "stall row cleared once the batch resolves"
+    );
+    // Now that the batch applied, the cursor advanced to batch_seq and the engine
+    // acks it. Deterministic positive check the relay can now prune.
+    tokio::task::yield_now().await;
+    assert!(
+        f.relay.ack_calls().contains(&f.batch_seq),
+        "after the batch applies, the cursor (batch_seq) must be acked: {:?}",
+        f.relay.ack_calls()
+    );
+}
+
+/// A stall must cost the retry budget at most ONE attempt per sync CYCLE, even
+/// when a full page (`>= pull_page_limit` batches) remains at/after the stalled
+/// seq — the high-backlog catch-up / post-pairing case the maintainer's "8 sync
+/// cycles" budget was meant to cover.
+///
+/// Regression guard for the paging-loop review blocker: `pull_one_page` returned a full
+/// `page_len` even when it broke early on a stall, so `pull_phase`'s paging loop
+/// (which stops only on a short page or the page/time budget) re-invoked it up to
+/// `max_pull_pages_per_cycle` times in ONE cycle. Each re-invocation re-hit the
+/// same frozen-cursor batch and bumped `pull_stall.attempts`, exhausting the
+/// 8-cycle budget within seconds (and re-fetching the registry up to 8x). The fix
+/// signals the stall so the paging loop stops for the cycle.
+///
+/// Setup: `pull_page_limit = 1` so the single stalled batch is a FULL page (the
+/// old code's re-page trigger), and `max_pull_pages_per_cycle = 5` so the bug,
+/// if present, would bump `attempts` to 5 in this one cycle. With the fix the
+/// loop stops after the first page: exactly one pull, `attempts == 1`.
+#[tokio::test]
+async fn f13_stall_bumps_attempts_at_most_once_per_cycle_under_backlog() {
+    let f = setup_f13_fixture_with_config(SyncConfig {
+        pull_page_limit: 1,
+        max_pull_pages_per_cycle: 5,
+        // Leave the stall budget at its default (8) so a within-cycle over-bump
+        // would manifest as attempts climbing, not as an early conversion.
+        ..SyncConfig::default()
+    });
+
+    // One sync cycle. B is unknown and no registry is set -> transient stall.
+    let r = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r.error.is_none(), "stall is non-fatal: {:?}", r.error);
+
+    // The cursor never advanced and the batch was not quarantined (within budget).
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor frozen behind the stalled batch"
+    );
+    assert!(
+        f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "one cycle within budget must NOT convert to quarantine"
+    );
+
+    // The crux: exactly ONE attempt despite a full page and a 5-page cycle budget.
+    let stalls = f.storage.list_pull_stalls(SYNC_ID).unwrap();
+    assert_eq!(stalls.len(), 1, "one stall row");
+    assert_eq!(
+        stalls[0].attempts, 1,
+        "a stall must cost exactly one attempt per cycle; >1 means the paging loop \
+         re-hit the frozen batch within the cycle (the paging-loop blocker)"
+    );
+
+    // And the page loop stopped: one pull_changes call, not max_pull_pages_per_cycle.
+    assert_eq!(
+        f.relay.pull_call_count(),
+        1,
+        "the paging loop must stop for the cycle on a stall (no re-paging the same batch)"
+    );
+    // The registry was fetched at most once too (the stall short-circuits the loop).
+    assert!(
+        f.relay.signed_registry_call_count() <= 1,
+        "registry fetched at most once per cycle, was {}",
+        f.relay.signed_registry_call_count()
+    );
+}
+
+/// A persistent registry outage holds the cursor for the budget, then converts
+/// the batch to a durable (replayable) quarantine and advances — never a silent
+/// skip. A later cycle that imports the sender replays the quarantined batch and
+/// applies its ops, restoring the data losslessly.
+///
+/// Budget semantics pinned here (maintainer reading of "8 sync cycles"): the
+/// stall converts on the cycle whose attempt count REACHES `pull_stall_max_attempts`
+/// (`attempts >= max`, with `attempts` incremented before the check). So with the
+/// default 8, attempts 1..=7 stall (the cursor is held across 7 completed retry
+/// cycles) and the 8th observation converts. Each sync cycle bumps `attempts` by
+/// exactly one (the page loop stops paging on a stall, so a backlog can't burn
+/// the budget within a single cycle). With `max_attempts = 2` below: cycle 1 =
+/// attempt 1 (stall), cycle 2 = attempt 2 (convert).
+#[tokio::test]
+async fn f13_budget_exhaustion_quarantines_then_replay_applies() {
+    // Tighten the budget so the test converts on the 2nd cycle rather than the
+    // 8th. Disable replay backoff so Phase 0b replay is eligible every cycle.
+    let f = setup_f13_fixture_with_config(SyncConfig {
+        pull_stall_max_attempts: 2,
+        quarantine_replay_backoff_base_ms: 0,
+        ..SyncConfig::default()
+    });
+
+    // No signed registry set yet: get_signed_registry returns Ok(None) every
+    // cycle, an ambiguous transient verdict -> stall.
+
+    // Cycle 1: stall (attempt 1).
+    let r1 = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r1.error.is_none(), "{:?}", r1.error);
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor frozen on attempt 1"
+    );
+    assert_eq!(f.storage.list_pull_stalls(SYNC_ID).unwrap()[0].attempts, 1);
+    assert!(f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty());
+
+    // Cycle 2: attempt 2 hits the budget (max_attempts = 2) -> convert to
+    // quarantine-and-advance.
+    let r2 = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        f.batch_seq,
+        "cursor advances once the batch is durably quarantined"
+    );
+    let quarantined = f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1, "batch durably quarantined, not dropped");
+    assert_eq!(quarantined[0].reason, "sender_unresolved");
+    assert_eq!(quarantined[0].server_seq, f.batch_seq);
+    assert!(
+        f.storage.list_pull_stalls(SYNC_ID).unwrap().is_empty(),
+        "stall row cleared on conversion to quarantine"
+    );
+    assert_eq!(f.entity.get_field("task-1", "title"), None, "still not applied (fail closed)");
+
+    // Now make the sender resolvable, then sync: Phase 0b replay applies the
+    // quarantined batch and deletes the row.
+    f.relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: f.signed_blob.clone(),
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+    let r3 = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r3.error.is_none(), "{:?}", r3.error);
+    assert_eq!(
+        f.entity.get_field("task-1", "title"),
+        Some(SyncValue::String("Hello from B".to_string())),
+        "Phase 0b replay restores B's data once the registry imports"
+    );
+    assert!(
+        f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "quarantine row deleted after a successful replay"
+    );
+}
+
+/// A genuinely-revoked sender keeps today's skip-and-advance policy. Pinned
+/// explicitly so it can't silently regress into a stall (which would freeze the
+/// cursor on a revoked device's in-flight batch forever).
+#[tokio::test]
+async fn f13_revoked_sender_skip_and_advance_unchanged() {
+    let mut f = setup_f13_fixture();
+
+    // Give A a local record for B with a non-active status (revoked).
+    {
+        let mut tx = f.storage.begin_tx().unwrap();
+        tx.upsert_device_record(&DeviceRecord {
+            sync_id: SYNC_ID.to_string(),
+            device_id: f.device_b_id.to_string(),
+            ed25519_public_key: vec![0u8; 32],
+            x25519_public_key: vec![0u8; 32],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: vec![],
+            status: "revoked".to_string(),
+            registered_at: chrono::Utc::now(),
+            revoked_at: Some(chrono::Utc::now()),
+            ml_dsa_key_generation: 0,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let r1 = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r1.error.is_none(), "{:?}", r1.error);
+    assert_eq!(r1.merged, 0, "nothing from a revoked sender is applied");
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        f.batch_seq,
+        "a revoked sender's batch is skipped-and-advanced (not stalled)"
+    );
+    assert!(
+        f.storage.list_pull_stalls(SYNC_ID).unwrap().is_empty(),
+        "a revoked sender must NOT create a stall row"
+    );
+    assert!(
+        f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "a revoked sender's batch is not quarantined either (skip policy)"
+    );
+    let events = drain_pull_stalled(&mut f.event_rx);
+    assert!(events.is_empty(), "no PullStalled for a revoked sender, got {events:?}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1443,27 +1983,30 @@ fn signer_missing_from_own_snapshot_rejected() {
 }
 
 /// When no signed registry is available on the relay and a batch arrives from
-/// an unknown sender, the engine must skip that batch (fail-closed) rather
-/// than fall back to the unverified `list_devices` endpoint.
+/// an unknown sender, the engine must remain fail-closed on APPLY (no merge, and
+/// it never falls back to the unverified `list_devices` endpoint). With the stall discipline the
+/// batch's disposition is a transient stall rather than a skip-and-advance, but
+/// the security property — never trust `list_devices`, never apply the unknown
+/// sender's ops — is unchanged.
 ///
-/// NOTE: This property is already verified by
-/// `registry_verification_fallback_when_no_artifact` (Test 5 above).
+/// NOTE: This property is verified by
+/// `unknown_sender_with_no_artifact_stalls_without_advancing` (Test 5 above).
 /// That test sets up a MockRelay with no signed registry, adds the unknown
-/// device to `list_devices`, injects a batch from that device, and asserts
-/// that `merged == 0` (the batch is skipped). This directly covers the G2
-/// security property: fail-closed behavior when signed registry is unavailable.
+/// device to `list_devices`, injects a batch from that device, and asserts that
+/// `merged == 0` (the batch is not applied) — directly covering the G2 security
+/// property: fail-closed behavior when the signed registry is unavailable.
 ///
 /// The test below is kept as a named alias so the property is easy to find by
 /// the G2 label, but the actual assertion is in Test 5.
 #[test]
 fn malicious_device_list_injection_rejected() {
-    // See `registry_verification_fallback_when_no_artifact` above, which is
-    // the authoritative test for G2 fail-closed behavior.
+    // See `unknown_sender_with_no_artifact_stalls_without_advancing` above,
+    // which is the authoritative test for G2 fail-closed behavior.
     //
     // Key properties verified there:
     // - MockRelay has no signed registry (`set_signed_registry` not called)
     // - Unknown device is present in `list_devices` only
-    // - Engine skips the unknown sender's batch (merged == 0)
+    // - Engine does not apply the unknown sender's batch (merged == 0)
     // - Data from unknown sender does not appear in entity store
 }
 
@@ -1827,4 +2370,504 @@ async fn hybrid_batch_roundtrip_with_verified_registry() {
         .unwrap()
         .expect("device B should be in local storage after verified import");
     assert_eq!(device_b_record.status, "active");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ML-DSA key-rotation race — stale-generation stall + archived key history
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A pre-rotation gen-0 batch that is still unpulled when the receiver imports
+/// the gen-1 registry must verify against the ARCHIVED gen-0 key from
+/// device_key_history and apply — not be lost because the receiver now only
+/// holds the gen-1 key. This is the core key-history mechanism: a verified
+/// import that supersedes a device's generation archives the outgoing key.
+#[tokio::test]
+async fn f16_pre_rotation_batch_verifies_against_archived_key() {
+    let key_hierarchy = init_key_hierarchy();
+
+    let verifier_id = "device-verifier";
+    let verifier_secret = DeviceSecret::generate();
+
+    let sender_id = "device-sender";
+    let sender_secret = DeviceSecret::generate();
+    let sender_ed25519 = sender_secret.ed25519_keypair(sender_id).unwrap();
+    let sender_x25519 = sender_secret.x25519_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen0 = sender_secret.ml_dsa_65_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen1 = sender_secret.ml_dsa_65_keypair_v(sender_id, 1).unwrap();
+    let sender_ml_kem = sender_secret.ml_kem_768_keypair(sender_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, verifier_id);
+
+    // Verifier knows the sender at gen 0 (pre-rotation).
+    register_device_in_storage(
+        &storage,
+        verifier_id,
+        &verifier_secret.ed25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.x25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_dsa_65_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_kem_768_keypair(verifier_id).unwrap().public_key_bytes(),
+        0,
+    );
+    register_device_in_storage(
+        &storage,
+        sender_id,
+        &sender_ed25519.public_key_bytes(),
+        &sender_x25519.public_key_bytes(),
+        &sender_ml_dsa_gen0.public_key_bytes(),
+        &sender_ml_kem.public_key_bytes(),
+        0,
+    );
+
+    // The sender pushed a gen-0 batch BEFORE rotating. It is still unpulled.
+    let sender_ed25519_pk = sender_ed25519.public_key_bytes().to_vec();
+    let signing_key_sender = sender_ed25519.into_signing_key();
+    let hlc = Hlc::now(sender_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-pre:title:{}:{}", hlc, sender_id),
+        batch_id: Some("batch-pre-rotation".to_string()),
+        entity_id: "task-pre".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Signed at gen 0\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+    let envelope = make_encrypted_batch_at_generation(
+        &ops,
+        &key_hierarchy,
+        &signing_key_sender,
+        &sender_ml_dsa_gen0,
+        "batch-pre-rotation",
+        sender_id,
+        0,
+    );
+
+    let relay = Arc::new(MockRelay::new());
+    let seq = relay.inject_batch(envelope);
+
+    // The verifier imports a signed registry advancing the sender to gen 1 —
+    // this is what archives the gen-0 key into device_key_history.
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: verifier_id.to_string(),
+            ed25519_public_key: verifier_secret
+                .ed25519_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            x25519_public_key: verifier_secret
+                .x25519_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            ml_dsa_65_public_key: verifier_secret
+                .ml_dsa_65_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes(),
+            ml_kem_768_public_key: verifier_secret
+                .ml_kem_768_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+            remote_wipe: false,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: sender_id.to_string(),
+            ed25519_public_key: sender_ed25519_pk.clone(),
+            x25519_public_key: sender_x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: sender_ml_dsa_gen1.public_key_bytes(),
+            ml_kem_768_public_key: sender_ml_kem.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 1,
+            remote_wipe: false,
+        },
+    ];
+    let signed_blob = build_signed_registry_blob(entries, &verifier_secret, verifier_id);
+
+    let verifier_signing = verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Resolve with the gen-1 hint via the registry import — this advances the
+    // sender's record to gen 1 AND archives the gen-0 key.
+    relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: signed_blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+    engine
+        .resolve_sender_keys_with_generation_hint(SYNC_ID, sender_id, Some(1))
+        .await
+        .expect("registry import to gen 1 should succeed");
+
+    assert_eq!(
+        storage.get_device_record(SYNC_ID, sender_id).unwrap().unwrap().ml_dsa_key_generation,
+        1,
+        "sender record advanced to gen 1"
+    );
+    let archived = storage
+        .get_archived_device_key(SYNC_ID, sender_id, 0)
+        .unwrap()
+        .expect("gen-0 key must be archived when the record advanced to gen 1");
+    assert_eq!(
+        archived,
+        sender_ml_dsa_gen0.public_key_bytes(),
+        "archived gen-0 key must equal the original gen-0 key"
+    );
+
+    // Now pull: the gen-0 batch verifies against the archived gen-0 key (current
+    // record is gen 1) and applies, instead of being lost.
+    let r = engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(
+        entity.get_field("task-pre", "title"),
+        Some(SyncValue::String("Signed at gen 0".to_string())),
+        "the pre-rotation gen-0 batch must apply via the archived gen-0 key"
+    );
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        seq,
+        "cursor advances once the batch applies"
+    );
+}
+
+/// A malicious enrolled device claiming a bogus future generation (gen 999) that
+/// no registry will ever satisfy must NOT wedge the group: it stalls for exactly
+/// the retry budget, then converts to a replayable `stale_key_generation`
+/// quarantine and the cursor advances. Nothing from the batch is ever applied
+/// (fail-closed).
+#[tokio::test]
+async fn f16_malicious_future_generation_stalls_then_quarantines() {
+    let key_hierarchy = init_key_hierarchy();
+
+    let verifier_id = "device-verifier";
+    let verifier_secret = DeviceSecret::generate();
+    let verifier_signing =
+        verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
+
+    let attacker_id = "device-attacker";
+    let attacker_secret = DeviceSecret::generate();
+    let attacker_ed25519 = attacker_secret.ed25519_keypair(attacker_id).unwrap();
+    let attacker_ml_dsa = attacker_secret.ml_dsa_65_keypair(attacker_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, verifier_id);
+    register_device_in_storage(
+        &storage,
+        verifier_id,
+        &verifier_secret.ed25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.x25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_dsa_65_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_kem_768_keypair(verifier_id).unwrap().public_key_bytes(),
+        0,
+    );
+    register_device_in_storage(
+        &storage,
+        attacker_id,
+        &attacker_ed25519.public_key_bytes(),
+        &attacker_secret.x25519_keypair(attacker_id).unwrap().public_key_bytes(),
+        &attacker_ml_dsa.public_key_bytes(),
+        &attacker_secret.ml_kem_768_keypair(attacker_id).unwrap().public_key_bytes(),
+        0,
+    );
+
+    // Envelope claims gen 999 (signed at gen 999, but no registry ever has it).
+    let attacker_ml_dsa_gen999 = attacker_secret.ml_dsa_65_keypair_v(attacker_id, 999).unwrap();
+    let signing_key_attacker = attacker_ed25519.into_signing_key();
+    let hlc = Hlc::now(attacker_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-mal:title:{}:{}", hlc, attacker_id),
+        batch_id: Some("batch-malicious".to_string()),
+        entity_id: "task-mal".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Should never apply\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: attacker_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+    let envelope = make_encrypted_batch_at_generation(
+        &ops,
+        &key_hierarchy,
+        &signing_key_attacker,
+        &attacker_ml_dsa_gen999,
+        "batch-malicious",
+        attacker_id,
+        999,
+    );
+
+    let relay = Arc::new(MockRelay::new());
+    let seq = relay.inject_batch(envelope);
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    // Tight budget so the conversion happens on the 2nd cycle. Disable replay
+    // backoff so the quarantine row is replay-eligible every cycle (and stays
+    // quarantined because the gen-999 key never resolves).
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay,
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig {
+            pull_stall_max_attempts: 2,
+            quarantine_replay_backoff_base_ms: 0,
+            ..SyncConfig::default()
+        },
+    );
+
+    // Cycle 1: stall (attempt 1), cursor frozen.
+    let r1 = engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    assert!(r1.error.is_none(), "{:?}", r1.error);
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor frozen while a bogus future generation stalls"
+    );
+    let stalls = storage.list_pull_stalls(SYNC_ID).unwrap();
+    assert_eq!(stalls.len(), 1);
+    assert_eq!(stalls[0].reason, "stale_key_generation");
+    assert!(storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty());
+
+    // Cycle 2: attempt 2 hits the budget -> quarantine-and-advance.
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        seq,
+        "cursor advances once the bogus-generation batch is durably quarantined"
+    );
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1, "batch durably quarantined, not dropped");
+    assert_eq!(quarantined[0].reason, "stale_key_generation");
+    assert!(
+        storage.list_pull_stalls(SYNC_ID).unwrap().is_empty(),
+        "stall row cleared on conversion"
+    );
+    assert_eq!(
+        entity.get_field("task-mal", "title"),
+        None,
+        "a bogus-generation batch is never applied (fail closed)"
+    );
+
+    // Cycle 3: replay re-attempts, the gen-999 key still never resolves -> stays
+    // quarantined, retry backs off, group is not wedged.
+    let r3 = engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    assert!(r3.error.is_none(), "{:?}", r3.error);
+    assert_eq!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().len(),
+        1,
+        "still quarantined while the bogus generation is unresolvable"
+    );
+    assert_eq!(entity.get_field("task-mal", "title"), None);
+}
+
+/// A genuine not-yet-propagated rotation whose stall exhausts the budget
+/// converts to a replayable `stale_key_generation` quarantine; once the gen-1
+/// registry imports, Phase 0b replay verifies against it and applies the batch
+/// — the data is restored losslessly even after the cursor advanced.
+#[tokio::test]
+async fn f16_stale_generation_budget_exhaustion_quarantines_then_replay_applies() {
+    let key_hierarchy = init_key_hierarchy();
+
+    let verifier_id = "device-verifier";
+    let verifier_secret = DeviceSecret::generate();
+    let verifier_signing =
+        verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
+
+    let sender_id = "device-sender";
+    let sender_secret = DeviceSecret::generate();
+    let sender_ed25519 = sender_secret.ed25519_keypair(sender_id).unwrap();
+    let sender_x25519 = sender_secret.x25519_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen0 = sender_secret.ml_dsa_65_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen1 = sender_secret.ml_dsa_65_keypair_v(sender_id, 1).unwrap();
+    let sender_ml_kem = sender_secret.ml_kem_768_keypair(sender_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, verifier_id);
+    register_device_in_storage(
+        &storage,
+        verifier_id,
+        &verifier_secret.ed25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.x25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_dsa_65_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_kem_768_keypair(verifier_id).unwrap().public_key_bytes(),
+        0,
+    );
+    // Verifier knows the sender at gen 0.
+    register_device_in_storage(
+        &storage,
+        sender_id,
+        &sender_ed25519.public_key_bytes(),
+        &sender_x25519.public_key_bytes(),
+        &sender_ml_dsa_gen0.public_key_bytes(),
+        &sender_ml_kem.public_key_bytes(),
+        0,
+    );
+
+    // The sender rotated and pushed a gen-1 batch.
+    let sender_ed25519_pk = sender_ed25519.public_key_bytes().to_vec();
+    let signing_key_sender = sender_ed25519.into_signing_key();
+    let hlc = Hlc::now(sender_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-rot:title:{}:{}", hlc, sender_id),
+        batch_id: Some("batch-rotated".to_string()),
+        entity_id: "task-rot".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Edit after rotation\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+    let envelope = make_encrypted_batch_at_generation(
+        &ops,
+        &key_hierarchy,
+        &signing_key_sender,
+        &sender_ml_dsa_gen1,
+        "batch-rotated",
+        sender_id,
+        1,
+    );
+
+    let relay = Arc::new(MockRelay::new());
+    let seq = relay.inject_batch(envelope);
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig {
+            pull_stall_max_attempts: 2,
+            quarantine_replay_backoff_base_ms: 0,
+            ..SyncConfig::default()
+        },
+    );
+
+    // No registry set: gen 1 > local gen 0 and no refresh succeeds -> stall.
+    let r1 = engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    assert!(r1.error.is_none(), "{:?}", r1.error);
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor frozen on attempt 1"
+    );
+
+    // Cycle 2: budget hit -> quarantine + advance.
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none(), "{:?}", r2.error);
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        seq,
+        "cursor advances once durably quarantined"
+    );
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].reason, "stale_key_generation");
+    assert_eq!(entity.get_field("task-rot", "title"), None, "fail closed until keys propagate");
+
+    // Make the gen-1 registry available, then sync: Phase 0b replay imports the
+    // gen-1 key, verifies the quarantined batch against it, and applies.
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: verifier_id.to_string(),
+            ed25519_public_key: verifier_secret
+                .ed25519_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            x25519_public_key: verifier_secret
+                .x25519_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            ml_dsa_65_public_key: verifier_secret
+                .ml_dsa_65_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes(),
+            ml_kem_768_public_key: verifier_secret
+                .ml_kem_768_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+            remote_wipe: false,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: sender_id.to_string(),
+            ed25519_public_key: sender_ed25519_pk.clone(),
+            x25519_public_key: sender_x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: sender_ml_dsa_gen1.public_key_bytes(),
+            ml_kem_768_public_key: sender_ml_kem.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 1,
+            remote_wipe: false,
+        },
+    ];
+    let signed_blob = build_signed_registry_blob(entries, &verifier_secret, verifier_id);
+    relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: signed_blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+
+    let r3 = engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    assert!(r3.error.is_none(), "{:?}", r3.error);
+    assert_eq!(
+        entity.get_field("task-rot", "title"),
+        Some(SyncValue::String("Edit after rotation".to_string())),
+        "Phase 0b replay restores the rotated sender's data once gen-1 imports"
+    );
+    assert!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "quarantine row deleted after a successful replay"
+    );
 }

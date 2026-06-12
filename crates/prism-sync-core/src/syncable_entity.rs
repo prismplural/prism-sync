@@ -36,10 +36,24 @@ pub trait SyncableEntity: Send + Sync {
     async fn hard_delete(&self, entity_id: &str) -> Result<()>;
 
     /// Called before applying a batch of remote changes. Consumer should begin a transaction.
+    ///
+    /// Implementations MUST tolerate a previously dangling batch and reset it
+    /// defensively: the engine pairs every `begin_batch` with a `commit_batch`
+    /// or `rollback_batch` before returning, but a misbehaving consumer (or a
+    /// `commit_batch` that itself fails partway through a multi-table batch)
+    /// could leave an open transaction. `begin_batch` should clear/replace any
+    /// stale in-progress state rather than assume a clean slate.
     async fn begin_batch(&self) -> Result<()> {
         Ok(())
     }
     /// Called after all ops in a batch succeed. Consumer should commit.
+    ///
+    /// When a batch touches several tables, the engine commits each entity in
+    /// turn. If `commit_batch` fails on a later table, the entities already
+    /// committed stay committed while the rest are rolled back and the batch is
+    /// re-pulled. Consumers MUST therefore implement idempotent upserts so the
+    /// re-pull re-applies the earlier-committed tables without duplicating or
+    /// corrupting rows.
     async fn commit_batch(&self) -> Result<()> {
         Ok(())
     }

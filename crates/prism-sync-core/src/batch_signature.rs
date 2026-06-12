@@ -210,22 +210,29 @@ pub fn verify_batch_signature(
 }
 
 /// Verify a batch signature and require the envelope's ML-DSA key generation
-/// to match the locally trusted registry generation.
+/// to match the verification key's generation.
 ///
 /// # Errors
 ///
-/// Returns an error if the envelope generation differs from the trusted
-/// registry generation, the signature cannot be parsed, or verification fails.
+/// Returns [`CoreError::StaleKeyGeneration`] — a TYPED, distinguishable verdict —
+/// if the envelope generation differs from `key_ml_dsa_key_generation`, so the
+/// pull path can tell "my registry is stale" (retry) from "cryptographically
+/// invalid under the matched key" (the generic verification-failure error from
+/// [`verify_batch_signature`], a permanent quarantine). Previously both produced
+/// the same opaque error and a generation race was permanently skipped as if it
+/// were a forgery.
 pub fn verify_batch_signature_for_generation(
     envelope: &SignedBatchEnvelope,
     sender_ed25519_pk: &[u8; 32],
     sender_ml_dsa_pk: &[u8],
-    registry_ml_dsa_key_generation: u32,
+    key_ml_dsa_key_generation: u32,
 ) -> Result<()> {
-    if envelope.sender_ml_dsa_key_generation != registry_ml_dsa_key_generation {
-        return Err(CoreError::Storage(StorageError::Logic(
-            "Batch signature verification failed".to_string(),
-        )));
+    if envelope.sender_ml_dsa_key_generation != key_ml_dsa_key_generation {
+        return Err(CoreError::StaleKeyGeneration {
+            device_id: envelope.sender_device_id.clone(),
+            envelope_gen: envelope.sender_ml_dsa_key_generation,
+            registry_gen: key_ml_dsa_key_generation,
+        });
     }
 
     verify_batch_signature(envelope, sender_ed25519_pk, sender_ml_dsa_pk)
@@ -480,22 +487,56 @@ mod tests {
     }
 
     #[test]
-    fn registry_generation_mismatch_fails_before_verify() {
+    fn registry_generation_mismatch_returns_typed_stale_generation() {
         let signing_key = make_signing_key();
         let ml_dsa_key = make_ml_dsa_keypair();
         let ed25519_pk = signing_key.verifying_key().to_bytes();
         let ml_dsa_pk = ml_dsa_key.public_key_bytes();
+        // sample_envelope signs at generation 0.
         let envelope = sample_envelope(&signing_key, &ml_dsa_key);
 
         assert!(
             verify_batch_signature_for_generation(&envelope, &ed25519_pk, &ml_dsa_pk, 0).is_ok()
         );
 
-        let err = verify_batch_signature_for_generation(&envelope, &ed25519_pk, &ml_dsa_pk, 1)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Batch signature verification failed"), "got: {err}");
-        assert!(!err.contains("generation"), "generation detail leaked: {err}");
+        // A generation mismatch is a TYPED, distinguishable verdict carrying both
+        // generations — routed to the transient stall path instead of the
+        // permanent invalid-signature quarantine.
+        let err =
+            verify_batch_signature_for_generation(&envelope, &ed25519_pk, &ml_dsa_pk, 1)
+                .unwrap_err();
+        match err {
+            CoreError::StaleKeyGeneration { envelope_gen, registry_gen, .. } => {
+                assert_eq!(envelope_gen, 0);
+                assert_eq!(registry_gen, 1);
+            }
+            other => panic!("expected StaleKeyGeneration, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn matched_generation_bad_signature_returns_generic_failure() {
+        let signing_key = make_signing_key();
+        let ml_dsa_key = make_ml_dsa_keypair();
+        let ed25519_pk = signing_key.verifying_key().to_bytes();
+        let envelope = sample_envelope(&signing_key, &ml_dsa_key);
+
+        // Generation matches (0), but the ML-DSA key is wrong -> a genuine crypto
+        // failure, NOT a StaleKeyGeneration verdict. This is the distinction the
+        // pull path keys off: stale-generation stalls, real failures quarantine.
+        let wrong_ml_dsa = make_ml_dsa_keypair();
+        let err = verify_batch_signature_for_generation(
+            &envelope,
+            &ed25519_pk,
+            &wrong_ml_dsa.public_key_bytes(),
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            !matches!(err, CoreError::StaleKeyGeneration { .. }),
+            "matched-generation bad signature must not be StaleKeyGeneration: {err}"
+        );
+        assert!(err.to_string().contains("Batch signature verification failed"), "got: {err}");
     }
 
     #[test]

@@ -3142,11 +3142,11 @@ async fn e2e_multi_batch_sync() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test 11: Old ML-DSA generation batch rejected after rotation
+// Test 11: Old ML-DSA generation batch verifies via key history after rotation
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn e2e_old_generation_batch_rejected_after_rotation() {
+async fn e2e_old_generation_batch_verifies_via_key_history_after_rotation() {
     let (url, _server, _db) = start_test_relay().await;
     let localhost_url = to_localhost_url(&url);
     let client = Client::new();
@@ -3341,7 +3341,8 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     assert_eq!(result.merged, 2, "B should merge gen-1 batch");
 
     // ── Now push a batch "signed with gen-0 key" directly into the relay ──
-    // This simulates a stale or replayed batch from before the rotation.
+    // This simulates a straggler batch from before the rotation (pushed while
+    // the sender was still on gen-0, pulled after B imported gen-1).
     let hlc = Hlc::now(&device_a_id, None);
     let ops_stale = vec![CrdtChange {
         op_id: format!("tasks:gen-test-stale:title:{hlc}:{device_a_id}"),
@@ -3403,17 +3404,22 @@ async fn e2e_old_generation_batch_rejected_after_rotation() {
     .unwrap();
     assert!(resp.status().is_success(), "relay should store the batch opaquely");
 
-    // B pulls → the gen-0 batch should be REJECTED because B now has gen-1 key for A
+    // B pulls → the gen-0 batch verifies against the archived gen-0 key
+    // (forward rotation moves the superseded key to device_key_history, so a
+    // genuine pre-rotation signature stays verifiable instead of being dropped
+    // as a forgery). Rotation is key hygiene, not revocation — a compromised
+    // device is locked out via revoke_and_rekey, which removes it from the
+    // epoch entirely regardless of ML-DSA generation.
     let result = engine_b
         .sync(&sync_id, &kh, &keys_b.ed25519_signing_key, Some(&ml_dsa_b), &device_b_id, 0)
         .await
         .unwrap();
     assert!(result.error.is_none());
-    // The stale batch was pulled but should not be merged (sig fails against gen-1 key)
-    assert_eq!(result.merged, 0, "gen-0 batch must be rejected after B imported gen-1 key");
-    assert!(
-        entity_b.get_field("gen-test-stale", "title").is_none(),
-        "stale gen-0 task should not appear on B"
+    assert_eq!(result.merged, 1, "gen-0 straggler must verify via archived key history");
+    assert_eq!(
+        entity_b.get_field("gen-test-stale", "title"),
+        Some(SyncValue::String("Stale gen-0 task".to_string())),
+        "gen-0 straggler task should appear on B"
     );
 }
 
@@ -3826,6 +3832,17 @@ async fn run_e2e_revoke_signed_wipe(remote_wipe: bool) {
     pin_full_device_record(&storage_c, &sync_id, &admin_id, &keys_a);
     pin_full_device_record(&storage_c, &sync_id, &victim_id, &keys_c);
     setup_sync_metadata(&storage_c, &sync_id, &victim_id);
+    // Freshness baseline: the victim recorded an imported registry version
+    // before being revoked (it was an active member). Without a baseline,
+    // `confirm_self_revocation` fails safe to `Unknown`; the admin's revocation
+    // registry is published at the binding floor, so seeding 1 lets the genuine
+    // current revocation pass the never-rewind freshness gate.
+    prism_sync_core::registry_publish::ratchet_last_imported_registry_version(
+        storage_c.as_ref(),
+        &sync_id,
+        1,
+    )
+    .unwrap();
 
     let relay_c = Arc::new(make_server_relay(&localhost_url, &sync_id, &victim_id, &token_c, &keys_c));
     let mut victim = PrismSync::builder()
