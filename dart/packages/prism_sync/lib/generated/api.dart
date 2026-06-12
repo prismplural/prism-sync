@@ -362,8 +362,8 @@ Future<void> onResume({required PrismSyncHandle handle}) =>
 
 /// Upload an encrypted media blob to the relay.
 ///
-/// `ttl_secs` optionally requests a short per-blob TTL (re-supply / pairing
-/// push); the relay clamps it and an old relay ignores it (default retention).
+/// `ttl_secs` optionally requests a short per-blob TTL; the relay clamps it and
+/// an old relay ignores it.
 ///
 /// `pairing_push` tags the upload for the dedicated pairing-push rate lane.
 /// Only meaningful with a `ttl_secs`; a fresh send passes `false`.

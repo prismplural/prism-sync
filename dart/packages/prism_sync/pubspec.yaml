@@ -6,6 +6,7 @@ environment:
   sdk: ^3.11.1
 
 dependencies:
+  code_assets: ^1.2.1
   flutter_rust_bridge: 2.12.0
   hooks: ^2.0.2
   meta: ^1.11.0
