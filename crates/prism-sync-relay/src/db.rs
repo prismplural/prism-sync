@@ -2461,37 +2461,60 @@ pub fn mark_stale_devices(
     )
 }
 
+/// Retention window for a session parked into `revoked_device_sessions` by the
+/// auto-revoke pass — mirrors the 30d window an explicit revoke uses so a
+/// returning device gets the structured `device_revoked` answer for that period.
+const REVOKED_SESSION_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
 /// Auto-revoke devices that have been inactive beyond the revoke threshold.
-/// Returns the sync_ids that had devices revoked (for rekey notification).
+/// Returns the `(sync_id, device_id)` pairs that were revoked, so the cleanup
+/// task can notify surviving devices and signal the rekey the group now owes.
+///
+/// Each victim's session row is moved into `revoked_device_sessions` (the
+/// same place an explicit revoke parks it) with the fixed
+/// `REVOKED_SESSION_RETENTION_SECS` window — independent of `SESSION_EXPIRY_SECS`.
+/// So a returning auto-revoked device gets the structured `device_revoked` 401
+/// from the auth middleware (via `validate_revoked_session`) for that window in
+/// BOTH configs: when `SESSION_EXPIRY > STALE_DEVICE` the original token had not
+/// yet expired, and under the default aligned config the original session had
+/// already expired but its hash is still parked. Past that window the
+/// `/session/refresh` door is what hands those returners the verifiable answer.
 pub fn auto_revoke_devices(
     conn: &Connection,
     revoke_threshold_secs: i64,
-) -> Result<Vec<String>, rusqlite::Error> {
+) -> Result<Vec<(String, String)>, rusqlite::Error> {
     let cutoff = now_secs() - revoke_threshold_secs;
     let now = now_secs();
 
-    // Find affected sync_ids before revoking
+    // Snapshot the victims (sync_id, device_id) before revoking so we can both
+    // park their sessions and report them to the cleanup notifier.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT sync_id FROM devices
+        "SELECT sync_id, device_id FROM devices
          WHERE status IN ('active', 'stale') AND last_seen_at < ?1",
     )?;
-    let sync_ids: Vec<String> =
-        stmt.query_map(params![cutoff], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+    let victims: Vec<(String, String)> = stmt
+        .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
 
-    if !sync_ids.is_empty() {
+    if !victims.is_empty() {
         conn.execute(
             "UPDATE devices SET status = 'revoked', revoked_at = ?1
              WHERE status IN ('active', 'stale') AND last_seen_at < ?2",
             params![now, cutoff],
         )?;
 
-        // Mark affected sync groups for rekey
-        for sid in &sync_ids {
-            set_needs_rekey(conn, sid, true)?;
+        // Park each victim's session as revoked and flag every affected group.
+        let mut flagged: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (sid, did) in &victims {
+            revoke_session(conn, sid, did, REVOKED_SESSION_RETENTION_SECS)?;
+            if flagged.insert(sid.as_str()) {
+                set_needs_rekey(conn, sid, true)?;
+            }
         }
     }
 
-    Ok(sync_ids)
+    Ok(victims)
 }
 
 /// Prune sync groups where no device has been seen within the threshold.
@@ -5076,7 +5099,10 @@ mod tests {
             // auto_revoke, not revoke_device which only matches 'active'),
             // the floor advances to dev1's ack.
             let revoked = auto_revoke_devices(conn, 7_776_000)?;
-            assert!(revoked.contains(&"sg1".to_string()), "dev2 auto-revoked at the 90d TTL");
+            assert!(
+                revoked.iter().any(|(sid, did)| sid == "sg1" && did == "dev2"),
+                "dev2 auto-revoked at the 90d TTL"
+            );
             assert_eq!(get_min_acked_seq_unrevoked(conn, "sg1")?, Some(seq5));
             assert_eq!(
                 prune_batches_by_acks(conn)?,

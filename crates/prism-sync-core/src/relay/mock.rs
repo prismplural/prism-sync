@@ -900,6 +900,7 @@ mod tests {
             x_wing_public_key: vec![],
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         });
         relay.add_device(DeviceInfo {
             device_id: "d2".to_string(),
@@ -912,6 +913,7 @@ mod tests {
             x_wing_public_key: vec![],
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         });
 
         let devices = relay.list_devices().await.unwrap();
@@ -948,6 +950,7 @@ mod tests {
             x_wing_public_key: vec![],
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         }
     }
 

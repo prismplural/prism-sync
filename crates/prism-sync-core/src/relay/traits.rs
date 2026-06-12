@@ -76,6 +76,13 @@ pub enum RelayError {
     #[error("forbidden: {message}")]
     Forbidden { message: String },
 
+    /// A not-yet-upgraded relay still 409s a standalone `/rekey` while
+    /// `needs_rekey` is set (the older "must use the atomic endpoint" guard).
+    /// Surfaced as a retryable condition so a pairing rekey backs off and retries
+    /// rather than failing hard — the new relay un-deadlocks it on deploy.
+    #[error("relay upgrade pending: {message}")]
+    RelayUpgradePending { message: String },
+
     #[error("http error ({status}): {body}")]
     Http { status: u16, body: String },
 }
@@ -101,6 +108,7 @@ impl RelayError {
             RelayError::SnapshotStale { .. } => RelayErrorKind::SnapshotStale,
             RelayError::NotFound => RelayErrorKind::NotFound,
             RelayError::Forbidden { .. } => RelayErrorKind::Forbidden,
+            RelayError::RelayUpgradePending { .. } => RelayErrorKind::RelayUpgradePending,
             RelayError::Http { .. } => RelayErrorKind::Http,
         }
     }
@@ -109,7 +117,12 @@ impl RelayError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind(),
-            RelayErrorKind::Network | RelayErrorKind::Timeout | RelayErrorKind::Server
+            RelayErrorKind::Network
+                | RelayErrorKind::Timeout
+                | RelayErrorKind::Server
+                // An old relay still 409ing a needs_rekey'd standalone
+                // rekey is transient — it clears the moment the relay upgrades.
+                | RelayErrorKind::RelayUpgradePending
         )
     }
 }
@@ -136,6 +149,9 @@ pub enum RelayErrorKind {
     SnapshotStale,
     NotFound,
     Forbidden,
+    /// A not-yet-upgraded relay 409s a standalone rekey while `needs_rekey`
+    /// is set. Retryable — clears on relay deploy.
+    RelayUpgradePending,
     Http,
 }
 
@@ -322,6 +338,13 @@ pub struct DeviceInfo {
     pub permission: Option<String>,
     #[serde(default)]
     pub ml_dsa_key_generation: u32,
+    /// Group-level rekey-needed flag, mirrored onto every device entry by
+    /// the relay's `list_devices`. `true` means the 90d auto-revoke left the
+    /// group owing a forced epoch rotation; a polling client (no live WS) reads
+    /// it to drive the standalone rekey that clears it. Defaults to `false` so an
+    /// older relay that omits the key still deserializes.
+    #[serde(default)]
+    pub needs_rekey: bool,
 }
 
 /// Relay-advertised GIF service configuration for the current sync server.
@@ -443,6 +466,10 @@ pub enum SyncNotification {
     DeviceRevoked { device_id: String, new_epoch: i32, remote_wipe: bool },
     /// The epoch was rotated; recover the new epoch key.
     EpochRotated { new_epoch: i32 },
+    /// The relay's cleanup auto-revoked an abandoned device and the group now
+    /// owes a forced rekey. One active device should run a standalone rekey
+    /// to advance the epoch and clear the relay's `needs_rekey` flag.
+    RekeyNeeded,
     /// Session token was rotated (handled internally).
     TokenRotated { new_token: String },
     /// WebSocket connection state changed (for UI display).

@@ -47,11 +47,20 @@ pub async fn list_devices(
     let db = state.db.clone();
     let sid = auth.sync_id;
 
-    let devices =
-        tokio::task::spawn_blocking(move || db.with_read_conn(|conn| db::list_devices(conn, &sid)))
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (devices, needs_rekey) = tokio::task::spawn_blocking(move || {
+        db.with_read_conn(|conn| {
+            // Surface the group-level rekey-needed flag so a polling client
+            // (no WS) can detect that the 90d auto-revoke left the group owing a
+            // forced rotation, and one active device can drive the standalone
+            // rekey that clears it. Additive per-device key — 0.12.x clients that
+            // don't know the field ignore it.
+            let needs_rekey = db::get_needs_rekey(conn, &sid)?.unwrap_or(false);
+            Ok((db::list_devices(conn, &sid)?, needs_rekey))
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let b64 = base64::engine::general_purpose::STANDARD;
     let body: Vec<serde_json::Value> = devices
@@ -67,6 +76,7 @@ pub async fn list_devices(
                 "epoch": d.epoch,
                 "status": d.status,
                 "ml_dsa_key_generation": d.ml_dsa_key_generation,
+                "needs_rekey": needs_rekey,
             })
         })
         .collect();
@@ -404,18 +414,33 @@ fn do_rekey(
 ) -> Result<i64, AppError> {
     let tx = conn.unchecked_transaction().map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let needs_rekey = db::get_needs_rekey(&tx, sync_id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .unwrap_or(false);
-    if needs_rekey {
-        return Err(AppError::Conflict("Rekey after revocation must use the atomic endpoint"));
-    }
-
+    // A standalone rekey is allowed to clear `needs_rekey`. The flag is set
+    // by the 90d auto-revoke with no epoch bump and can ONLY be cleared by an
+    // epoch rotation, but the previous early 409 forced that rotation onto the
+    // atomic-revoke endpoint — which requires a still-`active` target and so
+    // deadlocked forever once the trigger device was already revoked. The
+    // security property the 409 guarded (the new epoch key reaches exactly the
+    // current active set, never the auto-revoked device) is enforced in-tx below
+    // by `validate_wrapped_keys(active_survivor_set(..))`. The epoch CAS
+    // (`epoch == current_epoch + 1`) plus the writer-mutex serialization
+    // guarantees at most one rotation commits, so concurrent standalone rekey
+    // vs. atomic revoke still resolves to exactly one winner.
     let current_epoch = db::get_sync_group_epoch(&tx, sync_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::NotFound)?;
     if epoch != current_epoch + 1 {
         return Err(AppError::BadRequest("Rekey epoch must be current_epoch + 1"));
+    }
+
+    // Mirror the atomic endpoint's requester gate: a non-active requester (stale,
+    // or racing a Phase-2 reactivation) is excluded from `active_survivor_set`,
+    // so it would commit a rotation whose wrap set omits itself and self-lock out
+    // of the new epoch key with no artifact to recover from.
+    let requester = db::get_device(&tx, sync_id, device_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or(AppError::NotFound)?;
+    if requester.status != "active" {
+        return Err(AppError::Forbidden("Requester device is not active"));
     }
 
     let expected_devices = active_survivor_set(&tx, sync_id, None)?;

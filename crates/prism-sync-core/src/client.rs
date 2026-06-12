@@ -2227,6 +2227,195 @@ impl PrismSync {
         Ok(committed_epoch)
     }
 
+    /// React to a relay `needs_rekey` signal (F29): one active device drives a
+    /// standalone rekey that advances the epoch and clears the relay flag the
+    /// 90d auto-revoke set. Idempotent across responders — the relay's epoch CAS
+    /// admits exactly one winner and the rest reconcile to a no-op.
+    ///
+    /// Best-effort by design: every early return is a benign defer (we are not
+    /// the active device that should rotate, the relay is unreachable, an old
+    /// relay still 409s). It NEVER performs a destructive action.
+    pub async fn react_to_rekey_needed(&mut self, relay: Arc<dyn SyncRelay>) -> Result<()> {
+        let sync_id = match self.sync_service().sync_id() {
+            Some(id) => id.to_string(),
+            None => return Ok(()),
+        };
+        let self_device_id = match self.device_id() {
+            Some(id) => id.to_string(),
+            None => return Ok(()),
+        };
+
+        // Refresh the local pinned registry from the relay's latest verified
+        // artifact so `pinned` reflects any revocation a survivor already
+        // published. This is best-effort: the relay's in-transaction
+        // `validate_wrapped_keys(active_survivor_set)` is the real gate on who
+        // receives the new epoch key, so a missing/stale artifact only costs a
+        // retry, never correctness.
+        self.import_latest_verified_registry(relay.as_ref(), &sync_id).await;
+
+        // The relay device list is authoritative for the current epoch (local
+        // metadata can lag after recovering from a peer's earlier rekey). Only an
+        // ACTIVE device may rotate; anyone else defers (the relay would reject a
+        // non-active requester anyway).
+        let devices = relay.list_devices().await?;
+        let self_device = match devices.iter().find(|d| d.device_id == self_device_id) {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        if self_device.status != "active" {
+            return Ok(());
+        }
+        let current_epoch = self_device.epoch.max(0) as u32;
+
+        // The locally-pinned registry — not the relay list — is the authority for
+        // who may receive a wrapped key, so the relay cannot inject a recipient.
+        let pinned = DeviceRegistryManager::list_devices(&*self.storage, &sync_id)?;
+
+        let committed_epoch = current_epoch.saturating_add(1);
+        let installed = EpochManager::post_rekey_for_needed(
+            relay.as_ref(),
+            self.key_hierarchy_mut(),
+            &self_device_id,
+            &pinned,
+            current_epoch,
+            None,
+        )
+        .await?;
+
+        let epoch_key = match installed {
+            Some(key) => key,
+            // A peer already rotated (epoch-mismatch reconcile) — the relay's
+            // `EpochRotated` broadcast drives our key recovery. Nothing to commit.
+            None => return Ok(()),
+        };
+
+        self.commit_local_epoch_rotation(&sync_id, committed_epoch, epoch_key.as_ref()).await?;
+
+        // Publish a signed registry carrying the new epoch's key hash so peers can
+        // recover the new epoch key via the existing `EpochRotated` -> registry
+        // path. A publish failure is non-fatal: the rekey already committed and a
+        // survivor's next `catch_up_epoch_keys` epoch repair backstops it.
+        if let Err(error) =
+            self.publish_post_rekey_registry(relay.as_ref(), &sync_id, &self_device_id, committed_epoch).await
+        {
+            tracing::warn!(
+                error = %error,
+                epoch = committed_epoch,
+                "rekey-needed: failed to publish post-rekey registry (epoch repair will backstop)"
+            );
+        }
+
+        tracing::info!(
+            sync_id = %sync_id,
+            device_id = %self_device_id,
+            epoch = committed_epoch,
+            "rekey-needed: standalone rekey committed and needs_rekey cleared"
+        );
+        Ok(())
+    }
+
+    /// Best-effort import of the relay's latest verified signed registry into the
+    /// local pinned store. Logs and returns on any failure — callers treat a
+    /// missing/stale/unverifiable artifact as "use whatever is pinned locally".
+    async fn import_latest_verified_registry(&self, relay: &dyn SyncRelay, sync_id: &str) {
+        let response = match relay.get_signed_registry().await {
+            Ok(Some(response)) => response,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(error = %error, "rekey-needed: no signed registry to import");
+                return;
+            }
+        };
+        // A storage ERROR reading the last imported version must NOT collapse to
+        // `None`: `None` floors the monotonicity gate at -1, which would accept a
+        // rolled-back registry artifact — and this import directly feeds the
+        // wrap-set authority for the rekey reaction. Defer the import on error
+        // (keep whatever is pinned locally) rather than disable the gate. `Ok(None)`
+        // is the legitimate "no prior import" case and keeps `None`.
+        let last_version = match self.storage.get_sync_metadata(sync_id) {
+            Ok(meta) => meta.and_then(|m| m.last_imported_registry_version),
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "rekey-needed: registry import deferred (could not read last imported version)"
+                );
+                return;
+            }
+        };
+        match DeviceRegistryManager::verify_and_import_signed_registry(
+            &*self.storage,
+            sync_id,
+            &response.artifact_blob,
+            last_version,
+        ) {
+            Ok(signed_version) => {
+                if let Ok(mut tx) = self.storage.begin_tx() {
+                    let _ = tx.update_last_imported_registry_version(sync_id, signed_version);
+                    let _ = tx.commit();
+                }
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "rekey-needed: registry import skipped");
+            }
+        }
+    }
+
+    /// Publish a signed registry bound to `epoch` carrying the new epoch's key
+    /// hash, at a version strictly above the currently-served artifact. Mirrors
+    /// the post-commit publish in `revoke_and_rekey`, minus the revoked-tombstone
+    /// content check (a standalone rekey changes no membership).
+    async fn publish_post_rekey_registry(
+        &self,
+        relay: &dyn SyncRelay,
+        sync_id: &str,
+        self_device_id: &str,
+        epoch: u32,
+    ) -> Result<()> {
+        let device_secret = self.device_secret.as_ref().ok_or_else(|| {
+            CoreError::Engine("device secret not set — call configure_engine first".into())
+        })?;
+        let signing_key = device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
+        let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
+            CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
+        })?;
+
+        let new_version = match relay.get_signed_registry().await {
+            Ok(Some(response)) => {
+                let current = DeviceRegistryManager::verify_signed_registry_snapshot(
+                    self.storage.as_ref(),
+                    sync_id,
+                    &response.artifact_blob,
+                )
+                .map_err(|e| {
+                    CoreError::Engine(format!(
+                        "signed registry verification failed before post-rekey publish: {e}"
+                    ))
+                })?;
+                (current.registry_version + 1).max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+            }
+            Ok(None) => SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            Err(error) => return Err(CoreError::from_relay(error)),
+        };
+
+        let snapshot = registry_publish::build_signed_registry_from_pinned(
+            self.storage.as_ref(),
+            sync_id,
+            self_device_id,
+            new_version,
+            epoch,
+            &self.key_hierarchy,
+        )?;
+        let signed = snapshot.sign_hybrid(&signing_key, pq_signing_key);
+        relay.put_signed_registry(&signed).await.map_err(CoreError::from_relay)?;
+
+        registry_publish::ratchet_last_imported_registry_version(
+            self.storage.as_ref(),
+            sync_id,
+            new_version,
+        )?;
+        Ok(())
+    }
+
     /// Publish a signed registry carrying the locally-pinned revocation state
     /// (explicit revoked entries) so a genuinely revoked device can fetch it and
     /// reach `ConfirmedRevoked` via `confirm_self_revocation`.
@@ -3254,6 +3443,7 @@ mod tests {
             x_wing_public_key: secret.xwing_keypair(device_id).unwrap().encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         }
     }
 

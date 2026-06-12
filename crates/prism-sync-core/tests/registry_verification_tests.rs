@@ -242,6 +242,7 @@ async fn registry_verification_verified_import_happy_path() {
         x_wing_public_key: vec![],
         permission: None,
         ml_dsa_key_generation: 0,
+        needs_rekey: false,
     });
 
     // --- Set up storage for the local device (A) ---
@@ -271,6 +272,7 @@ async fn registry_verification_verified_import_happy_path() {
         x_wing_public_key: vec![],
         permission: None,
         ml_dsa_key_generation: 0,
+        needs_rekey: false,
     });
 
     // DO NOT register device B in local storage — it should be discovered
@@ -876,6 +878,7 @@ async fn unknown_sender_with_no_artifact_stalls_without_advancing() {
         x_wing_public_key: Vec::new(),
         permission: None,
         ml_dsa_key_generation: 0,
+        needs_rekey: false,
     });
 
     // Also add device A to relay
@@ -890,6 +893,7 @@ async fn unknown_sender_with_no_artifact_stalls_without_advancing() {
         x_wing_public_key: Vec::new(),
         permission: None,
         ml_dsa_key_generation: 0,
+        needs_rekey: false,
     });
 
     let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());

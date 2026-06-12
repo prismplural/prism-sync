@@ -3956,10 +3956,81 @@ async fn test_concurrent_atomic_revokes_one_wins() {
     assert_eq!(failures, 1, "exactly one revoke should fail, got statuses: {status_a}, {status_b}");
 }
 
-// ─────────── Test: Standalone rekey rejected when needs_rekey ───────────
+// ─── Test: Standalone rekey satisfies and clears needs_rekey ───
 
+/// A standalone rekey whose wrapped-key set exactly covers the current
+/// active devices is allowed to clear `needs_rekey` — the in-transaction
+/// `validate_wrapped_keys(active_survivor_set)` already enforces the security
+/// property the old 409 guarded. (Previously this asserted the 409 dead-end;
+/// the new behavior is 200 + epoch bumped + flag cleared. Do NOT "fix" this by
+/// restoring the 409 — the 409 was the deadlock.)
 #[tokio::test]
-async fn test_standalone_rekey_rejected_when_needs_rekey() {
+async fn test_standalone_rekey_satisfies_and_clears_needs_rekey() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // The HTTP register path creates the sync_groups row (so needs_rekey is
+    // readable) and keeps admin's last_seen_at fresh.
+    let admin_id = generate_device_id();
+    let admin_keys = TestDeviceKeys::generate(&admin_id);
+    let admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_keys).await;
+
+    // dev2 joins, then ages 91d offline and is auto-revoked — which sets
+    // needs_rekey on the group with no epoch bump (the deadlock setup).
+    let dev2_id = generate_device_id();
+    let (_dev2_token, _dev2_id_keys) = prepare_device(&db, &sync_id, &dev2_id).await;
+    age_device(&db, &sync_id, &dev2_id, 91);
+    run_auto_revoke_devices(&db, AUTO_REVOKE_SECS);
+    assert_eq!(device_status(&db, &sync_id, &dev2_id).as_deref(), Some("revoked"));
+    assert_eq!(group_needs_rekey(&db, &sync_id), Some(true), "auto-revoke flags needs_rekey");
+
+    // Standalone rekey to epoch 1, wrapping keys for exactly the active set
+    // {admin} (dev2 is now revoked, excluded from the survivor set).
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let rekey_body = serde_json::json!({
+        "epoch": 1,
+        "wrapped_keys": { admin_id.clone(): b64.encode(b"wrapped-key-admin") },
+    });
+    let rekey_body_bytes = serde_json::to_vec(&rekey_body).unwrap();
+    let resp = apply_signed_headers(
+        client.post(format!("{url}/v1/sync/{sync_id}/rekey")),
+        &admin_keys,
+        "POST",
+        &format!("/v1/sync/{sync_id}/rekey"),
+        &sync_id,
+        &admin_id,
+        &rekey_body_bytes,
+    )
+    .header("Authorization", format!("Bearer {admin_token}"))
+    .header("X-Device-Id", &admin_id)
+    .header("Content-Type", "application/json")
+    .body(rekey_body_bytes)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "standalone rekey covering the active set must satisfy needs_rekey"
+    );
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["new_epoch"].as_i64(), Some(1), "epoch should bump to 1");
+
+    // Flag cleared and epoch advanced.
+    assert_eq!(group_needs_rekey(&db, &sync_id), Some(false), "needs_rekey must be cleared");
+    let sid = sync_id.clone();
+    let epoch = db.with_conn(move |conn| db::get_sync_group_epoch(conn, &sid)).unwrap();
+    assert_eq!(epoch, Some(1), "group epoch advanced to 1");
+}
+
+/// The security property the removed 409 guarded survives. A standalone
+/// rekey whose wrapped_keys ALSO includes the auto-revoked device does not match
+/// the active survivor set, so it is rejected (400) and the flag stays set with
+/// the epoch unchanged — the auto-revoked device can never receive a post-
+/// revocation epoch artifact.
+#[tokio::test]
+async fn test_standalone_rekey_including_revoked_device_is_rejected() {
     let (url, _server, db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
@@ -3970,16 +4041,17 @@ async fn test_standalone_rekey_rejected_when_needs_rekey() {
 
     let dev2_id = generate_device_id();
     let (_dev2_token, _dev2_id_keys) = prepare_device(&db, &sync_id, &dev2_id).await;
+    age_device(&db, &sync_id, &dev2_id, 91);
+    run_auto_revoke_devices(&db, AUTO_REVOKE_SECS);
+    assert_eq!(group_needs_rekey(&db, &sync_id), Some(true));
 
-    // Manually set needs_rekey = true
-    db.with_conn(|conn| db::set_needs_rekey(conn, &sync_id, true)).expect("set needs_rekey");
-
+    // Wrap keys for admin AND the now-revoked dev2 — superset of the active set.
     let b64 = base64::engine::general_purpose::STANDARD;
     let rekey_body = serde_json::json!({
         "epoch": 1,
         "wrapped_keys": {
-            admin_id.clone(): b64.encode(b"wrapped-key"),
-            dev2_id.clone(): b64.encode(b"wrapped-key-dev2"),
+            admin_id.clone(): b64.encode(b"wrapped-key-admin"),
+            dev2_id.clone(): b64.encode(b"wrapped-key-revoked"),
         },
     });
     let rekey_body_bytes = serde_json::to_vec(&rekey_body).unwrap();
@@ -3999,7 +4071,105 @@ async fn test_standalone_rekey_rejected_when_needs_rekey() {
     .send()
     .await
     .unwrap();
-    assert_eq!(resp.status(), 409, "standalone rekey should be rejected when needs_rekey is true");
+    assert_eq!(resp.status(), 400, "wrapping a revoked device must not match the active set");
+
+    // Flag stays set, epoch unchanged, no artifact for the revoked device.
+    assert_eq!(group_needs_rekey(&db, &sync_id), Some(true), "needs_rekey stays set on rejection");
+    let sid = sync_id.clone();
+    let did = dev2_id.clone();
+    let (epoch, revoked_artifact) = db
+        .with_conn(move |conn| {
+            Ok((
+                db::get_sync_group_epoch(conn, &sid)?,
+                db::get_rekey_artifact(conn, &sid, 1, &did)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(epoch, Some(0), "epoch unchanged after the rejected rekey");
+    assert!(revoked_artifact.is_none(), "no epoch-1 artifact for the revoked device");
+}
+
+/// A standalone rekey and an atomic revoke racing at the same target epoch
+/// resolve to exactly one 200 — the epoch CAS plus the relay writer mutex
+/// serialize them. Mirrors `test_concurrent_atomic_revokes_one_wins`.
+#[tokio::test]
+async fn test_concurrent_standalone_rekey_and_atomic_revoke_one_wins() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let admin_id = generate_device_id();
+    let admin_keys = TestDeviceKeys::generate(&admin_id);
+    let admin_token = register_device(&client, &url, &sync_id, &admin_id, &admin_keys).await;
+
+    let dev2_id = generate_device_id();
+    let (_dev2_token, _dev2_keys) = prepare_device(&db, &sync_id, &dev2_id).await;
+    let dev3_id = generate_device_id();
+    let (_dev3_token, _dev3_keys) = prepare_device(&db, &sync_id, &dev3_id).await;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // (A) Standalone rekey to epoch 1, wrapping the full active set.
+    let rekey_body = serde_json::json!({
+        "epoch": 1,
+        "wrapped_keys": {
+            admin_id.clone(): b64.encode(b"rk-admin"),
+            dev2_id.clone(): b64.encode(b"rk-dev2"),
+            dev3_id.clone(): b64.encode(b"rk-dev3"),
+        },
+    });
+    let rekey_bytes = serde_json::to_vec(&rekey_body).unwrap();
+    let req_a = apply_signed_headers(
+        client.post(format!("{url}/v1/sync/{sync_id}/rekey")),
+        &admin_keys,
+        "POST",
+        &format!("/v1/sync/{sync_id}/rekey"),
+        &sync_id,
+        &admin_id,
+        &rekey_bytes,
+    )
+    .header("Authorization", format!("Bearer {admin_token}"))
+    .header("X-Device-Id", &admin_id)
+    .header("Content-Type", "application/json")
+    .body(rekey_bytes)
+    .send();
+
+    // (B) Atomic revoke of dev2 to epoch 1, wrapping the survivor set {admin, dev3}.
+    let revoke_body = serde_json::json!({
+        "new_epoch": 1,
+        "remote_wipe": false,
+        "wrapped_keys": {
+            admin_id.clone(): b64.encode(b"rv-admin"),
+            dev3_id.clone(): b64.encode(b"rv-dev3"),
+        },
+    });
+    let revoke_bytes = serde_json::to_vec(&revoke_body).unwrap();
+    let req_b = apply_signed_headers(
+        client.post(format!("{url}/v1/sync/{sync_id}/devices/{dev2_id}/revoke")),
+        &admin_keys,
+        "POST",
+        &format!("/v1/sync/{sync_id}/devices/{dev2_id}/revoke"),
+        &sync_id,
+        &admin_id,
+        &revoke_bytes,
+    )
+    .header("Authorization", format!("Bearer {admin_token}"))
+    .header("X-Device-Id", &admin_id)
+    .header("Content-Type", "application/json")
+    .body(revoke_bytes)
+    .send();
+
+    let (resp_a, resp_b) = tokio::join!(req_a, req_b);
+    let status_a = resp_a.unwrap().status().as_u16();
+    let status_b = resp_b.unwrap().status().as_u16();
+
+    let successes = [status_a, status_b].iter().filter(|&&s| s == 200).count();
+    let failures = [status_a, status_b].iter().filter(|&&s| s == 400 || s == 409).count();
+    assert_eq!(
+        successes, 1,
+        "exactly one of rekey/revoke should win, got statuses: {status_a}, {status_b}"
+    );
+    assert_eq!(failures, 1, "exactly one should fail, got statuses: {status_a}, {status_b}");
 }
 
 // ─── Test: Standalone rekey allowed after atomic revoke clears needs_rekey ───

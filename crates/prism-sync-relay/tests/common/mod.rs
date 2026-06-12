@@ -126,6 +126,18 @@ pub async fn start_test_relay() -> (String, tokio::task::JoinHandle<()>, std::sy
 pub async fn start_test_relay_with_config(
     config: Config,
 ) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
+    let (url, handle, db, _state) = start_test_relay_with_state(config).await;
+    (url, handle, db)
+}
+
+/// Like [`start_test_relay_with_config`] but also returns the live [`AppState`]
+/// so a test can reach in-process state (e.g. drive a single `cleanup::run_cleanup`
+/// pass, or observe WS broadcasts). `AppState` is `Arc`-backed `Clone`, so the
+/// returned handle shares the same connection table and WS registry as the
+/// router serving requests.
+pub async fn start_test_relay_with_state(
+    config: Config,
+) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>, AppState) {
     let db = if config.db_path == ":memory:" {
         Database::in_memory().expect("in-memory db")
     } else {
@@ -133,6 +145,7 @@ pub async fn start_test_relay_with_config(
     };
     let state = AppState::new(db, config);
     let db = state.db.clone();
+    let state_handle = state.clone();
     let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -145,7 +158,7 @@ pub async fn start_test_relay_with_config(
             .unwrap();
     });
 
-    (url, handle, db)
+    (url, handle, db, state_handle)
 }
 
 /// Generate a valid 64-char hex sync ID (32 random bytes).
@@ -722,9 +735,12 @@ pub fn run_mark_stale_devices(db: &std::sync::Arc<Database>, threshold_secs: i64
 }
 
 /// Run the relay's auto-revoke cleanup step directly against the test DB,
-/// returning the affected sync_ids (those that had a device revoked and were
-/// flagged `needs_rekey`).
-pub fn run_auto_revoke_devices(db: &std::sync::Arc<Database>, threshold_secs: i64) -> Vec<String> {
+/// returning the `(sync_id, device_id)` pairs that were revoked (their groups
+/// are flagged `needs_rekey` and each victim's session is parked as revoked).
+pub fn run_auto_revoke_devices(
+    db: &std::sync::Arc<Database>,
+    threshold_secs: i64,
+) -> Vec<(String, String)> {
     db.with_conn(move |conn| db::auto_revoke_devices(conn, threshold_secs))
         .expect("run_auto_revoke_devices")
 }

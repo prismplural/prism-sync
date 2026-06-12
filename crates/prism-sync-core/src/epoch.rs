@@ -71,6 +71,35 @@ pub(crate) fn install_epoch_key(kh: &mut KeyHierarchy, vk: VerifiedEpochKey) {
     kh.store_epoch_key(vk.epoch, vk.key);
 }
 
+/// Classification of the relay's 400 responses to a standalone `/rekey`, used by
+/// the rekey-needed reaction to decide between retrying (the active set
+/// moved) and reconciling (a peer already rotated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RekeyConflict {
+    /// `wrapped_keys must match active device set exactly` — the survivor set
+    /// changed between our list and the relay's check; rebuild and retry.
+    SurvivorSetMismatch,
+    /// `Rekey epoch must be current_epoch + 1` — another responder already
+    /// advanced the epoch; reconcile rather than retry.
+    EpochMismatch,
+    /// Anything else — propagate unchanged.
+    Other,
+}
+
+/// Match the relay's standalone-rekey 400 bodies by their (stable) message text.
+/// Both arrive as `CoreError::Relay { source: RelayError::Protocol { message } }`
+/// because the HTTP transport maps an un-structured 400 to `Protocol`.
+fn classify_rekey_conflict(error: &CoreError) -> RekeyConflict {
+    let message = error.to_string();
+    if message.contains("wrapped_keys must match the active device set exactly") {
+        RekeyConflict::SurvivorSetMismatch
+    } else if message.contains("Rekey epoch must be current_epoch + 1") {
+        RekeyConflict::EpochMismatch
+    } else {
+        RekeyConflict::Other
+    }
+}
+
 /// X-Wing ciphertext size in bytes.
 const XWING_CT_LEN: usize = 1120;
 /// Artifact version byte.
@@ -213,11 +242,22 @@ impl EpochManager {
     /// after cross-checking every recipient against the locally-pinned device
     /// registry `pinned` (obtained via `DeviceRegistryManager::list_devices`).
     ///
-    /// A device is wrapped to ONLY if it is present in `pinned` AND its pinned
-    /// `x_wing_public_key` matches the relay-supplied one byte-for-byte. Any
-    /// active recipient that is unknown to `pinned`, or whose key differs, is a
-    /// hard `Err` — an injected/swapped recipient must abort the whole rotation
-    /// rather than being silently skipped.
+    /// A device is wrapped to ONLY if it is present in `pinned`, its pinned
+    /// `status` is `active`, AND its pinned `x_wing_public_key` matches the
+    /// relay-supplied one byte-for-byte. Any active recipient that is unknown to
+    /// `pinned`, that the pinned registry records as revoked, or whose key
+    /// differs, is a hard `Err` — an injected/swapped/un-revoked recipient must
+    /// abort the whole rotation rather than being silently skipped.
+    ///
+    /// The pinned-status gate is the client-side enforcement of an explicit user
+    /// revocation: the pinned registry deliberately retains
+    /// `status == "revoked"` entries, so a lying relay that re-lists an
+    /// explicitly-revoked device as `active` (carrying its still-registered
+    /// X-Wing key, which the relay holds) cannot steer a new-epoch wrap artifact
+    /// to it. Relay-asserted 90d auto-revocation is unavoidably honest-relay-only
+    /// (the relay alone knows last-seen time, and an auto-revoked device's pinned
+    /// record is still `active`); registry-asserted explicit revocation is, after
+    /// this gate, enforced here regardless of what the relay claims.
     #[allow(clippy::type_complexity)]
     pub fn prepare_wrapped_keys_for_devices(
         devices: &[DeviceInfo],
@@ -249,6 +289,16 @@ impl EpochManager {
                         device.device_id
                     ))
                 })?;
+            // Reject any recipient the pinned registry records as revoked even if
+            // the relay relists it as active — a lying relay must not be able to
+            // undo an explicit user revocation by steering the new epoch key to a
+            // revoked (e.g. stolen) device.
+            if pinned_device.status != "active" {
+                return Err(CoreError::Engine(format!(
+                    "refusing rekey: device {} is {} in the pinned registry but relay reports active",
+                    device.device_id, pinned_device.status
+                )));
+            }
             if pinned_device.x_wing_public_key != device.x_wing_public_key {
                 return Err(CoreError::Engine(format!(
                     "refusing rekey: x_wing_public_key for device {} differs from pinned registry",
@@ -363,6 +413,13 @@ impl EpochManager {
             }
             Err(relay_error) => {
                 let error = CoreError::from_relay(relay_error);
+                // An old relay 409ing the needs_rekey'd standalone rekey
+                // committed nothing — surface the retryable upgrade-pending error
+                // directly (a pairing caller backs off and retries) without an
+                // ambiguous-commit reconcile that would always come back false.
+                if error.is_relay_upgrade_pending() {
+                    return Err(error);
+                }
                 if !error.is_retryable() {
                     return Err(error);
                 }
@@ -511,6 +568,112 @@ impl EpochManager {
         }
     }
 
+    /// React to a relay `needs_rekey` signal: drive one standalone rekey
+    /// that advances the epoch and clears the relay's flag.
+    ///
+    /// `pinned` is the active device set from a freshly imported, signature-
+    /// verified registry — it is the authority for who may receive a wrapped
+    /// key (the relay device list is only cross-checked against it), so the
+    /// auto-revoked device, which appears `revoked` in a fresh registry, is
+    /// provably excluded. `current_epoch` is the relay's current epoch; the new
+    /// epoch is `current_epoch + 1`.
+    ///
+    /// Outcomes:
+    /// - 200: epoch advanced, flag cleared; returns the installed epoch key.
+    /// - survivor-set-mismatch 400 (`wrapped_keys must match the active device
+    ///   set exactly`): the active set changed under us (a concurrent revoke/join).
+    ///   Re-list the relay devices once and retry — exactly one retry, then the
+    ///   error surfaces.
+    /// - epoch-mismatch 400 (`Rekey epoch must be current_epoch + 1`): another
+    ///   responder already rotated. Treat as concurrently resolved: if the relay
+    ///   shows our device advanced past the epoch we tried, reconcile silently
+    ///   (multi-responder dedup falls out of the epoch+1 CAS); otherwise refresh
+    ///   and recurse so we re-target the now-current epoch.
+    pub async fn post_rekey_for_needed(
+        relay: &dyn SyncRelay,
+        key_hierarchy: &mut KeyHierarchy,
+        device_id: &str,
+        pinned: &[DeviceRecord],
+        current_epoch: u32,
+        signed_registry_snapshot: Option<&[u8]>,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let new_epoch = current_epoch.saturating_add(1);
+
+        for attempt in 0..2 {
+            let devices = relay.list_devices().await.map_err(|e| {
+                CoreError::Storage(StorageError::Logic(format!("failed to list devices: {e}")))
+            })?;
+
+            // Re-check the flag the relay reports against this fresh list: an
+            // honest relay clears `needs_rekey` in the same tx that commits the
+            // winning rotation, so a responder that processes the frame after a
+            // peer already rotated sees it `false` and no-ops here instead of
+            // committing a needless epoch+2 rotation (the epoch CAS only dedups
+            // SAME-epoch races). This also bounds a lying relay's frame spam — a
+            // relay can keep broadcasting `rekey_needed` but cannot make us
+            // rotate while it reports the flag cleared.
+            if !devices.iter().any(|d| d.needs_rekey) {
+                tracing::debug!(
+                    device_id = %device_id,
+                    "rekey-needed: relay no longer reports needs_rekey; nothing to do"
+                );
+                return Ok(None);
+            }
+
+            let (epoch_key, wrapped_keys) = Self::prepare_wrapped_keys_for_devices(
+                &devices, new_epoch, None, pinned,
+            )?;
+
+            match Self::post_prepared_rekey(
+                relay,
+                key_hierarchy,
+                device_id,
+                new_epoch,
+                epoch_key,
+                wrapped_keys,
+                signed_registry_snapshot,
+            )
+            .await
+            {
+                Ok(key) => return Ok(Some(key)),
+                Err(error) => match classify_rekey_conflict(&error) {
+                    RekeyConflict::SurvivorSetMismatch if attempt == 0 => {
+                        tracing::info!(
+                            device_id = %device_id,
+                            epoch = new_epoch,
+                            "rekey-needed: survivor-set mismatch, refreshing device list and retrying once"
+                        );
+                        continue;
+                    }
+                    RekeyConflict::EpochMismatch => {
+                        // A peer already rotated to `new_epoch` (or beyond). If
+                        // the relay proves our device advanced, this signal is
+                        // satisfied — dedup. Otherwise the epoch moved further
+                        // and there is nothing more for us to do here either; the
+                        // EpochRotated path recovers the key.
+                        if Self::reconcile_post_rekey_commit(relay, device_id, new_epoch).await {
+                            tracing::info!(
+                                device_id = %device_id,
+                                epoch = new_epoch,
+                                "rekey-needed: epoch already advanced by a peer; reconciled"
+                            );
+                        } else {
+                            tracing::info!(
+                                device_id = %device_id,
+                                epoch = new_epoch,
+                                "rekey-needed: epoch moved on; deferring to epoch-recovery path"
+                            );
+                        }
+                        return Ok(None);
+                    }
+                    _ => return Err(error),
+                },
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Generate a new sync_id: 32 random bytes, hex-encoded (64 chars).
     pub fn generate_sync_id() -> String {
         let mut bytes = [0u8; 32];
@@ -554,6 +717,13 @@ mod tests {
         CommitThenNetworkError,
         NetworkErrorBeforeCommit,
         AdvanceWithoutArtifactThenNetworkError,
+        /// First POST returns the survivor-set-mismatch 400; the second
+        /// (after the reaction re-lists devices) succeeds — exercises retry-once.
+        SurvivorMismatchThenSuccess,
+        /// A peer already rotated to the target epoch. POST returns the
+        /// epoch-mismatch 400; the device row is pre-advanced + an artifact is
+        /// pre-stored so `reconcile_post_rekey_commit` proves the commit.
+        EpochMismatchPeerCommitted,
     }
 
     struct MockRelay {
@@ -564,6 +734,7 @@ mod tests {
         #[allow(clippy::type_complexity)]
         posted_artifacts: Mutex<Option<(i32, HashMap<String, Vec<u8>>)>>,
         post_rekey_behavior: PostRekeyBehavior,
+        post_rekey_calls: Mutex<usize>,
     }
 
     impl MockRelay {
@@ -575,6 +746,7 @@ mod tests {
                 artifact_error_epoch: Mutex::new(None),
                 posted_artifacts: Mutex::new(None),
                 post_rekey_behavior: PostRekeyBehavior::Success,
+                post_rekey_calls: Mutex::new(0),
             }
         }
 
@@ -593,6 +765,7 @@ mod tests {
                 artifact_error_epoch: Mutex::new(None),
                 posted_artifacts: Mutex::new(None),
                 post_rekey_behavior,
+                post_rekey_calls: Mutex::new(0),
             }
         }
 
@@ -727,6 +900,11 @@ mod tests {
             _signed_registry_snapshot: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             *self.posted_artifacts.lock().unwrap() = Some((epoch, keys.clone()));
+            let call = {
+                let mut c = self.post_rekey_calls.lock().unwrap();
+                *c += 1;
+                *c
+            };
             match self.post_rekey_behavior {
                 PostRekeyBehavior::Success => {
                     self.commit_rekey(epoch, keys);
@@ -740,6 +918,25 @@ mod tests {
                 PostRekeyBehavior::AdvanceWithoutArtifactThenNetworkError => {
                     self.advance_active_devices(epoch);
                     Err(Self::lost_response_error())
+                }
+                PostRekeyBehavior::SurvivorMismatchThenSuccess => {
+                    if call == 1 {
+                        Err(RelayError::Protocol {
+                            message: "HTTP 400: wrapped_keys must match the active device set exactly"
+                                .to_string(),
+                        })
+                    } else {
+                        self.commit_rekey(epoch, keys);
+                        Ok(epoch)
+                    }
+                }
+                PostRekeyBehavior::EpochMismatchPeerCommitted => {
+                    // A peer already advanced to `epoch`: pre-advance the device
+                    // and store our artifact so reconciliation proves the commit.
+                    self.commit_rekey(epoch, keys);
+                    Err(RelayError::Protocol {
+                        message: "HTTP 400: Rekey epoch must be current_epoch + 1".to_string(),
+                    })
                 }
             }
         }
@@ -943,6 +1140,9 @@ mod tests {
             .collect()
     }
 
+    // The active devices carry `needs_rekey: true` — the relay mirrors the
+    // group-level flag onto every device entry, and the rekey-needed reaction
+    // no-ops unless it sees the flag still set on the fresh list.
     fn make_devices(
         sender_secret: &DeviceSecret,
         receiver_secret: &DeviceSecret,
@@ -964,6 +1164,7 @@ mod tests {
                 x_wing_public_key: sender_xwing.encapsulation_key_bytes(),
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: true,
             },
             DeviceInfo {
                 device_id: "receiver".to_string(),
@@ -976,6 +1177,7 @@ mod tests {
                 x_wing_public_key: receiver_xwing.encapsulation_key_bytes(),
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: true,
             },
             DeviceInfo {
                 device_id: "revoked-dev".to_string(),
@@ -988,6 +1190,7 @@ mod tests {
                 x_wing_public_key: revoked_xwing.encapsulation_key_bytes(),
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: false,
             },
         ]
     }
@@ -1141,6 +1344,127 @@ mod tests {
         // Verify decrypted epoch key matches what was stored in the hierarchy
         let stored_key = kh.epoch_key(2).unwrap();
         assert_eq!(decrypted, stored_key, "decrypted key should match stored epoch key");
+    }
+
+    // ── rekey-needed reaction ──
+
+    /// The reaction wraps the new epoch key for exactly the active set (the
+    /// revoked registry entry is excluded), advances the epoch, and installs the
+    /// key locally on the first try.
+    #[tokio::test]
+    async fn rekey_needed_reaction_wraps_active_set_and_advances() {
+        let sender_secret = DeviceSecret::generate();
+        let receiver_secret = DeviceSecret::generate();
+        let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
+        let relay = MockRelay::new_with_devices(devices);
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let installed =
+            EpochManager::post_rekey_for_needed(&relay, &mut kh, "sender", &pinned, 1, None)
+                .await
+                .expect("reaction should succeed");
+        assert!(installed.is_some(), "reaction installed a new epoch key");
+        assert!(kh.has_epoch_key(2), "epoch 2 key installed locally");
+
+        let posted = relay.posted_artifacts.lock().unwrap();
+        let (epoch, keys) = posted.as_ref().unwrap();
+        assert_eq!(*epoch, 2);
+        // Active set only: sender + receiver, never the revoked device.
+        assert!(keys.contains_key("sender"));
+        assert!(keys.contains_key("receiver"));
+        assert!(!keys.contains_key("revoked-dev"), "revoked device gets no wrapped key");
+        assert_eq!(*relay.post_rekey_calls.lock().unwrap(), 1, "no retry on the happy path");
+    }
+
+    /// A survivor-set-mismatch 400 triggers exactly one re-list-and-retry, then
+    /// succeeds.
+    #[tokio::test]
+    async fn rekey_needed_reaction_retries_once_on_survivor_mismatch() {
+        let sender_secret = DeviceSecret::generate();
+        let receiver_secret = DeviceSecret::generate();
+        let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
+        let relay = MockRelay::new_with_devices_and_behavior(
+            devices,
+            PostRekeyBehavior::SurvivorMismatchThenSuccess,
+        );
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let installed =
+            EpochManager::post_rekey_for_needed(&relay, &mut kh, "sender", &pinned, 1, None)
+                .await
+                .expect("reaction should recover after one retry");
+        assert!(installed.is_some());
+        assert!(kh.has_epoch_key(2));
+        assert_eq!(
+            *relay.post_rekey_calls.lock().unwrap(),
+            2,
+            "exactly one retry on survivor-set mismatch"
+        );
+    }
+
+    /// An epoch-mismatch 400 (a peer already rotated) resolves silently via
+    /// `reconcile_post_rekey_commit` — no error, no second attempt.
+    #[tokio::test]
+    async fn rekey_needed_reaction_reconciles_on_epoch_mismatch() {
+        let sender_secret = DeviceSecret::generate();
+        let receiver_secret = DeviceSecret::generate();
+        let devices = make_devices(&sender_secret, &receiver_secret);
+        let pinned = pinned_from_devices(&devices);
+        let relay = MockRelay::new_with_devices_and_behavior(
+            devices,
+            PostRekeyBehavior::EpochMismatchPeerCommitted,
+        );
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let installed =
+            EpochManager::post_rekey_for_needed(&relay, &mut kh, "sender", &pinned, 1, None)
+                .await
+                .expect("epoch-mismatch must reconcile, not error");
+        assert!(installed.is_none(), "no local key installed — a peer owns the rotation");
+        assert_eq!(
+            *relay.post_rekey_calls.lock().unwrap(),
+            1,
+            "epoch mismatch reconciles without a retry"
+        );
+    }
+
+    /// When the relay no longer reports `needs_rekey` on the fresh list (an
+    /// honest relay clears it the moment a peer's rotation commits), a responder
+    /// processing a late frame no-ops instead of posting a redundant epoch+2
+    /// rotation. This also bounds a lying relay's `rekey_needed` frame spam.
+    #[tokio::test]
+    async fn rekey_needed_reaction_noops_when_flag_already_cleared() {
+        let sender_secret = DeviceSecret::generate();
+        let receiver_secret = DeviceSecret::generate();
+        let mut devices = make_devices(&sender_secret, &receiver_secret);
+        for d in devices.iter_mut() {
+            d.needs_rekey = false;
+        }
+        let pinned = pinned_from_devices(&devices);
+        let relay = MockRelay::new_with_devices(devices);
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+
+        let installed =
+            EpochManager::post_rekey_for_needed(&relay, &mut kh, "sender", &pinned, 1, None)
+                .await
+                .expect("a cleared flag is a benign no-op, not an error");
+        assert!(installed.is_none(), "nothing to rotate when the flag is already cleared");
+        assert!(!kh.has_epoch_key(2), "no epoch advanced");
+        assert_eq!(
+            *relay.post_rekey_calls.lock().unwrap(),
+            0,
+            "no rekey posted when the relay reports the flag cleared"
+        );
     }
 
     #[tokio::test]
@@ -1455,6 +1779,7 @@ mod tests {
                 x_wing_public_key: valid_xwing.encapsulation_key_bytes(),
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: false,
             },
             DeviceInfo {
                 device_id: "bad-dev".to_string(),
@@ -1467,6 +1792,7 @@ mod tests {
                 x_wing_public_key: vec![0u8; 100], // wrong length
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: false,
             },
         ];
         // Pinned registry agrees with the relay (same keys) so the intersection
@@ -1528,6 +1854,7 @@ mod tests {
             x_wing_public_key: pinned_xwing.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         };
         // Pinned registry knows only the legitimate device.
         let pinned = pinned_from_devices(std::slice::from_ref(&pinned_device));
@@ -1546,6 +1873,7 @@ mod tests {
                 x_wing_public_key: injected_xwing.encapsulation_key_bytes(),
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: false,
             },
         ];
 
@@ -1578,6 +1906,7 @@ mod tests {
             x_wing_public_key: real_xwing.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         }]);
 
         // Relay swaps in the attacker's X-Wing key for the same device_id.
@@ -1592,12 +1921,66 @@ mod tests {
             x_wing_public_key: attacker_xwing.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         }];
 
         let result = EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
         let err = result.expect_err("swapped X-Wing key must abort the rotation");
         assert!(
             err.to_string().contains("differs from pinned registry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A lying relay that re-lists an explicitly-revoked device as `active`
+    /// (carrying its original registered X-Wing key, which the relay holds) must
+    /// not be able to steer a new-epoch wrap artifact to it. The pinned registry
+    /// records the device as `revoked` (the pin retains explicit revoked
+    /// entries), so the rotation aborts rather than undoing the user's
+    /// revocation. This is the unattended-rekey-reaction analogue of the
+    /// stolen-device scenario.
+    #[test]
+    fn prepare_wrapped_keys_rejects_pinned_revoked_relisted_active() {
+        let secret = DeviceSecret::generate();
+        let xwing = secret.xwing_keypair("dev").unwrap();
+
+        // Pinned record marks the device REVOKED (an explicit user revocation),
+        // even though its registered X-Wing key is still on file.
+        let pinned = pinned_from_devices(&[DeviceInfo {
+            device_id: "dev".to_string(),
+            epoch: 1,
+            status: "revoked".to_string(),
+            ed25519_public_key: vec![],
+            x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+            needs_rekey: false,
+        }]);
+
+        // The relay lies: it reports the same device as `active` with the same
+        // (genuine, still-registered) X-Wing key, so presence and key-equality
+        // both pass — only the pinned-status gate stops it.
+        let relay_devices = vec![DeviceInfo {
+            device_id: "dev".to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: vec![],
+            x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+            needs_rekey: false,
+        }];
+
+        let result = EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
+        let err = result.expect_err("a pinned-revoked recipient must abort the rotation");
+        assert!(
+            err.to_string().contains("revoked in the pinned registry"),
             "unexpected error: {err}"
         );
     }
@@ -1620,6 +2003,7 @@ mod tests {
             x_wing_public_key: xwing.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         };
         let pinned = pinned_from_devices(std::slice::from_ref(&device));
         let relay_devices = vec![device];

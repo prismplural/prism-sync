@@ -279,6 +279,30 @@ pub fn spawn_notification_handler(
                     let _ = event_tx.send(SyncEvent::EpochRotated(new_epoch as u32));
                     let _ = sync_trigger.send(SyncTrigger::WebSocketNewData).await;
                 }
+                SyncNotification::RekeyNeeded => {
+                    // The relay auto-revoked an abandoned device and the
+                    // group owes a forced rekey. One active device drives the
+                    // standalone rotation that clears the flag; the relay's epoch
+                    // CAS dedups concurrent responders. Best-effort and never
+                    // destructive. The trigger is this one cleanup-time frame:
+                    // auto-revoke only fires once per device, so the relay does NOT
+                    // re-broadcast on later passes, and there is no client-side poll
+                    // of the additive `needs_rekey` list field (it only gates the
+                    // reaction's late-frame no-op). A survivor offline during the
+                    // revoking pass therefore recovers the rotation at the next
+                    // pairing, which rebuilds the wrap set from the live registry.
+                    // Surface the additive event for app visibility.
+                    if let (Some(inner), Some(relay)) = (inner.as_ref(), relay.as_ref()) {
+                        let mut guard = inner.lock().await;
+                        if let Err(e) = guard.react_to_rekey_needed(relay.clone()).await {
+                            tracing::warn!(
+                                error = %e,
+                                "rekey-needed reaction failed; will retry on next signal"
+                            );
+                        }
+                    }
+                    let _ = event_tx.send(SyncEvent::RekeyNeeded);
+                }
                 SyncNotification::TokenRotated { new_token } => {
                     // The transport already rotated its in-memory token
                     // (session-refresh recovery). Write the fresh token into the
@@ -2108,6 +2132,7 @@ mod tests {
             x_wing_public_key: xwing.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         });
 
         // Real recoverer + secure store.

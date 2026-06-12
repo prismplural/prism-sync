@@ -315,6 +315,16 @@ impl WebSocketClient {
                 let new_epoch = parsed["new_epoch"].as_i64().unwrap_or(0) as i32;
                 Some(SyncNotification::EpochRotated { new_epoch })
             }
+            "rekey_needed" => {
+                // A cleanup-time hint that the 90d auto-revoke left the group
+                // owing a forced rotation. Carries no key material — the reacting
+                // device drives the rekey from a freshly imported VERIFIED
+                // registry, so the relay cannot steer who receives the new epoch
+                // key. Safe to act on as a trigger (it cannot cause a destructive
+                // action): the worst case is a no-op rekey already resolved by a
+                // peer, which the epoch CAS turns into a benign reconcile.
+                Some(SyncNotification::RekeyNeeded)
+            }
             // NOTE: no `token_rotated` WS arm. The relay never legitimately
             // sends this frame (the only producer is the in-process signed
             // `/session/refresh` flow, which broadcasts `TokenRotated` directly

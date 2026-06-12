@@ -30,6 +30,12 @@ pub enum SyncEvent {
     SessionTokenRotated { token: String },
     /// The epoch was rotated (new epoch number).
     EpochRotated(u32),
+    /// The relay auto-revoked an abandoned device and the group now owes a
+    /// forced rekey. Emitted when one active device drives the standalone
+    /// rekey in reaction to a `rekey_needed` WS frame (or a `needs_rekey=true`
+    /// seen via `list_devices`). Additive event — the Dart decoder ignores
+    /// unknown event types.
+    RekeyNeeded,
     /// WebSocket real-time connection state changed.
     WebSocketStateChanged { connected: bool },
     /// A backoff delay was scheduled after a sync failure.

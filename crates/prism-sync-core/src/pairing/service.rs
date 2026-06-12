@@ -1943,6 +1943,7 @@ mod tests {
                 x_wing_public_key: req.x_wing_public_key,
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: false,
             });
             Ok(RegisterResponse {
                 device_session_token: "mock-session-token".to_string(),
@@ -2358,6 +2359,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         }]));
         registry_relay.insert_rekey_artifact(
             1,
@@ -2504,6 +2506,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         }]));
         let mut latest_hashes = std::collections::BTreeMap::new();
         latest_hashes.insert(0, compute_epoch_key_hash(&epoch_0_key));
@@ -2588,6 +2591,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
         }]));
 
         let initiator_store = Arc::new(MemStore::default());
@@ -3206,6 +3210,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
         }]));
         registry_relay.insert_rekey_artifact(
             1,
@@ -3369,6 +3374,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
         }]));
         registry_relay.insert_rekey_artifact(
             1,
@@ -3494,6 +3500,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
         }]));
         registry_relay.insert_rekey_artifact(
             1,
@@ -3635,6 +3642,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: 0,
+            needs_rekey: false,
         }]));
 
         let initiator_store = Arc::new(MemStore::default());
@@ -4374,6 +4382,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
         };
         let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![inviter_info.clone()]));
 

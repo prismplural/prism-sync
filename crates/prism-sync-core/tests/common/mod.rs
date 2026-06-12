@@ -218,6 +218,7 @@ pub fn register_device_with_pq(
         x_wing_public_key: Vec::new(),
         permission: None,
         ml_dsa_key_generation: 0,
+        needs_rekey: false,
     });
 
     let mut tx = storage.begin_tx().unwrap();

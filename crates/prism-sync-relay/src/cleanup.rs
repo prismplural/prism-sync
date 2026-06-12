@@ -21,7 +21,10 @@ pub fn spawn_cleanup_task(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-async fn run_cleanup(state: &AppState) {
+/// Run one cleanup cycle synchronously. Normally driven by the background
+/// ticker in [`spawn_cleanup_task`]; exposed so integration tests can trigger a
+/// single deterministic pass (e.g. to observe the auto-revoke WS frames).
+pub async fn run_cleanup(state: &AppState) {
     let db = state.db.clone();
     let config = state.config.clone();
 
@@ -38,8 +41,9 @@ async fn run_cleanup(state: &AppState) {
             let stale = crate::db::mark_stale_devices(conn, config.stale_device_secs as i64)?;
 
             // 3. Auto-revoke abandoned devices (> sync_inactive_ttl_secs).
-            //    Returns sync_ids that had devices revoked and now need a rekey.
-            let revoked_groups =
+            //    Returns (sync_id, device_id) pairs that were revoked; their
+            //    groups now owe a forced rekey (needs_rekey set in-pass).
+            let auto_revoked =
                 crate::db::auto_revoke_devices(conn, config.sync_inactive_ttl_secs as i64)?;
 
             // 4. Prune sync groups where no device has been seen within the
@@ -118,7 +122,7 @@ async fn run_cleanup(state: &AppState) {
                 signed_request_nonces,
                 revoked_sessions,
                 stale,
-                revoked_groups,
+                auto_revoked,
                 pruned,
                 stale_group_media_ids,
                 abandoned_new_groups,
@@ -145,7 +149,7 @@ async fn run_cleanup(state: &AppState) {
             signed_request_nonces,
             revoked_sessions,
             stale,
-            revoked_groups,
+            auto_revoked,
             pruned,
             stale_group_media_ids,
             abandoned_new_groups,
@@ -192,6 +196,47 @@ async fn run_cleanup(state: &AppState) {
             cleanup_empty_media_dirs(&state.config.media_storage_path, &stale_media_items);
             cleanup_empty_media_dirs(&state.config.media_storage_path, &expired_media);
 
+            // Tell each affected group's surviving devices that a sibling was
+            // auto-revoked and that the group now owes a rekey. The
+            // `device_revoked` frame is the existing non-destructive sibling-revoke
+            // signal (survivor apps gate any wipe on the signed-registry confirm,
+            // never on this unsigned hint); the new `rekey_needed` frame prompts
+            // one active device to run the standalone rekey that clears the flag.
+            // Both are best-effort broadcasts fired only on the pass that revokes
+            // the device: `auto_revoke_devices` matches `status IN ('active','stale')`,
+            // so a once-revoked device is not re-listed and these frames do not
+            // re-fire on later passes. A survivor offline during this pass recovers
+            // the forced rotation at the next pairing (which rebuilds the wrap set
+            // from the live registry and clears the flag via do_rekey). The additive
+            // `needs_rekey` field in `list_devices` exposes the pending state for an
+            // honest terminal answer but is not auto-polled by current clients.
+            let mut rekey_groups: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            for (sync_id, device_id) in &auto_revoked {
+                state
+                    .notify_devices(
+                        sync_id,
+                        None,
+                        &serde_json::json!({
+                            "type": "device_revoked",
+                            "device_id": device_id,
+                            "remote_wipe": false,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                rekey_groups.insert(sync_id.as_str());
+            }
+            for sync_id in &rekey_groups {
+                state
+                    .notify_devices(
+                        sync_id,
+                        None,
+                        &serde_json::json!({ "type": "rekey_needed" }).to_string(),
+                    )
+                    .await;
+            }
+
             state
                 .metrics
                 .last_cleanup_epoch_secs
@@ -201,7 +246,7 @@ async fn run_cleanup(state: &AppState) {
                 || signed_request_nonces > 0
                 || revoked_sessions > 0
                 || stale > 0
-                || !revoked_groups.is_empty()
+                || !auto_revoked.is_empty()
                 || pruned > 0
                 || abandoned_new_groups > 0
                 || expired_snapshots > 0
@@ -222,6 +267,7 @@ async fn run_cleanup(state: &AppState) {
                     signed_request_nonces,
                     revoked_sessions,
                     stale,
+                    auto_revoked = auto_revoked.len(),
                     pruned,
                     pruned_batches,
                     pruned_batches_by_acks,

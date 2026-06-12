@@ -11,13 +11,21 @@ mod common;
 use common::{
     age_device, apply_signed_headers, device_status, expire_device_session, group_needs_rekey,
     prepare_device, run_auto_revoke_devices, run_mark_stale_devices, start_test_relay,
-    start_test_relay_with_config, test_config, TestDeviceKeys, AUTO_REVOKE_SECS, STALE_DEVICE_SECS,
+    start_test_relay_with_config, start_test_relay_with_state, test_config, TestDeviceKeys,
+    AUTO_REVOKE_SECS, STALE_DEVICE_SECS,
 };
 use ed25519_dalek::Signer;
+use futures::StreamExt;
 use prism_sync_crypto::pq::hybrid_signature_contexts;
 use prism_sync_relay::db;
 use reqwest::Client;
 use serde_json::Value;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    http::{header::AUTHORIZATION, HeaderValue},
+    Message,
+};
 
 const fn day_secs(days: i64) -> i64 {
     days * 86_400
@@ -164,7 +172,11 @@ async fn fixture_ages_device_through_stale_and_revoked() {
     // 91 days offline, then auto-revoke -> revoked + needs_rekey.
     age_device(&db, &sync_id, device_id, 91);
     let revoked = run_auto_revoke_devices(&db, AUTO_REVOKE_SECS);
-    assert_eq!(revoked, vec![sync_id.clone()], "the group should be reported as affected");
+    assert_eq!(
+        revoked,
+        vec![(sync_id.clone(), device_id.to_string())],
+        "the revoked (sync_id, device_id) pair should be reported"
+    );
     assert_eq!(device_status(&db, &sync_id, device_id).as_deref(), Some("revoked"));
     assert_eq!(group_needs_rekey(&db, &sync_id), Some(true));
 }
@@ -656,6 +668,183 @@ async fn refresh_signed_for_one_sync_is_rejected_against_another() {
     assert_eq!(resp.status(), 401, "a refresh signed for sync A must not authorize sync B");
     // Neither group's device was reactivated by the rejected request.
     assert_eq!(device_status(&db, &sync_b, device_id).as_deref(), Some("active"));
+}
+
+// ─────────────────────── auto-revoke rekey behavioral tests ─────────────────
+
+/// Read WS text frames until one with `type == wanted` arrives (or timeout).
+/// Returns the matching frame's JSON. Skips `auth_ok`/`pong` and unrelated types.
+async fn await_ws_frame(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+              + Unpin),
+    wanted: &str,
+) -> Value {
+    let deadline = std::time::Duration::from_secs(5);
+    loop {
+        let next = tokio::time::timeout(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for WS frame type={wanted}"));
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let json: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if json["type"].as_str() == Some(wanted) {
+                    return json;
+                }
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("WS closed/errored before {wanted}: {other:?}"),
+        }
+    }
+}
+
+/// The cleanup auto-revoke parks the victim's session into
+/// `revoked_device_sessions` (so its still-valid token returns the structured
+/// `device_revoked` 401), and broadcasts both a `device_revoked` and a
+/// `rekey_needed` WS frame to the surviving devices.
+#[tokio::test]
+async fn auto_revoke_parks_session_and_cleanup_emits_both_ws_frames() {
+    // SESSION_EXPIRY_SECS > the offline gap so the victim's session is still
+    // valid when it gets parked as revoked (the structured-401 case lives only
+    // under non-default config; default-aligned returners use /session/refresh).
+    let mut config = test_config();
+    config.stale_device_secs = day_secs(30) as u64;
+    config.session_expiry_secs = day_secs(120) as u64;
+    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let client = Client::new();
+    let sync_id = common::generate_sync_id();
+
+    // Survivor registers over HTTP (creates the group, opens a WS below).
+    let survivor_id = common::generate_device_id();
+    let survivor_keys = TestDeviceKeys::generate(&survivor_id);
+    let survivor_token =
+        common::register_device(&client, &url, &sync_id, &survivor_id, &survivor_keys).await;
+
+    // Victim joins with a long-lived session, then ages 91d offline.
+    let victim_id = common::generate_device_id();
+    let (victim_token, victim_keys) = prepare_device(&db, &sync_id, &victim_id).await;
+    // Give the victim's session the long expiry too (prepare_device mints 3600s).
+    let sid = sync_id.clone();
+    let did = victim_id.clone();
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE device_sessions SET expires_at = ?1 WHERE sync_id = ?2 AND device_id = ?3",
+            rusqlite::params![db::now_secs() + day_secs(120), sid, did],
+        )?;
+        Ok::<_, rusqlite::Error>(())
+    })
+    .unwrap();
+    age_device(&db, &sync_id, &victim_id, 91);
+
+    // Survivor opens a WS so it can receive the cleanup broadcasts.
+    let mut req = format!("{url}/v1/sync/{sync_id}/ws")
+        .replacen("http://", "ws://", 1)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {survivor_token}")).unwrap(),
+    );
+    let (mut ws, _) = connect_async(req).await.expect("survivor WS upgrade");
+    // Drain the initial auth_ok so it doesn't shadow our matching below.
+    let _ = await_ws_frame(&mut ws, "auth_ok").await;
+
+    // Trigger one cleanup pass against the shared state.
+    prism_sync_relay::cleanup::run_cleanup(&state).await;
+
+    // The victim is revoked and the group is flagged for rekey.
+    assert_eq!(device_status(&db, &sync_id, &victim_id).as_deref(), Some("revoked"));
+    assert_eq!(group_needs_rekey(&db, &sync_id), Some(true));
+
+    // Both WS frames reach the survivor.
+    let revoked_frame = await_ws_frame(&mut ws, "device_revoked").await;
+    assert_eq!(revoked_frame["device_id"].as_str(), Some(victim_id.as_str()));
+    assert_eq!(revoked_frame["remote_wipe"].as_bool(), Some(false));
+    let _rekey_frame = await_ws_frame(&mut ws, "rekey_needed").await;
+
+    // The victim's still-valid token now returns the structured device_revoked
+    // 401 (its session was moved into revoked_device_sessions).
+    let pull = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since=0"))
+        .header("Authorization", format!("Bearer {victim_token}"))
+        .header("X-Device-Id", &victim_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pull.status(), 401, "auto-revoked victim's old token must be 401");
+    let json: Value = pull.json().await.unwrap();
+    assert_eq!(json["error"].as_str(), Some("device_revoked"));
+
+    let _ = ws.close(None).await;
+    let _ = victim_keys;
+    let _ = survivor_keys;
+}
+
+/// Cross-config companion: under the DEFAULT aligned config (the victim's
+/// session has already expired by the time it is auto-revoked), a returner still
+/// gets a verifiable structured `device_revoked` answer on BOTH doors:
+///   - its now-expired token: `auto_revoke_devices` parks the token into
+///     `revoked_device_sessions` with a fixed 30d retention that is independent
+///     of `SESSION_EXPIRY_SECS`, so `validate_revoked_session` matches it and the
+///     auth middleware returns the structured `device_revoked` 401 (not a generic
+///     one) for that window;
+///   - a signed `/session/refresh` (the door the db.rs comment names): 401
+///     with the same structured `device_revoked`.
+/// This pins the cross-config story so a future change to either door can't
+/// silently regress a default-config returner to a bare "Unauthorized".
+#[tokio::test]
+async fn auto_revoke_default_config_returner_gets_structured_device_revoked() {
+    // Default-aligned config: STALE (30d) < SESSION_EXPIRY, victim ages past the
+    // 90d auto-revoke floor and its 3600s session has long since expired.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = common::generate_sync_id();
+
+    let sid = sync_id.clone();
+    db.with_conn(move |conn| db::create_sync_group(conn, &sid, 0)).expect("create sync group");
+    let victim_id = common::generate_device_id();
+    let (victim_token, victim_keys) = prepare_device(&db, &sync_id, &victim_id).await;
+    age_device(&db, &sync_id, &victim_id, 91);
+    // The session TTL elapsed while the device was offline — the default case the
+    // db.rs comment describes (vs. the non-default still-valid-token case above).
+    expire_device_session(&db, &sync_id, &victim_id);
+
+    // Auto-revoke: revokes the victim and parks its (expired) token as revoked.
+    let revoked = run_auto_revoke_devices(&db, AUTO_REVOKE_SECS);
+    assert!(
+        revoked.iter().any(|(s, d)| s == &sync_id && d == &victim_id),
+        "victim must be auto-revoked"
+    );
+    assert_eq!(device_status(&db, &sync_id, &victim_id).as_deref(), Some("revoked"));
+
+    // Door 1 — the expired bearer token: the parked session means the auth
+    // middleware answers with the STRUCTURED `device_revoked` 401, not a bare
+    // "Unauthorized", even though the original session had already expired.
+    let pull = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since=0"))
+        .header("Authorization", format!("Bearer {victim_token}"))
+        .header("X-Device-Id", &victim_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pull.status(), 401, "expired token of an auto-revoked device must be 401");
+    let pull_json: Value = pull.json().await.unwrap();
+    assert_eq!(
+        pull_json["error"].as_str(),
+        Some("device_revoked"),
+        "the parked session yields the structured answer under default config too"
+    );
+
+    // Door 2 — the signed `/session/refresh` recovery path: also the structured
+    // `device_revoked` 401, so a returner whose parked window has lapsed still
+    // gets a verifiable terminal answer instead of looping in reconnecting.
+    let refresh = refresh_session(&client, &url, &sync_id, &victim_id, &victim_keys).await;
+    assert_eq!(refresh.status(), 401, "refreshing an auto-revoked device must not mint a token");
+    let refresh_json: Value = refresh.json().await.unwrap();
+    assert_eq!(refresh_json["error"].as_str(), Some("device_revoked"));
+    assert_eq!(device_status(&db, &sync_id, &victim_id).as_deref(), Some("revoked"));
 }
 
 // ── helper for the re-register test ──

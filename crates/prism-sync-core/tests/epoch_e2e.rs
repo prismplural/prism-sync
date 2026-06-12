@@ -299,6 +299,7 @@ async fn epoch_rotation_full_cycle() {
             x_wing_public_key: xwing_a.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
+            needs_rekey: false,
         },
         DeviceInfo {
             device_id: "device-b".to_string(),
@@ -311,6 +312,7 @@ async fn epoch_rotation_full_cycle() {
             x_wing_public_key: xwing_b.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
+            needs_rekey: false,
         },
         DeviceInfo {
             device_id: "device-c".to_string(),
@@ -323,6 +325,7 @@ async fn epoch_rotation_full_cycle() {
             x_wing_public_key: xwing_c.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
+            needs_rekey: false,
         },
     ];
 
@@ -427,6 +430,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
             x_wing_public_key: xwing_a.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
+            needs_rekey: false,
         },
         DeviceInfo {
             device_id: "device-c".to_string(),
@@ -440,6 +444,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
             x_wing_public_key: xwing_c.encapsulation_key_bytes(),
             ml_dsa_key_generation: 0,
             permission: None,
+            needs_rekey: false,
         },
     ];
 
@@ -504,6 +509,7 @@ async fn relay_injected_epoch_key_is_refused() {
         x_wing_public_key: victim_xwing.encapsulation_key_bytes(),
         ml_dsa_key_generation: 0,
         permission: None,
+        needs_rekey: false,
     }]);
     relay.insert_artifact(1, "victim", poisoned_artifact);
 

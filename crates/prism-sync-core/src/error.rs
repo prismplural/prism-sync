@@ -172,6 +172,16 @@ impl CoreError {
             }
             RelayError::NotFound => (RelayErrorCategory::Server, Some(404), None, None, None),
             RelayError::Forbidden { .. } => (RelayErrorCategory::Auth, Some(403), None, None, None),
+            // An old relay still 409ing a needs_rekey'd standalone rekey is
+            // transient — map to the retryable `Server` category (so
+            // `is_retryable()` is true) with a distinct code callers can match.
+            RelayError::RelayUpgradePending { .. } => (
+                RelayErrorCategory::Server,
+                Some(409),
+                Some("relay_upgrade_pending".to_string()),
+                None,
+                None,
+            ),
             RelayError::Http { status, .. } => {
                 (RelayErrorCategory::Server, Some(status), None, None, None)
             }
@@ -197,6 +207,16 @@ impl CoreError {
         matches!(
             self,
             CoreError::Relay { kind: RelayErrorCategory::Network | RelayErrorCategory::Server, .. }
+        )
+    }
+
+    /// Whether this is the "old relay still 409s a needs_rekey'd standalone
+    /// rekey" condition. Lets a rekey caller treat it as a transient
+    /// upgrade-pending backoff rather than an ambiguous-commit reconcile.
+    pub fn is_relay_upgrade_pending(&self) -> bool {
+        matches!(
+            self,
+            CoreError::Relay { code: Some(code), .. } if code == "relay_upgrade_pending"
         )
     }
 }

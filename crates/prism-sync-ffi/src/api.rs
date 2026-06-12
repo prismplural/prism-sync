@@ -871,6 +871,11 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "type": "EpochRotated",
             "epoch": epoch,
         }),
+        // Additive event — the Dart decoder ignores unknown event types, so
+        // no flutter_rust_bridge regen is required.
+        SyncEvent::RekeyNeeded => serde_json::json!({
+            "type": "RekeyNeeded",
+        }),
         SyncEvent::WebSocketStateChanged { connected } => serde_json::json!({
             "type": "WebSocketStateChanged",
             "connected": connected,
@@ -6545,6 +6550,7 @@ mod tests {
             x_wing_public_key: record.x_wing_public_key,
             permission: None,
             ml_dsa_key_generation: record.ml_dsa_key_generation,
+            needs_rekey: false,
         }
     }
 

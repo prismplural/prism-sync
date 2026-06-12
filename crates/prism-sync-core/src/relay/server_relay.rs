@@ -269,7 +269,25 @@ impl ServerRelay {
             }
             408 | 504 => RelayError::Timeout { message: format!("HTTP {status}: {body}") },
             409 => {
+                // A not-yet-upgraded relay 409s a standalone /rekey while
+                // `needs_rekey` is set (the older "must use the atomic endpoint"
+                // guard). It arrives either as plaintext or, on a slightly newer
+                // relay, as a structured `use_atomic_revoke` body. The client's
+                // standalone/pairing rekey never sends `revoked_device_id`, so
+                // this 409 can only mean the relay predates the atomic-revoke
+                // endpoint — surface it as a retryable upgrade-pending condition
+                // instead of a hard failure.
+                if body.contains("Rekey after revocation must use the atomic endpoint") {
+                    return RelayError::RelayUpgradePending {
+                        message: format!("HTTP {status}: {body}"),
+                    };
+                }
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                    if json.get("error").and_then(|v| v.as_str()) == Some("use_atomic_revoke") {
+                        return RelayError::RelayUpgradePending {
+                            message: format!("HTTP {status}: {body}"),
+                        };
+                    }
                     match json.get("error").and_then(|v| v.as_str()) {
                         Some("must_bootstrap_from_snapshot") => {
                             let since_seq =
