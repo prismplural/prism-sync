@@ -315,10 +315,14 @@ impl WebSocketClient {
                 let new_epoch = parsed["new_epoch"].as_i64().unwrap_or(0) as i32;
                 Some(SyncNotification::EpochRotated { new_epoch })
             }
-            "token_rotated" => {
-                let new_token = parsed["new_token"].as_str().unwrap_or("").to_string();
-                Some(SyncNotification::TokenRotated { new_token })
-            }
+            // NOTE: no `token_rotated` WS arm. The relay never legitimately
+            // sends this frame (the only producer is the in-process signed
+            // `/session/refresh` flow, which broadcasts `TokenRotated` directly
+            // on `notification_tx`). Decoding it here would let an untrusted
+            // relay clobber the persisted session token — the notification
+            // handler now writes `TokenRotated` to the secure store — so the
+            // credential-store write path stays restricted to refresh-originated
+            // rotations. A token rotation pushed over WS is dropped as unknown.
             "pong" => {
                 // Keepalive response — ignore.
                 None

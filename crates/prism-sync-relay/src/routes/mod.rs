@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod pairing;
 pub mod register;
 pub mod registry;
+pub mod session;
 pub mod sharing;
 pub mod sync;
 pub mod ws;
@@ -441,6 +442,7 @@ pub fn router(state: AppState) -> Router {
     // Routes that do NOT require authentication.
     let public_routes = Router::new()
         .merge(register::routes())
+        .merge(session::routes())
         .merge(pairing::routes())
         .route("/v1/gifs/trending", get(gifs::get_trending))
         .route("/v1/gifs/search", get(gifs::search_gifs))
@@ -609,7 +611,13 @@ async fn auth_middleware(
                     let Some(device) = db::get_device(conn, &sync_id, &device_id)? else {
                         return Ok(AuthResult::Invalid);
                     };
-                    if device.status != "active" {
+                    // Only an explicit revocation locks a device out. A merely
+                    // 'stale' device (30d idle) that still holds a valid session
+                    // token proceeds as Ok and is reactivated by the Phase-2
+                    // touch — stale is an activity state, not a trust state.
+                    // The session expiring is covered by the separate
+                    // signed /session/refresh recovery door.
+                    if device.status == "revoked" {
                         let wipe = db::get_device_wipe_status(conn, &sync_id, &device_id)?
                             .unwrap_or(false);
                         return Ok(AuthResult::DeviceRevoked {
@@ -685,7 +693,11 @@ async fn auth_middleware(
                 let _ = tokio::task::spawn_blocking(move || {
                     db_write.with_conn(|conn| {
                         db::touch_session(conn, &sid, &did, session_expiry, session_max_age)?;
-                        db::touch_device(conn, &sid, &did)
+                        // Reactivate a returning 'stale' device. The status guard
+                        // inside makes this safe against a concurrent
+                        // auto-revoke (a just-revoked device matches no row).
+                        db::touch_and_reactivate_device(conn, &sid, &did)?;
+                        Ok::<_, rusqlite::Error>(())
                     })
                 })
                 .await;

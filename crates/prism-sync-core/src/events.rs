@@ -22,6 +22,12 @@ pub enum SyncEvent {
     DeviceJoined(DeviceInfo),
     /// A device was revoked from the sync group.
     DeviceRevoked { device_id: String, remote_wipe: bool },
+    /// The relay minted a fresh device-session token (via the signed
+    /// `/session/refresh` recovery path after the old session expired). The app
+    /// should re-persist `token` to its keychain so the next launch starts with
+    /// a valid credential; until it does, refresh-on-401 at launch recovers.
+    /// Additive event — the Dart decoder ignores unknown event types.
+    SessionTokenRotated { token: String },
     /// The epoch was rotated (new epoch number).
     EpochRotated(u32),
     /// WebSocket real-time connection state changed.

@@ -271,8 +271,15 @@ fn do_atomic_revoke(
     let target = db::get_device(&tx, sync_id, target_device_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::NotFound)?;
-    if target.status != "active" {
-        return Err(AppError::Conflict("Target device is not active"));
+    // Reject only an already-`revoked` target: a `stale` device (30d idle) must
+    // remain revocable for the whole 30–90d window. A stale device can now
+    // self-reactivate via the signed `/session/refresh`, so leaving the owner
+    // unable to revoke a lost/stolen-but-stale device would open a window
+    // strictly weaker than before self-reactivation existed. `stale` is excluded from the active
+    // survivor set anyway, so `validate_wrapped_keys` agrees with the client's
+    // `status == "active"` wrap set for a stale target.
+    if target.status == "revoked" {
+        return Err(AppError::Conflict("Target device is already revoked"));
     }
 
     let expected_survivors = active_survivor_set(&tx, sync_id, Some(target_device_id))?;
@@ -281,7 +288,9 @@ fn do_atomic_revoke(
     let changed = db::revoke_device(&tx, sync_id, target_device_id, remote_wipe)
         .map_err(|e| AppError::Internal(e.to_string()))?;
     if !changed {
-        return Err(AppError::Conflict("Target device is not active"));
+        // Lost a race to a concurrent revoke (the row is no longer
+        // active/stale): the target is already revoked.
+        return Err(AppError::Conflict("Target device is already revoked"));
     }
 
     let _ = db::touch_session(&tx, sync_id, target_device_id, THIRTY_DAYS_SECS, session_max_age_secs);

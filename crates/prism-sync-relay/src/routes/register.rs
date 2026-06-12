@@ -501,7 +501,12 @@ fn do_register(
     if let Some(existing) =
         db::get_device(&tx, sync_id, device_id).map_err(|e| AppError::Internal(e.to_string()))?
     {
-        if existing.status != "active" {
+        // Only a genuinely revoked device is refused re-registration. A 'stale'
+        // device (30d idle) re-registering with matching keys is a legitimate
+        // session-recovery path and is reactivated below — stale is an activity
+        // state, not a trust state. The key-match check stays as the proof
+        // gate, so a stale row cannot be hijacked with a different identity.
+        if existing.status == "revoked" {
             return Err(AppError::Forbidden("Device has been revoked"));
         }
         if existing.signing_public_key != signing_pk
@@ -522,6 +527,11 @@ fn do_register(
             );
             return Err(AppError::DeviceIdentityMismatch);
         }
+        // Reactivate a returning stale device (no-op for one already active).
+        // The status guard inside makes this safe against a concurrent
+        // auto-revoke; if the device just got revoked the UPDATE matches no row.
+        db::touch_and_reactivate_device(&tx, sync_id, device_id)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
         tracing::debug!(
             sync_id = %&sync_id[..16],
             device_id = %&device_id[..8.min(device_id.len())],
@@ -743,7 +753,11 @@ fn verify_registry_approval(
     let approver = db::get_device(conn, sync_id, &approval.approver_device_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::Unauthorized)?;
-    if approver.status != "active"
+    // A 'stale' approver is still a trusted group member (only revocation
+    // removes trust). Reject only a revoked approver — consistent with
+    // `normalize_registry_status` mapping stale->active when the snapshot is
+    // built, so the live-row check must not be stricter than the snapshot.
+    if approver.status == "revoked"
         || approver.signing_public_key != approver_pk_bytes
         || approver.x25519_public_key != approver_entry.x25519_public_key
         || approver.ml_dsa_65_public_key != approver_ml_dsa_pk

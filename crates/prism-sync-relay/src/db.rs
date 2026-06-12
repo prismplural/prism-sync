@@ -1458,9 +1458,14 @@ pub fn revoke_device(
 ) -> Result<bool, rusqlite::Error> {
     let now = now_secs();
     let changed = conn.execute(
+        // `status IN ('active','stale')`: a merely-stale device (30d idle) must
+        // stay revocable for the whole 30–90d window — it can now
+        // self-reactivate via `/session/refresh`, so the owner's revoke must win
+        // over a lost/stolen device's reactivation. An already-`revoked` row is
+        // never re-revoked (the WHERE excludes it), keeping revoke idempotent.
         "UPDATE devices
          SET status = 'revoked', revoked_at = ?1, last_seen_at = ?1, remote_wipe = ?4
-         WHERE sync_id = ?2 AND device_id = ?3 AND status = 'active'",
+         WHERE sync_id = ?2 AND device_id = ?3 AND status IN ('active','stale')",
         params![now, sync_id, device_id, remote_wipe as i32],
     )?;
     Ok(changed > 0)
@@ -1529,6 +1534,32 @@ pub fn touch_device(
         params![now, sync_id, device_id],
     )?;
     Ok(())
+}
+
+/// Touch `last_seen_at` and, for a device that has merely gone `stale` (30d
+/// idle), flip it back to `active`. The `status IN ('active','stale')` guard is
+/// load-bearing: it makes this safe to run as a fire-and-forget write racing a
+/// concurrent `auto_revoke_devices` — a device the cleanup pass just revoked
+/// stays revoked (the UPDATE matches no row), so we never resurrect a genuinely
+/// revoked device. Returns the number of rows updated (0 if the device was
+/// revoked or absent).
+///
+/// 'stale' is an activity state, not a trust state: a device proved liveness by
+/// presenting a valid bearer token, so reactivating it is correct and restores
+/// the pruning-floor design intent (history is retained specifically so stale
+/// devices can return — see `get_min_acked_seq_unrevoked`).
+pub fn touch_and_reactivate_device(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    let changed = conn.execute(
+        "UPDATE devices SET last_seen_at = ?1, status = 'active'
+         WHERE sync_id = ?2 AND device_id = ?3 AND status IN ('active','stale')",
+        params![now, sync_id, device_id],
+    )?;
+    Ok(changed)
 }
 
 pub fn count_active_devices(conn: &Connection, sync_id: &str) -> Result<u64, rusqlite::Error> {

@@ -230,7 +230,9 @@ pub fn spawn_auto_sync_task(
 ///   for other devices
 /// - `EpochRotated` → attempts epoch recovery, emits [`SyncEvent::EpochRotated`],
 ///   then triggers sync
-/// - `TokenRotated` → ignored (handled internally by the relay)
+/// - `TokenRotated` → emits [`SyncEvent::SessionTokenRotated`] so the app can
+///   re-persist the refreshed credential (the transport already rotated its
+///   in-memory token)
 /// - `ConnectionStateChanged { connected: true }` → emits UI state and triggers
 ///   sync to recover any notifications missed while disconnected
 ///
@@ -277,8 +279,23 @@ pub fn spawn_notification_handler(
                     let _ = event_tx.send(SyncEvent::EpochRotated(new_epoch as u32));
                     let _ = sync_trigger.send(SyncTrigger::WebSocketNewData).await;
                 }
-                SyncNotification::TokenRotated { .. } => {
-                    // Handled internally by the relay transport layer
+                SyncNotification::TokenRotated { new_token } => {
+                    // The transport already rotated its in-memory token
+                    // (session-refresh recovery). Write the fresh token into the
+                    // secure store so the existing keychain-drain path persists
+                    // it (the store, not the relay handle, is what drains), then
+                    // surface an additive event so the app can also re-persist
+                    // immediately. Refresh-on-401 at next launch is the fallback
+                    // if both are missed.
+                    if let Some(inner) = inner.as_ref() {
+                        let guard = inner.lock().await;
+                        if let Err(e) =
+                            guard.secure_store().set("session_token", new_token.as_bytes())
+                        {
+                            tracing::warn!(error = %e, "failed to persist rotated session token");
+                        }
+                    }
+                    let _ = event_tx.send(SyncEvent::SessionTokenRotated { token: new_token });
                 }
                 SyncNotification::ConnectionStateChanged { connected } => {
                     let _ = event_tx.send(SyncEvent::WebSocketStateChanged { connected });
@@ -1346,6 +1363,39 @@ mod tests {
             .expect("not lagged");
         assert!(
             matches!(event, SyncEvent::DeviceRevoked { device_id: ref id, .. } if id == "my-device")
+        );
+
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn notification_handler_token_rotated_emits_session_event() {
+        let (trigger_tx, _trigger_rx) = mpsc::channel::<SyncTrigger>(16);
+        let (event_tx, mut event_rx) = broadcast::channel::<SyncEvent>(16);
+
+        let notifications = futures_util::stream::iter(vec![SyncNotification::TokenRotated {
+            new_token: "fresh-token".to_string(),
+        }]);
+        let pinned: std::pin::Pin<Box<dyn futures_util::Stream<Item = SyncNotification> + Send>> =
+            Box::pin(notifications);
+
+        // `inner: None` -> the secure-store persistence is skipped; the additive
+        // event still fires so the app can re-persist.
+        let handle = spawn_notification_handler(
+            pinned,
+            "my-device".to_string(),
+            trigger_tx,
+            event_tx,
+            None,
+            None,
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("should receive event")
+            .expect("not lagged");
+        assert!(
+            matches!(event, SyncEvent::SessionTokenRotated { ref token } if token == "fresh-token")
         );
 
         let _ = handle.await;

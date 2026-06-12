@@ -498,6 +498,19 @@ pub trait SyncTransport: Send + Sync {
 
     /// Acknowledge receipt of server_seq (allows relay to prune).
     async fn ack(&self, server_seq: i64) -> std::result::Result<(), RelayError>;
+
+    /// Recover an expired device session via the signed `/session/refresh`
+    /// endpoint. On success the transport rotates its in-memory token and
+    /// returns `Ok(Some(token))` so the engine can surface a
+    /// `SyncEvent::SessionTokenRotated` for the app to re-persist. Returns
+    /// `Ok(None)` when refresh is not available (e.g. an old relay that 404/405s
+    /// the route — the caller stays in reconnecting, no worse than today).
+    ///
+    /// The default impl is a no-op so mock transports and test doubles keep
+    /// compiling unchanged; only the HTTP `ServerRelay` performs a real refresh.
+    async fn refresh_session(&self) -> std::result::Result<Option<String>, RelayError> {
+        Ok(None)
+    }
 }
 
 /// Device lifecycle: registration, listing, revocation, deregistration, and key rotation.

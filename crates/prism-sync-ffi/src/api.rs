@@ -863,6 +863,10 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "device_id": device_id,
             "remote_wipe": remote_wipe,
         }),
+        SyncEvent::SessionTokenRotated { ref token } => serde_json::json!({
+            "type": "SessionTokenRotated",
+            "token": token,
+        }),
         SyncEvent::EpochRotated(epoch) => serde_json::json!({
             "type": "EpochRotated",
             "epoch": epoch,
