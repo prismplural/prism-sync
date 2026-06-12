@@ -157,6 +157,9 @@ pub struct Database {
     writer: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
+    /// Filesystem path the DB was opened from, so the lineage companion file
+    /// can be refreshed on each cleanup cycle and at graceful shutdown.
+    db_path: String,
 }
 
 impl Database {
@@ -169,6 +172,14 @@ impl Database {
         apply_pragmas(&conn)?;
         migrate(&conn)?;
 
+        // Detect a file-level DB restore (rewound seq stream) before serving any
+        // pull, rotating the log token so up-to-date clients reset instead of
+        // diverging. Also (re)writes the lineage companion. Best-effort: a check
+        // failure must not block startup, only forfeit detection this boot.
+        if let Err(e) = check_and_repair_lineage(path, &conn) {
+            tracing::warn!("startup lineage check failed: {e}");
+        }
+
         let readers = (0..reader_count)
             .map(|_| {
                 let c = Connection::open(path)?;
@@ -177,7 +188,17 @@ impl Database {
             })
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
-        Ok(Self { writer: Mutex::new(conn), readers, next_reader: AtomicUsize::new(0) })
+        Ok(Self {
+            writer: Mutex::new(conn),
+            readers,
+            next_reader: AtomicUsize::new(0),
+            db_path: path.to_string(),
+        })
+    }
+
+    /// The filesystem path this DB was opened from.
+    pub fn db_path(&self) -> &str {
+        &self.db_path
     }
 
     /// Open a database for testing, backed by a temp file so multiple
@@ -627,6 +648,23 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             name    TEXT PRIMARY KEY,
             value   INTEGER NOT NULL DEFAULT 0
         );",
+    )?;
+
+    // -- Relay metadata (key/value; e.g. the log-lineage token) --
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS relay_meta (
+            key     TEXT PRIMARY KEY,
+            value   TEXT NOT NULL
+        );",
+    )?;
+
+    // Mint the log-lineage token once if absent. It identifies the seq stream so
+    // a client cursor is only ever interpreted against the log that issued it; a
+    // file-level DB restore that rewinds the rowid sequence rotates this token so
+    // up-to-date clients reset instead of silently diverging.
+    conn.execute(
+        "INSERT OR IGNORE INTO relay_meta (key, value) VALUES ('log_token', ?1)",
+        params![uuid::Uuid::new_v4().to_string()],
     )?;
 
     // -- Incremental migrations for existing databases --
@@ -3562,6 +3600,146 @@ pub fn flush_counters(conn: &Connection, values: &[(&str, u64)]) -> Result<(), r
     Ok(())
 }
 
+/// Increment a persistent counter by `n`, returning nothing.
+/// Used for events observed outside a request handler (e.g. the startup
+/// lineage check, which runs before `AppState`/`Metrics` exist).
+pub fn bump_counter(conn: &Connection, name: &str, n: u64) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO counters (name, value) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET value = value + ?2",
+        params![name, n],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Log lineage
+// ---------------------------------------------------------------------------
+
+/// Read the current log-lineage token.
+pub fn get_log_token(conn: &Connection) -> Result<String, rusqlite::Error> {
+    conn.query_row(
+        "SELECT value FROM relay_meta WHERE key = 'log_token'",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// The highest batch rowid this log has ever issued, read from SQLite's
+/// AUTOINCREMENT bookkeeping. This survives pruning (deleting every batch row
+/// leaves `sqlite_sequence` untouched), so it is the durable high-water mark a
+/// file-level restore would rewind. Zero when no batch has ever been inserted.
+pub fn get_max_issued_batch_rowid(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'batches'), 0)",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// On-disk companion recording the log token and the max issued rowid at the
+/// last clean checkpoint. Lives next to the DB file so a backup tool that
+/// restores ONLY the DB (e.g. Litestream) leaves a stale-ahead companion the
+/// startup check can detect.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct LineageCompanion {
+    pub log_token: String,
+    pub max_issued_batch_rowid: i64,
+}
+
+fn lineage_companion_path(db_path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{db_path}.lineage"))
+}
+
+/// Write the lineage companion file (best-effort durable snapshot of the
+/// current token + max issued rowid). Called at startup, each cleanup cycle,
+/// and graceful shutdown.
+pub fn write_lineage_companion(db_path: &str, conn: &Connection) -> Result<(), rusqlite::Error> {
+    let companion = LineageCompanion {
+        log_token: get_log_token(conn)?,
+        max_issued_batch_rowid: get_max_issued_batch_rowid(conn)?,
+    };
+    let path = lineage_companion_path(db_path);
+    match serde_json::to_string(&companion) {
+        Ok(json) => {
+            // Write-then-rename so a crash mid-write (exactly the crash-then-restore
+            // sequence this guards against) can never leave a truncated companion the
+            // startup check would silently treat as unreadable and overwrite,
+            // forfeiting regression detection. rename is atomic on POSIX.
+            if let Err(e) = write_companion_atomically(&path, json.as_bytes()) {
+                tracing::warn!(path = %path.display(), "failed to write lineage companion: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize lineage companion: {e}"),
+    }
+    Ok(())
+}
+
+fn write_companion_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("lineage.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Startup lineage check. If the companion file records a max issued rowid that
+/// the DB no longer reaches, the DB was rewound by a file-level restore that
+/// kept the companion (or no companion existed and we just record one). On a
+/// detected regression: rotate `log_token` to a fresh UUID, log loudly, bump
+/// `log_token_rotations`. Always (re)writes the companion to the post-check
+/// state. Returns true when the token was rotated.
+pub fn check_and_repair_lineage(db_path: &str, conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let db_max_rowid = get_max_issued_batch_rowid(conn)?;
+    let companion_path = lineage_companion_path(db_path);
+
+    let mut rotated = false;
+    if let Ok(contents) = std::fs::read_to_string(&companion_path) {
+        match serde_json::from_str::<LineageCompanion>(&contents) {
+            Ok(companion) => {
+                if companion.max_issued_batch_rowid > db_max_rowid {
+                    let new_token = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "UPDATE relay_meta SET value = ?1 WHERE key = 'log_token'",
+                        params![new_token],
+                    )?;
+                    bump_counter(conn, "log_token_rotations", 1)?;
+                    tracing::error!(
+                        companion_max_rowid = companion.max_issued_batch_rowid,
+                        db_max_rowid,
+                        old_log_token = %companion.log_token,
+                        new_log_token = %new_token,
+                        "RELAY DB REGRESSED: companion lineage is ahead of the batch sequence \
+                         (likely a file-level restore). Rotated log_token; up-to-date clients \
+                         will reset their cursor and re-pull surviving + new history."
+                    );
+                    rotated = true;
+                }
+            }
+            Err(e) => {
+                // An unreadable companion (truncation, partial write, EACCES) is
+                // forfeited regression detection for this boot — and the overwrite
+                // below destroys the evidence. Log at error and surface a counter so
+                // it is operator-visible rather than a silent warn.
+                bump_counter(conn, "lineage_companion_unreadable", 1)?;
+                tracing::error!(
+                    path = %companion_path.display(),
+                    "unreadable lineage companion ({e}); cannot check for a DB restore \
+                     this boot — shape-A regression detection is forfeited until the next \
+                     companion refresh"
+                );
+            }
+        }
+    }
+
+    // Record the post-check state so subsequent restarts compare against it.
+    write_lineage_companion(db_path, conn)?;
+    Ok(rotated)
+}
+
 // ---------------------------------------------------------------------------
 // Sharing identity bundles
 // ---------------------------------------------------------------------------
@@ -6387,6 +6565,17 @@ mod tests {
         db.with_read_conn(|c| {
             assert!(get_media_metadata(c, "m1")?.unwrap().is_servable_at(later));
             assert_eq!(get_group_media_usage_at(c, "sg", later, 300)?, 100);
+    // -- F41: log lineage ----------------------------------------------------
+
+    #[test]
+    fn migrate_mints_a_log_token() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let token = get_log_token(conn)?;
+            assert!(!token.is_empty(), "migrate() must mint a log_token");
+            // Idempotent: re-running migrate keeps the same token.
+            migrate(conn)?;
+            assert_eq!(get_log_token(conn)?, token, "log_token is minted once");
             Ok(())
         })
         .unwrap();
@@ -6803,6 +6992,24 @@ mod tests {
                 "future-TTL blob must survive its old created_at"
             );
             assert!(get_media_metadata(c, "stale-default")?.unwrap().deleted_at.is_some());
+    fn max_issued_batch_rowid_survives_pruning() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+            let seq3 = insert_batch(conn, "sg1", 0, "dev1", "b3", b"d3")?;
+            assert_eq!(get_max_issued_batch_rowid(conn)?, seq3);
+
+            // Prune everything: MAX(id) drops to 0 but the AUTOINCREMENT
+            // high-water mark stays, so a restore that rewinds it is detectable.
+            prune_batches_before(conn, "sg1", seq3 + 1)?;
+            assert_eq!(get_latest_seq(conn, "sg1")?, 0, "all batches pruned");
+            assert_eq!(
+                get_max_issued_batch_rowid(conn)?,
+                seq3,
+                "issued-rowid high-water mark survives pruning"
+            );
             Ok(())
         })
         .unwrap();
@@ -7157,5 +7364,87 @@ mod tests {
             })
             .unwrap();
         assert_eq!((msgs, acks), (0, 0));
+    fn lineage_check_rotates_token_when_companion_is_ahead() {
+        // A file-level restore rewinds the batch seq stream while leaving the
+        // companion file recording the pre-restore high-water mark. The next
+        // startup check must rotate log_token and bump the rotation counter.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lineage.db");
+        let path = path.to_str().unwrap();
+
+        let original_token = {
+            let db = Database::open(path, 2).unwrap();
+            db.with_conn(|conn| {
+                create_sync_group(conn, "sg1", 0)?;
+                insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+                insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+                // Refresh the companion so it records rowid 2 at the clean point.
+                write_lineage_companion(path, conn)?;
+                get_log_token(conn)
+            })
+            .unwrap()
+        };
+
+        // Forge a backup restore: rewind the issued-rowid high-water mark below
+        // the companion's value by deleting batches AND resetting sqlite_sequence.
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute("DELETE FROM batches", []).unwrap();
+            conn.execute("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'batches'", [])
+                .unwrap();
+        }
+
+        // Reopen: the companion (rowid 2) is now ahead of the DB (rowid 0).
+        let db = Database::open(path, 2).unwrap();
+        db.with_conn(|conn| {
+            let new_token = get_log_token(conn)?;
+            assert_ne!(new_token, original_token, "regression must rotate the log_token");
+            let rotations: u64 = conn
+                .query_row(
+                    "SELECT value FROM counters WHERE name = 'log_token_rotations'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            assert_eq!(rotations, 1, "rotation must bump the metric once");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn lineage_check_is_stable_across_clean_restarts() {
+        // Matching companion and DB values => token stays put, no rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lineage_stable.db");
+        let path = path.to_str().unwrap();
+
+        let token1 = {
+            let db = Database::open(path, 2).unwrap();
+            db.with_conn(|conn| {
+                create_sync_group(conn, "sg1", 0)?;
+                insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+                write_lineage_companion(path, conn)?;
+                get_log_token(conn)
+            })
+            .unwrap()
+        };
+
+        // Clean restart: DB and companion agree.
+        let db = Database::open(path, 2).unwrap();
+        let token2 = db
+            .with_conn(|conn| {
+                let rotations: u64 = conn
+                    .query_row(
+                        "SELECT value FROM counters WHERE name = 'log_token_rotations'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                assert_eq!(rotations, 0, "clean restart must not rotate");
+                get_log_token(conn)
+            })
+            .unwrap();
+        assert_eq!(token1, token2, "log_token is stable across clean restarts");
     }
 }

@@ -42,6 +42,7 @@ fn setup_sync_for_upload() -> (PrismSync, Arc<MockRelay>) {
             registered_at: Some(chrono::Utc::now()),
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         })
@@ -122,6 +123,7 @@ async fn upload_pairing_snapshot_invokes_progress_callback() {
             registered_at: Some(chrono::Utc::now()),
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         })
@@ -196,6 +198,7 @@ async fn upload_pairing_snapshot_rejects_oversized() {
             registered_at: Some(chrono::Utc::now()),
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         })
@@ -287,6 +290,7 @@ async fn upload_pairing_snapshot_emits_failed_event_on_error() {
             registered_at: Some(chrono::Utc::now()),
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         })

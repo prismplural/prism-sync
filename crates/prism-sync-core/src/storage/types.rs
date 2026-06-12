@@ -15,6 +15,11 @@ pub struct SyncMetadata {
     pub registered_at: Option<DateTime<Utc>>,
     pub needs_rekey: bool,
     pub last_imported_registry_version: Option<i64>,
+    /// Lineage token of the relay seq stream that issued the current
+    /// `last_pulled_server_seq`. `None` until first seen against a lineage-aware
+    /// relay. A mismatch with a pull response's `log_token` means the relay log
+    /// regressed (restore) and the cursor must be reset.
+    pub relay_log_token: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -117,6 +117,16 @@ pub async fn run_cleanup(state: &AppState) {
             let freelist_after: i64 =
                 conn.query_row("PRAGMA freelist_count;", [], |r| r.get(0)).unwrap_or(0);
             let pages_freed = (freelist_before - freelist_after).max(0) as u64;
+
+            // 16. Refresh the lineage companion so the on-disk max-issued-rowid
+            // high-water mark stays current; a backup that restores only the DB
+            // (leaving this companion) is then caught by the startup check.
+            // Best-effort like the other cleanup steps: a telemetry-grade write
+            // must not abort the whole cleanup-stats closure.
+            if let Err(e) = crate::db::write_lineage_companion(db.db_path(), conn) {
+                tracing::warn!("cleanup: failed to refresh lineage companion: {e}");
+            }
+
             Ok::<_, rusqlite::Error>((
                 nonces,
                 signed_request_nonces,

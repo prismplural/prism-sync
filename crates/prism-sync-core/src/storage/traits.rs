@@ -240,6 +240,17 @@ pub trait SyncStorageTx {
     ///
     /// [`update_last_pulled_seq`]: Self::update_last_pulled_seq
     fn reset_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()>;
+    /// Record the relay log-lineage token observed for this group. Set when
+    /// a lineage-aware relay first reports a `log_token`, and overwritten on a
+    /// detected lineage change (alongside a cursor reset). Device-local.
+    fn update_relay_log_token(&mut self, sync_id: &str, token: &str) -> Result<()>;
+    /// Forget the stored lineage token (set NULL). Used by the
+    /// `cursor_ahead_of_log` recovery — whose 409 carries no token — so the
+    /// follow-up pull's token is adopted fresh rather than re-detected as a
+    /// mismatch and double-counted as a second lineage trip. Default: no-op.
+    fn clear_relay_log_token(&mut self, _sync_id: &str) -> Result<()> {
+        Ok(())
+    }
     fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()>;
     fn update_current_epoch(&mut self, sync_id: &str, epoch: i32) -> Result<()>;
     fn update_last_imported_registry_version(&mut self, sync_id: &str, version: i64) -> Result<()>;
@@ -374,6 +385,15 @@ pub trait SyncStorageTx {
     /// Clear the stall row for `server_seq` once it resolves (keys imported,
     /// batch applied or quarantined). Default: no-op for in-memory impls.
     fn clear_pull_stall(&mut self, _sync_id: &str, _server_seq: i64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear every stall row for the group. A relay-log
+    /// lineage reset re-issues the server-seq space, so all stall rows (keyed by
+    /// old-lineage seqs) are stale and must not survive the reset — a stale row
+    /// past the wall-clock ceiling would quarantine-and-advance a re-issued seq on
+    /// its first transient hiccup. Default: no-op for in-memory impls.
+    fn clear_all_pull_stalls(&mut self, _sync_id: &str) -> Result<()> {
         Ok(())
     }
 

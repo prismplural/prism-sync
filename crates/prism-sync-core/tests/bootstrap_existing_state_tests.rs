@@ -46,6 +46,7 @@ fn setup_sole_device(
             registered_at: Some(chrono::Utc::now()),
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         })

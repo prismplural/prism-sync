@@ -30,6 +30,15 @@ pub struct Metrics {
     pub snapshots_rejected_targeted_cap: AtomicU64,
     pub registrations: AtomicU64,
     pub vacuum_pages_freed: AtomicU64,
+    /// Times the startup lineage check detected a regressed batch sequence (a
+    /// file-level DB restore) and rotated `log_token`. Any nonzero value here is
+    /// an operator-visible signal that clients were forced to reset their cursor.
+    pub log_token_rotations: AtomicU64,
+    /// Times the startup lineage check could not read the companion file
+    /// (truncation, partial write, EACCES). Each one is a boot where shape-A
+    /// restore detection was forfeited — operator-visible because the overwrite
+    /// that follows destroys the evidence.
+    pub lineage_companion_unreadable: AtomicU64,
     pub last_cleanup_epoch_secs: AtomicU64,
     pub media_uploads: AtomicU64,
     pub media_downloads: AtomicU64,
@@ -70,6 +79,8 @@ impl Metrics {
             ("snapshots_rejected_targeted_cap", &self.snapshots_rejected_targeted_cap),
             ("registrations", &self.registrations),
             ("vacuum_pages_freed", &self.vacuum_pages_freed),
+            ("log_token_rotations", &self.log_token_rotations),
+            ("lineage_companion_unreadable", &self.lineage_companion_unreadable),
             ("media_uploads", &self.media_uploads),
             ("media_downloads", &self.media_downloads),
             ("media_bytes_uploaded", &self.media_bytes_uploaded),
@@ -98,6 +109,11 @@ impl Metrics {
             ),
             ("registrations", self.registrations.load(Ordering::Relaxed)),
             ("vacuum_pages_freed", self.vacuum_pages_freed.load(Ordering::Relaxed)),
+            ("log_token_rotations", self.log_token_rotations.load(Ordering::Relaxed)),
+            (
+                "lineage_companion_unreadable",
+                self.lineage_companion_unreadable.load(Ordering::Relaxed),
+            ),
             ("media_uploads", self.media_uploads.load(Ordering::Relaxed)),
             ("media_downloads", self.media_downloads.load(Ordering::Relaxed)),
             ("media_bytes_uploaded", self.media_bytes_uploaded.load(Ordering::Relaxed)),

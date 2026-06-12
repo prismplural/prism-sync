@@ -27,6 +27,8 @@ fn row_to_sync_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncMetadat
         registered_at: None,           // filled below
         needs_rekey: row.get::<_, i32>("needs_rekey")? != 0,
         last_imported_registry_version: row.get("last_imported_registry_version").ok(),
+        // `.ok()` so a SELECT predating the V9 column degrades to None.
+        relay_log_token: row.get::<_, Option<String>>("relay_log_token").ok().flatten(),
         created_at: Utc::now(), // filled below
         updated_at: Utc::now(), // filled below
     })
@@ -426,8 +428,8 @@ fn exec_upsert_sync_metadata(conn: &Connection, meta: &SyncMetadata) -> Result<(
         "INSERT OR REPLACE INTO sync_metadata \
          (sync_id, local_device_id, current_epoch, last_pulled_server_seq, \
           last_pushed_at, last_successful_sync_at, registered_at, needs_rekey, \
-          last_imported_registry_version, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+          last_imported_registry_version, relay_log_token, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             meta.sync_id,
             meta.local_device_id,
@@ -438,6 +440,7 @@ fn exec_upsert_sync_metadata(conn: &Connection, meta: &SyncMetadata) -> Result<(
             meta.registered_at.map(|d| d.to_rfc3339()),
             meta.needs_rekey as i32,
             meta.last_imported_registry_version,
+            meta.relay_log_token,
             meta.created_at.to_rfc3339(),
             meta.updated_at.to_rfc3339(),
         ],
@@ -471,6 +474,36 @@ fn exec_reset_last_pulled_seq(conn: &Connection, sync_id: &str, seq: i64) -> Res
          VALUES (?1, '', 0, ?2, ?3, ?3) \
          ON CONFLICT(sync_id) DO UPDATE SET last_pulled_server_seq = ?2, updated_at = ?3",
         params![sync_id, seq, now],
+    )?;
+    Ok(())
+}
+
+fn exec_update_relay_log_token(conn: &Connection, sync_id: &str, token: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    // Persist the observed lineage token. Inserts a metadata row if the
+    // group has none yet (first pull before any cursor write), otherwise just
+    // overwrites the token without touching the cursor.
+    conn.execute(
+        "INSERT INTO sync_metadata \
+         (sync_id, local_device_id, current_epoch, last_pulled_server_seq, \
+          relay_log_token, created_at, updated_at) \
+         VALUES (?1, '', 0, 0, ?2, ?3, ?3) \
+         ON CONFLICT(sync_id) DO UPDATE SET relay_log_token = ?2, updated_at = ?3",
+        params![sync_id, token, now],
+    )?;
+    Ok(())
+}
+
+fn exec_clear_relay_log_token(conn: &Connection, sync_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    // Forget the stored lineage token without touching the cursor. The
+    // `cursor_ahead_of_log` recovery uses this so the follow-up pull's token is
+    // adopted fresh (the `None` arm) rather than re-detected as a mismatch — the
+    // 409 body carries no token, so the reset and the new-token adoption are two
+    // steps and the in-between state must not still hold the stale token.
+    conn.execute(
+        "UPDATE sync_metadata SET relay_log_token = NULL, updated_at = ?2 WHERE sync_id = ?1",
+        params![sync_id, now],
     )?;
     Ok(())
 }
@@ -779,6 +812,16 @@ fn exec_clear_pull_stall(conn: &Connection, sync_id: &str, server_seq: i64) -> R
         "DELETE FROM pull_stall WHERE sync_id = ?1 AND server_seq = ?2",
         params![sync_id, server_seq],
     )?;
+    Ok(())
+}
+
+fn exec_clear_all_pull_stalls(conn: &Connection, sync_id: &str) -> Result<()> {
+    // A lineage reset gives the group a fresh server-seq
+    // space, so every stall row (keyed by old-lineage server_seq) is stale. A
+    // stale row older than the 24h wall-clock ceiling would otherwise convert a
+    // re-issued seq's first transient failure straight to quarantine-and-advance,
+    // skipping an unapplied batch. Drop them all alongside the cursor reset.
+    conn.execute("DELETE FROM pull_stall WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
 }
 
@@ -1715,6 +1758,14 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_reset_last_pulled_seq(&self.conn, sync_id, seq)
     }
 
+    fn update_relay_log_token(&mut self, sync_id: &str, token: &str) -> Result<()> {
+        exec_update_relay_log_token(&self.conn, sync_id, token)
+    }
+
+    fn clear_relay_log_token(&mut self, sync_id: &str) -> Result<()> {
+        exec_clear_relay_log_token(&self.conn, sync_id)
+    }
+
     fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {
         exec_update_last_successful_sync(&self.conn, sync_id)
     }
@@ -1819,6 +1870,10 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn clear_pull_stall(&mut self, sync_id: &str, server_seq: i64) -> Result<()> {
         exec_clear_pull_stall(&self.conn, sync_id, server_seq)
+    }
+
+    fn clear_all_pull_stalls(&mut self, sync_id: &str) -> Result<()> {
+        exec_clear_all_pull_stalls(&self.conn, sync_id)
     }
 
     // ── Quarantined local push batches ──
@@ -1963,6 +2018,7 @@ mod tests {
             registered_at: Some(now),
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: now,
             updated_at: now,
         }
@@ -3531,6 +3587,42 @@ mod tests {
         tx.commit().unwrap();
         let m = storage.get_sync_metadata("sync-1").unwrap().unwrap();
         assert_eq!(m.last_pulled_server_seq, 7);
+    }
+
+    #[test]
+    fn relay_log_token_round_trips_and_updates_in_place() {
+        // The token persists through upsert and is overwritten by
+        // update_relay_log_token without disturbing the cursor.
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+        tx.update_last_pulled_seq("sync-1", 42).unwrap();
+        tx.update_relay_log_token("sync-1", "lineage-A").unwrap();
+        tx.commit().unwrap();
+
+        let m = storage.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(m.relay_log_token.as_deref(), Some("lineage-A"));
+        assert_eq!(m.last_pulled_server_seq, 42, "token write leaves the cursor intact");
+
+        // A lineage change overwrites the token in place.
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_relay_log_token("sync-1", "lineage-B").unwrap();
+        tx.commit().unwrap();
+        let m = storage.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(m.relay_log_token.as_deref(), Some("lineage-B"));
+        assert_eq!(m.last_pulled_server_seq, 42);
+    }
+
+    #[test]
+    fn update_relay_log_token_creates_metadata_when_missing() {
+        // First lineage-aware pull may arrive before any cursor write.
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.update_relay_log_token("sync-1", "lineage-A").unwrap();
+        tx.commit().unwrap();
+        let m = storage.get_sync_metadata("sync-1").unwrap().unwrap();
+        assert_eq!(m.relay_log_token.as_deref(), Some("lineage-A"));
+        assert_eq!(m.last_pulled_server_seq, 0);
     }
 
     // ── Pull-failure discipline: quarantined_pull_batches + pull_stall ──

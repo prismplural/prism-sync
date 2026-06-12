@@ -5460,6 +5460,7 @@ mod tests {
             registered_at: Some(now),
             needs_rekey: false,
             last_imported_registry_version: Some(7),
+            relay_log_token: None,
             created_at: now,
             updated_at: now,
         };
@@ -6572,6 +6573,10 @@ mod tests {
 
         fn reset_last_pulled_seq(&mut self, sync_id: &str, seq: i64) -> Result<()> {
             self.inner.reset_last_pulled_seq(sync_id, seq)
+        }
+
+        fn update_relay_log_token(&mut self, sync_id: &str, token: &str) -> Result<()> {
+            self.inner.update_relay_log_token(sync_id, token)
         }
 
         fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {

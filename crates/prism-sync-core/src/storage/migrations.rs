@@ -223,6 +223,19 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_consumer_deliveries_sync_id
         ON consumer_deliveries(sync_id, id);
     ",
+    "-- V9: Relay log-lineage token (F41).
+    --
+    -- `relay_log_token` records the lineage token of the relay seq stream that
+    -- issued this group's current `last_pulled_server_seq`. The engine compares it
+    -- to each pull response's `log_token`: a mismatch means the relay's log was
+    -- restored from backup (the seq stream regressed), so the cursor is reset and
+    -- history re-pulled (idempotent LWW merge). NULL until first observed against a
+    -- lineage-aware relay; an old relay omits the field, leaving this NULL and
+    -- behavior unchanged. Device-local, never replicated, never snapshotted.
+    -- Written idempotently: the ALTER is a no-op-equivalent guarded by the version
+    -- gate, so re-running migrations never double-adds the column.
+    ALTER TABLE sync_metadata ADD COLUMN relay_log_token TEXT;
+    ",
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), String> {
@@ -323,6 +336,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(epoch_column_count, 1);
+    }
+
+    #[test]
+    fn v9_adds_relay_log_token_column_and_is_idempotent() {
+        // Stamp a DB at V8 (before the relay_log_token column) and upgrade: V9's
+        // ALTER must add `relay_log_token` exactly once, and re-applying must not
+        // re-add it.
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(8) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 8i64).unwrap();
+        assert_eq!(
+            relay_log_token_column_count(&conn),
+            0,
+            "V8 DB has no relay_log_token column yet"
+        );
+
+        apply(&mut conn).unwrap();
+        assert_eq!(relay_log_token_column_count(&conn), 1, "V9 adds the column");
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // Re-running is a no-op (the version gate stops the ALTER re-firing).
+        apply(&mut conn).unwrap();
+        assert_eq!(relay_log_token_column_count(&conn), 1, "column not double-added");
+    }
+
+    fn relay_log_token_column_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sync_metadata') WHERE name = 'relay_log_token'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]

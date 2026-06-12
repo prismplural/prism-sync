@@ -83,6 +83,8 @@ async fn prometheus_metrics(
     let reconciliation_missing = m.media_reconciliation_missing_files.load(Ordering::Relaxed);
     let snapshots_rejected_targeted_cap =
         m.snapshots_rejected_targeted_cap.load(Ordering::Relaxed);
+    let log_token_rotations = m.log_token_rotations.load(Ordering::Relaxed);
+    let lineage_companion_unreadable = m.lineage_companion_unreadable.load(Ordering::Relaxed);
 
     let output = format!(
         "# HELP prism_connected_devices Current WebSocket connections\n\
@@ -114,7 +116,13 @@ async fn prometheus_metrics(
          prism_media_reconciliation_missing_files {reconciliation_missing}\n\
          # HELP prism_snapshots_rejected_targeted_cap_total Targeted PUT /snapshot rejected with 409 too_many_targeted_snapshots\n\
          # TYPE prism_snapshots_rejected_targeted_cap_total counter\n\
-         prism_snapshots_rejected_targeted_cap_total {snapshots_rejected_targeted_cap}\n",
+         prism_snapshots_rejected_targeted_cap_total {snapshots_rejected_targeted_cap}\n\
+         # HELP prism_log_token_rotations_total Startup lineage checks that detected a regressed batch sequence and rotated log_token\n\
+         # TYPE prism_log_token_rotations_total counter\n\
+         prism_log_token_rotations_total {log_token_rotations}\n\
+         # HELP prism_lineage_companion_unreadable_total Startup lineage checks that could not read the companion file, forfeiting restore detection for that boot\n\
+         # TYPE prism_lineage_companion_unreadable_total counter\n\
+         prism_lineage_companion_unreadable_total {lineage_companion_unreadable}\n",
         m.last_cleanup_epoch_secs.load(Ordering::Relaxed),
     );
 

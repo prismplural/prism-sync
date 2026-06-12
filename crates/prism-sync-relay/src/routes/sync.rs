@@ -204,24 +204,48 @@ pub async fn pull_changes(
     let db = state.db.clone();
     let sid = sync_id.clone();
 
-    let (first_retained_seq, batches, min_acked_seq, password_version) =
+    let (first_retained_seq, batches, min_acked_seq, password_version, log_head_seq, log_token) =
         tokio::task::spawn_blocking(move || {
             // One read transaction so the floor gate, the batch page, the
-            // min-acked seq, and the password version all observe the same WAL
-            // snapshot. A cleanup prune committing mid-read can no longer slip
-            // between the floor read and the batch read, so the must_bootstrap
-            // gate provably matches the page it gates (F18/F46).
+            // min-acked seq, the password version, and the log-head accounting
+            // all observe the same WAL snapshot. A cleanup prune committing
+            // mid-read can no longer slip between the floor read and the batch
+            // read, so the must_bootstrap gate provably matches the page it
+            // gates, and the log-head gate sees a consistent head.
             db.with_read_tx(|conn| {
                 let first_retained = db::get_first_retained_batch_seq(conn, &sid)?;
                 let batches = db::get_batches_since(conn, &sid, since, limit)?;
                 let min_acked = db::get_min_acked_seq(conn, &sid, stale_threshold)?;
                 let pw_version = db::get_password_version(conn, &sid)?.unwrap_or(0);
-                Ok((first_retained, batches, min_acked, pw_version))
+                // The head is the highest seq the log can ever answer for: the
+                // latest issued batch seq, or the pruned floor when every batch
+                // for the group has been pruned (MAX(id)=0 but floor>0). A cursor
+                // above this came from a different lineage (a restored DB).
+                let latest = db::get_latest_seq(conn, &sid)?;
+                let floor = db::get_pruned_floor_seq(conn, &sid)?;
+                let log_head = latest.max(floor);
+                let token = db::get_log_token(conn)?;
+                Ok((first_retained, batches, min_acked, pw_version, log_head, token))
             })
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // The cursor must never sit above the log head. If it does, the relay's seq
+    // stream regressed (a backup restore re-issued lower seqs) and the empty page
+    // an up-to-date client would otherwise read as "in sync" actually masks lost
+    // delivery. Force an explicit reset instead.
+    if since > log_head_seq {
+        tracing::warn!(
+            sync_id = %trunc(&sync_id),
+            device_id = %trunc(&device_id),
+            since,
+            log_head_seq,
+            "Pull cursor is ahead of the log head — lineage regressed"
+        );
+        return Err(AppError::CursorAheadOfLog { since_seq: since, log_head_seq });
+    }
 
     if let Some(first_retained_seq) = first_retained_seq {
         // `since` is the last sequence the client says it has applied. The
@@ -271,6 +295,11 @@ pub async fn pull_changes(
         "max_server_seq": max_server_seq,
         "min_acked_seq": min_acked_seq,
         "password_version": password_version,
+        // Additive: old clients ignore unknown keys. `log_token` identifies
+        // the seq lineage so a client can detect a restore-induced reset;
+        // `log_head_seq` also closes the max_server_seq-echoes-since blindspot.
+        "log_token": log_token,
+        "log_head_seq": log_head_seq,
     })))
 }
 

@@ -151,6 +151,16 @@ impl CoreError {
                 None,
                 None,
             ),
+            // The engine intercepts `CursorAheadOfLog` for the lineage-reset
+            // recovery before this conversion runs; anything reaching here is the
+            // second consecutive trip being surfaced as a protocol error.
+            RelayError::CursorAheadOfLog { .. } => (
+                RelayErrorCategory::Protocol,
+                Some(409),
+                Some("cursor_ahead_of_log".to_string()),
+                None,
+                None,
+            ),
             // The engine intercepts `SnapshotStale` for the audience-
             // compatible suppress paths before this conversion runs;
             // anything that reaches here is being propagated. Callers

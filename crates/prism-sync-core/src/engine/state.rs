@@ -66,6 +66,12 @@ pub struct SyncResult {
     /// sync driver re-arms another cycle so the queue keeps draining without
     /// waiting for a new local mutation. Always `false` on error paths.
     pub push_incomplete: bool,
+    /// Telemetry: `true` when the relay's log lineage regressed this cycle (a
+    /// new `log_token`, or a `cursor_ahead_of_log` response) and the engine reset
+    /// the cursor to re-pull surviving + new history. Telemetry-only for this
+    /// release — there is no user-facing flow; it lets the host surface that a
+    /// relay restore was detected and history was re-fetched.
+    pub log_regressed: bool,
 }
 
 impl Default for SyncResult {
@@ -82,6 +88,7 @@ impl Default for SyncResult {
             remote_wipe: None,
             entity_changes: Vec::new(),
             push_incomplete: false,
+            log_regressed: false,
         }
     }
 }

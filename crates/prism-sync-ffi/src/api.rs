@@ -496,6 +496,10 @@ fn sync_result_to_json(result: &prism_sync_core::engine::SyncResult) -> serde_js
         // still queued; the driver re-arms another cycle. Dart treats such a
         // `SyncCompleted` as mid-drain (no spinner flip / re-query / drain).
         "push_incomplete": result.push_incomplete,
+        // Telemetry: true when the relay's log lineage regressed this cycle
+        // (a restore was detected) and history was re-pulled. Telemetry-only —
+        // no user-facing flow this release; Dart may surface it diagnostically.
+        "log_regressed": result.log_regressed,
     })
 }
 
@@ -5225,6 +5229,7 @@ fn ensure_local_sync_metadata(
             registered_at: Some(now),
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: now,
             updated_at: now,
         },
@@ -6573,6 +6578,7 @@ mod tests {
             registered_at: None,
             needs_rekey: false,
             last_imported_registry_version,
+            relay_log_token: None,
             created_at: now,
             updated_at: now,
         })
@@ -7210,6 +7216,7 @@ mod tests {
             registered_at: None,
             needs_rekey: false,
             last_imported_registry_version: None,
+            relay_log_token: None,
             created_at: now,
             updated_at: now,
         }

@@ -86,6 +86,10 @@ struct MockRelayState {
     ephemeral_sent: Vec<crate::ephemeral::EphemeralEnvelope>,
     ephemeral_acked: HashSet<String>,
     ephemeral_feature_absent: bool,
+    /// Lineage token returned in pull responses. `Some` mimics a current
+    /// relay; `None` mimics an old relay that omits the field (no behavior
+    /// change). Rotating this simulates a restore-induced lineage change.
+    log_token: Option<String>,
 }
 
 /// How an injected `pull_changes` failure should present on the wire.
@@ -99,6 +103,11 @@ pub enum InjectedPullError {
     Server,
     MustBootstrapFromSnapshot {
         first_retained_seq: i64,
+    },
+    /// Relay responded with `cursor_ahead_of_log` — the cursor is above the
+    /// log head after a restore-induced seq regression.
+    CursorAheadOfLog {
+        log_head_seq: i64,
     },
     /// Relay responded with `device_revoked` (optionally requesting a
     /// remote wipe). Used to verify that the engine -> sync_service ->
@@ -149,6 +158,7 @@ impl MockRelay {
                 ephemeral_sent: Vec::new(),
                 ephemeral_acked: HashSet::new(),
                 ephemeral_feature_absent: false,
+                log_token: Some(uuid::Uuid::new_v4().to_string()),
             }),
             notification_tx,
         }
@@ -177,6 +187,15 @@ impl MockRelay {
             self.state.lock().unwrap().ephemeral_acked.iter().cloned().collect();
         v.sort();
         v
+    /// F41: read the current lineage token the mock returns in pull responses.
+    pub fn log_token(&self) -> Option<String> {
+        self.state.lock().unwrap().log_token.clone()
+    }
+
+    /// Set the lineage token (or `None` to mimic an old relay). Changing it
+    /// simulates a restore-induced lineage change between pulls.
+    pub fn set_log_token(&self, token: Option<String>) {
+        self.state.lock().unwrap().log_token = token;
     }
 
     /// Cause the next `put_snapshot` to fail with
@@ -377,6 +396,9 @@ impl SyncTransport for MockRelay {
                             ),
                         }
                     }
+                    InjectedPullError::CursorAheadOfLog { log_head_seq } => {
+                        RelayError::CursorAheadOfLog { since_seq: since, log_head_seq }
+                    }
                     InjectedPullError::DeviceRevoked { remote_wipe } => {
                         RelayError::DeviceRevoked { remote_wipe }
                     }
@@ -402,11 +424,17 @@ impl SyncTransport for MockRelay {
             batches.truncate(limit as usize);
         }
         let max_server_seq = batches.iter().map(|b| b.server_seq).max().unwrap_or(since);
+        // The head is the highest seq ever issued. `None` log_token mimics an
+        // old relay (no field), in which case log_head_seq is also withheld.
+        let log_token = state.log_token.clone();
+        let log_head_seq = log_token.as_ref().map(|_| state.next_server_seq - 1);
         Ok(PullResponse {
             batches,
             max_server_seq,
             min_acked_seq: state.min_acked_seq,
             password_version: None,
+            log_token,
+            log_head_seq,
         })
     }
 

@@ -28,6 +28,7 @@ fn sample_metadata(sync_id: &str) -> SyncMetadata {
         registered_at: Some(Utc::now()),
         needs_rekey: false,
         last_imported_registry_version: None,
+        relay_log_token: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

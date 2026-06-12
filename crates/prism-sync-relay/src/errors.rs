@@ -35,6 +35,14 @@ pub enum AppError {
         "MustBootstrapFromSnapshot(since_seq={since_seq}, first_retained_seq={first_retained_seq})"
     )]
     MustBootstrapFromSnapshot { since_seq: i64, first_retained_seq: i64 },
+    /// A pull cursor sits above the log's head — the relay's seq stream regressed
+    /// (a backup restore re-issued lower seqs) so the client holds a cursor from a
+    /// no-longer-current lineage. Returned as `409 Conflict` with a structured
+    /// `cursor_ahead_of_log` body (mirrors `must_bootstrap_from_snapshot`) so the
+    /// client resets its cursor and re-pulls; an old (0.12.x) client classifies it
+    /// as a generic loud retry rather than reading the empty page as "in sync".
+    #[error("CursorAheadOfLog(since_seq={since_seq}, log_head_seq={log_head_seq})")]
+    CursorAheadOfLog { since_seq: i64, log_head_seq: i64 },
     /// A `PUT /snapshot` upload lost the seq-ordering race. Returned
     /// as `409 Conflict` with a structured `stale_snapshot_seq` body
     /// (`current_server_seq_at`, `current_target_device_id`) so the
@@ -73,6 +81,7 @@ impl IntoResponse for AppError {
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             AppError::StorageFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             AppError::MustBootstrapFromSnapshot { .. } => StatusCode::CONFLICT,
+            AppError::CursorAheadOfLog { .. } => StatusCode::CONFLICT,
             AppError::SnapshotStale { .. } => StatusCode::CONFLICT,
             AppError::TooManyTargetedSnapshots { .. } => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -160,6 +169,20 @@ impl IntoResponse for AppError {
                 }),
             )
                 .into_response(),
+            AppError::CursorAheadOfLog { since_seq, log_head_seq } => {
+                // Local JSON body (mirrors `must_bootstrap_from_snapshot`'s shape
+                // with a distinct `error` code and a `log_head_seq` field). A
+                // 0.12.x client has no branch for this code, so it falls through to
+                // the generic loud-retry path — strictly better than the silent
+                // in-sync misread it does today.
+                let body = serde_json::json!({
+                    "error": "cursor_ahead_of_log",
+                    "message": "Pull cursor is ahead of the relay log head; reset and re-pull",
+                    "since_seq": since_seq,
+                    "log_head_seq": log_head_seq,
+                });
+                (status, Json(body)).into_response()
+            }
             AppError::SnapshotStale { current_server_seq_at, current_target_device_id } => {
                 // Local JSON body rather than a field on the shared
                 // `ErrorBody` — this variant's payload doesn't overlap

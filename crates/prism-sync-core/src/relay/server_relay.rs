@@ -307,6 +307,16 @@ impl ServerRelay {
                                 message,
                             };
                         }
+                        Some("cursor_ahead_of_log") => {
+                            // The cursor sits above the relay's log head — the
+                            // seq stream regressed (a restore re-issued lower seqs).
+                            // The engine resets the cursor and re-pulls.
+                            let since_seq =
+                                json.get("since_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let log_head_seq =
+                                json.get("log_head_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                            return RelayError::CursorAheadOfLog { since_seq, log_head_seq };
+                        }
                         Some("stale_snapshot_seq") => {
                             // Distinct from the `EpochRotation` fallback so
                             // the engine can route the 409 through the
@@ -543,7 +553,20 @@ impl ServerRelay {
         let password_version =
             json.get("password_version").and_then(|v| v.as_i64()).map(|v| v as i32);
 
-        Ok(PullResponse { batches, max_server_seq, min_acked_seq, password_version })
+        // Additive lineage fields. Absent against an old relay → None → the
+        // engine's lineage tracking stays inert and behavior is unchanged.
+        let log_token =
+            json.get("log_token").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let log_head_seq = json.get("log_head_seq").and_then(|v| v.as_i64());
+
+        Ok(PullResponse {
+            batches,
+            max_server_seq,
+            min_acked_seq,
+            password_version,
+            log_token,
+            log_head_seq,
+        })
     }
 }
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use prism_sync_relay::{cleanup, config::Config, db::Database, routes, state::AppState};
+use prism_sync_relay::{cleanup, config::Config, db, db::Database, routes, state::AppState};
 
 #[cfg(all(feature = "test-helpers", not(debug_assertions)))]
 compile_error!("test-helpers feature must not be enabled in release builds");
@@ -48,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(db, config);
     let cleanup_handle = cleanup::spawn_cleanup_task(Arc::new(state.clone()));
+    // Keep a handle to the DB so the shutdown path can persist the lineage
+    // companion after `state` is moved into the router.
+    let shutdown_db = state.db.clone();
     let app = routes::router(state);
 
     let listener =
@@ -60,6 +63,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("shutting down — aborting cleanup task");
     cleanup_handle.abort();
+
+    // Persist the lineage companion at the clean shutdown point so the on-disk
+    // high-water mark reflects every batch issued this run.
+    if let Err(e) =
+        shutdown_db.with_conn(|conn| db::write_lineage_companion(shutdown_db.db_path(), conn))
+    {
+        tracing::warn!("failed to write lineage companion on shutdown: {e}");
+    }
 
     Ok(())
 }

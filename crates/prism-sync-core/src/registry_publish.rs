@@ -289,6 +289,7 @@ mod tests {
             registered_at: None,
             needs_rekey: false,
             last_imported_registry_version: baseline,
+            relay_log_token: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         })

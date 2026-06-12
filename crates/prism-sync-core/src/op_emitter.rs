@@ -1665,6 +1665,10 @@ mod tests {
             self.inner.reset_last_pulled_seq(sync_id, seq)
         }
 
+        fn update_relay_log_token(&mut self, sync_id: &str, token: &str) -> Result<()> {
+            self.inner.update_relay_log_token(sync_id, token)
+        }
+
         fn update_last_successful_sync(&mut self, sync_id: &str) -> Result<()> {
             self.inner.update_last_successful_sync(sync_id)
         }

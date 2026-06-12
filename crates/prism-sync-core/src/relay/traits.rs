@@ -54,6 +54,12 @@ pub enum RelayError {
     #[error("must bootstrap from snapshot: since_seq={since_seq}, first_retained_seq={first_retained_seq}")]
     MustBootstrapFromSnapshot { since_seq: i64, first_retained_seq: i64, message: String },
 
+    /// The pull cursor sits above the relay's log head — the relay's seq
+    /// stream regressed (a backup restore re-issued lower seqs). The engine resets
+    /// the cursor and re-pulls; a second consecutive trip surfaces as an error.
+    #[error("cursor ahead of log: since_seq={since_seq}, log_head_seq={log_head_seq}")]
+    CursorAheadOfLog { since_seq: i64, log_head_seq: i64 },
+
     /// A `PUT /snapshot` upload lost the seq-ordering race against an
     /// existing snapshot. Distinct from [`Self::EpochRotation`] so the
     /// engine can route it through the suppression matrix in
@@ -105,6 +111,7 @@ impl RelayError {
             RelayError::MustBootstrapFromSnapshot { .. } => {
                 RelayErrorKind::MustBootstrapFromSnapshot
             }
+            RelayError::CursorAheadOfLog { .. } => RelayErrorKind::CursorAheadOfLog,
             RelayError::SnapshotStale { .. } => RelayErrorKind::SnapshotStale,
             RelayError::NotFound => RelayErrorKind::NotFound,
             RelayError::Forbidden { .. } => RelayErrorKind::Forbidden,
@@ -142,6 +149,10 @@ pub enum RelayErrorKind {
     KeyChanged,
     DeviceRevoked,
     MustBootstrapFromSnapshot,
+    /// The pull cursor sits above the relay's log head (a restored relay DB
+    /// regressed the seq stream). Not generically retryable — the engine performs
+    /// the lineage-reset recovery (cursor reset + one re-pull) explicitly.
+    CursorAheadOfLog,
     /// Stale snapshot upload — the relay already has a snapshot with a
     /// `server_seq_at` strictly greater than (or equal to) ours. The
     /// caller should treat this as success-equivalent and drop the
@@ -256,6 +267,13 @@ pub struct PullResponse {
     /// The current password version for this sync group.
     /// `None` if the relay is older and doesn't include this field.
     pub password_version: Option<i32>,
+    /// Lineage token identifying the relay's seq stream. `None` against an
+    /// old relay that omits the field — in which case lineage tracking is a no-op
+    /// and behavior is unchanged.
+    pub log_token: Option<String>,
+    /// The highest seq the relay log can answer for (latest issued seq or the
+    /// pruned floor when fully pruned). `None` against an old relay.
+    pub log_head_seq: Option<i64>,
 }
 
 /// A batch received from the relay, including the full signed envelope.

@@ -491,6 +491,117 @@ async fn test_pull_stale_cursor_returns_must_bootstrap_response() {
 }
 
 #[tokio::test]
+async fn test_pull_cursor_above_log_head_returns_409_cursor_ahead_of_log() {
+    // A cursor above the log head can only happen after the relay's seq
+    // stream regressed (a restore re-issued lower seqs). The relay must reject it
+    // loudly instead of answering the empty page an up-to-date client reads as
+    // "in sync".
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let mut last_seq = 0i64;
+    for i in 0..3 {
+        let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
+        let resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+        assert!(resp.status().is_success(), "push failed: {}", resp.status());
+        let json: Value = resp.json().await.unwrap();
+        last_seq = json["server_seq"].as_i64().unwrap();
+    }
+
+    // since == head: a valid up-to-date cursor returns an empty page with the
+    // additive lineage fields present.
+    let at_head = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since={last_seq}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(at_head.status(), 200, "cursor at head is valid");
+    let at_head_json: Value = at_head.json().await.unwrap();
+    assert!(at_head_json["batches"].as_array().unwrap().is_empty());
+    assert_eq!(at_head_json["log_head_seq"].as_i64(), Some(last_seq));
+    assert!(at_head_json["log_token"].as_str().is_some(), "additive log_token present");
+
+    // since > head: regressed lineage → structured 409 with both fields.
+    let ahead = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since={}", last_seq + 5))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ahead.status(), 409);
+    let ahead_json: Value = ahead.json().await.unwrap();
+    assert_eq!(ahead_json["error"].as_str(), Some("cursor_ahead_of_log"));
+    assert_eq!(ahead_json["since_seq"].as_i64(), Some(last_seq + 5));
+    assert_eq!(ahead_json["log_head_seq"].as_i64(), Some(last_seq));
+}
+
+#[tokio::test]
+async fn test_pull_cursor_above_head_for_fully_pruned_group_uses_floor() {
+    // Head accounting: once every batch is pruned, MAX(id)=0 but the head is
+    // the pruned floor. A cursor at the floor is in-sync (200 empty); only a
+    // cursor strictly above the floor trips cursor_ahead_of_log.
+    let (url, _server, relay_db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let mut last_seq = 0i64;
+    for i in 0..3 {
+        let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
+        let resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+        assert!(resp.status().is_success());
+        let json: Value = resp.json().await.unwrap();
+        last_seq = json["server_seq"].as_i64().unwrap();
+    }
+
+    // Prune everything: floor advances to last_seq, MAX(id) drops to 0.
+    relay_db
+        .with_conn(|conn| {
+            db::prune_batches_before(conn, &sync_id, last_seq + 1)?;
+            assert_eq!(db::get_latest_seq(conn, &sync_id)?, 0);
+            assert_eq!(db::get_pruned_floor_seq(conn, &sync_id)?, last_seq);
+            Ok(())
+        })
+        .unwrap();
+
+    // Cursor at the floor: head == floor, so this is in-sync, not ahead.
+    let at_floor = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since={last_seq}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(at_floor.status(), 200, "cursor at the pruned floor is the head, not ahead");
+    let at_floor_json: Value = at_floor.json().await.unwrap();
+    assert_eq!(at_floor_json["log_head_seq"].as_i64(), Some(last_seq));
+
+    // Cursor above the floor: regressed lineage.
+    let above = client
+        .get(format!("{url}/v1/sync/{sync_id}/changes?since={}", last_seq + 1))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(above.status(), 409);
+    let above_json: Value = above.json().await.unwrap();
+    assert_eq!(above_json["error"].as_str(), Some("cursor_ahead_of_log"));
+    assert_eq!(above_json["log_head_seq"].as_i64(), Some(last_seq));
+}
+
+#[tokio::test]
 async fn test_ack_accepts_cursor_at_pruned_floor() {
     let (url, _server, relay_db) = start_test_relay().await;
     let client = Client::new();
@@ -783,4 +894,51 @@ async fn targeted_snapshot_tail_survives_cleanup_before_joiner_registers() {
     let batches = pull_json["batches"].as_array().unwrap();
     assert_eq!(batches.len(), 1, "the tail batch above the snapshot must be delivered");
     assert_eq!(batches[0]["envelope"]["batch_id"].as_str().unwrap(), "tail");
+}
+
+/// Shape-A detection rests on the lineage companion being kept current. Pin
+/// that a cleanup cycle actually refreshes the on-disk companion's
+/// `max_issued_batch_rowid` after new batches are issued — a silent regression of
+/// cleanup step 16 would otherwise let a DB-only restore go undetected.
+#[tokio::test]
+async fn cleanup_refreshes_lineage_companion_high_water_mark() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("relay.db").to_string_lossy().to_string();
+    let mut config = test_config();
+    config.db_path = db_path.clone();
+    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let companion_path = format!("{db_path}.lineage");
+    let read_companion = || {
+        let contents = std::fs::read_to_string(&companion_path).unwrap();
+        serde_json::from_str::<db::LineageCompanion>(&contents).unwrap()
+    };
+
+    // The companion was written at startup before any batch existed.
+    let before = read_companion();
+    assert_eq!(before.max_issued_batch_rowid, 0, "no batch issued yet");
+
+    for i in 0..3 {
+        let envelope = make_test_envelope(&sync_id, &device_id, &format!("batch-{i:03}"), 0);
+        let resp = push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
+        assert!(resp.status().is_success());
+    }
+    let db_max = db.with_read_conn(db::get_max_issued_batch_rowid).unwrap();
+    assert!(db_max >= 3, "three batches advanced the issued-rowid high-water mark");
+
+    prism_sync_relay::cleanup::run_cleanup(&state).await;
+
+    let after = read_companion();
+    assert_eq!(
+        after.max_issued_batch_rowid, db_max,
+        "cleanup step 16 must refresh the companion to the current max issued rowid",
+    );
+    // The token is stable across the refresh (no regression occurred).
+    assert_eq!(after.log_token, before.log_token, "the log token is unchanged by a clean cleanup");
 }

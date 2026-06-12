@@ -103,6 +103,18 @@ fn is_must_bootstrap_from_snapshot(error: &CoreError) -> bool {
     )
 }
 
+/// The relay rejected the pull cursor as above its log head (a restored relay
+/// DB regressed the seq stream). The engine resets the cursor and re-pulls.
+fn is_cursor_ahead_of_log(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Relay {
+            code: Some(code),
+            ..
+        } if code == "cursor_ahead_of_log"
+    )
+}
+
 #[cfg(debug_assertions)]
 fn debug_assert_remote_op_matches_sender(op: &CrdtChange, trusted_sender_device_id: &str) {
     debug_assert_eq!(
@@ -244,6 +256,10 @@ struct PullPhaseResult {
     /// of across the mandated 8 sync cycles / 24h. One stall = one
     /// attempt per cycle.
     stalled: bool,
+    /// `true` when this page observed a relay log-lineage change (new token
+    /// or a `cursor_ahead_of_log` recovery). The cursor has been reset to 0 and
+    /// the cycle re-pulls from the start of the new lineage. Telemetry-only.
+    log_regressed: bool,
 }
 
 /// Outcome of [`SyncEngine::filter_batch_ops`]: either the partition of the
@@ -489,6 +505,7 @@ impl SyncEngine {
                 result.pulled = pr.pulled;
                 result.merged += pr.merged;
                 result.entity_changes.extend(pr.entity_changes);
+                result.log_regressed = pr.log_regressed;
                 min_acked_seq = pr.min_acked_seq;
 
                 // Acknowledge up to the LOCAL pull cursor, not the relay page max
@@ -654,6 +671,80 @@ impl SyncEngine {
         Ok(meta.map(|m| m.last_pulled_server_seq).unwrap_or(0))
     }
 
+    /// Reconcile the relay's log-lineage token against the one we last saw.
+    ///
+    /// Returns `true` when the lineage REGRESSED (a different token than stored)
+    /// — in which case the cursor has been reset to 0 and the new token persisted,
+    /// so the caller must re-pull surviving + new history (idempotent LWW merge).
+    /// Adopting a token on a never-seen group, or matching the stored token,
+    /// returns `false`. An old relay (no `log_token`) is always `false` — lineage
+    /// tracking stays inert and behavior is unchanged.
+    async fn reconcile_log_lineage(
+        &self,
+        sync_id: &str,
+        response_token: Option<&str>,
+    ) -> Result<bool> {
+        let Some(token) = response_token else {
+            return Ok(false);
+        };
+        let token = token.to_string();
+
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let stored = tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??
+            .and_then(|m| m.relay_log_token);
+
+        match stored {
+            // First lineage-aware pull for this group: adopt the token.
+            None => {
+                let storage = self.storage.clone();
+                let sid = sync_id.to_string();
+                let tok = token.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut tx = storage.begin_tx()?;
+                    tx.update_relay_log_token(&sid, &tok)?;
+                    tx.commit()
+                })
+                .await
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+                Ok(false)
+            }
+            // Same lineage: nothing to do.
+            Some(prev) if prev == token => Ok(false),
+            // Lineage changed (relay DB restored): reset the cursor to re-pull from
+            // 0 and persist the new token. The reset MUST go through the explicit
+            // escape hatch — the MAX-monotonic update would silently no-op a reset
+            // to 0.
+            Some(prev) => {
+                tracing::warn!(
+                    sync_id = %sync_id,
+                    old_token = %prev,
+                    new_token = %token,
+                    "relay log lineage changed (likely a relay DB restore); \
+                     resetting pull cursor and re-pulling history"
+                );
+                let storage = self.storage.clone();
+                let sid = sync_id.to_string();
+                let tok = token.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut tx = storage.begin_tx()?;
+                    tx.reset_last_pulled_seq(&sid, 0)?;
+                    tx.update_relay_log_token(&sid, &tok)?;
+                    // The new lineage re-issues the seq space, so every stall row
+                    // (keyed by old-lineage seqs) is stale — drop them in the same
+                    // tx as the cursor reset.
+                    tx.clear_all_pull_stalls(&sid)?;
+                    tx.commit()
+                })
+                .await
+                .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+                Ok(true)
+            }
+        }
+    }
+
     /// Pull phase: drain the relay to head (or the per-cycle budget) by paging.
     ///
     /// Repeatedly pulls fixed-size pages via [`pull_one_page`] and accumulates
@@ -673,21 +764,78 @@ impl SyncEngine {
         let mut total_merged = 0u64;
         let mut all_entity_changes: Vec<EntityChange> = Vec::new();
         let mut max_server_seq = 0i64;
-        // Assigned on every loop iteration (the loop always runs once and writes
-        // this before any break), so it is definitely set by the final return.
+        // Carries the last clean page's value. The lineage-recovery paths `continue`
+        // before assigning these, but they never reach the final return without a
+        // clean page first (the loop ends only on a clean page's break), so the
+        // value read at return is always a clean page's.
         let mut min_acked_seq: Option<i64>;
 
         let page_limit = self.config.pull_page_limit;
         let max_pages = self.config.max_pull_pages_per_cycle;
         let pull_start = Instant::now();
         let mut pages = 0usize;
-        // Like `min_acked_seq`: assigned on every loop iteration before any read,
-        // so the final return always sees the last page's value.
         let mut stalled: bool;
 
+        // Lineage telemetry + recovery bound. `log_regressed` is sticky for the cycle
+        // (set once a lineage change is observed). `consecutive_regressions` caps
+        // recovery at one re-pull: a second consecutive lineage trip (token still
+        // changing, or the relay still 409ing `cursor_ahead_of_log` right after a
+        // reset) surfaces an error rather than looping or silently skipping.
+        let mut log_regressed = false;
+        let mut consecutive_regressions = 0u8;
+
         loop {
-            let (page, page_len) =
-                self.pull_one_page(sync_id, key_hierarchy, device_id).await?;
+            let (page, page_len) = match self.pull_one_page(sync_id, key_hierarchy, device_id).await
+            {
+                Ok(p) => p,
+                Err(e) if is_cursor_ahead_of_log(&e) => {
+                    // The relay rejected the cursor as above its log head — its seq
+                    // stream regressed. Reset to 0, forget the stale token, and clear
+                    // old-lineage stalls, then re-pull. Clearing the token is what
+                    // makes the follow-up pull's (rotated) token ADOPT rather than
+                    // re-trip as a mismatch — so this stays a single bounded retry.
+                    consecutive_regressions += 1;
+                    if consecutive_regressions > 1 {
+                        tracing::error!(
+                            sync_id = %sync_id,
+                            "relay reported cursor_ahead_of_log again right after a reset; \
+                             surfacing instead of looping"
+                        );
+                        return Err(e);
+                    }
+                    log_regressed = true;
+                    tracing::warn!(
+                        sync_id = %sync_id,
+                        "relay reported cursor_ahead_of_log; resetting pull cursor and re-pulling"
+                    );
+                    self.reset_pull_cursor(sync_id).await?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            // A lineage-token change reset the cursor to 0 inside the page
+            // fetch. Re-page from the start of the new lineage, bounded to one
+            // recovery so a relay flapping its token can't spin the cycle.
+            if page.log_regressed {
+                log_regressed = true;
+                consecutive_regressions += 1;
+                if consecutive_regressions > 1 {
+                    tracing::error!(
+                        sync_id = %sync_id,
+                        "relay log token changed again right after a reset; \
+                         surfacing instead of looping"
+                    );
+                    return Err(CoreError::Engine(
+                        "relay log lineage changed repeatedly within one sync cycle; \
+                         the relay may be flapping between restored states"
+                            .to_string(),
+                    ));
+                }
+                continue;
+            }
+            // A clean page resets the consecutive-trip guard.
+            consecutive_regressions = 0;
 
             total_pulled += page.pulled;
             total_merged += page.merged;
@@ -737,7 +885,32 @@ impl SyncEngine {
             max_server_seq,
             min_acked_seq,
             stalled,
+            log_regressed,
         })
+    }
+
+    /// Reset the pull cursor to 0 (escape-hatch rewind) so the cycle re-pulls
+    /// from the start of the relay's regressed lineage. Used by the
+    /// `cursor_ahead_of_log` recovery, where the relay rejected the cursor before
+    /// returning a token to reconcile against.
+    ///
+    /// The same tx also (a) clears the stored lineage token so the follow-up
+    /// pull's token is adopted fresh instead of mismatched and double-counted —
+    /// the 409 body carries no token to persist; and (b) drops all stall rows
+    /// keyed by the now-defunct old-lineage seqs.
+    async fn reset_pull_cursor(&self, sync_id: &str) -> Result<()> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = storage.begin_tx()?;
+            tx.reset_last_pulled_seq(&sid, 0)?;
+            tx.clear_relay_log_token(&sid)?;
+            tx.clear_all_pull_stalls(&sid)?;
+            tx.commit()
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        Ok(())
     }
 
     /// Pull and process a single page (one `pull_changes` round-trip). Returns
@@ -767,6 +940,27 @@ impl SyncEngine {
             .await
             .map_err(CoreError::from_relay)?;
 
+        // Reconcile the relay's log lineage before processing this page. A
+        // lineage change resets the cursor to 0 and re-pulls from the start of the
+        // new lineage — so discard this page (its seqs belong to the new lineage;
+        // re-pulling from 0 is the correct, idempotent recovery) and let the
+        // paging loop re-run. `page_len = 0` here would break the loop, so the
+        // dedicated `log_regressed` signal tells `pull_phase` to re-page instead.
+        if self.reconcile_log_lineage(sync_id, pull_response.log_token.as_deref()).await? {
+            return Ok((
+                PullPhaseResult {
+                    pulled: 0,
+                    merged: 0,
+                    entity_changes: Vec::new(),
+                    max_server_seq: 0,
+                    min_acked_seq: pull_response.min_acked_seq,
+                    stalled: false,
+                    log_regressed: true,
+                },
+                0,
+            ));
+        }
+
         let min_acked_seq = pull_response.min_acked_seq;
         let max_server_seq = pull_response.max_server_seq;
         let page_len = pull_response.batches.len();
@@ -780,6 +974,7 @@ impl SyncEngine {
                     max_server_seq,
                     min_acked_seq,
                     stalled: false,
+                    log_regressed: false,
                 },
                 0,
             ));
@@ -1141,6 +1336,7 @@ impl SyncEngine {
                 max_server_seq,
                 min_acked_seq,
                 stalled,
+                log_regressed: false,
             },
             page_len,
         ))
@@ -3130,6 +3326,7 @@ impl SyncEngine {
                         registered_at,
                         needs_rekey: false,
                         last_imported_registry_version: None,
+                        relay_log_token: None,
                         created_at: now,
                         updated_at: now,
                     },
