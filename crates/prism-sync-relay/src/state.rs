@@ -24,6 +24,10 @@ pub struct Metrics {
     /// `PUT /snapshot` rejected with 409 `stale_snapshot_seq`. Unusual
     /// rates here flag a buggy client or a concurrency regression.
     pub snapshots_rejected_stale: AtomicU64,
+    /// Targeted `PUT /snapshot` rejected with 409 `too_many_targeted_snapshots`
+    /// because the group already holds the per-group cap of unexpired targeted
+    /// rows. Elevated rates flag a pairing storm or stalled pairings.
+    pub snapshots_rejected_targeted_cap: AtomicU64,
     pub registrations: AtomicU64,
     pub vacuum_pages_freed: AtomicU64,
     pub last_cleanup_epoch_secs: AtomicU64,
@@ -63,6 +67,7 @@ impl Metrics {
             ("auth_failures", &self.auth_failures),
             ("snapshots_exchanged", &self.snapshots_exchanged),
             ("snapshots_rejected_stale", &self.snapshots_rejected_stale),
+            ("snapshots_rejected_targeted_cap", &self.snapshots_rejected_targeted_cap),
             ("registrations", &self.registrations),
             ("vacuum_pages_freed", &self.vacuum_pages_freed),
             ("media_uploads", &self.media_uploads),
@@ -87,6 +92,10 @@ impl Metrics {
             ("auth_failures", self.auth_failures.load(Ordering::Relaxed)),
             ("snapshots_exchanged", self.snapshots_exchanged.load(Ordering::Relaxed)),
             ("snapshots_rejected_stale", self.snapshots_rejected_stale.load(Ordering::Relaxed)),
+            (
+                "snapshots_rejected_targeted_cap",
+                self.snapshots_rejected_targeted_cap.load(Ordering::Relaxed),
+            ),
             ("registrations", self.registrations.load(Ordering::Relaxed)),
             ("vacuum_pages_freed", self.vacuum_pages_freed.load(Ordering::Relaxed)),
             ("media_uploads", self.media_uploads.load(Ordering::Relaxed)),

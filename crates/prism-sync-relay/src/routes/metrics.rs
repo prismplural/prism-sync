@@ -81,6 +81,8 @@ async fn prometheus_metrics(
     let ws_notifications_dropped = m.ws_notifications_dropped.load(Ordering::Relaxed);
     let snapshots_rejected_stale = m.snapshots_rejected_stale.load(Ordering::Relaxed);
     let reconciliation_missing = m.media_reconciliation_missing_files.load(Ordering::Relaxed);
+    let snapshots_rejected_targeted_cap =
+        m.snapshots_rejected_targeted_cap.load(Ordering::Relaxed);
 
     let output = format!(
         "# HELP prism_connected_devices Current WebSocket connections\n\
@@ -109,7 +111,10 @@ async fn prometheus_metrics(
          prism_snapshots_rejected_stale_total {snapshots_rejected_stale}\n\
          # HELP prism_media_reconciliation_missing_files Committed/servable media rows whose on-disk file is missing (count the dry-run reconciliation sweep would delete)\n\
          # TYPE prism_media_reconciliation_missing_files gauge\n\
-         prism_media_reconciliation_missing_files {reconciliation_missing}\n",
+         prism_media_reconciliation_missing_files {reconciliation_missing}\n\
+         # HELP prism_snapshots_rejected_targeted_cap_total Targeted PUT /snapshot rejected with 409 too_many_targeted_snapshots\n\
+         # TYPE prism_snapshots_rejected_targeted_cap_total counter\n\
+         prism_snapshots_rejected_targeted_cap_total {snapshots_rejected_targeted_cap}\n",
         m.last_cleanup_epoch_secs.load(Ordering::Relaxed),
     );
 

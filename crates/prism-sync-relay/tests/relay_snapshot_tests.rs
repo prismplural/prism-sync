@@ -13,7 +13,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::Client;
 
 use prism_sync_relay::db;
-use prism_sync_relay::snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES;
+use prism_sync_relay::snapshot_limits::{
+    DEFAULT_TARGETED_SNAPSHOT_TTL_SECS, MAX_SNAPSHOT_WIRE_BYTES, MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+};
 
 use common::*;
 
@@ -148,6 +150,10 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
     .await;
     assert_eq!(upload_resp.status(), 204);
 
+    // A non-target device sees the row as simply absent (404 → client maps to
+    // Ok(None)). The old cross-target 403 path is gone: with per-audience rows
+    // the query never returns another device's targeted snapshot, so there is
+    // no row to forbid.
     let denied_resp = client
         .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
         .header("Authorization", format!("Bearer {token_a}"))
@@ -155,7 +161,7 @@ async fn test_targeted_snapshot_allows_only_intended_device() {
         .send()
         .await
         .unwrap();
-    assert_eq!(denied_resp.status(), 403, "wrong device should be denied");
+    assert_eq!(denied_resp.status(), 404, "non-target device sees no snapshot");
 
     let download_resp = client
         .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
@@ -406,7 +412,11 @@ async fn test_delete_snapshot_by_target_device_removes_it() {
 }
 
 #[tokio::test]
-async fn test_delete_snapshot_by_non_target_device_is_forbidden() {
+async fn test_delete_snapshot_by_non_target_device_returns_404() {
+    // The ACK-delete is a single conditional writer scoped to the caller's own
+    // targeted row. A device that is not the target of any row matches nothing,
+    // so it gets 404 even while another joiner's row exists — and crucially it
+    // cannot delete that other row (the old read-then-delete TOCTOU is gone).
     let (url, _server, db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
@@ -416,7 +426,7 @@ async fn test_delete_snapshot_by_non_target_device_is_forbidden() {
     let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
 
     let joiner_id = generate_device_id();
-    let (_token_joiner, _keys_joiner) = prepare_device(&db, &sync_id, &joiner_id).await;
+    let (token_joiner, _keys_joiner) = prepare_device(&db, &sync_id, &joiner_id).await;
 
     // Third device registered on the same sync group — not the snapshot target.
     let attacker_id = generate_device_id();
@@ -445,7 +455,17 @@ async fn test_delete_snapshot_by_non_target_device_is_forbidden() {
         &keys_attacker,
     )
     .await;
-    assert_eq!(resp.status(), 403, "non-target device must not be able to ACK-delete");
+    assert_eq!(resp.status(), 404, "non-target device's ACK-delete matches no row");
+
+    // The targeted joiner's row is untouched — the attacker could not delete it.
+    let get_resp = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token_joiner}"))
+        .header("X-Device-Id", &joiner_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), 200, "the real target's snapshot must survive");
 }
 
 #[tokio::test]
@@ -988,28 +1008,26 @@ async fn put_snapshot_equal_seq_same_uploader_replaces() {
 }
 
 #[tokio::test]
-async fn put_snapshot_stale_includes_target_in_409_body() {
-    // When a stale upload loses to an existing targeted snapshot, the
-    // 409 body must carry that target so the engine can route the
-    // (Some, Some) cross-target case to propagation. The `snapshots`
-    // table has PRIMARY KEY on `sync_id` alone, so two concurrent
-    // pairing snapshots for different joiners race for one row and
-    // the losing joiner would later 403 on download.
+async fn put_snapshot_different_audiences_coexist() {
+    // Two concurrent pairings target different joiners. With per-audience rows
+    // each lands in its own row regardless of seq order — the lower-seq second
+    // upload is NOT stale against the first (different audience), so it is a
+    // fresh insert, not a 409. Both joiners can then read their own snapshot.
+    // This is the cross-target 403/409 path disappearing.
     let (url, _server, db) = start_test_relay().await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 
-    // Initiator uploads the snapshots; two joiners are the targets.
     let initiator_id = generate_device_id();
     let keys_init = TestDeviceKeys::generate(&initiator_id);
     let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
 
     let joiner_a = generate_device_id();
-    let (_token_a, _keys_a) = prepare_device(&db, &sync_id, &joiner_a).await;
+    let (token_a, _keys_a) = prepare_device(&db, &sync_id, &joiner_a).await;
     let joiner_b = generate_device_id();
-    let (_token_b, _keys_b) = prepare_device(&db, &sync_id, &joiner_b).await;
+    let (token_b, _keys_b) = prepare_device(&db, &sync_id, &joiner_b).await;
 
-    // 1. Initiator uploads snapshot seq=100 targeting joiner-A.
+    // 1. seq=100 targeting joiner-A.
     let resp = put_snapshot_signed(
         &client,
         &url,
@@ -1024,11 +1042,8 @@ async fn put_snapshot_stale_includes_target_in_409_body() {
     .await;
     assert_eq!(resp.status(), 204, "first targeted upload should succeed");
 
-    // 2. Initiator uploads snapshot seq=42 targeting joiner-B.
-    //    seq=42 is stale relative to seq=100, so this loses the race
-    //    against the existing row. The 409 body must report:
-    //      - current_server_seq_at = 100 (the existing row's seq)
-    //      - current_target_device_id = joiner-A (the existing row's target)
+    // 2. seq=42 targeting joiner-B — a different audience, so it does NOT
+    //    contend with A's row even though 42 < 100. Fresh insert, not 409.
     let resp = put_snapshot_signed(
         &client,
         &url,
@@ -1041,20 +1056,71 @@ async fn put_snapshot_stale_includes_target_in_409_body() {
         &[("X-For-Device-Id", &joiner_b)],
     )
     .await;
-    assert_eq!(resp.status(), 409, "stale targeted upload must return Conflict");
+    assert_eq!(resp.status(), 204, "different-audience upload must coexist, not 409");
+
+    // Each joiner reads its own targeted snapshot.
+    let snap_a = fetch_snapshot_json(&client, &url, &sync_id, &joiner_a, &token_a).await;
+    assert_eq!(snap_a["server_seq_at"].as_i64().unwrap(), 100);
+    assert_eq!(BASE64.decode(snap_a["data"].as_str().unwrap()).unwrap(), b"snapshot-for-A");
+
+    let snap_b = fetch_snapshot_json(&client, &url, &sync_id, &joiner_b, &token_b).await;
+    assert_eq!(snap_b["server_seq_at"].as_i64().unwrap(), 42);
+    assert_eq!(BASE64.decode(snap_b["data"].as_str().unwrap()).unwrap(), b"snapshot-for-B");
+}
+
+#[tokio::test]
+async fn put_snapshot_stale_within_audience_includes_target_in_409_body() {
+    // A stale upload for the SAME audience still loses, and the 409 body must
+    // carry that audience's target so the engine routes it through its
+    // suppression matrix.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner = generate_device_id();
+    let (_token_j, _keys_j) = prepare_device(&db, &sync_id, &joiner).await;
+
+    // seq=100 targeting the joiner.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "100",
+        b"snapshot-v1".to_vec(),
+        &[("X-For-Device-Id", &joiner)],
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // seq=42 targeting the SAME joiner — stale within that audience.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "42",
+        b"snapshot-v0".to_vec(),
+        &[("X-For-Device-Id", &joiner)],
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "stale same-audience upload must return Conflict");
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "stale_snapshot_seq");
-    assert_eq!(
-        body["current_server_seq_at"].as_i64().unwrap(),
-        100,
-        "must report the existing snapshot's seq"
-    );
+    assert_eq!(body["current_server_seq_at"].as_i64().unwrap(), 100);
     assert_eq!(
         body["current_target_device_id"].as_str(),
-        Some(joiner_a.as_str()),
-        "must report the existing snapshot's target so the engine can detect cross-target overwrite \
-         (body = {body})"
+        Some(joiner.as_str()),
+        "must report this audience's existing target (body = {body})"
     );
 }
 
@@ -1196,4 +1262,306 @@ async fn put_snapshot_concurrent_higher_seq_wins() {
     );
     let decoded = BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap();
     assert_eq!(decoded.as_slice(), b"hundred");
+}
+
+// ───────────────────── per-audience rows + resource bounds ─────────────────
+
+#[tokio::test]
+async fn concurrent_pairing_snapshots_are_independent() {
+    // Full concurrent-pairing route walk: an initiator pairs two joiners at
+    // once. PUT B@100 and PUT E@101 both succeed (separate audiences), B GETs
+    // its own row, E ACK-deletes only E's row, and B's row still reads 200.
+    // The displaced-joiner-bricking class is gone.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner_b = generate_device_id();
+    let (token_b, _keys_b) = prepare_device(&db, &sync_id, &joiner_b).await;
+    let joiner_e = generate_device_id();
+    let (token_e, keys_e) = prepare_device(&db, &sync_id, &joiner_e).await;
+
+    let put_b = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "100",
+        b"for-B".to_vec(),
+        &[("X-For-Device-Id", &joiner_b)],
+    )
+    .await;
+    assert_eq!(put_b.status(), 204, "PUT B@100 succeeds");
+
+    let put_e = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "101",
+        b"for-E".to_vec(),
+        &[("X-For-Device-Id", &joiner_e)],
+    )
+    .await;
+    assert_eq!(put_e.status(), 204, "PUT E@101 succeeds — no clobber of B's row");
+
+    // B reads its own snapshot.
+    let snap_b = fetch_snapshot_json(&client, &url, &sync_id, &joiner_b, &token_b).await;
+    assert_eq!(snap_b["server_seq_at"].as_i64().unwrap(), 100);
+    assert_eq!(BASE64.decode(snap_b["data"].as_str().unwrap()).unwrap(), b"for-B");
+
+    // E ACK-deletes — removes only E's row.
+    let del_e = delete_snapshot_signed(&client, &url, &sync_id, &joiner_e, &token_e, &keys_e).await;
+    assert_eq!(del_e.status(), 204, "E ACK-deletes its own row");
+
+    // B's row survives E's ACK-delete.
+    let get_b = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token_b}"))
+        .header("X-Device-Id", &joiner_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_b.status(), 200, "B's snapshot must survive E's ACK-delete");
+    let json: serde_json::Value = get_b.json().await.unwrap();
+    assert_eq!(BASE64.decode(json["data"].as_str().unwrap()).unwrap(), b"for-B");
+}
+
+#[tokio::test]
+async fn group_wide_only_group_has_no_ack_shortcut() {
+    // A group-wide (untargeted) snapshot is not ACK-deletable: DELETE from any
+    // device matches no targeted row, so it returns 404 and the row survives to
+    // expire on its TTL. This keeps a device from short-circuiting TTL cleanup.
+    let (url, _server, _db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // Group-wide upload (no X-For-Device-Id).
+    let put = put_snapshot_signed(
+        &client, &url, &sync_id, &device_id, &token, &keys, "5", b"group-wide".to_vec(), &[],
+    )
+    .await;
+    assert_eq!(put.status(), 204);
+
+    let del = delete_snapshot_signed(&client, &url, &sync_id, &device_id, &token, &keys).await;
+    assert_eq!(del.status(), 404, "group-wide rows are not ACK-deletable");
+
+    // Still present.
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 200, "group-wide snapshot must survive a DELETE attempt");
+}
+
+#[tokio::test]
+async fn targeted_snapshot_cap_rejects_new_audience() {
+    // The relay caps concurrent unexpired targeted rows per group. Filling the
+    // cap then targeting a fresh joiner yields 409 too_many_targeted_snapshots;
+    // re-uploading to an existing audience still succeeds (no growth).
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    // Fill the cap with distinct targeted audiences.
+    let mut joiners = Vec::new();
+    for i in 0..MAX_TARGETED_SNAPSHOTS_PER_GROUP {
+        let joiner = generate_device_id();
+        prepare_device(&db, &sync_id, &joiner).await;
+        let resp = put_snapshot_signed(
+            &client,
+            &url,
+            &sync_id,
+            &initiator_id,
+            &token_init,
+            &keys_init,
+            &format!("{}", 100 + i),
+            b"cap-filler".to_vec(),
+            &[("X-For-Device-Id", &joiner)],
+        )
+        .await;
+        assert_eq!(resp.status(), 204, "filler upload {i} should succeed");
+        joiners.push(joiner);
+    }
+
+    // One more distinct audience is rejected.
+    let overflow_joiner = generate_device_id();
+    prepare_device(&db, &sync_id, &overflow_joiner).await;
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "999",
+        b"one-too-many".to_vec(),
+        &[("X-For-Device-Id", &overflow_joiner)],
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "a new audience beyond the cap must be rejected");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "too_many_targeted_snapshots");
+    assert_eq!(body["max"].as_i64().unwrap(), MAX_TARGETED_SNAPSHOTS_PER_GROUP);
+
+    // Re-uploading to an EXISTING audience (higher seq) still succeeds — it
+    // updates a row in place rather than adding one.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "200",
+        b"in-place-update".to_vec(),
+        &[("X-For-Device-Id", &joiners[0])],
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "updating an existing audience must not trip the cap");
+}
+
+#[tokio::test]
+async fn targeted_cap_counts_only_other_unexpired_audiences() {
+    // The cap counts unexpired audiences OTHER than the caller's, so the live
+    // unexpired total can never exceed the cap. Fill the cap, expire one row,
+    // let a fresh joiner take the freed slot, then re-upload to the expired
+    // audience: that refresh is rejected because four other audiences are now
+    // unexpired — the row can't come back to make five.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    // Fill the cap with distinct targeted audiences.
+    let mut joiners = Vec::new();
+    for i in 0..MAX_TARGETED_SNAPSHOTS_PER_GROUP {
+        let joiner = generate_device_id();
+        prepare_device(&db, &sync_id, &joiner).await;
+        let resp = put_snapshot_signed(
+            &client, &url, &sync_id, &initiator_id, &token_init, &keys_init,
+            &format!("{}", 100 + i), b"cap-filler".to_vec(),
+            &[("X-For-Device-Id", &joiner)],
+        )
+        .await;
+        assert_eq!(resp.status(), 204, "filler upload {i} should succeed");
+        joiners.push(joiner);
+    }
+
+    // Expire the first audience's row directly.
+    let expired_joiner = joiners[0].clone();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE snapshots SET expires_at = ?1 WHERE sync_id = ?2 AND target_device_id = ?3",
+            rusqlite::params![db::now_secs() - 10, sync_id, expired_joiner],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    // A fresh joiner now fits in the slot freed by the expired row.
+    let fresh_joiner = generate_device_id();
+    prepare_device(&db, &sync_id, &fresh_joiner).await;
+    let resp = put_snapshot_signed(
+        &client, &url, &sync_id, &initiator_id, &token_init, &keys_init,
+        "500", b"fills-freed-slot".to_vec(), &[("X-For-Device-Id", &fresh_joiner)],
+    )
+    .await;
+    assert_eq!(resp.status(), 204, "a fresh audience may reclaim an expired slot");
+
+    // Re-uploading to the now-expired audience is rejected: the four other
+    // audiences are unexpired, so refreshing this one would make five.
+    let resp = put_snapshot_signed(
+        &client, &url, &sync_id, &initiator_id, &token_init, &keys_init,
+        "501", b"would-be-fifth".to_vec(), &[("X-For-Device-Id", &expired_joiner)],
+    )
+    .await;
+    assert_eq!(resp.status(), 409, "refreshing an expired audience can't exceed the cap");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "too_many_targeted_snapshots");
+}
+
+#[tokio::test]
+async fn targeted_upload_without_ttl_gets_default_ttl() {
+    // A targeted upload with no X-Snapshot-TTL is given the relay default TTL
+    // so it cannot live forever; a group-wide upload keeps no default expiry.
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator_id = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator_id);
+    let token_init = register_device(&client, &url, &sync_id, &initiator_id, &keys_init).await;
+
+    let joiner = generate_device_id();
+    prepare_device(&db, &sync_id, &joiner).await;
+
+    // Targeted, no TTL header.
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "7",
+        b"targeted".to_vec(),
+        &[("X-For-Device-Id", &joiner)],
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // Group-wide, no TTL header.
+    let resp = put_snapshot_signed(
+        &client, &url, &sync_id, &initiator_id, &token_init, &keys_init, "8",
+        b"group-wide".to_vec(), &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    db.with_conn(|conn| {
+        let now = db::now_secs();
+        let targeted_expiry: Option<i64> = conn.query_row(
+            "SELECT expires_at FROM snapshots WHERE sync_id = ?1 AND target_device_id = ?2",
+            rusqlite::params![sync_id, joiner],
+            |row| row.get(0),
+        )?;
+        let targeted_expiry = targeted_expiry.expect("targeted row must have a default TTL");
+        assert!(
+            targeted_expiry >= now + DEFAULT_TARGETED_SNAPSHOT_TTL_SECS - 60
+                && targeted_expiry <= now + DEFAULT_TARGETED_SNAPSHOT_TTL_SECS + 60,
+            "targeted default TTL should be ~{DEFAULT_TARGETED_SNAPSHOT_TTL_SECS}s out, got {}",
+            targeted_expiry - now
+        );
+
+        let group_wide_expiry: Option<i64> = conn.query_row(
+            "SELECT expires_at FROM snapshots WHERE sync_id = ?1 AND target_device_id IS NULL",
+            rusqlite::params![sync_id],
+            |row| row.get(0),
+        )?;
+        assert!(group_wide_expiry.is_none(), "group-wide upload keeps no default TTL");
+        Ok(())
+    })
+    .expect("inspect stored snapshot expiries");
 }

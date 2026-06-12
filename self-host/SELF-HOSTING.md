@@ -286,6 +286,19 @@ copying the file directly.
 Media files live at `MEDIA_STORAGE_PATH` (default `data/media`). Back up this directory
 alongside the database. Media is encrypted ciphertext — safe to store on any backup service.
 
+## Upgrades and rollback
+
+Schema migrations run automatically on boot and are idempotent, so upgrading is just a
+matter of pulling the new image and restarting. Take a backup first regardless.
+
+One migration is not reversible: the relay now stores pair-time snapshots one row per
+target device, which rebuilds the `snapshots` table off its old single-key shape. Rolling
+the relay binary **back** to a pre-upgrade version after this migration has run keeps
+existing snapshots readable (devices still pair and pull), but snapshot **upload** fails on
+the old binary until you re-upgrade or restore the database from a pre-upgrade backup. In
+practice that means a downgraded relay can serve already-paired devices but cannot complete
+new pairings. If you must run an older binary, restore its matching database backup.
+
 ## Monitoring
 
 `GET /metrics` returns Prometheus-format metrics. If `METRICS_TOKEN` is set, requests need

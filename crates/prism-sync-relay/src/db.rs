@@ -412,9 +412,14 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_dedup
             ON batches(sync_id, sender_device_id, batch_id);
 
-        -- Snapshots (one per sync group, with optional TTL for ephemeral snapshots)
+        -- Snapshots (one row per audience: the group-wide row has a NULL
+        -- target_device_id, each pair-time row is targeted at one joiner).
+        -- Uniqueness is per audience via the COALESCE expression index below,
+        -- not a sync_id-only primary key, so concurrent pairings can't clobber
+        -- each other's targeted row. NULL stays the group-wide sentinel so an
+        -- older relay binary still reads these rows correctly after a rollback.
         CREATE TABLE IF NOT EXISTS snapshots (
-            sync_id                 TEXT PRIMARY KEY,
+            sync_id                 TEXT NOT NULL,
             epoch                   INTEGER NOT NULL,
             server_seq_at           INTEGER NOT NULL DEFAULT 0,
             data                    BLOB NOT NULL,
@@ -424,6 +429,11 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             uploaded_by_device_id   TEXT,
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
+        -- The per-audience UNIQUE index is created by
+        -- migrate_snapshots_per_audience() below, NOT here: on a legacy
+        -- sync_id-PK table the index would build cleanly (the PK already keeps
+        -- one row per sync_id) and the migration would then early-return,
+        -- leaving the PK in place and breaking the per-audience upsert.
 
         -- Rekey artifacts (per-device wrapped epoch keys)
         CREATE TABLE IF NOT EXISTS rekey_artifacts (
@@ -623,6 +633,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     // ALTER TABLE ADD COLUMN is a no-op if the table was freshly created above
     // with the columns already present. For pre-existing tables we need to add them.
     migrate_snapshots_ephemeral(conn)?;
+    migrate_snapshots_per_audience(conn)?;
     migrate_devices_remote_wipe(conn)?;
     migrate_devices_pq_columns(conn)?;
     migrate_devices_xwing_column(conn)?;
@@ -794,6 +805,86 @@ fn migrate_snapshots_ephemeral(conn: &Connection) -> Result<(), rusqlite::Error>
     Ok(())
 }
 
+/// Move a legacy `snapshots` table off its `sync_id`-only primary key onto
+/// per-audience uniqueness: one row per `(sync_id, COALESCE(target_device_id,
+/// ''))`. NULL stays the group-wide sentinel so an older relay binary still
+/// reads these rows correctly after a rollback (the rollback-tolerant variant —
+/// no `''` sentinel to misread).
+///
+/// Idempotent. The legacy shape is detected directly — from the `sync_id`-only
+/// primary key, or from duplicate-audience rows that would block the UNIQUE
+/// index — NOT from index existence: `migrate()` no longer creates the audience
+/// index in the base batch precisely because that index builds cleanly on a
+/// legacy PK table and would mask the rebuild. A fresh or already-migrated
+/// table (no PK, no duplicates) only needs the index created. Legacy tables are
+/// rebuilt, collapsing any duplicate-audience rows to the newest (`created_at`,
+/// then `rowid`) so the UNIQUE index can be created without a constraint
+/// failure.
+fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let needs_rebuild =
+        snapshots_have_sync_id_pk(conn)? || snapshots_have_duplicate_audiences(conn)?;
+    if !needs_rebuild {
+        // Fresh or already rebuilt: just ensure the audience index exists. (A
+        // fresh `migrate()` builds the table without the PK and without this
+        // index; a prior rebuild already created it.) IF NOT EXISTS makes this
+        // a no-op on the already-migrated path.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_audience
+                 ON snapshots (sync_id, COALESCE(target_device_id, ''));",
+        )?;
+        return Ok(());
+    }
+
+    // Rebuild the table off its sync_id-only PK onto per-audience uniqueness.
+    // The whole rebuild runs in one transaction (SQLite DDL is transactional)
+    // so a crash mid-migration rolls back cleanly: either the legacy table
+    // survives intact for a retry, or the rebuild is fully committed. Without
+    // it, a crash between CREATE/INSERT and the final RENAME would either brick
+    // boot ("table already exists" on retry) or silently drop every snapshot
+    // row. The defensive pre-drop clears any orphan left by a pre-transaction
+    // build. unchecked_transaction mirrors prune_batches_before.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS snapshots_per_audience_new;
+         CREATE TABLE snapshots_per_audience_new (
+             sync_id                 TEXT NOT NULL,
+             epoch                   INTEGER NOT NULL,
+             server_seq_at           INTEGER NOT NULL DEFAULT 0,
+             data                    BLOB NOT NULL,
+             created_at              INTEGER NOT NULL,
+             expires_at              INTEGER,
+             target_device_id        TEXT,
+             uploaded_by_device_id   TEXT,
+             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+         );
+         -- Copy the newest row per audience. Legacy tables can only hold one
+         -- row per sync_id, but a future re-run (or a hand-doctored DB) might
+         -- carry duplicates; the window keeps the latest and drops the rest.
+         INSERT INTO snapshots_per_audience_new
+             (sync_id, epoch, server_seq_at, data, created_at, expires_at,
+              target_device_id, uploaded_by_device_id)
+         SELECT sync_id, epoch, server_seq_at, data, created_at, expires_at,
+                target_device_id, uploaded_by_device_id
+         FROM (
+             SELECT *, ROW_NUMBER() OVER (
+                 PARTITION BY sync_id, COALESCE(target_device_id, '')
+                 ORDER BY created_at DESC, rowid DESC
+             ) AS rn
+             FROM snapshots
+         )
+         WHERE rn = 1;
+         DROP TABLE snapshots;
+         ALTER TABLE snapshots_per_audience_new RENAME TO snapshots;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_audience
+             ON snapshots (sync_id, COALESCE(target_device_id, ''));
+         CREATE INDEX IF NOT EXISTS idx_snapshots_expires_at
+             ON snapshots (expires_at) WHERE expires_at IS NOT NULL;",
+    )?;
+    tx.commit()?;
+
+    Ok(())
+}
+
 /// Add remote_wipe column to an existing `devices` table.
 /// Safe to call repeatedly — checks for column existence first.
 fn migrate_devices_remote_wipe(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -854,6 +945,36 @@ fn snapshot_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite
         }
     }
     Ok(false)
+}
+
+/// True if the legacy `snapshots` table is still keyed on a `sync_id`-only
+/// primary key (every deployed relay before the per-audience rebuild). The `pk`
+/// column of `table_info` is the 1-based position in the primary key, so any row
+/// with `pk > 0` means a declared primary key — the per-audience table has none.
+fn snapshots_have_sync_id_pk(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let max_pk: i64 = conn
+        .query_row("SELECT MAX(pk) FROM pragma_table_info('snapshots')", [], |row| row.get(0))
+        .unwrap_or(0);
+    Ok(max_pk > 0)
+}
+
+/// True if any `(sync_id, COALESCE(target_device_id, ''))` audience holds more
+/// than one row — which a real legacy PK table can't, but a hand-doctored or
+/// partially-migrated DB might. Such a table must be rebuilt (to collapse the
+/// duplicates) before the UNIQUE audience index can be created.
+fn snapshots_have_duplicate_audiences(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let dup: bool = conn
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM snapshots
+                 GROUP BY sync_id, COALESCE(target_device_id, '')
+                 HAVING COUNT(*) > 1
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    Ok(dup)
 }
 
 fn sync_group_has_column(conn: &Connection, column: &str) -> Result<bool, rusqlite::Error> {
@@ -1980,10 +2101,14 @@ pub fn upsert_snapshot(
     uploaded_by_device_id: Option<&str>,
 ) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
+    // The conflict target is the per-audience expression index, so the
+    // seq/expiry/same-uploader replacement guard only ever compares against the
+    // row for THIS audience. An upload targeted at one joiner can never replace
+    // the group-wide row or another joiner's targeted row.
     let affected = conn.execute(
         "INSERT INTO snapshots (sync_id, epoch, server_seq_at, data, created_at, expires_at, target_device_id, uploaded_by_device_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(sync_id) DO UPDATE SET
+         ON CONFLICT(sync_id, COALESCE(target_device_id, '')) DO UPDATE SET
             epoch = excluded.epoch,
             server_seq_at = excluded.server_seq_at,
             data = excluded.data,
@@ -2012,34 +2137,53 @@ pub fn upsert_snapshot(
     Ok(affected)
 }
 
-/// Look up `(server_seq_at, target_device_id)` of the stored snapshot.
+/// Look up `(server_seq_at, target_device_id)` of the stored snapshot for one
+/// audience: the caller's own targeted row (`audience_device_id`) if present,
+/// else the group-wide row.
 ///
-/// Used by the put-snapshot handler on a stale-upload rejection so the
-/// 409 body can carry the existing target alongside its seq, which
-/// drives the engine's suppression matrix. Does not filter expired
-/// rows — callers invoke this immediately after a write-side rejection.
+/// Used by the put-snapshot handler on a stale-upload rejection so the 409 body
+/// carries the existing row's seq and target for the audience the upload
+/// actually contended for — scoped, because an upload for one joiner only ever
+/// conflicts with its own audience row. Does not filter expired rows; callers
+/// invoke this immediately after a write-side rejection.
 pub fn get_snapshot_seq_and_target(
     conn: &Connection,
     sync_id: &str,
+    audience_device_id: &str,
 ) -> Result<Option<(i64, Option<String>)>, rusqlite::Error> {
     conn.query_row(
-        "SELECT server_seq_at, target_device_id FROM snapshots WHERE sync_id = ?1",
-        params![sync_id],
+        "SELECT server_seq_at, target_device_id FROM snapshots
+         WHERE sync_id = ?1 AND COALESCE(target_device_id, '') = ?2",
+        params![sync_id, audience_device_id],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
     )
     .optional()
 }
 
+/// Fetch the unexpired snapshot for `requesting_device_id`: its own targeted
+/// row if one exists, otherwise the group-wide row. A row targeted at another
+/// device is invisible here, so the cross-target 403 path disappears — a
+/// non-target simply gets `None` (404 → client maps to `Ok(None)`).
+///
+/// Preference is by AUDIENCE, not freshness: a stale targeted row deliberately
+/// shadows a newer group-wide row for its target, because the targeted row is
+/// the pairing-time bootstrap the initiator prepared for exactly that device. A
+/// future untargeted group-wide re-supply path (media-completeness work) would
+/// make this preference load-bearing and should revisit the ORDER BY.
 pub fn get_snapshot(
     conn: &Connection,
     sync_id: &str,
+    requesting_device_id: &str,
 ) -> Result<Option<SnapshotRecord>, rusqlite::Error> {
     conn.query_row(
         "SELECT data, epoch, server_seq_at, target_device_id, uploaded_by_device_id
          FROM snapshots
          WHERE sync_id = ?1
-           AND (expires_at IS NULL OR expires_at >= unixepoch())",
-        params![sync_id],
+           AND (target_device_id = ?2 OR target_device_id IS NULL)
+           AND (expires_at IS NULL OR expires_at >= unixepoch())
+         ORDER BY (target_device_id IS NOT NULL) DESC
+         LIMIT 1",
+        params![sync_id, requesting_device_id],
         |row| {
             Ok(SnapshotRecord {
                 data: row.get(0)?,
@@ -2053,9 +2197,20 @@ pub fn get_snapshot(
     .optional()
 }
 
-/// Delete the snapshot for a sync group. Returns `true` if a row was deleted.
-pub fn delete_snapshot(conn: &Connection, sync_id: &str) -> Result<bool, rusqlite::Error> {
-    let rows = conn.execute("DELETE FROM snapshots WHERE sync_id = ?1", params![sync_id])?;
+/// Conditionally ACK-delete the caller's own targeted snapshot row. The single
+/// `DELETE ... WHERE sync_id = ?1 AND target_device_id = ?2` statement is the
+/// whole writer — no read-then-delete, so there is no TOCTOU window for a
+/// concurrent pairing to lose its row. Group-wide rows (NULL target) are never
+/// ACK-deletable, so they are not matched. Returns `true` if a row was deleted.
+pub fn delete_snapshot(
+    conn: &Connection,
+    sync_id: &str,
+    target_device_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let rows = conn.execute(
+        "DELETE FROM snapshots WHERE sync_id = ?1 AND target_device_id = ?2",
+        params![sync_id, target_device_id],
+    )?;
     Ok(rows > 0)
 }
 
@@ -2066,6 +2221,30 @@ pub fn cleanup_expired_snapshots(conn: &Connection) -> Result<usize, rusqlite::E
         [],
     )?;
     Ok(rows)
+}
+
+/// Count the group's unexpired *targeted* snapshot rows (NULL group-wide rows
+/// excluded), optionally skipping one audience (`exclude_target`). Bounds
+/// concurrent pairings: each targeted row can hold up to `MAX_SNAPSHOT_WIRE_BYTES`,
+/// so an uncapped count would let a pathological burst of pairings fill the
+/// relay. The put handler counts the *other* audiences (excluding the caller's
+/// own) and rejects once that reaches the cap — so re-uploading to an existing
+/// audience never trips it, and an expired-then-refreshed caller row can't push
+/// the live total to cap+1.
+pub fn count_unexpired_targeted_snapshots(
+    conn: &Connection,
+    sync_id: &str,
+    exclude_target: Option<&str>,
+) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM snapshots
+         WHERE sync_id = ?1
+           AND target_device_id IS NOT NULL
+           AND target_device_id IS NOT ?2
+           AND (expires_at IS NULL OR expires_at >= unixepoch())",
+        params![sync_id, exclude_target],
+        |row| row.get(0),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4318,25 +4497,35 @@ mod tests {
             create_sync_group(conn, "sg1", 0)?;
 
             // No snapshot initially
-            let snap = get_snapshot(conn, "sg1")?;
+            let snap = get_snapshot(conn, "sg1", "dev2")?;
             assert!(snap.is_none());
 
+            // Group-wide row (NULL target).
             upsert_snapshot(conn, "sg1", 1, 10, b"snap_data", None, None, None)?;
 
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
+            let snap = get_snapshot(conn, "sg1", "dev2")?.unwrap();
             assert_eq!(snap.epoch, 1);
             assert_eq!(snap.server_seq_at, 10);
             assert_eq!(snap.data, b"snap_data");
             assert_eq!(snap.uploaded_by_device_id, None);
 
-            // Upsert replaces
+            // A targeted upload for dev2 is a SEPARATE audience — it coexists
+            // with the group-wide row rather than replacing it.
             upsert_snapshot(conn, "sg1", 2, 20, b"snap_data_v2", None, Some("dev2"), Some("dev1"))?;
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
+
+            // dev2 sees its own targeted row (preferred over group-wide).
+            let snap = get_snapshot(conn, "sg1", "dev2")?.unwrap();
             assert_eq!(snap.epoch, 2);
             assert_eq!(snap.server_seq_at, 20);
             assert_eq!(snap.data, b"snap_data_v2");
             assert_eq!(snap.target_device_id.as_deref(), Some("dev2"));
             assert_eq!(snap.uploaded_by_device_id.as_deref(), Some("dev1"));
+
+            // A different device still gets the untouched group-wide row.
+            let snap = get_snapshot(conn, "sg1", "dev3")?.unwrap();
+            assert_eq!(snap.server_seq_at, 10);
+            assert_eq!(snap.data, b"snap_data");
+            assert!(snap.target_device_id.is_none());
 
             Ok(())
         })
@@ -4627,7 +4816,7 @@ mod tests {
             // Verify all gone
             assert_eq!(get_sync_group_epoch(conn, "sg1")?, None);
             assert!(get_device(conn, "sg1", "dev1")?.is_none());
-            assert!(get_snapshot(conn, "sg1")?.is_none());
+            assert!(get_snapshot(conn, "sg1", "dev1")?.is_none());
             assert_eq!(get_latest_seq(conn, "sg1")?, 0);
             assert!(get_rekey_artifact(conn, "sg1", 1, "dev1")?.is_none());
             let rev_count: i64 = conn.query_row(
@@ -4835,8 +5024,9 @@ mod tests {
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
             assert_eq!(seq, Some(10));
 
-            // Delete snapshot => no prune point even with ACKs.
-            delete_snapshot(conn, "sg1")?;
+            // Remove the group-wide snapshot => no prune point even with ACKs.
+            // Group-wide rows aren't ACK-deletable, so drop it directly.
+            conn.execute("DELETE FROM snapshots WHERE sync_id = ?1", params!["sg1"])?;
             let seq = get_safe_prune_seq(conn, "sg1", 3600)?;
             assert_eq!(seq, None);
 
@@ -4926,22 +5116,247 @@ mod tests {
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
 
-            // Delete non-existent snapshot returns false
-            assert!(!delete_snapshot(conn, "sg1")?);
+            // Delete with no targeted row returns false.
+            assert!(!delete_snapshot(conn, "sg1", "dev2")?);
 
-            upsert_snapshot(conn, "sg1", 1, 10, b"data", None, None, None)?;
-            assert!(get_snapshot(conn, "sg1")?.is_some());
+            // ACK-delete only ever removes the caller's own targeted row.
+            upsert_snapshot(conn, "sg1", 1, 10, b"data", None, Some("dev2"), Some("dev1"))?;
+            assert!(get_snapshot(conn, "sg1", "dev2")?.is_some());
 
-            // Delete existing snapshot returns true
-            assert!(delete_snapshot(conn, "sg1")?);
-            assert!(get_snapshot(conn, "sg1")?.is_none());
+            // A non-target device cannot ACK-delete it.
+            assert!(!delete_snapshot(conn, "sg1", "dev3")?);
+            assert!(get_snapshot(conn, "sg1", "dev2")?.is_some());
 
-            // Second delete returns false
-            assert!(!delete_snapshot(conn, "sg1")?);
+            // The target device removes exactly its own row.
+            assert!(delete_snapshot(conn, "sg1", "dev2")?);
+            assert!(get_snapshot(conn, "sg1", "dev2")?.is_none());
+
+            // Second delete returns false.
+            assert!(!delete_snapshot(conn, "sg1", "dev2")?);
+
+            // A group-wide (NULL target) row is NOT ACK-deletable.
+            upsert_snapshot(conn, "sg1", 1, 11, b"group", None, None, Some("dev1"))?;
+            assert!(!delete_snapshot(conn, "sg1", "dev2")?);
+            assert!(get_snapshot(conn, "sg1", "dev2")?.is_some());
 
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn migrate_snapshots_per_audience_collapses_duplicates_and_creates_index() {
+        // Build a pre-migration `snapshots` table: the legacy schema, no
+        // audience index. Seed a group-wide row, a targeted row, AND a
+        // duplicate-audience pair for the same target. The migration must keep
+        // the newest row per audience, create the unique index, and leave every
+        // surviving row readable under per-audience semantics.
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        // Minimal `sync_groups` so the rebuilt table's FK target resolves.
+        conn.execute_batch(
+            "CREATE TABLE sync_groups (sync_id TEXT PRIMARY KEY);
+             INSERT INTO sync_groups (sync_id) VALUES ('sg1');
+             CREATE TABLE snapshots (
+                 sync_id                 TEXT NOT NULL,
+                 epoch                   INTEGER NOT NULL,
+                 server_seq_at           INTEGER NOT NULL DEFAULT 0,
+                 data                    BLOB NOT NULL,
+                 created_at              INTEGER NOT NULL,
+                 expires_at              INTEGER,
+                 target_device_id        TEXT,
+                 uploaded_by_device_id   TEXT
+             );",
+        )
+        .unwrap();
+
+        let insert = |target: Option<&str>, seq: i64, created: i64, data: &[u8]| {
+            conn.execute(
+                "INSERT INTO snapshots
+                     (sync_id, epoch, server_seq_at, data, created_at, target_device_id)
+                 VALUES ('sg1', 0, ?1, ?2, ?3, ?4)",
+                params![seq, data, created, target],
+            )
+            .unwrap();
+        };
+
+        // Group-wide row.
+        insert(None, 10, 100, b"group-wide");
+        // Two rows for the SAME targeted audience (dev_b): keep the newer one.
+        insert(Some("dev_b"), 20, 100, b"old-for-b");
+        insert(Some("dev_b"), 21, 200, b"new-for-b");
+        // A distinct targeted audience.
+        insert(Some("dev_c"), 30, 100, b"for-c");
+
+        migrate_snapshots_per_audience(&conn).expect("migration runs");
+
+        // The unique audience index now exists.
+        let has_index: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_snapshots_audience')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_index, "audience index must be created");
+
+        // Exactly three rows survive: one per audience.
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 3, "duplicate audience collapsed to one row");
+
+        // The newest row per audience won.
+        let dev_b = get_snapshot(&conn, "sg1", "dev_b").unwrap().unwrap();
+        assert_eq!(dev_b.server_seq_at, 21);
+        assert_eq!(dev_b.data, b"new-for-b");
+
+        let dev_c = get_snapshot(&conn, "sg1", "dev_c").unwrap().unwrap();
+        assert_eq!(dev_c.data, b"for-c");
+
+        // A non-target falls back to the group-wide row.
+        let group = get_snapshot(&conn, "sg1", "dev_z").unwrap().unwrap();
+        assert_eq!(group.data, b"group-wide");
+        assert!(group.target_device_id.is_none());
+
+        // Idempotent: a second run is a no-op (index already present).
+        migrate_snapshots_per_audience(&conn).expect("migration is idempotent");
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 3);
+    }
+
+    /// Build a faithful legacy on-disk DB at `path` whose `snapshots` table
+    /// still carries the original `sync_id TEXT PRIMARY KEY`, then seed one
+    /// targeted row. If `pre_ephemeral`, the table predates the ephemeral
+    /// migration and has no `target_device_id` / `uploaded_by_device_id`
+    /// columns (those get added by `migrate_snapshots_ephemeral` on open).
+    fn seed_legacy_snapshot_db(path: &str, pre_ephemeral: bool) {
+        let conn = Connection::open(path).expect("open legacy db");
+        conn.execute_batch(
+            "CREATE TABLE sync_groups (
+                 sync_id          TEXT PRIMARY KEY,
+                 current_epoch    INTEGER NOT NULL DEFAULT 0,
+                 needs_rekey      INTEGER NOT NULL DEFAULT 0,
+                 password_version INTEGER NOT NULL DEFAULT 0,
+                 pruned_floor_seq INTEGER NOT NULL DEFAULT 0,
+                 created_at       INTEGER NOT NULL,
+                 updated_at       INTEGER NOT NULL
+             );
+             INSERT INTO sync_groups (sync_id, created_at, updated_at)
+                 VALUES ('sg1', 0, 0);",
+        )
+        .unwrap();
+        if pre_ephemeral {
+            conn.execute_batch(
+                "CREATE TABLE snapshots (
+                     sync_id       TEXT PRIMARY KEY,
+                     epoch         INTEGER NOT NULL,
+                     server_seq_at INTEGER NOT NULL DEFAULT 0,
+                     data          BLOB NOT NULL,
+                     created_at    INTEGER NOT NULL,
+                     expires_at    INTEGER,
+                     FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+                 );
+                 INSERT INTO snapshots (sync_id, epoch, server_seq_at, data, created_at)
+                     VALUES ('sg1', 0, 100, X'01', 1);",
+            )
+            .unwrap();
+        } else {
+            conn.execute_batch(
+                "CREATE TABLE snapshots (
+                     sync_id               TEXT PRIMARY KEY,
+                     epoch                 INTEGER NOT NULL,
+                     server_seq_at         INTEGER NOT NULL DEFAULT 0,
+                     data                  BLOB NOT NULL,
+                     created_at            INTEGER NOT NULL,
+                     expires_at            INTEGER,
+                     target_device_id      TEXT,
+                     uploaded_by_device_id TEXT,
+                     FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+                 );
+                 INSERT INTO snapshots
+                     (sync_id, epoch, server_seq_at, data, created_at, target_device_id)
+                     VALUES ('sg1', 0, 100, X'01', 1, 'dev_b');",
+            )
+            .unwrap();
+        }
+    }
+
+    /// Assert that after `Database::open`, the rebuilt `snapshots` table accepts
+    /// two distinct audiences (proving the sync_id-only PK is gone) and that no
+    /// primary-key-origin index survives.
+    fn assert_two_audiences_coexist(db: &Database) {
+        db.with_conn(|conn| {
+            // Add two fresh targeted audiences. Under the legacy sync_id-only PK
+            // the second insert raised `UNIQUE constraint failed: snapshots.sync_id`
+            // -> AppError::Internal -> 500. Both shapes already hold one
+            // pre-migration row (group-wide or dev_b), so these two are distinct
+            // from it and from each other.
+            assert_eq!(
+                upsert_snapshot(conn, "sg1", 0, 201, b"\x02", None, Some("dev_e"), Some("up"))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                upsert_snapshot(conn, "sg1", 0, 202, b"\x03", None, Some("dev_f"), Some("up"))
+                    .unwrap(),
+                1
+            );
+
+            let targeted: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM snapshots WHERE target_device_id IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(targeted >= 2, "two targeted audiences must coexist, got {targeted}");
+
+            // No primary-key-origin index survives the rebuild — only the
+            // hand-built audience/expiry indexes remain.
+            let mut stmt = conn.prepare("PRAGMA index_list('snapshots')").unwrap();
+            let origins: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                !origins.iter().any(|o| o == "pk"),
+                "the sync_id-only primary key must not survive the rebuild"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn database_open_rebuilds_legacy_post_ephemeral_snapshots() {
+        // The real upgrade path: a legacy post-ephemeral DB file opened through
+        // Database::open (so the base migrate() batch runs first). Before the
+        // blocker fix the base batch created the audience index directly on the
+        // PK table, the migration early-returned, and the PK survived.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_post_ephemeral.db");
+        let path = path.to_str().unwrap();
+        seed_legacy_snapshot_db(path, false);
+
+        let db = Database::open(path, 2).expect("relay must boot on a legacy DB");
+        assert_two_audiences_coexist(&db);
+    }
+
+    #[test]
+    fn database_open_rebuilds_legacy_pre_ephemeral_snapshots() {
+        // Pre-ephemeral legacy DB (no target_device_id column). Before the fix,
+        // the base batch's `CREATE UNIQUE INDEX ... COALESCE(target_device_id)`
+        // failed with `no such column: target_device_id` and the relay would
+        // not boot at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_pre_ephemeral.db");
+        let path = path.to_str().unwrap();
+        seed_legacy_snapshot_db(path, true);
+
+        let db = Database::open(path, 2).expect("relay must boot on a pre-ephemeral legacy DB");
+        assert_two_audiences_coexist(&db);
     }
 
     #[test]
@@ -4955,18 +5370,18 @@ mod tests {
             // in `tests/relay_snapshot_tests.rs`.
             let past = now_secs() - 60;
             upsert_snapshot(conn, "sg1", 1, 10, b"expired", Some(past), None, Some("dev1"))?;
-            let snap = get_snapshot(conn, "sg1")?;
+            let snap = get_snapshot(conn, "sg1", "dev2")?;
             assert!(snap.is_none(), "expired snapshot should not be returned");
 
             let future = now_secs() + 3600;
             upsert_snapshot(conn, "sg1", 1, 11, b"valid", Some(future), None, Some("dev1"))?;
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
+            let snap = get_snapshot(conn, "sg1", "dev2")?.unwrap();
             assert_eq!(snap.data, b"valid");
             assert_eq!(snap.uploaded_by_device_id.as_deref(), Some("dev1"));
 
             // Snapshot with no expiry (legacy) is always returned.
             upsert_snapshot(conn, "sg1", 1, 12, b"permanent", None, None, None)?;
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
+            let snap = get_snapshot(conn, "sg1", "dev2")?.unwrap();
             assert_eq!(snap.data, b"permanent");
             assert_eq!(snap.uploaded_by_device_id, None);
 
@@ -4998,9 +5413,9 @@ mod tests {
             assert_eq!(cleaned, 1);
 
             // sg1 gone, sg2 and sg3 still present
-            assert!(get_snapshot(conn, "sg1")?.is_none());
-            assert!(get_snapshot(conn, "sg2")?.is_some());
-            assert!(get_snapshot(conn, "sg3")?.is_some());
+            assert!(get_snapshot(conn, "sg1", "dev1")?.is_none());
+            assert!(get_snapshot(conn, "sg2", "dev2")?.is_some());
+            assert!(get_snapshot(conn, "sg3", "dev1")?.is_some());
 
             // Running again removes nothing
             let cleaned = cleanup_expired_snapshots(conn)?;
@@ -5040,18 +5455,18 @@ mod tests {
             )?;
 
             // Device B can download it (not expired)
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
+            let snap = get_snapshot(conn, "sg1", "dev_b")?.unwrap();
             assert_eq!(snap.data, b"snap_data");
             assert_eq!(snap.epoch, 0);
             assert_eq!(snap.server_seq_at, 10);
             assert_eq!(snap.target_device_id.as_deref(), Some("dev_b"));
             assert_eq!(snap.uploaded_by_device_id.as_deref(), Some("dev_a"));
 
-            // Simulate auto-delete (what the HTTP handler does after cross-device download)
-            assert!(delete_snapshot(conn, "sg1")?);
+            // Target device ACK-deletes its own row.
+            assert!(delete_snapshot(conn, "sg1", "dev_b")?);
 
             // Subsequent download returns None (404)
-            let snap = get_snapshot(conn, "sg1")?;
+            let snap = get_snapshot(conn, "sg1", "dev_b")?;
             assert!(snap.is_none(), "snapshot should be gone after auto-delete");
 
             Ok(())
@@ -5378,7 +5793,7 @@ mod tests {
             )?;
 
             // Get should return None (expired)
-            let snap = get_snapshot(conn, "sg1")?;
+            let snap = get_snapshot(conn, "sg1", "dev1")?;
             assert!(snap.is_none(), "expired snapshot should return None");
 
             Ok(())
@@ -5401,7 +5816,7 @@ mod tests {
             assert_eq!(cleaned, 0, "legacy snapshot should not be cleaned up");
 
             // Verify still accessible
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
+            let snap = get_snapshot(conn, "sg1", "dev1")?.unwrap();
             assert_eq!(snap.data, b"legacy_data");
             assert_eq!(snap.uploaded_by_device_id, None);
 
@@ -5430,9 +5845,9 @@ mod tests {
             assert_eq!(cleaned, 1, "only expired snapshot should be cleaned");
 
             // sg_a still exists
-            assert!(get_snapshot(conn, "sg_a")?.is_some(), "valid snapshot should exist");
+            assert!(get_snapshot(conn, "sg_a", "dev1")?.is_some(), "valid snapshot should exist");
             // sg_b gone
-            assert!(get_snapshot(conn, "sg_b")?.is_none(), "expired snapshot should be gone");
+            assert!(get_snapshot(conn, "sg_b", "dev2")?.is_none(), "expired snapshot should be gone");
 
             Ok(())
         })
@@ -5473,8 +5888,10 @@ mod tests {
     /// Test 10: Auto-delete only for different device — verifies that
     /// uploaded_by_device_id is correctly stored and can be used by the
     /// HTTP handler to decide whether to auto-delete.
+    /// Retention is ACK-gated, not download-gated: a GET never deletes, and
+    /// only the targeted device's explicit ACK-delete removes its own row.
     #[test]
-    fn test_auto_delete_only_for_different_device() {
+    fn test_ack_delete_only_by_target_device() {
         let db = test_db();
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
@@ -5483,32 +5900,22 @@ mod tests {
 
             let future = now_secs() + 300;
 
-            // Device A uploads snapshot
-            upsert_snapshot(conn, "sg1", 0, 10, b"snap", Some(future), None, Some("dev_a"))?;
+            // Device A uploads a snapshot targeted at device B.
+            upsert_snapshot(conn, "sg1", 0, 10, b"snap", Some(future), Some("dev_b"), Some("dev_a"))?;
 
-            // Device A downloads — check uploaded_by matches (no auto-delete)
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
-            let uploader = snap.uploaded_by_device_id.as_deref().unwrap();
-            let downloading_device = "dev_a";
-            let is_different = uploader != downloading_device;
-            assert!(!is_different, "same device should NOT trigger auto-delete");
-            // Snapshot should still exist
-            assert!(get_snapshot(conn, "sg1")?.is_some());
+            // Reads never delete: B can fetch it repeatedly.
+            assert!(get_snapshot(conn, "sg1", "dev_b")?.is_some());
+            assert!(get_snapshot(conn, "sg1", "dev_b")?.is_some());
 
-            // Device B downloads — different device triggers auto-delete
-            let snap = get_snapshot(conn, "sg1")?.unwrap();
-            let uploader = snap.uploaded_by_device_id.as_deref().unwrap();
-            let downloading_device = "dev_b";
-            let is_different = uploader != downloading_device;
-            assert!(is_different, "different device should trigger auto-delete");
+            // A non-target ACK-delete does nothing.
+            assert!(!delete_snapshot(conn, "sg1", "dev_a")?);
+            assert!(get_snapshot(conn, "sg1", "dev_b")?.is_some());
 
-            // Simulate auto-delete (as done by the HTTP handler)
-            delete_snapshot(conn, "sg1")?;
-
-            // Verify snapshot is gone
+            // The target device's ACK-delete removes its own row.
+            assert!(delete_snapshot(conn, "sg1", "dev_b")?);
             assert!(
-                get_snapshot(conn, "sg1")?.is_none(),
-                "snapshot should be deleted after cross-device download"
+                get_snapshot(conn, "sg1", "dev_b")?.is_none(),
+                "snapshot should be gone after the target ACK-deletes it"
             );
 
             Ok(())

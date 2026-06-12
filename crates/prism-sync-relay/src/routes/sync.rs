@@ -8,7 +8,15 @@ use axum::{
 use base64::Engine;
 use serde::Deserialize;
 
-use crate::{db, errors::AppError, snapshot_limits::MAX_SNAPSHOT_WIRE_BYTES, state::AppState};
+use crate::{
+    db,
+    errors::AppError,
+    snapshot_limits::{
+        DEFAULT_TARGETED_SNAPSHOT_TTL_SECS, MAX_SNAPSHOT_WIRE_BYTES,
+        MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+    },
+    state::AppState,
+};
 
 use super::{verify_signed_request, AuthIdentity};
 
@@ -281,12 +289,17 @@ pub async fn get_snapshot(
 
     let db = state.db.clone();
     let sid = auth.sync_id.clone();
+    let did = auth.device_id.clone();
 
-    let snapshot =
-        tokio::task::spawn_blocking(move || db.with_read_conn(|conn| db::get_snapshot(conn, &sid)))
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+    // The query returns the caller's own targeted row, else the group-wide
+    // row, so a non-target sees `None` (404 → client maps to `Ok(None)`)
+    // rather than a hard 403 — the cross-target 403 path is gone.
+    let snapshot = tokio::task::spawn_blocking(move || {
+        db.with_read_conn(|conn| db::get_snapshot(conn, &sid, &did))
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
     tracing::debug!(
         sync_id = %trunc(&auth.sync_id),
@@ -296,12 +309,6 @@ pub async fn get_snapshot(
 
     match snapshot {
         Some(snap) => {
-            if let Some(target_device_id) = snap.target_device_id.as_deref() {
-                if target_device_id != auth.device_id {
-                    return Err(AppError::Forbidden("Snapshot is targeted at a different device"));
-                }
-            }
-
             // Retention is ACK-gated: the target device issues
             // `DELETE /v1/sync/{sync_id}/snapshot` once the snapshot has
             // been applied locally. TTL-based cleanup still fires via
@@ -324,10 +331,14 @@ pub async fn get_snapshot(
 // delete_snapshot — DELETE /v1/sync/{sync_id}/snapshot
 // ---------------------------------------------------------------------------
 
-/// Acknowledge-and-delete the pair-time bootstrap snapshot. Only the device
-/// the snapshot was targeted at (`for_device_id` / `target_device_id`) may
-/// delete it. Returns 404 if no snapshot exists, 403 if the caller is not
-/// the target, and 204 on success.
+/// Acknowledge-and-delete the caller's own pair-time bootstrap snapshot. The
+/// delete is a single conditional writer scoped to the caller's targeted row
+/// (`DELETE WHERE sync_id = ? AND target_device_id = caller`), so it can only
+/// ever remove the snapshot the caller was the audience for — never another
+/// concurrent pairing's row and never the group-wide row (NULL target is not
+/// ACK-deletable; it expires via TTL). Folding the target check into the DELETE
+/// kills the old read-then-delete TOCTOU structurally. Returns 404 when the
+/// caller has no targeted row, 204 on success.
 pub async fn delete_snapshot(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
@@ -343,35 +354,19 @@ pub async fn delete_snapshot(
 
     let db = state.db.clone();
     let sid = auth.sync_id.clone();
+    let did = auth.device_id.clone();
 
-    let snapshot = tokio::task::spawn_blocking({
-        let db = db.clone();
-        let sid = sid.clone();
-        move || db.with_read_conn(|conn| db::get_snapshot(conn, &sid))
+    let deleted = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| db::delete_snapshot(conn, &sid, &did))
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let snap = snapshot.ok_or(AppError::NotFound)?;
-
-    // Only the targeted device may ACK-delete. Untargeted (legacy)
-    // snapshots have no `for_device_id` and therefore no ACK handshake —
-    // the caller must not be allowed to short-circuit TTL cleanup.
-    match snap.target_device_id.as_deref() {
-        Some(target) if target == auth.device_id => {}
-        Some(_) => return Err(AppError::Forbidden("Snapshot is targeted at a different device")),
-        None => return Err(AppError::Forbidden("Snapshot has no target device to ACK")),
-    }
-
-    let deleted =
-        tokio::task::spawn_blocking(move || db.with_conn(|conn| db::delete_snapshot(conn, &sid)))
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-
     if !deleted {
-        // Race: TTL cleanup removed the row between our lookup and delete.
+        // No row targeted at the caller: either it never existed, TTL cleanup
+        // removed it, another concurrent pairing's row is all that remains, or
+        // the group is group-wide-only (NULL target — not ACK-deletable).
         return Err(AppError::NotFound);
     }
 
@@ -416,7 +411,6 @@ pub async fn put_snapshot(
         .get("X-Snapshot-TTL")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let expires_at = ttl_secs.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
     let target_device_id = headers
         .get("X-For-Device-Id")
         .and_then(|v| v.to_str().ok())
@@ -427,6 +421,16 @@ pub async fn put_snapshot(
             return Err(AppError::BadRequest("Invalid X-For-Device-Id"));
         }
     }
+
+    // A targeted (pair-time) snapshot must never outlive its pairing window, so
+    // give it a relay-default TTL when the client did not set one. Group-wide
+    // uploads keep their existing no-default semantics.
+    let effective_ttl_secs = match (ttl_secs, target_device_id.is_some()) {
+        (Some(ttl), _) => Some(ttl as i64),
+        (None, true) => Some(DEFAULT_TARGETED_SNAPSHOT_TTL_SECS),
+        (None, false) => None,
+    };
+    let expires_at = effective_ttl_secs.map(|ttl| chrono::Utc::now().timestamp() + ttl);
 
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();
@@ -464,8 +468,14 @@ pub async fn put_snapshot(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    if matches!(upsert_result, Err(AppError::SnapshotStale { .. })) {
-        state.metrics.inc(&state.metrics.snapshots_rejected_stale);
+    match &upsert_result {
+        Err(AppError::SnapshotStale { .. }) => {
+            state.metrics.inc(&state.metrics.snapshots_rejected_stale);
+        }
+        Err(AppError::TooManyTargetedSnapshots { .. }) => {
+            state.metrics.inc(&state.metrics.snapshots_rejected_targeted_cap);
+        }
+        _ => {}
     }
     upsert_result?;
 
@@ -488,6 +498,22 @@ fn do_put_snapshot(
         .ok_or(AppError::NotFound)?;
     let epoch = device.epoch;
 
+    // Cap concurrent targeted rows. The count excludes the caller's own
+    // audience, so re-uploading to an existing audience updates it in place and
+    // never trips the cap — and an expired-then-refreshed caller row can't push
+    // the live unexpired total to cap+1 (the slack the expiry-agnostic precheck
+    // used to leave until hourly cleanup). The whole handler runs under
+    // `with_conn`'s writer mutex, so the count and the upsert are atomic.
+    if let Some(target) = target_device_id {
+        let other_audiences = db::count_unexpired_targeted_snapshots(conn, sync_id, Some(target))
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if other_audiences >= MAX_TARGETED_SNAPSHOTS_PER_GROUP {
+            return Err(AppError::TooManyTargetedSnapshots {
+                max: MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+            });
+        }
+    }
+
     let affected = db::upsert_snapshot(
         conn,
         sync_id,
@@ -501,17 +527,19 @@ fn do_put_snapshot(
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if affected == 0 {
-        // The upsert's WHERE guard filtered our write: a snapshot with
-        // a >= server_seq_at is already stored. Report the existing
-        // (seq, target) so the client can advance its watermark and
-        // route the 409 through the engine's suppression matrix.
+        // The upsert's WHERE guard filtered our write: a snapshot with a
+        // >= server_seq_at is already stored FOR THIS AUDIENCE (the conflict
+        // target is the per-audience index). Report that audience's existing
+        // (seq, target) so the client can advance its watermark and route the
+        // 409 through the engine's suppression matrix.
         //
         // The lookup is a separate auto-commit statement, not a SQL
         // transaction. Safe because `with_conn` serializes writers
         // behind a single `Mutex<Connection>`, so no other writer can
         // mutate the row between the failed upsert and this read.
+        let audience = target_device_id.unwrap_or("");
         let (current_server_seq_at, current_target_device_id) =
-            db::get_snapshot_seq_and_target(conn, sync_id)
+            db::get_snapshot_seq_and_target(conn, sync_id, audience)
                 .map_err(|e| AppError::Internal(e.to_string()))?
                 .unwrap_or((0, None));
         return Err(AppError::SnapshotStale { current_server_seq_at, current_target_device_id });

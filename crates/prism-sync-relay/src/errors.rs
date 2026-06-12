@@ -46,6 +46,12 @@ pub enum AppError {
          current_target_device_id={current_target_device_id:?})"
     )]
     SnapshotStale { current_server_seq_at: i64, current_target_device_id: Option<String> },
+    /// A targeted `PUT /snapshot` for a NEW audience was rejected because the
+    /// group already holds the maximum unexpired targeted snapshot rows.
+    /// Returned as `409 Conflict` with a structured `too_many_targeted_snapshots`
+    /// body so an old (0.12.x) client classifies it as a generic loud retry.
+    #[error("TooManyTargetedSnapshots(max={max})")]
+    TooManyTargetedSnapshots { max: i64 },
     #[error("Internal({0})")]
     Internal(String),
 }
@@ -68,6 +74,7 @@ impl IntoResponse for AppError {
             AppError::StorageFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             AppError::MustBootstrapFromSnapshot { .. } => StatusCode::CONFLICT,
             AppError::SnapshotStale { .. } => StatusCode::CONFLICT,
+            AppError::TooManyTargetedSnapshots { .. } => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let response = match &self {
@@ -163,6 +170,14 @@ impl IntoResponse for AppError {
                     "message": "Snapshot upload superseded by a newer server snapshot",
                     "current_server_seq_at": current_server_seq_at,
                     "current_target_device_id": current_target_device_id,
+                });
+                (status, Json(body)).into_response()
+            }
+            AppError::TooManyTargetedSnapshots { max } => {
+                let body = serde_json::json!({
+                    "error": "too_many_targeted_snapshots",
+                    "message": "Too many concurrent pair-time snapshots; retry later",
+                    "max": max,
                 });
                 (status, Json(body)).into_response()
             }
