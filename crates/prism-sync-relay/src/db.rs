@@ -208,6 +208,24 @@ impl Database {
         let conn = self.readers[idx].lock().expect("reader mutex poisoned");
         f(&conn)
     }
+
+    /// Run a multi-statement read against a single consistent WAL snapshot.
+    /// A `BEGIN` is legal under `query_only = ON`, so the implicit deferred
+    /// transaction pins the reader to one snapshot for the whole closure —
+    /// concurrent writer commits (e.g. a cleanup prune) stay invisible. Use
+    /// this whenever a route reads several values that must agree (e.g. the
+    /// pruned floor and the batch page it gates).
+    pub fn with_read_tx<F, T>(&self, f: F) -> Result<T, rusqlite::Error>
+    where
+        F: FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    {
+        let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        let conn = self.readers[idx].lock().expect("reader mutex poisoned");
+        let tx = conn.unchecked_transaction()?;
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2121,25 +2139,35 @@ pub fn get_safe_prune_seq(
 }
 
 /// Delete batches with id < before_seq. Returns number deleted.
+///
+/// The DELETE and the floor advance commit atomically so a crash between them
+/// can never leave the floor claiming pruned history is still retained. The
+/// floor UPDATE runs unconditionally whenever `before_seq > 1` — even when the
+/// DELETE removes 0 rows — so a historically crash-stale floor self-heals on
+/// the next cleanup cycle that targets the same range, instead of waiting for a
+/// future prune to delete a fresh row.
 pub fn prune_batches_before(
     conn: &Connection,
     sync_id: &str,
     before_seq: i64,
 ) -> Result<usize, rusqlite::Error> {
-    let n = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
         "DELETE FROM batches WHERE sync_id = ?1 AND id < ?2",
         params![sync_id, before_seq],
     )?;
-    if n > 0 && before_seq > 1 {
-        // The highest seq we just pruned is `before_seq - 1`; advance the
-        // floor monotonically so concurrent prune calls can't roll it back.
-        conn.execute(
+    if before_seq > 1 {
+        // The highest seq this range covers is `before_seq - 1`; advance the
+        // floor monotonically (MAX) so concurrent prune calls can't roll it
+        // back and a stale floor below the deleted range catches up.
+        tx.execute(
             "UPDATE sync_groups
              SET pruned_floor_seq = MAX(pruned_floor_seq, ?2)
              WHERE sync_id = ?1",
             params![sync_id, before_seq - 1],
         )?;
     }
+    tx.commit()?;
     Ok(n)
 }
 
@@ -4372,6 +4400,174 @@ mod tests {
             assert_eq!(pruned, 0);
 
             Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn prune_batches_before_self_heals_crash_stale_floor() {
+        // Simulate the pre-fix crash window: a prior DELETE committed but the
+        // floor UPDATE never ran (process died between two auto-commit
+        // statements). The next cleanup cycle targets the same range, deletes
+        // 0 rows, and must still advance the floor so the gap stops being
+        // invisible to pulls.
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            let _seq1 = insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            let _seq2 = insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+            let seq3 = insert_batch(conn, "sg1", 0, "dev1", "b3", b"d3")?;
+
+            // Manually delete the first two batches WITHOUT touching the floor,
+            // exactly as a crash between DELETE and UPDATE would leave the DB.
+            conn.execute(
+                "DELETE FROM batches WHERE sync_id = ?1 AND id < ?2",
+                params!["sg1", seq3],
+            )?;
+            assert_eq!(get_pruned_floor_seq(conn, "sg1")?, 0, "floor left crash-stale");
+            assert!(
+                get_first_retained_batch_seq(conn, "sg1")?.is_none(),
+                "stale floor falsely claims all history retained"
+            );
+
+            // Re-running prune with the same before_seq deletes nothing but
+            // self-heals the floor to seq3 - 1.
+            let pruned = prune_batches_before(conn, "sg1", seq3)?;
+            assert_eq!(pruned, 0, "rows already gone");
+            assert_eq!(
+                get_pruned_floor_seq(conn, "sg1")?,
+                seq3 - 1,
+                "floor self-heals to cover the deleted range"
+            );
+            assert_eq!(
+                get_first_retained_batch_seq(conn, "sg1")?,
+                Some(seq3),
+                "first retained now correctly excludes the pruned range"
+            );
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn prune_batches_before_floor_advances_with_zero_deletes_on_empty_group() {
+        // before_seq == 1 means nothing is below the floor: no rows deleted and
+        // the floor stays at 0 (the `before_seq > 1` guard is the only gate).
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            let pruned = prune_batches_before(conn, "sg1", 1)?;
+            assert_eq!(pruned, 0);
+            assert_eq!(get_pruned_floor_seq(conn, "sg1")?, 0, "before_seq=1 never moves the floor");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn prune_batches_before_commits_delete_and_floor_atomically() {
+        // A reader holding a snapshot opened before the prune must see a
+        // consistent pair: old floor AND old (un-deleted) batches. A snapshot
+        // opened after the commit must see the new floor AND the pruned table.
+        // The single-tx prune plus with_read_tx make the mixed state — new
+        // floor with stale batches, or vice versa — unobservable.
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+            insert_batch(conn, "sg1", 0, "dev1", "b3", b"d3")?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // Pre-prune snapshot: floor 0, all three batches present.
+        db.with_read_tx(|conn| {
+            assert_eq!(get_pruned_floor_seq(conn, "sg1")?, 0);
+            assert_eq!(get_batches_since(conn, "sg1", 0, 100)?.len(), 3);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // Commit the prune on the writer.
+        let seq3 = db
+            .with_conn(|conn| {
+                let max: i64 = conn.query_row(
+                    "SELECT MAX(id) FROM batches WHERE sync_id = ?1",
+                    params!["sg1"],
+                    |row| row.get(0),
+                )?;
+                prune_batches_before(conn, "sg1", max)?;
+                Ok::<_, rusqlite::Error>(max)
+            })
+            .unwrap();
+
+        // Post-prune snapshot: floor self-consistent with the surviving batch.
+        db.with_read_tx(|conn| {
+            assert_eq!(get_pruned_floor_seq(conn, "sg1")?, seq3 - 1);
+            let batches = get_batches_since(conn, "sg1", 0, 100)?;
+            assert_eq!(batches.len(), 1, "only the head batch survives");
+            assert_eq!(batches[0].server_seq, seq3);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn with_read_tx_pins_one_snapshot_across_a_concurrent_prune_commit() {
+        // Integration shape mirroring pull_changes: open a read tx, read the
+        // floor, let a writer commit a prune mid-tx, then read the batch page in
+        // the SAME tx. The reader must still see the pre-prune batches (snapshot
+        // isolation), so the floor gate and the page it gates always agree.
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+            insert_batch(conn, "sg1", 0, "dev1", "b3", b"d3")?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        db.with_read_tx(|conn| {
+            // First read inside the tx pins the WAL snapshot.
+            let first_retained = get_first_retained_batch_seq(conn, "sg1")?;
+            assert!(first_retained.is_none(), "no pruning yet");
+
+            // Writer commits a full prune of seqs below the head while our read
+            // tx is still open.
+            db.with_conn(|wconn| {
+                let max: i64 = wconn.query_row(
+                    "SELECT MAX(id) FROM batches WHERE sync_id = ?1",
+                    params!["sg1"],
+                    |row| row.get(0),
+                )?;
+                prune_batches_before(wconn, "sg1", max)?;
+                Ok::<_, rusqlite::Error>(())
+            })?;
+
+            // The pruned rows are STILL visible inside this snapshot, so the
+            // page matches the floor we already gated on (all three batches).
+            let batches = get_batches_since(conn, "sg1", 0, 100)?;
+            assert_eq!(batches.len(), 3, "snapshot isolation keeps pruned rows visible");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // A fresh read tx after the prune sees the new floor; a cursor below it
+        // is exactly the MustBootstrapFromSnapshot precondition pull_changes
+        // checks (since + 1 < first_retained_seq).
+        db.with_read_tx(|conn| {
+            let first_retained =
+                get_first_retained_batch_seq(conn, "sg1")?.expect("floor advanced");
+            assert!(first_retained > 1, "floor moved up past the pruned range");
+            let below_floor_cursor = 0i64;
+            assert!(
+                below_floor_cursor.saturating_add(1) < first_retained,
+                "a below-floor cursor must trip the bootstrap gate"
+            );
+            Ok::<_, rusqlite::Error>(())
         })
         .unwrap();
     }

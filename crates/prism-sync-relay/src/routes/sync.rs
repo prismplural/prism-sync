@@ -198,7 +198,12 @@ pub async fn pull_changes(
 
     let (first_retained_seq, batches, min_acked_seq, password_version) =
         tokio::task::spawn_blocking(move || {
-            db.with_read_conn(|conn| {
+            // One read transaction so the floor gate, the batch page, the
+            // min-acked seq, and the password version all observe the same WAL
+            // snapshot. A cleanup prune committing mid-read can no longer slip
+            // between the floor read and the batch read, so the must_bootstrap
+            // gate provably matches the page it gates (F18/F46).
+            db.with_read_tx(|conn| {
                 let first_retained = db::get_first_retained_batch_seq(conn, &sid)?;
                 let batches = db::get_batches_since(conn, &sid, since, limit)?;
                 let min_acked = db::get_min_acked_seq(conn, &sid, stale_threshold)?;
