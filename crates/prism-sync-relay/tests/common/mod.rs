@@ -637,3 +637,94 @@ pub fn build_registry_approval_hybrid(
         signed_registry_snapshot,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Device-lifecycle test fixture (shared infra for device-trust lockout tests)
+//
+// Time-travel helpers that age devices/sessions into the past so the cleanup
+// steps (`db::mark_stale_devices` at 30d, `db::auto_revoke_devices` at 90d) can
+// be exercised deterministically without waiting. The cleanup functions compare
+// `last_seen_at` against `now_secs() - threshold`, so "aging" a device means
+// pushing its `last_seen_at` (and, for the expired-session recovery path, its
+// `device_sessions.expires_at`) backwards.
+// ---------------------------------------------------------------------------
+
+/// Default `STALE_DEVICE_SECS` (30 days) — devices idle past this go `stale`.
+pub const STALE_DEVICE_SECS: i64 = 2_592_000;
+
+/// Default `SYNC_INACTIVE_TTL_SECS` (90 days) — the auto-revoke floor.
+pub const AUTO_REVOKE_SECS: i64 = 7_776_000;
+
+const SECS_PER_DAY: i64 = 86_400;
+
+/// Push a device's `last_seen_at` `days` into the past, simulating an offline
+/// gap of that length without waiting. Panics if the device row is missing so a
+/// typo in sync_id/device_id fails loudly instead of silently aging nothing.
+pub fn age_device(db: &std::sync::Arc<Database>, sync_id: &str, device_id: &str, days: i64) {
+    let last_seen = db::now_secs() - days * SECS_PER_DAY;
+    let sid = sync_id.to_string();
+    let did = device_id.to_string();
+    db.with_conn(move |conn| {
+        let changed = conn.execute(
+            "UPDATE devices SET last_seen_at = ?1 WHERE sync_id = ?2 AND device_id = ?3",
+            rusqlite::params![last_seen, sid, did],
+        )?;
+        assert_eq!(changed, 1, "age_device: no such device row to age");
+        Ok::<_, rusqlite::Error>(())
+    })
+    .expect("age_device");
+}
+
+/// Expire a device's session by pushing `device_sessions.expires_at` into the
+/// past, simulating the case where the session TTL elapsed while the device was
+/// offline (the signed `/session/refresh` recovery path). Panics if no session
+/// row exists for the device.
+pub fn expire_device_session(db: &std::sync::Arc<Database>, sync_id: &str, device_id: &str) {
+    let expired = db::now_secs() - SECS_PER_DAY;
+    let sid = sync_id.to_string();
+    let did = device_id.to_string();
+    db.with_conn(move |conn| {
+        let changed = conn.execute(
+            "UPDATE device_sessions SET expires_at = ?1 WHERE sync_id = ?2 AND device_id = ?3",
+            rusqlite::params![expired, sid, did],
+        )?;
+        assert_eq!(changed, 1, "expire_device_session: no such session row to expire");
+        Ok::<_, rusqlite::Error>(())
+    })
+    .expect("expire_device_session");
+}
+
+/// Read a device's current `status` string (`active`/`stale`/`revoked`), or
+/// `None` if the device row is absent.
+pub fn device_status(
+    db: &std::sync::Arc<Database>,
+    sync_id: &str,
+    device_id: &str,
+) -> Option<String> {
+    let sid = sync_id.to_string();
+    let did = device_id.to_string();
+    db.with_conn(move |conn| Ok(db::get_device(conn, &sid, &did)?.map(|d| d.status)))
+        .expect("device_status")
+}
+
+/// Read a group's `needs_rekey` flag (`None` if the `sync_groups` row is
+/// absent — i.e. `set_needs_rekey`'s UPDATE matched nothing).
+pub fn group_needs_rekey(db: &std::sync::Arc<Database>, sync_id: &str) -> Option<bool> {
+    let sid = sync_id.to_string();
+    db.with_conn(move |conn| db::get_needs_rekey(conn, &sid)).expect("group_needs_rekey")
+}
+
+/// Run the relay's stale-marking cleanup step directly against the test DB,
+/// returning the number of devices flipped `active` -> `stale`.
+pub fn run_mark_stale_devices(db: &std::sync::Arc<Database>, threshold_secs: i64) -> usize {
+    db.with_conn(move |conn| db::mark_stale_devices(conn, threshold_secs))
+        .expect("run_mark_stale_devices")
+}
+
+/// Run the relay's auto-revoke cleanup step directly against the test DB,
+/// returning the affected sync_ids (those that had a device revoked and were
+/// flagged `needs_rekey`).
+pub fn run_auto_revoke_devices(db: &std::sync::Arc<Database>, threshold_secs: i64) -> Vec<String> {
+    db.with_conn(move |conn| db::auto_revoke_devices(conn, threshold_secs))
+        .expect("run_auto_revoke_devices")
+}
