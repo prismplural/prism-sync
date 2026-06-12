@@ -332,6 +332,13 @@ impl ServerRelay {
         }
     }
 
+    fn classify_media_upload_error(status: u16, body: &str) -> RelayError {
+        if status == 409 {
+            return RelayError::Protocol { message: format!("HTTP 409: {body}") };
+        }
+        Self::classify_error(status, body)
+    }
+
     /// Classify a reqwest error into a RelayError.
     fn classify_reqwest_error(err: reqwest::Error) -> RelayError {
         if err.is_timeout() {
@@ -1148,7 +1155,7 @@ impl MediaRelay for ServerRelay {
         let status = resp.status().as_u16();
         if status >= 400 {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(Self::classify_error(status, &body_text));
+            return Err(Self::classify_media_upload_error(status, &body_text));
         }
         Ok(Self::upload_outcome_for_status(status))
     }
@@ -1654,6 +1661,15 @@ mod tests {
         // epoch-rotation handling will misroute.
         let err = ServerRelay::classify_error(409, r#"{"error":"something_else"}"#);
         assert!(matches!(err, RelayError::EpochRotation { new_epoch: 0 }));
+    }
+
+    #[test]
+    fn media_upload_409_does_not_report_epoch_rotation() {
+        let err = ServerRelay::classify_media_upload_error(
+            409,
+            r#"{"error":"conflict","message":"Media with this ID already exists"}"#,
+        );
+        assert!(matches!(err, RelayError::Protocol { ref message } if message.contains("409")));
     }
 
     #[test]

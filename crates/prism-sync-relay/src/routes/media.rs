@@ -212,7 +212,7 @@ pub async fn upload_media(
                     } else {
                         0
                     };
-                    let would_add_bytes = match db::get_media_metadata(&tx, &mid)? {
+                    let would_add_bytes = match db::get_media_metadata(&tx, &sid, &mid)? {
                         // No row, or an expired/soft-deleted row (resurrect) adds
                         // its bytes back. A committed-live row (idempotent/repair)
                         // or a pending reserve (→ 202) adds nothing.
@@ -229,7 +229,8 @@ pub async fn upload_media(
 
         // Unlink swept expired files (best-effort; the cleanup loop backstops).
         for swept_id in &swept {
-            let _ = tokio::fs::remove_file(media_file_path(&storage_path, &sync_id, swept_id)).await;
+            let _ =
+                tokio::fs::remove_file(media_file_path(&storage_path, &sync_id, swept_id)).await;
         }
 
         if would_add_bytes && usage + size_bytes > quota {
@@ -331,9 +332,10 @@ pub async fn upload_media(
                 // row untouched (the `committed_at IS NULL` guard enforces this).
                 if outcome == ReserveOutcome::ReservedPending {
                     let db = state.db.clone();
+                    let sid = sync_id.clone();
                     let mid = media_id_owned.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        db.with_conn(|conn| db::delete_pending_media_row(conn, &mid))
+                        db.with_conn(|conn| db::delete_pending_media_row(conn, &sid, &mid))
                     })
                     .await;
                 }
@@ -342,11 +344,14 @@ pub async fn upload_media(
 
             // 14. Finalize: mark the row committed (servable).
             let db = state.db.clone();
+            let sid = sync_id.clone();
             let mid = media_id_owned.clone();
-            tokio::task::spawn_blocking(move || db.with_conn(|conn| db::finalize_media(conn, &mid, now)))
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            tokio::task::spawn_blocking(move || {
+                db.with_conn(|conn| db::finalize_media(conn, &sid, &mid, now))
+            })
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
             state.metrics.inc(&state.metrics.media_uploads);
             state.metrics.inc_by(&state.metrics.media_bytes_uploaded, size_bytes as u64);
@@ -469,7 +474,7 @@ pub async fn download_media(
     let sync_id = auth.sync_id.clone();
 
     let metadata = tokio::task::spawn_blocking(move || {
-        db.with_read_conn(|conn| db::get_media_metadata(conn, &mid))
+        db.with_read_conn(|conn| db::get_media_metadata(conn, &sync_id, &mid))
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
@@ -480,7 +485,7 @@ pub async fn download_media(
     // (belt-and-suspenders for the brief promote window / legacy crash rows).
     let now = db::now_secs();
     let metadata = match metadata {
-        Some(m) if m.sync_id == sync_id && m.is_servable_at(now) => m,
+        Some(m) if m.is_servable_at(now) => m,
         _ => return Err(AppError::NotFound),
     };
 
@@ -565,8 +570,10 @@ mod tests {
         std::fs::write(&file_path, data).unwrap();
 
         // Verify metadata exists
-        let row =
-            state.db.with_read_conn(|conn| db::get_media_metadata(conn, "media-001")).unwrap();
+        let row = state
+            .db
+            .with_read_conn(|conn| db::get_media_metadata(conn, "test-sync-id", "media-001"))
+            .unwrap();
         let row = row.expect("metadata should exist");
         assert_eq!(row.media_id, "media-001");
         assert_eq!(row.sync_id, "test-sync-id");
@@ -584,8 +591,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = test_state(tmp.path());
 
-        let row =
-            state.db.with_read_conn(|conn| db::get_media_metadata(conn, "nonexistent")).unwrap();
+        let row = state
+            .db
+            .with_read_conn(|conn| db::get_media_metadata(conn, "test-sync-id", "nonexistent"))
+            .unwrap();
         assert!(row.is_none());
     }
 
@@ -606,13 +615,13 @@ mod tests {
                     &"a".repeat(64),
                     None,
                 )?;
-                db::mark_media_deleted(conn, "media-del")
+                db::mark_media_deleted(conn, "test-sync-id", "media-del")
             })
             .unwrap();
 
         let row = state
             .db
-            .with_read_conn(|conn| db::get_media_metadata(conn, "media-del"))
+            .with_read_conn(|conn| db::get_media_metadata(conn, "test-sync-id", "media-del"))
             .unwrap()
             .expect("row should exist");
         assert!(row.deleted_at.is_some(), "deleted_at should be set");
@@ -728,11 +737,11 @@ mod tests {
                 assert_eq!(expired[0].1, "old-media");
 
                 // Verify old media is now marked deleted
-                let old = db::get_media_metadata(conn, "old-media")?;
+                let old = db::get_media_metadata(conn, "test-sync-id", "old-media")?;
                 assert!(old.unwrap().deleted_at.is_some());
 
                 // Verify new media is untouched
-                let new = db::get_media_metadata(conn, "new-media")?;
+                let new = db::get_media_metadata(conn, "test-sync-id", "new-media")?;
                 assert!(new.unwrap().deleted_at.is_none());
 
                 Ok(())
@@ -771,8 +780,8 @@ mod tests {
                 assert_eq!(ids.len(), 2);
 
                 // Verify they're gone
-                assert!(db::get_media_metadata(conn, "m1")?.is_none());
-                assert!(db::get_media_metadata(conn, "m2")?.is_none());
+                assert!(db::get_media_metadata(conn, "test-sync-id", "m1")?.is_none());
+                assert!(db::get_media_metadata(conn, "test-sync-id", "m2")?.is_none());
 
                 Ok(())
             })

@@ -530,7 +530,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         -- distinguishes a genuine in-flight reserve from a legacy pre-lifecycle
         -- row (which has `reserved_at IS NULL` and is backfilled committed).
         CREATE TABLE IF NOT EXISTS media_metadata (
-            media_id      TEXT PRIMARY KEY,
+            media_id      TEXT NOT NULL,
             sync_id       TEXT NOT NULL,
             device_id     TEXT NOT NULL,
             size_bytes    INTEGER NOT NULL,
@@ -540,6 +540,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             deleted_at    INTEGER,
             committed_at  INTEGER,
             reserved_at   INTEGER,
+            PRIMARY KEY (sync_id, media_id),
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
         CREATE INDEX IF NOT EXISTS idx_media_sync_id ON media_metadata(sync_id);
@@ -614,6 +615,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_devices_ml_dsa_rotation(conn)?;
     migrate_pairing_session_consumed_columns(conn)?;
     migrate_media_lifecycle_columns(conn)?;
+    migrate_media_metadata_sync_scoped_key(conn)?;
 
     Ok(())
 }
@@ -679,6 +681,70 @@ fn media_metadata_has_column(conn: &Connection, column: &str) -> Result<bool, ru
         }
     }
     Ok(false)
+}
+
+fn migrate_media_metadata_sync_scoped_key(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if media_metadata_has_sync_scoped_key(conn)? {
+        ensure_media_metadata_indexes(conn)?;
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE media_metadata RENAME TO media_metadata_old;
+         CREATE TABLE media_metadata (
+            media_id      TEXT NOT NULL,
+            sync_id       TEXT NOT NULL,
+            device_id     TEXT NOT NULL,
+            size_bytes    INTEGER NOT NULL,
+            content_hash  TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            expires_at    INTEGER,
+            deleted_at    INTEGER,
+            committed_at  INTEGER,
+            reserved_at   INTEGER,
+            PRIMARY KEY (sync_id, media_id),
+            FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
+         );
+         INSERT INTO media_metadata
+            (media_id, sync_id, device_id, size_bytes, content_hash,
+             created_at, expires_at, deleted_at, committed_at, reserved_at)
+         SELECT media_id, sync_id, device_id, size_bytes, content_hash,
+                created_at, expires_at, deleted_at, committed_at, reserved_at
+           FROM media_metadata_old;
+         DROP TABLE media_metadata_old;",
+    )?;
+    tx.commit()?;
+
+    ensure_media_metadata_indexes(conn)?;
+    Ok(())
+}
+
+fn media_metadata_has_sync_scoped_key(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(media_metadata)")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?)))?;
+    let mut sync_pk = None;
+    let mut media_pk = None;
+    for row in rows {
+        let (name, pk) = row?;
+        match name.as_str() {
+            "sync_id" => sync_pk = Some(pk),
+            "media_id" => media_pk = Some(pk),
+            _ => {}
+        }
+    }
+    Ok(sync_pk == Some(1) && media_pk == Some(2))
+}
+
+fn ensure_media_metadata_indexes(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_media_sync_id ON media_metadata(sync_id);
+         CREATE INDEX IF NOT EXISTS idx_media_expires
+             ON media_metadata(expires_at) WHERE expires_at IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_media_sync_expires
+             ON media_metadata (sync_id, expires_at) WHERE expires_at IS NOT NULL;",
+    )?;
+    Ok(())
 }
 
 /// Add ephemeral snapshot columns to an existing `snapshots` table.
@@ -2700,11 +2766,14 @@ fn media_row_from(row: &rusqlite::Row<'_>) -> Result<MediaRow, rusqlite::Error> 
 
 pub fn get_media_metadata(
     conn: &Connection,
+    sync_id: &str,
     media_id: &str,
 ) -> Result<Option<MediaRow>, rusqlite::Error> {
     conn.query_row(
-        &format!("SELECT {MEDIA_ROW_COLUMNS} FROM media_metadata WHERE media_id = ?1"),
-        params![media_id],
+        &format!(
+            "SELECT {MEDIA_ROW_COLUMNS} FROM media_metadata WHERE sync_id = ?1 AND media_id = ?2"
+        ),
+        params![sync_id, media_id],
         media_row_from,
     )
     .optional()
@@ -2834,7 +2903,7 @@ pub fn reserve_media_upload(
     pending_grace_secs: i64,
     final_file_present: bool,
 ) -> Result<ReserveOutcome, rusqlite::Error> {
-    let existing = get_media_metadata(tx, media_id)?;
+    let existing = get_media_metadata(tx, sync_id, media_id)?;
 
     let Some(row) = existing else {
         // No row → fresh insert. Δquota +size.
@@ -2852,19 +2921,8 @@ pub fn reserve_media_upload(
         return Ok(ReserveOutcome::ReservedPending);
     };
 
-    // `media_id` is a GLOBAL primary key, so a row may belong to another sync
-    // group. We must never mutate or promote against another group's row, and
-    // the uploader can't insert its own row (PK collision), so this is a hard
-    // conflict. Unreachable for honest clients (media_ids are random /
-    // content-derived and globally unique in practice), but the relay must not
-    // assume that — a forged `X-Media-Id` referencing another group's id would
-    // otherwise corrupt that group's availability accounting.
-    if row.sync_id != sync_id {
-        return Ok(ReserveOutcome::HashConflict);
-    }
-
     // A different content for the same id is a hard conflict in every state
-    // (the id⟺content bijection means this never happens in practice).
+    // within the same sync group.
     if row.content_hash != content_hash {
         return Ok(ReserveOutcome::HashConflict);
     }
@@ -2886,11 +2944,11 @@ pub fn reserve_media_upload(
         }
         tx.execute(
             "UPDATE media_metadata
-                 SET device_id = ?2, size_bytes = ?3, content_hash = ?4,
-                     created_at = ?5, expires_at = ?6,
-                     deleted_at = NULL, committed_at = NULL, reserved_at = ?5
-             WHERE media_id = ?1",
-            params![media_id, device_id, size_bytes, content_hash, now, new_expires_at],
+                 SET device_id = ?3, size_bytes = ?4, content_hash = ?5,
+                     created_at = ?6, expires_at = ?7,
+                     deleted_at = NULL, committed_at = NULL, reserved_at = ?6
+             WHERE sync_id = ?1 AND media_id = ?2",
+            params![sync_id, media_id, device_id, size_bytes, content_hash, now, new_expires_at],
         )?;
         return Ok(ReserveOutcome::ReservedPending);
     }
@@ -2899,8 +2957,8 @@ pub fn reserve_media_upload(
     // Δquota 0 either way; refresh the TTL to the longer-lived value.
     let refreshed = combine_ttl(row.expires_at, new_expires_at);
     tx.execute(
-        "UPDATE media_metadata SET expires_at = ?2 WHERE media_id = ?1",
-        params![media_id, refreshed],
+        "UPDATE media_metadata SET expires_at = ?3 WHERE sync_id = ?1 AND media_id = ?2",
+        params![sync_id, media_id, refreshed],
     )?;
     if final_file_present {
         Ok(ReserveOutcome::AlreadyServable)
@@ -2912,10 +2970,17 @@ pub fn reserve_media_upload(
 /// Mark a reserved row committed (servable) after its file has been promoted.
 /// Idempotent: re-running on an already-committed row just refreshes
 /// `committed_at`.
-pub fn finalize_media(conn: &Connection, media_id: &str, now: i64) -> Result<(), rusqlite::Error> {
+pub fn finalize_media(
+    conn: &Connection,
+    sync_id: &str,
+    media_id: &str,
+    now: i64,
+) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "UPDATE media_metadata SET committed_at = ?2, reserved_at = NULL WHERE media_id = ?1",
-        params![media_id, now],
+        "UPDATE media_metadata
+            SET committed_at = ?3, reserved_at = NULL
+          WHERE sync_id = ?1 AND media_id = ?2",
+        params![sync_id, media_id, now],
     )?;
     Ok(())
 }
@@ -2926,11 +2991,13 @@ pub fn finalize_media(conn: &Connection, media_id: &str, now: i64) -> Result<(),
 /// drop a committed row (e.g. a repair that races a concurrent finalize).
 pub fn delete_pending_media_row(
     conn: &Connection,
+    sync_id: &str,
     media_id: &str,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "DELETE FROM media_metadata WHERE media_id = ?1 AND committed_at IS NULL",
-        params![media_id],
+        "DELETE FROM media_metadata
+          WHERE sync_id = ?1 AND media_id = ?2 AND committed_at IS NULL",
+        params![sync_id, media_id],
     )?;
     Ok(())
 }
@@ -2948,7 +3015,8 @@ pub fn sweep_expired_media_for_group(
 ) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "UPDATE media_metadata SET deleted_at = ?2
-         WHERE media_id IN (
+         WHERE sync_id = ?1
+           AND media_id IN (
              SELECT media_id FROM media_metadata
              WHERE sync_id = ?1
                AND deleted_at IS NULL
@@ -2966,11 +3034,15 @@ pub fn sweep_expired_media_for_group(
     Ok(ids)
 }
 
-pub fn mark_media_deleted(conn: &Connection, media_id: &str) -> Result<(), rusqlite::Error> {
+pub fn mark_media_deleted(
+    conn: &Connection,
+    sync_id: &str,
+    media_id: &str,
+) -> Result<(), rusqlite::Error> {
     let now = now_secs();
     conn.execute(
-        "UPDATE media_metadata SET deleted_at = ?1 WHERE media_id = ?2",
-        params![now, media_id],
+        "UPDATE media_metadata SET deleted_at = ?1 WHERE sync_id = ?2 AND media_id = ?3",
+        params![now, sync_id, media_id],
     )?;
     Ok(())
 }
@@ -3024,16 +3096,16 @@ pub fn retain_unlinkable_media(
 ) -> Vec<(String, String)> {
     pairs
         .iter()
-        .filter(|(_, media_id)| {
+        .filter(|(sync_id, media_id)| {
             match conn.query_row(
-                "SELECT deleted_at FROM media_metadata WHERE media_id = ?1",
-                params![media_id],
+                "SELECT deleted_at FROM media_metadata WHERE sync_id = ?1 AND media_id = ?2",
+                params![sync_id, media_id],
                 |row| row.get::<_, Option<i64>>(0),
             ) {
-                Ok(Some(_)) => true,  // still soft-deleted → safe to unlink
-                Ok(None) => false,    // resurrected (deleted_at NULL) → keep the file
+                Ok(Some(_)) => true, // still soft-deleted → safe to unlink
+                Ok(None) => false,   // resurrected (deleted_at NULL) → keep the file
                 Err(rusqlite::Error::QueryReturnedNoRows) => true, // row gone → unlink
-                Err(_) => false,      // unknown → skip; the orphan sweep backstops
+                Err(_) => false,     // unknown → skip; the orphan sweep backstops
             }
         })
         .cloned()
@@ -3075,10 +3147,8 @@ pub fn reap_stale_pending_media(
 pub fn all_media_keys(conn: &Connection) -> Result<Vec<(String, String)>, rusqlite::Error> {
     let mut stmt =
         conn.prepare("SELECT sync_id, media_id FROM media_metadata WHERE deleted_at IS NULL")?;
-    let pairs: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let pairs: Vec<(String, String)> =
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.filter_map(|r| r.ok()).collect();
     Ok(pairs)
 }
 
@@ -5353,12 +5423,37 @@ mod tests {
         db.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             let oc = reserve_media_upload(
-                &tx, media_id, "sg", "d", size, hash, ttl, quota, now, 300, file_present,
+                &tx,
+                media_id,
+                "sg",
+                "d",
+                size,
+                hash,
+                ttl,
+                quota,
+                now,
+                300,
+                file_present,
             )?;
             tx.commit()?;
             Ok(oc)
         })
         .unwrap()
+    }
+
+    fn get_media_metadata(
+        conn: &Connection,
+        media_id: &str,
+    ) -> Result<Option<MediaRow>, rusqlite::Error> {
+        super::get_media_metadata(conn, "sg", media_id)
+    }
+
+    fn finalize_media(conn: &Connection, media_id: &str, now: i64) -> Result<(), rusqlite::Error> {
+        super::finalize_media(conn, "sg", media_id, now)
+    }
+
+    fn mark_media_deleted(conn: &Connection, media_id: &str) -> Result<(), rusqlite::Error> {
+        super::mark_media_deleted(conn, "sg", media_id)
     }
 
     #[test]
@@ -5474,7 +5569,7 @@ mod tests {
         reserve(&db, "m1", HASH_A, 100, Some(now + 10), 10_000, now, false);
         db.with_conn(|c| finalize_media(c, "m1", now)).unwrap();
         let later = now + 100; // past the TTL
-        // Expired → excluded from usage, not servable.
+                               // Expired → excluded from usage, not servable.
         db.with_read_conn(|c| {
             assert_eq!(get_group_media_usage_at(c, "sg", later, 300)?, 0);
             assert!(!get_media_metadata(c, "m1")?.unwrap().is_servable_at(later));
@@ -5516,7 +5611,19 @@ mod tests {
         // Two committed, expired rows.
         for (id, h) in [("e1", HASH_A), ("e2", HASH_B)] {
             db.with_conn(|c| {
-                reserve_media_upload(c, id, "sg", "d", 10, h, Some(now - 1), 10_000, now, 300, false)?;
+                reserve_media_upload(
+                    c,
+                    id,
+                    "sg",
+                    "d",
+                    10,
+                    h,
+                    Some(now - 1),
+                    10_000,
+                    now,
+                    300,
+                    false,
+                )?;
                 finalize_media(c, id, now - 10)?;
                 Ok(())
             })
@@ -5525,7 +5632,19 @@ mod tests {
         // A still-PENDING row that is "expired" by TTL but in-flight: the sweep
         // must NOT touch it (reconciliation-vs-promote race guard).
         db.with_conn(|c| {
-            reserve_media_upload(c, "p1", "sg", "d", 10, HASH_A, Some(now - 1), 10_000, now, 300, false)
+            reserve_media_upload(
+                c,
+                "p1",
+                "sg",
+                "d",
+                10,
+                HASH_A,
+                Some(now - 1),
+                10_000,
+                now,
+                300,
+                false,
+            )
         })
         .unwrap();
 
@@ -5585,14 +5704,38 @@ mod tests {
         let now = now_secs();
         // Committed row past its per-blob TTL → cleaned.
         db.with_conn(|c| {
-            reserve_media_upload(c, "ttl", "sg", "d", 10, HASH_A, Some(now - 5), 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c,
+                "ttl",
+                "sg",
+                "d",
+                10,
+                HASH_A,
+                Some(now - 5),
+                10_000,
+                now,
+                300,
+                false,
+            )?;
             finalize_media(c, "ttl", now - 100)?;
             Ok(())
         })
         .unwrap();
         // In-flight pending row (committed_at NULL) → never cleaned by this path.
         db.with_conn(|c| {
-            reserve_media_upload(c, "pend", "sg", "d", 10, HASH_B, Some(now - 5), 10_000, now, 300, false)
+            reserve_media_upload(
+                c,
+                "pend",
+                "sg",
+                "d",
+                10,
+                HASH_B,
+                Some(now - 5),
+                10_000,
+                now,
+                300,
+                false,
+            )
         })
         .unwrap();
 
@@ -5612,15 +5755,41 @@ mod tests {
         let now = now_secs();
         db.with_conn(|c| {
             // Committed then soft-deleted → still safe to unlink.
-            reserve_media_upload(c, "still-del", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c,
+                "still-del",
+                "sg",
+                "d",
+                10,
+                HASH_A,
+                None,
+                10_000,
+                now,
+                300,
+                false,
+            )?;
             finalize_media(c, "still-del", now)?;
             c.execute(
-                "UPDATE media_metadata SET deleted_at = ?1 WHERE media_id = 'still-del'",
+                "UPDATE media_metadata
+                    SET deleted_at = ?1
+                  WHERE sync_id = 'sg' AND media_id = 'still-del'",
                 params![now],
             )?;
             // Committed-live (a heal resurrected + re-promoted it in the gap) →
             // must be spared so its fresh file is never unlinked.
-            reserve_media_upload(c, "resurrected", "sg", "d", 10, HASH_B, None, 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c,
+                "resurrected",
+                "sg",
+                "d",
+                10,
+                HASH_B,
+                None,
+                10_000,
+                now,
+                300,
+                false,
+            )?;
             finalize_media(c, "resurrected", now)?;
             Ok(())
         })
@@ -5631,8 +5800,7 @@ mod tests {
             ("sg".to_string(), "resurrected".to_string()),
             ("sg".to_string(), "absent".to_string()), // no row → safe to unlink
         ];
-        let unlinkable =
-            db.with_read_conn(|c| Ok(retain_unlinkable_media(c, &pairs))).unwrap();
+        let unlinkable = db.with_read_conn(|c| Ok(retain_unlinkable_media(c, &pairs))).unwrap();
 
         assert_eq!(
             unlinkable,
@@ -5666,11 +5834,20 @@ mod tests {
                  VALUES ('legacy','sg','d',10,?1,?2)",
                 params![HASH_A, 12345],
             )?;
-            // Re-run the lifecycle migration.
+            // Re-run the lifecycle and primary-key migrations.
             migrate_media_lifecycle_columns(conn)?;
+            migrate_media_metadata_sync_scoped_key(conn)?;
+            assert!(media_metadata_has_sync_scoped_key(conn)?);
             let row = get_media_metadata(conn, "legacy")?.unwrap();
             assert_eq!(row.committed_at, Some(12345), "backfill committed_at = created_at");
             assert!(row.is_servable_at(99_999), "legacy row stays servable");
+
+            create_sync_group(conn, "sg2", 0)?;
+            let oc = reserve_media_upload(
+                conn, "legacy", "sg2", "d2", 10, HASH_A, None, 10_000, 12346, 300, false,
+            )?;
+            assert_eq!(oc, ReserveOutcome::ReservedPending);
+            assert!(super::get_media_metadata(conn, "sg2", "legacy")?.is_some());
             Ok(())
         })
         .unwrap();
@@ -5686,14 +5863,36 @@ mod tests {
             finalize_media(c, "live", now)?;
             // committed-live with a future TTL → listed
             reserve_media_upload(
-                c, "live-ttl", "sg", "d", 10, HASH_B, Some(now + 1000), 10_000, now, 300, false,
+                c,
+                "live-ttl",
+                "sg",
+                "d",
+                10,
+                HASH_B,
+                Some(now + 1000),
+                10_000,
+                now,
+                300,
+                false,
             )?;
             finalize_media(c, "live-ttl", now)?;
             // pending (never finalized) → excluded (reconciliation must ignore it)
-            reserve_media_upload(c, "pending", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c, "pending", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false,
+            )?;
             // expired committed → excluded
             reserve_media_upload(
-                c, "expired", "sg", "d", 10, HASH_B, Some(now - 1), 10_000, now, 300, false,
+                c,
+                "expired",
+                "sg",
+                "d",
+                10,
+                HASH_B,
+                Some(now - 1),
+                10_000,
+                now,
+                300,
+                false,
             )?;
             finalize_media(c, "expired", now)?;
             // soft-deleted → excluded
@@ -5716,23 +5915,31 @@ mod tests {
     }
 
     #[test]
-    fn reserve_cross_sync_same_media_id_is_conflict_and_leaves_other_group_untouched() {
-        // media_id is a GLOBAL primary key. A row owned by another sync group
-        // must never be mutated/promoted by this group's upload — even on the
-        // same content hash (the cross-tenant hole).
+    fn reserve_cross_sync_same_media_id_is_independent() {
         let db = media_test_db();
         db.with_conn(|c| create_sync_group(c, "sg2", 0)).unwrap();
         let now = 1_000_000;
         // Group "sg" owns media_id "m" with a fixed TTL.
         db.with_conn(|c| {
-            reserve_media_upload(c, "m", "sg", "d", 10, HASH_A, Some(now + 1000), 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c,
+                "m",
+                "sg",
+                "d",
+                10,
+                HASH_A,
+                Some(now + 1000),
+                10_000,
+                now,
+                300,
+                false,
+            )?;
             finalize_media(c, "m", now)?;
             Ok(())
         })
         .unwrap();
 
-        // Group "sg2" tries to upload the SAME media_id + SAME hash → conflict,
-        // not an idempotent/repair on sg's row.
+        // Group "sg2" can independently upload the same media_id + hash.
         let oc = db
             .with_conn(|c| {
                 let tx = c.unchecked_transaction()?;
@@ -5743,13 +5950,15 @@ mod tests {
                 Ok(oc)
             })
             .unwrap();
-        assert_eq!(oc, ReserveOutcome::HashConflict);
+        assert_eq!(oc, ReserveOutcome::ReservedPending);
 
-        // sg's row is completely untouched: still its sync_id, TTL unchanged.
         db.with_read_conn(|c| {
-            let row = get_media_metadata(c, "m")?.unwrap();
-            assert_eq!(row.sync_id, "sg");
-            assert_eq!(row.expires_at, Some(now + 1000), "other group's TTL not mutated");
+            let sg_row = get_media_metadata(c, "m")?.unwrap();
+            let sg2_row = super::get_media_metadata(c, "sg2", "m")?.unwrap();
+            assert_eq!(sg_row.sync_id, "sg");
+            assert_eq!(sg_row.expires_at, Some(now + 1000));
+            assert_eq!(sg2_row.sync_id, "sg2");
+            assert!(sg2_row.is_pending());
             Ok(())
         })
         .unwrap();
@@ -5804,17 +6013,47 @@ mod tests {
             // committed-live (no TTL) and committed-live (future TTL) → present
             reserve_media_upload(c, "live", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
             finalize_media(c, "live", now)?;
-            reserve_media_upload(c, "live-ttl", "sg", "d", 10, HASH_B, Some(now + 1000), 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c,
+                "live-ttl",
+                "sg",
+                "d",
+                10,
+                HASH_B,
+                Some(now + 1000),
+                10_000,
+                now,
+                300,
+                false,
+            )?;
             finalize_media(c, "live-ttl", now)?;
             // pending, expired, soft-deleted → absent
-            reserve_media_upload(c, "pending", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
-            reserve_media_upload(c, "expired", "sg", "d", 10, HASH_B, Some(now - 1), 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c, "pending", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false,
+            )?;
+            reserve_media_upload(
+                c,
+                "expired",
+                "sg",
+                "d",
+                10,
+                HASH_B,
+                Some(now - 1),
+                10_000,
+                now,
+                300,
+                false,
+            )?;
             finalize_media(c, "expired", now)?;
-            reserve_media_upload(c, "deleted", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c, "deleted", "sg", "d", 10, HASH_A, None, 10_000, now, 300, false,
+            )?;
             finalize_media(c, "deleted", now)?;
             mark_media_deleted(c, "deleted")?;
             // same role in another group → must NOT leak across sync_id
-            reserve_media_upload(c, "other", "sg2", "d", 10, HASH_B, None, 10_000, now, 300, false)?;
+            reserve_media_upload(
+                c, "other", "sg2", "d", 10, HASH_B, None, 10_000, now, 300, false,
+            )?;
             finalize_media(c, "other", now)?;
             Ok(())
         })
@@ -5829,7 +6068,10 @@ mod tests {
         got.sort();
         assert_eq!(got, vec!["live".to_string(), "live-ttl".to_string()]);
         // Empty input → empty (no all-rows query).
-        assert!(db.with_read_conn(|c| servable_media_subset(c, "sg", &[], now)).unwrap().is_empty());
+        assert!(db
+            .with_read_conn(|c| servable_media_subset(c, "sg", &[], now))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -5852,10 +6094,16 @@ mod tests {
         })
         .unwrap();
         // grace 300s, reserved_at = now (fresh) → counts despite past expires_at.
-        assert_eq!(db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now, 300)).unwrap(), 100);
+        assert_eq!(
+            db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now, 300)).unwrap(),
+            100
+        );
         // If the reserve were stale (reserved_at well before the cutoff) it would
         // drop out (about to be reaped).
-        assert_eq!(db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now + 10_000, 300)).unwrap(), 0);
+        assert_eq!(
+            db.with_read_conn(|c| get_group_media_usage_at(c, "sg", now + 10_000, 300)).unwrap(),
+            0
+        );
     }
 
     // -- Ephemeral mailbox ---------------------------------------------
@@ -5872,7 +6120,12 @@ mod tests {
         .unwrap();
     }
 
-    fn send(db: &Database, mid: &str, sender: &str, recipient: Option<&str>) -> DeviceMessageSendOutcome {
+    fn send(
+        db: &Database,
+        mid: &str,
+        sender: &str,
+        recipient: Option<&str>,
+    ) -> DeviceMessageSendOutcome {
         db.with_conn(|conn| {
             insert_device_message(conn, "g", mid, sender, recipient, 0, b"payload", 3600, 100)
         })
@@ -5914,9 +6167,7 @@ mod tests {
         let db = test_db();
         mailbox_group(&db, &["d1", "d2", "d3"]);
         send(&db, "m1", "d1", None);
-        let n = db
-            .with_conn(|c| ack_device_messages(c, "g", "d2", &["m1".to_string()]))
-            .unwrap();
+        let n = db.with_conn(|c| ack_device_messages(c, "g", "d2", &["m1".to_string()])).unwrap();
         assert_eq!(n, 1);
         assert!(pending_ids(&db, "d2").is_empty(), "d2 acked → suppressed for d2");
         assert_eq!(pending_ids(&db, "d3"), vec!["m1".to_string()], "d3 still sees it");
@@ -5931,7 +6182,11 @@ mod tests {
         assert_eq!(send(&db, "dup", "d2", None), DeviceMessageSendOutcome::Coalesced);
         let count: i64 = db
             .with_read_conn(|c| {
-                c.query_row("SELECT COUNT(*) FROM device_messages WHERE message_id = 'dup'", [], |r| r.get(0))
+                c.query_row(
+                    "SELECT COUNT(*) FROM device_messages WHERE message_id = 'dup'",
+                    [],
+                    |r| r.get(0),
+                )
             })
             .unwrap();
         assert_eq!(count, 1);
@@ -5947,12 +6202,21 @@ mod tests {
         };
         assert_eq!(db.with_conn(|c| mk(c, "a")).unwrap(), DeviceMessageSendOutcome::Stored);
         assert_eq!(db.with_conn(|c| mk(c, "b")).unwrap(), DeviceMessageSendOutcome::Stored);
-        assert_eq!(db.with_conn(|c| mk(c, "c")).unwrap(), DeviceMessageSendOutcome::PendingCapExceeded);
+        assert_eq!(
+            db.with_conn(|c| mk(c, "c")).unwrap(),
+            DeviceMessageSendOutcome::PendingCapExceeded
+        );
         // Re-sending an already-stored id at the cap is a coalesce, NOT a reject.
         assert_eq!(db.with_conn(|c| mk(c, "a")).unwrap(), DeviceMessageSendOutcome::Coalesced);
         // The rejected message was not stored.
         let count: i64 = db
-            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_messages WHERE sender_device_id = 'd1'", [], |r| r.get(0)))
+            .with_read_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM device_messages WHERE sender_device_id = 'd1'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
             .unwrap();
         assert_eq!(count, 2);
     }
@@ -5970,7 +6234,9 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1, "only the real message id is acked");
         let count: i64 = db
-            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0)))
+            .with_read_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0))
+            })
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -6009,7 +6275,9 @@ mod tests {
         // Both recipients acked → fully acked → swept (with its ack rows).
         assert_eq!(db.with_conn(cleanup_expired_device_messages).unwrap(), 1);
         let acks: i64 = db
-            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0)))
+            .with_read_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0))
+            })
             .unwrap();
         assert_eq!(acks, 0, "orphan acks cleaned with their message");
     }
@@ -6075,10 +6343,14 @@ mod tests {
         // FK to sync_groups: deletion must remove mailbox rows first or fail.
         db.with_conn(|c| delete_sync_group(c, "g")).unwrap();
         let msgs: i64 = db
-            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_messages", [], |r| r.get(0)))
+            .with_read_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM device_messages", [], |r| r.get(0))
+            })
             .unwrap();
         let acks: i64 = db
-            .with_read_conn(|c| c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0)))
+            .with_read_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM device_message_acks", [], |r| r.get(0))
+            })
             .unwrap();
         assert_eq!((msgs, acks), (0, 0));
     }

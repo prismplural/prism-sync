@@ -564,7 +564,7 @@ async fn download_returns_404_for_deleted_media() {
     assert_eq!(resp.status(), 200, "upload should succeed");
 
     // Mark as deleted directly in DB
-    db.with_conn(|conn| db::mark_media_deleted(conn, "media-to-delete")).unwrap();
+    db.with_conn(|conn| db::mark_media_deleted(conn, &sync_id, "media-to-delete")).unwrap();
 
     // Try to download — should get 404
     let resp = client
@@ -816,11 +816,11 @@ async fn upload_without_ttl_defaults_to_no_expiry() {
     let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
 
     let data = vec![1u8; 64];
-    let resp = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-no-ttl", &data)
-        .await;
+    let resp =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-no-ttl", &data).await;
     assert_eq!(resp.status(), 200);
 
-    let row = db.with_conn(|c| db::get_media_metadata(c, "m-no-ttl")).unwrap().unwrap();
+    let row = db.with_conn(|c| db::get_media_metadata(c, &sync_id, "m-no-ttl")).unwrap().unwrap();
     assert!(row.expires_at.is_none(), "no X-Media-TTL ⇒ default retention (NULL)");
     assert!(row.committed_at.is_some(), "successful upload ⇒ committed");
 }
@@ -838,21 +838,29 @@ async fn upload_with_ttl_sets_clamped_expires_at() {
     let data = vec![2u8; 64];
     upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "m-min", &data, 1)
         .await;
-    let row = db.with_conn(|c| db::get_media_metadata(c, "m-min")).unwrap().unwrap();
+    let row = db.with_conn(|c| db::get_media_metadata(c, &sync_id, "m-min")).unwrap().unwrap();
     assert_eq!(row.expires_at, Some(row.created_at + 3600), "clamped to min floor");
 
     // Within range → honored exactly.
     upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "m-mid", &data, 7200)
         .await;
-    let row = db.with_conn(|c| db::get_media_metadata(c, "m-mid")).unwrap().unwrap();
+    let row = db.with_conn(|c| db::get_media_metadata(c, &sync_id, "m-mid")).unwrap().unwrap();
     assert_eq!(row.expires_at, Some(row.created_at + 7200), "honored within range");
 
     // Above retention → clamped down to retention (90d = 7_776_000s).
     upload_media_with_ttl(
-        &client, &url, &token, &keys, &sync_id, &device_id, "m-max", &data, 999_999_999,
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        "m-max",
+        &data,
+        999_999_999,
     )
     .await;
-    let row = db.with_conn(|c| db::get_media_metadata(c, "m-max")).unwrap().unwrap();
+    let row = db.with_conn(|c| db::get_media_metadata(c, &sync_id, "m-max")).unwrap().unwrap();
     assert_eq!(row.expires_at, Some(row.created_at + 7_776_000), "clamped to retention ceiling");
 }
 
@@ -879,9 +887,11 @@ async fn resupply_uploads_ride_a_separate_rate_lane() {
     let data = vec![7u8; 64];
 
     // Fresh-send lane: first ok, second exhausts it (429).
-    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "fresh-1", &data).await;
+    let r =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "fresh-1", &data).await;
     assert_eq!(r.status(), 200, "first fresh send ok");
-    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "fresh-2", &data).await;
+    let r =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "fresh-2", &data).await;
     assert_eq!(r.status(), 429, "second fresh send exhausts the fresh lane");
 
     // Re-supply lane is untouched by the exhausted fresh lane: first ok.
@@ -917,19 +927,22 @@ async fn resupply_byte_ceiling_caps_ephemeral_bytes_only() {
     let data = vec![8u8; 64];
 
     // Two re-supply blobs fit exactly at the ceiling (64 + 64 == 128).
-    let r =
-        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "rc-a", &data, 7200)
-            .await;
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "rc-a", &data, 7200,
+    )
+    .await;
     assert_eq!(r.status(), 200, "first re-supply within ceiling");
-    let r =
-        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "rc-b", &data, 7200)
-            .await;
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "rc-b", &data, 7200,
+    )
+    .await;
     assert_eq!(r.status(), 200, "second re-supply lands exactly at the ceiling");
 
     // The third re-supply would push live ephemeral bytes over the ceiling → 507.
-    let r =
-        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "rc-c", &data, 7200)
-            .await;
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "rc-c", &data, 7200,
+    )
+    .await;
     assert_eq!(r.status(), 507, "third re-supply exceeds the byte ceiling");
 
     // A fresh send (no X-Media-TTL) is NOT counted against the re-supply ceiling
@@ -964,9 +977,10 @@ async fn clearing_a_ttl_frees_resupply_ceiling_room() {
     upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "tc-b", &data, 7200)
         .await;
     // A third ephemeral blob is over the ceiling.
-    let r =
-        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "tc-c", &data, 7200)
-            .await;
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "tc-c", &data, 7200,
+    )
+    .await;
     assert_eq!(r.status(), 507, "ceiling full → third ephemeral rejected");
 
     // Re-send tc-a as a FRESH upload (no X-Media-TTL): same bytes ⇒ idempotent,
@@ -974,13 +988,14 @@ async fn clearing_a_ttl_frees_resupply_ceiling_room() {
     // ephemeral subset.
     let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "tc-a", &data).await;
     assert_eq!(r.status(), 200, "fresh re-send of tc-a succeeds and clears its TTL");
-    let row = db.with_conn(|c| db::get_media_metadata(c, "tc-a")).unwrap().unwrap();
+    let row = db.with_conn(|c| db::get_media_metadata(c, &sync_id, "tc-a")).unwrap().unwrap();
     assert!(row.expires_at.is_none(), "fresh re-send cleared tc-a's TTL");
 
     // tc-a no longer counts against the ceiling, so tc-c now fits.
-    let r =
-        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "tc-c", &data, 7200)
-            .await;
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "tc-c", &data, 7200,
+    )
+    .await;
     assert_eq!(r.status(), 200, "freed ceiling room lets the third ephemeral through");
 }
 
@@ -1009,9 +1024,10 @@ async fn idempotent_resupply_reupload_is_exempt_from_ceiling() {
 
     // Re-upload ix-a (same bytes, still TTL-bearing) while at the cap: it adds no
     // bytes, so the ceiling must NOT reject it.
-    let r =
-        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "ix-a", &data, 7200)
-            .await;
+    let r = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "ix-a", &data, 7200,
+    )
+    .await;
     assert_eq!(r.status(), 200, "idempotent re-upload at the cap is ceiling-exempt");
 }
 
@@ -1041,19 +1057,37 @@ async fn pairing_push_uploads_ride_a_separate_rate_lane() {
     let data = vec![5u8; 64];
 
     // Fresh lane: first ok, second exhausts it.
-    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "p-fresh-1", &data).await;
+    let r =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "p-fresh-1", &data).await;
     assert_eq!(r.status(), 200);
-    let r = upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "p-fresh-2", &data).await;
+    let r =
+        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "p-fresh-2", &data).await;
     assert_eq!(r.status(), 429, "fresh lane exhausted");
 
     // Re-supply lane (TTL, no class): untouched by the full fresh lane.
     let r = upload_media_with_ttl(
-        &client, &url, &token, &keys, &sync_id, &device_id, "p-resup-1", &data, 7200,
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        "p-resup-1",
+        &data,
+        7200,
     )
     .await;
     assert_eq!(r.status(), 200, "re-supply lane independent of fresh");
     let r = upload_media_with_ttl(
-        &client, &url, &token, &keys, &sync_id, &device_id, "p-resup-2", &data, 7200,
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        "p-resup-2",
+        &data,
+        7200,
     )
     .await;
     assert_eq!(r.status(), 429, "re-supply lane exhausted");
@@ -1101,7 +1135,15 @@ async fn pairing_push_counts_against_the_ephemeral_ceiling() {
 
     // …so a further pairing push is rejected — the ceiling spans both classes.
     let r = upload_media_pairing_push(
-        &client, &url, &token, &keys, &sync_id, &device_id, "ec-pair-2", &data, 7200,
+        &client,
+        &url,
+        &token,
+        &keys,
+        &sync_id,
+        &device_id,
+        "ec-pair-2",
+        &data,
+        7200,
     )
     .await;
     assert_eq!(r.status(), 507, "ephemeral ceiling spans re-supply + pairing");
@@ -1136,7 +1178,7 @@ async fn pairing_class_without_ttl_is_a_fresh_send() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let row = db.with_conn(|c| db::get_media_metadata(c, "fc-nottl")).unwrap().unwrap();
+    let row = db.with_conn(|c| db::get_media_metadata(c, &sync_id, "fc-nottl")).unwrap().unwrap();
     assert!(
         row.expires_at.is_none(),
         "class header without a TTL ⇒ fresh send (default retention), not ephemeral",
@@ -1155,9 +1197,10 @@ async fn download_404_after_ttl_expiry() {
     let (token, keys) = prepare_device(&db, &sync_id, &device_id).await;
 
     let data = vec![3u8; 64];
-    let resp =
-        upload_media_with_ttl(&client, &url, &token, &keys, &sync_id, &device_id, "m-ttl", &data, 1)
-            .await;
+    let resp = upload_media_with_ttl(
+        &client, &url, &token, &keys, &sync_id, &device_id, "m-ttl", &data, 1,
+    )
+    .await;
     assert_eq!(resp.status(), 200);
 
     // Servable immediately.
@@ -1357,13 +1400,15 @@ async fn concurrent_same_media_id_uploads_no_clobber() {
 
     let data = vec![9u8; 512];
     // Fire several concurrent uploads of the SAME id + content.
-    let uploads = (0..8).map(|_| {
-        upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-conc", &data)
-    });
+    let uploads = (0..8)
+        .map(|_| upload_media(&client, &url, &token, &keys, &sync_id, &device_id, "m-conc", &data));
     let results = join_all(uploads).await;
     for resp in results {
         let status = resp.status().as_u16();
-        assert!(status == 200 || status == 202, "each upload is committed or in-progress, got {status}");
+        assert!(
+            status == 200 || status == 202,
+            "each upload is committed or in-progress, got {status}"
+        );
     }
 
     // The blob ends servable with the right bytes…
@@ -1378,11 +1423,8 @@ async fn concurrent_same_media_id_uploads_no_clobber() {
 
     // …and there is exactly one final file (no cross-delete / clobber).
     let sync_dir = std::path::Path::new(&storage).join(&sync_id);
-    let finals: Vec<_> = std::fs::read_dir(&sync_dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.path().is_file())
-        .collect();
+    let finals: Vec<_> =
+        std::fs::read_dir(&sync_dir).unwrap().flatten().filter(|e| e.path().is_file()).collect();
     assert_eq!(finals.len(), 1, "exactly one committed file for the media_id");
 }
 
@@ -1451,7 +1493,9 @@ async fn batch_exists_returns_only_servable() {
     for id in ["a", "b"] {
         let data = vec![1u8; 32];
         assert_eq!(
-            upload_media(&client, &url, &token, &keys, &sync_id, &device_id, id, &data).await.status(),
+            upload_media(&client, &url, &token, &keys, &sync_id, &device_id, id, &data)
+                .await
+                .status(),
             200
         );
     }
@@ -1472,8 +1516,8 @@ async fn batch_exists_returns_only_servable() {
     // Expire "a" → batch-exists must drop it (TTL → absent), matching download-404.
     db.with_conn(|conn| {
         conn.execute(
-            "UPDATE media_metadata SET expires_at = ?1 WHERE media_id = 'a'",
-            rusqlite::params![db::now_secs() - 10],
+            "UPDATE media_metadata SET expires_at = ?1 WHERE sync_id = ?2 AND media_id = 'a'",
+            rusqlite::params![db::now_secs() - 10, sync_id],
         )?;
         Ok(())
     })
@@ -1615,7 +1659,7 @@ async fn servable_upload_implies_file_present() {
         200
     );
     // The servable-⟹-file invariant: a committed/servable row has its file.
-    let row = db.with_conn(|c| db::get_media_metadata(c, "m-inv")).unwrap().unwrap();
+    let row = db.with_conn(|c| db::get_media_metadata(c, &sync_id, "m-inv")).unwrap().unwrap();
     assert!(row.committed_at.is_some() && row.deleted_at.is_none());
     assert!(final_media_path(&storage, &sync_id, "m-inv").exists());
 }
