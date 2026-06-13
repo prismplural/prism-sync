@@ -38,6 +38,10 @@ pub mod sync_aad;
 pub mod sync_service;
 pub mod syncable_entity;
 
+pub use clock_drift::{
+    is_excessively_future, max_inheritable, sort_batch_ids_by_typed_hlc, ClockConfidence,
+    MAX_CLOCK_DRIFT_MS,
+};
 pub use client::{KeyMode, PrismSync, PrismSyncBuilder, SelfRevocationStatus, SyncStatus};
 pub use crdt_change::{CrdtChange, BULK_RESET_FIELD};
 pub use debug_log::SyncDebugLog;
