@@ -7378,8 +7378,8 @@ mod tests {
             self.inner.clear_sync_state(sync_id)
         }
 
-        fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64> {
-            self.inner.import_snapshot(sync_id, data)
+        fn import_snapshot(&mut self, sync_id: &str, data: &[u8], bound_ms: i64) -> Result<u64> {
+            self.inner.import_snapshot(sync_id, data, bound_ms)
         }
 
         fn commit(self: Box<Self>) -> Result<()> {

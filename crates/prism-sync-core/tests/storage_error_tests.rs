@@ -778,7 +778,7 @@ fn sequential_transactions_work_after_drop() {
 fn import_snapshot_empty_bytes_returns_error() {
     let storage = make_storage();
     let mut tx = storage.begin_tx().unwrap();
-    let result = tx.import_snapshot("sync-1", &[]);
+    let result = tx.import_snapshot("sync-1", &[], prism_sync_core::MAX_CLOCK_DRIFT_MS);
     assert!(result.is_err(), "empty bytes should return Err, not panic");
 }
 
@@ -786,7 +786,7 @@ fn import_snapshot_empty_bytes_returns_error() {
 fn import_snapshot_garbage_bytes_returns_error() {
     let storage = make_storage();
     let mut tx = storage.begin_tx().unwrap();
-    let result = tx.import_snapshot("sync-1", &[0xFF, 0xFE, 0x00, 0x01]);
+    let result = tx.import_snapshot("sync-1", &[0xFF, 0xFE, 0x00, 0x01], prism_sync_core::MAX_CLOCK_DRIFT_MS);
     assert!(result.is_err(), "garbage bytes should return Err, not panic");
 }
 
@@ -795,7 +795,7 @@ fn import_snapshot_truncated_zstd_returns_error() {
     let storage = make_storage();
     let mut tx = storage.begin_tx().unwrap();
     // Valid zstd magic number (0xFD2FB528 little-endian) but truncated payload
-    let result = tx.import_snapshot("sync-1", &[0x28, 0xB5, 0x2F, 0xFD, 0x00]);
+    let result = tx.import_snapshot("sync-1", &[0x28, 0xB5, 0x2F, 0xFD, 0x00], prism_sync_core::MAX_CLOCK_DRIFT_MS);
     assert!(result.is_err(), "truncated zstd frame should return Err, not panic");
 }
 

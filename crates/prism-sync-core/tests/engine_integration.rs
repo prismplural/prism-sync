@@ -1570,6 +1570,518 @@ async fn snapshot_import_accepts_rows_from_trusted_non_uploader_device() {
 }
 
 /// A snapshot auto-bootstrap (the relay-history-pruned path that runs
+/// `bootstrap_from_snapshot`): a snapshot field whose winning HLC is far in the
+/// future (the same condition the pull path defers) must NOT be imported as a
+/// live field, must NOT surface in the returned EntityChanges, and must instead
+/// land in the per-op quarantine lane with the shared `future_hlc` reason — so
+/// the snapshot channel can never diverge from the op channel, and the replay
+/// path picks it up once the local clock catches up.
+#[tokio::test]
+async fn bootstrap_from_snapshot_quarantines_future_drift_field() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 7;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    // A live field whose winner sits an hour in the future — well past the 60s
+    // drift bound the op channel enforces.
+    let future_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let drift_hlc = Hlc::new(future_ms, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-drift".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: drift_hlc.clone(),
+            winning_device_id: source_id.to_string(),
+            winning_op_id: "op-drift".to_string(),
+            winning_encoded_value: Some("\"Drifted title\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        // The drift op is deliberately NOT pre-marked applied, so the quarantine
+        // stays replayable once the clock catches up.
+        applied_ops: vec![],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-drift",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    let (count, entity_changes) =
+        engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+
+    // No live import, no EntityChange for the drifted field.
+    assert_eq!(count, 0);
+    assert!(
+        entity_changes.is_empty(),
+        "a future-drift snapshot field must not surface as a live EntityChange"
+    );
+    assert!(
+        storage.get_field_version(SYNC_ID, "tasks", "task-drift", "title").unwrap().is_none(),
+        "a future-drift snapshot field must not import into field_versions"
+    );
+    assert!(!storage.is_op_applied("op-drift").unwrap());
+
+    // It is held in the per-op quarantine lane with the shared reason string.
+    let quarantined = storage.list_quarantined_ops(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].op_id, "op-drift");
+    assert_eq!(quarantined[0].reason, "future_hlc");
+    assert_eq!(quarantined[0].op.device_id, source_id);
+    assert_eq!(quarantined[0].op.client_hlc, drift_hlc);
+}
+
+/// Regression: a snapshot field within the drift bound (now+30s) bootstraps
+/// normally — imported live, surfaced as an EntityChange, never quarantined.
+#[tokio::test]
+async fn bootstrap_from_snapshot_imports_within_bound_field() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 9;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let near_ms = chrono::Utc::now().timestamp_millis() + 30_000; // within the 60s bound
+    let near_hlc = Hlc::new(near_ms, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-near".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: near_hlc.clone(),
+            winning_device_id: source_id.to_string(),
+            winning_op_id: "op-near".to_string(),
+            winning_encoded_value: Some("\"Within bound\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        applied_ops: vec![],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-near",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    let (count, entity_changes) =
+        engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(entity_changes.len(), 1);
+    assert_eq!(
+        entity_changes[0].fields.get("title"),
+        Some(&"\"Within bound\"".to_string())
+    );
+    assert_eq!(
+        storage
+            .get_field_version(SYNC_ID, "tasks", "task-near", "title")
+            .unwrap()
+            .unwrap()
+            .winning_encoded_value,
+        Some("\"Within bound\"".to_string())
+    );
+    assert!(storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty());
+}
+
+/// Supersede: once a later same-device op has won the same field, the
+/// future-drift quarantine row from the snapshot import is dead on arrival (it
+/// can never win LWW), so the reused replay path evicts it on the next sync
+/// cycle rather than holding it forever or resurrecting stale state.
+#[tokio::test]
+async fn bootstrap_from_snapshot_drift_quarantine_evicted_by_later_same_device_op() {
+    use prism_sync_core::storage::FieldVersion;
+
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 11;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    let future_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let drift_hlc = Hlc::new(future_ms, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-drift".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: drift_hlc.clone(),
+            winning_device_id: source_id.to_string(),
+            winning_op_id: "op-drift".to_string(),
+            winning_encoded_value: Some("\"Drifted title\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        applied_ops: vec![],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-drift",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay, vec![entity], test_schema(), SyncConfig::default());
+    engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+    assert_eq!(storage.list_quarantined_ops(SYNC_ID).unwrap().len(), 1);
+
+    // The source device's clock recovered, so its NEXT edit to the same field
+    // carries a monotonically higher HLC than the excursion op and wins the
+    // field. (HLC is per-device monotonic, so the recovered edit's HLC strictly
+    // exceeds the excursion's even though it was emitted "now".) Simulate that
+    // applied winner directly in storage.
+    {
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: SYNC_ID.to_string(),
+            entity_table: "tasks".to_string(),
+            entity_id: "task-drift".to_string(),
+            field_name: "title".to_string(),
+            winning_op_id: "op-recovered".to_string(),
+            winning_device_id: source_id.to_string(),
+            winning_hlc: Hlc::new(future_ms, 1, source_id).to_string(),
+            winning_encoded_value: Some("\"Recovered title\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // A sync cycle's Phase 0 replay evaluates the supersede rule and evicts the
+    // dead drift quarantine row.
+    engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty(),
+        "the superseded future-drift quarantine row must be evicted"
+    );
+    // The recovered winner stands; the stale excursion value never resurrects.
+    assert_eq!(
+        storage
+            .get_field_version(SYNC_ID, "tasks", "task-drift", "title")
+            .unwrap()
+            .unwrap()
+            .winning_encoded_value,
+        Some("\"Recovered title\"".to_string())
+    );
+}
+
+/// Data-loss guard: a snapshot whose `applied_ops` ALREADY lists the
+/// over-bound field's winning op (legacy pre-replay data, or an exporter that
+/// replayed it while it was within-bound to its faster clock) must still recover.
+/// The gate must NOT mark that op applied on import — otherwise the replay
+/// would skip it (merge skips already-applied ops) and then delete its quarantine
+/// row as "replayed", losing the field forever. Once the clock catches up the
+/// quarantined op replays and the field lands in field_versions.
+#[tokio::test]
+async fn bootstrap_from_snapshot_quarantined_op_in_applied_ops_still_recovers() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_source = make_signing_key();
+    let ml_dsa_key_source = make_ml_dsa_keypair();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let source_id = "device-source";
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+    let server_seq_at = 9;
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        source_id,
+        &signing_key_source.verifying_key(),
+        &ml_dsa_key_source.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device(&relay, &storage, receiver_id, &signing_key_receiver.verifying_key());
+
+    // 90s ahead — over the default 60s bound at bootstrap, but inside the wider
+    // bound used for the replay pass (simulating the local clock catching up).
+    let future_ms = current_time_ms() + 90_000;
+    let drift_hlc = Hlc::new(future_ms, 0, source_id).to_string();
+    let snapshot = SnapshotData {
+        version: SNAPSHOT_VERSION,
+        field_versions: vec![FieldVersionEntry {
+            entity_table: "tasks".to_string(),
+            entity_id: "task-drift".to_string(),
+            field_name: "title".to_string(),
+            winning_hlc: drift_hlc.clone(),
+            winning_device_id: source_id.to_string(),
+            winning_op_id: "op-drift".to_string(),
+            winning_encoded_value: Some("\"Drifted title\"".to_string()),
+            updated_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        device_registry: vec![
+            snapshot_device_entry(
+                source_id,
+                &signing_key_source.verifying_key(),
+                &ml_dsa_key_source.public_key_bytes(),
+            ),
+            snapshot_device_entry(
+                sender_id,
+                &signing_key_sender.verifying_key(),
+                &ml_dsa_key_sender.public_key_bytes(),
+            ),
+        ],
+        // The exporter ran the op as applied (its faster clock made it in-bound),
+        // so the snapshot carries op-drift in applied_ops. The importer must NOT
+        // honor that for the field it is quarantining.
+        applied_ops: vec![AppliedOpEntry {
+            op_id: "op-drift".to_string(),
+            sync_id: SYNC_ID.to_string(),
+            epoch: 0,
+            device_id: source_id.to_string(),
+            client_hlc: drift_hlc.clone(),
+            server_seq: server_seq_at,
+            applied_at: "2024-03-15T00:00:00Z".to_string(),
+        }],
+        sync_metadata: SyncMetadataEntry {
+            sync_id: SYNC_ID.to_string(),
+            local_device_id: sender_id.to_string(),
+            current_epoch: 0,
+            last_pulled_server_seq: server_seq_at,
+        },
+    };
+    let envelope_bytes = make_snapshot_envelope_bytes(
+        &snapshot,
+        &key_hierarchy,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "snapshot-drift",
+        sender_id,
+        server_seq_at,
+    );
+    relay
+        .put_snapshot(0, server_seq_at, envelope_bytes, None, None, sender_id.to_string(), None)
+        .await
+        .unwrap();
+
+    // Bootstrap at the default 60s bound: op-drift is over-bound, so its field is
+    // quarantined and — critically — op-drift must NOT be marked applied.
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity.clone()],
+        test_schema(),
+        SyncConfig::default(),
+    );
+    engine.bootstrap_from_snapshot(SYNC_ID, &key_hierarchy).await.unwrap();
+    assert!(
+        !storage.is_op_applied("op-drift").unwrap(),
+        "a quarantined snapshot op must not be marked applied, or replay loses the field"
+    );
+    assert!(storage.get_field_version(SYNC_ID, "tasks", "task-drift", "title").unwrap().is_none());
+    assert_eq!(storage.list_quarantined_ops(SYNC_ID).unwrap().len(), 1);
+
+    // The local clock catches up (modeled by a wider drift bound): a Phase 0
+    // replay cycle applies the quarantined op and the field lands. On the buggy
+    // code op-drift was already applied, so replay skipped it and deleted the
+    // quarantine row — the field never appeared and this assert failed.
+    let replay_engine = SyncEngine::new(
+        storage.clone(),
+        relay,
+        vec![entity],
+        test_schema(),
+        SyncConfig { max_clock_drift_ms: 200_000, ..Default::default() },
+    );
+    replay_engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .get_field_version(SYNC_ID, "tasks", "task-drift", "title")
+            .unwrap()
+            .expect("the quarantined field must be applied to field_versions on replay")
+            .winning_encoded_value,
+        Some("\"Drifted title\"".to_string())
+    );
+    assert!(
+        storage.list_quarantined_ops(SYNC_ID).unwrap().is_empty(),
+        "the replayed quarantine row is removed once applied"
+    );
+    assert!(storage.is_op_applied("op-drift").unwrap(), "the op is applied after replay");
+}
+
+/// A snapshot auto-bootstrap (the relay-history-pruned path that runs
 /// `bootstrap_from_snapshot`) must preserve the device's existing
 /// `last_imported_registry_version` freshness baseline. The snapshot blob carries
 /// no baseline, so without the importer's preserve-on-REPLACE fix the bootstrap

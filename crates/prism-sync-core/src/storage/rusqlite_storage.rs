@@ -10,7 +10,9 @@ use super::migrations;
 use super::snapshot_format::*;
 use super::traits::*;
 use super::types::*;
+use crate::crdt_change::CrdtChange;
 use crate::device_registry::{registry_import_action, RegistryImportAction, RegistryImportSource};
+use crate::engine::SchemaQuarantineReason;
 use crate::error::{CoreError, Result};
 use crate::hlc::Hlc;
 
@@ -1325,7 +1327,12 @@ fn snapshot_field_import_decision(
     }
 }
 
-fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result<u64> {
+fn exec_import_snapshot(
+    conn: &Connection,
+    sync_id: &str,
+    data: &[u8],
+    bound_ms: i64,
+) -> Result<u64> {
     // 1. Decompress zstd
     let json = zstd::decode_all(data).map_err(|e| {
         CoreError::Storage(StorageError::Logic(format!("zstd decompression failed: {e}")))
@@ -1399,7 +1406,70 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
         }
     }
 
+    // Snapshot bootstrap must gate on the same future-drift bound the pull path
+    // uses: a snapshot uploaded by a device whose clock ran far ahead
+    // legitimately carries over-bound winning HLCs that `filter_batch_ops` would
+    // defer on the op channel, so accepting them here would make snapshot-cohort
+    // and pull-cohort devices diverge by construction. Each excluded row is
+    // QUARANTINED into the same per-op lane as the pull deferral (reason
+    // `future_hlc`) — not dropped — so the existing reason-aware replay re-applies
+    // it (or evicts it via the supersede rule) once the local clock catches up.
+    // Computed once; the over-bound check is the entry gate, evaluated before the
+    // LWW/tombstone decision so a poisoned winner never reaches field_versions.
+    // Like the pull filter, the gate compares against raw wall clock and does NOT
+    // consult ClockConfidence (unlike the clock-excursion repair): the snapshot
+    // path must run on every bootstrap regardless of validation state, so the
+    // omission is deliberate.
+    //
+    // Every quarantined winning_op_id is collected so step 5 below can exclude it
+    // from the applied_ops insert. The snapshot's applied_ops may already list it
+    // (legacy data, or an exporter that replayed the op while it was
+    // within-bound to its faster clock); marking it applied would make the
+    // replay skip it (merge skips already-applied ops) and then delete the
+    // quarantine row as "replayed", losing the field forever. The pull path is
+    // self-consistent because it never marks a deferred op applied.
+    let now_ms = Hlc::now_ms();
+    let mut quarantined_op_ids: HashSet<String> = HashSet::new();
     for fv in &snapshot.field_versions {
+        if let Ok(hlc) = Hlc::from_string(&fv.winning_hlc) {
+            if crate::clock_drift::is_excessively_future(&hlc, now_ms, bound_ms) {
+                let is_delete = fv.field_name == "is_deleted"
+                    && is_tombstone_value(fv.winning_encoded_value.as_deref());
+                let op = CrdtChange::new(
+                    Some(fv.winning_op_id.clone()),
+                    None,
+                    fv.entity_id.clone(),
+                    fv.entity_table.clone(),
+                    fv.field_name.clone(),
+                    fv.winning_encoded_value.clone(),
+                    Some(fv.winning_hlc.clone()),
+                    is_delete,
+                    Some(fv.winning_device_id.clone()),
+                    Some(snapshot.sync_metadata.current_epoch),
+                    None,
+                );
+                exec_insert_quarantined_op(
+                    conn,
+                    &QuarantinedOp {
+                        sync_id: sync_id.to_string(),
+                        op_id: fv.winning_op_id.clone(),
+                        op,
+                        reason: SchemaQuarantineReason::FutureHlc.as_str().to_string(),
+                        server_seq: snapshot.sync_metadata.last_pulled_server_seq,
+                        quarantined_at: Utc::now(),
+                    },
+                )?;
+                tracing::warn!(
+                    table = %fv.entity_table,
+                    entity_id = %fv.entity_id,
+                    field = %fv.field_name,
+                    winning_hlc = %fv.winning_hlc,
+                    "Quarantining snapshot field with excessive future HLC drift (F30)"
+                );
+                quarantined_op_ids.insert(fv.winning_op_id.clone());
+                continue;
+            }
+        }
         match snapshot_field_import_decision(conn, sync_id, fv, &locally_tombstoned)? {
             SnapshotFieldImportDecision::InsertOrUpdate => {
                 conn.execute(
@@ -1514,8 +1584,13 @@ fn exec_import_snapshot(conn: &Connection, sync_id: &str, data: &[u8]) -> Result
         )?;
     }
 
-    // 5. Insert applied_ops (INSERT OR IGNORE — idempotent)
+    // 5. Insert applied_ops (INSERT OR IGNORE — idempotent). Skip any op_id the
+    //    future-drift gate quarantined above: marking it applied would let the
+    //    replay skip-then-delete it, dropping the field permanently (see the gate above).
     for ao in &snapshot.applied_ops {
+        if quarantined_op_ids.contains(&ao.op_id) {
+            continue;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO applied_ops \
              (op_id, sync_id, epoch, device_id, client_hlc, server_seq, applied_at) \
@@ -2100,8 +2175,8 @@ impl SyncStorageTx for RusqliteTx<'_> {
         exec_delete_non_tombstone_field_versions_for_entity(&self.conn, sync_id, table, entity_id)
     }
 
-    fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64> {
-        exec_import_snapshot(&self.conn, sync_id, data)
+    fn import_snapshot(&mut self, sync_id: &str, data: &[u8], bound_ms: i64) -> Result<u64> {
+        exec_import_snapshot(&self.conn, sync_id, data, bound_ms)
     }
 
     // ── Transaction lifecycle ──
@@ -2932,7 +3007,7 @@ mod tests {
 
         let dst = make_storage();
         let mut tx = dst.begin_tx().unwrap();
-        let entity_count = tx.import_snapshot("sync-1", &blob).unwrap();
+        let entity_count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         // 2 unique entities: (members, ent-1) and (sessions, ent-2)
@@ -2991,7 +3066,7 @@ mod tests {
         }
 
         let mut tx = dst.begin_tx().unwrap();
-        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         let meta = dst.get_sync_metadata("sync-1").unwrap().unwrap();
@@ -3020,7 +3095,7 @@ mod tests {
 
         let dst = make_storage();
         let mut tx = dst.begin_tx().unwrap();
-        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         let meta = dst.get_sync_metadata("sync-1").unwrap().unwrap();
@@ -3065,7 +3140,7 @@ mod tests {
         }
         {
             let mut tx = dst.begin_tx().unwrap();
-            tx.import_snapshot("sync-1", &blob).unwrap();
+            tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
             tx.commit().unwrap();
         }
         let fv = dst.get_field_version("sync-1", "members", "e1", "is_deleted").unwrap().unwrap();
@@ -3094,7 +3169,7 @@ mod tests {
         }
         {
             let mut tx = dst2.begin_tx().unwrap();
-            tx.import_snapshot("sync-1", &blob2).unwrap();
+            tx.import_snapshot("sync-1", &blob2, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
             tx.commit().unwrap();
         }
         let fv2 = dst2.get_field_version("sync-1", "members", "e2", "is_deleted").unwrap().unwrap();
@@ -3156,7 +3231,7 @@ mod tests {
 
         let count = {
             let mut tx = dst.begin_tx().unwrap();
-            let count = tx.import_snapshot("sync-1", &blob).unwrap();
+            let count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
             tx.commit().unwrap();
             count
         };
@@ -3233,7 +3308,7 @@ mod tests {
 
         {
             let mut tx = dst.begin_tx().unwrap();
-            tx.import_snapshot("sync-1", &blob).unwrap();
+            tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
             tx.commit().unwrap();
         }
 
@@ -3292,7 +3367,7 @@ mod tests {
 
         let count = {
             let mut tx = dst.begin_tx().unwrap();
-            let count = tx.import_snapshot("sync-1", &blob).unwrap();
+            let count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
             tx.commit().unwrap();
             count
         };
@@ -3316,11 +3391,11 @@ mod tests {
 
         // Import twice — should not error
         let mut tx = dst.begin_tx().unwrap();
-        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         let mut tx = dst.begin_tx().unwrap();
-        let count = tx.import_snapshot("sync-1", &blob).unwrap();
+        let count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         assert_eq!(count, 2);
@@ -3348,7 +3423,7 @@ mod tests {
         // Import fails closed, and (because it errors mid-transaction) nothing
         // partially applies.
         let mut tx = dst.begin_tx().unwrap();
-        let result = tx.import_snapshot("sync-1", &blob);
+        let result = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS);
         assert!(
             matches!(result, Err(CoreError::DeviceKeyChanged { ref device_id }) if device_id == "dev-1"),
             "expected DeviceKeyChanged, got: {result:?}"
@@ -3378,7 +3453,7 @@ mod tests {
             .unwrap();
 
         let mut tx = dst.begin_tx().unwrap();
-        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
@@ -3409,7 +3484,7 @@ mod tests {
         tx.commit().unwrap();
 
         let mut tx = dst.begin_tx().unwrap();
-        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
@@ -3441,7 +3516,7 @@ mod tests {
         tx.commit().unwrap();
 
         let mut tx = dst.begin_tx().unwrap();
-        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         let d1 = dst.get_device_record("sync-1", "dev-1").unwrap().unwrap();
@@ -3453,8 +3528,263 @@ mod tests {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
         // Random bytes that aren't valid zstd
-        let result = tx.import_snapshot("sync-1", &[0xFF, 0xFE, 0xFD]);
+        let result = tx.import_snapshot("sync-1", &[0xFF, 0xFE, 0xFD], crate::clock_drift::MAX_CLOCK_DRIFT_MS);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn import_snapshot_quarantines_future_drift_field_not_imports_it() {
+        // A snapshot field whose winning HLC is far in the future (the same
+        // condition the pull path defers) must NOT land in field_versions; it is
+        // quarantined into the per-op lane with reason `future_hlc` so the
+        // replay path applies it once the local clock catches up.
+        let future_ms = Hlc::now_ms() + 3_600_000; // +1h, well over the 60s bound
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-future".to_string(),
+                winning_device_id: "src".to_string(),
+                winning_hlc: format!("{future_ms}:0:src"),
+                winning_encoded_value: Some("\"Drifted\"".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.commit().unwrap();
+        }
+        let count = {
+            let mut tx = dst.begin_tx().unwrap();
+            let count = tx
+                .import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS)
+                .unwrap();
+            tx.commit().unwrap();
+            count
+        };
+
+        // The over-bound field was excluded from the import set.
+        assert!(
+            dst.get_field_version("sync-1", "members", "e1", "name").unwrap().is_none(),
+            "a future-drift snapshot field must not import into field_versions"
+        );
+        assert_eq!(count, 0, "an excluded field contributes nothing to the import count");
+
+        // ...and it was quarantined with the shared `future_hlc` reason.
+        let quarantined = dst.list_quarantined_ops("sync-1").unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].op_id, "op-future");
+        assert_eq!(quarantined[0].reason, "future_hlc");
+        assert_eq!(quarantined[0].op.entity_table, "members");
+        assert_eq!(quarantined[0].op.field_name, "name");
+        assert_eq!(quarantined[0].op.device_id, "src");
+        assert_eq!(quarantined[0].op.encoded_value, "\"Drifted\"");
+    }
+
+    #[test]
+    fn import_snapshot_quarantines_future_drift_on_pruned_local_tombstone() {
+        // Even when the entity is locally tombstoned (and pruned to
+        // only is_deleted=true), an over-bound live snapshot field is excluded by
+        // the future-drift entry gate and quarantined — the gate runs ahead of the
+        // per-entity tombstone decision, so the row never reaches it.
+        let future_ms = Hlc::now_ms() + 3_600_000;
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-future".to_string(),
+                winning_device_id: "src".to_string(),
+                winning_hlc: format!("{future_ms}:0:src"),
+                winning_encoded_value: Some("\"Drifted\"".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "is_deleted".to_string(),
+                winning_op_id: "del-op".to_string(),
+                winning_device_id: "dst".to_string(),
+                winning_hlc: "1000:0:dst".to_string(),
+                winning_encoded_value: Some("true".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert!(
+            dst.get_field_version("sync-1", "members", "e1", "name").unwrap().is_none(),
+            "a future-drift live field must not recreate a locally-tombstoned entity"
+        );
+        let quarantined = dst.list_quarantined_ops("sync-1").unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].reason, "future_hlc");
+        assert_eq!(quarantined[0].op_id, "op-future");
+    }
+
+    #[test]
+    fn import_snapshot_within_bound_field_still_imports() {
+        // Regression: a snapshot field within the drift bound (now+30s) imports
+        // normally and is NOT quarantined.
+        let near_ms = Hlc::now_ms() + 30_000; // +30s, inside the 60s bound
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-near".to_string(),
+                winning_device_id: "src".to_string(),
+                winning_hlc: format!("{near_ms}:0:src"),
+                winning_encoded_value: Some("\"Fine\"".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.commit().unwrap();
+        }
+        let count = {
+            let mut tx = dst.begin_tx().unwrap();
+            let count = tx
+                .import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS)
+                .unwrap();
+            tx.commit().unwrap();
+            count
+        };
+
+        let fv = dst.get_field_version("sync-1", "members", "e1", "name").unwrap().unwrap();
+        assert_eq!(fv.winning_encoded_value, Some("\"Fine\"".to_string()));
+        assert_eq!(count, 1);
+        assert!(
+            dst.list_quarantined_ops("sync-1").unwrap().is_empty(),
+            "a within-bound snapshot field is not quarantined"
+        );
+    }
+
+    #[test]
+    fn import_snapshot_quarantined_op_is_not_marked_applied() {
+        // Data-loss guard: when the snapshot's applied_ops already lists the
+        // over-bound field's winning op (legacy data, or an exporter that
+        // replayed it while it was within-bound to its faster clock), the import
+        // must NOT mark that op applied — otherwise the replay would skip it
+        // (merge skips already-applied ops) and then delete its quarantine row as
+        // "replayed", losing the field forever. A within-bound op in the same
+        // snapshot stays applied as usual.
+        let future_ms = Hlc::now_ms() + 3_600_000; // +1h, well over the 60s bound
+        let near_ms = Hlc::now_ms() + 30_000; // +30s, inside the bound
+        let src = make_storage();
+        {
+            let mut tx = src.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "op-future".to_string(),
+                winning_device_id: "src".to_string(),
+                winning_hlc: format!("{future_ms}:0:src"),
+                winning_encoded_value: Some("\"Drifted\"".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "e1".to_string(),
+                field_name: "bio".to_string(),
+                winning_op_id: "op-near".to_string(),
+                winning_device_id: "src".to_string(),
+                winning_hlc: format!("{near_ms}:0:src"),
+                winning_encoded_value: Some("\"Fine\"".to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+            // Both ops are already applied on the exporter — the over-bound one
+            // because the exporter's clock made it in-bound, the near one normally.
+            tx.insert_applied_op(&AppliedOp {
+                op_id: "op-future".to_string(),
+                sync_id: "sync-1".to_string(),
+                epoch: 0,
+                device_id: "src".to_string(),
+                client_hlc: format!("{future_ms}:0:src"),
+                server_seq: 5,
+                applied_at: Utc::now(),
+            })
+            .unwrap();
+            tx.insert_applied_op(&AppliedOp {
+                op_id: "op-near".to_string(),
+                sync_id: "sync-1".to_string(),
+                epoch: 0,
+                device_id: "src".to_string(),
+                client_hlc: format!("{near_ms}:0:src"),
+                server_seq: 6,
+                applied_at: Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let blob = src.export_snapshot("sync-1").unwrap();
+
+        let dst = make_storage();
+        {
+            let mut tx = dst.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+            tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // The quarantined op must NOT be applied, so the replay can still apply it.
+        assert!(
+            !dst.is_op_applied("op-future").unwrap(),
+            "a quarantined future-drift op must not be marked applied, or replay loses the field"
+        );
+        // The within-bound op imported and stays applied as usual.
+        assert!(dst.is_op_applied("op-near").unwrap());
+        let quarantined = dst.list_quarantined_ops("sync-1").unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].op_id, "op-future");
     }
 
     #[test]
@@ -3505,7 +3835,7 @@ mod tests {
         let blob = src.export_snapshot("sync-1").unwrap();
         let dst = make_storage();
         let mut tx = dst.begin_tx().unwrap();
-        tx.import_snapshot("sync-1", &blob).unwrap();
+        tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         // Verify non-zero generation survived

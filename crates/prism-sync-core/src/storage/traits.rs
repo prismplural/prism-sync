@@ -544,7 +544,12 @@ pub trait SyncStorageTx {
 
     /// Import sync state from a snapshot blob (zstd-compressed JSON).
     /// Returns the number of unique entities restored.
-    fn import_snapshot(&mut self, sync_id: &str, data: &[u8]) -> Result<u64>;
+    ///
+    /// `bound_ms` is the receiver-side future-drift tolerance (the same bound the
+    /// pull path applies): any snapshot field whose winning HLC exceeds it is
+    /// quarantined into `quarantined_ops` (reason `future_hlc`) rather than
+    /// imported, so the snapshot channel can never diverge from the op channel.
+    fn import_snapshot(&mut self, sync_id: &str, data: &[u8], bound_ms: i64) -> Result<u64>;
 
     // ── Transaction lifecycle ──
     fn commit(self: Box<Self>) -> Result<()>;

@@ -3522,10 +3522,15 @@ impl SyncEngine {
         let sid = sync_id.to_string();
         let seq = snapshot.server_seq_at;
         let data = compressed.clone();
+        // Gate the snapshot import on the same future-drift bound the pull path
+        // uses: over-bound snapshot fields are quarantined inside the import,
+        // never written to field_versions, so the post-import re-read below
+        // excludes them from both the consumer journal and the EntityChange stream.
+        let bound_ms = self.config.max_clock_drift_ms;
         let snapshot_field_versions = snapshot_data.field_versions.clone();
         let accepted_field_versions = tokio::task::spawn_blocking(move || {
             let mut tx = storage.begin_tx()?;
-            tx.import_snapshot(&sid, &data)?;
+            tx.import_snapshot(&sid, &data, bound_ms)?;
             tx.update_last_pulled_seq(&sid, seq)?;
 
             // Re-read each snapshot field within the tx; keep only the ones
