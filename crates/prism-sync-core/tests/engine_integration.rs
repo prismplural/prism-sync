@@ -3934,6 +3934,99 @@ async fn push_caps_batches_per_cycle_and_flags_incomplete() {
     assert_eq!(relay.batch_count(), 3);
 }
 
+/// The push queue is ordered by typed logical HLC, not wall-clock
+/// `created_at`. A create batch (earlier HLC) and a later update batch for the
+/// same entity are queued; the update's `created_at` is doctored 90s earlier
+/// than the create's, simulating a backward clock step while the backlog sat
+/// queued. The old `ORDER BY MIN(created_at)` would have pushed the update
+/// first — which makes the receiver's non-strict apply silently drop the
+/// NOT-NULL create. The typed-HLC sort keeps emission order so the relay
+/// receives the create strictly before the update.
+#[tokio::test]
+async fn push_orders_by_hlc_not_wallclock_after_backward_step() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key = make_signing_key();
+    let ml_dsa_key = make_ml_dsa_keypair();
+    let device_id = "device-push-order";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, device_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        device_id,
+        &signing_key.verifying_key(),
+        &ml_dsa_key.public_key_bytes(),
+    );
+
+    // Two batches for the same entity, emitted in HLC order: create first
+    // (counter 0), update second (counter 1). The HLCs are explicit so the
+    // ordering does not depend on wall-clock resolution.
+    let base_ts = 1_778_947_200_000_i64;
+    let create_hlc = Hlc::new(base_ts, 0, device_id);
+    let update_hlc = Hlc::new(base_ts, 1, device_id);
+    let create_op = CrdtChange {
+        op_id: format!("tasks:task-1:title:{create_hlc}:{device_id}"),
+        batch_id: Some("batch-create".to_string()),
+        entity_id: "task-1".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"created\"".to_string(),
+        client_hlc: create_hlc.to_string(),
+        is_delete: false,
+        device_id: device_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    let update_op = CrdtChange {
+        op_id: format!("tasks:task-1:title:{update_hlc}:{device_id}"),
+        batch_id: Some("batch-update".to_string()),
+        entity_id: "task-1".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"updated\"".to_string(),
+        client_hlc: update_hlc.to_string(),
+        is_delete: false,
+        device_id: device_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+
+    // The create batch carries a normal emit time; the later update batch
+    // carries one 90s earlier, simulating a backward wall-clock step.
+    let create_at = chrono::Utc::now();
+    let update_at = create_at - chrono::Duration::seconds(90);
+    // Insert the update first so the result cannot depend on insertion order.
+    insert_pending_ops_at(&storage, std::slice::from_ref(&update_op), "batch-update", update_at);
+    insert_pending_ops_at(&storage, std::slice::from_ref(&create_op), "batch-create", create_at);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    let result = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key, Some(&ml_dsa_key), device_id, 0)
+        .await
+        .unwrap();
+    assert!(result.error.is_none(), "push should succeed: {:?}", result.error);
+    assert_eq!(result.pushed, 2, "both batches must push");
+
+    let order = relay.push_call_batch_ids();
+    assert_eq!(
+        order,
+        vec!["batch-create".to_string(), "batch-update".to_string()],
+        "the create batch (earlier HLC) must reach the relay before the later \
+         update even though the update's created_at is 90s earlier (F39)"
+    );
+}
+
 /// Degenerate case: metadata claims current_epoch = N but the KeyHierarchy
 /// has no key at N. Push must fail with a clear error, NOT silently fall
 /// back to an older epoch key. It must bubble as `MissingEpochKey` so the

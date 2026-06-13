@@ -242,6 +242,17 @@ pub fn register_device_with_pq(
 
 /// Insert pending ops into storage so the engine can push them.
 pub fn insert_pending_ops(storage: &RusqliteSyncStorage, ops: &[CrdtChange], batch_id: &str) {
+    insert_pending_ops_at(storage, ops, batch_id, chrono::Utc::now());
+}
+
+/// Insert pending ops with an explicit `created_at`, so a test can simulate a
+/// backward wall-clock step (a later-HLC batch carrying an earlier emit time).
+pub fn insert_pending_ops_at(
+    storage: &RusqliteSyncStorage,
+    ops: &[CrdtChange],
+    batch_id: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) {
     use prism_sync_core::storage::{PendingOp, SyncStorage};
     let mut tx = storage.begin_tx().unwrap();
     for op in ops {
@@ -257,7 +268,7 @@ pub fn insert_pending_ops(storage: &RusqliteSyncStorage, ops: &[CrdtChange], bat
             encoded_value: op.encoded_value.clone(),
             is_delete: op.is_delete,
             client_hlc: op.client_hlc.clone(),
-            created_at: chrono::Utc::now(),
+            created_at,
             pushed_at: None,
         })
         .unwrap();

@@ -159,31 +159,66 @@ fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<Stri
     // over the client-side guard, but excluding them here keeps the cycle
     // from even loading their op rows.
     //
-    // ORDER BY first_created with first_hlc as a secondary tiebreaker. The
-    // primary sort is fixed-width microsecond timestamps (see
-    // `exec_insert_pending_op`), so lexical order on TEXT matches chronological
-    // order. The HLC tiebreaker is belt-and-suspenders: HLCs are monotonic per
-    // device (`{ms:013}:{counter:010}:{node_id}`), so even if two batches share
-    // an identical `created_at` they still resolve to a deterministic partition
-    // ordering — and any pre-existing variable-width rows from before Fix A
-    // still partition correctly behind it.
+    // The outbound order is keyed on the typed logical HLC, not on wall-clock
+    // `created_at`. `client_hlc` is `timestamp:counter:node_id` with
+    // unpadded integers, so a SQL `MIN(client_hlc)`/`ORDER BY` compares it
+    // lexically and gets the counter wrong (`:9` sorts after `:10`). Per-device
+    // HLCs are strictly increasing across ticks regardless of wall-clock steps,
+    // so typed-HLC order equals true emission order — which guarantees a create
+    // batch pushes before any later update for the same entity even after a
+    // backward clock step. We therefore read each batch's rows and compute the
+    // per-batch minimum typed HLC in Rust (defensively, in case a repartition
+    // left more than one op sharing a tick in a batch), then sort via the
+    // shared `sort_batch_ids_by_typed_hlc` helper with `created_at` then
+    // `batch_id` as deterministic tiebreakers.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT local_batch_id, \
-                MIN(created_at) AS first_created, \
-                MIN(client_hlc) AS first_hlc \
+        "SELECT local_batch_id, client_hlc, created_at \
              FROM pending_ops WHERE sync_id = ?1 AND pushed_at IS NULL \
                AND local_batch_id NOT IN ( \
                    SELECT batch_id FROM push_quarantine WHERE sync_id = ?1 \
-               ) \
-             GROUP BY local_batch_id \
-             ORDER BY first_created ASC, first_hlc ASC",
+               )",
     )?;
-    let rows = stmt.query_map(params![sync_id], |row| row.get::<_, String>(0))?;
-    let mut result = Vec::new();
+    let rows = stmt.query_map(params![sync_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    // Per batch keep the minimum typed HLC and the minimum `created_at`. The
+    // typed minimum is tracked as a parsed `Hlc`; an unparseable string (which
+    // should never occur for a locally minted op) keeps the existing string so
+    // the helper can sort it last.
+    let mut mins: std::collections::HashMap<String, (Option<Hlc>, String, String)> =
+        std::collections::HashMap::new();
     for r in rows {
-        result.push(r?);
+        let (batch_id, hlc_str, created_at) = r?;
+        let parsed = Hlc::from_string(&hlc_str).ok();
+        let entry = mins
+            .entry(batch_id)
+            .or_insert_with(|| (parsed.clone(), hlc_str.clone(), created_at.clone()));
+        match (&entry.0, &parsed) {
+            (Some(cur), Some(new)) if new < cur => {
+                entry.0 = parsed.clone();
+                entry.1 = hlc_str.clone();
+            }
+            (None, Some(_)) => {
+                entry.0 = parsed.clone();
+                entry.1 = hlc_str.clone();
+            }
+            _ => {}
+        }
+        if created_at < entry.2 {
+            entry.2 = created_at;
+        }
     }
-    Ok(result)
+
+    let batches: Vec<(String, String, String)> = mins
+        .into_iter()
+        .map(|(batch_id, (_, hlc_str, created_at))| (batch_id, hlc_str, created_at))
+        .collect();
+    Ok(crate::clock_drift::sort_batch_ids_by_typed_hlc(batches))
 }
 
 fn query_batch_ops(conn: &Connection, batch_id: &str) -> Result<Vec<PendingOp>> {
@@ -4278,11 +4313,11 @@ mod tests {
     /// differs by 1µs land at fixed-width `.123000Z` and `.123001Z` strings
     /// that sort correctly lexically.
     ///
-    /// **Fix B** (verified here): `query_unpushed_batch_ids` now uses
-    /// `MIN(client_hlc) ASC` as a secondary sort key, so if two batches end
-    /// up sharing an identical `first_created` (e.g., two ops emitted within
-    /// the same microsecond on a coarse clock) the per-device monotonic HLC
-    /// still partitions them deterministically.
+    /// **Fix B** (verified here): `query_unpushed_batch_ids` now orders by the
+    /// typed minimum HLC with `created_at` as a secondary tiebreaker, so
+    /// if two batches end up sharing an identical `created_at` (e.g., two ops
+    /// emitted within the same microsecond on a coarse clock) the per-device
+    /// monotonic HLC still partitions them deterministically.
     #[test]
     fn unpushed_batch_ids_partition_order_is_deterministic_in_boundary_case() {
         // Part 1 — Fix A: verify the storage trait writes fixed-width
@@ -4414,8 +4449,104 @@ mod tests {
         assert_eq!(
             ids,
             vec!["batch-earlier".to_string(), "batch-later".to_string()],
-            "when first_created ties, MIN(client_hlc) must break the tie in \
-             HLC order — Fix B's secondary ORDER BY"
+            "when created_at ties, the typed minimum HLC must break the tie in \
+             HLC order (F39)"
+        );
+    }
+
+    /// Push order is keyed on the typed logical HLC, so a backward
+    /// wall-clock step that leaves a later batch with an *earlier* `created_at`
+    /// must not reorder it ahead of the batch that was emitted first.
+    ///
+    /// Repro: batch1 has the earlier HLC (`T:0`) but a normal `created_at`;
+    /// batch2 has the later HLC (`T+1:0`) but a `created_at` 90s in the past,
+    /// simulating a clock that stepped backward while a backlog was queued. The
+    /// old `ORDER BY MIN(created_at)` would have pushed batch2 first; the
+    /// typed-HLC sort keeps emission order so a create always precedes a later
+    /// update for the same entity.
+    #[test]
+    fn unpushed_batch_ids_follow_hlc_after_backward_clock_step() {
+        let storage = make_storage();
+        let sync_id = "sync-clockstep";
+
+        let created1 = "2026-05-11T08:00:00.000000Z";
+        // 90 seconds earlier than batch1's created_at: a backward clock step.
+        let created2 = "2026-05-11T07:58:30.000000Z";
+        let hlc1 = "1778947200000:0:dev1";
+        let hlc2 = "1778947200001:0:dev1";
+
+        {
+            let conn = storage.conn.lock().expect("mutex poisoned");
+            // Insert the later-HLC batch first so the result cannot depend on
+            // insertion order.
+            conn.execute(
+                "INSERT INTO pending_ops \
+                 (op_id, sync_id, epoch, device_id, local_batch_id, entity_table, entity_id, \
+                  field_name, encoded_value, is_delete, client_hlc, created_at, pushed_at) \
+                 VALUES ('op2', ?1, 1, 'dev1', 'batch2', 'members', 'ent-1', 'banner', '\"u\"', 0, ?2, ?3, NULL)",
+                params![sync_id, hlc2, created2],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_ops \
+                 (op_id, sync_id, epoch, device_id, local_batch_id, entity_table, entity_id, \
+                  field_name, encoded_value, is_delete, client_hlc, created_at, pushed_at) \
+                 VALUES ('op1', ?1, 1, 'dev1', 'batch1', 'members', 'ent-1', 'name', '\"A\"', 0, ?2, ?3, NULL)",
+                params![sync_id, hlc1, created1],
+            )
+            .unwrap();
+        }
+
+        let ids = storage.get_unpushed_batch_ids(sync_id).unwrap();
+        assert_eq!(
+            ids,
+            vec!["batch1".to_string(), "batch2".to_string()],
+            "the earlier-HLC batch1 must push before batch2 even though batch2 \
+             carries an earlier created_at after a backward clock step (F39)"
+        );
+    }
+
+    /// The HLC counter is encoded unpadded (`timestamp:counter:node_id`),
+    /// so a lexical `MIN(client_hlc)` would order `:9` after `:10`. The typed
+    /// sort compares the parsed counter numerically, so the same-timestamp
+    /// counter-9 batch pushes before counter-10.
+    #[test]
+    fn unpushed_batch_ids_order_unpadded_hlc_counters_numerically() {
+        let storage = make_storage();
+        let sync_id = "sync-counter";
+
+        let same_ts = "2026-05-11T08:00:00.000000Z";
+        // Same HLC timestamp, counters 9 and 10 (unpadded, as the emitter mints
+        // them). `:10` sorts before `:9` lexically — the bug the typed sort cures.
+        let hlc9 = "1778947200000:9:dev1";
+        let hlc10 = "1778947200000:10:dev1";
+
+        {
+            let conn = storage.conn.lock().expect("mutex poisoned");
+            conn.execute(
+                "INSERT INTO pending_ops \
+                 (op_id, sync_id, epoch, device_id, local_batch_id, entity_table, entity_id, \
+                  field_name, encoded_value, is_delete, client_hlc, created_at, pushed_at) \
+                 VALUES ('op10', ?1, 1, 'dev1', 'batch10', 'members', 'ent-1', 'name', '\"j\"', 0, ?2, ?3, NULL)",
+                params![sync_id, hlc10, same_ts],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_ops \
+                 (op_id, sync_id, epoch, device_id, local_batch_id, entity_table, entity_id, \
+                  field_name, encoded_value, is_delete, client_hlc, created_at, pushed_at) \
+                 VALUES ('op9', ?1, 1, 'dev1', 'batch9', 'members', 'ent-1', 'name', '\"i\"', 0, ?2, ?3, NULL)",
+                params![sync_id, hlc9, same_ts],
+            )
+            .unwrap();
+        }
+
+        let ids = storage.get_unpushed_batch_ids(sync_id).unwrap();
+        assert_eq!(
+            ids,
+            vec!["batch9".to_string(), "batch10".to_string()],
+            "counter 9 must sort before counter 10 (the unpadded-encoding bug a \
+             lexical MIN(client_hlc) got wrong) — F39"
         );
     }
 

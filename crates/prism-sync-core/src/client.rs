@@ -4653,7 +4653,10 @@ mod tests {
         )
         .unwrap();
         sync.record_delete("members", "ent-1").unwrap();
-        let batches_before = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+        // Isolate the new batches by set difference rather than positional skip:
+        // the origin-stamped op sorts by its (earlier) HLC, not append order.
+        let batches_before: std::collections::HashSet<String> =
+            sync.storage.get_unpushed_batch_ids("sync-1").unwrap().into_iter().collect();
 
         let origin = Hlc::now_ms() - 7_200_000; // two hours ago
         let mut changed = HashMap::new();
@@ -4666,7 +4669,7 @@ mod tests {
             .get_unpushed_batch_ids("sync-1")
             .unwrap()
             .into_iter()
-            .skip(batches_before)
+            .filter(|b| !batches_before.contains(b))
             .collect();
         let ops: Vec<_> =
             new_batches.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
@@ -4742,7 +4745,10 @@ mod tests {
             ]),
         )
         .unwrap();
-        let before = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+        // Isolate the new batches by set difference rather than positional skip:
+        // floor/fresh-stamped ops sort by their HLC, not append order.
+        let before: std::collections::HashSet<String> =
+            sync.storage.get_unpushed_batch_ids("sync-1").unwrap().into_iter().collect();
 
         // Reconcile: name equal (skip), age diverged (fresh), score absent (floor).
         sync.record_reconcile(
@@ -4762,7 +4768,7 @@ mod tests {
             .get_unpushed_batch_ids("sync-1")
             .unwrap()
             .into_iter()
-            .skip(before)
+            .filter(|b| !before.contains(b))
             .collect();
         let ops: Vec<_> =
             new_batches.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
@@ -4783,7 +4789,10 @@ mod tests {
             &HashMap::from([("name".to_string(), SyncValue::String("Existing".to_string()))]),
         )
         .unwrap();
-        let before = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+        // Isolate the new batches by set difference rather than positional skip:
+        // a floor-HLC backfill op sorts by its (earliest) HLC, not append order.
+        let before: std::collections::HashSet<String> =
+            sync.storage.get_unpushed_batch_ids("sync-1").unwrap().into_iter().collect();
 
         // name diverged (Skip ⇒ no emit), age absent (floor backfill).
         sync.record_backfill(
@@ -4801,7 +4810,7 @@ mod tests {
             .get_unpushed_batch_ids("sync-1")
             .unwrap()
             .into_iter()
-            .skip(before)
+            .filter(|b| !before.contains(b))
             .collect();
         let ops: Vec<_> =
             new_batches.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
