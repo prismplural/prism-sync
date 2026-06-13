@@ -12,6 +12,27 @@ use crate::storage::{FieldVersion, PendingOp, SyncStorage};
 /// Constant field name used for delete tombstone ops.
 pub const DELETED_FIELD: &str = "is_deleted";
 
+/// Floor HLC timestamp (ms) for write-if-absent backfill ops: 2020-01-01.
+///
+/// Reconcile/backfill emission stamps never-synced fields at this constant so
+/// they establish an entity on peers that lack it but lose LWW to any genuine
+/// edit (every real op carries a ~now wall-clock HLC, far above this floor).
+/// It sits above `Hlc::zero` (timestamp 0) so a backfill op still beats truly
+/// empty state, and below any genuine op so it never reverts a real edit.
+pub const BACKFILL_HLC_TIMESTAMP_MS: i64 = 1_577_836_800_000;
+
+/// How [`OpEmitter::emit_reconcile_multi`] handles a field whose local Drift
+/// value diverges from this device's `field_versions` winner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivergentMode {
+    /// Emit the divergent value at a fresh `tick()` HLC — treat the divergence
+    /// as a genuine deferred local edit that should win as if made now.
+    FreshHlc,
+    /// Leave the divergent field alone (emit nothing). Pure backfill: only
+    /// fields absent from `field_versions` are emitted, at the floor HLC.
+    Skip,
+}
+
 /// Match the default engine drift tolerance for remote batches.
 ///
 /// Remote ops further in the future than this are deferred (quarantined) before
@@ -656,6 +677,437 @@ impl OpEmitter {
         );
 
         Ok(())
+    }
+
+    /// Mint an HLC stamped at `origin_ms` (clamped to the legal range) WITHOUT
+    /// advancing the emitter watermark.
+    ///
+    /// The HLC's timestamp is clamped to `BACKFILL_HLC_TIMESTAMP_MS + 1 ..=
+    /// now_ms()` so a replayed op can never claim to be from the future (which a
+    /// near-future receiver would accept and let win), nor sink to/below the
+    /// backfill floor (reserved for write-if-absent). The counter is a fresh
+    /// `tick()`-equivalent against the watermark so two ops minted at the same
+    /// origin within one batch stay distinguishable, and `node_id` stays local
+    /// so `validate_attribution` on the receiver passes.
+    ///
+    /// `last_hlc` is deliberately NOT advanced: emitting below the watermark is
+    /// already legal (offline `pending_ops` carry old `client_hlc`), and a
+    /// replay must not push the live clock forward to the replayed value.
+    pub fn mint_hlc_at(&self, origin_ms: i64) -> Hlc {
+        let ceiling = Hlc::now_ms();
+        let floor = BACKFILL_HLC_TIMESTAMP_MS + 1;
+        let timestamp = origin_ms.clamp(floor, ceiling.max(floor));
+        // Share the watermark's counter space when the origin lands on the
+        // same millisecond, so ops minted back-to-back at one origin don't
+        // collide; otherwise reset to 0. We never mutate `self.last_hlc`.
+        let counter = if self.last_hlc.timestamp == timestamp {
+            self.last_hlc.counter.saturating_add(1)
+        } else {
+            0
+        };
+        Hlc::new(timestamp, counter, self.device_id.clone())
+    }
+
+    /// Reconcile `fields` against this device's `field_versions`, emitting only
+    /// what genuinely diverges — never a value the device already agrees with.
+    ///
+    /// Inside ONE storage transaction, per field:
+    /// - value-equal to the local winner → skip (no op, no FV write); this is
+    ///   the load-bearing change that stops re-broadcast from clobbering a
+    ///   peer's un-pulled newer edit on an unchanged field.
+    /// - no `field_versions` row (never synced) → emit `pending_op` + FV at the
+    ///   floor backfill HLC; establishes the entity on peers that lack it but
+    ///   loses to any existing state.
+    /// - row present but value differs → per `divergent_mode`: `FreshHlc` emits
+    ///   at a fresh `tick()` (a genuine deferred edit), `Skip` emits nothing.
+    ///
+    /// Field-versions are upserted only for the fields that actually emit. The
+    /// `is_deleted = false` phantom-undelete strip is the caller's job (done in
+    /// `client.rs` against the conditional `without_phantom_undelete`).
+    pub fn emit_reconcile_multi(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        fields: &HashMap<String, SyncValue>,
+        divergent_mode: DivergentMode,
+        local_batch_id: &str,
+    ) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        // Classify every field against field_versions before opening the write
+        // transaction. Each field carries the HLC it should emit at, so the
+        // fresh-tick path can advance the watermark deterministically.
+        enum Plan {
+            Floor,
+            Fresh,
+        }
+        let mut plans: Vec<(&String, &SyncValue, String, Plan)> = Vec::new();
+        for (field_name, value) in fields {
+            let encoded = encode_value(value);
+            match storage.get_field_version(&self.sync_id, entity_table, entity_id, field_name)? {
+                None => plans.push((field_name, value, encoded, Plan::Floor)),
+                Some(fv) => {
+                    if fv.winning_encoded_value.as_deref() == Some(encoded.as_str()) {
+                        // Value-equal: this device already agrees with its
+                        // winner — emitting would only risk clobbering a peer.
+                        continue;
+                    }
+                    match divergent_mode {
+                        DivergentMode::FreshHlc => {
+                            plans.push((field_name, value, encoded, Plan::Fresh))
+                        }
+                        DivergentMode::Skip => continue,
+                    }
+                }
+            }
+        }
+
+        if plans.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-mint HLCs so a fresh-tick overflow is observed before any write,
+        // restoring the watermark on failure (mirrors `emit_multi`).
+        let saved_last_hlc = self.last_hlc.clone();
+        let floor_hlc = Hlc::new(
+            BACKFILL_HLC_TIMESTAMP_MS,
+            0,
+            self.device_id.clone(),
+        );
+        let mut stamped: Vec<(&String, &SyncValue, String, Hlc)> = Vec::with_capacity(plans.len());
+        for (field_name, value, encoded, plan) in plans {
+            let hlc = match plan {
+                Plan::Floor => floor_hlc.clone(),
+                Plan::Fresh => match self.tick() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        self.last_hlc = saved_last_hlc;
+                        return Err(e);
+                    }
+                },
+            };
+            stamped.push((field_name, value, encoded, hlc));
+        }
+
+        let now = Utc::now();
+        let mut tx = match storage.begin_tx() {
+            Ok(tx) => tx,
+            Err(e) => {
+                self.last_hlc = saved_last_hlc;
+                return Err(e);
+            }
+        };
+
+        for (field_name, _value, encoded, hlc) in &stamped {
+            let op_id = Uuid::new_v4().to_string();
+            let hlc_string = hlc.to_string();
+            let is_delete = field_name.as_str() == DELETED_FIELD && encoded == "true";
+
+            if let Err(e) = tx.insert_pending_op(&PendingOp {
+                op_id: op_id.clone(),
+                sync_id: self.sync_id.clone(),
+                epoch: self.epoch,
+                device_id: self.device_id.clone(),
+                local_batch_id: local_batch_id.to_string(),
+                entity_table: entity_table.to_string(),
+                entity_id: entity_id.to_string(),
+                field_name: (*field_name).clone(),
+                encoded_value: encoded.clone(),
+                is_delete,
+                client_hlc: hlc_string.clone(),
+                created_at: now,
+                pushed_at: None,
+            }) {
+                let _ = tx.rollback();
+                self.last_hlc = saved_last_hlc;
+                return Err(e);
+            }
+
+            // Guard the field_versions write: a floor/diverging op must never
+            // regress a newer local winner. The pending_op still pushed (above)
+            // so peers merge it and reject it under the same rule.
+            if let Err(e) = Self::upsert_field_version_if_wins(
+                &mut *tx,
+                &self.sync_id,
+                entity_table,
+                entity_id,
+                field_name,
+                &op_id,
+                &self.device_id,
+                hlc,
+                encoded,
+                now,
+            ) {
+                let _ = tx.rollback();
+                self.last_hlc = saved_last_hlc;
+                return Err(e);
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            self.last_hlc = saved_last_hlc;
+            return Err(e);
+        }
+
+        tracing::debug!(
+            table = entity_table,
+            entity_id = entity_id,
+            field_count = stamped.len(),
+            mode = ?divergent_mode,
+            "Queued reconcile ops"
+        );
+
+        Ok(())
+    }
+
+    /// Like [`emit_create_multi`](Self::emit_create_multi) but stamps every
+    /// partition at `origin_ms` via [`mint_hlc_at`](Self::mint_hlc_at) and
+    /// guards each `field_versions` upsert with `wins_over` — a replay of an
+    /// old captured op never advances the watermark nor regresses a newer local
+    /// winner. The `pending_op` is always inserted so peers merge and reject it.
+    pub fn emit_create_multi_at(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        partitions: &[(HashMap<String, SyncValue>, String)],
+        origin_ms: i64,
+    ) -> Result<()> {
+        self.emit_multi_at(storage, entity_table, entity_id, partitions, origin_ms, "create")
+    }
+
+    /// Update variant of [`emit_create_multi_at`](Self::emit_create_multi_at).
+    pub fn emit_update_multi_at(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        partitions: &[(HashMap<String, SyncValue>, String)],
+        origin_ms: i64,
+    ) -> Result<()> {
+        self.emit_multi_at(storage, entity_table, entity_id, partitions, origin_ms, "update")
+    }
+
+    /// Shared implementation for the origin-stamped create/update variants.
+    fn emit_multi_at(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        partitions: &[(HashMap<String, SyncValue>, String)],
+        origin_ms: i64,
+        kind: &'static str,
+    ) -> Result<()> {
+        let non_empty: Vec<(&HashMap<String, SyncValue>, &str)> = partitions
+            .iter()
+            .filter(|(fields, _)| !fields.is_empty())
+            .map(|(fields, batch_id)| (fields, batch_id.as_str()))
+            .collect();
+        if non_empty.is_empty() {
+            return Ok(());
+        }
+
+        // One HLC per partition stamped at the same clamped origin, counters
+        // incrementing so partitions stay distinguishable. `mint_hlc_at` does
+        // not touch the watermark, so there is nothing to restore on failure.
+        let base = self.mint_hlc_at(origin_ms);
+        let mut partition_hlcs: Vec<Hlc> = Vec::with_capacity(non_empty.len());
+        for index in 0..non_empty.len() {
+            let counter = base.counter.checked_add(index as u32).ok_or_else(|| {
+                CoreError::Engine(format!(
+                    "HLC counter overflow stamping origin batch for {entity_table}/{entity_id}"
+                ))
+            })?;
+            partition_hlcs.push(Hlc::new(base.timestamp, counter, self.device_id.clone()));
+        }
+
+        let base_now = Utc::now();
+        let mut tx = storage.begin_tx()?;
+        let mut total_field_count = 0usize;
+
+        for (partition_index, ((fields, batch_id), hlc)) in
+            non_empty.iter().zip(partition_hlcs.iter()).enumerate()
+        {
+            let hlc_string = hlc.to_string();
+            let partition_now = base_now + chrono::Duration::microseconds(partition_index as i64);
+
+            for (field_name, value) in *fields {
+                let op_id = Uuid::new_v4().to_string();
+                let encoded = encode_value(value);
+
+                if let Err(e) = tx.insert_pending_op(&PendingOp {
+                    op_id: op_id.clone(),
+                    sync_id: self.sync_id.clone(),
+                    epoch: self.epoch,
+                    device_id: self.device_id.clone(),
+                    local_batch_id: (*batch_id).to_string(),
+                    entity_table: entity_table.to_string(),
+                    entity_id: entity_id.to_string(),
+                    field_name: field_name.clone(),
+                    encoded_value: encoded.clone(),
+                    is_delete: false,
+                    client_hlc: hlc_string.clone(),
+                    created_at: partition_now,
+                    pushed_at: None,
+                }) {
+                    let _ = tx.rollback();
+                    return Err(e);
+                }
+
+                if let Err(e) = Self::upsert_field_version_if_wins(
+                    &mut *tx,
+                    &self.sync_id,
+                    entity_table,
+                    entity_id,
+                    field_name,
+                    &op_id,
+                    &self.device_id,
+                    hlc,
+                    &encoded,
+                    partition_now,
+                ) {
+                    let _ = tx.rollback();
+                    return Err(e);
+                }
+
+                total_field_count += 1;
+            }
+        }
+
+        // `mint_hlc_at` never advanced the watermark, so there is nothing to
+        // restore on a commit failure — SQLite rolls back its own tx.
+        tx.commit()?;
+
+        tracing::debug!(
+            table = entity_table,
+            entity_id = entity_id,
+            partition_count = non_empty.len(),
+            field_count = total_field_count,
+            kind = kind,
+            origin_ms = origin_ms,
+            "Queued origin-stamped multi-batch ops"
+        );
+
+        Ok(())
+    }
+
+    /// Tombstone variant stamped at `origin_ms`. Always pushes the delete op;
+    /// the `field_versions` write is `wins_over`-guarded so a stale-origin
+    /// delete never overwrites a newer local winner (the receiver's absorbing
+    /// tombstone rule still applies to the pushed op).
+    pub fn emit_delete_at(
+        &mut self,
+        storage: &dyn SyncStorage,
+        entity_table: &str,
+        entity_id: &str,
+        local_batch_id: &str,
+        origin_ms: i64,
+    ) -> Result<()> {
+        let hlc = self.mint_hlc_at(origin_ms);
+        let hlc_string = hlc.to_string();
+        let now = Utc::now();
+        let op_id = Uuid::new_v4().to_string();
+
+        let mut tx = storage.begin_tx()?;
+
+        if let Err(e) = tx.insert_pending_op(&PendingOp {
+            op_id: op_id.clone(),
+            sync_id: self.sync_id.clone(),
+            epoch: self.epoch,
+            device_id: self.device_id.clone(),
+            local_batch_id: local_batch_id.to_string(),
+            entity_table: entity_table.to_string(),
+            entity_id: entity_id.to_string(),
+            field_name: DELETED_FIELD.to_string(),
+            encoded_value: "true".to_string(),
+            is_delete: true,
+            client_hlc: hlc_string,
+            created_at: now,
+            pushed_at: None,
+        }) {
+            let _ = tx.rollback();
+            return Err(e);
+        }
+
+        if let Err(e) = Self::upsert_field_version_if_wins(
+            &mut *tx,
+            &self.sync_id,
+            entity_table,
+            entity_id,
+            DELETED_FIELD,
+            &op_id,
+            &self.device_id,
+            &hlc,
+            "true",
+            now,
+        ) {
+            let _ = tx.rollback();
+            return Err(e);
+        }
+
+        tx.commit()?;
+
+        tracing::debug!(
+            table = entity_table,
+            entity_id = entity_id,
+            batch_id = local_batch_id,
+            origin_ms = origin_ms,
+            "Queued origin-stamped delete op"
+        );
+
+        Ok(())
+    }
+
+    /// Upsert a `field_versions` row only if the candidate `(hlc, device_id,
+    /// op_id)` wins LWW over the row currently stored — the same three-level
+    /// tiebreak the merge engine uses (`crdt_change::wins_over`). A replay or
+    /// floor-HLC backfill that loses leaves the existing winner untouched, so a
+    /// newer local edit is never regressed. Absent rows always write.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_field_version_if_wins(
+        tx: &mut dyn crate::storage::SyncStorageTx,
+        sync_id: &str,
+        entity_table: &str,
+        entity_id: &str,
+        field_name: &str,
+        op_id: &str,
+        device_id: &str,
+        hlc: &Hlc,
+        encoded: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        if let Some(existing) =
+            tx.get_field_version(sync_id, entity_table, entity_id, field_name)?
+        {
+            let existing_hlc = Hlc::from_string(&existing.winning_hlc)?;
+            let wins = match hlc.cmp(&existing_hlc) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => match device_id.cmp(&existing.winning_device_id) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => op_id > existing.winning_op_id.as_str(),
+                },
+            };
+            if !wins {
+                return Ok(());
+            }
+        }
+
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: sync_id.to_string(),
+            entity_table: entity_table.to_string(),
+            entity_id: entity_id.to_string(),
+            field_name: field_name.to_string(),
+            winning_op_id: op_id.to_string(),
+            winning_device_id: device_id.to_string(),
+            winning_hlc: hlc.to_string(),
+            winning_encoded_value: Some(encoded.to_string()),
+            updated_at: now,
+        })
     }
 }
 
@@ -1735,5 +2187,190 @@ mod tests {
         fn rollback(self: Box<Self>) -> Result<()> {
             self.inner.rollback()
         }
+    }
+
+    // ── Origin-stamped + reconcile/backfill emission ──
+
+    fn single_field(name: &str, value: SyncValue) -> HashMap<String, SyncValue> {
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), value);
+        m
+    }
+
+    fn fv(
+        storage: &RusqliteSyncStorage,
+        table: &str,
+        entity_id: &str,
+        field: &str,
+    ) -> Option<FieldVersion> {
+        storage.get_field_version("sync-1", table, entity_id, field).unwrap()
+    }
+
+    #[test]
+    fn mint_hlc_at_clamps_to_origin_and_leaves_watermark_untouched() {
+        let emitter = make_emitter();
+        let watermark_before = emitter.last_hlc().clone();
+
+        let origin = now_ms() - 3_600_000; // an hour ago
+        let hlc = emitter.mint_hlc_at(origin);
+        assert_eq!(hlc.timestamp, origin, "in-range origin is preserved");
+        assert_eq!(hlc.node_id, "a1b2c3d4e5f6", "node_id stays local for attribution");
+
+        // Watermark must not move — minting below it is legal.
+        assert_eq!(*emitter.last_hlc(), watermark_before);
+
+        // Future origin clamps down to now; floor origin clamps up off the floor.
+        let future = emitter.mint_hlc_at(now_ms() + 10_000_000);
+        assert!(future.timestamp <= Hlc::now_ms() + 1);
+        let below_floor = emitter.mint_hlc_at(0);
+        assert_eq!(below_floor.timestamp, BACKFILL_HLC_TIMESTAMP_MS + 1);
+    }
+
+    #[test]
+    fn emit_update_multi_at_inserts_op_but_does_not_overwrite_newer_field_version() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        // A genuine "now" write establishes the current winner.
+        emitter
+            .emit_update(&storage, "members", "ent-fv", &single_field("name", SyncValue::String("Beta".into())), "live")
+            .unwrap();
+        let winner = fv(&storage, "members", "ent-fv", "name").unwrap();
+        let winner_op = winner.winning_op_id.clone();
+
+        // Replay an OLDER captured value at an origin from an hour ago.
+        let origin = now_ms() - 3_600_000;
+        let partitions =
+            vec![(single_field("name", SyncValue::String("Alpha".into())), "replay".to_string())];
+        emitter.emit_update_multi_at(&storage, "members", "ent-fv", &partitions, origin).unwrap();
+
+        // pending_op was inserted (so peers merge + reject it)...
+        let ops = storage.load_batch_ops("replay").unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].encoded_value, "\"Alpha\"");
+        let replay_hlc = Hlc::from_string(&ops[0].client_hlc).unwrap();
+        assert_eq!(replay_hlc.timestamp, origin);
+
+        // ...but field_versions still holds the newer "Beta" winner.
+        let after = fv(&storage, "members", "ent-fv", "name").unwrap();
+        assert_eq!(after.winning_encoded_value, Some("\"Beta\"".to_string()));
+        assert_eq!(after.winning_op_id, winner_op, "newer winner not regressed");
+    }
+
+    #[test]
+    fn reconcile_skips_equal_fresh_for_divergent_floor_for_absent() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        // Seed two synced fields; leave a third never-synced.
+        let mut seed = HashMap::new();
+        seed.insert("name".to_string(), SyncValue::String("Same".into()));
+        seed.insert("color_hex".to_string(), SyncValue::String("#000".into()));
+        emitter.emit_create(&storage, "member_groups", "g1", &seed, "seed").unwrap();
+        let equal_winner = fv(&storage, "member_groups", "g1", "name").unwrap().winning_op_id;
+
+        // Reconcile: name equal, color_hex divergent, emoji absent.
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Same".into()));
+        fields.insert("color_hex".to_string(), SyncValue::String("#fff".into()));
+        fields.insert("emoji".to_string(), SyncValue::String("⭐".into()));
+        emitter
+            .emit_reconcile_multi(
+                &storage,
+                "member_groups",
+                "g1",
+                &fields,
+                DivergentMode::FreshHlc,
+                "recon",
+            )
+            .unwrap();
+
+        let ops = storage.load_batch_ops("recon").unwrap();
+        let by_field: HashMap<&str, &PendingOp> =
+            ops.iter().map(|op| (op.field_name.as_str(), op)).collect();
+
+        // Equal field: nothing emitted, winner untouched.
+        assert!(!by_field.contains_key("name"), "value-equal field must not emit");
+        assert_eq!(fv(&storage, "member_groups", "g1", "name").unwrap().winning_op_id, equal_winner);
+
+        // Divergent field: fresh HLC (above the floor, ~now).
+        let color = by_field.get("color_hex").expect("divergent field emits");
+        let color_hlc = Hlc::from_string(&color.client_hlc).unwrap();
+        assert!(color_hlc.timestamp > BACKFILL_HLC_TIMESTAMP_MS + 1);
+        assert_eq!(
+            fv(&storage, "member_groups", "g1", "color_hex").unwrap().winning_encoded_value,
+            Some("\"#fff\"".to_string())
+        );
+
+        // Absent field: floor backfill HLC, FV now present.
+        let emoji = by_field.get("emoji").expect("absent field emits");
+        let emoji_hlc = Hlc::from_string(&emoji.client_hlc).unwrap();
+        assert_eq!(emoji_hlc.timestamp, BACKFILL_HLC_TIMESTAMP_MS);
+        assert!(fv(&storage, "member_groups", "g1", "emoji").is_some());
+    }
+
+    #[test]
+    fn backfill_emits_only_absent_fields_at_floor_with_local_node_id() {
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+
+        // One field already synced (divergent), one never synced.
+        emitter
+            .emit_create(&storage, "member_groups", "g2", &single_field("name", SyncValue::String("Existing".into())), "seed2")
+            .unwrap();
+        let existing_winner = fv(&storage, "member_groups", "g2", "name").unwrap().winning_op_id;
+
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Divergent".into()));
+        fields.insert("emoji".to_string(), SyncValue::String("🌟".into()));
+        emitter
+            .emit_reconcile_multi(
+                &storage,
+                "member_groups",
+                "g2",
+                &fields,
+                DivergentMode::Skip,
+                "back",
+            )
+            .unwrap();
+
+        let ops = storage.load_batch_ops("back").unwrap();
+        // Skip mode: divergent "name" never emits; only absent "emoji" does.
+        assert_eq!(ops.len(), 1, "only the absent field is backfilled");
+        assert_eq!(ops[0].field_name, "emoji");
+        let hlc = Hlc::from_string(&ops[0].client_hlc).unwrap();
+        assert_eq!(hlc.timestamp, BACKFILL_HLC_TIMESTAMP_MS, "exactly the floor, never fresh");
+        assert_eq!(hlc.node_id, "a1b2c3d4e5f6", "local node_id");
+
+        // Divergent winner untouched (first-device-wins).
+        assert_eq!(fv(&storage, "member_groups", "g2", "name").unwrap().winning_op_id, existing_winner);
+    }
+
+    #[test]
+    fn backfill_floor_op_does_not_regress_an_existing_field_version() {
+        // A backfill of a field that already has any field_version row inserts
+        // no op (Skip leaves divergent alone; equal is also a no-op).
+        let storage = make_storage();
+        let mut emitter = make_emitter();
+        emitter
+            .emit_update(&storage, "members", "ent-b", &single_field("name", SyncValue::String("Live".into())), "live-b")
+            .unwrap();
+        let winner = fv(&storage, "members", "ent-b", "name").unwrap();
+
+        emitter
+            .emit_reconcile_multi(
+                &storage,
+                "members",
+                "ent-b",
+                &single_field("name", SyncValue::String("Stale".into())),
+                DivergentMode::Skip,
+                "back-present",
+            )
+            .unwrap();
+
+        let ops = storage.load_batch_ops("back-present").unwrap();
+        assert!(ops.is_empty(), "present field is never backfilled");
+        let after = fv(&storage, "members", "ent-b", "name").unwrap();
+        assert_eq!(after.winning_op_id, winner.winning_op_id, "winner untouched");
     }
 }

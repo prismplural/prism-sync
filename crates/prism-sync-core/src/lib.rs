@@ -47,7 +47,7 @@ pub use error::{CoreError, RelayErrorCategory, Result};
 pub use events::{event_channel, ChangeSet, EntityChange, SyncError, SyncErrorKind, SyncEvent};
 pub use hlc::Hlc;
 pub use node_id::generate_node_id;
-pub use op_emitter::{OpEmitter, DELETED_FIELD};
+pub use op_emitter::{DivergentMode, OpEmitter, BACKFILL_HLC_TIMESTAMP_MS, DELETED_FIELD};
 pub use pairing::service::{cleanup_failed_setup, PairingService};
 pub use pruning::{PruneResult, TombstonePruner};
 pub use runtime::background_runtime;

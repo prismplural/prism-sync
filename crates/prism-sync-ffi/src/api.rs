@@ -2103,6 +2103,91 @@ pub async fn record_delete(
     inner.record_delete(&table, &entity_id).map_err(|e| e.to_string())
 }
 
+/// Record a new entity creation stamped at `origin_timestamp_ms` instead of a
+/// fresh wall-clock HLC. Used to replay a startup-deferred capture at its
+/// capture time so it cannot win LWW against an edit made after capture; the
+/// emitter watermark is left untouched and the field_versions write is
+/// `wins_over`-guarded.
+pub async fn record_create_at(
+    handle: &PrismSyncHandle,
+    table: String,
+    entity_id: String,
+    fields_json: String,
+    origin_timestamp_ms: i64,
+) -> Result<(), String> {
+    let mut inner = handle.inner.lock().await;
+    let fields = parse_fields_json_for_schema(&fields_json, inner.schema(), &table)?;
+    inner
+        .record_create_at(&table, &entity_id, &fields, origin_timestamp_ms)
+        .map_err(|e| e.to_string())
+}
+
+/// Record field updates stamped at `origin_timestamp_ms`. See
+/// [`record_create_at`].
+pub async fn record_update_at(
+    handle: &PrismSyncHandle,
+    table: String,
+    entity_id: String,
+    changed_fields_json: String,
+    origin_timestamp_ms: i64,
+) -> Result<(), String> {
+    let mut inner = handle.inner.lock().await;
+    let fields = parse_fields_json_for_schema(&changed_fields_json, inner.schema(), &table)?;
+    inner
+        .record_update_at(&table, &entity_id, &fields, origin_timestamp_ms)
+        .map_err(|e| e.to_string())
+}
+
+/// Record a soft-delete stamped at `origin_timestamp_ms`. See
+/// [`record_create_at`].
+pub async fn record_delete_at(
+    handle: &PrismSyncHandle,
+    table: String,
+    entity_id: String,
+    origin_timestamp_ms: i64,
+) -> Result<(), String> {
+    let mut inner = handle.inner.lock().await;
+    inner.record_delete_at(&table, &entity_id, origin_timestamp_ms).map_err(|e| e.to_string())
+}
+
+/// Reconcile `fields` against this device's `field_versions`, emitting only
+/// genuinely-diverged fields and never-synced fields (as floor-HLC backfill).
+///
+/// A value the device already agrees with produces zero ops, so a re-broadcast
+/// can no longer clobber a peer's un-pulled newer edit. When
+/// `divergent_fresh_hlc` is true a diverging field emits at a fresh HLC
+/// (deferred local edit wins); when false the divergent field is left alone
+/// (pure backfill, first-device-wins).
+pub async fn record_reconcile(
+    handle: &PrismSyncHandle,
+    table: String,
+    entity_id: String,
+    fields_json: String,
+    divergent_fresh_hlc: bool,
+) -> Result<(), String> {
+    let mut inner = handle.inner.lock().await;
+    let fields = parse_fields_json_for_schema(&fields_json, inner.schema(), &table)?;
+    let mode = if divergent_fresh_hlc {
+        prism_sync_core::DivergentMode::FreshHlc
+    } else {
+        prism_sync_core::DivergentMode::Skip
+    };
+    inner.record_reconcile(&table, &entity_id, &fields, mode).map_err(|e| e.to_string())
+}
+
+/// Pure write-if-absent backfill: reconcile with `DivergentMode::Skip`. Emits
+/// only fields with no `field_versions` row, at the floor backfill HLC.
+pub async fn record_backfill(
+    handle: &PrismSyncHandle,
+    table: String,
+    entity_id: String,
+    fields_json: String,
+) -> Result<(), String> {
+    let mut inner = handle.inner.lock().await;
+    let fields = parse_fields_json_for_schema(&fields_json, inner.schema(), &table)?;
+    inner.record_backfill(&table, &entity_id, &fields).map_err(|e| e.to_string())
+}
+
 /// Delete many entities of one table in a single call. Their tombstones are
 /// packed into a few batches instead of one push round-trip per row — use this
 /// for bulk deletes (clearing a list, deleting a group's members, etc.).

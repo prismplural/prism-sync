@@ -25,7 +25,7 @@ use crate::epoch::EpochManager;
 use crate::error::{CoreError, Result};
 use crate::events::{event_channel, EntityChange, SyncEvent};
 use crate::hlc::Hlc;
-use crate::op_emitter::{OpEmitter, DELETED_FIELD};
+use crate::op_emitter::{DivergentMode, OpEmitter, DELETED_FIELD};
 use crate::pairing::{
     compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
     SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
@@ -244,6 +244,14 @@ impl PrismSyncBuilder {
             epoch: None,
         })
     }
+}
+
+/// Whether an origin-stamped mutation is a create or an update — the two share
+/// `record_mutation_at`'s body and differ only in which emitter method runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationKind {
+    Create,
+    Update,
 }
 
 /// The primary consumer-facing API for prism-sync.
@@ -1477,6 +1485,170 @@ impl PrismSync {
         result
     }
 
+    /// Record a newly created entity, stamping the ops at `origin_timestamp_ms`
+    /// instead of a fresh wall-clock HLC.
+    ///
+    /// Used by the startup-deferred-op replay: a captured create that was
+    /// deferred during auto-configure replays at its capture time so it never
+    /// wins LWW against an edit made (locally or by a peer) after capture. The
+    /// emitter watermark is left untouched and each `field_versions` write is
+    /// `wins_over`-guarded, so the replay can only push a `pending_op` (peers
+    /// merge and may reject it), never regress a newer local winner.
+    pub fn record_create_at(
+        &mut self,
+        table: &str,
+        entity_id: &str,
+        fields: &HashMap<String, SyncValue>,
+        origin_timestamp_ms: i64,
+    ) -> Result<()> {
+        self.record_mutation_at(table, entity_id, fields, origin_timestamp_ms, MutationKind::Create)
+    }
+
+    /// Record changed fields on an existing entity, stamped at
+    /// `origin_timestamp_ms`. See [`record_create_at`](Self::record_create_at).
+    pub fn record_update_at(
+        &mut self,
+        table: &str,
+        entity_id: &str,
+        changed_fields: &HashMap<String, SyncValue>,
+        origin_timestamp_ms: i64,
+    ) -> Result<()> {
+        self.record_mutation_at(
+            table,
+            entity_id,
+            changed_fields,
+            origin_timestamp_ms,
+            MutationKind::Update,
+        )
+    }
+
+    /// Shared body for the origin-stamped create/update variants — identical to
+    /// `record_create` / `record_update` (phantom-undelete strip, validation,
+    /// size partitioning) except the emit stamps every partition at the origin.
+    fn record_mutation_at(
+        &mut self,
+        table: &str,
+        entity_id: &str,
+        fields: &HashMap<String, SyncValue>,
+        origin_timestamp_ms: i64,
+        kind: MutationKind,
+    ) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        let (device_id, epoch, sync_id) = {
+            let emitter = self
+                .op_emitter
+                .as_ref()
+                .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+            (emitter.last_hlc().node_id.clone(), emitter.epoch(), emitter.sync_id().to_string())
+        };
+        let stripped =
+            Self::without_phantom_undelete(&*self.storage, &sync_id, table, entity_id, fields);
+        let fields = stripped.as_ref().unwrap_or(fields);
+        if fields.is_empty() {
+            return Ok(());
+        }
+        self.validate_mutation_fields(table, fields)?;
+        let partitions =
+            Self::partition_fields_into_batches(fields, table, entity_id, &device_id, epoch);
+        let emitter = self
+            .op_emitter
+            .as_mut()
+            .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+        let result = match kind {
+            MutationKind::Create => emitter.emit_create_multi_at(
+                &*self.storage,
+                table,
+                entity_id,
+                &partitions,
+                origin_timestamp_ms,
+            ),
+            MutationKind::Update => emitter.emit_update_multi_at(
+                &*self.storage,
+                table,
+                entity_id,
+                &partitions,
+                origin_timestamp_ms,
+            ),
+        };
+        if result.is_ok() {
+            if let Some(tx) = self.sync_service.auto_sync_sender() {
+                let _ = tx.try_send(());
+            }
+        }
+        result
+    }
+
+    /// Reconcile `fields` against this device's `field_versions`, emitting only
+    /// genuinely-diverged fields (`divergent_mode` decides fresh-HLC vs skip)
+    /// and never-synced fields as floor-HLC backfill.
+    ///
+    /// The clobber-free replacement for full-row fresh-HLC re-broadcasts: a
+    /// value the device already agrees with produces zero ops, so a
+    /// re-broadcast can no longer beat a peer's un-pulled newer edit. Reuses the
+    /// conditional phantom-undelete strip and field validation; size
+    /// partitioning is unnecessary because the reconcile only emits the small
+    /// subset that actually diverges, so the whole reconcile rides one batch.
+    pub fn record_reconcile(
+        &mut self,
+        table: &str,
+        entity_id: &str,
+        fields: &HashMap<String, SyncValue>,
+        divergent_mode: DivergentMode,
+    ) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        let sync_id = {
+            let emitter = self
+                .op_emitter
+                .as_ref()
+                .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+            emitter.sync_id().to_string()
+        };
+        let stripped =
+            Self::without_phantom_undelete(&*self.storage, &sync_id, table, entity_id, fields);
+        let fields = stripped.as_ref().unwrap_or(fields);
+        if fields.is_empty() {
+            return Ok(());
+        }
+        self.validate_mutation_fields(table, fields)?;
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let emitter = self
+            .op_emitter
+            .as_mut()
+            .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+        let result = emitter.emit_reconcile_multi(
+            &*self.storage,
+            table,
+            entity_id,
+            fields,
+            divergent_mode,
+            &batch_id,
+        );
+        if result.is_ok() {
+            if let Some(tx) = self.sync_service.auto_sync_sender() {
+                let _ = tx.try_send(());
+            }
+        }
+        result
+    }
+
+    /// Pure write-if-absent backfill: reconcile with [`DivergentMode::Skip`].
+    ///
+    /// Emits only fields with no `field_versions` row, stamped at the floor
+    /// backfill HLC — establishing the entity group-wide while losing to every
+    /// genuine edit. Divergent local values are left alone (first-device-wins).
+    pub fn record_backfill(
+        &mut self,
+        table: &str,
+        entity_id: &str,
+        fields: &HashMap<String, SyncValue>,
+    ) -> Result<()> {
+        self.record_reconcile(table, entity_id, fields, DivergentMode::Skip)
+    }
+
     /// Drop a phantom `is_deleted = false` from a mutation's fields when the
     /// entity is already locally tombstoned.
     ///
@@ -1554,6 +1726,36 @@ impl PrismSync {
             .as_mut()
             .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
         let result = emitter.emit_delete_multi(&*self.storage, table, &partitions);
+        if result.is_ok() {
+            if let Some(tx) = self.sync_service.auto_sync_sender() {
+                let _ = tx.try_send(());
+            }
+        }
+        result
+    }
+
+    /// Record a soft-delete stamped at `origin_timestamp_ms`. The replay-time
+    /// variant of [`record_delete`](Self::record_delete): the tombstone
+    /// op pushes at its capture HLC and the `field_versions` write is
+    /// `wins_over`-guarded, so a stale-origin delete never overwrites a newer
+    /// local winner. Receivers still apply the absorbing-tombstone rule.
+    pub fn record_delete_at(
+        &mut self,
+        table: &str,
+        entity_id: &str,
+        origin_timestamp_ms: i64,
+    ) -> Result<()> {
+        if self.op_emitter.is_none() {
+            return Err(CoreError::Engine("sync not configured".into()));
+        }
+        self.schema.entity(table).ok_or_else(|| CoreError::UnknownTable(table.to_string()))?;
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let emitter = self
+            .op_emitter
+            .as_mut()
+            .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
+        let result =
+            emitter.emit_delete_at(&*self.storage, table, entity_id, &batch_id, origin_timestamp_ms);
         if result.is_ok() {
             if let Some(tx) = self.sync_service.auto_sync_sender() {
                 let _ = tx.try_send(());
@@ -4434,6 +4636,197 @@ mod tests {
             Some("true"),
             "a phantom un-delete must not flip the tombstone back to false"
         );
+    }
+
+    #[test]
+    fn record_update_at_strips_phantom_undelete_and_stamps_partitions_at_origin() {
+        // The origin-stamped update reuses the conditional phantom-undelete
+        // strip: against a tombstoned id, an is_deleted=false rides off but a
+        // real field still emits — at the supplied origin HLC, not a fresh tick.
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        sync.record_create(
+            "members",
+            "ent-1",
+            &HashMap::from([("name".to_string(), SyncValue::String("Alice".to_string()))]),
+        )
+        .unwrap();
+        sync.record_delete("members", "ent-1").unwrap();
+        let batches_before = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+
+        let origin = Hlc::now_ms() - 7_200_000; // two hours ago
+        let mut changed = HashMap::new();
+        changed.insert("name".to_string(), SyncValue::String("Bob".to_string()));
+        changed.insert(DELETED_FIELD.to_string(), SyncValue::Bool(false));
+        sync.record_update_at("members", "ent-1", &changed, origin).unwrap();
+
+        let new_batches: Vec<_> = sync
+            .storage
+            .get_unpushed_batch_ids("sync-1")
+            .unwrap()
+            .into_iter()
+            .skip(batches_before)
+            .collect();
+        let ops: Vec<_> =
+            new_batches.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
+        // The phantom is_deleted=false was stripped; only the real "name" emits.
+        assert!(ops.iter().any(|o| o.field_name == "name"));
+        assert!(
+            !ops.iter().any(|o| o.field_name == DELETED_FIELD && o.encoded_value == "false"),
+            "phantom is_deleted=false must be stripped on a tombstoned id"
+        );
+        // Every emitted partition's client_hlc carries the origin timestamp.
+        for op in ops.iter().filter(|o| o.field_name == "name") {
+            let hlc = Hlc::from_string(&op.client_hlc).unwrap();
+            assert_eq!(hlc.timestamp, origin, "op stamped at origin, not a fresh tick");
+            assert_eq!(hlc.node_id, "a1b2c3d4e5f6");
+        }
+        // The tombstone winner is untouched (wins_over-guarded FV upsert).
+        assert_eq!(
+            sync.storage
+                .get_field_version("sync-1", "members", "ent-1", DELETED_FIELD)
+                .unwrap()
+                .and_then(|fv| fv.winning_encoded_value)
+                .as_deref(),
+            Some("true"),
+        );
+    }
+
+    #[test]
+    fn record_update_at_does_not_regress_a_newer_field_version() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // A genuine "now" winner.
+        sync.record_update(
+            "members",
+            "ent-1",
+            &HashMap::from([("name".to_string(), SyncValue::String("Beta".to_string()))]),
+        )
+        .unwrap();
+
+        // Replay an older captured value.
+        let origin = Hlc::now_ms() - 3_600_000;
+        sync.record_update_at(
+            "members",
+            "ent-1",
+            &HashMap::from([("name".to_string(), SyncValue::String("Alpha".to_string()))]),
+            origin,
+        )
+        .unwrap();
+
+        // field_versions still holds Beta; the Alpha op is pushable but loses.
+        assert_eq!(
+            sync.storage
+                .get_field_version("sync-1", "members", "ent-1", "name")
+                .unwrap()
+                .and_then(|fv| fv.winning_encoded_value)
+                .as_deref(),
+            Some("\"Beta\""),
+        );
+    }
+
+    #[test]
+    fn record_reconcile_emits_only_diverged_fields() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // Seed name + age; leave score never-synced.
+        sync.record_create(
+            "members",
+            "ent-1",
+            &HashMap::from([
+                ("name".to_string(), SyncValue::String("Same".to_string())),
+                ("age".to_string(), SyncValue::Int(10)),
+            ]),
+        )
+        .unwrap();
+        let before = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+
+        // Reconcile: name equal (skip), age diverged (fresh), score absent (floor).
+        sync.record_reconcile(
+            "members",
+            "ent-1",
+            &HashMap::from([
+                ("name".to_string(), SyncValue::String("Same".to_string())),
+                ("age".to_string(), SyncValue::Int(20)),
+                ("score".to_string(), SyncValue::Real(1.5)),
+            ]),
+            crate::op_emitter::DivergentMode::FreshHlc,
+        )
+        .unwrap();
+
+        let new_batches: Vec<_> = sync
+            .storage
+            .get_unpushed_batch_ids("sync-1")
+            .unwrap()
+            .into_iter()
+            .skip(before)
+            .collect();
+        let ops: Vec<_> =
+            new_batches.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
+        let fields: Vec<&str> = ops.iter().map(|o| o.field_name.as_str()).collect();
+        assert!(!fields.contains(&"name"), "value-equal field must not emit");
+        assert!(fields.contains(&"age"), "diverged field emits");
+        assert!(fields.contains(&"score"), "absent field backfills");
+    }
+
+    #[test]
+    fn record_backfill_emits_only_absent_fields_at_floor() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        sync.record_create(
+            "members",
+            "ent-1",
+            &HashMap::from([("name".to_string(), SyncValue::String("Existing".to_string()))]),
+        )
+        .unwrap();
+        let before = sync.storage.get_unpushed_batch_ids("sync-1").unwrap().len();
+
+        // name diverged (Skip ⇒ no emit), age absent (floor backfill).
+        sync.record_backfill(
+            "members",
+            "ent-1",
+            &HashMap::from([
+                ("name".to_string(), SyncValue::String("Divergent".to_string())),
+                ("age".to_string(), SyncValue::Int(42)),
+            ]),
+        )
+        .unwrap();
+
+        let new_batches: Vec<_> = sync
+            .storage
+            .get_unpushed_batch_ids("sync-1")
+            .unwrap()
+            .into_iter()
+            .skip(before)
+            .collect();
+        let ops: Vec<_> =
+            new_batches.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
+        assert_eq!(ops.len(), 1, "only the absent field backfills");
+        assert_eq!(ops[0].field_name, "age");
+        let hlc = Hlc::from_string(&ops[0].client_hlc).unwrap();
+        assert_eq!(hlc.timestamp, crate::op_emitter::BACKFILL_HLC_TIMESTAMP_MS);
+    }
+
+    #[test]
+    fn record_delete_at_stamps_tombstone_at_origin() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        let origin = Hlc::now_ms() - 3_600_000;
+        sync.record_delete_at("members", "ent-1", origin).unwrap();
+
+        let batch_ids = sync.storage.get_unpushed_batch_ids("sync-1").unwrap();
+        let ops: Vec<_> =
+            batch_ids.iter().flat_map(|b| sync.storage.load_batch_ops(b).unwrap()).collect();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].field_name, DELETED_FIELD);
+        assert!(ops[0].is_delete);
+        let hlc = Hlc::from_string(&ops[0].client_hlc).unwrap();
+        assert_eq!(hlc.timestamp, origin);
     }
 
     #[test]

@@ -677,3 +677,107 @@ mod bulk_reset_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod backfill_merge_tests {
+    use super::*;
+    use crate::op_emitter::BACKFILL_HLC_TIMESTAMP_MS;
+    use crate::schema::SyncType;
+
+    fn schema() -> SyncSchema {
+        SyncSchema::builder()
+            .entity("members", |e| e.field("name", SyncType::String))
+            .build()
+    }
+
+    fn change(op_id: &str, hlc_ts: i64, device: &str, value: &str) -> CrdtChange {
+        CrdtChange::new(
+            Some(op_id.to_string()),
+            Some("batch-1".to_string()),
+            "ent-1".to_string(),
+            "members".to_string(),
+            "name".to_string(),
+            Some(format!("\"{value}\"")),
+            Some(format!("{hlc_ts}:0:{device}")),
+            false,
+            Some(device.to_string()),
+            Some(0),
+            None,
+        )
+    }
+
+    fn no_field_versions(_: &str, _: &str, _: &str, _: &str) -> Result<Option<FieldVersion>> {
+        Ok(None)
+    }
+    fn no_ops_applied(_: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// A floor-HLC backfill op loses to ANY genuine (fresh-HLC) op for the same
+    /// field, no matter which arrives first in the batch — the protection is
+    /// purely HLC-level, so order is irrelevant.
+    #[test]
+    fn floor_backfill_loses_to_fresh_op_regardless_of_arrival_order() {
+        let engine = MergeEngine::new(schema());
+        let backfill = change("op-backfill", BACKFILL_HLC_TIMESTAMP_MS, "dev-a", "Backfill");
+        let fresh = change("op-fresh", crate::hlc::Hlc::now_ms(), "dev-b", "Real");
+
+        for ops in [
+            vec![backfill.clone(), fresh.clone()],
+            vec![fresh.clone(), backfill.clone()],
+        ] {
+            let winners = engine
+                .determine_winners(&ops, &no_field_versions, &no_ops_applied, "sync-1")
+                .unwrap();
+            assert!(winners.contains_key("op-fresh"), "fresh op must win");
+            assert!(!winners.contains_key("op-backfill"), "floor backfill must lose");
+        }
+    }
+
+    /// A floor-HLC backfill op loses to a pre-existing field_version winner
+    /// (write-if-absent: it only establishes state where none exists).
+    #[test]
+    fn floor_backfill_loses_to_existing_field_version() {
+        let engine = MergeEngine::new(schema());
+        let existing = FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-existing".to_string(),
+            winning_device_id: "dev-c".to_string(),
+            winning_hlc: format!("{}:0:dev-c", crate::hlc::Hlc::now_ms() - 1_000),
+            winning_encoded_value: Some("\"Existing\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        };
+        let get_fv = |_: &str, _: &str, _: &str, _: &str| Ok(Some(existing.clone()));
+
+        let backfill = change("op-backfill", BACKFILL_HLC_TIMESTAMP_MS, "dev-a", "Backfill");
+        let winners = engine
+            .determine_winners(&[backfill], &get_fv, &no_ops_applied, "sync-1")
+            .unwrap();
+        assert!(winners.is_empty(), "backfill must not beat an existing winner");
+    }
+
+    /// Two devices backfilling the same field at the floor converge on the same
+    /// winner (deterministic node_id/op_id tiebreak), independent of order.
+    #[test]
+    fn concurrent_floor_backfills_converge_deterministically() {
+        let engine = MergeEngine::new(schema());
+        let a = change("op-a", BACKFILL_HLC_TIMESTAMP_MS, "dev-a", "FromA");
+        let b = change("op-b", BACKFILL_HLC_TIMESTAMP_MS, "dev-b", "FromB");
+
+        let forward = engine
+            .determine_winners(&[a.clone(), b.clone()], &no_field_versions, &no_ops_applied, "sync-1")
+            .unwrap();
+        let reverse = engine
+            .determine_winners(&[b, a], &no_field_versions, &no_ops_applied, "sync-1")
+            .unwrap();
+
+        let forward_winner: Vec<&String> = forward.keys().collect();
+        let reverse_winner: Vec<&String> = reverse.keys().collect();
+        assert_eq!(forward_winner, reverse_winner, "winner is order-independent");
+        // dev-b > dev-a lexicographically at equal HLC, so op-b wins.
+        assert!(forward.contains_key("op-b"));
+    }
+}
