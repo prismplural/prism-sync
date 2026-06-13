@@ -180,6 +180,47 @@ pub trait SyncStorage: Send + Sync {
         Ok(0)
     }
 
+    /// List the `field_versions` rows this device authored whose winning HLC
+    /// is more than `bound_ms` ahead of wall-clock now.
+    ///
+    /// Used by the relay-anchored clock-excursion repair to find the
+    /// self-authored winners a forward clock step poisoned. The HLC is parsed
+    /// in Rust because the TEXT encoding is unpadded (`":9"` sorts after
+    /// `":10"`), so a SQL comparison would be wrong; the drift filter applies
+    /// `clock_drift::is_excessively_future` against a single captured `now`.
+    ///
+    /// Default: empty (no-op).
+    fn list_self_authored_future_fv(
+        &self,
+        _sync_id: &str,
+        _device_id: &str,
+        _bound_ms: i64,
+    ) -> Result<Vec<FieldVersion>> {
+        Ok(vec![])
+    }
+
+    /// Delete this device's UNPUSHED `pending_ops` whose `client_hlc` is more
+    /// than `bound_ms` ahead of wall-clock now, transactionally. Returns the
+    /// number of rows deleted.
+    ///
+    /// Used by the clock-excursion repair: a poisoned future op is safe to drop
+    /// because its `field_versions` winner is itself self-authored and
+    /// over-bound, and the repair re-emits that winner at a sane HLC. Only
+    /// unpushed rows are touched — an already-pushed op is on a peer's log and
+    /// out of scope. The
+    /// HLC is parsed in Rust for the same unpadded-encoding reason as
+    /// [`list_self_authored_future_fv`].
+    ///
+    /// Default: 0 (no-op).
+    fn delete_unpushed_future_pending_ops(
+        &self,
+        _sync_id: &str,
+        _device_id: &str,
+        _bound_ms: i64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Check whether this sync group has any `applied_ops` rows.
     ///
     /// Cheap `SELECT 1 ... LIMIT 1`. Used by the first-device bootstrap

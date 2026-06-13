@@ -1086,6 +1086,67 @@ fn exec_delete_all_pending_ops(conn: &Connection, sync_id: &str) -> Result<usize
     Ok(affected)
 }
 
+fn query_self_authored_future_fv(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    bound_ms: i64,
+) -> Result<Vec<FieldVersion>> {
+    // Filter by author in SQL, parse the HLC and apply the drift bound in Rust
+    // (the TEXT encoding is unpadded, so a SQL comparison gets counters wrong).
+    let mut stmt = conn.prepare(
+        "SELECT * FROM field_versions WHERE sync_id = ?1 AND winning_device_id = ?2",
+    )?;
+    let rows = stmt.query_map(params![sync_id, device_id], row_to_field_version)?;
+    let now_ms = Hlc::now_ms();
+    let mut result = Vec::new();
+    for r in rows {
+        let fv = r?;
+        if let Ok(hlc) = Hlc::from_string(&fv.winning_hlc) {
+            if crate::clock_drift::is_excessively_future(&hlc, now_ms, bound_ms) {
+                result.push(fv);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn exec_delete_unpushed_future_pending_ops(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    bound_ms: i64,
+) -> Result<usize> {
+    // Read candidate unpushed self-authored ops, parse the HLC in Rust (the
+    // TEXT encoding is unpadded), and delete only the over-bound ones by op_id.
+    let to_delete: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT op_id, client_hlc FROM pending_ops \
+             WHERE sync_id = ?1 AND device_id = ?2 AND pushed_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![sync_id, device_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let now_ms = Hlc::now_ms();
+        let mut ids = Vec::new();
+        for r in rows {
+            let (op_id, hlc_str) = r?;
+            if let Ok(hlc) = Hlc::from_string(&hlc_str) {
+                if crate::clock_drift::is_excessively_future(&hlc, now_ms, bound_ms) {
+                    ids.push(op_id);
+                }
+            }
+        }
+        ids
+    };
+
+    let mut deleted = 0usize;
+    for op_id in &to_delete {
+        deleted += conn.execute("DELETE FROM pending_ops WHERE op_id = ?1", params![op_id])?;
+    }
+    Ok(deleted)
+}
+
 fn query_has_any_applied_ops(conn: &Connection, sync_id: &str) -> Result<bool> {
     let exists: Option<i32> = conn
         .query_row(
@@ -1711,6 +1772,36 @@ impl SyncStorage for RusqliteSyncStorage {
         let conn = self.conn.lock().expect("mutex poisoned");
         conn.execute_batch("BEGIN IMMEDIATE")?;
         match exec_delete_all_pending_ops(&conn, sync_id) {
+            Ok(n) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn list_self_authored_future_fv(
+        &self,
+        sync_id: &str,
+        device_id: &str,
+        bound_ms: i64,
+    ) -> Result<Vec<FieldVersion>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_self_authored_future_fv(&conn, sync_id, device_id, bound_ms)
+    }
+
+    fn delete_unpushed_future_pending_ops(
+        &self,
+        sync_id: &str,
+        device_id: &str,
+        bound_ms: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match exec_delete_unpushed_future_pending_ops(&conn, sync_id, device_id, bound_ms) {
             Ok(n) => {
                 conn.execute_batch("COMMIT")?;
                 Ok(n)
@@ -3506,6 +3597,94 @@ mod tests {
         // Calling again on an empty sync group returns 0.
         let removed_again = storage.delete_all_pending_ops("sync-1").unwrap();
         assert_eq!(removed_again, 0);
+    }
+
+    #[test]
+    fn list_self_authored_future_fv_returns_only_over_bound_self_rows() {
+        let storage = make_storage();
+        let now_ms = Hlc::now_ms();
+        let mut tx = storage.begin_tx().unwrap();
+        // Self-authored, over-bound: included.
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-future".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: Hlc::new(now_ms + 3_600_000, 0, "dev1").to_string(),
+            winning_encoded_value: Some("\"Alice\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        // Self-authored, within bound: excluded.
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "pronouns".to_string(),
+            winning_op_id: "op-sane".to_string(),
+            winning_device_id: "dev1".to_string(),
+            winning_hlc: Hlc::new(now_ms + 5_000, 0, "dev1").to_string(),
+            winning_encoded_value: Some("\"she/her\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        // Over-bound but authored by a PEER: excluded (not our excursion).
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-2".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "op-peer".to_string(),
+            winning_device_id: "dev2".to_string(),
+            winning_hlc: Hlc::new(now_ms + 3_600_000, 0, "dev2").to_string(),
+            winning_encoded_value: Some("\"Bob\"".to_string()),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = storage.list_self_authored_future_fv("sync-1", "dev1", 60_000).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].field_name, "name");
+        assert_eq!(rows[0].winning_op_id, "op-future");
+    }
+
+    #[test]
+    fn delete_unpushed_future_pending_ops_targets_self_unpushed_over_bound() {
+        let storage = make_storage();
+        let now_ms = Hlc::now_ms();
+
+        let mut over_bound = sample_pending_op("op-future", "sync-1", "batch-future");
+        over_bound.client_hlc = Hlc::new(now_ms + 3_600_000, 0, "dev1").to_string();
+
+        let mut within_bound = sample_pending_op("op-sane", "sync-1", "batch-sane");
+        within_bound.client_hlc = Hlc::new(now_ms + 5_000, 0, "dev1").to_string();
+
+        let mut peer_future = sample_pending_op("op-peer", "sync-1", "batch-peer");
+        peer_future.device_id = "dev2".to_string();
+        peer_future.client_hlc = Hlc::new(now_ms + 3_600_000, 0, "dev2").to_string();
+
+        let mut pushed_future = sample_pending_op("op-pushed", "sync-1", "batch-pushed");
+        pushed_future.client_hlc = Hlc::new(now_ms + 3_600_000, 0, "dev1").to_string();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_pending_op(&over_bound).unwrap();
+        tx.insert_pending_op(&within_bound).unwrap();
+        tx.insert_pending_op(&peer_future).unwrap();
+        tx.insert_pending_op(&pushed_future).unwrap();
+        tx.mark_batch_pushed("batch-pushed").unwrap();
+        tx.commit().unwrap();
+
+        let deleted =
+            storage.delete_unpushed_future_pending_ops("sync-1", "dev1", 60_000).unwrap();
+        assert_eq!(deleted, 1, "only the self-authored unpushed over-bound op should go");
+
+        assert!(storage.load_batch_ops("batch-future").unwrap().is_empty());
+        assert_eq!(storage.load_batch_ops("batch-sane").unwrap().len(), 1);
+        assert_eq!(storage.load_batch_ops("batch-peer").unwrap().len(), 1);
+        assert_eq!(storage.load_batch_ops("batch-pushed").unwrap().len(), 1);
     }
 
     #[test]

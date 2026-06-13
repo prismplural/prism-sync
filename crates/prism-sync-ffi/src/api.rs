@@ -951,6 +951,11 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "reason": reason,
             "attempt": attempt,
         }),
+        SyncEvent::ClockExcursionRepaired { field_count, max_drift_ms } => serde_json::json!({
+            "type": "ClockExcursionRepaired",
+            "field_count": field_count,
+            "max_drift_ms": max_drift_ms,
+        }),
     }
 }
 
@@ -6983,6 +6988,18 @@ mod tests {
         assert_eq!(json["server_seq"], 42);
         assert_eq!(json["reason"], "sender_unresolved");
         assert_eq!(json["attempt"], 3);
+    }
+
+    #[test]
+    fn clock_excursion_repaired_event_json_serializes_all_fields() {
+        let event = prism_sync_core::events::SyncEvent::ClockExcursionRepaired {
+            field_count: 3,
+            max_drift_ms: 3_600_000,
+        };
+        let json = sync_event_to_json(&event);
+        assert_eq!(json["type"], "ClockExcursionRepaired");
+        assert_eq!(json["field_count"], 3);
+        assert_eq!(json["max_drift_ms"], 3_600_000);
     }
 
     #[test]

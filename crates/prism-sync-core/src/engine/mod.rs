@@ -513,15 +513,20 @@ impl SyncEngine {
                 // was fully applied or durably quarantined here, so acking it can
                 // never authorise the relay to prune a batch this device has
                 // neither applied nor stored — which is what the transient
-                // stalls (cursor held behind a batch) rely on. Fire-and-forget.
+                // stalls (cursor held behind a batch) rely on.
+                //
+                // Awaited (not spawned): the ack is the one *signed* request a
+                // pull-only cycle issues, so its 2xx is the relay clock anchor
+                // the excursion repair gates on (`signed_exchange_validated`). A
+                // failure stays non-fatal — we just leave the anchor unset, so
+                // the repair defers to a later validated cycle rather than
+                // arming on an unproven clock.
                 let acked_cursor = self.local_pull_cursor(sync_id).await.unwrap_or(0);
                 if acked_cursor > 0 {
-                    let relay = self.relay.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = relay.ack(acked_cursor).await {
-                            tracing::warn!("ack failed (non-fatal): {e}");
-                        }
-                    });
+                    match self.relay.ack(acked_cursor).await {
+                        Ok(()) => result.signed_exchange_validated = true,
+                        Err(e) => tracing::warn!("ack failed (non-fatal): {e}"),
+                    }
                 }
             }
             Err(e) => {
@@ -583,6 +588,11 @@ impl SyncEngine {
             Ok((pushed, push_incomplete)) => {
                 result.pushed = pushed;
                 result.push_incomplete = push_incomplete;
+                // A pushed batch is a 2xx on the signed `PUT /changes` route, an
+                // independent relay clock anchor alongside the ack.
+                if pushed > 0 {
+                    result.signed_exchange_validated = true;
+                }
             }
             Err(e) => {
                 if should_bubble_recoverable_key_error(&e) {

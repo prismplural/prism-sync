@@ -1229,6 +1229,11 @@ impl SyncService {
         Ok(())
     }
 
+    /// Returns `Ok(None)` when the debounce short-circuited (no sync ran), and
+    /// `Ok(Some(result))` when a real cycle completed. The caller needs the
+    /// distinction: a debounce no-op contacted no relay, so it must not arm the
+    /// clock-excursion repair (only a cycle's `signed_exchange_validated`
+    /// flag may).
     pub(crate) async fn catch_up_if_stale_with_recovery(
         &mut self,
         key_hierarchy: &mut prism_sync_crypto::KeyHierarchy,
@@ -1236,13 +1241,13 @@ impl SyncService {
         ml_dsa_signing_key: Option<&prism_sync_crypto::DevicePqSigningKey>,
         device_id: &str,
         ml_dsa_key_generation: u32,
-    ) -> Result<()> {
+    ) -> Result<Option<SyncResult>> {
         if let Some(last) = self.last_sync_time {
             if last.elapsed() < Duration::from_secs(5) {
-                return Ok(());
+                return Ok(None);
             }
         }
-        let _ = self
+        let result = self
             .sync_now_with_recovery(
                 key_hierarchy,
                 signing_key,
@@ -1251,7 +1256,7 @@ impl SyncService {
                 ml_dsa_key_generation,
             )
             .await?;
-        Ok(())
+        Ok(Some(result))
     }
 }
 

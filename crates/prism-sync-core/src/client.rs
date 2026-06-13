@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::clock_drift::{ClockConfidence, MAX_CLOCK_DRIFT_MS};
 use crate::crdt_change::{estimate_envelope_body_size, CrdtChange};
 use crate::device_registry::DeviceRegistryManager;
 use crate::engine::{BootstrapReport, SeedRecord, SyncConfig, SyncEngine};
@@ -242,6 +243,7 @@ impl PrismSyncBuilder {
             ml_dsa_key_generation: None,
             device_id: None,
             epoch: None,
+            clock_confidence: ClockConfidence::new(),
         })
     }
 }
@@ -252,6 +254,15 @@ impl PrismSyncBuilder {
 enum MutationKind {
     Create,
     Update,
+}
+
+/// A confirmed forward HLC clock excursion: the over-bound self-authored
+/// `field_versions` winners that the repair re-emits, plus the peak drift.
+struct ClockExcursion {
+    device_id: String,
+    sync_id: String,
+    future_rows: Vec<crate::storage::FieldVersion>,
+    max_drift_ms: i64,
 }
 
 /// The primary consumer-facing API for prism-sync.
@@ -275,6 +286,11 @@ pub struct PrismSync {
     ml_dsa_key_generation: Option<u32>,
     device_id: Option<String>,
     epoch: Option<i32>,
+    /// Stamped whenever a sync cycle completes a successful signed relay
+    /// exchange; gates the excursion repair so it never fires during a
+    /// backward clock step (where the relay 401s and this stays
+    /// stale).
+    clock_confidence: ClockConfidence,
 }
 
 impl PrismSync {
@@ -586,6 +602,9 @@ impl PrismSync {
             .await;
         self.apply_recovered_epoch_high_water();
         self.refresh_op_emitter_hlc_from_storage("sync_now");
+        let signed_exchange_validated =
+            matches!(&result, Ok(r) if r.signed_exchange_validated);
+        self.note_signed_exchange_and_repair_clock(signed_exchange_validated);
         result
     }
 
@@ -1289,7 +1308,13 @@ impl PrismSync {
             .await;
         self.apply_recovered_epoch_high_water();
         self.refresh_op_emitter_hlc_from_storage("on_resume");
-        result
+        // Gate on the cycle's signed-exchange flag, same as `sync_now`. The
+        // debounce short-circuit returns `Ok(None)` — no relay contact — which
+        // (like a failed cycle) must not arm the repair.
+        let signed_exchange_validated =
+            matches!(&result, Ok(Some(r)) if r.signed_exchange_validated);
+        self.note_signed_exchange_and_repair_clock(signed_exchange_validated);
+        result.map(|_| ())
     }
 
     // ── Snapshot operations ──
@@ -2890,6 +2915,185 @@ impl PrismSync {
         }
     }
 
+    /// Stamp clock confidence on a relay-validated signed exchange and, when one
+    /// occurred this cycle, run the forward-excursion detect-and-repair.
+    ///
+    /// `signed_exchange_validated` is the engine's [`SyncResult`] flag: `true`
+    /// only when this cycle landed a 2xx on a *signed* route (push or ack) whose
+    /// `X-Prism-Timestamp` the relay checked against its symmetric skew window —
+    /// which proves `|local − relay| ≤ MAX_CLOCK_DRIFT_MS`. It is NOT keyed on
+    /// `error.is_none()`: a pull-only cycle (the unsigned, bearer-only `GET`) can
+    /// succeed with the local clock arbitrarily skewed, so gating on bare success
+    /// would arm the repair with no clock proof. Keying on the signed-exchange
+    /// flag is the relay anchor that separates a genuine forward excursion (a
+    /// signed request still validates, so we repair) from a backward clock step
+    /// (the relay 401s the signed request on the same skew check, the flag stays
+    /// `false`, and the repair never runs). A cycle with nothing
+    /// signed to send simply defers the repair to a later validated cycle.
+    fn note_signed_exchange_and_repair_clock(&mut self, signed_exchange_validated: bool) {
+        if !signed_exchange_validated {
+            return;
+        }
+        // Bookkeeping for cross-cycle freshness consumers; the per-cycle gate
+        // above is the load-bearing evidence (a backward step never reaches here).
+        self.clock_confidence.record_validated(Hlc::now_ms());
+
+        if let Some(excursion) = self.check_clock_excursion() {
+            if let Err(e) = self.repair_future_hlc_excursion(excursion) {
+                tracing::error!(error = %e, "clock-excursion repair failed");
+            }
+        }
+    }
+
+    /// Detect a confirmed forward HLC excursion over the drift bound.
+    ///
+    /// Computes `future_drift_ms` as the MAX over (a) the emitter watermark and
+    /// (b) the self-authored `field_versions` winners that exceed the bound, and
+    /// returns the over-bound rows plus the peak drift when an excursion is
+    /// confirmed. Gated by the caller on relay-anchored clock confidence, so a
+    /// reading over the bound here can only be a forward clock step.
+    fn check_clock_excursion(&self) -> Option<ClockExcursion> {
+        let sync_id = self.sync_service.sync_id()?.to_string();
+        let device_id = self.device_id.clone()?;
+        let emitter = self.op_emitter.as_ref()?;
+
+        let now_ms = Hlc::now_ms();
+        let watermark_drift = crate::clock_drift::future_drift_ms(emitter.last_hlc(), now_ms);
+
+        let future_rows = match self.storage.list_self_authored_future_fv(
+            &sync_id,
+            &device_id,
+            MAX_CLOCK_DRIFT_MS,
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "clock-excursion: failed to read self-authored FV rows");
+                return None;
+            }
+        };
+
+        let fv_drift = future_rows
+            .iter()
+            .filter_map(|fv| Hlc::from_string(&fv.winning_hlc).ok())
+            .map(|hlc| crate::clock_drift::future_drift_ms(&hlc, now_ms))
+            .max()
+            .unwrap_or(0);
+
+        let max_drift = watermark_drift.max(fv_drift);
+        if max_drift <= MAX_CLOCK_DRIFT_MS {
+            return None;
+        }
+        Some(ClockExcursion { device_id, sync_id, future_rows, max_drift_ms: max_drift })
+    }
+
+    /// Repair a confirmed forward HLC excursion.
+    ///
+    /// (i) clamp the emitter watermark back to now; (ii) drop the device's
+    /// unpushed over-bound `pending_ops` (their FV winner is also self-authored
+    /// and over-bound, and is re-emitted below, so nothing is lost); (iii)
+    /// re-emit each over-bound self-authored winner at a fresh sane HLC via the
+    /// normal `record_update` path so blobs re-partition correctly — the blind
+    /// FV upsert rewrites the poisoned winner downward locally, and the re-emit
+    /// is what lets peers (who silently dropped the excursion-era ops) finally
+    /// converge. (iv) emit `ClockExcursionRepaired`.
+    ///
+    /// The three steps are not one transaction (each `record_update` commits its
+    /// own), but a crash mid-repair is recoverable on the next validated cycle
+    /// because [`check_clock_excursion`](Self::check_clock_excursion) re-detects
+    /// off the FV winners' drift, not the watermark alone: a clamped watermark
+    /// plus any still-poisoned FV row re-confirms the excursion and re-runs the
+    /// repair. A deleted pending op is never lost — its FV winner is the re-emit
+    /// source, and `record_update` re-creates the op atomically with the FV
+    /// rewrite. The repair is therefore idempotent and self-healing.
+    fn repair_future_hlc_excursion(&mut self, excursion: ClockExcursion) -> Result<()> {
+        let ClockExcursion { device_id, sync_id, future_rows, max_drift_ms } = excursion;
+
+        tracing::error!(
+            device_id = %device_id,
+            field_count = future_rows.len(),
+            max_drift_ms,
+            "forward HLC clock excursion detected — repairing self-authored future HLCs"
+        );
+
+        if let Some(emitter) = self.op_emitter.as_mut() {
+            emitter.clamp_watermark_to_now()?;
+        }
+
+        let deleted = self
+            .storage
+            .delete_unpushed_future_pending_ops(&sync_id, &device_id, MAX_CLOCK_DRIFT_MS)?;
+        tracing::debug!(deleted, "clock-excursion: dropped over-bound unpushed pending ops");
+
+        let mut field_count = 0u64;
+        for fv in &future_rows {
+            // A self-authored future tombstone re-emits through the delete path;
+            // `is_deleted` is not a declared schema field so it cannot ride
+            // `record_update`. A live `is_deleted = "false"` row is just a normal
+            // field and falls through to the update path below.
+            if fv.field_name == DELETED_FIELD
+                && crate::storage::is_tombstone_value(fv.winning_encoded_value.as_deref())
+            {
+                if let Err(e) = self.record_delete(&fv.entity_table, &fv.entity_id) {
+                    tracing::warn!(
+                        error = %e,
+                        entity_table = %fv.entity_table,
+                        entity_id = %fv.entity_id,
+                        "clock-excursion: failed to re-emit tombstone"
+                    );
+                    continue;
+                }
+                field_count += 1;
+                continue;
+            }
+
+            // Decode the winning value back into a SyncValue and re-emit it as a
+            // normal update; `record_update` partitions large blobs and stamps a
+            // fresh now-HLC via the freshly clamped watermark. Resolve the field
+            // type the same way the engine's apply path does.
+            let Some(encoded) = fv.winning_encoded_value.as_deref() else {
+                continue;
+            };
+            let sync_type = self
+                .schema
+                .entity(&fv.entity_table)
+                .and_then(|e| e.field_by_name(&fv.field_name))
+                .map(|f| f.sync_type)
+                .unwrap_or(SyncType::String);
+            let value = match crate::schema::decode_value(encoded, sync_type) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        entity_table = %fv.entity_table,
+                        entity_id = %fv.entity_id,
+                        field_name = %fv.field_name,
+                        "clock-excursion: skipping field with undecodable winning value"
+                    );
+                    continue;
+                }
+            };
+            let mut fields = HashMap::new();
+            fields.insert(fv.field_name.clone(), value);
+            if let Err(e) = self.record_update(&fv.entity_table, &fv.entity_id, &fields) {
+                tracing::warn!(
+                    error = %e,
+                    entity_table = %fv.entity_table,
+                    entity_id = %fv.entity_id,
+                    field_name = %fv.field_name,
+                    "clock-excursion: failed to re-emit field"
+                );
+                continue;
+            }
+            field_count += 1;
+        }
+
+        let _ = self
+            .event_tx
+            .send(SyncEvent::ClockExcursionRepaired { field_count, max_drift_ms });
+
+        Ok(())
+    }
+
     /// Advance the runtime epoch after a successful rotation or recovery.
     /// Updates both the in-memory epoch and the live OpEmitter so new
     /// mutations are stamped at the correct epoch.
@@ -4399,6 +4603,111 @@ mod tests {
             "local mutation HLC {local_hlc:?} must be causally after pulled HLC {remote_hlc:?}"
         );
         assert_eq!(local_hlc.node_id, "a1b2c3d4e5f6");
+    }
+
+    /// Seed a configured engine with a self-authored future winner for
+    /// `members/ent-1/name` plus a matching unpushed pending op, both carrying a
+    /// `+1h` HLC. This is the residue a forward clock excursion leaves behind.
+    fn seed_clock_excursion(sync: &PrismSync) -> Hlc {
+        use crate::storage::{FieldVersion, PendingOp};
+        let poison_hlc = Hlc::new(Hlc::now_ms() + 3_600_000, 0, "a1b2c3d4e5f6");
+        let mut tx = sync.storage.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: "sync-1".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            winning_op_id: "poison-op".to_string(),
+            winning_device_id: "a1b2c3d4e5f6".to_string(),
+            winning_hlc: poison_hlc.to_string(),
+            winning_encoded_value: Some("\"Future\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.insert_pending_op(&PendingOp {
+            op_id: "poison-op".to_string(),
+            sync_id: "sync-1".to_string(),
+            epoch: 1,
+            device_id: "a1b2c3d4e5f6".to_string(),
+            local_batch_id: "poison-batch".to_string(),
+            entity_table: "members".to_string(),
+            entity_id: "ent-1".to_string(),
+            field_name: "name".to_string(),
+            encoded_value: "\"Future\"".to_string(),
+            is_delete: false,
+            client_hlc: poison_hlc.to_string(),
+            created_at: chrono::Utc::now(),
+            pushed_at: None,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+        poison_hlc
+    }
+
+    #[test]
+    fn clock_excursion_repair_runs_after_successful_signed_exchange() {
+        let mut sync = make_sync();
+        configure(&mut sync);
+        let poison_hlc = seed_clock_excursion(&sync);
+        // configure_engine already seeded the emitter from storage; the
+        // self-authored future HLC poisons the watermark.
+        sync.refresh_op_emitter_hlc_from_storage("test");
+        assert!(sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS);
+
+        let mut events = sync.events();
+
+        // A successful signed exchange certifies the clock and arms the repair.
+        sync.note_signed_exchange_and_repair_clock(true);
+
+        // The over-bound unpushed pending op is gone.
+        assert!(sync.storage.load_batch_ops("poison-batch").unwrap().is_empty());
+
+        // The FV winner was rewritten at a sane HLC (value preserved).
+        let fv =
+            sync.storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
+        let repaired = Hlc::from_string(&fv.winning_hlc).unwrap();
+        assert!(repaired.future_drift_ms() <= MAX_CLOCK_DRIFT_MS);
+        assert!(repaired < poison_hlc);
+        assert_eq!(fv.winning_encoded_value, Some("\"Future\"".to_string()));
+
+        // The watermark was clamped back to a sane value.
+        assert!(sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() <= MAX_CLOCK_DRIFT_MS);
+
+        // A ClockExcursionRepaired event surfaced.
+        let mut saw_event = false;
+        while let Ok(ev) = events.try_recv() {
+            if let SyncEvent::ClockExcursionRepaired { field_count, max_drift_ms } = ev {
+                assert_eq!(field_count, 1);
+                assert!(max_drift_ms > MAX_CLOCK_DRIFT_MS);
+                saw_event = true;
+            }
+        }
+        assert!(saw_event, "expected a ClockExcursionRepaired event");
+    }
+
+    #[test]
+    fn clock_excursion_repair_does_not_run_without_signed_exchange() {
+        // Unit contract for the gate: when no signed exchange validated the clock
+        // this cycle (`signed_exchange_validated == false`), the repair is a
+        // no-op and leaves all state untouched. The load-bearing link that a
+        // backward clock step actually yields `false` (the pull stays unsigned,
+        // the ack 401s on the skew check) is exercised end-to-end through the
+        // real gate in `e2e_clock_excursion_repair_skips_unvalidated_pull_only`.
+        let mut sync = make_sync();
+        configure(&mut sync);
+        let poison_hlc = seed_clock_excursion(&sync);
+        sync.refresh_op_emitter_hlc_from_storage("test");
+
+        // No validated signed exchange this cycle → the gate stays shut.
+        sync.note_signed_exchange_and_repair_clock(false);
+
+        // Pending op survives and the FV keeps its poisoned HLC.
+        assert_eq!(sync.storage.load_batch_ops("poison-batch").unwrap().len(), 1);
+        let fv =
+            sync.storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
+        assert_eq!(fv.winning_hlc, poison_hlc.to_string());
+        // Watermark untouched (still poisoned).
+        assert!(sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS);
     }
 
     #[test]

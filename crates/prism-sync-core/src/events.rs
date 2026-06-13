@@ -101,6 +101,15 @@ pub enum SyncEvent {
         reason: String,
         attempt: i64,
     },
+    /// A forward clock excursion poisoned this device's own HLCs (watermark and
+    /// self-authored `field_versions` winners drifted past the drift bound) and
+    /// the relay-anchored repair rewrote those winners at sane HLCs and
+    /// re-queued them for push. The failure it cures was previously silent —
+    /// every excursion-era op was dropped by peers' future-drift filters with no
+    /// detection. `field_count` is how many self-authored fields were re-emitted;
+    /// `max_drift_ms` is the largest future drift observed before repair.
+    /// Additive event — the Dart decoder ignores unknown event types.
+    ClockExcursionRepaired { field_count: u64, max_drift_ms: i64 },
 }
 
 /// A single entity change with full field data, for consumer DB application.

@@ -72,6 +72,17 @@ pub struct SyncResult {
     /// release — there is no user-facing flow; it lets the host surface that a
     /// relay restore was detected and history was re-fetched.
     pub log_regressed: bool,
+    /// `true` when this cycle completed at least one 2xx on a *signed* relay
+    /// route (push `PUT /changes`, ack `POST /ack`) — the routes the relay
+    /// gates with `verify_signed_request`'s symmetric `X-Prism-Timestamp` skew
+    /// check (`SIGNED_REQUEST_MAX_SKEW_SECS`, default 60s, kept in lockstep with
+    /// [`crate::clock_drift::MAX_CLOCK_DRIFT_MS`]). A 2xx there proves
+    /// `|local − relay| ≤ bound`, so this — and only this — is the relay anchor
+    /// the excursion repair gates on. A pull-only cycle (`GET /changes` is
+    /// bearer-only, no timestamp/skew check) leaves it `false`, so a backward
+    /// clock step never arms the repair. Always `false` on
+    /// error paths.
+    pub signed_exchange_validated: bool,
 }
 
 impl Default for SyncResult {
@@ -89,6 +100,7 @@ impl Default for SyncResult {
             entity_changes: Vec::new(),
             push_incomplete: false,
             log_regressed: false,
+            signed_exchange_validated: false,
         }
     }
 }

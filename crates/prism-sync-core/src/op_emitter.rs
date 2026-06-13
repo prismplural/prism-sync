@@ -122,6 +122,20 @@ impl OpEmitter {
         hlc.node_id == device_id || hlc.future_drift_ms() <= MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS
     }
 
+    /// Reset the watermark to wall-clock now, dropping a poisoned future HLC.
+    ///
+    /// Used only by the relay-anchored excursion repair: once a sync
+    /// cycle has proved the local clock is within the drift bound of relay
+    /// time, a watermark far in the future can only be a leftover forward
+    /// clock excursion. `Hlc::try_now(device_id, None)` ignores `last_hlc`, so
+    /// this is the one place the watermark is allowed to move backward — the
+    /// next `tick()` then mints sane, peer-deliverable HLCs again.
+    pub fn clamp_watermark_to_now(&mut self) -> Result<()> {
+        self.last_hlc =
+            Hlc::try_now(&self.device_id, None).map_err(|e| CoreError::Engine(e.to_string()))?;
+        Ok(())
+    }
+
     /// Tick the HLC once and return the new value.
     fn tick(&mut self) -> Result<Hlc> {
         let next_hlc = Hlc::try_now(&self.device_id, Some(&self.last_hlc))
@@ -1293,6 +1307,24 @@ mod tests {
         emitter.set_last_hlc(remote_hlc.clone());
 
         assert_eq!(emitter.last_hlc(), &remote_hlc);
+    }
+
+    #[test]
+    fn clamp_watermark_to_now_drops_far_future_watermark() {
+        let mut emitter = make_emitter();
+        // Poison the watermark a full year ahead, as a forward clock excursion
+        // would have. A normal `set_last_hlc` cannot move it back; the repair
+        // clamp is the one path that may.
+        let poisoned = Hlc::new(now_ms() + 365 * 24 * 60 * 60 * 1000, 0, emitter.last_hlc().node_id.clone());
+        emitter.set_last_hlc(poisoned);
+        assert!(emitter.last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS);
+
+        emitter.clamp_watermark_to_now().unwrap();
+
+        // The watermark is back at wall clock, so the next tick mints a sane HLC.
+        let next = emitter.tick().unwrap();
+        let drift = crate::clock_drift::future_drift_ms(&next, now_ms());
+        assert_eq!(drift, 0);
     }
 
     #[test]

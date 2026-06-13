@@ -925,6 +925,286 @@ async fn e2e_replace_front_after_near_future_remote_pull_closes_previous_session
     );
 }
 
+/// A forward clock excursion poisons A's own watermark, a `field_versions`
+/// winner, and an unpushed pending op to +1h. After A syncs against the real
+/// relay (which proves the local clock is now within bound), the repair clamps
+/// the watermark, drops the over-bound pending op, and re-emits the poisoned
+/// winner at a sane HLC — so B, which would otherwise have silently dropped the
+/// excursion-era op, finally converges to A's value.
+#[tokio::test]
+async fn e2e_clock_excursion_repair_recovers_poisoned_self_authored_field() {
+    use prism_sync_core::storage::PendingOp;
+    let (url, _server, _db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let epoch0_key = vec![0xAB; 32];
+
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let device_b_id = generate_device_id();
+    let keys_b = TestDeviceKeys::generate(&device_b_id);
+    let token_b = register_joiner_device(
+        &client,
+        &url,
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        &device_a_id,
+        &keys_a,
+        vec![
+            registry_snapshot_entry_hybrid(&sync_id, &device_a_id, &keys_a, "active"),
+            registry_snapshot_entry_hybrid(&sync_id, &device_b_id, &keys_b, "active"),
+        ],
+    )
+    .await;
+
+    let storage_a = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_a, &sync_id, &device_b_id, &keys_b);
+
+    let storage_b = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    register_peer_device(&storage_b, &sync_id, &device_a_id, &keys_a);
+    register_peer_device(&storage_b, &sync_id, &device_b_id, &keys_b);
+
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64;
+
+    let session_id = "session-poisoned";
+    let poison_hlc = Hlc::new(now_ms + 3_600_000, 0, &device_a_id); // +1h, self-authored
+
+    // Pre-seed A with a self-authored future winner for `member_id` plus an
+    // unpushed pending op carrying the same poisoned HLC. This is the residue a
+    // forward clock excursion leaves behind: the FV winner, the pending op, and
+    // (after configure_engine seeds from storage) the emitter watermark are all
+    // ~1h in the future.
+    {
+        let mut tx = storage_a.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: sync_id.clone(),
+            entity_table: "fronting_sessions".to_string(),
+            entity_id: session_id.to_string(),
+            field_name: "member_id".to_string(),
+            winning_op_id: "poison-op".to_string(),
+            winning_device_id: device_a_id.clone(),
+            winning_hlc: poison_hlc.to_string(),
+            winning_encoded_value: Some("\"member-from-future\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.insert_pending_op(&PendingOp {
+            op_id: "poison-op".to_string(),
+            sync_id: sync_id.clone(),
+            epoch: 0,
+            device_id: device_a_id.clone(),
+            local_batch_id: "poison-batch".to_string(),
+            entity_table: "fronting_sessions".to_string(),
+            entity_id: session_id.to_string(),
+            field_name: "member_id".to_string(),
+            encoded_value: "\"member-from-future\"".to_string(),
+            is_delete: false,
+            client_hlc: poison_hlc.to_string(),
+            created_at: chrono::Utc::now(),
+            pushed_at: None,
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let entity_a = fronting_test_entity();
+    let relay_a = make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a);
+    let mut sync_a = make_prism_sync_client(
+        &sync_id,
+        &device_a_id,
+        &keys_a,
+        relay_a,
+        storage_a.clone(),
+        entity_a,
+        &epoch0_key,
+    );
+
+    let entity_b = fronting_test_entity();
+    let relay_b = make_server_relay(&localhost_url, &sync_id, &device_b_id, &token_b, &keys_b);
+    let mut sync_b = make_prism_sync_client(
+        &sync_id,
+        &device_b_id,
+        &keys_b,
+        relay_b,
+        storage_b.clone(),
+        entity_b.clone(),
+        &epoch0_key,
+    );
+
+    let mut events_a = sync_a.events();
+
+    // A syncs against the real relay. The signed exchange certifies A's clock,
+    // so the excursion is detected and repaired in this cycle.
+    let a_sync = sync_a.sync_now().await.unwrap();
+    assert!(a_sync.error.is_none(), "A sync failed: {:?}", a_sync.error);
+
+    // The poisoned unpushed pending op is gone (replaced by a sane re-emit).
+    let poison_still_present = storage_a
+        .load_batch_ops("poison-batch")
+        .unwrap()
+        .iter()
+        .any(|op| op.op_id == "poison-op");
+    assert!(!poison_still_present, "the over-bound pending op should be deleted");
+
+    // The FV winner was rewritten downward to a sane HLC by the re-emit.
+    let repaired_fv = storage_a
+        .get_field_version(&sync_id, "fronting_sessions", session_id, "member_id")
+        .unwrap()
+        .expect("member_id field version should still exist after repair");
+    let repaired_hlc = Hlc::from_string(&repaired_fv.winning_hlc).unwrap();
+    assert!(
+        repaired_hlc.future_drift_ms() <= 60_000,
+        "repaired FV HLC should be within the drift bound, got drift {}",
+        repaired_hlc.future_drift_ms()
+    );
+    assert_eq!(
+        repaired_fv.winning_encoded_value,
+        Some("\"member-from-future\"".to_string()),
+        "the field value is preserved; only its HLC is repaired"
+    );
+
+    // The repair event surfaced.
+    let mut saw_event = false;
+    while let Ok(ev) = events_a.try_recv() {
+        if let prism_sync_core::events::SyncEvent::ClockExcursionRepaired {
+            field_count,
+            max_drift_ms,
+        } = ev
+        {
+            assert!(field_count >= 1);
+            assert!(max_drift_ms > 60_000);
+            saw_event = true;
+        }
+    }
+    assert!(saw_event, "a ClockExcursionRepaired event should have been emitted");
+
+    // Push the repaired re-emit, then B pulls and converges to A's value — the
+    // data the excursion-era op could never deliver.
+    let a_push = sync_a.sync_now().await.unwrap();
+    assert!(a_push.error.is_none(), "A repaired-push failed: {:?}", a_push.error);
+
+    let b_pull = sync_b.sync_now().await.unwrap();
+    assert!(b_pull.error.is_none(), "B pull failed: {:?}", b_pull.error);
+
+    let b_member = storage_b
+        .get_field_version(&sync_id, "fronting_sessions", session_id, "member_id")
+        .unwrap()
+        .expect("B should receive A's repaired member_id");
+    assert_eq!(
+        b_member.winning_encoded_value,
+        Some("\"member-from-future\"".to_string()),
+        "B should converge to A's repaired value"
+    );
+    assert_eq!(b_member.winning_device_id, device_a_id);
+}
+
+/// The repair gate, through the real relay: a pull-only cycle must NOT arm the
+/// excursion repair, because the pull `GET` is bearer-only and never validates
+/// the clock. This is the backward-clock-step hazard the gate exists to prevent
+/// — the seeded `+1h` self-authored winner stands in for correct-time state that
+/// looks future after the local clock regressed.
+///
+/// A has a self-authored future FV winner but NO unpushed pending op, so the
+/// cycle pulls (unsigned, succeeds) yet issues no *signed* request: push has
+/// nothing to send and there is nothing to ack. `signed_exchange_validated`
+/// stays `false`, the repair never runs, and the (would-be-legitimate) winner
+/// and watermark are left untouched — no clamp, no deletion, no downward re-emit.
+#[tokio::test]
+async fn e2e_clock_excursion_repair_skips_unvalidated_pull_only() {
+    let (url, _server, _db) = start_test_relay().await;
+    let localhost_url = to_localhost_url(&url);
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let epoch0_key = vec![0xAB; 32];
+
+    let device_a_id = generate_device_id();
+    let keys_a = TestDeviceKeys::generate(&device_a_id);
+    let token_a = register_device(&client, &url, &sync_id, &device_a_id, &keys_a).await;
+
+    let storage_a = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    register_peer_device(&storage_a, &sync_id, &device_a_id, &keys_a);
+
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64;
+    let session_id = "session-looks-future";
+    let future_hlc = Hlc::new(now_ms + 3_600_000, 0, &device_a_id); // +1h, self-authored
+
+    // Seed ONLY a self-authored future FV winner — no pending op. After the
+    // local clock regressed this row looks `+1h` future even though it was
+    // written at a correct time; the repair must not touch it.
+    {
+        let mut tx = storage_a.begin_tx().unwrap();
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: sync_id.clone(),
+            entity_table: "fronting_sessions".to_string(),
+            entity_id: session_id.to_string(),
+            field_name: "member_id".to_string(),
+            winning_op_id: "looks-future-op".to_string(),
+            winning_device_id: device_a_id.clone(),
+            winning_hlc: future_hlc.to_string(),
+            winning_encoded_value: Some("\"legit-member\"".to_string()),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let entity_a = fronting_test_entity();
+    let relay_a = make_server_relay(&localhost_url, &sync_id, &device_a_id, &token_a, &keys_a);
+    let mut sync_a = make_prism_sync_client(
+        &sync_id,
+        &device_a_id,
+        &keys_a,
+        relay_a,
+        storage_a.clone(),
+        entity_a,
+        &epoch0_key,
+    );
+
+    // configure_engine (in make_prism_sync_client) already seeded the emitter
+    // watermark from the future winner in storage (monotonic inheritance).
+    let mut events_a = sync_a.events();
+
+    // Pull-only cycle: nothing to push, nothing to ack. It succeeds, but no
+    // signed route ran, so the clock was never relay-validated.
+    let a_sync = sync_a.sync_now().await.unwrap();
+    assert!(a_sync.error.is_none(), "A sync failed: {:?}", a_sync.error);
+    assert!(
+        !a_sync.signed_exchange_validated,
+        "a pull-only cycle must not report a validated signed exchange"
+    );
+
+    // The future FV winner is untouched — no downward re-emit.
+    let fv = storage_a
+        .get_field_version(&sync_id, "fronting_sessions", session_id, "member_id")
+        .unwrap()
+        .expect("the seeded winner should still exist");
+    assert_eq!(
+        fv.winning_hlc,
+        future_hlc.to_string(),
+        "the gate stayed shut: the winner's HLC must be unchanged"
+    );
+    assert_eq!(fv.winning_encoded_value, Some("\"legit-member\"".to_string()));
+
+    // No repair event surfaced (the clamp + delete + re-emit never ran — the
+    // unchanged FV above already evidences the repair body did not execute).
+    let mut saw_repair = false;
+    while let Ok(ev) = events_a.try_recv() {
+        if matches!(ev, prism_sync_core::events::SyncEvent::ClockExcursionRepaired { .. }) {
+            saw_repair = true;
+        }
+    }
+    assert!(!saw_repair, "no ClockExcursionRepaired event should be emitted on a pull-only cycle");
+}
+
 #[tokio::test]
 async fn server_relay_uses_registration_session_for_followup_auth() {
     let (url, _server, _db) = start_test_relay().await;
