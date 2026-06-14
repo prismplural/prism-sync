@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `coalesce_consumer_deliveries`, `compute_registration_key_bundle_hash`, `consumer_delivery_spill_threshold`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `empty_undelivered_changes_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `validate_cached_sharing_id`
+// These functions are ignored because they are not marked as `pub`: `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `coalesce_consumer_deliveries`, `compute_registration_key_bundle_hash`, `consumer_delivery_spill_threshold`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `effective_allow_insecure`, `empty_undelivered_changes_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `heal_configured_epoch`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_localhost_url`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `map_media_fetch_error_kind`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `skip_ascii_whitespace`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `url_host`, `validate_cached_sharing_id`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `RollbackCredentialSnapshot`, `SharingHandleContext`, `SharingPendingResultJson`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
 
@@ -17,13 +17,21 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 /// panic payload + source location captured by the hook installed at engine
 /// creation. Returns `None` when no panic has been captured since the last
 /// call (the slot is cleared on read).
+///
+/// The payload is run through [`redact_sensitive_message`] before it leaves
+/// the FFI boundary: panic messages (e.g. an `assert_eq!` / `expect` on a
+/// secret-typed operand) can otherwise carry key material into the Dart logs.
 Future<String?> takeLastPanic() => RustLib.instance.api.crateApiTakeLastPanic();
 
 /// Build and configure a PrismSync instance.
 ///
 /// - `relay_url`: The relay server URL.
 /// - `db_path`: SQLite database path, or ":memory:" for in-memory.
-/// - `allow_insecure`: Allow http:// relay URLs (dev only).
+/// - `allow_insecure`: Allow http:// relay URLs (dev only). For a
+///   **non-localhost** host this is honored only when the crate is built with
+///   the `insecure-transport-dev` feature; release builds force it to `false`
+///   so cleartext can never reach the open network. `http://localhost` stays
+///   allowed regardless.
 /// - `schema_json`: JSON schema definition (see `parse_schema_json` docs).
 ///   Pass an empty string or "{}" to use an empty schema.
 ///
@@ -439,28 +447,70 @@ Future<void> onResume({required PrismSyncHandle handle}) =>
 
 /// Upload an encrypted media blob to the relay.
 ///
+/// `ttl_secs` optionally requests a short per-blob TTL; the relay clamps it and
+/// an old relay ignores it.
+///
+/// `pairing_push` tags the upload for the dedicated pairing-push rate lane.
+/// Only meaningful with a `ttl_secs`; a fresh send passes `false`.
+///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
-Future<void> uploadMedia({
+Future<MediaUploadOutcome> uploadMedia({
   required PrismSyncHandle handle,
   required String mediaId,
   required String contentHash,
   required List<int> data,
+  BigInt? ttlSecs,
+  required bool pairingPush,
 }) => RustLib.instance.api.crateApiUploadMedia(
   handle: handle,
   mediaId: mediaId,
   contentHash: contentHash,
   data: data,
+  ttlSecs: ttlSecs,
+  pairingPush: pairingPush,
 );
 
 /// Download an encrypted media blob from the relay.
 ///
+/// Returns a typed [`MediaDownloadOutcome`] (`bytes` xor `error`). A relay 404
+/// surfaces as `NotFound`; the outer `Err(String)` is only "relay not configured".
+///
 /// Requires `configure_engine` to have been called after `initialize`/`unlock`.
-Future<Uint8List> downloadMedia({
+Future<MediaDownloadOutcome> downloadMedia({
   required PrismSyncHandle handle,
   required String mediaId,
 }) => RustLib.instance.api.crateApiDownloadMedia(
   handle: handle,
   mediaId: mediaId,
+);
+
+/// Return the subset of `media_ids` the relay currently holds and can serve.
+///
+/// Requires `configure_engine`. Against an old relay without the endpoint this
+/// returns an error string; the caller treats "feature absent" as a no-op
+/// rather than as "all blobs absent".
+Future<List<String>> mediaExists({
+  required PrismSyncHandle handle,
+  required List<String> mediaIds,
+}) => RustLib.instance.api.crateApiMediaExists(
+  handle: handle,
+  mediaIds: mediaIds,
+);
+
+/// Send one sealed ephemeral message to the relay's device-message mailbox.
+///
+/// Requires `configure_engine`. Against an old relay without the endpoint this
+/// returns an error string; callers treat "feature absent" as a no-op.
+Future<void> sendEphemeral({
+  required PrismSyncHandle handle,
+  required String kind,
+  required String mediaId,
+  String? recipientDeviceId,
+}) => RustLib.instance.api.crateApiSendEphemeral(
+  handle: handle,
+  kind: kind,
+  mediaId: mediaId,
+  recipientDeviceId: recipientDeviceId,
 );
 
 /// Upload an ephemeral snapshot for device pairing.
@@ -539,7 +589,7 @@ Future<PlatformInt64> quarantinedPullBatchCount({
 
 /// Drain up to `limit` rows from the durable consumer-delivery journal — the
 /// at-least-once delivery channel that replaces applying directly from the
-/// fire-and-forget `RemoteChanges` event (F01/F04/F40). The Dart drain loops
+/// fire-and-forget `RemoteChanges` event. The Dart drain loops
 /// take -> apply (or quarantine) -> ack, where the ack
 /// ([`ack_consumer_deliveries`]) fires only AFTER the consumer-DB transaction
 /// commits, so a pulled winner survives process death.
@@ -717,14 +767,21 @@ Future<String> listDevices({
 /// credential clear) on this verified result, never on the hint alone.
 ///
 /// Uses the engine relay configured by [`configure_engine`] (so a valid session
-/// token is in scope). Returns a stable lowercase string:
-/// - `"revoked"`  — verified signed registry marks this device `revoked`.
-/// - `"active"`   — verified signed registry lists this device non-revoked.
-/// - `"unknown"`  — inconclusive (no registry, verification failed, relay error,
-///   self absent). Fail-safe: callers must NOT wipe or clear credentials.
+/// token is in scope). Returns a stable JSON string (H3 Layer B):
+/// - `{"status":"revoked","remote_wipe":<bool>}` — verified signed registry
+///   marks this device `revoked`; `remote_wipe` is the admin-authenticated wipe
+///   intent read from the SAME signature-verified entry (defaults `false` for
+///   older snapshots that omit it). Callers MUST drive any local data wipe from
+///   this verified bit, never from the relay's `device_revoked` frame / error.
+/// - `{"status":"active"}`  — verified signed registry lists this device
+///   non-revoked.
+/// - `{"status":"unknown"}` — inconclusive (no registry, verification failed,
+///   relay error, self absent). Fail-safe: callers must NOT wipe or clear creds.
 ///
-/// Never returns `Err`: every failure mode collapses to `"unknown"` so a relay
-/// cannot weaponize an error into a destructive outcome.
+/// Never returns `Err`: every failure mode collapses to `{"status":"unknown"}`
+/// so a relay cannot weaponize an error into a destructive outcome. The
+/// `Result<String, String>` signature is unchanged from the prior lowercase-
+/// string form, so no flutter_rust_bridge type regeneration is required.
 Future<String> confirmSelfRevocation({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiConfirmSelfRevocation(handle: handle);
 
@@ -1072,16 +1129,6 @@ Future<String> sharingUnwrapKeys({
 Future<Uint8List> getIdentityPublicKey({required PrismSyncHandle handle}) =>
     RustLib.instance.api.crateApiGetIdentityPublicKey(handle: handle);
 
-/// Perform X25519 ECDH key agreement with a peer's public key.
-/// Returns the 32-byte shared secret.
-Future<Uint8List> performEcdh({
-  required PrismSyncHandle handle,
-  required List<int> peerPublicKey,
-}) => RustLib.instance.api.crateApiPerformEcdh(
-  handle: handle,
-  peerPublicKey: peerPublicKey,
-);
-
 /// Encrypt plaintext with XChaCha20-Poly1305. Returns `nonce || ciphertext+MAC`.
 Future<Uint8List> encryptXchacha({
   required List<int> key,
@@ -1282,6 +1329,75 @@ abstract class MemorySecureStore implements RustOpaqueInterface {
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<PrismSyncHandle>>
 abstract class PrismSyncHandle implements RustOpaqueInterface {}
+
+/// The result of a media download: exactly one of `bytes` / `error` is `Some`.
+/// A `Some(error)` is a normal typed failure; the
+/// outer `Result`'s `Err(String)` is reserved for misconfiguration (no relay).
+class MediaDownloadOutcome {
+  final Uint8List? bytes;
+  final MediaFetchErrorKind? error;
+
+  const MediaDownloadOutcome({this.bytes, this.error});
+
+  @override
+  int get hashCode => bytes.hashCode ^ error.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MediaDownloadOutcome &&
+          runtimeType == other.runtimeType &&
+          bytes == other.bytes &&
+          error == other.error;
+}
+
+/// Why a media download failed, surfaced typed to Dart.
+enum MediaFetchErrorKind {
+  /// The relay returned 404; the blob is missing.
+  notFound,
+
+  /// Transport-level failure (connect/request/no status).
+  network,
+
+  /// Auth / forbidden / revoked / upgrade-required.
+  auth,
+
+  /// Request timed out (or relay 408/504).
+  timeout,
+
+  /// Relay 5xx (retryable server error).
+  server,
+
+  /// Local decrypt / integrity failure (set on the Dart side, not here).
+  decrypt,
+
+  /// Anything else (protocol, epoch rotation, unexpected status).
+  other,
+}
+
+/// Outcome of a media upload surfaced to Dart.
+///
+/// `committed` ⇒ the blob is committed and servable (relay HTTP 200).
+/// `in_progress` ⇒ another writer holds the PENDING reserve (relay HTTP 202):
+/// this is not a success to act on; the caller must back off
+/// and re-check batch-exists rather than broadcast `media_uploaded`.
+class MediaUploadOutcome {
+  final bool committed;
+  final bool inProgress;
+
+  const MediaUploadOutcome({required this.committed, required this.inProgress});
+
+  @override
+  int get hashCode => committed.hashCode ^ inProgress.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MediaUploadOutcome &&
+          runtimeType == other.runtimeType &&
+          committed == other.committed &&
+          inProgress == other.inProgress;
+}
 
 class SharingProcessPendingInputs {
   final List<String> existingRelationships;
