@@ -4731,16 +4731,19 @@ pub fn encode_image(
 ) -> Result<(Vec<u8>, String), String> {
     use image::codecs::jpeg::JpegEncoder;
     use image::codecs::webp::WebPEncoder;
-    use image::ImageReader;
+    use image::{ImageDecoder, ImageReader};
     use std::io::Cursor;
 
     let reader = ImageReader::new(Cursor::new(&image_bytes))
         .with_guessed_format()
         .map_err(|e| format!("Failed to read image: {e}"))?;
 
-    let img = reader
-        .decode()
+    let mut decoder = reader.into_decoder().map_err(|e| format!("Failed to decode image: {e}"))?;
+    let orientation =
+        decoder.orientation().map_err(|e| format!("Failed to read image orientation: {e}"))?;
+    let mut img = image::DynamicImage::from_decoder(decoder)
         .map_err(|e| format!("Failed to decode image: {e}"))?;
+    img.apply_orientation(orientation);
 
     let resized = img.resize(max_width, max_height, image::imageops::FilterType::Lanczos3);
 
@@ -6118,10 +6121,12 @@ pub async fn get_ml_dsa_key_generation(handle: &PrismSyncHandle) -> Result<u32, 
 mod tests {
     use super::*;
     use chrono::Utc;
+    use image::ImageDecoder;
     use prism_sync_core::relay::{DeviceInfo, MockRelay, SignedRegistryResponse};
     use prism_sync_core::secure_store::SecureStore;
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
+    use std::io::Cursor;
     use std::sync::Arc;
 
     #[test]
@@ -6467,6 +6472,55 @@ mod tests {
             revoked_at: None,
             ml_dsa_key_generation: generation,
         }
+    }
+
+    #[test]
+    fn encode_image_applies_exif_orientation() {
+        let source = jpeg_with_orientation_6(80, 40);
+        {
+            let mut decoder = image::ImageReader::new(Cursor::new(&source))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap();
+            assert_eq!(decoder.orientation().unwrap(), image::metadata::Orientation::Rotate90);
+        }
+
+        let (encoded, mime_type) = encode_image(source, 80, 80, 85).unwrap();
+        assert_eq!(mime_type, "image/jpeg");
+
+        let image = image::load_from_memory(&encoded).unwrap();
+        assert_eq!((image.width(), image.height()), (40, 80));
+    }
+
+    fn jpeg_with_orientation_6(width: u32, height: u32) -> Vec<u8> {
+        use image::codecs::jpeg::JpegEncoder;
+
+        let source = image::RgbImage::from_pixel(width, height, image::Rgb([20, 80, 140]));
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode(source.as_raw(), width, height, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+
+        let app1 = [
+            0xff, 0xe1, 0x00, 0x22, // APP1 marker + length.
+            b'E', b'x', b'i', b'f', 0x00, 0x00, // Exif header.
+            b'I', b'I', 0x2a, 0x00, // Little-endian TIFF header.
+            0x08, 0x00, 0x00, 0x00, // IFD0 offset.
+            0x01, 0x00, // One IFD entry.
+            0x12, 0x01, // Orientation tag.
+            0x03, 0x00, // SHORT.
+            0x01, 0x00, 0x00, 0x00, // One value.
+            0x06, 0x00, 0x00, 0x00, // Rotate 90 degrees clockwise.
+            0x00, 0x00, 0x00, 0x00, // No next IFD.
+        ];
+
+        let mut out = Vec::with_capacity(jpeg.len() + app1.len());
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
     }
 
     fn make_device_info(
