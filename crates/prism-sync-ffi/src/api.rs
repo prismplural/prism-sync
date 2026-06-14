@@ -2872,6 +2872,31 @@ pub async fn quarantined_batch_count(handle: &PrismSyncHandle) -> Result<i64, St
     .map_err(|e| e.to_string())?
 }
 
+/// Return the count of durably quarantined inbound pull batches: batches
+/// whose deterministic-but-recoverable failure (a missing epoch key, an
+/// undecodable cross-version payload, a stale-registry signature) has not yet
+/// cleared. Parity with `quarantined_batch_count` on the push side.
+///
+/// A nonzero value is bounded, visible divergence — the cursor and relay ack
+/// have already advanced past these batches (so pruning is never pinned) and
+/// Phase 0b replay re-applies each one the moment its blocking condition clears.
+/// Returns 0 if the engine has not been configured.
+pub async fn quarantined_pull_batch_count(handle: &PrismSyncHandle) -> Result<i64, String> {
+    let (storage, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let Some(sync_id) = inner.sync_service().sync_id() else {
+            return Ok(0);
+        };
+        (inner.storage().clone(), sync_id.to_string())
+    };
+
+    tokio::task::spawn_blocking(move || {
+        storage.quarantined_pull_batch_count(&sync_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Compute the highest journal id in `chunk` that must SPILL into the Dart
 /// quarantine lane because the total backlog (`total`) exceeds `cap`. The oldest
 /// `total - cap` rows are over-cap; since the chunk is the oldest rows in id

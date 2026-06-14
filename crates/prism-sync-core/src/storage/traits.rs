@@ -57,6 +57,17 @@ pub trait SyncStorage: Send + Sync {
         Ok(vec![])
     }
 
+    /// Count the durably-quarantined pull batches for this sync group. Cheaper
+    /// than `list_quarantined_pull_batches` for a diagnostics poll (parity with
+    /// the push-side `quarantined_batch_count`). A nonzero value is bounded,
+    /// visible divergence — batches whose key/decoder/registry has not yet
+    /// arrived — rather than the old group-wide pull wedge.
+    ///
+    /// Default: 0 (no-op for in-memory impls).
+    fn quarantined_pull_batch_count(&self, _sync_id: &str) -> Result<i64> {
+        Ok(0)
+    }
+
     /// List the current pull-stall budget rows for this sync group, ordered by
     /// `server_seq` ascending. Default: empty (no-op for in-memory impls).
     fn list_pull_stalls(&self, _sync_id: &str) -> Result<Vec<PullStall>> {

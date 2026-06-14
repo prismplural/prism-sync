@@ -83,6 +83,40 @@ fn make_encrypted_batch_with_generation(
     .unwrap()
 }
 
+/// Build a signed + encrypted batch at an explicit epoch, using `epoch_key` for
+/// the AEAD. Mirrors `make_encrypted_batch_with_generation` but lets a test
+/// produce a batch at an epoch the *receiver* does not yet hold.
+fn make_encrypted_batch_at_epoch(
+    ops: &[CrdtChange],
+    epoch_key: &[u8; 32],
+    epoch: i32,
+    signing_key: &SigningKey,
+    ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+    batch_id: &str,
+    sender_device_id: &str,
+) -> SignedBatchEnvelope {
+    let plaintext = CrdtChange::encode_batch(ops).unwrap();
+    let payload_hash = batch_signature::compute_payload_hash(&plaintext);
+    let aad = sync_aad::build_sync_aad(SYNC_ID, sender_device_id, epoch, batch_id, "ops");
+    let (ciphertext, nonce) =
+        prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &plaintext, &aad).unwrap();
+
+    batch_signature::sign_batch(
+        signing_key,
+        ml_dsa_signing_key,
+        SYNC_ID,
+        epoch,
+        batch_id,
+        "ops",
+        sender_device_id,
+        0,
+        &payload_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap()
+}
+
 fn make_snapshot_envelope_bytes(
     snapshot: &SnapshotData,
     key_hierarchy: &prism_sync_crypto::KeyHierarchy,
@@ -742,6 +776,211 @@ async fn undecodable_batch_quarantined_with_decode_failed_reason() {
     assert_eq!(
         q3[0].retry_count, 1,
         "backoff gate must skip the replay within the window (no retry_count bump)"
+    );
+}
+
+/// A batch encrypted at an epoch the receiver does not yet hold no
+/// longer hard-wedges the pull cursor. It quarantines-and-advances (reason
+/// `missing_epoch_key`), the cursor AND the relay ack advance past it (so the
+/// relay's min-acked prune floor is never pinned for the group), and once the
+/// epoch key arrives Phase 0b replay applies it to the identical merge result a
+/// live pull would have produced.
+#[tokio::test]
+async fn missing_epoch_key_batch_quarantines_advances_then_replays_on_key_arrival() {
+    let mut key_hierarchy = init_key_hierarchy(); // receiver: holds only epoch 0
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let ml_dsa_key_receiver = make_ml_dsa_keypair();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        receiver_id,
+        &signing_key_receiver.verifying_key(),
+        &ml_dsa_key_receiver.public_key_bytes(),
+    );
+
+    // The sender encrypts a batch at epoch 2 with a key the receiver lacks.
+    let epoch2_key = [0xABu8; 32];
+    let op = make_op(sender_id, "batch-epoch2", 2, "epoch2");
+    let envelope = make_encrypted_batch_at_epoch(
+        std::slice::from_ref(&op),
+        &epoch2_key,
+        2,
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        "batch-epoch2",
+        sender_id,
+    );
+    let q_seq = relay.inject_batch(envelope);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // Cycle 1: the receiver cannot decrypt the epoch-2 batch. Previously this hard-
+    // errored (CoreError::MissingEpochKey), froze the cursor, and the device
+    // never acked. Now sync returns Ok and the cursor/ack advance past it.
+    let r1 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r1.error.is_none(), "missing epoch key must not be a terminal sync error: {:?}", r1.error);
+    assert_eq!(r1.merged, 0, "nothing applies while the key is absent");
+
+    assert_eq!(
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        q_seq,
+        "cursor must advance past the undecryptable batch"
+    );
+    assert!(
+        relay.ack_calls().iter().any(|&s| s >= q_seq),
+        "the relay ack must advance past the quarantined seq so pruning is unpinned"
+    );
+
+    let q = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(q.len(), 1, "exactly one quarantined pull batch");
+    assert_eq!(q[0].reason, "missing_epoch_key");
+    assert_eq!(q[0].server_seq, q_seq);
+    assert_eq!(q[0].epoch, Some(2), "the row records the batch epoch for the replay gate");
+    assert_eq!(storage.quarantined_pull_batch_count(SYNC_ID).unwrap(), 1);
+
+    // Cycle 2 with the key STILL absent: the reason-aware gate skips the row with
+    // no crypto/network and no retry_count churn (it cannot succeed yet).
+    let r2 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r2.error.is_none());
+    let q2 = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(q2.len(), 1, "row stays quarantined while the key is missing");
+    assert_eq!(q2[0].retry_count, 0, "no replay attempt is made while the key is absent");
+    assert_eq!(entity.get_field("task-epoch2", "title"), None, "op not applied yet");
+
+    // The epoch-2 key arrives (catch-up / recovery / bundle history). Phase 0b
+    // replay re-runs the full pipeline and applies the batch.
+    key_hierarchy.store_epoch_key(2, zeroize::Zeroizing::new(epoch2_key.to_vec()));
+    let r3 = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .unwrap();
+    assert!(r3.error.is_none(), "{:?}", r3.error);
+    assert_eq!(
+        entity.get_field("task-epoch2", "title"),
+        Some(SyncValue::String("hello".into())),
+        "the batch must apply identically once its epoch key is installed"
+    );
+    assert!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "the row is deleted after a successful replay"
+    );
+    assert_eq!(storage.quarantined_pull_batch_count(SYNC_ID).unwrap(), 0);
+}
+
+/// Fail-closed boundary: a genuine `DecryptFailed` — the receiver HOLDS the
+/// epoch key but the ciphertext authenticates wrong (tamper/corruption) — must
+/// stay a hard error, never quarantine-and-advance. Only key-ABSENT is
+/// quarantined; an authentication failure under a held key is not.
+#[tokio::test]
+async fn decrypt_failed_with_held_key_still_hard_fails() {
+    let key_hierarchy = init_key_hierarchy(); // receiver holds epoch 0
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_receiver = make_signing_key();
+    let ml_dsa_key_receiver = make_ml_dsa_keypair();
+    let sender_id = "device-sender";
+    let receiver_id = "device-receiver";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity: Arc<dyn SyncableEntity> = Arc::new(MockTaskEntity::new());
+
+    setup_sync_metadata(&storage, receiver_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        receiver_id,
+        &signing_key_receiver.verifying_key(),
+        &ml_dsa_key_receiver.public_key_bytes(),
+    );
+
+    // Build a valid epoch-0 batch, then corrupt the ciphertext so AEAD auth fails
+    // under the key the receiver holds. The signature is recomputed over the
+    // tampered ciphertext so we reach STEP 2 (decrypt) rather than failing
+    // signature verification first.
+    let op = make_op(sender_id, "batch-tamper", 0, "tamper");
+    let plaintext = CrdtChange::encode_batch(std::slice::from_ref(&op)).unwrap();
+    let payload_hash = batch_signature::compute_payload_hash(&plaintext);
+    let epoch_key = key_hierarchy.epoch_key(0).unwrap();
+    let aad = sync_aad::build_sync_aad(SYNC_ID, sender_id, 0, "batch-tamper", "ops");
+    let (mut ciphertext, nonce) =
+        prism_sync_crypto::aead::xchacha_encrypt_for_sync(epoch_key, &plaintext, &aad).unwrap();
+    ciphertext[0] ^= 0xFF; // corrupt one byte -> AEAD authentication fails
+    let envelope = batch_signature::sign_batch(
+        &signing_key_sender,
+        &ml_dsa_key_sender,
+        SYNC_ID,
+        0,
+        "batch-tamper",
+        "ops",
+        sender_id,
+        0,
+        &payload_hash,
+        nonce,
+        ciphertext,
+    )
+    .unwrap();
+    relay.inject_batch(envelope);
+
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    // A held-key decrypt failure bubbles as a terminal error (it is in the
+    // recoverable-key-error set the engine re-raises), not Ok-with-error and
+    // never quarantine-and-advance.
+    let err = engine
+        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .await
+        .expect_err("a DecryptFailed under a held key must remain a terminal error");
+    assert!(
+        matches!(err, CoreError::DecryptFailed { epoch: 0, .. }),
+        "unexpected error: {err}"
+    );
+    assert!(
+        storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "a held-key decrypt failure must NOT be quarantined (fail-closed)"
     );
 }
 

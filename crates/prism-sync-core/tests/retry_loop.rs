@@ -499,12 +499,16 @@ async fn sync_now_does_not_retry_on_missing_ml_dsa_key_error() {
     );
 }
 
-/// A pulled batch at a newer epoch must surface as a local/protocol failure
-/// when the receiver is missing that epoch key. The retry loop must not
-/// treat this like a transient network issue, and relay-only metadata must
-/// stay unset.
+/// A pulled batch at an epoch the receiver does not yet hold no
+/// longer wedges the cursor with a hard MissingEpochKey error. It is
+/// quarantine-and-advanced — the sync succeeds, the cursor moves past it (so the
+/// relay ack advances and pruning is never pinned), a `PullBatchQuarantined`
+/// event fires with reason `missing_epoch_key`, and no terminal Error/Protocol
+/// error is surfaced. Phase 0b replay re-applies it once the key arrives
+/// (covered in engine_integration); this test pins the service-level disposition
+/// that the design previously asserted as a hard error.
 #[tokio::test(start_paused = true)]
-async fn sync_now_does_not_retry_on_missing_epoch_key_pull_error() {
+async fn sync_now_quarantines_and_advances_on_missing_epoch_key_pull() {
     let relay = Arc::new(MockRelay::new());
 
     let TestService {
@@ -555,28 +559,40 @@ async fn sync_now_does_not_retry_on_missing_epoch_key_pull_error() {
         remote_device,
         1,
     );
-    relay.inject_batch(envelope);
+    let q_seq = relay.inject_batch(envelope);
 
+    use prism_sync_core::storage::SyncStorage;
     let result = service.sync_now(&kh, &sk, Some(&ml_dsa), &device_id, 0).await;
-    assert!(result.is_err(), "missing epoch key must return Err");
+    let result = result.expect("missing epoch key must quarantine-and-advance, not return Err");
+    assert!(result.error.is_none(), "no terminal error: {:?}", result.error);
+    assert_eq!(result.merged, 0, "nothing merges while the key is absent");
+
+    // The cursor advanced past the undecryptable batch (the wedge is gone).
     assert_eq!(
-        relay.pull_call_count(),
-        1,
-        "missing epoch key is local/protocol, so it must not retry"
+        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        q_seq,
+        "cursor must advance past the undecryptable batch"
     );
 
+    // The batch is durably quarantined with the missing-epoch-key reason.
+    let quarantined = storage.list_quarantined_pull_batches(SYNC_ID).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].reason, "missing_epoch_key");
+    assert_eq!(quarantined[0].epoch, Some(1));
+
     let events = drain_events(&mut event_rx);
-    let err_event = events
-        .iter()
-        .find_map(|e| match e {
-            SyncEvent::Error(err) => Some(err),
-            _ => None,
-        })
-        .expect("must emit Error");
-    assert_eq!(err_event.kind, SyncErrorKind::Protocol);
-    assert!(!err_event.retryable);
-    assert!(err_event.code.is_none());
-    assert!(err_event.remote_wipe.is_none());
+    // No terminal Error event — this is a recoverable, non-wedging disposition.
+    assert!(
+        !events.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+        "missing epoch key must not surface a terminal Error event"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SyncEvent::PullBatchQuarantined { reason, .. } if reason == "missing_epoch_key"
+        )),
+        "must emit PullBatchQuarantined(missing_epoch_key)"
+    );
 
     let completed = events
         .iter()
@@ -585,9 +601,7 @@ async fn sync_now_does_not_retry_on_missing_epoch_key_pull_error() {
             _ => None,
         })
         .expect("must emit SyncCompleted");
-    assert_eq!(completed.error_kind.as_ref(), Some(&SyncErrorKind::Protocol));
-    assert!(completed.error_code.is_none());
-    assert!(completed.remote_wipe.is_none());
+    assert!(completed.error_kind.is_none(), "the cycle completed without a terminal error");
 }
 
 /// If a device has the wrong key material cached for a pulled epoch, the

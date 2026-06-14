@@ -5778,6 +5778,64 @@ mod tests {
         .unwrap();
     }
 
+    /// Client-side quarantine, relay-side consequence: before the quarantine fix a
+    /// device that hit an undecryptable batch froze its pull cursor and never acked
+    /// past that seq, so its `device_receipts` row pinned `get_min_acked_seq_unrevoked`
+    /// at the quarantined seq and the relay could never prune the group's history.
+    /// Client-side quarantine-and-advance makes it ack to head — the floor
+    /// advances past the quarantined seq and ack-only pruning proceeds. The relay
+    /// itself is unchanged; this pins the unwedging behavior that quarantine unlocks.
+    #[test]
+    fn ack_past_quarantined_seq_unpins_prune_floor() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+            register_device(conn, "sg1", "dev1", &[1; 32], &[2; 32], 0)?;
+            register_device(conn, "sg1", "dev2", &[3; 32], &[4; 32], 0)?;
+            touch_device(conn, "sg1", "dev1")?;
+            touch_device(conn, "sg1", "dev2")?;
+
+            // dev1 pushes 4 batches; b2 (seq2) is the one dev2 cannot decrypt.
+            let _seq1 = insert_batch(conn, "sg1", 0, "dev1", "b1", b"d1")?;
+            let quarantined_seq = insert_batch(conn, "sg1", 0, "dev1", "b2", b"d2")?;
+            let _seq3 = insert_batch(conn, "sg1", 0, "dev1", "b3", b"d3")?;
+            let head_seq = insert_batch(conn, "sg1", 0, "dev1", "b4", b"d4")?;
+
+            // dev1 is the sender (acked to head). dev2 hit the undecryptable b2.
+            upsert_device_receipt(conn, "sg1", "dev1", head_seq)?;
+
+            // Pre-quarantine behavior: dev2's cursor froze at the seq BEFORE b2, so its
+            // receipt pins the floor there and b2 onward can never be pruned.
+            upsert_device_receipt(conn, "sg1", "dev2", quarantined_seq - 1)?;
+            assert_eq!(
+                get_min_acked_seq_unrevoked(conn, "sg1")?,
+                Some(quarantined_seq - 1),
+                "a frozen cursor pins the prune floor below the quarantined seq"
+            );
+            let pruned = prune_batches_by_acks(conn)?;
+            assert_eq!(pruned, 1, "only the batch before the wedge is prunable while frozen");
+
+            // With quarantine: dev2 quarantines b2 locally and ACKS PAST it, all the way to head.
+            upsert_device_receipt(conn, "sg1", "dev2", head_seq)?;
+            assert_eq!(
+                get_min_acked_seq_unrevoked(conn, "sg1")?,
+                Some(head_seq),
+                "acking past the quarantined seq advances the floor to head"
+            );
+            let pruned = prune_batches_by_acks(conn)?;
+            assert_eq!(pruned, 3, "the remaining batches (incl. the quarantined seq) now prune");
+            assert!(
+                get_batches_since(conn, "sg1", 0, 100)?.is_empty(),
+                "pruning proceeds past the quarantined seq — the group is unpinned"
+            );
+            // Sanity: the quarantined seq itself was among those pruned.
+            assert!(quarantined_seq <= head_seq);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// A still-active device that has acked nothing pins the floor at 0, so
     /// ack-only pruning deletes nothing — until the device is revoked (e.g.
     /// by `auto_revoke_devices`), after which the floor advances to the

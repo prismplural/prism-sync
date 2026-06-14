@@ -1229,17 +1229,40 @@ impl SyncEngine {
             }
 
             // STEP 2: Decrypt batch using the epoch key from THIS batch's epoch
-            // (not "current epoch" -- pulled batches may span multiple epochs)
-            let epoch_key = key_hierarchy.epoch_key(envelope.epoch as u32).map_err(|_| {
-                tracing::error!(
+            // (not "current epoch" -- pulled batches may span multiple epochs).
+            //
+            // A missing epoch key is NOT a forgery — the signature already
+            // verified above — it just means the key has not reached this device
+            // yet (a joiner pre-dating the rotation, a crash-stranded rekey, a
+            // pre-bundle-history pairing). The old code bubbled
+            // `CoreError::MissingEpochKey` out of the whole pull, freezing the
+            // cursor on this seq forever: the device never acked past it, so the
+            // relay's min-acked prune floor stayed pinned for the WHOLE group.
+            // Instead quarantine-and-advance like the other
+            // deterministic-but-recoverable failures: the full
+            // signature-verified envelope is durably stored, the cursor advances
+            // so the relay can prune, and Phase 0b replay re-runs the complete
+            // pipeline the moment the epoch key arrives (catch-up, WS recovery,
+            // journal resume, or bundle history). DecryptFailed below
+            // (a key we HOLD failing to authenticate) stays fail-closed.
+            let Ok(epoch_key) = key_hierarchy.epoch_key(envelope.epoch as u32) else {
+                tracing::warn!(
                     batch_epoch = envelope.epoch,
                     server_seq = batch.server_seq,
                     sender_device_id = %envelope.sender_device_id,
                     known_epochs = ?key_hierarchy.known_epochs(),
-                    "engine: missing epoch key — cannot decrypt batch"
+                    "Quarantining batch whose epoch key is not yet held (replayable on key arrival)"
                 );
-                CoreError::MissingEpochKey { epoch: envelope.epoch as u32 }
-            })?;
+                self.quarantine_pull_batch(
+                    sync_id,
+                    batch,
+                    PermanentPullReason::MissingEpochKey,
+                    None,
+                )
+                .await?;
+                total_pulled += 1;
+                continue;
+            };
             let aad = sync_aad::build_sync_aad(
                 sync_id,
                 &envelope.sender_device_id,
@@ -2593,14 +2616,39 @@ impl SyncEngine {
         let backoff_base_ms = self.config.quarantine_replay_backoff_base_ms;
 
         for q in quarantined {
-            // Reason/time-aware eligibility gate: skip a row that is still inside
-            // its exponential backoff window. This must run BEFORE
-            // try_replay_quarantined_batch so an ineligible row triggers no
-            // crypto, no decode, and — critically — no relay registry fetch (the
-            // sender-resolution path in try_replay hits the network for an
-            // unknown/deregistered/future-generation sender). Without it a
-            // permanently-poison row churns all of that every single cycle.
-            if !quarantine_replay_eligible(now, q.retry_count, q.last_retry_at, backoff_base_ms) {
+            // Reason-aware eligibility for the missing-epoch-key arm: a row
+            // quarantined because its epoch key was absent can only ever succeed
+            // once that key is in the hierarchy, and the resolution path is purely
+            // local (no network). So gate it on the key's presence rather than the
+            // time-based backoff: skip entirely while the key is still missing (no
+            // crypto, no sender-resolution fetch, no retry_count churn that would
+            // push it into an ever-longer backoff for a row that structurally
+            // cannot apply yet), and replay it PROMPTLY the moment the key arrives
+            // (catch-up / WS recovery / journal resume / bundle history) —
+            // not after waiting out whatever exponential window it had accrued.
+            if q.reason == PermanentPullReason::MissingEpochKey.as_str() {
+                let key_present = q
+                    .epoch
+                    .is_some_and(|e| key_hierarchy.has_epoch_key(e as u32));
+                if !key_present {
+                    tracing::trace!(
+                        batch_id = %q.batch_id,
+                        epoch = ?q.epoch,
+                        "Skipping quarantined pull batch: epoch key not yet held"
+                    );
+                    continue;
+                }
+                // Key present — fall through to replay unconditionally (no backoff
+                // gate); the merge path is idempotent on applied_ops.
+            } else if !quarantine_replay_eligible(now, q.retry_count, q.last_retry_at, backoff_base_ms)
+            {
+                // Time-aware eligibility gate for every other reason: skip a row
+                // still inside its exponential backoff window. This must run BEFORE
+                // try_replay_quarantined_batch so an ineligible row triggers no
+                // crypto, no decode, and — critically — no relay registry fetch
+                // (the sender-resolution path in try_replay hits the network for an
+                // unknown/deregistered/future-generation sender). Without it a
+                // permanently-poison row churns all of that every single cycle.
                 tracing::trace!(
                     batch_id = %q.batch_id,
                     sender_device_id = %q.sender_device_id,

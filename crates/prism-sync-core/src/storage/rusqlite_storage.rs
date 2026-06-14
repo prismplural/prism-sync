@@ -318,6 +318,15 @@ fn query_quarantined_pull_batches(
     Ok(out)
 }
 
+fn query_quarantined_pull_batch_count(conn: &Connection, sync_id: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM quarantined_pull_batches WHERE sync_id = ?1",
+        params![sync_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 fn row_to_pull_stall(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullStall> {
     let first_seen_at: String = row.get("first_seen_at")?;
     let last_seen_at: String = row.get("last_seen_at")?;
@@ -1750,6 +1759,11 @@ impl SyncStorage for RusqliteSyncStorage {
     ) -> Result<Vec<QuarantinedPullBatch>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_quarantined_pull_batches(&conn, sync_id)
+    }
+
+    fn quarantined_pull_batch_count(&self, sync_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_quarantined_pull_batch_count(&conn, sync_id)
     }
 
     fn list_pull_stalls(&self, sync_id: &str) -> Result<Vec<PullStall>> {
@@ -4242,6 +4256,34 @@ mod tests {
         assert_eq!(r.envelope.sender_ml_dsa_key_generation, 1);
         assert_eq!(r.envelope.payload_hash, [7u8; 32]);
         assert_eq!(r.envelope.ciphertext, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn quarantined_pull_batch_count_matches_list() {
+        let storage = make_storage();
+        assert_eq!(storage.quarantined_pull_batch_count("sync-1").unwrap(), 0);
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-1", "b1", 10, "missing_epoch_key",
+        ))
+        .unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-1", "b2", 20, "decode_failed",
+        ))
+        .unwrap();
+        tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
+            "sync-other", "b3", 5, "missing_epoch_key",
+        ))
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(storage.quarantined_pull_batch_count("sync-1").unwrap(), 2);
+        assert_eq!(
+            storage.quarantined_pull_batch_count("sync-1").unwrap() as usize,
+            storage.list_quarantined_pull_batches("sync-1").unwrap().len(),
+        );
+        assert_eq!(storage.quarantined_pull_batch_count("sync-other").unwrap(), 1);
     }
 
     #[test]

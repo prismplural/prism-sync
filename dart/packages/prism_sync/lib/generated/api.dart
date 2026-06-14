@@ -524,6 +524,19 @@ Future<PlatformInt64> quarantinedBatchCount({
   required PrismSyncHandle handle,
 }) => RustLib.instance.api.crateApiQuarantinedBatchCount(handle: handle);
 
+/// Return the count of durably quarantined inbound pull batches (R3): batches
+/// whose deterministic-but-recoverable failure (a missing epoch key, an
+/// undecodable cross-version payload, a stale-registry signature) has not yet
+/// cleared. Parity with `quarantined_batch_count` on the push side.
+///
+/// A nonzero value is bounded, visible divergence — the cursor and relay ack
+/// have already advanced past these batches (so pruning is never pinned) and
+/// Phase 0b replay re-applies each one the moment its blocking condition clears.
+/// Returns 0 if the engine has not been configured.
+Future<PlatformInt64> quarantinedPullBatchCount({
+  required PrismSyncHandle handle,
+}) => RustLib.instance.api.crateApiQuarantinedPullBatchCount(handle: handle);
+
 /// Drain up to `limit` rows from the durable consumer-delivery journal — the
 /// at-least-once delivery channel that replaces applying directly from the
 /// fire-and-forget `RemoteChanges` event (F01/F04/F40). The Dart drain loops
