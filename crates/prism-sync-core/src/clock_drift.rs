@@ -1,13 +1,15 @@
 //! Single source of truth for the receiver-side clock-drift tolerance, plus the
 //! shared HLC-vs-wall-clock policy the clock-robustness work builds on.
 //!
-//! An HLC further in the future than this bound is treated as out-of-tolerance:
-//! the pull filter defers it to quarantine instead of applying it, and the local
-//! emitter refuses to inherit it as a watermark. The same number gates both
-//! decisions, so it must come from one place — previously the value was
-//! duplicated as `SyncConfig::max_clock_drift_ms`'s default and
-//! `op_emitter::MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS`, which could silently
-//! diverge.
+//! An HLC further in the future than this bound is treated as out-of-tolerance
+//! at every entry into `field_versions`: the pull filter defers it to quarantine
+//! instead of applying it, and snapshot import does the same. Watermark
+//! inheritance is unconditional — a candidate already past an entry gate
+//! is always inherited, monotonic-max only — and the bound is instead the
+//! threshold for future-drift telemetry plus the relay-anchored excursion
+//! repair. The same number gates all of these, so it must come from one
+//! place — previously the value was duplicated as `SyncConfig::max_clock_drift_ms`'s
+//! default and an op_emitter inheritance constant, which could silently diverge.
 //!
 //! This module also carries the clock-robustness surface:
 //! - typed entry-gate helpers ([`is_excessively_future`], [`max_inheritable`])

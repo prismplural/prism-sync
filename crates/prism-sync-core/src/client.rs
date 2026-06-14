@@ -4605,6 +4605,143 @@ mod tests {
         assert_eq!(local_hlc.node_id, "a1b2c3d4e5f6");
     }
 
+    /// Repro: storage holds a remote-authored winner 10 minutes in the
+    /// future (the residue of a remote peer that pulled at +60s then a local
+    /// backward clock step). `configure_engine` seeds the emitter from that
+    /// over-bound winner (unconditional inheritance), so the next local edit
+    /// mints an HLC strictly above it and WINS the LWW merge on any peer that
+    /// holds the +600s winner — the group converges to the local edit instead
+    /// of splitting per-field as it did when the watermark was zeroed.
+    #[test]
+    fn over_bound_remote_winner_is_inherited_so_local_edit_wins_merge() {
+        use crate::hlc::Hlc;
+        use crate::storage::FieldVersion;
+
+        let mut sync = make_sync();
+
+        // T = now + 600s: well past the 60s drift bound, remote-authored.
+        let t = Hlc::new(Hlc::now_ms() + 600_000, 0, "remote-device");
+        {
+            let mut tx = sync.storage.begin_tx().unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "ent-1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "remote-op".to_string(),
+                winning_device_id: "remote-device".to_string(),
+                winning_hlc: t.to_string(),
+                winning_encoded_value: Some("\"Remote\"".to_string()),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // configure_engine seeds the emitter from the stored max HLC: the
+        // over-bound winner is inherited rather than zeroed.
+        configure(&mut sync);
+        assert!(
+            sync.op_emitter.as_ref().unwrap().last_hlc() >= &t,
+            "emitter watermark must inherit the over-bound stored winner"
+        );
+
+        // A local edit to the same field mints an HLC strictly above T.
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Local".to_string()));
+        sync.record_update("members", "ent-1", &fields).unwrap();
+
+        let fv =
+            sync.storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
+        let local_hlc = Hlc::from_string(&fv.winning_hlc).unwrap();
+        assert!(local_hlc > t, "local edit HLC {local_hlc:?} must exceed inherited winner {t:?}");
+        assert_eq!(local_hlc.node_id, "a1b2c3d4e5f6");
+
+        // A second engine still holding the T winner applies the local op: the
+        // merge uses CrdtChange::wins_over, so the local op WINS and the group
+        // converges to "Local" rather than keeping the stale remote value.
+        let local_op = CrdtChange::new(
+            None,
+            None,
+            "ent-1".to_string(),
+            "members".to_string(),
+            "name".to_string(),
+            Some("\"Local\"".to_string()),
+            Some(local_hlc.to_string()),
+            false,
+            Some("a1b2c3d4e5f6".to_string()),
+            Some(1),
+            None,
+        );
+        let t_winner = CrdtChange::new(
+            Some("remote-op".to_string()),
+            None,
+            "ent-1".to_string(),
+            "members".to_string(),
+            "name".to_string(),
+            Some("\"Remote\"".to_string()),
+            Some(t.to_string()),
+            false,
+            Some("remote-device".to_string()),
+            Some(1),
+            None,
+        );
+        assert!(
+            local_op.wins_over(&t_winner).unwrap(),
+            "the inherited-watermark local edit must win LWW on a peer holding the +600s winner"
+        );
+    }
+
+    /// Snapshot-joiner half: a snapshot-bootstrapped device imports a winner
+    /// at now+30s (within the drift bound, so the gate admits it). Refresh
+    /// must leave the emitter ABOVE the imported max so a joiner edit beats the
+    /// imported winner on the uploader.
+    #[test]
+    fn refresh_emitter_stays_above_within_bound_imported_snapshot_winner() {
+        use crate::hlc::Hlc;
+        use crate::storage::FieldVersion;
+
+        let mut sync = make_sync();
+        configure(&mut sync);
+
+        // Imported snapshot winner at +30s, remote-authored (passes the gate).
+        let imported = Hlc::new(Hlc::now_ms() + 30_000, 0, "uploader-device");
+        {
+            let mut tx = sync.storage.begin_tx().unwrap();
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: "members".to_string(),
+                entity_id: "ent-1".to_string(),
+                field_name: "name".to_string(),
+                winning_op_id: "imported-op".to_string(),
+                winning_device_id: "uploader-device".to_string(),
+                winning_hlc: imported.to_string(),
+                winning_encoded_value: Some("\"Imported\"".to_string()),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        sync.refresh_op_emitter_hlc_from_storage("bootstrap_from_snapshot");
+        assert!(
+            sync.op_emitter.as_ref().unwrap().last_hlc() >= &imported,
+            "emitter must stay above the within-bound imported winner after refresh"
+        );
+
+        // A joiner edit then mints an HLC above the imported winner and wins.
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), SyncValue::String("Joiner".to_string()));
+        sync.record_update("members", "ent-1", &fields).unwrap();
+        let fv =
+            sync.storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
+        let joiner_hlc = Hlc::from_string(&fv.winning_hlc).unwrap();
+        assert!(
+            joiner_hlc > imported,
+            "joiner edit HLC {joiner_hlc:?} must exceed imported winner {imported:?}"
+        );
+    }
+
     /// Seed a configured engine with a self-authored future winner for
     /// `members/ent-1/name` plus a matching unpushed pending op, both carrying a
     /// `+1h` HLC. This is the residue a forward clock excursion leaves behind.

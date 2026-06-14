@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::clock_drift::MAX_CLOCK_DRIFT_MS;
+use crate::clock_drift::{is_excessively_future, MAX_CLOCK_DRIFT_MS};
 use crate::error::{CoreError, Result};
 use crate::hlc::Hlc;
 use crate::schema::{encode_value, SyncValue};
@@ -33,13 +33,24 @@ pub enum DivergentMode {
     Skip,
 }
 
-/// Match the default engine drift tolerance for remote batches.
+/// Emit future-drift telemetry for an inherited watermark candidate.
 ///
-/// Remote ops further in the future than this are deferred (quarantined) before
-/// they reach `field_versions`. Near-future remote HLCs are accepted, so the
-/// local emitter must inherit them to preserve causality for the next local
-/// mutation. Shares the single drift bound in [`crate::clock_drift`].
-const MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS: i64 = MAX_CLOCK_DRIFT_MS;
+/// The watermark is always inherited (monotonic max). A candidate more than
+/// the drift bound ahead of wall clock is still inherited, but warned on: it
+/// either reflects a local clock that regressed since the candidate was gated
+/// in (benign, and inheritance is required for LWW) or a forward excursion
+/// the relay-anchored repair will catch on the next validated sync cycle.
+fn warn_if_future_drift(device_id: &str, hlc: &Hlc) {
+    if is_excessively_future(hlc, Hlc::now_ms(), MAX_CLOCK_DRIFT_MS) {
+        tracing::warn!(
+            device_id = %device_id,
+            incoming_node_id = %hlc.node_id,
+            incoming_timestamp = hlc.timestamp,
+            future_drift_ms = hlc.future_drift_ms(),
+            "Inheriting future-drift HLC watermark for local emitter"
+        );
+    }
+}
 
 /// Records field-level ops into pending_ops at mutation time.
 ///
@@ -62,17 +73,7 @@ pub struct OpEmitter {
 impl OpEmitter {
     pub fn new(device_id: String, sync_id: String, epoch: i32, last_hlc: Option<Hlc>) -> Self {
         let last_hlc = last_hlc.unwrap_or_else(|| Hlc::zero(&device_id));
-        let last_hlc = if Self::can_inherit_hlc(&device_id, &last_hlc) {
-            last_hlc
-        } else {
-            tracing::warn!(
-                device_id = %device_id,
-                incoming_node_id = %last_hlc.node_id,
-                incoming_timestamp = last_hlc.timestamp,
-                "Ignoring excessive future remote HLC watermark for local emitter"
-            );
-            Hlc::zero(&device_id)
-        };
+        warn_if_future_drift(&device_id, &last_hlc);
         Self { device_id, sync_id, epoch, last_hlc }
     }
 
@@ -101,25 +102,20 @@ impl OpEmitter {
     /// wall-clock time, whichever is larger.
     ///
     /// Used after bootstrap/snapshot imports so locally minted HLCs never
-    /// fall behind state that was seeded from an external source.
+    /// fall behind state that was seeded from an external source. Inheritance
+    /// is unconditional (monotonic max only): every channel that writes a
+    /// winner into `field_versions` — pull, snapshot import, local emit — is
+    /// gated at entry against the writer's then-current clock, so a stored HLC
+    /// that looks future at restart can only mean the local clock regressed
+    /// since entry, which is exactly when inheritance is REQUIRED for LWW
+    /// (the candidate is within the drift bound of real time, so emitted ops
+    /// still pass every receiver's filter). A genuine forward excursion is
+    /// caught instead by the relay-anchored repair. See [`crate::clock_drift`].
     pub fn set_last_hlc(&mut self, new_hlc: Hlc) {
-        if !Self::can_inherit_hlc(&self.device_id, &new_hlc) {
-            tracing::warn!(
-                device_id = %self.device_id,
-                incoming_node_id = %new_hlc.node_id,
-                incoming_timestamp = new_hlc.timestamp,
-                "Ignoring excessive future remote HLC watermark for local emitter"
-            );
-            return;
-        }
-
+        warn_if_future_drift(&self.device_id, &new_hlc);
         if new_hlc > self.last_hlc {
             self.last_hlc = new_hlc;
         }
-    }
-
-    fn can_inherit_hlc(device_id: &str, hlc: &Hlc) -> bool {
-        hlc.node_id == device_id || hlc.future_drift_ms() <= MAX_INHERITABLE_FUTURE_HLC_DRIFT_MS
     }
 
     /// Reset the watermark to wall-clock now, dropping a poisoned future HLC.
@@ -1264,18 +1260,24 @@ mod tests {
     }
 
     #[test]
-    fn new_ignores_excessive_future_remote_initial_hlc() {
+    fn new_inherits_excessive_future_remote_initial_hlc() {
+        // Inheritance is unconditional. An over-bound remote watermark is
+        // inherited (not zeroed), because the only way it reached field_versions
+        // is past an entry gate — so it sits within the drift bound of real time
+        // and the next tick must stay above it for LWW.
         let local_device = "a1b2c3d4e5f6";
         let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
 
-        let emitter = OpEmitter::new(
+        let mut emitter = OpEmitter::new(
             local_device.to_string(),
             "sync-1".to_string(),
             1,
-            Some(future_remote_hlc),
+            Some(future_remote_hlc.clone()),
         );
 
-        assert_eq!(emitter.last_hlc(), &Hlc::zero(local_device));
+        assert_eq!(emitter.last_hlc(), &future_remote_hlc);
+        let next = emitter.tick().unwrap();
+        assert!(next > future_remote_hlc, "next tick must strictly exceed the inherited watermark");
     }
 
     #[test]
@@ -1289,14 +1291,17 @@ mod tests {
     }
 
     #[test]
-    fn set_last_hlc_ignores_excessive_future_remote_hlc() {
+    fn set_last_hlc_inherits_excessive_future_remote_hlc() {
+        // set_last_hlc inherits an over-bound remote watermark too, keeping
+        // only the monotonic-max guard. The next tick stays strictly above it.
         let mut emitter = make_emitter();
-        let original = emitter.last_hlc().clone();
         let future_remote_hlc = Hlc::new(now_ms() + 120_000, 0, "remote-device");
 
-        emitter.set_last_hlc(future_remote_hlc);
+        emitter.set_last_hlc(future_remote_hlc.clone());
 
-        assert_eq!(*emitter.last_hlc(), original);
+        assert_eq!(*emitter.last_hlc(), future_remote_hlc);
+        let next = emitter.tick().unwrap();
+        assert!(next > future_remote_hlc, "next tick must strictly exceed the inherited watermark");
     }
 
     #[test]
@@ -1325,6 +1330,53 @@ mod tests {
         let next = emitter.tick().unwrap();
         let drift = crate::clock_drift::future_drift_ms(&next, now_ms());
         assert_eq!(drift, 0);
+    }
+
+    #[test]
+    fn minted_hlcs_strictly_increase_across_arbitrary_watermark_ops() {
+        // Property: over any sequence of set_last_hlc / tick / clamp, each
+        // tick mints an HLC strictly greater than the watermark it held just
+        // before the tick, and strictly greater than every prior tick since the
+        // last clamp — clamp is the one operation that may lower the watermark
+        // (the relay-anchored excursion repair), so the strictly-increasing
+        // chain is per-device and resets only at a clamp.
+        let mut emitter = make_emitter();
+        // Deterministic LCG so the sequence is reproducible (no proptest needed).
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_rng = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng
+        };
+
+        let mut floor: Option<Hlc> = None; // last minted HLC since the last clamp
+        for _ in 0..500 {
+            match next_rng() % 5 {
+                // set_last_hlc with a candidate spread around now (past, near
+                // future, and over-bound future all included).
+                0 | 1 => {
+                    let offset = (next_rng() % 240_000) as i64 - 60_000; // [-60s, +180s]
+                    let node = if next_rng() % 2 == 0 { "a1b2c3d4e5f6" } else { "remote-device" };
+                    let candidate = Hlc::new(now_ms() + offset, (next_rng() % 8) as u32, node);
+                    emitter.set_last_hlc(candidate);
+                }
+                // tick: must strictly exceed the watermark just before, and the
+                // running floor since the last clamp.
+                2 | 3 => {
+                    let before = emitter.last_hlc().clone();
+                    let minted = emitter.tick().unwrap();
+                    assert!(minted > before, "tick {minted:?} must exceed pre-tick watermark {before:?}");
+                    if let Some(prev) = &floor {
+                        assert!(minted > *prev, "tick {minted:?} must exceed prior minted {prev:?}");
+                    }
+                    floor = Some(minted);
+                }
+                // clamp: resets the watermark to now and the increasing chain.
+                _ => {
+                    emitter.clamp_watermark_to_now().unwrap();
+                    floor = None;
+                }
+            }
+        }
     }
 
     #[test]
