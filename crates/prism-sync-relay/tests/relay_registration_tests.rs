@@ -1578,6 +1578,120 @@ async fn test_existing_group_registration_ignores_revoked_devices_in_current_reg
     .unwrap();
 }
 
+// F29 regression: after a relay-side 90d AUTO-revoke (status=revoked +
+// needs_rekey, NO epoch bump, NO durable notification to survivors), a brand
+// new device must still be able to pair. The surviving approver A never learned
+// B was auto-revoked, so the approval snapshot it authors from the served signed
+// registry STILL lists B as active. Before the fix the relay's active-only
+// reconciliation left {B, C} after removing A, tripping the "must add exactly
+// one device" 409 — a permanent pairing deadlock. The relay must reconcile a
+// snapshot entry whose identity keys match a relay-stored REVOKED row by
+// dropping it from the delta (it cannot resurrect the device, since
+// registration of a revoked device is refused downstream).
+#[tokio::test]
+async fn test_registration_succeeds_when_snapshot_lists_auto_revoked_device_as_active() {
+    let (url, _server, db) = start_test_relay().await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    // A: the surviving approver.
+    let approver_device_id = generate_device_id();
+    let approver_keys = TestDeviceKeys::generate(&approver_device_id);
+    let _approver_token =
+        register_device(&client, &url, &sync_id, &approver_device_id, &approver_keys).await;
+
+    // B: paired, then AUTO-revoked relay-side. We seed B with real PQ keys,
+    // revoke it, and flag the group needs_rekey WITHOUT bumping the epoch —
+    // exactly what `auto_revoke_devices` does in the hourly cleanup pass.
+    let revoked_device_id = generate_device_id();
+    let revoked_keys = TestDeviceKeys::generate(&revoked_device_id);
+    db.with_conn(|conn| {
+        db::register_device_with_pq(
+            conn,
+            &sync_id,
+            &revoked_device_id,
+            revoked_keys.ed25519_signing_key.verifying_key().as_bytes(),
+            &revoked_keys.x25519_pk,
+            &revoked_keys.ml_dsa_pk,
+            &revoked_keys.ml_kem_pk,
+            &[],
+            0,
+        )?;
+        let revoked = db::revoke_device(conn, &sync_id, &revoked_device_id, false)?;
+        assert!(revoked, "auto-revoke should mark B revoked");
+        db::set_needs_rekey(conn, &sync_id, true)?;
+        Ok(())
+    })
+    .unwrap();
+
+    // C: the brand-new joiner A is pairing in.
+    let joiner_device_id = generate_device_id();
+    let joiner_keys = TestDeviceKeys::generate(&joiner_device_id);
+    let nonce = fetch_nonce(&client, &url, &sync_id).await;
+    let joiner_ml_dsa_kp = joiner_keys.device_secret.ml_dsa_65_keypair(&joiner_device_id).unwrap();
+    let challenge_sig = sign_hybrid_challenge(
+        &joiner_keys.ed25519_signing_key,
+        &joiner_ml_dsa_kp,
+        &sync_id,
+        &joiner_device_id,
+        &nonce,
+    );
+
+    // The approval snapshot A authors STILL lists B as active — A never learned
+    // about the relay-side auto-revoke (epoch unchanged, served registry still
+    // names B). The entry carries B's REAL identity keys (the served registry is
+    // signature-verified by A), so the relay can match it to the revoked row.
+    let registry_approval = build_registry_approval(
+        &sync_id,
+        &approver_device_id,
+        &approver_keys,
+        vec![
+            registry_snapshot_entry_hybrid(&sync_id, &approver_device_id, &approver_keys, "active"),
+            registry_snapshot_entry_hybrid(
+                &sync_id,
+                &revoked_device_id,
+                &revoked_keys,
+                "active",
+            ),
+            registry_snapshot_entry_hybrid(&sync_id, &joiner_device_id, &joiner_keys, "active"),
+        ],
+    );
+
+    let register_resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/register"))
+        .json(&serde_json::json!({
+            "device_id": joiner_device_id,
+            "signing_public_key": hex::encode(joiner_keys.ed25519_signing_key.verifying_key().as_bytes()),
+            "x25519_public_key": hex::encode(joiner_keys.x25519_pk),
+            "ml_dsa_65_public_key": hex::encode(&joiner_keys.ml_dsa_pk),
+            "ml_kem_768_public_key": hex::encode(&joiner_keys.ml_kem_pk),
+            "registration_challenge": hex::encode(&challenge_sig),
+            "nonce": nonce,
+            "registry_approval": registry_approval,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        register_resp.status(),
+        201,
+        "pairing C must succeed even though A's snapshot still lists auto-revoked B as active"
+    );
+
+    db.with_conn(|conn| {
+        let devices = db::list_devices(conn, &sync_id)?;
+        assert_eq!(devices.len(), 3, "approver + revoked B + joiner C");
+        // B must stay revoked — the snapshot's stale "active" claim must NOT
+        // resurrect it.
+        let b = devices.iter().find(|d| d.device_id == revoked_device_id).unwrap();
+        assert_eq!(b.status, "revoked", "auto-revoked B must stay revoked");
+        let active: Vec<_> = devices.iter().filter(|d| d.status == "active").collect();
+        assert_eq!(active.len(), 2, "only approver + joiner are active");
+        Ok(())
+    })
+    .unwrap();
+}
+
 #[tokio::test]
 async fn test_first_device_pow_is_bound_to_device_and_nonce() {
     let config = Config {

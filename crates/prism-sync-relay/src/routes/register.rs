@@ -780,17 +780,39 @@ fn verify_registry_approval(
         return Err(AppError::DeviceIdentityMismatch);
     }
 
-    // Compare only against active devices. Revoked devices stay in the DB so
-    // historical ops from them still verify, but they are not members of the
-    // current sync group — the initiator builds its approval snapshot from
-    // active devices only (see pairing::service::build_registry_snapshot in
-    // prism-sync-core), so revoked rows here would never match and would
-    // deterministically 409 admission for any group that has ever revoked a
-    // device.
-    let current_entries: Vec<_> = current_registry_entries(conn, sync_id)?
-        .into_iter()
-        .filter(|entry| entry.status == "active")
+    // Reconcile the snapshot against the relay's live device rows. The initiator
+    // builds its approval snapshot from the membership it can see (its pinned
+    // records / the served signed registry), which the relay can drift away from
+    // in two directions; both must reconcile to "snapshot == active set + the one
+    // joiner" without weakening the exactly-one-device admission boundary.
+    //
+    // 1. Active rows: must each appear in the snapshot with byte-identical keys
+    //    and an "active" status (a relay-active device the snapshot omits or
+    //    rewrites is a forged/stale approval -> reject).
+    // 2. Revoked rows the snapshot OMITS: handled implicitly — they simply never
+    //    appear in `remaining`, so a group that has ever revoked a device still
+    //    admits. This is the initiator-already-knows-about-the-revoke case.
+    // 3. Revoked rows the snapshot STILL LISTS as active (F29): a relay-side 90d
+    //    auto-revoke flips a device to `revoked` + flags `needs_rekey` WITHOUT
+    //    bumping the epoch and WITHOUT durably telling survivors, so the surviving
+    //    approver authors its snapshot still listing the auto-revoked sibling as
+    //    active. Drop that entry from the delta IFF it matches the relay's stored
+    //    revoked row on every identity key. The full key-equality gate against the
+    //    relay's own row is what keeps this safe: an attacker cannot smuggle an
+    //    extra device past the exactly-one check by labelling it revoked, because
+    //    a fabricated identity won't byte-match a row the relay already stored as
+    //    revoked, and a revoked device_id whose keys DO match is not resurrected
+    //    here (only `device_id`, the joiner, is ever registered below; the revoked
+    //    row is left untouched, and re-registration of a revoked device is refused
+    //    outright). Any mismatch falls through to the catch-all 409.
+    let all_entries = current_registry_entries(conn, sync_id)?;
+    let revoked_by_device: HashMap<&str, &RegistrySnapshotEntry> = all_entries
+        .iter()
+        .filter(|entry| entry.status == "revoked")
+        .map(|entry| (entry.device_id.as_str(), entry))
         .collect();
+    let current_entries: Vec<_> =
+        all_entries.iter().filter(|entry| entry.status == "active").collect();
     let mut remaining = snapshot_map;
     for current in &current_entries {
         let Some(snapshot_entry) = remaining.remove(&current.device_id) else {
@@ -806,6 +828,26 @@ fn verify_registry_approval(
             return Err(AppError::Conflict("Stale registry approval"));
         }
     }
+
+    // F29 reconciliation: forgive a stale snapshot entry that names a device the
+    // relay has already auto-revoked, but only when it byte-matches that revoked
+    // row's identity keys. This never resurrects the device and never admits it
+    // (it is dropped, not registered), so the exactly-one-device boundary below
+    // still counts only genuinely-new admissions.
+    remaining.retain(|snapshot_device_id, snapshot_entry| {
+        let Some(revoked) = revoked_by_device.get(snapshot_device_id.as_str()) else {
+            return true;
+        };
+        let keys_match = snapshot_entry.ed25519_public_key == revoked.ed25519_public_key
+            && snapshot_entry.x25519_public_key == revoked.x25519_public_key
+            && snapshot_entry.ml_dsa_65_public_key == revoked.ml_dsa_65_public_key
+            && snapshot_entry.ml_kem_768_public_key == revoked.ml_kem_768_public_key
+            && snapshot_entry.x_wing_public_key == revoked.x_wing_public_key;
+        // Drop (return false) only the never-the-joiner stale-revoked entry that
+        // proves out against the relay's row. Keep everything else so a forged or
+        // identity-mismatched entry still trips the catch-all 409.
+        !(keys_match && snapshot_device_id != device_id)
+    });
 
     match remaining.len() {
         // New device: snapshot has exactly one entry not yet in the registry
