@@ -2,6 +2,27 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.13.0] - 2026-06-13
+
+Tagged for the matching `prism-app 0.13.0+13001` release. Cargo crate versions
+remain `0.1.1`.
+
+### Added
+- Relay media support: a device-message mailbox, a media-heal lane, and a
+  pairing-push media lane, so a newly paired device can be sent the media it is
+  missing.
+- prism_sync is built as a native asset, with the iOS deployment target forwarded
+  into the Rust build.
+
+### Fixed
+- Pull recovery, sync-apply atomicity, and the revocation-replay gate were
+  hardened (CRDT correctness remediation waves 1 and 2; all three critical
+  findings closed).
+- `encode_image` applies EXIF orientation before encoding, so rotated camera
+  photos are stored upright.
+- The relay accepts media ids shared across sync groups, raised the mailbox
+  pending cap, and no longer races cleanup against resurrected media.
+
 ## [0.12.2] - 2026-06-06
 
 Tagged for the matching `prism-app 0.12.2+12201` release. Cargo crate
