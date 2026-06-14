@@ -187,7 +187,9 @@ impl MockRelay {
             self.state.lock().unwrap().ephemeral_acked.iter().cloned().collect();
         v.sort();
         v
-    /// F41: read the current lineage token the mock returns in pull responses.
+    }
+
+    /// Read the current lineage token the mock returns in pull responses.
     pub fn log_token(&self) -> Option<String> {
         self.state.lock().unwrap().log_token.clone()
     }
@@ -495,10 +497,20 @@ impl DeviceRegistry for MockRelay {
         _remote_wipe: bool,
         epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<i32, RelayError> {
         let mut state = self.state.lock().unwrap();
         state.devices.retain(|d| d.device_id != device_id);
         let _ = wrapped_keys;
+        // Mirror the real relay's atomic-attach: a snapshot supplied with the
+        // revoke is committed in the same step as the epoch bump.
+        if let Some(snapshot) = signed_registry_snapshot {
+            state.signed_registry = Some(SignedRegistryResponse {
+                registry_version: 1,
+                artifact_blob: snapshot.to_vec(),
+                artifact_kind: "signed_registry_snapshot".to_string(),
+            });
+        }
         Ok(epoch)
     }
 
@@ -947,7 +959,7 @@ mod tests {
         let devices = relay.list_devices().await.unwrap();
         assert_eq!(devices.len(), 2);
 
-        relay.revoke_device("d1", false, 2, HashMap::new()).await.unwrap();
+        relay.revoke_device("d1", false, 2, HashMap::new(), None).await.unwrap();
         let devices = relay.list_devices().await.unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_id, "d2");

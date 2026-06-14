@@ -134,6 +134,23 @@ pub struct PullStall {
     pub last_seen_at: DateTime<Utc>,
 }
 
+/// A staged-but-uncommitted epoch rotation (write-ahead journal).
+///
+/// Written BEFORE a revoke/rekey is committed to the relay: the new epoch key
+/// `K_N` is staged in the secure store (`epoch_key_N`) and this row records the
+/// in-flight rotation (epoch `N` + the device being revoked, if any). It is
+/// cleared once the rotation reaches a terminal state — fully committed (sqlite
+/// = cache = N, registry published at N) or proven-uncommitted (a different
+/// device won the rotation). On restart, `resume_pending_epoch_rotation` drives
+/// it to that terminal state. Device-local, never replicated, never snapshotted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEpochRotation {
+    pub sync_id: String,
+    pub epoch: i32,
+    pub target_device_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Diagnostic info about a local push batch that was quarantined because its
 /// serialized envelope exceeded the relay's 1 MB body cap.
 ///

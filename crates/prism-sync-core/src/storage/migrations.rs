@@ -236,6 +236,24 @@ const MIGRATIONS: &[&str] = &[
     -- gate, so re-running migrations never double-adds the column.
     ALTER TABLE sync_metadata ADD COLUMN relay_log_token TEXT;
     ",
+    "-- V10: Write-ahead epoch-key rotation journal (F24).
+    --
+    -- `pending_epoch_rotation` is the durable write-ahead marker a device stages
+    -- BEFORE committing a revoke/rekey to the relay. The new epoch key K_N is
+    -- staged in the secure store (`epoch_key_N`) and this row records the rotation
+    -- in flight (epoch N + the revoked target). After the relay commits the epoch
+    -- bump and the local cache/sqlite catch up, the row is cleared. On restart,
+    -- `resume_pending_epoch_rotation` drives the staged rotation to a terminal
+    -- state: fully committed if the relay reached N and our staged K_N matches the
+    -- relay artifact, or discarded if a different device won the rotation. One row
+    -- per sync group. Device-local, never replicated, never snapshotted.
+    CREATE TABLE IF NOT EXISTS pending_epoch_rotation (
+        sync_id TEXT NOT NULL PRIMARY KEY,
+        epoch INTEGER NOT NULL,
+        target_device_id TEXT,
+        created_at TEXT NOT NULL
+    );
+    ",
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), String> {
@@ -315,6 +333,8 @@ mod tests {
             "pull_stall",
             "device_key_history",
             "consumer_deliveries",
+            // V10: the epoch-rotation write-ahead journal.
+            "pending_epoch_rotation",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -367,6 +387,41 @@ mod tests {
     fn relay_log_token_column_count(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('sync_metadata') WHERE name = 'relay_log_token'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v10_adds_pending_epoch_rotation_table_and_is_idempotent() {
+        // Stamp a DB at V9 (before the epoch-rotation journal) and upgrade: V10
+        // must create `pending_epoch_rotation` exactly once, and re-applying is a
+        // no-op.
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(9) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 9i64).unwrap();
+        assert_eq!(
+            pending_epoch_rotation_table_count(&conn),
+            0,
+            "V9 DB has no pending_epoch_rotation table yet"
+        );
+
+        apply(&mut conn).unwrap();
+        assert_eq!(pending_epoch_rotation_table_count(&conn), 1, "V10 adds the table");
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // Re-running is a no-op (version gate plus the IF NOT EXISTS guard).
+        apply(&mut conn).unwrap();
+        assert_eq!(pending_epoch_rotation_table_count(&conn), 1, "table not double-created");
+    }
+
+    fn pending_epoch_rotation_table_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_epoch_rotation'",
             [],
             |row| row.get(0),
         )

@@ -327,6 +327,30 @@ fn query_quarantined_pull_batch_count(conn: &Connection, sync_id: &str) -> Resul
     Ok(count)
 }
 
+fn query_pending_epoch_rotation(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<Option<PendingEpochRotation>> {
+    conn.query_row(
+        "SELECT sync_id, epoch, target_device_id, created_at \
+         FROM pending_epoch_rotation WHERE sync_id = ?1",
+        params![sync_id],
+        |row| {
+            let created_at: String = row.get("created_at")?;
+            Ok(PendingEpochRotation {
+                sync_id: row.get("sync_id")?,
+                epoch: row.get("epoch")?,
+                target_device_id: row.get("target_device_id")?,
+                created_at: DateTime::parse_from_rfc3339(&created_at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn row_to_pull_stall(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullStall> {
     let first_seen_at: String = row.get("first_seen_at")?;
     let last_seen_at: String = row.get("last_seen_at")?;
@@ -868,6 +892,29 @@ fn exec_clear_all_pull_stalls(conn: &Connection, sync_id: &str) -> Result<()> {
     // re-issued seq's first transient failure straight to quarantine-and-advance,
     // skipping an unapplied batch. Drop them all alongside the cursor reset.
     conn.execute("DELETE FROM pull_stall WHERE sync_id = ?1", params![sync_id])?;
+    Ok(())
+}
+
+fn exec_set_pending_epoch_rotation(
+    conn: &Connection,
+    sync_id: &str,
+    epoch: i32,
+    target_device_id: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO pending_epoch_rotation (sync_id, epoch, target_device_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(sync_id) DO UPDATE SET \
+         epoch = excluded.epoch, target_device_id = excluded.target_device_id, \
+         created_at = excluded.created_at",
+        params![sync_id, epoch, target_device_id, now],
+    )?;
+    Ok(())
+}
+
+fn exec_clear_pending_epoch_rotation(conn: &Connection, sync_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM pending_epoch_rotation WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
 }
 
@@ -1796,6 +1843,14 @@ impl SyncStorage for RusqliteSyncStorage {
         query_quarantined_batch_count(&conn, sync_id)
     }
 
+    fn get_pending_epoch_rotation(
+        &self,
+        sync_id: &str,
+    ) -> Result<Option<PendingEpochRotation>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_pending_epoch_rotation(&conn, sync_id)
+    }
+
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_device_record(&conn, sync_id, device_id)
@@ -2089,6 +2144,21 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn clear_all_pull_stalls(&mut self, sync_id: &str) -> Result<()> {
         exec_clear_all_pull_stalls(&self.conn, sync_id)
+    }
+
+    // ── Epoch-rotation write-ahead journal ──
+
+    fn set_pending_epoch_rotation(
+        &mut self,
+        sync_id: &str,
+        epoch: i32,
+        target_device_id: Option<&str>,
+    ) -> Result<()> {
+        exec_set_pending_epoch_rotation(&self.conn, sync_id, epoch, target_device_id)
+    }
+
+    fn clear_pending_epoch_rotation(&mut self, sync_id: &str) -> Result<()> {
+        exec_clear_pending_epoch_rotation(&self.conn, sync_id)
     }
 
     // ── Quarantined local push batches ──

@@ -965,6 +965,7 @@ impl PairingService {
                 x_wing_public_key: e.x_wing_public_key.clone(),
                 permission: None,
                 ml_dsa_key_generation: e.ml_dsa_key_generation,
+                needs_rekey: false,
             })
             .collect();
         let pinned: Vec<crate::storage::DeviceRecord> = registry_snapshot
@@ -1778,6 +1779,7 @@ mod tests {
             _: bool,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -2023,6 +2025,7 @@ mod tests {
             _: bool,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -4191,6 +4194,7 @@ mod tests {
                 _: bool,
                 _: i32,
                 _: HashMap<String, Vec<u8>>,
+                _: Option<&[u8]>,
             ) -> std::result::Result<i32, RelayError> {
                 unimplemented!()
             }

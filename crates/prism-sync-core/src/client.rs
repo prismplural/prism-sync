@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use tokio::sync::broadcast;
 
 use crate::clock_drift::{ClockConfidence, MAX_CLOCK_DRIFT_MS};
@@ -648,11 +649,18 @@ impl PrismSync {
                 return Ok(());
             }
         };
-        let Some(device_secret) = self.device_secret.as_ref() else {
+        if self.device_secret.is_none() {
             tracing::debug!("catch_up_epoch_keys: skipped (no device_secret)");
             return Ok(());
-        };
+        }
 
+        // Resume a staged-but-uncommitted epoch rotation BEFORE any gate, so
+        // a crash between the relay revoke and the local commit is driven to a
+        // terminal state (committed or discarded) before the normal catch-up
+        // reads the local epoch below.
+        self.resume_pending_epoch_rotation(relay.as_ref(), &sync_id, &device_id).await;
+
+        let device_secret = self.device_secret.as_ref().expect("device_secret checked above");
         let local_epoch = self.epoch.unwrap_or(0).max(0) as u32;
         let devices = match relay.list_devices().await {
             Ok(devices) => devices,
@@ -789,11 +797,41 @@ impl PrismSync {
             return Ok(());
         }
         if snapshot.current_epoch < relay_epoch {
-            tracing::warn!(
-                registry_epoch = snapshot.current_epoch,
-                relay_epoch,
-                "catch_up_epoch_keys: signed registry lags relay epoch"
-            );
+            // Malicious-relay defense (commit 1455805): a registry whose
+            // current_epoch lags the relay-reported epoch cannot prove the new
+            // epoch key, so we never adopt one here. But if THIS device already
+            // holds the relay_epoch key (e.g. a legitimate rotator whose registry
+            // publish lagged, or a survivor that recovered the key but sits behind
+            // a stale served artifact), self-heal by republishing the epoch-N
+            // registry so a subsequent push is not rejected. The repair
+            // builds from local pins + holder keys, so it cannot be steered by the
+            // relay. The revoker-gone rescue (no device holds the key) stays
+            // deferred — this branch only fires when a key holder is alive.
+            if self.key_hierarchy.has_epoch_key(relay_epoch) {
+                if let Err(error) = self
+                    .repair_signed_registry_epoch_if_needed(
+                        relay.as_ref(),
+                        &sync_id,
+                        &device_id,
+                        relay_epoch,
+                        &devices,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        registry_epoch = snapshot.current_epoch,
+                        relay_epoch,
+                        "catch_up_epoch_keys: registry-lag epoch repair failed"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    registry_epoch = snapshot.current_epoch,
+                    relay_epoch,
+                    "catch_up_epoch_keys: signed registry lags relay epoch"
+                );
+            }
             return Ok(());
         }
         let Some(current_entry) =
@@ -887,6 +925,199 @@ impl PrismSync {
         }
 
         Ok(())
+    }
+
+    /// Drive a staged-but-uncommitted epoch rotation (write-ahead journal) to
+    /// a terminal state after a crash. Called at the top of
+    /// [`catch_up_epoch_keys`](Self::catch_up_epoch_keys) before any gate.
+    ///
+    /// The new epoch key `K_N` was persisted to the secure store (and held in the
+    /// hierarchy) before the relay revoke; a crash could have struck before the
+    /// local cache/sqlite caught up. On the next sync we reconcile:
+    ///
+    /// - **Relay reached N AND the rekey artifact for self decrypts to our staged
+    ///   `K_N`:** we won the rotation. Ensure the signed registry's
+    ///   `current_epoch >= N` (republish via the holder-key repair if it lags),
+    ///   commit the local epoch, and clear the journal.
+    /// - **Relay reached >= N but the artifact for self is absent or decrypts to a
+    ///   different key:** a different device won. Discard our staged key + journal
+    ///   and let normal catch-up adopt the winner.
+    /// - **Relay still below N:** the rotation never committed remotely. Discard
+    ///   the staged key + journal; the local epoch was never advanced.
+    /// - **Relay unreachable:** keep the journal and retry next cycle.
+    ///
+    /// Best-effort and self-contained: every failure path defers rather than
+    /// performing a destructive action.
+    async fn resume_pending_epoch_rotation(
+        &mut self,
+        relay: &dyn SyncRelay,
+        sync_id: &str,
+        device_id: &str,
+    ) {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let journal = match tokio::task::spawn_blocking(move || {
+            storage.get_pending_epoch_rotation(&sid)
+        })
+        .await
+        {
+            Ok(Ok(Some(journal))) => journal,
+            Ok(Ok(None)) => return,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "resume_pending_epoch_rotation: failed to read journal");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "resume_pending_epoch_rotation: journal read task failed");
+                return;
+            }
+        };
+        let staged_epoch = journal.epoch.max(0) as u32;
+
+        let devices = match relay.list_devices().await {
+            Ok(devices) => devices,
+            // Relay unreachable: keep the journal, retry next cycle.
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    epoch = staged_epoch,
+                    "resume_pending_epoch_rotation: relay unreachable — keeping journal"
+                );
+                return;
+            }
+        };
+        let relay_epoch = devices
+            .iter()
+            .find(|d| d.device_id == device_id)
+            .map(|d| d.epoch.max(0) as u32)
+            .unwrap_or(0);
+
+        if relay_epoch < staged_epoch {
+            // The rotation never committed remotely (a 4xx race the revoke path
+            // could not record, or a crash before the relay commit). The local
+            // cache/sqlite were never advanced, so discard the staged key.
+            tracing::info!(
+                epoch = staged_epoch,
+                relay_epoch,
+                "resume_pending_epoch_rotation: relay below staged epoch — discarding staged rotation"
+            );
+            self.discard_staged_epoch_rotation(sync_id, staged_epoch).await;
+            return;
+        }
+
+        // Relay reached >= N. Verify WE own the rotation: fetch our rekey artifact
+        // for epoch N and decrypt it; only our staged K_N proves we committed it.
+        let Some(staged_key) = self.staged_epoch_key_bytes(staged_epoch) else {
+            // The staged key is gone from both hierarchy and secure store — there
+            // is nothing to commit. Clear the stale journal and let normal
+            // catch-up recover the key from the relay.
+            tracing::warn!(
+                epoch = staged_epoch,
+                "resume_pending_epoch_rotation: journal present but staged key absent — clearing journal"
+            );
+            self.clear_pending_epoch_rotation(sync_id).await;
+            return;
+        };
+
+        let owns = match self.staged_rotation_is_ours(relay, device_id, staged_epoch, &staged_key).await {
+            Some(owns) => owns,
+            // Inconclusive (relay error mid-check): keep the journal, retry next.
+            None => return,
+        };
+
+        if !owns {
+            // A different device won the rotation to N. Discard our staged key and
+            // journal; normal catch-up will adopt the winner's key.
+            tracing::info!(
+                epoch = staged_epoch,
+                "resume_pending_epoch_rotation: another device won the rotation — discarding staged key"
+            );
+            self.discard_staged_epoch_rotation(sync_id, staged_epoch).await;
+            return;
+        }
+
+        // We own the rotation. Ensure the signed registry commits epoch N (the
+        // crash may have struck before the registry was published); the
+        // holder-key repair is a no-op if the served registry already reached N.
+        if let Err(error) = self
+            .repair_signed_registry_epoch_if_needed(relay, sync_id, device_id, staged_epoch, &devices)
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                epoch = staged_epoch,
+                "resume_pending_epoch_rotation: registry repair failed — keeping journal for retry"
+            );
+            return;
+        }
+
+        if let Err(error) =
+            self.commit_local_epoch_rotation(sync_id, staged_epoch, &staged_key).await
+        {
+            tracing::warn!(
+                error = %error,
+                epoch = staged_epoch,
+                "resume_pending_epoch_rotation: local commit failed — keeping journal for retry"
+            );
+            return;
+        }
+        self.clear_pending_epoch_rotation(sync_id).await;
+        tracing::info!(
+            epoch = staged_epoch,
+            "resume_pending_epoch_rotation: committed staged rotation"
+        );
+    }
+
+    /// Read the staged epoch key for `epoch` from the in-memory hierarchy, or the
+    /// secure store if the hierarchy has not loaded it (e.g. just after restart
+    /// before `catch_up_epoch_keys` populated it). Returns `None` if neither holds
+    /// it — the rotation cannot be committed.
+    fn staged_epoch_key_bytes(&self, epoch: u32) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        if self.key_hierarchy.has_epoch_key(epoch) {
+            if let Ok(key) = self.key_hierarchy.epoch_key(epoch) {
+                return Some(zeroize::Zeroizing::new(key.to_vec()));
+            }
+        }
+        let raw = self.secure_store.get(&format!("epoch_key_{epoch}")).ok().flatten()?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(String::from_utf8(raw).ok()?)
+            .ok()?;
+        Some(zeroize::Zeroizing::new(decoded))
+    }
+
+    /// Decide whether the relay's epoch-`epoch` rekey artifact for this device
+    /// decrypts to our staged key — i.e. whether THIS device is the one that
+    /// committed the rotation. Returns `None` on an inconclusive relay error so
+    /// the caller can defer rather than discard.
+    async fn staged_rotation_is_ours(
+        &self,
+        relay: &dyn SyncRelay,
+        device_id: &str,
+        epoch: u32,
+        staged_key: &[u8],
+    ) -> Option<bool> {
+        let device_secret = self.device_secret.as_ref()?;
+        let artifact = match relay.get_rekey_artifact(epoch as i32, device_id).await {
+            Ok(Some(artifact)) => artifact,
+            // No artifact for us at this epoch: a different device rotated.
+            Ok(None) => return Some(false),
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    epoch,
+                    "resume_pending_epoch_rotation: failed to fetch rekey artifact"
+                );
+                return None;
+            }
+        };
+        let xwing = device_secret.xwing_keypair(device_id).ok()?;
+        match crate::epoch::decapsulate_and_decrypt_artifact(&artifact, &xwing, epoch, device_id) {
+            // The relay's artifact decrypts to our staged key iff we wrapped it.
+            Ok(decrypted) => Some(decrypted.as_slice() == staged_key),
+            // A decrypt failure means the artifact is not ours (another device's
+            // rotation), so we do not own this epoch.
+            Err(_) => Some(false),
+        }
     }
 
     /// Determine whether THIS device has been revoked, according to a
@@ -2294,11 +2525,28 @@ impl PrismSync {
 
     /// Revoke a device and rotate to a new epoch with a fresh epoch key.
     ///
-    /// 1. Revokes `target_device_id` on the relay (bumps epoch server-side).
-    /// 2. Generates a new epoch key and posts per-device wrapped keys for all
-    ///    remaining active devices.
-    /// 3. Persists the new epoch key to the secure store.
-    /// 4. Updates the local sync metadata with the new epoch number.
+    /// Crash-safe. The new epoch key becomes visible on the relay (via the
+    /// revoke commit) only after it is durably staged on this device, and the
+    /// epoch-N signed registry committing `hash(K_N)` is published atomically
+    /// with the relay-side epoch bump (attached to the revoke). The ordering is:
+    ///
+    /// 1. Wrap the new epoch key `K_N` for surviving devices and pin the local
+    ///    revocation tombstone (so the built registry carries the target as
+    ///    `revoked`).
+    /// 2. Write-ahead stage: persist `K_N` to the secure store, hold it in the
+    ///    in-memory hierarchy (so the registry can commit its hash), and record a
+    ///    `pending_epoch_rotation` journal row — without touching the epoch cache
+    ///    or sqlite `current_epoch`, so neither can ever exceed the
+    ///    relay-committed epoch.
+    /// 3. Build + sign the epoch-N registry and attach it to the atomic revoke.
+    /// 4. On success commit the local epoch (cache + sqlite) and clear the
+    ///    journal; on a proven-uncommitted epoch race discard the staged key and
+    ///    clear the journal.
+    ///
+    /// A crash in any window is recovered on the next sync by
+    /// `resume_pending_epoch_rotation`. Against an old relay that ignores the
+    /// attached snapshot, the publish-after `put_signed_registry` fallback keeps
+    /// the registry from lagging the epoch.
     ///
     /// Requires [`configure_engine`](Self::configure_engine) to have been called
     /// and a `DeviceSecret` to be available.
@@ -2350,14 +2598,109 @@ impl PrismSync {
                 &pinned,
             )?;
 
+        // 3. Pin the local revocation tombstone BEFORE building the registry, so
+        //    the pins-only builder emits the target as an explicit
+        //    status=="revoked" entry. A pin failure means we cannot prove the
+        //    tombstone in the attached registry, so fall back to the publish-after
+        //    path (no atomic attach): the relay revoke still commits below and a
+        //    survivor's epoch repair re-derives the tombstone from the relay's
+        //    revoked row. We never attach a tombstone-less registry, which would
+        //    make the served artifact epoch-current and permanently disarm the
+        //    revoked-absorbing backstop.
+        let tombstone_pinned = match DeviceRegistryManager::revoke_device(
+            self.storage.as_ref(),
+            &sync_id,
+            target_device_id,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    target_device_id = %target_device_id,
+                    epoch = new_epoch,
+                    "revoke_and_rekey: failed to pin local revocation tombstone — falling back to publish-after with no atomic attach"
+                );
+                false
+            }
+        };
+
+        // 4. Write-ahead stage K_N before the relay commit. Persist the key, hold
+        //    it in the in-memory hierarchy (so the epoch-N registry can commit its
+        //    hash), and record the rotation journal — WITHOUT advancing the epoch
+        //    cache or sqlite current_epoch, so neither can outrun the
+        //    relay-committed epoch. A crash after this point is resumed by
+        //    resume_pending_epoch_rotation on the next sync cycle.
+        crate::recovery::persist_epoch_key(
+            self.secure_store.as_ref(),
+            new_epoch,
+            epoch_key.as_ref(),
+        )?;
+        self.key_hierarchy_mut()
+            .store_epoch_key(new_epoch, zeroize::Zeroizing::new(epoch_key.to_vec()));
+        {
+            let storage = self.storage.clone();
+            let sid = sync_id.clone();
+            let target = target_device_id.to_string();
+            let ne = new_epoch as i32;
+            tokio::task::spawn_blocking(move || {
+                let mut tx = storage.begin_tx()?;
+                tx.set_pending_epoch_rotation(&sid, ne, Some(&target))?;
+                tx.commit()
+            })
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        }
+
+        // 5. Build + sign the epoch-N registry so it can be attached to the
+        //    atomic revoke. Only attach it when the tombstone pin succeeded and
+        //    the built snapshot actually carries the target as revoked.
+        let attached_registry = if tombstone_pinned {
+            match self
+                .build_signed_revocation_registry(
+                    relay.as_ref(),
+                    &sync_id,
+                    &self_device_id,
+                    target_device_id,
+                    new_epoch,
+                    remote_wipe,
+                )
+                .await
+            {
+                Ok(signed) => Some(signed),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        target_device_id = %target_device_id,
+                        epoch = new_epoch,
+                        "revoke_and_rekey: failed to build epoch-N revocation registry — proceeding without atomic attach"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // 6. Atomic revoke: the relay commits the epoch bump, the rekey
+        //    artifacts, and (when present) the epoch-N registry in one tx.
         let committed_epoch = match relay
-            .revoke_device(target_device_id, remote_wipe, new_epoch as i32, wrapped_keys)
+            .revoke_device(
+                target_device_id,
+                remote_wipe,
+                new_epoch as i32,
+                wrapped_keys,
+                attached_registry.as_deref(),
+            )
             .await
         {
             Ok(epoch) => epoch as u32,
             Err(relay_error) => {
                 let error = CoreError::from_relay(relay_error);
                 if !error.is_retryable() {
+                    // A proven-uncommitted rotation (e.g. a 4xx epoch race): the
+                    // relay did not advance, so discard the staged key and journal
+                    // and let normal catch-up adopt whoever won.
+                    self.discard_staged_epoch_rotation(&sync_id, new_epoch).await;
                     return Err(error);
                 }
 
@@ -2370,6 +2713,10 @@ impl PrismSync {
                     )
                     .await
                 {
+                    // Ambiguous failure that did NOT commit remotely: discard the
+                    // staged key + journal (resume would otherwise re-attempt a
+                    // rotation the group never adopted).
+                    self.discard_staged_epoch_rotation(&sync_id, new_epoch).await;
                     return Err(error);
                 }
 
@@ -2383,70 +2730,73 @@ impl PrismSync {
             }
         };
 
-        self.commit_local_epoch_rotation(&sync_id, committed_epoch, epoch_key.as_ref()).await?;
-
-        // Revoke-publish + wipe-intent binding: pin the local tombstone, then publish a signed
-        // registry that carries the target as an explicit status=="revoked"
-        // entry — binding the admin's `remote_wipe` intent into the SIGNATURE so
-        // the revoked device can both confirm its own revocation and read the
-        // wipe bit from the verified entry. Both steps run strictly AFTER the
-        // relay-side revocation committed (above), so a signed revoked-claim can
-        // never precede the actual revocation.
-        //
-        // The pin is the gate for the publish: the publisher builds from local
-        // pins, so without a successful revoked pin it would emit a
-        // tombstone-LESS artifact at the new epoch (omitting an unpinned target,
-        // or re-asserting an active target after a storage write error). Such a
-        // publish is worse than no publish: it makes the served artifact
-        // epoch-current, so the revoked-absorbing epoch repair backstop
-        // (repair_signed_registry_epoch_if_needed early-returns once the served
-        // epoch catches up) never republishes the tombstone — permanently
-        // disarming the revoke-publish backstop. So if the pin fails we deliberately do NOT publish: the
-        // served artifact stays epoch-stale and any survivor's next
-        // catch_up_epoch_keys repair re-derives the tombstone from the relay
-        // list (the revoker's revoke_device call already moved the relay row to
-        // revoked). publish_revocation_registry additionally re-checks the built
-        // snapshot carries the target as revoked before PUT (belt-and-braces).
-        match DeviceRegistryManager::revoke_device(
-            self.storage.as_ref(),
-            &sync_id,
-            target_device_id,
-        ) {
-            Ok(()) => {
-                // Publish failure is non-fatal: the revoke itself already
-                // committed, and any survivor's next catch_up_epoch_keys epoch
-                // repair republishes the tombstone-bearing registry (the
-                // revoked-absorbing backstop).
-                if let Err(error) = self
-                    .publish_revocation_registry(
-                        relay.as_ref(),
-                        &sync_id,
-                        &self_device_id,
-                        target_device_id,
-                        committed_epoch,
-                        remote_wipe,
-                    )
-                    .await
-                {
+        // 7. Old-relay fallback: a 0.12.x relay silently ignores the attached
+        //    snapshot, leaving the served registry epoch behind. Detect that and
+        //    publish via put_signed_registry before committing locally, so the
+        //    registry never lags the epoch.
+        if let Some(signed) = attached_registry.as_deref() {
+            let served_epoch = match relay.get_signed_registry().await {
+                Ok(Some(response)) => DeviceRegistryManager::verify_signed_registry_snapshot(
+                    self.storage.as_ref(),
+                    &sync_id,
+                    &response.artifact_blob,
+                )
+                .map(|snapshot| snapshot.current_epoch)
+                .unwrap_or(0),
+                Ok(None) => 0,
+                Err(_) => committed_epoch, // inconclusive — assume the attach stuck
+            };
+            if served_epoch < committed_epoch {
+                if let Err(error) = relay.put_signed_registry(signed).await {
                     tracing::warn!(
                         error = %error,
                         target_device_id = %target_device_id,
                         epoch = committed_epoch,
-                        "revoke_and_rekey: failed to publish revocation registry (epoch repair will backstop)"
+                        "revoke_and_rekey: old-relay registry fallback PUT failed (epoch repair will backstop)"
                     );
                 }
             }
-            Err(error) => {
-                // The relay-side revoke already committed, so the revocation is
-                // real and durable. Skip the publish entirely (see above): the
-                // epoch-stale served artifact makes the epoch repair backstop
-                // fire on the next survivor's catch_up_epoch_keys, which derives
-                // the tombstone from the relay's revoked row.
+        }
+
+        // 8. Commit locally (cache + sqlite) now the relay has the epoch, then
+        //    clear the journal: the rotation reached its committed terminal state.
+        self.commit_local_epoch_rotation(&sync_id, committed_epoch, epoch_key.as_ref()).await?;
+        self.clear_pending_epoch_rotation(&sync_id).await;
+
+        // Ratchet our own freshness baseline to the attached registry's version
+        // so we never treat our just-published registry as stale.
+        if let Some(signed) = attached_registry.as_deref() {
+            if let Ok(snapshot) = DeviceRegistryManager::verify_signed_registry_snapshot(
+                self.storage.as_ref(),
+                &sync_id,
+                signed,
+            ) {
+                let _ = registry_publish::ratchet_last_imported_registry_version(
+                    self.storage.as_ref(),
+                    &sync_id,
+                    snapshot.registry_version,
+                );
+            }
+        } else if tombstone_pinned {
+            // No atomic attach was built (e.g. registry-build failure): fall back
+            // to the publish-after path so the tombstone still reaches the
+            // relay. Non-fatal — the epoch repair backstops a publish failure.
+            if let Err(error) = self
+                .publish_revocation_registry(
+                    relay.as_ref(),
+                    &sync_id,
+                    &self_device_id,
+                    target_device_id,
+                    committed_epoch,
+                    remote_wipe,
+                )
+                .await
+            {
                 tracing::warn!(
                     error = %error,
                     target_device_id = %target_device_id,
                     epoch = committed_epoch,
-                    "revoke_and_rekey: failed to pin local revocation tombstone — skipping revocation-registry publish so the epoch repair backstop re-derives it"
+                    "revoke_and_rekey: publish-after fallback failed (epoch repair will backstop)"
                 );
             }
         }
@@ -2454,7 +2804,110 @@ impl PrismSync {
         Ok(committed_epoch)
     }
 
-    /// React to a relay `needs_rekey` signal (F29): one active device drives a
+    /// Build and sign the epoch-`epoch` revocation registry to attach to the
+    /// atomic revoke. Built from local pins via the shared revoked-absorbing
+    /// [`build_signed_registry_from_pinned`] helper at a version strictly above
+    /// the currently-served artifact, then re-checked to carry `target_device_id`
+    /// as `status == "revoked"` before signing — the same belt-and-braces gate as
+    /// [`publish_revocation_registry`], so a tombstone-less artifact is never
+    /// attached.
+    ///
+    /// When `remote_wipe` is set, the admin's wipe intent is bound into the
+    /// target's signed revoked entry (`wipe_target`) so the victim reads it back
+    /// from the verified registry rather than trusting a relay-controlled bit.
+    async fn build_signed_revocation_registry(
+        &self,
+        relay: &dyn SyncRelay,
+        sync_id: &str,
+        self_device_id: &str,
+        target_device_id: &str,
+        epoch: u32,
+        remote_wipe: bool,
+    ) -> Result<Vec<u8>> {
+        let device_secret = self.device_secret.as_ref().ok_or_else(|| {
+            CoreError::Engine("device secret not set — call configure_engine first".into())
+        })?;
+        let signing_key = device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
+        let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
+            CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
+        })?;
+
+        let new_version = match relay.get_signed_registry().await {
+            Ok(Some(response)) => {
+                let current = DeviceRegistryManager::verify_signed_registry_snapshot(
+                    self.storage.as_ref(),
+                    sync_id,
+                    &response.artifact_blob,
+                )
+                .map_err(|e| {
+                    CoreError::Engine(format!(
+                        "signed registry verification failed before atomic-attach build: {e}"
+                    ))
+                })?;
+                (current.registry_version + 1).max(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING)
+            }
+            Ok(None) => SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            Err(error) => return Err(CoreError::from_relay(error)),
+        };
+
+        let wipe_target = remote_wipe.then_some(target_device_id);
+        let snapshot = registry_publish::build_signed_registry_from_pinned(
+            self.storage.as_ref(),
+            sync_id,
+            self_device_id,
+            new_version,
+            epoch,
+            &self.key_hierarchy,
+            wipe_target,
+        )?;
+
+        let target_revoked = snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.device_id == target_device_id && entry.status == "revoked");
+        if !target_revoked {
+            return Err(CoreError::Engine(format!(
+                "refusing to attach revocation registry: built snapshot does not carry target {target_device_id} as revoked"
+            )));
+        }
+
+        Ok(snapshot.sign_hybrid(&signing_key, pq_signing_key))
+    }
+
+    /// Clear the epoch-rotation write-ahead journal after the rotation reached a
+    /// terminal state. Best-effort: a clear failure is non-fatal because the
+    /// resume path is idempotent and re-converges the next cycle.
+    async fn clear_pending_epoch_rotation(&self, sync_id: &str) {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut tx = storage.begin_tx()?;
+            tx.clear_pending_epoch_rotation(&sid)?;
+            tx.commit()
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "failed to clear pending epoch-rotation journal");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to clear pending epoch-rotation journal");
+            }
+        }
+    }
+
+    /// Discard a staged-but-proven-uncommitted epoch rotation: forget the staged
+    /// key from the in-memory hierarchy, delete the persisted `epoch_key_N`, and
+    /// clear the journal. The epoch cache/sqlite were never advanced, so the
+    /// device stays at its prior epoch and normal catch-up adopts whoever won.
+    async fn discard_staged_epoch_rotation(&mut self, sync_id: &str, epoch: u32) {
+        self.key_hierarchy_mut().remove_epoch_key(epoch);
+        let _ = self.secure_store.delete(&format!("epoch_key_{epoch}"));
+        self.clear_pending_epoch_rotation(sync_id).await;
+    }
+
+    /// React to a relay `needs_rekey` signal: one active device drives a
     /// standalone rekey that advances the epoch and clears the relay flag the
     /// 90d auto-revoke set. Idempotent across responders — the relay's epoch CAS
     /// admits exactly one winner and the rest reconcile to a no-op.
@@ -2624,6 +3077,7 @@ impl PrismSync {
             Err(error) => return Err(CoreError::from_relay(error)),
         };
 
+        // A standalone rekey changes no membership, so no wipe intent is bound.
         let snapshot = registry_publish::build_signed_registry_from_pinned(
             self.storage.as_ref(),
             sync_id,
@@ -2631,6 +3085,7 @@ impl PrismSync {
             new_version,
             epoch,
             &self.key_hierarchy,
+            None,
         )?;
         let signed = snapshot.sign_hybrid(&signing_key, pq_signing_key);
         relay.put_signed_registry(&signed).await.map_err(CoreError::from_relay)?;
@@ -3376,6 +3831,7 @@ mod tests {
             _: bool,
             _: i32,
             _: HashMap<String, Vec<u8>>,
+            _: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }
@@ -3519,6 +3975,9 @@ mod tests {
         signed_registry_error: bool,
         behavior: RevokeBehavior,
         revoke_calls: u32,
+        /// The signed_registry_snapshot blob the last revoke_device call carried,
+        /// captured to assert the atomic-attach.
+        last_revoke_snapshot: Option<Vec<u8>>,
     }
 
     struct RevokeTestRelay {
@@ -3535,12 +3994,34 @@ mod tests {
                     signed_registry_error: false,
                     behavior,
                     revoke_calls: 0,
+                    last_revoke_snapshot: None,
                 }),
             }
         }
 
         fn revoke_calls(&self) -> u32 {
             self.state.lock().unwrap().revoke_calls
+        }
+
+        fn last_revoke_snapshot(&self) -> Option<Vec<u8>> {
+            self.state.lock().unwrap().last_revoke_snapshot.clone()
+        }
+
+        /// Extract `current_epoch` from the served signed registry by parsing the
+        /// JSON tail of the hybrid-signed blob (`[0x03][sig][json]`). Test-only;
+        /// the production read path verifies the signature first. The wrapper JSON
+        /// starts at the distinctive `{"registry_version"` marker (the signature
+        /// bytes that precede it may incidentally contain a `{`).
+        fn served_registry_epoch(&self) -> Option<i32> {
+            let blob = self.state.lock().unwrap().signed_registry.clone()?.artifact_blob;
+            let marker = b"{\"registry_version\"";
+            let start = blob.windows(marker.len()).position(|w| w == marker)?;
+            #[derive(serde::Deserialize)]
+            struct Wrapper {
+                #[serde(default)]
+                current_epoch: u32,
+            }
+            serde_json::from_slice::<Wrapper>(&blob[start..]).ok().map(|w| w.current_epoch as i32)
         }
 
         fn devices(&self) -> Vec<DeviceInfo> {
@@ -3564,6 +4045,7 @@ mod tests {
             target_device_id: &str,
             new_epoch: i32,
             wrapped_keys: HashMap<String, Vec<u8>>,
+            signed_registry_snapshot: Option<&[u8]>,
         ) {
             for device in &mut state.devices {
                 if device.device_id == target_device_id {
@@ -3577,6 +4059,23 @@ mod tests {
 
             for (device_id, artifact) in wrapped_keys {
                 state.artifacts.insert((new_epoch, device_id), artifact);
+            }
+
+            // Atomic-attach: a snapshot supplied with the revoke is stored in the
+            // same step as the epoch bump, mirroring the real relay — including
+            // the relay's monotonic served-version bump (sync_registry_state_with
+            // _current_devices stores registry_version + 1 for a changed hash).
+            if let Some(snapshot) = signed_registry_snapshot {
+                let registry_version = state
+                    .signed_registry
+                    .as_ref()
+                    .map(|registry| registry.registry_version + 1)
+                    .unwrap_or(SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING);
+                state.signed_registry = Some(SignedRegistryResponse {
+                    registry_version,
+                    artifact_blob: snapshot.to_vec(),
+                    artifact_kind: "signed_registry_snapshot".to_string(),
+                });
             }
         }
     }
@@ -3624,9 +4123,11 @@ mod tests {
             _: bool,
             new_epoch: i32,
             wrapped_keys: HashMap<String, Vec<u8>>,
+            signed_registry_snapshot: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             let mut state = self.state.lock().unwrap();
             state.revoke_calls += 1;
+            state.last_revoke_snapshot = signed_registry_snapshot.map(<[u8]>::to_vec);
 
             match state.behavior {
                 RevokeBehavior::Success
@@ -3659,11 +4160,23 @@ mod tests {
                             });
                         }
                     }
-                    Self::commit_revoke(&mut state, device_id, new_epoch, wrapped_keys);
+                    Self::commit_revoke(
+                        &mut state,
+                        device_id,
+                        new_epoch,
+                        wrapped_keys,
+                        signed_registry_snapshot,
+                    );
                     Ok(new_epoch)
                 }
                 RevokeBehavior::CommitThenTimeout => {
-                    Self::commit_revoke(&mut state, device_id, new_epoch, wrapped_keys);
+                    Self::commit_revoke(
+                        &mut state,
+                        device_id,
+                        new_epoch,
+                        wrapped_keys,
+                        signed_registry_snapshot,
+                    );
                     Err(RelayError::Timeout { message: "response lost after commit".to_string() })
                 }
                 RevokeBehavior::TimeoutBeforeCommit => Err(RelayError::Timeout {
@@ -5865,6 +6378,196 @@ mod tests {
         assert!(!sync.key_hierarchy().has_epoch_key(7));
         assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_none());
         assert!(sync.secure_store().get("epoch_key_7").unwrap().is_none());
+        // The write-ahead rotation journal must be cleaned up on the 409
+        // path — the staged rotation is proven-uncommitted, so resume must not
+        // re-attempt it on the next cycle.
+        assert!(sync.storage().get_pending_epoch_rotation("sync-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_and_rekey_attaches_epoch_n_registry_to_atomic_revoke() {
+        // The epoch-N signed registry (committing hash(K_N), carrying the
+        // target as revoked) is attached to the revoke call so the relay can
+        // commit it atomically with the epoch bump. After a clean success the
+        // journal is cleared and the served registry reflects epoch N.
+        let mut sync = make_sync();
+        sync.initialize("test-password", &[1u8; 16]).unwrap();
+
+        let self_device_id = "a1b2c3d4e5f6";
+        let target_device_id = "b7c8d9e0f1a2";
+        let target_secret = DeviceSecret::generate();
+        let relay = Arc::new(RevokeTestRelay::new(
+            vec![
+                make_device_info(self_device_id, sync.device_secret().unwrap(), 0, "active"),
+                make_device_info(target_device_id, &target_secret, 0, "active"),
+            ],
+            RevokeBehavior::Success,
+        ));
+
+        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        seed_device_registry(&sync, "sync-1", &relay.devices());
+
+        let committed_epoch =
+            sync.revoke_and_rekey(relay.clone(), target_device_id, false).await.unwrap();
+        assert_eq!(committed_epoch, 1);
+
+        // The revoke carried a signed registry, and the relay committed it as the
+        // served artifact at epoch 1, atomically with the epoch bump.
+        assert!(relay.last_revoke_snapshot().is_some());
+        assert_eq!(relay.served_registry_epoch(), Some(1));
+        // The staged rotation reached its committed terminal state.
+        assert!(sync.storage().get_pending_epoch_rotation("sync-1").unwrap().is_none());
+        assert!(sync.key_hierarchy().has_epoch_key(1));
+    }
+
+    #[tokio::test]
+    async fn resume_pending_epoch_rotation_discards_when_relay_below_staged_epoch() {
+        // Resume: a journal exists for epoch N but the relay is still at N-1.
+        // The rotation never committed remotely, so resume discards the staged key
+        // + journal and leaves the local epoch unchanged.
+        let (mut sync, _relay, _device_id, _epoch_1_key, _epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+        // First catch-up brings the device level with the relay (epoch 2).
+        sync.catch_up_epoch_keys().await.unwrap();
+        assert_eq!(sync.epoch(), Some(2));
+
+        // Stage a phantom rotation to epoch 3 — key persisted + held, journal set —
+        // but the relay never advanced past 2.
+        let staged_key = [0x33u8; 32];
+        crate::recovery::persist_epoch_key(sync.secure_store().as_ref(), 3, &staged_key).unwrap();
+        sync.key_hierarchy_mut().store_epoch_key(3, zeroize::Zeroizing::new(staged_key.to_vec()));
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.set_pending_epoch_rotation("sync-1", 3, Some("b7c8d9e0f1a2")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        assert_eq!(sync.epoch(), Some(2), "local epoch must be unchanged");
+        assert!(!sync.key_hierarchy().has_epoch_key(3), "staged key must be discarded");
+        assert!(sync.secure_store().get("epoch_key_3").unwrap().is_none());
+        assert!(sync.storage().get_pending_epoch_rotation("sync-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_pending_epoch_rotation_discards_when_another_device_won() {
+        // Resume: a journal exists for epoch N and the relay reached N, but the
+        // rekey artifact for self decrypts to a DIFFERENT key — another device won
+        // the rotation. Resume discards our staged key and lets normal catch-up
+        // adopt the winner's key (epoch_2_key seeded in the fixture).
+        let (mut sync, _relay, _device_id, _epoch_1_key, epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+
+        // Stage a LOSING rotation to epoch 2: a different staged key than the
+        // relay's epoch-2 artifact holds.
+        let losing_key = [0x99u8; 32];
+        crate::recovery::persist_epoch_key(sync.secure_store().as_ref(), 2, &losing_key).unwrap();
+        sync.key_hierarchy_mut().store_epoch_key(2, zeroize::Zeroizing::new(losing_key.to_vec()));
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.set_pending_epoch_rotation("sync-1", 2, Some("b7c8d9e0f1a2")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        // Resume discarded the losing key, then normal catch-up adopted the
+        // relay's winning epoch-2 key.
+        assert!(sync.storage().get_pending_epoch_rotation("sync-1").unwrap().is_none());
+        assert_eq!(sync.epoch(), Some(2));
+        assert_eq!(sync.key_hierarchy().epoch_key(2).unwrap(), &epoch_2_key);
+    }
+
+    #[tokio::test]
+    async fn resume_pending_epoch_rotation_commits_when_owned() {
+        // Resume: a journal exists for epoch N, the relay reached N, and the
+        // rekey artifact for self decrypts to OUR staged key — we won. Resume
+        // ensures the registry commits epoch N, commits the local epoch, and
+        // clears the journal.
+        let (mut sync, _relay, _device_id, _epoch_1_key, epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+        // Advance to epoch 2 first so the device legitimately holds the epoch-2
+        // key (this seeds the staged key for the simulated crash below).
+        sync.catch_up_epoch_keys().await.unwrap();
+        assert_eq!(sync.epoch(), Some(2));
+
+        // Roll the device back to model a crash AFTER the relay committed epoch 2
+        // but BEFORE the local sqlite/cache caught up: sqlite + cache at 1, the
+        // staged epoch-2 key still held, and the journal recorded.
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.update_current_epoch("sync-1", 1).unwrap();
+            tx.commit().unwrap();
+        }
+        sync.secure_store().set("epoch", b"1").unwrap();
+        sync.advance_epoch(1);
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.set_pending_epoch_rotation("sync-1", 2, Some("b7c8d9e0f1a2")).unwrap();
+            tx.commit().unwrap();
+        }
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        assert_eq!(sync.epoch(), Some(2), "owned rotation commits the local epoch");
+        assert_eq!(sync.key_hierarchy().epoch_key(2).unwrap(), &epoch_2_key);
+        assert_eq!(sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch, 2);
+        assert!(sync.storage().get_pending_epoch_rotation("sync-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn survivor_repairs_registry_when_holding_relay_epoch_key_but_registry_lags() {
+        // Survivor-convergence: relay epoch is ahead of the served registry's
+        // current_epoch (relay=2, registry=1), and THIS device already holds the
+        // relay-epoch key. The registry-lag gate (malicious-relay defense) would
+        // normally refuse to adopt and return read-only, but because a key holder
+        // is alive it self-heals by republishing the epoch-2 registry so a
+        // subsequent push is not rejected.
+        let (mut sync, relay, device_id, epoch_1_key, _epoch_2_key) =
+            prepare_verified_epoch_catch_up(true);
+        // Bring the device fully current (holds epoch-2 key).
+        sync.catch_up_epoch_keys().await.unwrap();
+        assert_eq!(sync.epoch(), Some(2));
+        assert!(sync.key_hierarchy().has_epoch_key(2));
+
+        // Now serve a registry that LAGS the relay epoch (relay devices at epoch 2,
+        // served registry current_epoch 1).
+        let device_secret =
+            DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
+        let device_info = relay.state.lock().unwrap().devices[0].clone();
+        let epoch_0_key: [u8; 32] = sync.key_hierarchy().epoch_key(0).unwrap().try_into().unwrap();
+        relay.set_signed_registry(signed_registry_response(
+            "sync-1",
+            &device_secret,
+            &device_id,
+            &device_info,
+            1,
+            &[(0, epoch_0_key), (1, epoch_1_key)],
+        ));
+        // Force local epoch below relay so the lag gate (relay_epoch > local_epoch
+        // AND registry < relay_epoch) is exercised.
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.update_current_epoch("sync-1", 1).unwrap();
+            tx.commit().unwrap();
+        }
+        sync.advance_epoch(1);
+
+        sync.catch_up_epoch_keys().await.unwrap();
+
+        // The holder self-healed: the served registry now commits epoch 2.
+        let repaired = relay.state.lock().unwrap().signed_registry.clone().unwrap();
+        let signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let pq_signing_key = device_secret.ml_dsa_65_keypair(&device_id).unwrap();
+        let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
+            &repaired.artifact_blob,
+            &signing_key.public_key_bytes(),
+            &pq_signing_key.public_key_bytes(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.current_epoch, 2);
+        assert!(snapshot.epoch_key_hashes.contains_key(&2));
     }
 
     #[tokio::test]

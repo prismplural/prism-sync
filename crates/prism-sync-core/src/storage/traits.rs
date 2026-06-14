@@ -114,6 +114,19 @@ pub trait SyncStorage: Send + Sync {
         Ok(0)
     }
 
+    /// Read the write-ahead epoch-rotation journal row for this sync group, if a
+    /// rotation is currently staged but not yet committed. Read at the top
+    /// of `resume_pending_epoch_rotation` on every catch-up to drive a staged
+    /// rotation to a terminal state after a crash.
+    ///
+    /// Default: `None` (no-op for in-memory impls).
+    fn get_pending_epoch_rotation(
+        &self,
+        _sync_id: &str,
+    ) -> Result<Option<PendingEpochRotation>> {
+        Ok(None)
+    }
+
     /// Get a device record by sync_id and device_id.
     fn get_device_record(&self, sync_id: &str, device_id: &str) -> Result<Option<DeviceRecord>>;
 
@@ -446,6 +459,29 @@ pub trait SyncStorageTx {
     /// past the wall-clock ceiling would quarantine-and-advance a re-issued seq on
     /// its first transient hiccup. Default: no-op for in-memory impls.
     fn clear_all_pull_stalls(&mut self, _sync_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    // ── Epoch-rotation write-ahead journal ──
+
+    /// Stage (upsert) the write-ahead epoch-rotation journal row before a
+    /// revoke/rekey is committed to the relay. One row per sync group; `epoch`
+    /// is the new epoch `N` whose key `K_N` is already staged in the secure
+    /// store. The impl stamps `created_at = Utc::now().to_rfc3339()`.
+    /// Default: no-op for in-memory impls.
+    fn set_pending_epoch_rotation(
+        &mut self,
+        _sync_id: &str,
+        _epoch: i32,
+        _target_device_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear the epoch-rotation journal row once the staged rotation reaches a
+    /// terminal state (committed or discarded). Default: no-op for in-memory
+    /// impls.
+    fn clear_pending_epoch_rotation(&mut self, _sync_id: &str) -> Result<()> {
         Ok(())
     }
 

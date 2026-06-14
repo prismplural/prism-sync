@@ -865,6 +865,7 @@ mod tests {
             _remote_wipe: bool,
             _new_epoch: i32,
             _wrapped_keys: HashMap<String, Vec<u8>>,
+            _signed_registry_snapshot: Option<&[u8]>,
         ) -> std::result::Result<i32, RelayError> {
             unimplemented!()
         }

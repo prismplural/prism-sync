@@ -196,6 +196,7 @@ pub async fn post_atomic_revoke(
         body_json["new_epoch"].as_i64().ok_or(AppError::BadRequest("Missing new_epoch"))?;
     let remote_wipe = body_json["remote_wipe"].as_bool().unwrap_or(false);
     let wrapped_keys = parse_wrapped_keys(&body_json)?;
+    let signed_registry_snapshot = decode_optional_signed_registry_snapshot(&body_json)?;
 
     let sync_id = auth.sync_id.clone();
     let requester = auth.device_id.clone();
@@ -214,6 +215,7 @@ pub async fn post_atomic_revoke(
                 remote_wipe,
                 &wrapped_keys,
                 session_max_age,
+                signed_registry_snapshot.as_deref(),
             ))
         })
     })
@@ -257,6 +259,7 @@ fn do_atomic_revoke(
     remote_wipe: bool,
     wrapped_keys: &[(String, Vec<u8>)],
     session_max_age_secs: i64,
+    signed_registry_snapshot: Option<&[u8]>,
 ) -> Result<i64, AppError> {
     if target_device_id == requester_device_id {
         return Err(AppError::BadRequest("Self-deregister must use DELETE /devices/{device_id}"));
@@ -316,6 +319,19 @@ fn do_atomic_revoke(
     for (device_id, wrapped_key) in wrapped_keys {
         db::store_rekey_artifact(&tx, sync_id, new_epoch, device_id, wrapped_key)
             .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    // Publish the epoch-N signed registry inside the same transaction as the
+    // revoke + epoch bump, so the registry committing hash(K_N) can never lag the
+    // relay-visible epoch. The device row is already revoked above, so the rebuilt
+    // registry entries exclude the target.
+    if let Some(snapshot) = signed_registry_snapshot {
+        sync_registry_state_with_current_devices(
+            &tx,
+            sync_id,
+            Some("signed_registry_snapshot"),
+            Some(snapshot),
+        )?;
     }
 
     db::insert_revocation_event(
@@ -835,4 +851,109 @@ fn do_rotate_ml_dsa(
     }
 
     Ok(applied)
+}
+
+#[cfg(test)]
+mod atomic_revoke_registry_tests {
+    use super::*;
+    use crate::db::Database;
+    use std::collections::HashMap;
+
+    const SYNC_ID: &str = "sg1";
+    const REQUESTER: &str = "a1b2c3d4e5f6";
+    const TARGET: &str = "b7c8d9e0f1a2";
+
+    fn seed_two_active_devices(conn: &rusqlite::Connection) {
+        db::create_sync_group(conn, SYNC_ID, 0).unwrap();
+        // Requester needs a non-empty x_wing key so the wrap-set validation has a
+        // recipient; the snapshot store path is independent of the key contents.
+        db::register_device_with_pq(
+            conn, SYNC_ID, REQUESTER, b"sig-r", b"x-r", b"mldsa-r", b"mlkem-r", b"xwing-r", 0,
+        )
+        .unwrap();
+        db::register_device_with_pq(
+            conn, SYNC_ID, TARGET, b"sig-t", b"x-t", b"mldsa-t", b"mlkem-t", b"xwing-t", 0,
+        )
+        .unwrap();
+    }
+
+    fn survivor_wrapped_keys() -> HashMap<String, Vec<u8>> {
+        // After excluding the revoked target, the requester is the sole survivor.
+        let mut keys = HashMap::new();
+        keys.insert(REQUESTER.to_string(), vec![0xab; 16]);
+        keys
+    }
+
+    fn wrapped_pairs() -> Vec<(String, Vec<u8>)> {
+        survivor_wrapped_keys().into_iter().collect()
+    }
+
+    #[test]
+    fn atomic_revoke_with_snapshot_stores_registry_in_same_tx() {
+        let db = Database::in_memory().unwrap();
+        db.with_conn(|conn| {
+            seed_two_active_devices(conn);
+            let snapshot = b"signed-registry-epoch-1".to_vec();
+
+            let new_epoch =
+                do_atomic_revoke(conn, SYNC_ID, REQUESTER, TARGET, 1, false, &wrapped_pairs(), 7_776_000, Some(&snapshot))
+                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            assert_eq!(new_epoch, 1);
+
+            // The committed registry is visible after the tx commit, and its
+            // artifact is the snapshot we attached — committed atomically with the
+            // epoch bump.
+            let state = db::get_registry_state(conn, SYNC_ID)?.expect("registry state present");
+            let artifact = db::get_registry_artifact(conn, SYNC_ID, state.registry_version)?
+                .expect("registry artifact present");
+            assert_eq!(artifact.artifact_kind, "signed_registry_snapshot");
+            assert_eq!(artifact.artifact_blob, snapshot);
+            assert_eq!(db::get_sync_group_epoch(conn, SYNC_ID)?, Some(1));
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn atomic_revoke_without_snapshot_stores_no_registry_artifact() {
+        let db = Database::in_memory().unwrap();
+        db.with_conn(|conn| {
+            seed_two_active_devices(conn);
+
+            let new_epoch =
+                do_atomic_revoke(conn, SYNC_ID, REQUESTER, TARGET, 1, false, &wrapped_pairs(), 7_776_000, None)
+                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            assert_eq!(new_epoch, 1);
+
+            // Without the field, the behavior is exactly as before: the epoch bumps
+            // but no registry artifact is stored by the revoke.
+            assert_eq!(db::get_sync_group_epoch(conn, SYNC_ID)?, Some(1));
+            assert!(db::get_registry_state(conn, SYNC_ID)?.is_none());
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn aborted_atomic_revoke_leaves_no_registry() {
+        let db = Database::in_memory().unwrap();
+        db.with_conn(|conn| {
+            seed_two_active_devices(conn);
+
+            // A bad new_epoch (not current+1) aborts the whole tx before commit, so
+            // neither the epoch bump nor the attached registry persists.
+            let snapshot = b"signed-registry-epoch-9".to_vec();
+            let result = do_atomic_revoke(
+                conn, SYNC_ID, REQUESTER, TARGET, 9, false, &wrapped_pairs(), 7_776_000, Some(&snapshot),
+            );
+            assert!(result.is_err());
+
+            assert_eq!(db::get_sync_group_epoch(conn, SYNC_ID)?, Some(0));
+            assert!(db::get_registry_state(conn, SYNC_ID)?.is_none());
+            // The target is still active — the aborted tx rolled back the revoke.
+            assert_eq!(db::get_device(conn, SYNC_ID, TARGET)?.unwrap().status, "active");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
 }

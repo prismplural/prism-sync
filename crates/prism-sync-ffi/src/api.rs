@@ -1840,6 +1840,33 @@ pub async fn rekey_db(handle: &PrismSyncHandle, new_key: Vec<u8>) -> Result<(), 
 
 // ── Engine configuration ──
 
+/// Heal the sqlite-vs-cache epoch split at `configure_engine` time.
+///
+/// The durable source is sqlite (`sync_metadata.current_epoch`), but a crash
+/// mid-rotation can leave the secure-store cache ahead of sqlite, because the
+/// cache writer persists the key, then the cache, then sqlite — a crash between
+/// the last two leaves cache > sqlite. Take the MAX of the two, but only trust
+/// the cached epoch when its `epoch_key_{cached}` is actually present
+/// (`cached_key_present`). That guard is sound because every cache writer
+/// persists the key BEFORE writing the cache, so a cache value backed by a real
+/// key is never spurious; a cache value with no key (e.g. a half-written
+/// rotation that never reached `persist_epoch_key`) is ignored. Falls back to
+/// the cache alone before first sync creates metadata, then 0.
+fn heal_configured_epoch(
+    meta_epoch: Option<i32>,
+    cached_epoch: Option<i32>,
+    cached_key_present: impl Fn(i32) -> bool,
+) -> i32 {
+    let cached_epoch_with_key =
+        cached_epoch.filter(|&cached| cached >= 0 && cached_key_present(cached));
+    match (meta_epoch, cached_epoch_with_key) {
+        (Some(meta), Some(cached)) => meta.max(cached),
+        (Some(meta), None) => meta,
+        (None, Some(cached)) => cached,
+        (None, None) => 0,
+    }
+}
+
 /// Configure the sync engine after initialize/unlock.
 ///
 /// Reads `sync_id`, `device_id`, and `session_token` from SecureStore,
@@ -1874,8 +1901,16 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         .unwrap_or_default();
     let storage = inner.storage().clone();
 
-    // Read authoritative epoch from sync_metadata (storage), falling back
-    // to secure_store cache, then 0 for brand-new groups.
+    // Read the authoritative epoch. The durable source is sqlite
+    // (`sync_metadata.current_epoch`), but a crash mid-rotation can leave the
+    // secure-store cache ahead of sqlite (the cache writer persists the key,
+    // then the cache, then sqlite — a crash between the last two leaves
+    // cache > sqlite). Heal that split: take the MAX of the two whenever
+    // the cached epoch's key is actually present in the secure store. The
+    // key-present guard is sound because every cache writer persists
+    // `epoch_key_N` BEFORE writing the cache, so a cache value backed by a real
+    // key is never spurious. Falls back to the cache alone before first sync
+    // creates metadata, then 0 for brand-new groups.
     let epoch = {
         let storage = inner.storage().clone();
         let sid = sync_id.clone();
@@ -1885,16 +1920,21 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .map(|m| m.current_epoch);
 
-        meta_epoch.unwrap_or_else(|| {
-            // Fallback to secure_store cache (e.g. before first sync creates metadata)
-            inner
-                .secure_store()
-                .get("epoch")
+        let cached_epoch = inner
+            .secure_store()
+            .get("epoch")
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse::<i32>().ok());
+
+        let secure_store = inner.secure_store();
+        heal_configured_epoch(meta_epoch, cached_epoch, |epoch| {
+            secure_store
+                .get(&format!("epoch_key_{epoch}"))
                 .ok()
                 .flatten()
-                .and_then(|b| String::from_utf8(b).ok())
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0)
+                .is_some()
         })
     };
 
@@ -8138,5 +8178,36 @@ mod tests {
         assert_eq!(parsed["max_id"], 0);
         assert_eq!(parsed["spill_up_to_id"], 0);
         assert_eq!(parsed["over_cap"], false);
+    }
+
+    #[test]
+    fn heal_configured_epoch_takes_max_when_cached_key_present() {
+        // sqlite-vs-cache heal: a crash left the cache (2) ahead of sqlite
+        // (1) but the staged epoch_key_2 is present, so the configured epoch
+        // heals up to 2.
+        assert_eq!(heal_configured_epoch(Some(1), Some(2), |e| e == 2), 2);
+    }
+
+    #[test]
+    fn heal_configured_epoch_ignores_cache_without_key() {
+        // A cache value with no backing key (a half-written rotation that never
+        // reached persist_epoch_key) is not trusted: stay at sqlite's 1.
+        assert_eq!(heal_configured_epoch(Some(1), Some(2), |_| false), 1);
+    }
+
+    #[test]
+    fn heal_configured_epoch_falls_back_to_cache_before_metadata_exists() {
+        // Before first sync creates metadata, the key-backed cache is the source.
+        assert_eq!(heal_configured_epoch(None, Some(2), |e| e == 2), 2);
+        // …unless its key is absent, in which case there is nothing to trust.
+        assert_eq!(heal_configured_epoch(None, Some(2), |_| false), 0);
+    }
+
+    #[test]
+    fn heal_configured_epoch_prefers_metadata_when_cache_lags() {
+        // sqlite ahead of the cache (the steady state) keeps sqlite's value.
+        assert_eq!(heal_configured_epoch(Some(3), Some(2), |e| e == 2), 3);
+        assert_eq!(heal_configured_epoch(Some(3), None, |_| true), 3);
+        assert_eq!(heal_configured_epoch(None, None, |_| true), 0);
     }
 }

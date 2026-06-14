@@ -583,13 +583,16 @@ pub trait DeviceRegistry: Send + Sync {
     /// Atomically revoke a device and rotate to `new_epoch`.
     ///
     /// `wrapped_keys` must contain wrapped epoch-key artifacts for all
-    /// surviving devices.
+    /// surviving devices. `signed_registry_snapshot`, when present, is the
+    /// epoch-`new_epoch` registry the relay commits inside the same transaction
+    /// as the revoke + epoch bump, so the registry never lags the epoch.
     async fn revoke_device(
         &self,
         device_id: &str,
         remote_wipe: bool,
         new_epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> std::result::Result<i32, RelayError>;
 
     /// Self-deregister this device from the sync group.

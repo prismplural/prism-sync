@@ -144,6 +144,7 @@ impl DeviceRegistry for RekeyMockRelay {
         _remote_wipe: bool,
         epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        _signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<i32, RelayError> {
         let mut artifacts = self.artifacts.lock().unwrap();
         for (device_id, wrapped) in wrapped_keys {
@@ -346,7 +347,7 @@ async fn epoch_rotation_full_cycle() {
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
-        .revoke_device("device-c", false, 1, wrapped_keys)
+        .revoke_device("device-c", false, 1, wrapped_keys, None)
         .await
         .expect("atomic revoke should succeed");
     kh_a.store_epoch_key(1, zeroize::Zeroizing::new(epoch_key_a.to_vec()));
@@ -460,7 +461,7 @@ async fn revoked_device_cannot_recover_epoch_key() {
             .await
             .expect("prepare_wrapped_keys should succeed");
     relay
-        .revoke_device("device-c", false, 1, wrapped_keys)
+        .revoke_device("device-c", false, 1, wrapped_keys, None)
         .await
         .expect("atomic revoke should succeed");
 

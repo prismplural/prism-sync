@@ -822,6 +822,7 @@ impl DeviceRegistry for ServerRelay {
         remote_wipe: bool,
         new_epoch: i32,
         wrapped_keys: HashMap<String, Vec<u8>>,
+        signed_registry_snapshot: Option<&[u8]>,
     ) -> Result<i32, RelayError> {
         let path = self.canonical_path(&format!("/devices/{device_id}/revoke"));
         let url = format!("{}{}", self.base_url, path);
@@ -833,6 +834,7 @@ impl DeviceRegistry for ServerRelay {
             "new_epoch": new_epoch,
             "remote_wipe": remote_wipe,
             "wrapped_keys": encoded_keys,
+            "signed_registry_snapshot": signed_registry_snapshot.map(|s| BASE64.encode(s)),
         });
         let body_bytes = serde_json::to_vec(&body).map_err(|e| RelayError::Protocol {
             message: format!("Failed to encode revoke request: {e}"),

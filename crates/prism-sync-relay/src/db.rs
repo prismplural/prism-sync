@@ -6623,7 +6623,12 @@ mod tests {
         db.with_read_conn(|c| {
             assert!(get_media_metadata(c, "m1")?.unwrap().is_servable_at(later));
             assert_eq!(get_group_media_usage_at(c, "sg", later, 300)?, 100);
-    // -- F41: log lineage ----------------------------------------------------
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // -- log lineage ----------------------------------------------------------
 
     #[test]
     fn migrate_mints_a_log_token() {
@@ -7050,6 +7055,12 @@ mod tests {
                 "future-TTL blob must survive its old created_at"
             );
             assert!(get_media_metadata(c, "stale-default")?.unwrap().deleted_at.is_some());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn max_issued_batch_rowid_survives_pruning() {
         let db = test_db();
         db.with_conn(|conn| {
@@ -7422,6 +7433,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!((msgs, acks), (0, 0));
+    }
+
+    #[test]
     fn lineage_check_rotates_token_when_companion_is_ahead() {
         // A file-level restore rewinds the batch seq stream while leaving the
         // companion file recording the pre-restore high-water mark. The next
