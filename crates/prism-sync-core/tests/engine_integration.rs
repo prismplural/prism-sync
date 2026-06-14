@@ -390,6 +390,102 @@ async fn pull_to_head_drains_backlog_larger_than_one_page() {
     }
 }
 
+/// `upload_pairing_snapshot` pulls to relay head before reading the cursor
+/// it stamps onto the snapshot. With batches retained above the initiator's
+/// stale `last_pulled_server_seq`, the uploaded snapshot's `server_seq_at` must
+/// equal the relay head — not the stale cursor — so a joiner bootstrapping from
+/// it never has retained batches above its bootstrap point with an epoch key it
+/// can never obtain.
+#[tokio::test]
+async fn upload_pairing_snapshot_pulls_to_head_first() {
+    let key_hierarchy = init_key_hierarchy();
+    let signing_key_sender = make_signing_key();
+    let ml_dsa_key_sender = make_ml_dsa_keypair();
+    let signing_key_initiator = make_signing_key();
+    let ml_dsa_key_initiator = make_ml_dsa_keypair();
+    let sender_id = "device-sender";
+    let initiator_id = "device-initiator";
+
+    let relay = Arc::new(MockRelay::new());
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+
+    setup_sync_metadata(&storage, initiator_id);
+    register_device_with_pq(
+        &relay,
+        &storage,
+        sender_id,
+        &signing_key_sender.verifying_key(),
+        &ml_dsa_key_sender.public_key_bytes(),
+    );
+    register_device_with_pq(
+        &relay,
+        &storage,
+        initiator_id,
+        &signing_key_initiator.verifying_key(),
+        &ml_dsa_key_initiator.public_key_bytes(),
+    );
+
+    // Seed three retained batches above the initiator's (stale) cursor of 0.
+    const N: i64 = 3;
+    for i in 0..N {
+        let hlc = Hlc::new(1_710_500_000_000 + i, 0, sender_id);
+        let op = CrdtChange {
+            op_id: format!("op-{i}"),
+            batch_id: Some(format!("batch-{i}")),
+            entity_id: format!("task-{i}"),
+            entity_table: "tasks".to_string(),
+            field_name: "title".to_string(),
+            encoded_value: "\"hi\"".to_string(),
+            client_hlc: hlc.to_string(),
+            is_delete: false,
+            device_id: sender_id.to_string(),
+            epoch: 0,
+            server_seq: None,
+        };
+        let envelope = make_encrypted_batch(
+            std::slice::from_ref(&op),
+            &key_hierarchy,
+            &signing_key_sender,
+            &ml_dsa_key_sender,
+            &format!("batch-{i}"),
+            sender_id,
+        );
+        relay.inject_batch(envelope);
+    }
+
+    let meta_before = storage.get_sync_metadata(SYNC_ID).unwrap().unwrap();
+    assert_eq!(meta_before.last_pulled_server_seq, 0, "cursor starts stale");
+
+    let engine =
+        SyncEngine::new(storage.clone(), relay.clone(), vec![entity_ref], test_schema(), SyncConfig::default());
+    engine
+        .upload_pairing_snapshot(
+            SYNC_ID,
+            &key_hierarchy,
+            0,
+            initiator_id,
+            &signing_key_initiator,
+            &ml_dsa_key_initiator,
+            0,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The cursor advanced to head, and the uploaded snapshot was stamped there.
+    let meta_after = storage.get_sync_metadata(SYNC_ID).unwrap().unwrap();
+    assert_eq!(meta_after.last_pulled_server_seq, N, "cursor pulled to relay head");
+    let snapshot = relay.get_snapshot().await.unwrap().expect("snapshot uploaded");
+    assert_eq!(snapshot.server_seq_at, N, "snapshot stamped at relay head, not the stale cursor");
+    for i in 0..N {
+        assert!(storage.is_op_applied(&format!("op-{i}")).unwrap(), "op-{i} folded into state");
+    }
+}
+
 /// The pull-to-head loop stops at its per-cycle page budget rather than
 /// monopolising one cycle; the cursor advances so the next cycle resumes. With
 /// `pull_page_limit = 1` and `max_pull_pages_per_cycle = 3`, 5 batches drain as

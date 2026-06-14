@@ -510,6 +510,24 @@ impl PairingService {
             &bundle.epoch_key,
             &key_hierarchy,
         )?;
+
+        // Install the initiator's full epoch-key history. The bundle's
+        // signed registry commits a hash for every epoch the initiator holds, so
+        // each entry is verified against `registry_snapshot` BEFORE it is
+        // persisted; a single mismatch aborts the pairing fail-closed (the
+        // partial setup is rolled back via `setup_rollback_marker`), consistent
+        // with the epoch-binding posture from commit 1455805. Holding every
+        // epoch's key lets this joiner decrypt retained batches at any epoch
+        // above its bootstrap cursor — quarantine only has to cover keys that
+        // arrive later.
+        install_bundle_epoch_keys(
+            self.secure_store.as_ref(),
+            &mut key_hierarchy,
+            &bundle.epoch_keys,
+            bundle.current_epoch,
+            &registry_snapshot,
+        )?;
+
         let final_registry_snapshot =
             if latest_registry_snapshot.current_epoch > bundle.current_epoch {
                 let catch_up = EpochManager::catch_up_epoch_keys(
@@ -870,6 +888,19 @@ impl PairingService {
         approval_wire.extend_from_slice(&hybrid_approval.to_bytes());
         let approval_signature = hex::encode(&approval_wire);
 
+        // Ship every epoch key the initiator holds (1..=current_epoch) so the
+        // joiner can decrypt retained batches at any epoch above its bootstrap
+        // cursor — not just `current_epoch`. Each entry is committed by the
+        // `epoch_key_hashes` already bound into the signed registry above, and
+        // the joiner re-verifies every entry against that hash before persisting.
+        // Epoch 0 is omitted: it is DEK-derived locally, never raw on the wire.
+        let mut bundle_epoch_keys = std::collections::BTreeMap::new();
+        for (epoch, key) in key_hierarchy.epoch_keys_iter().map_err(CoreError::Crypto)? {
+            if epoch != 0 {
+                bundle_epoch_keys.insert(epoch, key.to_vec());
+            }
+        }
+
         let credential_bundle = BootstrapCredentialBundle {
             sync_id: sync_id.clone(),
             relay_url: relay_url.clone(),
@@ -878,6 +909,7 @@ impl PairingService {
             salt: salt.clone(),
             current_epoch,
             epoch_key,
+            epoch_keys: bundle_epoch_keys,
             signed_keyring: signed_keyring.clone(),
             inviter_device_id: device_id.clone(),
             inviter_ed25519_pk: signing_key.public_key_bytes().to_vec(),
@@ -1203,6 +1235,38 @@ fn verify_epoch_key_hash_in_snapshot(
             epoch,
             message: "local epoch key does not match signed registry hash".into(),
         });
+    }
+    Ok(())
+}
+
+/// Verify and persist every historical epoch key carried in a credential
+/// bundle. Epoch 0 (DEK-derived) and `current_epoch` (already handled by
+/// the single-key block) are skipped. Each entry is checked against
+/// `registry_snapshot.epoch_key_hashes` before it is written; a mismatched or
+/// malformed key aborts fail-closed so a malicious or corrupted bundle can
+/// never seed an unverified epoch key into the hierarchy.
+fn install_bundle_epoch_keys(
+    secure_store: &dyn SecureStore,
+    key_hierarchy: &mut KeyHierarchy,
+    epoch_keys: &std::collections::BTreeMap<u32, Vec<u8>>,
+    current_epoch: u32,
+    registry_snapshot: &SignedRegistrySnapshot,
+) -> Result<()> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    for (&epoch, key) in epoch_keys {
+        if epoch == 0 || epoch == current_epoch {
+            continue;
+        }
+        if key.len() != 32 {
+            return Err(CoreError::EpochKeyMismatch {
+                epoch,
+                message: format!("bundle epoch key has length {}, expected 32", key.len()),
+            });
+        }
+        verify_epoch_key_hash_in_snapshot(registry_snapshot, epoch, key, key_hierarchy)?;
+        let encoded = STANDARD.encode(key);
+        secure_store.set(&format!("epoch_key_{epoch}"), encoded.as_bytes())?;
+        key_hierarchy.store_epoch_key(epoch, zeroize::Zeroizing::new(key.clone()));
     }
     Ok(())
 }
@@ -2338,6 +2402,7 @@ mod tests {
             salt: salt.clone(),
             current_epoch: 0,
             epoch_key: Vec::new(),
+            epoch_keys: std::collections::BTreeMap::new(),
             signed_keyring: bundle_snapshot
                 .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
             inviter_device_id: inviter_device_id.clone(),
@@ -2485,6 +2550,7 @@ mod tests {
             salt,
             current_epoch: 0,
             epoch_key: Vec::new(),
+            epoch_keys: std::collections::BTreeMap::new(),
             signed_keyring: bundle_snapshot
                 .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
             inviter_device_id: inviter_device_id.clone(),
@@ -2842,6 +2908,7 @@ mod tests {
                 x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
                 permission: None,
                 ml_dsa_key_generation: current_generation,
+                needs_rekey: false,
             },
             DeviceInfo {
                 device_id: peer_device_id.clone(),
@@ -2854,6 +2921,7 @@ mod tests {
                 x_wing_public_key: attacker_xwing.clone(), // SWAPPED
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: false,
             },
             DeviceInfo {
                 device_id: injected_device_id.clone(),
@@ -2866,6 +2934,7 @@ mod tests {
                 x_wing_public_key: injected_xwing.clone(),
                 permission: None,
                 ml_dsa_key_generation: 0,
+                needs_rekey: false,
             },
         ]));
 
@@ -3058,6 +3127,7 @@ mod tests {
             x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
             permission: None,
             ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
         }]));
 
         let initiator_store = Arc::new(MemStore::default());
@@ -4507,5 +4577,245 @@ mod tests {
             Some(&compute_epoch_key_hash(&epoch_1_key)),
             "epoch_key_hash for epoch 1 must hash the persisted post-revoke key"
         );
+    }
+
+    /// Helper coverage: a registry-verified set of history keys is persisted
+    /// to the secure store and stored in the hierarchy; epoch 0 and the current
+    /// epoch are skipped (handled elsewhere).
+    #[test]
+    fn install_bundle_epoch_keys_persists_verified_history() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let store = MemStore::default();
+        let mut hierarchy = KeyHierarchy::new();
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        hierarchy.initialize("pw", &secret_key).unwrap();
+
+        let key1 = vec![0xA1u8; 32];
+        let key2 = vec![0xA2u8; 32];
+        let key3 = vec![0xA3u8; 32];
+        let mut hashes = std::collections::BTreeMap::new();
+        hashes.insert(0, compute_epoch_key_hash(hierarchy.epoch_key(0).unwrap().try_into().unwrap()));
+        hashes.insert(1, compute_epoch_key_hash(&[0xA1u8; 32]));
+        hashes.insert(2, compute_epoch_key_hash(&[0xA2u8; 32]));
+        hashes.insert(3, compute_epoch_key_hash(&[0xA3u8; 32]));
+        let snapshot =
+            SignedRegistrySnapshot::new_with_epoch_binding(Vec::new(), 1, 3, hashes);
+
+        let bundle_keys = std::collections::BTreeMap::from([
+            (1u32, key1.clone()),
+            (2u32, key2.clone()),
+            (3u32, key3.clone()),
+        ]);
+        // current_epoch == 3 is handled by the single-key block, so only 1 and 2
+        // should be installed here.
+        install_bundle_epoch_keys(&store, &mut hierarchy, &bundle_keys, 3, &snapshot).unwrap();
+
+        for (epoch, key) in [(1u32, &key1), (2u32, &key2)] {
+            let stored = store.get(&format!("epoch_key_{epoch}")).unwrap().unwrap();
+            assert_eq!(STANDARD.decode(stored).unwrap(), *key);
+            assert_eq!(hierarchy.epoch_key(epoch).unwrap(), key.as_slice());
+        }
+        assert!(
+            store.get("epoch_key_3").unwrap().is_none(),
+            "current_epoch key must be skipped here (single-key block owns it)"
+        );
+    }
+
+    /// Fail-closed: a history key whose hash does not match the signed
+    /// registry aborts and persists nothing for that epoch.
+    #[test]
+    fn install_bundle_epoch_keys_rejects_hash_mismatch_fail_closed() {
+        let store = MemStore::default();
+        let mut hierarchy = KeyHierarchy::new();
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        hierarchy.initialize("pw", &secret_key).unwrap();
+
+        let good = vec![0xB1u8; 32];
+        let tampered = vec![0xFFu8; 32];
+        let mut hashes = std::collections::BTreeMap::new();
+        // Registry commits to the GOOD key for epoch 1.
+        hashes.insert(1, compute_epoch_key_hash(&[0xB1u8; 32]));
+        let snapshot =
+            SignedRegistrySnapshot::new_with_epoch_binding(Vec::new(), 1, 2, hashes);
+
+        // Bundle ships the tampered key.
+        let bundle_keys = std::collections::BTreeMap::from([(1u32, tampered)]);
+        let err =
+            install_bundle_epoch_keys(&store, &mut hierarchy, &bundle_keys, 2, &snapshot).unwrap_err();
+        assert!(
+            matches!(err, CoreError::EpochKeyMismatch { epoch: 1, .. }),
+            "expected epoch-1 mismatch, got {err:?}"
+        );
+        assert!(
+            store.get("epoch_key_1").unwrap().is_none(),
+            "nothing must be persisted for the rejected epoch"
+        );
+        assert!(!hierarchy.has_epoch_key(1), "rejected key must not enter the hierarchy");
+        // Sanity: the good key would have verified.
+        let _ = good;
+    }
+
+    /// End-to-end: an initiator at epoch 3 holding keys 1..3 ships a bundle
+    /// whose `epoch_keys` is {1,2,3}; the joiner installs and persists all of
+    /// them after hash verification against the bundle's signed registry.
+    #[tokio::test]
+    async fn bootstrap_carries_full_epoch_key_history() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        // Relay reports the inviter at epoch 3 (matches local) — no catch-up.
+        let inviter_info = DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 3,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
+        };
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![inviter_info.clone()]));
+
+        // Seed the initiator at epoch 3 with persisted epoch_key_1..3, the shape
+        // three successive rekeys leave behind.
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("epoch", b"3").unwrap();
+        let epoch_1_key = [0x71u8; 32];
+        let epoch_2_key = [0x72u8; 32];
+        let epoch_3_key = [0x73u8; 32];
+        initiator_store
+            .set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes())
+            .unwrap();
+        initiator_store
+            .set("epoch_key_2", STANDARD.encode(epoch_2_key).as_bytes())
+            .unwrap();
+        initiator_store
+            .set("epoch_key_3", STANDARD.encode(epoch_3_key).as_bytes())
+            .unwrap();
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+
+        let mut current_epoch_hashes = build_epoch_key_hashes(&key_hierarchy).unwrap();
+        current_epoch_hashes.insert(1, compute_epoch_key_hash(&epoch_1_key));
+        current_epoch_hashes.insert(2, compute_epoch_key_hash(&epoch_2_key));
+        current_epoch_hashes.insert(3, compute_epoch_key_hash(&epoch_3_key));
+        let current_registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: inviter_info.device_id.clone(),
+                ed25519_public_key: inviter_info.ed25519_public_key.clone(),
+                x25519_public_key: inviter_info.x25519_public_key.clone(),
+                ml_dsa_65_public_key: inviter_info.ml_dsa_65_public_key.clone(),
+                ml_kem_768_public_key: inviter_info.ml_kem_768_public_key.clone(),
+                x_wing_public_key: inviter_info.x_wing_public_key.clone(),
+                status: inviter_info.status.clone(),
+                ml_dsa_key_generation: inviter_info.ml_dsa_key_generation,
+                remote_wipe: false,
+            }],
+            4,
+            3,
+            current_epoch_hashes,
+        );
+        registry_relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: 4,
+            artifact_blob: current_registry
+                .sign_hybrid(&inviter_signing_key, &inviter_pq_signing_key),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let joiner_service_task = PairingService::new(joiner_store.clone());
+
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let joiner_rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes =
+            wait_for_slot(mailbox.as_ref(), &joiner_rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service_task
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+                .unwrap()
+        });
+
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
+        initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+                initiator_storage.as_ref(),
+            )
+            .await
+            .expect("initiator at epoch 3 must produce a valid bundle");
+
+        let (_joiner_key_hierarchy, _joiner_snapshot) = joiner_handle.await.unwrap();
+
+        // The joiner persisted every epoch key the initiator held, each verified
+        // against the bundle's signed registry before install.
+        for (epoch, key) in
+            [(1u32, epoch_1_key), (2u32, epoch_2_key), (3u32, epoch_3_key)]
+        {
+            let stored = joiner_store
+                .get(&format!("epoch_key_{epoch}"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("joiner missing epoch_key_{epoch}"));
+            assert_eq!(
+                STANDARD.decode(stored).unwrap(),
+                key.to_vec(),
+                "joiner persisted epoch_key_{epoch} does not match the initiator's key"
+            );
+        }
     }
 }

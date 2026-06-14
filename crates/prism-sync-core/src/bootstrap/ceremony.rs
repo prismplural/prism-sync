@@ -570,6 +570,7 @@ mod tests {
             salt: vec![0xBB; 32],
             current_epoch: 1,
             epoch_key: vec![0xCC; 32],
+            epoch_keys: std::collections::BTreeMap::from([(1, vec![0xCC; 32])]),
             signed_keyring: vec![0xDD; 128],
             inviter_device_id: "inviter-dev".to_string(),
             inviter_ed25519_pk: vec![0xEE; 32],

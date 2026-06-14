@@ -378,6 +378,14 @@ pub struct CredentialBundle {
     pub salt: Vec<u8>,
     pub current_epoch: u32,
     pub epoch_key: Vec<u8>,
+    /// Every epoch key the initiator holds (1..=current_epoch), each bound to
+    /// the bundle's signed registry via `epoch_key_hashes`. The joiner installs
+    /// all of them so it can decrypt retained batches at any epoch above its
+    /// bootstrap cursor, not just `current_epoch`. Serde-default for forward
+    /// compat: a 0.12.x initiator emits an empty map and the joiner falls back
+    /// to the single `epoch_key` plus the quarantine-and-replay net.
+    #[serde(default)]
+    pub epoch_keys: std::collections::BTreeMap<u32, Vec<u8>>,
     pub signed_keyring: Vec<u8>,
     pub inviter_device_id: String,
     pub inviter_ed25519_pk: Vec<u8>,
@@ -777,6 +785,11 @@ mod tests {
             salt: vec![0xBB; 32],
             current_epoch: 3,
             epoch_key: vec![0xCC; 32],
+            epoch_keys: std::collections::BTreeMap::from([
+                (1, vec![0xC1; 32]),
+                (2, vec![0xC2; 32]),
+                (3, vec![0xCC; 32]),
+            ]),
             signed_keyring: vec![0xDD; 128],
             inviter_device_id: "inviter-device".to_string(),
             inviter_ed25519_pk: vec![0xEE; 32],
@@ -795,11 +808,36 @@ mod tests {
         assert_eq!(parsed.salt, bundle.salt);
         assert_eq!(parsed.current_epoch, bundle.current_epoch);
         assert_eq!(parsed.epoch_key, bundle.epoch_key);
+        assert_eq!(parsed.epoch_keys, bundle.epoch_keys);
         assert_eq!(parsed.signed_keyring, bundle.signed_keyring);
         assert_eq!(parsed.inviter_device_id, bundle.inviter_device_id);
         assert_eq!(parsed.inviter_ed25519_pk, bundle.inviter_ed25519_pk);
         assert_eq!(parsed.inviter_ml_dsa_65_pk, bundle.inviter_ml_dsa_65_pk);
         assert_eq!(parsed.registry_approval_signature, bundle.registry_approval_signature);
         assert_eq!(parsed.registration_token, bundle.registration_token);
+    }
+
+    /// Compat: an old-initiator bundle (no `epoch_keys` field on the wire)
+    /// deserializes with an empty map, so a new joiner falls back to the
+    /// single-key behavior plus the quarantine net.
+    #[test]
+    fn credential_bundle_without_epoch_keys_defaults_empty() {
+        let json = r#"{
+            "sync_id": "sync-001",
+            "relay_url": "https://relay.example.com",
+            "mnemonic": "phrase",
+            "wrapped_dek": [1,2,3],
+            "salt": [4,5,6],
+            "current_epoch": 2,
+            "epoch_key": [7,8,9],
+            "signed_keyring": [10,11],
+            "inviter_device_id": "inviter",
+            "inviter_ed25519_pk": [12],
+            "registry_approval_signature": null,
+            "registration_token": null
+        }"#;
+        let parsed: CredentialBundle = serde_json::from_str(json).unwrap();
+        assert!(parsed.epoch_keys.is_empty());
+        assert_eq!(parsed.current_epoch, 2);
     }
 }

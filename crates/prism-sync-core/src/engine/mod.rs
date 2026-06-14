@@ -3151,6 +3151,17 @@ impl SyncEngine {
         for_device_id: Option<String>,
         progress: Option<SnapshotUploadProgress>,
     ) -> Result<()> {
+        // 0. Pull to relay head before cutting the snapshot. `sync` runs
+        // pull-then-push, so the initiator's own most recent pushes always sit
+        // above its `last_pulled_server_seq` cursor; cutting the snapshot at that
+        // stale cursor leaves those batches above the snapshot point, and a
+        // joiner that lacks their epoch key wedges on them. Pulling first both
+        // advances the cursor read in step 2 to the relay head and folds the
+        // pulled state into the exported snapshot. Any batch this initiator
+        // cannot decrypt is quarantined (the cursor still advances), so the
+        // pull never wedges the pairing flow.
+        self.pull_phase(sync_id, key_hierarchy, device_id).await?;
+
         // 1. Export snapshot from storage (already zstd-compressed)
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
