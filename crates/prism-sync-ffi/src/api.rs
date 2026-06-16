@@ -977,7 +977,7 @@ fn device_info_to_json(info: &prism_sync_core::relay::traits::DeviceInfo) -> ser
 /// (and acks them) instead of applying — never silently dropped in Rust. The
 /// retention rule is device-local (the relay-as-expiring-buffer rule does not
 /// apply to local engine state).
-const CONSUMER_DELIVERY_JOURNAL_CAP: i64 = 50_000;
+const CONSUMER_DELIVERY_JOURNAL_CAP: i64 = 250_000;
 
 const SHARING_ID_CACHE_KEY: &str = "sharing_id_cache";
 const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
@@ -8168,6 +8168,43 @@ mod tests {
         // 2 rows; spill is bounded to the whole chunk (threshold = last id).
         // The next drain pass spills the next prefix until back under cap.
         assert_eq!(consumer_delivery_spill_threshold(&rows, 100, 3), 11);
+    }
+
+    #[test]
+    fn spill_threshold_handles_real_cap_boundary() {
+        assert_eq!(CONSUMER_DELIVERY_JOURNAL_CAP, 250_000);
+
+        let rows: Vec<_> = (1..=200)
+            .map(|id| delivery(id, &format!("ent-{id}"), Some("n"), Some("\"x\"")))
+            .collect();
+
+        assert_eq!(
+            consumer_delivery_spill_threshold(
+                &rows,
+                CONSUMER_DELIVERY_JOURNAL_CAP,
+                CONSUMER_DELIVERY_JOURNAL_CAP,
+            ),
+            0,
+            "exactly at the hard cap should not spill",
+        );
+        assert_eq!(
+            consumer_delivery_spill_threshold(
+                &rows,
+                CONSUMER_DELIVERY_JOURNAL_CAP + 1,
+                CONSUMER_DELIVERY_JOURNAL_CAP,
+            ),
+            1,
+            "one row over cap spills exactly the oldest row in the chunk",
+        );
+        assert_eq!(
+            consumer_delivery_spill_threshold(
+                &rows,
+                CONSUMER_DELIVERY_JOURNAL_CAP + 200,
+                CONSUMER_DELIVERY_JOURNAL_CAP,
+            ),
+            200,
+            "one full chunk over cap spills the whole chunk",
+        );
     }
 
     #[test]
