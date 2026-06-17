@@ -2,6 +2,20 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.13.1] - 2026-06-17
+
+Tagged for the matching `prism-app 0.13.1+13101` release. Cargo crate versions
+remain `0.1.1`. The app's sync pin moves from `prism-sync v0.13.0` to
+`prism-sync v0.13.1`.
+
+### Fixed
+- Raised the FFI consumer-delivery journal cap from 50,000 to 250,000 rows so
+  very large restore or catch-up backlogs spill less aggressively while still
+  bounding local engine state.
+
+### Internal
+- Added cap-boundary coverage for the consumer-delivery spill threshold.
+
 ## [0.13.0] - 2026-06-13
 
 Tagged for the matching `prism-app 0.13.0+13001` release. Cargo crate versions
