@@ -41,6 +41,31 @@ fn diag_prefix(bytes: &[u8]) -> String {
     hex::encode(&bytes[..bytes.len().min(8)])
 }
 
+fn post_registration_rekey_entries(
+    registry_snapshot: &SignedRegistrySnapshot,
+    active_device_ids: &std::collections::HashSet<String>,
+    current_device_id: &str,
+    joiner_device_id: &str,
+) -> Result<Vec<RegistrySnapshotEntry>> {
+    if !active_device_ids.contains(current_device_id) {
+        return Err(CoreError::Engine(
+            "current device missing from active relay device list after joiner registration".into(),
+        ));
+    }
+    if !active_device_ids.contains(joiner_device_id) {
+        return Err(CoreError::Engine(
+            "joiner device missing from active relay device list after registration".into(),
+        ));
+    }
+
+    Ok(registry_snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "active" && active_device_ids.contains(&entry.device_id))
+        .cloned()
+        .collect())
+}
+
 /// Orchestrates sync group creation and joining.
 ///
 /// Holds a shared reference to the secure store (for credential persistence).
@@ -944,14 +969,28 @@ impl PairingService {
         })?;
 
         let next_epoch = current_epoch.saturating_add(1);
-        // SECURITY: the rekey wrap is driven entirely by the verified signed
-        // snapshot — both recipients and the `pinned` cross-check come from
-        // `registry_snapshot.entries`, so `relay.list_devices()` has no say in who
-        // is wrapped or to which key. Recipients == pinned by construction, so the
-        // byte-for-byte equality check in `prepare_wrapped_keys_for_devices` passes
-        // and the key is wrapped to exactly the verified set (incl. self).
-        let recipients: Vec<DeviceInfo> = registry_snapshot
-            .entries
+        let post_registration_active_ids: std::collections::HashSet<String> = sync_relay
+            .list_devices()
+            .await
+            .map_err(|e| CoreError::from_relay_with_context(Some("listing devices"), e))?
+            .into_iter()
+            .filter(|device| device.status == "active")
+            .map(|device| device.device_id)
+            .collect();
+        // SECURITY: identity material still comes only from the verified signed
+        // snapshot. The fresh relay list can only prune the set to devices the
+        // relay currently treats as active after joiner registration, which keeps
+        // 90d auto-revoked stale entries out of the rekey wrap and matches the
+        // relay's exact active-set validation. It cannot inject a recipient or
+        // swap keys because recipients and pins are still authored from
+        // `registry_snapshot.entries`.
+        let post_rekey_entries = post_registration_rekey_entries(
+            &registry_snapshot,
+            &post_registration_active_ids,
+            &device_id,
+            &joiner_device_id,
+        )?;
+        let recipients: Vec<DeviceInfo> = post_rekey_entries
             .iter()
             .map(|e| DeviceInfo {
                 device_id: e.device_id.clone(),
@@ -968,8 +1007,7 @@ impl PairingService {
                 needs_rekey: false,
             })
             .collect();
-        let pinned: Vec<crate::storage::DeviceRecord> = registry_snapshot
-            .entries
+        let pinned: Vec<crate::storage::DeviceRecord> = post_rekey_entries
             .iter()
             .map(|e| crate::storage::DeviceRecord {
                 sync_id: e.sync_id.clone(),
@@ -996,7 +1034,7 @@ impl PairingService {
         let mut next_epoch_hashes = build_epoch_key_hashes(&key_hierarchy)?;
         next_epoch_hashes.insert(next_epoch, compute_epoch_key_hash(&next_epoch_key_array));
         let post_rekey_registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
-            registry_snapshot.entries.clone(),
+            post_rekey_entries,
             registry_snapshot.registry_version,
             next_epoch,
             next_epoch_hashes,
@@ -1729,6 +1767,57 @@ mod tests {
             wait_for_pairing_slot_bytes(&relay, "rendezvous-hex", PairingSlot::Init, "PairingInit")
                 .await;
         assert!(result.is_err(), "fatal relay error should abort the wait");
+    }
+
+    #[test]
+    fn post_registration_rekey_entries_prunes_auto_revoked_stale_peer() {
+        fn entry(sync_id: &str, device_id: &str) -> RegistrySnapshotEntry {
+            RegistrySnapshotEntry {
+                sync_id: sync_id.to_string(),
+                device_id: device_id.to_string(),
+                ed25519_public_key: vec![],
+                x25519_public_key: vec![],
+                ml_dsa_65_public_key: vec![],
+                ml_kem_768_public_key: vec![],
+                x_wing_public_key: vec![],
+                status: "active".to_string(),
+                ml_dsa_key_generation: 0,
+                remote_wipe: false,
+            }
+        }
+
+        let sync_id = "sync";
+        let current_device_id = "aaaaaaaaaaaa";
+        let stale_peer_id = "bbbbbbbbbbbb";
+        let joiner_device_id = "cccccccccccc";
+        let registry_snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![
+                entry(sync_id, current_device_id),
+                entry(sync_id, stale_peer_id),
+                entry(sync_id, joiner_device_id),
+            ],
+            SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            0,
+            std::collections::BTreeMap::new(),
+        );
+        let active_device_ids = std::collections::HashSet::from([
+            current_device_id.to_string(),
+            joiner_device_id.to_string(),
+        ]);
+
+        let post_registration_entries = post_registration_rekey_entries(
+            &registry_snapshot,
+            &active_device_ids,
+            current_device_id,
+            joiner_device_id,
+        )
+        .unwrap();
+
+        let device_ids: Vec<&str> = post_registration_entries
+            .iter()
+            .map(|entry| entry.device_id.as_str())
+            .collect();
+        assert_eq!(device_ids, vec![current_device_id, joiner_device_id]);
     }
 
     // ── Mock Relay (minimal) ──

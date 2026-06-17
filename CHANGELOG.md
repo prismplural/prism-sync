@@ -15,11 +15,16 @@ remain `0.1.1`. The app's sync pin moves from `prism-sync v0.13.0` to
 - Registry approval now ignores stale active entries for devices the relay has
   already auto-revoked, so pairing a new device after a 90-day revoke can clear
   the pending rekey instead of failing with a protocol conflict.
+- Post-registration pairing rekeys now prune auto-revoked stale peers from the
+  verified wrap set, keeping the new epoch artifact aligned with the relay's
+  active device set while preserving signed-registry key authority.
 
 ### Internal
 - Added cap-boundary coverage for the consumer-delivery spill threshold.
 - Added relay coverage for registering a new device while the approver still
   carries an auto-revoked peer in its registry snapshot.
+- Added sync-core coverage for pruning a stale auto-revoked peer before the
+  pairing rekey wrap is posted.
 
 ## [0.13.0] - 2026-06-13
 
