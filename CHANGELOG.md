@@ -12,9 +12,14 @@ remain `0.1.1`. The app's sync pin moves from `prism-sync v0.13.0` to
 - Raised the FFI consumer-delivery journal cap from 50,000 to 250,000 rows so
   very large restore or catch-up backlogs spill less aggressively while still
   bounding local engine state.
+- Registry approval now ignores stale active entries for devices the relay has
+  already auto-revoked, so pairing a new device after a 90-day revoke can clear
+  the pending rekey instead of failing with a protocol conflict.
 
 ### Internal
 - Added cap-boundary coverage for the consumer-delivery spill threshold.
+- Added relay coverage for registering a new device while the approver still
+  carries an auto-revoked peer in its registry snapshot.
 
 ## [0.13.0] - 2026-06-13
 
