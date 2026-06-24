@@ -12,6 +12,7 @@ pub(crate) struct SimulatedClient {
     pub(crate) sync_id: String,
     pub(crate) device_id: String,
     pub(crate) signing_key: SigningKey,
+    pub(crate) ml_dsa_key: relay::MlDsaSigningKey,
     pub(crate) token: Option<String>,
     pub(crate) last_server_seq: i64,
     pub(crate) epoch: i64,
@@ -23,6 +24,7 @@ impl SimulatedClient {
             sync_id,
             device_id: relay::generate_device_id(),
             signing_key: SigningKey::generate(&mut OsRng),
+            ml_dsa_key: relay::generate_ml_dsa_key(),
             token: None,
             last_server_seq: 0,
             epoch: 0,
@@ -42,6 +44,7 @@ impl SimulatedClient {
             &self.sync_id,
             &self.device_id,
             &self.signing_key,
+            &self.ml_dsa_key,
         )
         .await
         {
@@ -66,15 +69,31 @@ impl SimulatedClient {
         let batch_id = uuid::Uuid::new_v4().to_string();
         let envelope =
             relay::make_test_envelope(&self.sync_id, &self.device_id, &batch_id, self.epoch);
+        // Serialize once so the bytes we sign are exactly the bytes we send.
+        let body = serde_json::to_vec(&envelope)?;
+        let path = format!("/v1/sync/{}/changes", self.sync_id);
+        let (ts, nonce, sig) = relay::sign_request(
+            &self.signing_key,
+            &self.ml_dsa_key,
+            "PUT",
+            &path,
+            &self.sync_id,
+            &self.device_id,
+            &body,
+        );
 
         let start = Instant::now();
         let resp = http
-            .put(format!("{base_url}/v1/sync/{}/changes", self.sync_id))
+            .put(format!("{base_url}{path}"))
             .bearer_auth(token)
             .header("X-Device-Id", &self.device_id)
             .header("X-Batch-Id", &batch_id)
             .header("X-Epoch", self.epoch.to_string())
-            .json(&envelope)
+            .header("X-Prism-Timestamp", ts)
+            .header("X-Prism-Nonce", nonce)
+            .header("X-Prism-Signature", sig)
+            .header("Content-Type", "application/json")
+            .body(body)
             .send()
             .await?;
 
@@ -130,13 +149,28 @@ impl SimulatedClient {
         stats: &Stats,
     ) -> Result<()> {
         let token = self.token()?;
+        let body = serde_json::to_vec(&serde_json::json!({ "server_seq": server_seq }))?;
+        let path = format!("/v1/sync/{}/ack", self.sync_id);
+        let (ts, nonce, sig) = relay::sign_request(
+            &self.signing_key,
+            &self.ml_dsa_key,
+            "POST",
+            &path,
+            &self.sync_id,
+            &self.device_id,
+            &body,
+        );
 
         let start = Instant::now();
         let resp = http
-            .post(format!("{base_url}/v1/sync/{}/ack", self.sync_id))
+            .post(format!("{base_url}{path}"))
             .bearer_auth(token)
             .header("X-Device-Id", &self.device_id)
-            .json(&serde_json::json!({ "server_seq": server_seq }))
+            .header("X-Prism-Timestamp", ts)
+            .header("X-Prism-Nonce", nonce)
+            .header("X-Prism-Signature", sig)
+            .header("Content-Type", "application/json")
+            .body(body)
             .send()
             .await?;
 

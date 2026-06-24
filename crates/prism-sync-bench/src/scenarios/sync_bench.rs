@@ -71,10 +71,13 @@ pub(crate) async fn run(
         let stats = stats.clone();
 
         let handle = tokio::spawn(async move {
-            // Add jitter to avoid thundering herd
-            let jitter =
-                Duration::from_millis(rand::random::<u64>() % sync_interval.as_millis() as u64);
-            tokio::time::sleep(jitter).await;
+            // Add jitter to avoid thundering herd. With sync_interval=0 the
+            // clients push as fast as they can (saturation mode), so skip it.
+            let interval_ms = sync_interval.as_millis() as u64;
+            if interval_ms > 0 {
+                let jitter = Duration::from_millis(rand::random::<u64>() % interval_ms);
+                tokio::time::sleep(jitter).await;
+            }
 
             while Instant::now() < deadline {
                 // Push
