@@ -2112,6 +2112,8 @@ mod tests {
         signed_registry: Option<SignedRegistryResponse>,
         advance_after_artifact_fetch: Option<(i32, i32)>,
         fail_next_register: bool,
+        fail_list_devices_on_call: Option<usize>,
+        list_devices_calls: usize,
     }
 
     #[derive(Clone, Default)]
@@ -2130,6 +2132,8 @@ mod tests {
                     signed_registry: None,
                     advance_after_artifact_fetch: None,
                     fail_next_register: false,
+                    fail_list_devices_on_call: None,
+                    list_devices_calls: 0,
                 })),
             }
         }
@@ -2153,6 +2157,14 @@ mod tests {
 
         fn fail_next_register(&self) {
             self.state.lock().unwrap().fail_next_register = true;
+        }
+
+        /// Fail the `n`-th `list_devices` call once (1-based), then disarm. The
+        /// initiator's 2nd call runs after it caches the joiner bundle, so `(2)`
+        /// drives the cached-bundle retry path (the joiner never calls
+        /// `list_devices`, so the count is deterministic).
+        fn fail_list_devices_on_call(&self, n: usize) {
+            self.state.lock().unwrap().fail_list_devices_on_call = Some(n);
         }
     }
 
@@ -2226,7 +2238,16 @@ mod tests {
             })
         }
         async fn list_devices(&self) -> std::result::Result<Vec<DeviceInfo>, RelayError> {
-            Ok(self.state.lock().unwrap().devices.clone())
+            let mut state = self.state.lock().unwrap();
+            state.list_devices_calls += 1;
+            if state.fail_list_devices_on_call == Some(state.list_devices_calls) {
+                state.fail_list_devices_on_call = None;
+                return Err(RelayError::Server {
+                    status_code: 503,
+                    message: "synthetic one-shot list_devices failure".to_string(),
+                });
+            }
+            Ok(state.devices.clone())
         }
         async fn revoke_device(
             &self,
@@ -3196,6 +3217,137 @@ mod tests {
         // ...even with no setup_rollback_marker present (returns false: only
         // best-effort cache hygiene ran, no destructive setup cleanup).
         assert!(!performed);
+    }
+
+    #[tokio::test]
+    async fn initiator_retry_uses_cached_joiner_bundle_after_consumed_slot() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "c1c2c3c4c5c6c1c2c3c4c5c6c1c2c3c4c5c6c1c2c3c4c5c6c1c2c3c4c5c6c1c2";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 0,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
+        }]));
+        // Fail the initiator's SECOND list_devices — the one after it caches the
+        // joiner bundle — so the first attempt aborts post-cache and the retry
+        // must read the cached bundle.
+        registry_relay.fail_list_devices_on_call(2);
+
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes = wait_for_slot(mailbox.as_ref(), &rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+
+        // The joiner runs to completion concurrently: it posts the one-shot Joiner
+        // bundle the initiator caches, then returns.
+        let joiner_mailbox = mailbox.clone();
+        let joiner_relay = registry_relay.clone();
+        let joiner_handle = tokio::spawn(async move {
+            joiner_service
+                .complete_bootstrap_join(
+                    &joiner,
+                    joiner_mailbox.as_ref(),
+                    &[],
+                    password,
+                    |_sync_id, _device_id, _token| Ok(joiner_relay as Arc<dyn SyncRelay>),
+                )
+                .await
+        });
+
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
+
+        // First attempt: aborts at the post-cache list_devices.
+        let first = initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+                initiator_storage.as_ref(),
+            )
+            .await;
+        assert!(
+            first.as_ref().err().is_some_and(|e| e.to_string().contains("listing devices")),
+            "first initiator attempt should fail at the synthetic list_devices failure: {first:?}"
+        );
+
+        let joiner_bundle_cache_key =
+            pairing_terminal_cache_key(PAIRING_JOINER_BUNDLE_CACHE_PREFIX, &rendezvous_id);
+        assert!(
+            initiator_store.get(&joiner_bundle_cache_key).unwrap().is_some(),
+            "joiner bundle must be cached before the fallible list_devices step"
+        );
+
+        // Simulate one-shot terminal-slot consumption.
+        mailbox.remove_slot_for_test(&rendezvous_id, PairingSlot::Joiner);
+
+        // Retry: must succeed using the cached joiner bundle.
+        initiator_service
+            .complete_bootstrap_initiator(
+                &initiator,
+                mailbox.as_ref(),
+                password,
+                &mnemonic,
+                registry_relay.as_ref(),
+                initiator_storage.as_ref(),
+            )
+            .await
+            .expect("retry should use the cached joiner bundle");
+        assert!(
+            initiator_store.get(&joiner_bundle_cache_key).unwrap().is_none(),
+            "successful retry should clear the terminal joiner-bundle cache"
+        );
+
+        joiner_handle.await.unwrap().expect("joiner should complete after posting its bundle");
     }
 
     /// NEGATIVE TEST 1 (C2 / existing-device X-Wing swap + relay injection).
