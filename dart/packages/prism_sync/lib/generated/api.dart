@@ -248,7 +248,7 @@ Future<void> recordDelete({
 );
 
 /// Record a new entity creation stamped at `origin_timestamp_ms` instead of a
-/// fresh wall-clock HLC. Used to replay a startup-deferred capture (F32) at its
+/// fresh wall-clock HLC. Used to replay a startup-deferred capture at its
 /// capture time so it cannot win LWW against an edit made after capture; the
 /// emitter watermark is left untouched and the field_versions write is
 /// `wins_over`-guarded.
@@ -300,7 +300,7 @@ Future<void> recordDeleteAt({
 /// genuinely-diverged fields and never-synced fields (as floor-HLC backfill).
 ///
 /// A value the device already agrees with produces zero ops, so a re-broadcast
-/// can no longer clobber a peer's un-pulled newer edit (F43/F44). When
+/// can no longer clobber a peer's un-pulled newer edit. When
 /// `divergent_fresh_hlc` is true a diverging field emits at a fresh HLC
 /// (deferred local edit wins); when false the divergent field is left alone
 /// (pure backfill, first-device-wins).
@@ -574,7 +574,7 @@ Future<PlatformInt64> quarantinedBatchCount({
   required PrismSyncHandle handle,
 }) => RustLib.instance.api.crateApiQuarantinedBatchCount(handle: handle);
 
-/// Return the count of durably quarantined inbound pull batches (R3): batches
+/// Return the count of durably quarantined inbound pull batches: batches
 /// whose deterministic-but-recoverable failure (a missing epoch key, an
 /// undecodable cross-version payload, a stale-registry signature) has not yet
 /// cleared. Parity with `quarantined_batch_count` on the push side.
@@ -586,6 +586,31 @@ Future<PlatformInt64> quarantinedBatchCount({
 Future<PlatformInt64> quarantinedPullBatchCount({
   required PrismSyncHandle handle,
 }) => RustLib.instance.api.crateApiQuarantinedPullBatchCount(handle: handle);
+
+/// Return the current per-sender inbound pull-liveness rows (one-way-sync
+/// diagnostics) as a JSON array, for the debug logs / a support screen.
+///
+/// Each element:
+/// ```json
+/// [{
+///   "sender_device_id": "...",
+///   "reason": "sender_unresolved" | "stale_key_generation",
+///   "live_stall_count": 3,
+///   "quarantined_batch_count": 1,
+///   "first_seen_at": "2026-06-27T12:00:00+00:00",
+///   "last_seen_at":  "2026-06-27T12:05:00+00:00",
+///   "last_error": "..."
+/// }, ...]
+/// ```
+///
+/// A nonempty array is the asymmetric one-way symptom: a peer's inbound batches
+/// keep failing to apply locally while this device's own push still succeeds.
+/// `live_stall_count` is how many cycles stalled on that sender/reason and
+/// `quarantined_batch_count` how many of its batches converted to a durable
+/// (replayable) quarantine. Diagnostic only — verification stays fail-closed and
+/// nothing is applied unverified. Returns `"[]"` if the engine is not configured.
+Future<String> listPullSenderHealth({required PrismSyncHandle handle}) =>
+    RustLib.instance.api.crateApiListPullSenderHealth(handle: handle);
 
 /// Drain up to `limit` rows from the durable consumer-delivery journal — the
 /// at-least-once delivery channel that replaces applying directly from the

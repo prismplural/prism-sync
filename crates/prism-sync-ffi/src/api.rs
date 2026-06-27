@@ -2948,6 +2948,59 @@ pub async fn quarantined_pull_batch_count(handle: &PrismSyncHandle) -> Result<i6
     .map_err(|e| e.to_string())?
 }
 
+/// Return the current per-sender inbound pull-liveness rows (one-way-sync
+/// diagnostics) as a JSON array, for the debug logs / a support screen.
+///
+/// Each element:
+/// ```json
+/// [{
+///   "sender_device_id": "...",
+///   "reason": "sender_unresolved" | "stale_key_generation",
+///   "live_stall_count": 3,
+///   "quarantined_batch_count": 1,
+///   "first_seen_at": "2026-06-27T12:00:00+00:00",
+///   "last_seen_at":  "2026-06-27T12:05:00+00:00",
+///   "last_error": "..."
+/// }, ...]
+/// ```
+///
+/// A nonempty array is the asymmetric one-way symptom: a peer's inbound batches
+/// keep failing to apply locally while this device's own push still succeeds.
+/// `live_stall_count` is how many cycles stalled on that sender/reason and
+/// `quarantined_batch_count` how many of its batches converted to a durable
+/// (replayable) quarantine. Diagnostic only — verification stays fail-closed and
+/// nothing is applied unverified. Returns `"[]"` if the engine is not configured.
+pub async fn list_pull_sender_health(handle: &PrismSyncHandle) -> Result<String, String> {
+    let (storage, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let Some(sync_id) = inner.sync_service().sync_id() else {
+            return Ok("[]".to_string());
+        };
+        (inner.storage().clone(), sync_id.to_string())
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let list = storage.list_pull_sender_health(&sync_id).map_err(|e| e.to_string())?;
+        let json: Vec<serde_json::Value> = list
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "sender_device_id": row.sender_device_id,
+                    "reason": row.reason,
+                    "live_stall_count": row.live_stall_count,
+                    "quarantined_batch_count": row.quarantined_batch_count,
+                    "first_seen_at": row.first_seen_at.to_rfc3339(),
+                    "last_seen_at": row.last_seen_at.to_rfc3339(),
+                    "last_error": row.last_error,
+                })
+            })
+            .collect();
+        Ok::<_, String>(serde_json::Value::Array(json).to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Compute the highest journal id in `chunk` that must SPILL into the Dart
 /// quarantine lane because the total backlog (`total`) exceeds `cap`. The oldest
 /// `total - cap` rows are over-cap; since the chunk is the oldest rows in id
