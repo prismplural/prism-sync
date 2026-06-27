@@ -33,6 +33,11 @@ const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
 const PAIRING_CREDENTIAL_BUNDLE_CACHE_PREFIX: &str = "pairing_credential_bundle_v1";
 const PAIRING_JOINER_BUNDLE_CACHE_PREFIX: &str = "pairing_joiner_bundle_v1";
+/// Fixed markers recording the live one-shot terminal-cache key per side, so an
+/// abandoned pairing's orphaned cache can be reconstructed and swept without
+/// `SecureStore` key enumeration (which the trait does not provide).
+const PAIRING_PENDING_CREDENTIAL_CACHE_KEY: &str = "pairing_pending_credential_cache";
+const PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY: &str = "pairing_pending_joiner_bundle_cache";
 
 fn pairing_terminal_cache_key(prefix: &str, rendezvous_id: &str) -> String {
     format!("{prefix}_{rendezvous_id}")
@@ -89,6 +94,19 @@ impl PairingService {
     /// Create a new `PairingService`.
     pub fn new(secure_store: Arc<dyn SecureStore>) -> Self {
         Self { secure_store }
+    }
+
+    /// Point [`marker`] at the live terminal-cache key, purging any prior entry.
+    /// Ceremonies are single-slot, so a prior key always belongs to an abandoned
+    /// pairing — an unfinished pairing leaves at most one orphan per side (also
+    /// swept by [`cleanup_failed_setup`]). Best-effort; never fail a pairing.
+    fn record_terminal_cache_key(&self, marker: &str, key: &str) {
+        if let Ok(Some(prev)) = self.secure_store.get(marker) {
+            if prev.as_slice() != key.as_bytes() {
+                let _ = self.secure_store.delete(&String::from_utf8_lossy(&prev));
+            }
+        }
+        let _ = self.secure_store.set(marker, key.as_bytes());
     }
 
     fn stored_min_signature_version_floor(&self) -> Result<Option<u8>> {
@@ -383,6 +401,10 @@ impl PairingService {
                     )
                     .await?;
                     // Cache the one-shot terminal payload before fallible work.
+                    self.record_terminal_cache_key(
+                        PAIRING_PENDING_CREDENTIAL_CACHE_KEY,
+                        &credential_cache_key,
+                    );
                     self.secure_store.set(&credential_cache_key, &bytes)?;
                     bytes
                 }
@@ -616,6 +638,7 @@ impl PairingService {
             .map_err(|e| CoreError::from_relay_with_context(Some("posting joiner bundle"), e))?;
 
         self.secure_store.delete(&credential_cache_key)?;
+        let _ = self.secure_store.delete(PAIRING_PENDING_CREDENTIAL_CACHE_KEY);
         self.secure_store.delete("setup_rollback_marker")?;
         self.secure_store.delete("pending_device_secret")?;
         self.secure_store.delete("pending_device_id")?;
@@ -991,6 +1014,10 @@ impl PairingService {
                 )
                 .await?;
                 // Cache the one-shot terminal payload before fallible work.
+                self.record_terminal_cache_key(
+                    PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY,
+                    &joiner_bundle_cache_key,
+                );
                 self.secure_store.set(&joiner_bundle_cache_key, &bytes)?;
                 bytes
             }
@@ -1101,6 +1128,7 @@ impl PairingService {
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("deleting pairing session"), e))?;
         self.secure_store.delete(&joiner_bundle_cache_key)?;
+        let _ = self.secure_store.delete(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY);
         self.secure_store.delete("bootstrap_joiner_bundle")?;
         self.secure_store.delete("bootstrap_joiner_device_id")?;
 
@@ -1607,6 +1635,20 @@ pub async fn cleanup_failed_setup(
     secure_store: &dyn SecureStore,
     relay: &dyn SyncRelay,
 ) -> Result<bool> {
+    // Best-effort: sweep one-shot caches orphaned by an abandoned pairing (not
+    // cancelled, not completed). Safe — a post-restart retry uses a fresh
+    // rendezvous, so any cached payload is encrypted under a discarded in-memory
+    // key and unreachable. Keys reconstructed from markers (no enumeration).
+    for marker in [
+        PAIRING_PENDING_CREDENTIAL_CACHE_KEY,
+        PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY,
+    ] {
+        if let Ok(Some(key)) = secure_store.get(marker) {
+            let _ = secure_store.delete(&String::from_utf8_lossy(&key));
+            let _ = secure_store.delete(marker);
+        }
+    }
+
     if secure_store.get("setup_rollback_marker")?.is_some() {
         let _ = relay.deregister().await;
         for key in [
@@ -3099,6 +3141,61 @@ mod tests {
             .await
             .unwrap()
             .expect("initiator should complete after retry posts joiner bundle");
+    }
+
+    #[test]
+    fn record_terminal_cache_key_supersedes_prior_orphan() {
+        let store = Arc::new(MemStore::default());
+        let service = PairingService::new(store.clone());
+        let k1 = pairing_terminal_cache_key(PAIRING_JOINER_BUNDLE_CACHE_PREFIX, "rid-1");
+        let k2 = pairing_terminal_cache_key(PAIRING_JOINER_BUNDLE_CACHE_PREFIX, "rid-2");
+
+        // A first ceremony caches k1, then is abandoned.
+        service.record_terminal_cache_key(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, &k1);
+        store.set(&k1, b"bundle-1").unwrap();
+
+        // A new ceremony (k2) supersedes the abandoned k1.
+        service.record_terminal_cache_key(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, &k2);
+        store.set(&k2, b"bundle-2").unwrap();
+        assert!(store.get(&k1).unwrap().is_none(), "superseded orphan purged");
+        assert_eq!(
+            store.get(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY).unwrap().unwrap(),
+            k2.as_bytes(),
+            "marker now records the live key"
+        );
+
+        // Re-recording the SAME key (a same-rid retry) must not purge the live cache.
+        service.record_terminal_cache_key(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, &k2);
+        assert!(
+            store.get(&k2).unwrap().is_some(),
+            "same-key re-record must keep the live cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_failed_setup_sweeps_orphaned_pairing_terminal_caches() {
+        // An abandoned pairing (not cancelled, not completed) leaves a one-shot
+        // terminal cache plus its marker, with no setup_rollback_marker.
+        let store = Arc::new(MemStore::default());
+        let cred_key =
+            pairing_terminal_cache_key(PAIRING_CREDENTIAL_BUNDLE_CACHE_PREFIX, "rid-cred");
+        store.set(&cred_key, b"encrypted-credential-bundle").unwrap();
+        store.set(PAIRING_PENDING_CREDENTIAL_CACHE_KEY, cred_key.as_bytes()).unwrap();
+        let joiner_key =
+            pairing_terminal_cache_key(PAIRING_JOINER_BUNDLE_CACHE_PREFIX, "rid-joiner");
+        store.set(&joiner_key, b"encrypted-joiner-bundle").unwrap();
+        store.set(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, joiner_key.as_bytes()).unwrap();
+
+        let performed = cleanup_failed_setup(store.as_ref(), &MockRelay).await.unwrap();
+
+        // Both orphaned caches and their markers are swept...
+        assert!(store.get(&cred_key).unwrap().is_none());
+        assert!(store.get(PAIRING_PENDING_CREDENTIAL_CACHE_KEY).unwrap().is_none());
+        assert!(store.get(&joiner_key).unwrap().is_none());
+        assert!(store.get(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY).unwrap().is_none());
+        // ...even with no setup_rollback_marker present (returns false: only
+        // best-effort cache hygiene ran, no destructive setup cleanup).
+        assert!(!performed);
     }
 
     /// NEGATIVE TEST 1 (C2 / existing-device X-Wing swap + relay injection).
