@@ -1027,6 +1027,8 @@ struct F13Fixture {
     engine: SyncEngine,
     signing_key_a: ed25519_dalek::SigningKey,
     ml_dsa_a: prism_sync_crypto::DevicePqSigningKey,
+    signing_key_b: ed25519_dalek::SigningKey,
+    ml_dsa_b: prism_sync_crypto::DevicePqSigningKey,
     device_a_id: &'static str,
     device_b_id: &'static str,
     signed_blob: Vec<u8>,
@@ -1149,6 +1151,8 @@ fn setup_f13_fixture_with_config(config: SyncConfig) -> F13Fixture {
         engine,
         signing_key_a,
         ml_dsa_a,
+        signing_key_b,
+        ml_dsa_b: ml_dsa_key_b,
         device_a_id,
         device_b_id,
         signed_blob,
@@ -3304,5 +3308,325 @@ async fn stale_generation_sender_health_tracks_and_recovers() {
             .iter()
             .any(|(s, r, n)| s == sender_id && r == "stale_key_generation" && *n == 1),
         "expected PullSenderRecovered(stale_key_generation) for the sender; got {recovered:?}"
+    );
+}
+
+/// Phase 2: once a sender is known-broken (it already has one budget-exhausted
+/// quarantine for a reason), later batches from that sender quarantine-and-
+/// advance after the shortened fast-quarantine budget instead of re-incurring the
+/// full per-seq stall budget once per batch. The first batch still pays the full
+/// budget; the second converts in 2 cycles where the full budget is 4.
+#[tokio::test]
+async fn sender_fast_quarantine_after_first_budget_exhaustion() {
+    // Normal budget 4, fast budget 2 — so the shortcut is observably shorter.
+    let f = setup_f13_fixture_with_config(SyncConfig {
+        pull_stall_max_attempts: 4,
+        sender_fast_quarantine_max_attempts: 2,
+        quarantine_replay_backoff_base_ms: 0,
+        ..SyncConfig::default()
+    });
+
+    // Inject a SECOND batch from the same unknown sender B (the fixture already
+    // injected batch-b1 at f.batch_seq).
+    let hlc2 = Hlc::now(f.device_b_id, None);
+    let ops2 = vec![CrdtChange {
+        op_id: format!("tasks:task-2:title:{}:{}", hlc2, f.device_b_id),
+        batch_id: Some("batch-b2".to_string()),
+        entity_id: "task-2".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Second from B\"".to_string(),
+        client_hlc: hlc2.to_string(),
+        is_delete: false,
+        device_id: f.device_b_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+    let env2 = make_encrypted_batch(
+        &ops2,
+        &f.key_hierarchy,
+        &f.signing_key_b,
+        &f.ml_dsa_b,
+        "batch-b2",
+        f.device_b_id,
+    );
+    let seq2 = f.relay.inject_batch(env2);
+    assert!(seq2 > f.batch_seq, "batch-b2 sits after batch-b1 in the log");
+
+    let run = || async {
+        f.engine
+            .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+            .await
+            .unwrap()
+    };
+
+    // Cycles 1–3: batch-b1 stalls within the full budget (paging stops on the
+    // first stall, so batch-b2 is never reached). Nothing quarantined yet.
+    for _ in 0..3 {
+        run().await;
+    }
+    assert!(
+        f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
+        "first batch still within its full budget"
+    );
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor frozen behind batch-b1"
+    );
+
+    // Cycle 4: batch-b1 hits the full budget (attempt 4) -> quarantine + advance;
+    // the page then continues to batch-b2, which takes its first stall this cycle.
+    run().await;
+    assert_eq!(
+        f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().len(),
+        1,
+        "batch-b1 quarantined on the full budget"
+    );
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        f.batch_seq,
+        "cursor advanced past batch-b1 only"
+    );
+
+    // Cycle 5: batch-b2's SECOND stall. The sender is now known-broken
+    // (quarantined_batch_count >= 1), so the fast budget (2) trips and batch-b2
+    // quarantines now — where the full budget would need attempts 3 and 4 (two
+    // more cycles).
+    run().await;
+    assert_eq!(
+        f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().len(),
+        2,
+        "batch-b2 fast-quarantined after 2 cycles, not the full budget of 4"
+    );
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        seq2,
+        "cursor advanced past both of B's batches"
+    );
+    let health = sender_health_row(&f.storage, f.device_b_id, "sender_unresolved");
+    assert_eq!(health.quarantined_batch_count, 2, "both of B's batches tallied");
+}
+
+/// The fast-quarantine shortcut is reset by recovery: after a sender's batch
+/// applies via Phase 0b replay (clearing its health), a later batch from that
+/// same sender once again gets the full budget rather than the shortened one.
+#[tokio::test]
+async fn sender_recovery_resets_fast_quarantine() {
+    let f = setup_f13_fixture_with_config(SyncConfig {
+        pull_stall_max_attempts: 3,
+        sender_fast_quarantine_max_attempts: 2,
+        quarantine_replay_backoff_base_ms: 0,
+        ..SyncConfig::default()
+    });
+
+    // Drive batch-b1 to quarantine (full budget 3): cycles 1,2 stall; cycle 3
+    // converts.
+    for _ in 0..3 {
+        f.engine
+            .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+            .await
+            .unwrap();
+    }
+    assert_eq!(f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().len(), 1);
+    assert_eq!(
+        sender_health_row(&f.storage, f.device_b_id, "sender_unresolved").quarantined_batch_count,
+        1,
+        "sender now known-broken"
+    );
+
+    // Recover: import the registry; Phase 0b replay applies batch-b1 and clears
+    // the sender's health (resetting the shortcut).
+    f.relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: f.signed_blob.clone(),
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+    f.engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        f.storage.list_pull_sender_health(SYNC_ID).unwrap().is_empty(),
+        "recovery cleared sender health — shortcut reset"
+    );
+
+    // With the shortcut reset, sender_fast_quarantine_tripped must NOT fire even
+    // at the fast threshold, because quarantined_batch_count is back to 0.
+    assert!(
+        f.storage.get_pull_sender_health(SYNC_ID, f.device_b_id, "sender_unresolved").unwrap().is_none(),
+        "no known-broken signal remains for B after recovery"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3: refresh_sender_registry_for_liveness (explicit registry repair)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Build a verifiable registry snapshot entry for `(device_id, gen)` from a
+/// device secret (gen 0 = base ML-DSA keypair, gen N>0 = keypair_v).
+fn refresh_registry_entry(
+    secret: &DeviceSecret,
+    device_id: &str,
+    gen: u32,
+) -> RegistrySnapshotEntry {
+    let dsa = if gen == 0 {
+        secret.ml_dsa_65_keypair(device_id).unwrap()
+    } else {
+        secret.ml_dsa_65_keypair_v(device_id, gen).unwrap()
+    };
+    RegistrySnapshotEntry {
+        sync_id: SYNC_ID.to_string(),
+        device_id: device_id.to_string(),
+        ed25519_public_key: secret.ed25519_keypair(device_id).unwrap().public_key_bytes().to_vec(),
+        x25519_public_key: secret.x25519_keypair(device_id).unwrap().public_key_bytes().to_vec(),
+        ml_dsa_65_public_key: dsa.public_key_bytes(),
+        ml_kem_768_public_key: secret.ml_kem_768_keypair(device_id).unwrap().public_key_bytes(),
+        x_wing_public_key: vec![],
+        status: "active".to_string(),
+        ml_dsa_key_generation: gen,
+        remote_wipe: false,
+    }
+}
+
+/// Minimal engine + storage for the refresh tests. The verifier is registered
+/// locally so it can verify signed registries; the sender is optionally
+/// pre-registered locally at `local_sender_gen`.
+struct RefreshFx {
+    relay: Arc<MockRelay>,
+    storage: Arc<RusqliteSyncStorage>,
+    engine: SyncEngine,
+    verifier_id: &'static str,
+    verifier_secret: DeviceSecret,
+    sender_id: &'static str,
+    sender_secret: DeviceSecret,
+}
+
+fn setup_refresh_fx(local_sender_gen: Option<u32>) -> RefreshFx {
+    let verifier_id = "device-verifier";
+    let verifier_secret = DeviceSecret::generate();
+    let sender_id = "device-sender";
+    let sender_secret = DeviceSecret::generate();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, verifier_id);
+    register_device_in_storage(
+        &storage,
+        verifier_id,
+        &verifier_secret.ed25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.x25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_dsa_65_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_kem_768_keypair(verifier_id).unwrap().public_key_bytes(),
+        0,
+    );
+    if let Some(gen) = local_sender_gen {
+        let dsa = if gen == 0 {
+            sender_secret.ml_dsa_65_keypair(sender_id).unwrap()
+        } else {
+            sender_secret.ml_dsa_65_keypair_v(sender_id, gen).unwrap()
+        };
+        register_device_in_storage(
+            &storage,
+            sender_id,
+            &sender_secret.ed25519_keypair(sender_id).unwrap().public_key_bytes(),
+            &sender_secret.x25519_keypair(sender_id).unwrap().public_key_bytes(),
+            &dsa.public_key_bytes(),
+            &sender_secret.ml_kem_768_keypair(sender_id).unwrap().public_key_bytes(),
+            gen,
+        );
+    }
+
+    let relay = Arc::new(MockRelay::new());
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![],
+        test_schema(),
+        SyncConfig::default(),
+    );
+
+    RefreshFx { relay, storage, engine, verifier_id, verifier_secret, sender_id, sender_secret }
+}
+
+/// Registry-unavailable: an unknown sender with no registry artifact fails closed
+/// and the precise error is preserved in sender health.
+#[tokio::test]
+async fn refresh_registry_unavailable_preserves_error() {
+    let fx = setup_refresh_fx(None); // sender NOT known locally
+    // MockRelay get_signed_registry returns Ok(None) by default.
+    let res = fx
+        .engine
+        .refresh_sender_registry_for_liveness(SYNC_ID, fx.sender_id, Some(0))
+        .await;
+    assert!(res.is_err(), "unknown sender with no registry must fail closed");
+    let health = fx
+        .storage
+        .get_pull_sender_health(SYNC_ID, fx.sender_id, "sender_unresolved")
+        .unwrap()
+        .expect("refresh recorded a sender-health diagnostic");
+    assert!(health.last_error.is_some(), "precise error preserved: {health:?}");
+}
+
+/// Registry-stale: the relay's signed registry verifies and imports but does not
+/// list the sender — fail closed, error preserved (never trust an artifact that
+/// omits the device).
+#[tokio::test]
+async fn refresh_registry_stale_missing_sender_preserves_error() {
+    let fx = setup_refresh_fx(None);
+    // A valid registry that lists ONLY the verifier — the sender is missing.
+    let blob = build_signed_registry_blob(
+        vec![refresh_registry_entry(&fx.verifier_secret, fx.verifier_id, 0)],
+        &fx.verifier_secret,
+        fx.verifier_id,
+    );
+    fx.relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+    let res = fx
+        .engine
+        .refresh_sender_registry_for_liveness(SYNC_ID, fx.sender_id, Some(0))
+        .await;
+    assert!(res.is_err(), "sender absent from the imported registry must fail closed");
+    let health = fx
+        .storage
+        .get_pull_sender_health(SYNC_ID, fx.sender_id, "sender_unresolved")
+        .unwrap()
+        .expect("diagnostic recorded");
+    assert!(health.last_error.is_some());
+}
+
+/// Generation-catch-up: the sender is known locally at gen 0, the relay now
+/// serves a gen-1 registry; a refresh imports gen 1 and resolves the sender at
+/// the new generation. The success path records no failure diagnostic.
+#[tokio::test]
+async fn refresh_generation_catch_up_resolves_new_generation() {
+    let fx = setup_refresh_fx(Some(0)); // sender known locally at gen 0
+    let blob = build_signed_registry_blob(
+        vec![
+            refresh_registry_entry(&fx.verifier_secret, fx.verifier_id, 0),
+            refresh_registry_entry(&fx.sender_secret, fx.sender_id, 1),
+        ],
+        &fx.verifier_secret,
+        fx.verifier_id,
+    );
+    fx.relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+    let info = fx
+        .engine
+        .refresh_sender_registry_for_liveness(SYNC_ID, fx.sender_id, Some(1))
+        .await
+        .expect("gen-1 registry imports and resolves the sender");
+    assert_eq!(info.ml_dsa_key_generation, 1, "refresh caught the sender up to gen 1");
+    assert!(
+        fx.storage
+            .get_pull_sender_health(SYNC_ID, fx.sender_id, "sender_unresolved")
+            .unwrap()
+            .is_none(),
+        "no failure diagnostic recorded on the success path"
     );
 }

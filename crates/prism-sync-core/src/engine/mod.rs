@@ -1093,6 +1093,14 @@ impl SyncEngine {
                     if self
                         .stall_budget_exhausted(sync_id, batch.server_seq, attempts)
                         .await?
+                        || self
+                            .sender_fast_quarantine_tripped(
+                                sync_id,
+                                &envelope.sender_device_id,
+                                TransientPullReason::SenderUnresolved.as_str(),
+                                attempts,
+                            )
+                            .await?
                     {
                         tracing::warn!(
                             "Sender {} unresolvable after {attempts} attempts ({e}); \
@@ -1201,6 +1209,14 @@ impl SyncEngine {
                 if self
                     .stall_budget_exhausted(sync_id, batch.server_seq, attempts)
                     .await?
+                    || self
+                        .sender_fast_quarantine_tripped(
+                            sync_id,
+                            &envelope.sender_device_id,
+                            TransientPullReason::StaleKeyGeneration.as_str(),
+                            attempts,
+                        )
+                        .await?
                 {
                     tracing::warn!(
                         "ML-DSA generation {} for sender {} unresolvable after {attempts} \
@@ -1640,6 +1656,60 @@ impl SyncEngine {
                     // skip-and-advance.
                     Err(read_err) => SenderResolution::TransientlyUnavailable(read_err),
                 }
+            }
+        }
+    }
+
+    /// Phase 3: explicit, diagnostic-grade registry repair for one sender.
+    ///
+    /// Force-resolves `sender_device_id` — fetching, verifying, and importing the
+    /// signed registry as needed, generation-aware via `expected_generation` —
+    /// and on failure records the EXACT verification / import / fetch error into
+    /// `pull_sender_health.last_error` so a support surface sees *why* a peer will
+    /// not resolve, not just a generic `sender_unresolved` stall. Returns the
+    /// resolved [`SenderKeyInfo`] on success.
+    ///
+    /// This never accepts an unverifiable artifact: it delegates to the same
+    /// fail-closed [`resolve_sender_keys_with_generation_hint`] /
+    /// `verify_and_import_signed_registry` the live pull path uses, so the goal is
+    /// not to trust more — it is to centralize the repair attempt and its
+    /// diagnostics and avoid silent repetition. The live pull and Phase 0b replay
+    /// paths already trigger this resolution implicitly on every attempt; this is
+    /// the explicit entry point for support tooling / FFI to retry one sender on
+    /// demand and capture the precise outcome.
+    pub async fn refresh_sender_registry_for_liveness(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+        expected_generation: Option<u32>,
+    ) -> Result<SenderKeyInfo> {
+        match self
+            .resolve_sender_keys_with_generation_hint(
+                sync_id,
+                sender_device_id,
+                expected_generation,
+            )
+            .await
+        {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                // Preserve the precise error for diagnostics (best-effort: a
+                // failure to record must never mask the original resolution error).
+                if let Err(touch_err) = self
+                    .touch_sender_pull_health(
+                        sync_id,
+                        sender_device_id,
+                        PermanentPullReason::SenderUnresolved.as_str(),
+                        &e.to_string(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        sender_device_id,
+                        "failed to record sender-health diagnostic: {touch_err}"
+                    );
+                }
+                Err(e)
             }
         }
     }
@@ -2512,6 +2582,55 @@ impl SyncEngine {
             }
         }
         Ok(false)
+    }
+
+    /// Sender-level fast-quarantine shortcut (Phase 2). Returns `true` when a
+    /// *known-broken* sender's stall should convert to quarantine-and-advance
+    /// after the shortened [`SyncConfig::sender_fast_quarantine_max_attempts`]
+    /// budget instead of the full per-seq budget.
+    ///
+    /// "Known-broken" = this sender already has at least one batch durably
+    /// quarantined for the *same reason* (a nonzero
+    /// `pull_sender_health.quarantined_batch_count`) — so the first affected
+    /// sequence still paid the full budget, but every later batch from that
+    /// sender/reason no longer re-incurs the full head-of-line stall. A Phase 0b
+    /// replay recovery clears the sender's health,
+    /// which automatically resets the shortcut. Layered ON TOP of
+    /// [`stall_budget_exhausted`] (the caller ORs the two), so the normal budget
+    /// and the 24h age ceiling still apply; this only ever converts *sooner*.
+    /// Fail-closed is unchanged — a quarantine preserves the envelope for replay
+    /// and never applies anything unverified.
+    async fn sender_fast_quarantine_tripped(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+        reason: &str,
+        attempts: i64,
+    ) -> Result<bool> {
+        if attempts < self.config.sender_fast_quarantine_max_attempts {
+            return Ok(false);
+        }
+        let known_broken = self
+            .read_sender_pull_health(sync_id, sender_device_id, reason)
+            .await?
+            .is_some_and(|h| h.quarantined_batch_count >= 1);
+        Ok(known_broken)
+    }
+
+    /// Read the `pull_sender_health` row for `(sender, reason)` off the reactor.
+    async fn read_sender_pull_health(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+        reason: &str,
+    ) -> Result<Option<PullSenderHealth>> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let sender = sender_device_id.to_string();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || storage.get_pull_sender_health(&sid, &sender, &reason))
+            .await
+            .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?
     }
 
     /// Clear a transient stall row for `server_seq` ONLY if its current reason

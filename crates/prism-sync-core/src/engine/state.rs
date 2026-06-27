@@ -154,6 +154,17 @@ pub const DEFAULT_PULL_STALL_MAX_ATTEMPTS: i64 = 8;
 /// floor indefinitely.
 pub const DEFAULT_PULL_STALL_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// Shortened stall budget (in cycles) applied to a *known-broken* sender — one
+/// that has already had at least one batch convert to a durable quarantine for
+/// the same reason (tracked in `pull_sender_health`). The first affected
+/// sequence still uses the full [`DEFAULT_PULL_STALL_MAX_ATTEMPTS`]; every later
+/// batch from that sender/reason quarantine-and-advances after this many cycles
+/// so a persistently-unresolvable peer cannot re-incur the full head-of-line
+/// stall once per batch. Reset when a Phase 0b replay recovery clears the
+/// sender's health. Fail-closed semantics are unchanged — this only quarantines
+/// (custody preserved, replayable) sooner; nothing is applied unverified.
+pub const DEFAULT_SENDER_FAST_QUARANTINE_MAX_ATTEMPTS: i64 = 2;
+
 /// Configuration for the sync engine.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -189,6 +200,12 @@ pub struct SyncConfig {
     /// stall budget — whichever bound trips first wins. See
     /// [`DEFAULT_PULL_STALL_MAX_AGE_MS`].
     pub pull_stall_max_age_ms: i64,
+    /// Shortened per-cycle stall budget for a sender already known to be broken
+    /// for a given reason (it has a prior budget-exhausted quarantine recorded in
+    /// `pull_sender_health`). See [`DEFAULT_SENDER_FAST_QUARANTINE_MAX_ATTEMPTS`].
+    /// Configurable so tests can exercise the shortcut; set `>=
+    /// pull_stall_max_attempts` to disable it.
+    pub sender_fast_quarantine_max_attempts: i64,
 }
 
 impl Default for SyncConfig {
@@ -201,6 +218,7 @@ impl Default for SyncConfig {
             quarantine_replay_backoff_base_ms: DEFAULT_QUARANTINE_REPLAY_BACKOFF_BASE_MS,
             pull_stall_max_attempts: DEFAULT_PULL_STALL_MAX_ATTEMPTS,
             pull_stall_max_age_ms: DEFAULT_PULL_STALL_MAX_AGE_MS,
+            sender_fast_quarantine_max_attempts: DEFAULT_SENDER_FAST_QUARANTINE_MAX_ATTEMPTS,
         }
     }
 }
