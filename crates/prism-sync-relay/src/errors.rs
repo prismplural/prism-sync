@@ -19,6 +19,8 @@ pub enum AppError {
     FirstDeviceAdmissionInvalid,
     #[error("UpgradeRequired(min_signature_version={min_signature_version})")]
     UpgradeRequired { min_signature_version: u8 },
+    #[error("EpochMismatch(envelope_epoch={envelope_epoch}, relay_epoch={relay_epoch})")]
+    EpochMismatch { envelope_epoch: i64, relay_epoch: i64 },
     #[error("Forbidden({0})")]
     Forbidden(&'static str),
     #[error("NotFound")]
@@ -74,6 +76,7 @@ impl IntoResponse for AppError {
             AppError::FirstDeviceAdmissionRequired => StatusCode::FORBIDDEN,
             AppError::FirstDeviceAdmissionInvalid => StatusCode::FORBIDDEN,
             AppError::UpgradeRequired { .. } => StatusCode::FORBIDDEN,
+            AppError::EpochMismatch { .. } => StatusCode::FORBIDDEN,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Conflict(_) => StatusCode::CONFLICT,
@@ -151,6 +154,15 @@ impl IntoResponse for AppError {
                 }),
             )
                 .into_response(),
+            AppError::EpochMismatch { envelope_epoch, relay_epoch } => {
+                let body = serde_json::json!({
+                    "error": "epoch_mismatch",
+                    "message": "Envelope epoch does not match relay epoch; perform epoch recovery first",
+                    "envelope_epoch": envelope_epoch,
+                    "relay_epoch": relay_epoch,
+                });
+                (status, Json(body)).into_response()
+            }
             AppError::Forbidden(msg) => (status, msg.to_string()).into_response(),
             AppError::NotFound => (status, "Not Found".to_string()).into_response(),
             AppError::Conflict(msg) => (status, msg.to_string()).into_response(),

@@ -723,6 +723,10 @@ async fn test_push_rejects_wrong_epoch() {
     let push_resp =
         push_signed(&client, &url, &sync_id, &device_id, &token, &keys, &envelope).await;
     assert_eq!(push_resp.status(), 403, "push with wrong epoch should be rejected");
+    let body: Value = push_resp.json().await.unwrap();
+    assert_eq!(body["error"], "epoch_mismatch");
+    assert_eq!(body["envelope_epoch"], 5);
+    assert_eq!(body["relay_epoch"], 0);
 }
 
 // ───────────────── Tests: unsigned mutation requests are rejected ──────────

@@ -30,7 +30,7 @@ use crate::events::{ChangeSet, EntityChange, SyncError, SyncErrorKind, SyncEvent
 use crate::recovery::{
     persist_epoch_cache, persist_epoch_key, EpochRecoverer, RecoveryCommitToken,
 };
-use crate::relay::traits::{SnapshotUploadProgress, SyncNotification};
+use crate::relay::traits::{RelayError, SnapshotUploadProgress, SyncNotification};
 use crate::relay::SyncRelay;
 use crate::runtime::background_runtime;
 use crate::storage::StorageError;
@@ -116,13 +116,48 @@ impl<'a> ReactiveRecoveryState<'a> {
             Some(self.recovered_high_water.map(|current| current.max(epoch)).unwrap_or(epoch));
     }
 
-    fn forget_recovered_epoch(&mut self, epoch: u32) -> Option<RecoveryCommitToken> {
-        let token = self.tokens.remove(&epoch);
+    fn recovered_suffix_from(&self, epoch: u32) -> Vec<(u32, RecoveryCommitToken)> {
+        let mut suffix: Vec<_> = self
+            .tokens
+            .iter()
+            .filter(|(recovered, _)| **recovered >= epoch)
+            .map(|(epoch, token)| (*epoch, *token))
+            .collect();
+        suffix.sort_by(|(left, _), (right, _)| right.cmp(left));
+        suffix
+    }
+
+    fn forget_recovered_epoch_after_rollback(&mut self, epoch: u32) {
+        self.tokens.remove(&epoch);
         self.recovered_high_water = self.tokens.keys().copied().max();
-        token
+    }
+
+    fn note_recovery_attempt(&mut self, epoch: u32) -> Result<()> {
+        if self.attempts.contains(&epoch) {
+            return Err(CoreError::Engine(format!(
+                "reactive epoch recovery already attempted epoch {epoch}"
+            )));
+        }
+        if self.attempts.len() >= MAX_REACTIVE_RECOVERIES_PER_SYNC {
+            return Err(CoreError::Engine("reactive epoch recovery budget exhausted".into()));
+        }
+        self.attempts.insert(epoch);
+        Ok(())
+    }
+
+    fn note_no_progress_retry(&mut self, epoch: u32) -> Result<bool> {
+        if self.attempts.contains(&epoch) {
+            return Ok(false);
+        }
+        if self.attempts.len() >= MAX_REACTIVE_RECOVERIES_PER_SYNC {
+            return Err(CoreError::Engine("reactive epoch recovery budget exhausted".into()));
+        }
+        self.attempts.insert(epoch);
+        Ok(true)
     }
 }
 
+#[derive(Debug)]
 enum RecoveryControl {
     Retry,
     ReturnErr(CoreError),
@@ -1068,61 +1103,164 @@ impl SyncService {
 
         match error {
             CoreError::MissingEpochKey { epoch } => {
-                if state.attempts.len() >= MAX_REACTIVE_RECOVERIES_PER_SYNC {
-                    return RecoveryControl::ReturnErr(CoreError::Engine(
-                        "reactive epoch recovery budget exhausted".into(),
-                    ));
-                }
-                if !state.attempts.insert(epoch) {
-                    return RecoveryControl::ReturnErr(CoreError::MissingEpochKey { epoch });
-                }
-
-                let key_bytes = match recoverer.recover(epoch).await {
-                    Ok(key_bytes) => key_bytes,
+                let local_epoch = match recoverer.current_epoch().await {
+                    Ok(epoch) => epoch,
                     Err(error) => return RecoveryControl::ReturnErr(error),
                 };
-
-                // Fail-closed: bind the relay-derived key to the verified
-                // registry hash BEFORE install or commit, so a poisoned key is
-                // never persisted (closing the crash-window before AEAD rollback).
-                let registry = match recoverer.verified_registry().await {
-                    Ok(registry) => registry,
-                    Err(error) => return RecoveryControl::ReturnErr(error),
-                };
-                let vk = match crate::epoch::VerifiedEpochKey::verify(
-                    epoch,
-                    Zeroizing::new(key_bytes.to_vec()),
-                    &registry,
-                ) {
-                    Ok(vk) => vk,
-                    Err(error) => return RecoveryControl::ReturnErr(error),
-                };
-                crate::epoch::install_epoch_key(state.key_hierarchy, vk);
-
-                match recoverer.commit_recovered_epoch(epoch, &key_bytes).await {
-                    Ok(token) => {
-                        state.note_recovered_epoch(epoch, token);
-                        RecoveryControl::Retry
+                if epoch <= local_epoch {
+                    match self.recover_verified_epoch(recoverer.as_ref(), state, epoch, false).await
+                    {
+                        Ok(()) => RecoveryControl::Retry,
+                        Err(error) => RecoveryControl::ReturnErr(error),
                     }
-                    Err(error) => {
-                        state.key_hierarchy.remove_epoch_key(epoch);
-                        RecoveryControl::ReturnErr(error)
-                    }
+                } else {
+                    self.recover_verified_epoch_range(recoverer.as_ref(), state, local_epoch, epoch)
+                        .await
                 }
+            }
+            CoreError::EpochMismatch { local_epoch, relay_epoch, message } => {
+                let committed_epoch = match recoverer.current_epoch().await {
+                    Ok(epoch) => epoch,
+                    Err(error) => return RecoveryControl::ReturnErr(error),
+                };
+                if relay_epoch == committed_epoch {
+                    return match state.note_no_progress_retry(relay_epoch) {
+                        Ok(true) => RecoveryControl::Retry,
+                        Ok(false) => RecoveryControl::ReturnErr(CoreError::EpochMismatch {
+                            local_epoch,
+                            relay_epoch,
+                            message,
+                        }),
+                        Err(error) => RecoveryControl::ReturnErr(error),
+                    };
+                }
+                if relay_epoch < committed_epoch || relay_epoch <= local_epoch {
+                    return RecoveryControl::ReturnErr(CoreError::EpochMismatch {
+                        local_epoch,
+                        relay_epoch,
+                        message,
+                    });
+                }
+                self.recover_verified_epoch_range(
+                    recoverer.as_ref(),
+                    state,
+                    committed_epoch,
+                    relay_epoch,
+                )
+                .await
             }
             CoreError::DecryptFailed { epoch, source } => {
-                let Some(token) = state.forget_recovered_epoch(epoch) else {
+                let suffix = state.recovered_suffix_from(epoch);
+                if suffix.is_empty() {
                     return RecoveryControl::NotHandled(CoreError::DecryptFailed { epoch, source });
                 };
-                state.key_hierarchy.remove_epoch_key(epoch);
-                match recoverer.rollback_recovered_epoch(epoch, token).await {
-                    Ok(()) => {
-                        RecoveryControl::ReturnErr(CoreError::DecryptFailed { epoch, source })
+                for (rollback_epoch, token) in suffix {
+                    match recoverer.rollback_recovered_epoch(rollback_epoch, token).await {
+                        Ok(()) => {
+                            state.key_hierarchy.remove_epoch_key(rollback_epoch);
+                            state.forget_recovered_epoch_after_rollback(rollback_epoch);
+                        }
+                        Err(error) => return RecoveryControl::ReturnErr(error),
                     }
-                    Err(error) => RecoveryControl::ReturnErr(error),
                 }
+                RecoveryControl::ReturnErr(CoreError::DecryptFailed { epoch, source })
             }
             other => RecoveryControl::NotHandled(other),
+        }
+    }
+
+    async fn recover_verified_epoch_range(
+        &self,
+        recoverer: &dyn EpochRecoverer,
+        state: &mut ReactiveRecoveryState<'_>,
+        from_exclusive: u32,
+        through_inclusive: u32,
+    ) -> RecoveryControl {
+        if through_inclusive <= from_exclusive {
+            return RecoveryControl::ReturnErr(CoreError::Engine(format!(
+                "reactive epoch recovery range is empty ({from_exclusive}..={through_inclusive})"
+            )));
+        }
+
+        for epoch in from_exclusive.saturating_add(1)..=through_inclusive {
+            if let Err(error) = self.recover_verified_epoch(recoverer, state, epoch, true).await {
+                return RecoveryControl::ReturnErr(error);
+            }
+        }
+        RecoveryControl::Retry
+    }
+
+    async fn recover_verified_epoch(
+        &self,
+        recoverer: &dyn EpochRecoverer,
+        state: &mut ReactiveRecoveryState<'_>,
+        epoch: u32,
+        advance_current_epoch: bool,
+    ) -> Result<()> {
+        state.note_recovery_attempt(epoch)?;
+
+        // Fail-closed: consult a signature-verified registry before asking the
+        // relay for key material. A registry that proves this device was removed
+        // must surface the existing device-revoked path even if the relay refuses
+        // to serve a rekey artifact to the revoked device.
+        let registry = recoverer.verified_registry().await?;
+        if registry.current_epoch < epoch {
+            return Err(CoreError::Engine(format!(
+                "signed registry lags recovered epoch {epoch} (registry current_epoch={})",
+                registry.current_epoch
+            )));
+        }
+        match registry.entries.iter().find(|entry| entry.device_id == recoverer.device_id()) {
+            Some(entry) if entry.status == "active" => {}
+            Some(entry) => {
+                return Err(CoreError::from_relay(RelayError::DeviceRevoked {
+                    remote_wipe: entry.remote_wipe,
+                }));
+            }
+            None => {
+                return Err(CoreError::from_relay(RelayError::DeviceRevoked {
+                    remote_wipe: false,
+                }));
+            }
+        }
+
+        let had_key = state.key_hierarchy.has_epoch_key(epoch);
+        let key_bytes = if had_key {
+            Zeroizing::new(state.key_hierarchy.epoch_key(epoch)?.to_vec())
+        } else {
+            recoverer.recover(epoch).await?
+        };
+
+        let vk = crate::epoch::VerifiedEpochKey::verify(
+            epoch,
+            Zeroizing::new(key_bytes.to_vec()),
+            &registry,
+        )?;
+        crate::epoch::install_epoch_key(state.key_hierarchy, vk);
+
+        if advance_current_epoch {
+            match recoverer.commit_recovered_epoch(epoch, &key_bytes).await {
+                Ok(token) => {
+                    state.note_recovered_epoch(epoch, token);
+                    Ok(())
+                }
+                Err(error) => {
+                    if !had_key {
+                        state.key_hierarchy.remove_epoch_key(epoch);
+                    }
+                    Err(error)
+                }
+            }
+        } else {
+            match recoverer.persist_recovered_epoch_key_only(epoch, &key_bytes).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    if !had_key {
+                        state.key_hierarchy.remove_epoch_key(epoch);
+                    }
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -1842,12 +1980,12 @@ mod tests {
     // bound to the wrong registry hash must be refused with NO install and NO
     // commit (no current_epoch advance / persisted key).
 
-    use crate::pairing::{compute_epoch_key_hash, SignedRegistrySnapshot};
+    use crate::pairing::{compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot};
     use crate::recovery::{EpochRecoverer, RecoveryCommitToken};
     use prism_sync_crypto::KeyHierarchy;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use zeroize::Zeroizing;
 
     /// Mock recoverer: serves a chosen (possibly poisoned) key and a fixed
@@ -1855,11 +1993,24 @@ mod tests {
     struct MockRecoverer {
         served_key: [u8; 32],
         registry: SignedRegistrySnapshot,
+        current_epoch: u32,
+        device_id: String,
         committed: Arc<AtomicBool>,
+        committed_epochs: Arc<Mutex<Vec<u32>>>,
+        key_only_epochs: Arc<Mutex<Vec<u32>>>,
+        rolled_back_epochs: Arc<Mutex<Vec<u32>>>,
     }
 
     #[async_trait::async_trait]
     impl EpochRecoverer for MockRecoverer {
+        fn device_id(&self) -> &str {
+            &self.device_id
+        }
+
+        async fn current_epoch(&self) -> Result<u32> {
+            Ok(self.current_epoch)
+        }
+
         async fn recover(&self, _epoch: u32) -> Result<Zeroizing<Vec<u8>>> {
             Ok(Zeroizing::new(self.served_key.to_vec()))
         }
@@ -1870,20 +2021,53 @@ mod tests {
 
         async fn commit_recovered_epoch(
             &self,
-            _epoch: u32,
+            epoch: u32,
             _key_bytes: &[u8],
         ) -> Result<RecoveryCommitToken> {
             self.committed.store(true, Ordering::SeqCst);
-            Ok(RecoveryCommitToken { previous_epoch: 0 })
+            self.committed_epochs.lock().unwrap().push(epoch);
+            Ok(RecoveryCommitToken { previous_epoch: epoch.saturating_sub(1) as i32 })
+        }
+
+        async fn persist_recovered_epoch_key_only(
+            &self,
+            epoch: u32,
+            _key_bytes: &[u8],
+        ) -> Result<()> {
+            self.key_only_epochs.lock().unwrap().push(epoch);
+            Ok(())
         }
 
         async fn rollback_recovered_epoch(
             &self,
-            _epoch: u32,
+            epoch: u32,
             _token: RecoveryCommitToken,
         ) -> Result<()> {
+            self.rolled_back_epochs.lock().unwrap().push(epoch);
             Ok(())
         }
+    }
+
+    fn active_registry_entry(device_id: &str) -> RegistrySnapshotEntry {
+        RegistrySnapshotEntry {
+            sync_id: "sync-1".to_string(),
+            device_id: device_id.to_string(),
+            ed25519_public_key: vec![],
+            x25519_public_key: vec![],
+            ml_dsa_65_public_key: vec![],
+            ml_kem_768_public_key: vec![],
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+            remote_wipe: false,
+        }
+    }
+
+    fn revoked_registry_entry(device_id: &str, remote_wipe: bool) -> RegistrySnapshotEntry {
+        let mut entry = active_registry_entry(device_id);
+        entry.status = "revoked".to_string();
+        entry.remote_wipe = remote_wipe;
+        entry
     }
 
     /// NEGATIVE: relay serves a poisoned key while the signed registry commits
@@ -1896,8 +2080,9 @@ mod tests {
 
         let real_key = [0x11u8; 32];
         let attacker_key = [0x41u8; 32];
+        let device_id = "device-1";
         let registry = SignedRegistrySnapshot::new_with_epoch_binding(
-            vec![],
+            vec![active_registry_entry(device_id)],
             0,
             5,
             BTreeMap::from([(5u32, compute_epoch_key_hash(&real_key))]),
@@ -1906,7 +2091,12 @@ mod tests {
         service.set_recoverer(Arc::new(MockRecoverer {
             served_key: attacker_key,
             registry,
+            current_epoch: 4,
+            device_id: device_id.to_string(),
             committed: committed.clone(),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
         }));
 
         let mut kh = KeyHierarchy::new();
@@ -1938,8 +2128,9 @@ mod tests {
         let mut service = SyncService::new(event_tx);
 
         let real_key = [0x11u8; 32];
+        let device_id = "device-1";
         let registry = SignedRegistrySnapshot::new_with_epoch_binding(
-            vec![],
+            vec![active_registry_entry(device_id)],
             0,
             5,
             BTreeMap::from([(5u32, compute_epoch_key_hash(&real_key))]),
@@ -1948,7 +2139,12 @@ mod tests {
         service.set_recoverer(Arc::new(MockRecoverer {
             served_key: real_key,
             registry,
+            current_epoch: 4,
+            device_id: device_id.to_string(),
             committed: committed.clone(),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
         }));
 
         let mut kh = KeyHierarchy::new();
@@ -1978,8 +2174,9 @@ mod tests {
         let mut service = SyncService::new(event_tx);
 
         // Registry commits epoch 7, but we recover epoch 5 → no hash for 5.
+        let device_id = "device-1";
         let registry = SignedRegistrySnapshot::new_with_epoch_binding(
-            vec![],
+            vec![active_registry_entry(device_id)],
             0,
             7,
             BTreeMap::from([(7u32, compute_epoch_key_hash(&[0x22u8; 32]))]),
@@ -1988,7 +2185,12 @@ mod tests {
         service.set_recoverer(Arc::new(MockRecoverer {
             served_key: [0x11u8; 32],
             registry,
+            current_epoch: 4,
+            device_id: device_id.to_string(),
             committed: committed.clone(),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
         }));
 
         let mut kh = KeyHierarchy::new();
@@ -2006,6 +2208,450 @@ mod tests {
         drop(state); // release the &mut borrow on `kh` before inspecting it
         assert!(!kh.has_epoch_key(5), "no key may be installed");
         assert!(!committed.load(Ordering::SeqCst), "no commit on refusal");
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_epoch_mismatch_recovers_contiguous_range() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let real_key = [0x33u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![active_registry_entry(device_id)],
+            0,
+            3,
+            BTreeMap::from([
+                (1u32, compute_epoch_key_hash(&real_key)),
+                (2u32, compute_epoch_key_hash(&real_key)),
+                (3u32, compute_epoch_key_hash(&real_key)),
+            ]),
+        );
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_epochs = Arc::new(Mutex::new(vec![]));
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            current_epoch: 0,
+            device_id: device_id.to_string(),
+            committed: committed.clone(),
+            committed_epochs: committed_epochs.clone(),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 0,
+                    relay_epoch: 3,
+                    message: "recover first".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+
+        assert!(matches!(control, RecoveryControl::Retry));
+        let high_water = state.recovered_high_water;
+        drop(state);
+        assert_eq!(*committed_epochs.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(high_water, Some(3));
+        for epoch in 1..=3 {
+            assert!(kh.has_epoch_key(epoch), "epoch {epoch} key must be installed");
+            assert_eq!(kh.epoch_key(epoch).unwrap(), &real_key);
+        }
+        assert!(committed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_decrypt_failed_rolls_back_recovered_suffix() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let real_key = [0x34u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![active_registry_entry(device_id)],
+            0,
+            3,
+            BTreeMap::from([
+                (1u32, compute_epoch_key_hash(&real_key)),
+                (2u32, compute_epoch_key_hash(&real_key)),
+                (3u32, compute_epoch_key_hash(&real_key)),
+            ]),
+        );
+        let committed_epochs = Arc::new(Mutex::new(vec![]));
+        let rolled_back_epochs = Arc::new(Mutex::new(vec![]));
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            current_epoch: 0,
+            device_id: device_id.to_string(),
+            committed: Arc::new(AtomicBool::new(false)),
+            committed_epochs: committed_epochs.clone(),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: rolled_back_epochs.clone(),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let recovery = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 0,
+                    relay_epoch: 3,
+                    message: "recover first".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+        assert!(matches!(recovery, RecoveryControl::Retry));
+
+        let decrypt_failure = service
+            .handle_reactive_recovery(
+                CoreError::DecryptFailed {
+                    epoch: 2,
+                    source: prism_sync_crypto::CryptoError::DecryptionFailed(
+                        "bad ciphertext".into(),
+                    ),
+                },
+                Some(&mut state),
+            )
+            .await;
+
+        match decrypt_failure {
+            RecoveryControl::ReturnErr(CoreError::DecryptFailed { epoch: 2, .. }) => {}
+            other => panic!("expected terminal decrypt failure, got {other:?}"),
+        }
+        let high_water = state.recovered_high_water;
+        drop(state);
+
+        assert_eq!(*committed_epochs.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(*rolled_back_epochs.lock().unwrap(), vec![3, 2]);
+        assert_eq!(high_water, Some(1));
+        assert!(kh.has_epoch_key(1));
+        assert!(!kh.has_epoch_key(2));
+        assert!(!kh.has_epoch_key(3));
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_relay_behind_committed_epoch_surfaces_error() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let real_key = [0x38u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![active_registry_entry(device_id)],
+            0,
+            5,
+            BTreeMap::from([(5u32, compute_epoch_key_hash(&real_key))]),
+        );
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            current_epoch: 5,
+            device_id: device_id.to_string(),
+            committed: Arc::new(AtomicBool::new(false)),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 5,
+                    relay_epoch: 2,
+                    message: "relay behind".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+
+        match control {
+            RecoveryControl::ReturnErr(CoreError::EpochMismatch {
+                local_epoch: 5,
+                relay_epoch: 2,
+                ..
+            }) => {}
+            other => panic!("expected unrecoverable epoch mismatch, got {other:?}"),
+        }
+        assert!(state.recovered_high_water.is_none());
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_equal_committed_epoch_retries_once_then_surfaces_error() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let real_key = [0x39u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![active_registry_entry(device_id)],
+            0,
+            5,
+            BTreeMap::from([(5u32, compute_epoch_key_hash(&real_key))]),
+        );
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            current_epoch: 5,
+            device_id: device_id.to_string(),
+            committed: Arc::new(AtomicBool::new(false)),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let first = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 4,
+                    relay_epoch: 5,
+                    message: "retry with committed epoch".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+        assert!(matches!(first, RecoveryControl::Retry));
+
+        let second = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 4,
+                    relay_epoch: 5,
+                    message: "retry with committed epoch".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+        match second {
+            RecoveryControl::ReturnErr(CoreError::EpochMismatch {
+                local_epoch: 4,
+                relay_epoch: 5,
+                ..
+            }) => {}
+            other => panic!("expected bounded epoch mismatch, got {other:?}"),
+        }
+        assert!(state.recovered_high_water.is_none());
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_large_epoch_gap_keeps_verified_prefix_on_budget_exhaustion() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let real_key = [0x44u8; 32];
+        let through = MAX_REACTIVE_RECOVERIES_PER_SYNC as u32 + 1;
+        let hashes =
+            (1..=through).map(|epoch| (epoch, compute_epoch_key_hash(&real_key))).collect();
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![active_registry_entry(device_id)],
+            0,
+            through,
+            hashes,
+        );
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_epochs = Arc::new(Mutex::new(vec![]));
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            current_epoch: 0,
+            device_id: device_id.to_string(),
+            committed,
+            committed_epochs: committed_epochs.clone(),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 0,
+                    relay_epoch: through,
+                    message: "recover first".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+
+        match control {
+            RecoveryControl::ReturnErr(err) => {
+                assert!(err.to_string().contains("budget exhausted"), "unexpected error: {err}");
+            }
+            _ => panic!("expected budget exhaustion"),
+        }
+        let high_water = state.recovered_high_water;
+        drop(state);
+        let expected: Vec<u32> = (1..=MAX_REACTIVE_RECOVERIES_PER_SYNC as u32).collect();
+        assert_eq!(*committed_epochs.lock().unwrap(), expected);
+        assert_eq!(high_water, Some(MAX_REACTIVE_RECOVERIES_PER_SYNC as u32));
+        assert!(kh.has_epoch_key(MAX_REACTIVE_RECOVERIES_PER_SYNC as u32));
+        assert!(!kh.has_epoch_key(through), "budget-exhausted suffix must not be installed");
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_historical_missing_key_does_not_advance_current_epoch() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let historical_key = [0x55u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![active_registry_entry(device_id)],
+            0,
+            5,
+            BTreeMap::from([(3u32, compute_epoch_key_hash(&historical_key))]),
+        );
+        let committed = Arc::new(AtomicBool::new(false));
+        let key_only_epochs = Arc::new(Mutex::new(vec![]));
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: historical_key,
+            registry,
+            current_epoch: 5,
+            device_id: device_id.to_string(),
+            committed: committed.clone(),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: key_only_epochs.clone(),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(CoreError::MissingEpochKey { epoch: 3 }, Some(&mut state))
+            .await;
+
+        assert!(matches!(control, RecoveryControl::Retry));
+        let high_water = state.recovered_high_water;
+        drop(state);
+        assert_eq!(*key_only_epochs.lock().unwrap(), vec![3]);
+        assert!(!committed.load(Ordering::SeqCst));
+        assert_eq!(high_water, None, "historical key install must not advance high water");
+        assert!(kh.has_epoch_key(3));
+        assert_eq!(kh.epoch_key(3).unwrap(), &historical_key);
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_revoked_self_surfaces_device_revoked() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let real_key = [0x66u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![revoked_registry_entry(device_id, true)],
+            0,
+            1,
+            BTreeMap::from([(1u32, compute_epoch_key_hash(&real_key))]),
+        );
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            current_epoch: 0,
+            device_id: device_id.to_string(),
+            committed: Arc::new(AtomicBool::new(false)),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 0,
+                    relay_epoch: 1,
+                    message: "recover first".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+
+        match control {
+            RecoveryControl::ReturnErr(CoreError::Relay {
+                code: Some(code),
+                remote_wipe: Some(true),
+                ..
+            }) => assert_eq!(code, "device_revoked"),
+            other => panic!("expected device_revoked relay error, got {other:?}"),
+        }
+        drop(state);
+        assert!(!kh.has_epoch_key(1), "revoked devices must not install recovered keys");
+    }
+
+    #[tokio::test]
+    async fn reactive_recovery_stale_registry_is_not_treated_as_device_revoked() {
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+
+        let device_id = "device-1";
+        let real_key = [0x77u8; 32];
+        let registry = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![revoked_registry_entry(device_id, true)],
+            0,
+            1,
+            BTreeMap::from([(1u32, compute_epoch_key_hash(&real_key))]),
+        );
+        service.set_recoverer(Arc::new(MockRecoverer {
+            served_key: real_key,
+            registry,
+            current_epoch: 1,
+            device_id: device_id.to_string(),
+            committed: Arc::new(AtomicBool::new(false)),
+            committed_epochs: Arc::new(Mutex::new(vec![])),
+            key_only_epochs: Arc::new(Mutex::new(vec![])),
+            rolled_back_epochs: Arc::new(Mutex::new(vec![])),
+        }));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let mut state = ReactiveRecoveryState::new(&mut kh);
+
+        let control = service
+            .handle_reactive_recovery(
+                CoreError::EpochMismatch {
+                    local_epoch: 1,
+                    relay_epoch: 2,
+                    message: "recover first".to_string(),
+                },
+                Some(&mut state),
+            )
+            .await;
+
+        match control {
+            RecoveryControl::ReturnErr(CoreError::Engine(message)) => {
+                assert!(message.contains("signed registry lags"), "unexpected error: {message}");
+            }
+            other => panic!("expected registry-lag engine error, got {other:?}"),
+        }
+        drop(state);
+        assert!(!kh.has_epoch_key(2), "stale registry failure must not install target key");
     }
 
     // ── LEGIT end-to-end reactive recovery through the REAL stack ──
@@ -2203,5 +2849,183 @@ mod tests {
             1,
             "current_epoch advanced to 1"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_now_epoch_mismatch_recovers_and_retries_push_at_relay_epoch() {
+        use crate::engine::{SyncConfig, SyncEngine};
+        use crate::pairing::RegistrySnapshotEntry;
+        use crate::schema::{SyncSchema, SyncType};
+        use crate::storage::{PendingOp, SyncMetadata};
+
+        let sync_id = "sync-1";
+        let device_id = "a1b2c3d4e5f6";
+        let device_secret = DeviceSecret::generate();
+        let real_epoch_1_key = [0x41u8; 32];
+
+        let storage = Arc::new(RusqliteSyncStorage::in_memory().expect("in-memory storage"));
+        let ed = device_secret.ed25519_keypair(device_id).unwrap();
+        let batch_signing_key =
+            device_secret.ed25519_keypair(device_id).unwrap().into_signing_key();
+        let x25519 = device_secret.x25519_keypair(device_id).unwrap();
+        let ml_dsa = device_secret.ml_dsa_65_keypair(device_id).unwrap();
+        let ml_kem = device_secret.ml_kem_768_keypair(device_id).unwrap();
+        let xwing = device_secret.xwing_keypair(device_id).unwrap();
+        let now = chrono::Utc::now();
+        {
+            let mut tx = storage.begin_tx().unwrap();
+            tx.upsert_sync_metadata(&SyncMetadata {
+                sync_id: sync_id.to_string(),
+                local_device_id: device_id.to_string(),
+                current_epoch: 0,
+                last_pulled_server_seq: 0,
+                last_pushed_at: None,
+                last_successful_sync_at: None,
+                registered_at: Some(now),
+                needs_rekey: false,
+                last_imported_registry_version: None,
+                relay_log_token: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+            tx.upsert_device_record(&DeviceRecord {
+                sync_id: sync_id.to_string(),
+                device_id: device_id.to_string(),
+                ed25519_public_key: ed.public_key_bytes().to_vec(),
+                x25519_public_key: x25519.public_key_bytes().to_vec(),
+                ml_dsa_65_public_key: ml_dsa.public_key_bytes(),
+                ml_kem_768_public_key: ml_kem.public_key_bytes(),
+                x_wing_public_key: xwing.encapsulation_key_bytes(),
+                status: "active".to_string(),
+                registered_at: now,
+                revoked_at: None,
+                ml_dsa_key_generation: 0,
+            })
+            .unwrap();
+            let hlc = crate::Hlc::now(device_id, None);
+            tx.insert_pending_op(&PendingOp {
+                op_id: format!("tasks:task-1:title:{hlc}:{device_id}"),
+                sync_id: sync_id.to_string(),
+                epoch: 0,
+                device_id: device_id.to_string(),
+                local_batch_id: "batch-epoch-retry".to_string(),
+                entity_table: "tasks".to_string(),
+                entity_id: "task-1".to_string(),
+                field_name: "title".to_string(),
+                encoded_value: "\"hi\"".to_string(),
+                is_delete: false,
+                client_hlc: hlc.to_string(),
+                created_at: now,
+                pushed_at: None,
+            })
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let relay = Arc::new(MockRelay::new());
+        relay.enforce_push_epoch(1);
+        relay.insert_rekey_artifact(
+            1,
+            device_id,
+            build_real_v2_artifact(&device_secret, device_id, &real_epoch_1_key, 1),
+        );
+        let entry = RegistrySnapshotEntry {
+            sync_id: sync_id.to_string(),
+            device_id: device_id.to_string(),
+            ed25519_public_key: ed.public_key_bytes().to_vec(),
+            x25519_public_key: x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem.public_key_bytes(),
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+            remote_wipe: false,
+        };
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(
+            vec![entry],
+            crate::pairing::SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            1,
+            BTreeMap::from([(1u32, compute_epoch_key_hash(&real_epoch_1_key))]),
+        );
+        relay.set_signed_registry(SignedRegistryResponse {
+            registry_version: crate::pairing::SIGNED_REGISTRY_VERSION_MIN_WITH_EPOCH_BINDING,
+            artifact_blob: snapshot.sign_hybrid(&ed, &ml_dsa),
+            artifact_kind: "signed_registry_snapshot".to_string(),
+        });
+        relay.add_device(DeviceInfo {
+            device_id: device_id.to_string(),
+            epoch: 1,
+            status: "active".to_string(),
+            ed25519_public_key: ed.public_key_bytes().to_vec(),
+            x25519_public_key: x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: ml_dsa.public_key_bytes(),
+            ml_kem_768_public_key: ml_kem.public_key_bytes(),
+            x_wing_public_key: xwing.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+            needs_rekey: false,
+        });
+
+        let secure_store: Arc<dyn crate::secure_store::SecureStore> = {
+            #[derive(Default)]
+            struct S(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+            impl crate::secure_store::SecureStore for S {
+                fn get(&self, k: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(self.0.lock().unwrap().get(k).cloned())
+                }
+                fn set(&self, k: &str, v: &[u8]) -> Result<()> {
+                    self.0.lock().unwrap().insert(k.to_string(), v.to_vec());
+                    Ok(())
+                }
+                fn delete(&self, k: &str) -> Result<()> {
+                    self.0.lock().unwrap().remove(k);
+                    Ok(())
+                }
+                fn clear(&self) -> Result<()> {
+                    self.0.lock().unwrap().clear();
+                    Ok(())
+                }
+            }
+            Arc::new(S::default())
+        };
+        let recoverer = KeyHierarchyRecoverer::new(
+            relay.clone(),
+            storage.clone(),
+            secure_store,
+            &device_secret,
+            sync_id.to_string(),
+            device_id.to_string(),
+        )
+        .unwrap();
+
+        let schema =
+            SyncSchema::builder().entity("tasks", |e| e.field("title", SyncType::String)).build();
+        let engine = SyncEngine::new(
+            storage.clone(),
+            relay.clone(),
+            Vec::new(),
+            schema,
+            SyncConfig::default(),
+        );
+        let (event_tx, _rx) = broadcast::channel::<SyncEvent>(16);
+        let mut service = SyncService::new(event_tx);
+        service.set_engine(engine, sync_id.to_string());
+        service.set_recoverer(Arc::new(recoverer));
+
+        let mut kh = KeyHierarchy::new();
+        kh.initialize("password", &[1u8; 16]).unwrap();
+        let result = service
+            .sync_now_with_recovery(&mut kh, &batch_signing_key, Some(&ml_dsa), device_id, 0)
+            .await
+            .expect("sync should recover epoch mismatch and retry push");
+
+        assert!(result.error.is_none(), "sync should finish cleanly: {:?}", result.error);
+        assert_eq!(result.pushed, 1);
+        assert_eq!(relay.push_call_epochs(), vec![0, 1]);
+        assert_eq!(relay.push_call_batch_ids(), vec!["batch-epoch-retry", "batch-epoch-retry"]);
+        assert_eq!(storage.get_sync_metadata(sync_id).unwrap().unwrap().current_epoch, 1);
+        assert!(kh.has_epoch_key(1), "retry must install the recovered epoch key");
+        assert_eq!(service.take_recovered_epoch_high_water(), Some(1));
     }
 }

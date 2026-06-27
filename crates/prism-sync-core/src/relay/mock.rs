@@ -75,6 +75,11 @@ struct MockRelayState {
     push_413_batch_ids: HashSet<String>,
     /// Records each `push_changes` call's batch_id for test assertions.
     push_call_batch_ids: Vec<String>,
+    /// Records each pushed envelope epoch for retry-path assertions.
+    push_call_epochs: Vec<i32>,
+    /// Optional relay-current-epoch gate for tests that need epoch mismatch
+    /// behavior. When set, pushes whose envelope epoch differs are rejected.
+    expected_push_epoch: Option<u32>,
     /// If set, the next `put_snapshot` call returns `SnapshotStale`
     /// with these values and clears the slot.
     next_put_snapshot_stale: Option<(i64, Option<String>)>,
@@ -153,6 +158,8 @@ impl MockRelay {
                 rekey_artifacts: HashMap::new(),
                 push_413_batch_ids: HashSet::new(),
                 push_call_batch_ids: Vec::new(),
+                push_call_epochs: Vec::new(),
+                expected_push_epoch: None,
                 next_put_snapshot_stale: None,
                 ephemeral_inbox: Vec::new(),
                 ephemeral_sent: Vec::new(),
@@ -225,6 +232,16 @@ impl MockRelay {
     /// afterwards).
     pub fn push_call_batch_ids(&self) -> Vec<String> {
         self.state.lock().unwrap().push_call_batch_ids.clone()
+    }
+
+    /// Reject pushed envelopes unless their epoch matches `epoch`.
+    pub fn enforce_push_epoch(&self, epoch: u32) {
+        self.state.lock().unwrap().expected_push_epoch = Some(epoch);
+    }
+
+    /// Returns the envelope epochs observed by `push_changes`, in call order.
+    pub fn push_call_epochs(&self) -> Vec<i32> {
+        self.state.lock().unwrap().push_call_epochs.clone()
     }
 
     /// Inject a batch into the relay (simulates another device pushing).
@@ -346,11 +363,7 @@ impl MockRelay {
 
     /// Seed a rekey artifact served from `get_rekey_artifact(epoch, device_id)`.
     pub fn insert_rekey_artifact(&self, epoch: i32, device_id: &str, artifact: Vec<u8>) {
-        self.state
-            .lock()
-            .unwrap()
-            .rekey_artifacts
-            .insert((epoch, device_id.to_string()), artifact);
+        self.state.lock().unwrap().rekey_artifacts.insert((epoch, device_id.to_string()), artifact);
     }
 }
 
@@ -368,11 +381,7 @@ impl SyncTransport for MockRelay {
         self.pull_changes_paged(since, i64::MAX).await
     }
 
-    async fn pull_changes_paged(
-        &self,
-        since: i64,
-        limit: i64,
-    ) -> Result<PullResponse, RelayError> {
+    async fn pull_changes_paged(&self, since: i64, limit: i64) -> Result<PullResponse, RelayError> {
         {
             let mut guard = self.state.lock().unwrap();
             guard.pull_call_count += 1;
@@ -443,11 +452,21 @@ impl SyncTransport for MockRelay {
     async fn push_changes(&self, batch: OutgoingBatch) -> Result<i64, RelayError> {
         let mut state = self.state.lock().unwrap();
         state.push_call_batch_ids.push(batch.batch_id.clone());
+        state.push_call_epochs.push(batch.envelope.epoch);
         if state.push_413_batch_ids.remove(&batch.batch_id) {
             return Err(RelayError::Server {
                 status_code: 413,
                 message: format!("mock injected payload-too-large for batch {}", batch.batch_id),
             });
+        }
+        if let Some(relay_epoch) = state.expected_push_epoch {
+            if batch.envelope.epoch != relay_epoch as i32 {
+                return Err(RelayError::EpochMismatch {
+                    local_epoch: batch.envelope.epoch.max(0) as u32,
+                    relay_epoch,
+                    message: "mock epoch mismatch; perform epoch recovery first".to_string(),
+                });
+            }
         }
         let seq = state.next_server_seq;
         state.next_server_seq += 1;
@@ -601,13 +620,7 @@ impl EpochManagement for MockRelay {
         epoch: i32,
         device_id: &str,
     ) -> Result<Option<Vec<u8>>, RelayError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .rekey_artifacts
-            .get(&(epoch, device_id.to_string()))
-            .cloned())
+        Ok(self.state.lock().unwrap().rekey_artifacts.get(&(epoch, device_id.to_string())).cloned())
     }
 }
 

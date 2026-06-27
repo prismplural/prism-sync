@@ -89,8 +89,13 @@ fn populate_result_error(result: &mut SyncResult, e: &CoreError) {
     }
 }
 
-fn should_bubble_recoverable_key_error(error: &CoreError) -> bool {
-    matches!(error, CoreError::MissingEpochKey { .. } | CoreError::DecryptFailed { .. })
+fn should_bubble_reactive_recovery_error(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::MissingEpochKey { .. }
+            | CoreError::EpochMismatch { .. }
+            | CoreError::DecryptFailed { .. }
+    )
 }
 
 fn is_must_bootstrap_from_snapshot(error: &CoreError) -> bool {
@@ -541,7 +546,7 @@ impl SyncEngine {
                 }
             }
             Err(e) => {
-                if should_bubble_recoverable_key_error(&e) {
+                if should_bubble_reactive_recovery_error(&e) {
                     self.set_state(SyncState::Error { message: e.to_string() });
                     return Err(e);
                 }
@@ -606,7 +611,7 @@ impl SyncEngine {
                 }
             }
             Err(e) => {
-                if should_bubble_recoverable_key_error(&e) {
+                if should_bubble_reactive_recovery_error(&e) {
                     self.set_state(SyncState::Error { message: e.to_string() });
                     return Err(e);
                 }

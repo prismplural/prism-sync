@@ -20,6 +20,10 @@ pub(crate) struct RecoveryCommitToken {
 
 #[async_trait]
 pub(crate) trait EpochRecoverer: Send + Sync {
+    fn device_id(&self) -> &str;
+
+    async fn current_epoch(&self) -> Result<u32>;
+
     async fn recover(&self, epoch: u32) -> Result<Zeroizing<Vec<u8>>>;
 
     /// Fetch and signature-verify the relay's current signed device registry.
@@ -35,6 +39,8 @@ pub(crate) trait EpochRecoverer: Send + Sync {
         epoch: u32,
         key_bytes: &[u8],
     ) -> Result<RecoveryCommitToken>;
+
+    async fn persist_recovered_epoch_key_only(&self, epoch: u32, key_bytes: &[u8]) -> Result<()>;
 
     async fn rollback_recovered_epoch(&self, epoch: u32, token: RecoveryCommitToken) -> Result<()>;
 }
@@ -70,6 +76,27 @@ impl KeyHierarchyRecoverer {
 
 #[async_trait]
 impl EpochRecoverer for KeyHierarchyRecoverer {
+    fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    async fn current_epoch(&self) -> Result<u32> {
+        let storage = self.storage.clone();
+        let sync_id = self.sync_id.clone();
+        let secure_store = self.secure_store.clone();
+        let stored_epoch = tokio::task::spawn_blocking(move || {
+            Ok::<_, CoreError>(storage.get_sync_metadata(&sync_id)?.map(|meta| meta.current_epoch))
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        let epoch = match stored_epoch {
+            Some(epoch) => epoch,
+            None => load_cached_epoch(secure_store.as_ref())?.unwrap_or(0),
+        };
+        Ok(epoch.max(0) as u32)
+    }
+
     async fn recover(&self, epoch: u32) -> Result<Zeroizing<Vec<u8>>> {
         let xwing = self.device_secret.xwing_keypair(&self.device_id)?;
         let artifact =
@@ -118,6 +145,10 @@ impl EpochRecoverer for KeyHierarchyRecoverer {
             key_bytes,
         )
         .await
+    }
+
+    async fn persist_recovered_epoch_key_only(&self, epoch: u32, key_bytes: &[u8]) -> Result<()> {
+        persist_epoch_key(self.secure_store.as_ref(), epoch, key_bytes)
     }
 
     async fn rollback_recovered_epoch(&self, epoch: u32, token: RecoveryCommitToken) -> Result<()> {

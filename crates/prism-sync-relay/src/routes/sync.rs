@@ -136,7 +136,10 @@ fn do_push(
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or(AppError::NotFound)?;
     if device_epoch != current_epoch {
-        return Err(AppError::Forbidden("Epoch mismatch; perform epoch recovery first"));
+        return Err(AppError::EpochMismatch {
+            envelope_epoch: device_epoch,
+            relay_epoch: current_epoch,
+        });
     }
 
     // Check max unpruned batches

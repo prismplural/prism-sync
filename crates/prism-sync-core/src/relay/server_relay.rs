@@ -251,18 +251,48 @@ impl ServerRelay {
             }
             403 => {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-                    if json.get("error").and_then(|v| v.as_str()) == Some("upgrade_required") {
-                        let min_signature_version = json
-                            .get("min_signature_version")
-                            .and_then(|v| v.as_u64())
-                            .and_then(|v| u8::try_from(v).ok())
-                            .unwrap_or(3);
-                        let message = json
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
-                        return RelayError::UpgradeRequired { min_signature_version, message };
+                    match json.get("error").and_then(|v| v.as_str()) {
+                        Some("upgrade_required") => {
+                            let min_signature_version = json
+                                .get("min_signature_version")
+                                .and_then(|v| v.as_u64())
+                                .and_then(|v| u8::try_from(v).ok())
+                                .unwrap_or(3);
+                            let message = json
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+                            return RelayError::UpgradeRequired { min_signature_version, message };
+                        }
+                        Some("epoch_mismatch") => {
+                            let local_epoch = json
+                                .get("envelope_epoch")
+                                .and_then(|v| v.as_u64())
+                                .and_then(|v| u32::try_from(v).ok());
+                            let relay_epoch = json
+                                .get("relay_epoch")
+                                .and_then(|v| v.as_u64())
+                                .and_then(|v| u32::try_from(v).ok());
+                            let message = json
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+                            return match (local_epoch, relay_epoch) {
+                                (Some(local_epoch), Some(relay_epoch)) => RelayError::EpochMismatch {
+                                    local_epoch,
+                                    relay_epoch,
+                                    message,
+                                },
+                                _ => RelayError::Protocol {
+                                    message: format!(
+                                        "malformed epoch_mismatch response: HTTP {status}: {body}"
+                                    ),
+                                },
+                            };
+                        }
+                        _ => {}
                     }
                 }
                 RelayError::Auth { message: format!("HTTP {status}: {body}") }
@@ -1838,6 +1868,44 @@ mod tests {
                 ref message,
             } if message == "update"
         ));
+    }
+
+    #[test]
+    fn classify_error_parses_epoch_mismatch_response() {
+        let err = ServerRelay::classify_error(
+            403,
+            r#"{"error":"epoch_mismatch","message":"recover first","envelope_epoch":1,"relay_epoch":3}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::EpochMismatch {
+                local_epoch: 1,
+                relay_epoch: 3,
+                ref message,
+            } if message == "recover first"
+        ));
+    }
+
+    #[test]
+    fn classify_error_epoch_mismatch_malformed_is_protocol_not_auth() {
+        let err = ServerRelay::classify_error(
+            403,
+            r#"{"error":"epoch_mismatch","message":"recover first","envelope_epoch":"bad","relay_epoch":3}"#,
+        );
+
+        assert!(matches!(
+            err,
+            RelayError::Protocol { ref message }
+                if message.contains("malformed epoch_mismatch")
+        ));
+    }
+
+    #[test]
+    fn classify_error_unknown_403_stays_auth() {
+        let err = ServerRelay::classify_error(403, r#"{"error":"something_else"}"#);
+
+        assert!(matches!(err, RelayError::Auth { .. }));
     }
 
     #[test]

@@ -115,6 +115,14 @@ impl CoreError {
             None => error.to_string(),
         };
 
+        if let RelayError::EpochMismatch { local_epoch, relay_epoch, .. } = &error {
+            return CoreError::EpochMismatch {
+                local_epoch: *local_epoch,
+                relay_epoch: *relay_epoch,
+                message,
+            };
+        }
+
         let (kind, status, code, min_signature_version, remote_wipe) = match error {
             RelayError::Network { .. } | RelayError::Timeout { .. } => {
                 (RelayErrorCategory::Network, None, None, None, None)
@@ -123,6 +131,9 @@ impl CoreError {
                 (RelayErrorCategory::Server, Some(status_code), None, None, None)
             }
             RelayError::Auth { .. } => (RelayErrorCategory::Auth, None, None, None, None),
+            RelayError::EpochMismatch { .. } => {
+                unreachable!("epoch mismatch is converted to CoreError::EpochMismatch above")
+            }
             RelayError::UpgradeRequired { min_signature_version, .. } => (
                 RelayErrorCategory::Auth,
                 Some(403),
@@ -299,6 +310,27 @@ mod tests {
                 remote_wipe: None,
                 ..
             } if code == "must_bootstrap_from_snapshot"
+        ));
+    }
+
+    #[test]
+    fn from_relay_maps_epoch_mismatch_to_core_error() {
+        let error = CoreError::from_relay_with_context(
+            Some("push"),
+            RelayError::EpochMismatch {
+                local_epoch: 2,
+                relay_epoch: 4,
+                message: "recover first".into(),
+            },
+        );
+
+        assert!(matches!(
+            error,
+            CoreError::EpochMismatch {
+                local_epoch: 2,
+                relay_epoch: 4,
+                ref message,
+            } if message.contains("push") && message.contains("recover first")
         ));
     }
 }

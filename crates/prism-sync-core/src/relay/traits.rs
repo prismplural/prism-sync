@@ -33,6 +33,9 @@ pub enum RelayError {
     #[error("upgrade required: min_signature_version={min_signature_version}, {message}")]
     UpgradeRequired { min_signature_version: u8, message: String },
 
+    #[error("epoch mismatch: local_epoch={local_epoch}, relay_epoch={relay_epoch}: {message}")]
+    EpochMismatch { local_epoch: u32, relay_epoch: u32, message: String },
+
     #[error("device identity mismatch: {message}")]
     DeviceIdentityMismatch { message: String },
 
@@ -102,6 +105,7 @@ impl RelayError {
             RelayError::Timeout { .. } => RelayErrorKind::Timeout,
             RelayError::Auth { .. } => RelayErrorKind::Auth,
             RelayError::UpgradeRequired { .. } => RelayErrorKind::UpgradeRequired,
+            RelayError::EpochMismatch { .. } => RelayErrorKind::EpochMismatch,
             RelayError::DeviceIdentityMismatch { .. } => RelayErrorKind::DeviceIdentityMismatch,
             RelayError::Protocol { .. } => RelayErrorKind::Protocol,
             RelayError::EpochRotation { .. } => RelayErrorKind::EpochRotation,
@@ -142,6 +146,7 @@ pub enum RelayErrorKind {
     Timeout,
     Auth,
     UpgradeRequired,
+    EpochMismatch,
     DeviceIdentityMismatch,
     Protocol,
     EpochRotation,
@@ -786,10 +791,7 @@ pub trait MediaRelay: Send + Sync {
     /// Acknowledge processed (or skipped/undecryptable) mailbox messages so the
     /// relay stops redelivering them to this device. Per-device — never hides a
     /// broadcast from the other recipients.
-    async fn ack_ephemeral(
-        &self,
-        message_ids: &[String],
-    ) -> std::result::Result<(), RelayError>;
+    async fn ack_ephemeral(&self, message_ids: &[String]) -> std::result::Result<(), RelayError>;
 }
 
 /// Transport layer for communicating with the relay server.
