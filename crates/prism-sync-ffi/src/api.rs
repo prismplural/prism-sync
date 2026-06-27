@@ -929,23 +929,16 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
                 "epoch_id": epoch_id,
             })
         }
-        SyncEvent::PullBatchQuarantined {
-            server_seq,
-            batch_id,
-            sender_device_id,
-            reason,
-        } => serde_json::json!({
-            "type": "PullBatchQuarantined",
-            "server_seq": server_seq,
-            "batch_id": batch_id,
-            "sender_device_id": sender_device_id,
-            "reason": reason,
-        }),
-        SyncEvent::PullStalled {
-            server_seq,
-            reason,
-            attempt,
-        } => serde_json::json!({
+        SyncEvent::PullBatchQuarantined { server_seq, batch_id, sender_device_id, reason } => {
+            serde_json::json!({
+                "type": "PullBatchQuarantined",
+                "server_seq": server_seq,
+                "batch_id": batch_id,
+                "sender_device_id": sender_device_id,
+                "reason": reason,
+            })
+        }
+        SyncEvent::PullStalled { server_seq, reason, attempt } => serde_json::json!({
             "type": "PullStalled",
             "server_seq": server_seq,
             "reason": reason,
@@ -1930,11 +1923,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 
         let secure_store = inner.secure_store();
         heal_configured_epoch(meta_epoch, cached_epoch, |epoch| {
-            secure_store
-                .get(&format!("epoch_key_{epoch}"))
-                .ok()
-                .flatten()
-                .is_some()
+            secure_store.get(&format!("epoch_key_{epoch}")).ok().flatten().is_some()
         })
     };
 
@@ -3083,9 +3072,8 @@ pub async fn take_undelivered_changes(
             return Ok::<_, String>(empty_undelivered_changes_json());
         }
 
-        let rows = storage
-            .list_consumer_deliveries(&sync_id, 0, limit)
-            .map_err(|e| e.to_string())?;
+        let rows =
+            storage.list_consumer_deliveries(&sync_id, 0, limit).map_err(|e| e.to_string())?;
         if rows.is_empty() {
             return Ok(empty_undelivered_changes_json());
         }
@@ -4937,23 +4925,13 @@ pub fn encode_image(
 
     if let Some(rgba) = rgba_buf {
         WebPEncoder::new_lossless(&mut output)
-            .encode(
-                rgba.as_raw(),
-                rgba.width(),
-                rgba.height(),
-                image::ExtendedColorType::Rgba8,
-            )
+            .encode(rgba.as_raw(), rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8)
             .map_err(|e| format!("Failed to encode WebP: {e}"))?;
         Ok((output, "image/webp".to_string()))
     } else {
         let rgb = resized.to_rgb8();
         JpegEncoder::new_with_quality(&mut output, quality.min(100) as u8)
-            .encode(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                image::ExtendedColorType::Rgb8,
-            )
+            .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
             .map_err(|e| format!("Failed to encode JPEG: {e}"))?;
         Ok((output, "image/jpeg".to_string()))
     }
@@ -4970,10 +4948,7 @@ fn build_pairing_relay(handle: &PrismSyncHandle) -> Result<ServerPairingRelay, S
     // `insecure-transport-dev` feature (handle.allow_insecure was already gated
     // at create_prism_sync; this keeps the guard correct at the choke point).
     let allow_insecure = effective_allow_insecure(handle.allow_insecure, relay_url);
-    if !allow_insecure
-        && !relay_url.starts_with("https://")
-        && !is_localhost_url(relay_url)
-    {
+    if !allow_insecure && !relay_url.starts_with("https://") && !is_localhost_url(relay_url) {
         return Err(format!(
             "PairingRelay requires HTTPS (got {relay_url:?}). \
              Set allow_insecure=true for development."
@@ -5086,6 +5061,10 @@ pub async fn cancel_pairing_ceremony(handle: &PrismSyncHandle) -> Result<(), Str
             tracing::debug!(
                 "[prism_sync_ffi] pairing cancel could not delete pending_device_id: {error}"
             );
+        }
+        for rendezvous_id in &rendezvous_ids {
+            let _ = secure_store.delete(&format!("pairing_credential_bundle_v1_{rendezvous_id}"));
+            let _ = secure_store.delete(&format!("pairing_joiner_bundle_v1_{rendezvous_id}"));
         }
     }
 
@@ -5252,6 +5231,9 @@ pub async fn complete_joiner_ceremony(
     {
         Ok(value) => value,
         Err(error) => {
+            if let Ok(mut slot) = handle.joiner_ceremony.lock() {
+                slot.replace(ceremony);
+            }
             return Err(encode_handle_core_error(handle, "complete_bootstrap_join", error).await);
         }
     };
@@ -5544,8 +5526,11 @@ pub async fn complete_initiator_ceremony(
     {
         Ok(version) => version,
         Err(error) => {
+            if let Ok(mut slot) = handle.initiator_ceremony.lock() {
+                slot.replace(ceremony);
+            }
             return Err(
-                encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await,
+                encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await
             );
         }
     };
@@ -8026,7 +8011,12 @@ mod tests {
 
     // ── Consumer-delivery journal helpers ──
 
-    fn delivery(id: i64, entity: &str, field: Option<&str>, value: Option<&str>) -> ConsumerDelivery {
+    fn delivery(
+        id: i64,
+        entity: &str,
+        field: Option<&str>,
+        value: Option<&str>,
+    ) -> ConsumerDelivery {
         ConsumerDelivery {
             id,
             sync_id: "sync-1".to_string(),
@@ -8139,7 +8129,10 @@ mod tests {
 
     #[test]
     fn spill_threshold_zero_when_under_cap() {
-        let rows = vec![delivery(1, "a", Some("n"), Some("\"x\"")), delivery(2, "b", Some("n"), Some("\"y\""))];
+        let rows = vec![
+            delivery(1, "a", Some("n"), Some("\"x\"")),
+            delivery(2, "b", Some("n"), Some("\"y\"")),
+        ];
         // total == cap -> not over, no spill.
         assert_eq!(consumer_delivery_spill_threshold(&rows, 2, 2), 0);
         // total < cap -> no spill.

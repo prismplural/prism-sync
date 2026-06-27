@@ -305,6 +305,14 @@ impl MockPairingRelay {
             session.joiner_bootstrap = joiner_bootstrap;
         }
     }
+
+    /// Test hook for terminal slot consumption.
+    #[cfg(test)]
+    pub fn remove_slot_for_test(&self, rendezvous_id: &str, slot: PairingSlot) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(rendezvous_id) {
+            session.slots.remove(slot.as_path_segment());
+        }
+    }
 }
 
 impl Default for MockPairingRelay {

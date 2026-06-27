@@ -18,7 +18,7 @@ use crate::pairing::models::*;
 use crate::relay::pairing_relay::{PairingRelay, PairingSlot};
 use crate::relay::traits::{
     DeviceInfo, FirstDeviceAdmissionProof, ProofOfWorkChallenge, ProofOfWorkSolution,
-    RegistrationNonceResponse, RegistryApproval, SignedRegistryResponse,
+    RegistrationNonceResponse, RegistryApproval, RelayError, SignedRegistryResponse,
 };
 use crate::relay::SyncRelay;
 use crate::secure_store::SecureStore;
@@ -31,6 +31,16 @@ const MIN_SIGNATURE_VERSION_FLOOR_KEY: &str = "min_signature_version_floor";
 const SIGNATURE_VERSION_SOURCE_FLOOR: u8 = 0x03;
 #[cfg(test)]
 const SUPPORTED_SIGNATURE_VERSION: u8 = 0x03;
+const PAIRING_CREDENTIAL_BUNDLE_CACHE_PREFIX: &str = "pairing_credential_bundle_v1";
+const PAIRING_JOINER_BUNDLE_CACHE_PREFIX: &str = "pairing_joiner_bundle_v1";
+
+fn pairing_terminal_cache_key(prefix: &str, rendezvous_id: &str) -> String {
+    format!("{prefix}_{rendezvous_id}")
+}
+
+fn is_pairing_slot_already_written(error: &RelayError) -> bool {
+    matches!(error, RelayError::Protocol { message } if message.contains("slot already written"))
+}
 
 fn diag_hash(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -350,19 +360,33 @@ impl PairingService {
     {
         // Publish our confirmation MAC before accepting credentials.
         let confirmation_mac = ceremony.confirmation_mac()?;
-        relay
-            .put_slot(&ceremony.rendezvous_id_hex(), PairingSlot::Confirmation, &confirmation_mac)
-            .await
-            .map_err(|e| CoreError::from_relay_with_context(Some("posting confirmation"), e))?;
+        let rendezvous_id = ceremony.rendezvous_id_hex();
+        if let Err(e) =
+            relay.put_slot(&rendezvous_id, PairingSlot::Confirmation, &confirmation_mac).await
+        {
+            if !is_pairing_slot_already_written(&e) {
+                return Err(CoreError::from_relay_with_context(Some("posting confirmation"), e));
+            }
+        }
+        let credential_cache_key =
+            pairing_terminal_cache_key(PAIRING_CREDENTIAL_BUNDLE_CACHE_PREFIX, &rendezvous_id);
 
         let credential_bytes = if encrypted_credentials.is_empty() {
-            wait_for_pairing_slot_bytes(
-                relay,
-                &ceremony.rendezvous_id_hex(),
-                PairingSlot::Credentials,
-                "credential bundle",
-            )
-            .await?
+            match self.secure_store.get(&credential_cache_key)? {
+                Some(cached) => cached,
+                None => {
+                    let bytes = wait_for_pairing_slot_bytes(
+                        relay,
+                        &rendezvous_id,
+                        PairingSlot::Credentials,
+                        "credential bundle",
+                    )
+                    .await?;
+                    // Cache the one-shot terminal payload before fallible work.
+                    self.secure_store.set(&credential_cache_key, &bytes)?;
+                    bytes
+                }
+            }
         } else {
             encrypted_credentials.to_vec()
         };
@@ -591,6 +615,7 @@ impl PairingService {
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("posting joiner bundle"), e))?;
 
+        self.secure_store.delete(&credential_cache_key)?;
         self.secure_store.delete("setup_rollback_marker")?;
         self.secure_store.delete("pending_device_secret")?;
         self.secure_store.delete("pending_device_id")?;
@@ -944,18 +969,32 @@ impl PairingService {
         };
 
         let credential_envelope = ceremony.encrypt_credentials(&credential_bundle)?;
-        pairing_relay
+        if let Err(e) = pairing_relay
             .put_slot(&rendezvous_id, PairingSlot::Credentials, &credential_envelope)
             .await
-            .map_err(|e| CoreError::from_relay_with_context(Some("posting credentials"), e))?;
+        {
+            if !is_pairing_slot_already_written(&e) {
+                return Err(CoreError::from_relay_with_context(Some("posting credentials"), e));
+            }
+        }
 
-        let joiner_bundle_bytes = wait_for_pairing_slot_bytes(
-            pairing_relay,
-            &rendezvous_id,
-            PairingSlot::Joiner,
-            "joiner bundle",
-        )
-        .await?;
+        let joiner_bundle_cache_key =
+            pairing_terminal_cache_key(PAIRING_JOINER_BUNDLE_CACHE_PREFIX, &rendezvous_id);
+        let joiner_bundle_bytes = match self.secure_store.get(&joiner_bundle_cache_key)? {
+            Some(cached) => cached,
+            None => {
+                let bytes = wait_for_pairing_slot_bytes(
+                    pairing_relay,
+                    &rendezvous_id,
+                    PairingSlot::Joiner,
+                    "joiner bundle",
+                )
+                .await?;
+                // Cache the one-shot terminal payload before fallible work.
+                self.secure_store.set(&joiner_bundle_cache_key, &bytes)?;
+                bytes
+            }
+        };
         let joiner_bundle_hash = diag_hash(&joiner_bundle_bytes);
         let joiner_bundle_version =
             joiner_bundle_bytes.first().map(|b| b.to_string()).unwrap_or_else(|| "none".into());
@@ -1061,6 +1100,7 @@ impl PairingService {
             .delete_session(&rendezvous_id)
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("deleting pairing session"), e))?;
+        self.secure_store.delete(&joiner_bundle_cache_key)?;
         self.secure_store.delete("bootstrap_joiner_bundle")?;
         self.secure_store.delete("bootstrap_joiner_device_id")?;
 
@@ -1605,25 +1645,25 @@ async fn wait_for_pairing_slot_bytes(
     slot: PairingSlot,
     description: &str,
 ) -> Result<Vec<u8>> {
-    const MAX_ATTEMPTS: usize = 200;
-    // Pairing is human-paced, so a transient relay error (timeout/network/5xx) is
-    // recoverable — re-poll it like an empty slot. Abort only on a fatal error or
-    // too many consecutive transient failures (relay unreachable).
-    const MAX_CONSECUTIVE_TRANSIENT: u32 = 5;
+    const PAIRING_SLOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+    // Empty slots are human-paced.
+    const MAX_ATTEMPTS: usize = 1_200;
+    // Continuous relay failures still fail fast.
+    const MAX_CONSECUTIVE_TRANSIENT: u32 = 20;
     let mut consecutive_transient = 0u32;
     for _ in 0..MAX_ATTEMPTS {
         match relay.get_slot(rendezvous_id, slot).await {
             Ok(Some(bytes)) => return Ok(bytes),
             Ok(None) => {
                 consecutive_transient = 0;
-                sleep(Duration::from_millis(25)).await;
+                sleep(PAIRING_SLOT_POLL_INTERVAL).await;
             }
             Err(e) if e.is_retryable() => {
                 consecutive_transient += 1;
                 if consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT {
                     return Err(CoreError::from_relay_with_context(Some(description), e));
                 }
-                sleep(Duration::from_millis(25)).await;
+                sleep(PAIRING_SLOT_POLL_INTERVAL).await;
             }
             Err(e) => return Err(CoreError::from_relay_with_context(Some(description), e)),
         }
@@ -1677,6 +1717,7 @@ mod tests {
     // pairing" regression.
     struct FlakyPairingRelay {
         transient_failures_remaining: Mutex<u32>,
+        empty_polls_remaining: Mutex<u32>,
         slot_payload: Option<Vec<u8>>,
         fatal: bool,
     }
@@ -1685,6 +1726,16 @@ mod tests {
         fn transient_then_ok(failures: u32, payload: Vec<u8>) -> Self {
             Self {
                 transient_failures_remaining: Mutex::new(failures),
+                empty_polls_remaining: Mutex::new(0),
+                slot_payload: Some(payload),
+                fatal: false,
+            }
+        }
+
+        fn empty_polls_then_ok(empty_polls: u32, payload: Vec<u8>) -> Self {
+            Self {
+                transient_failures_remaining: Mutex::new(0),
+                empty_polls_remaining: Mutex::new(empty_polls),
                 slot_payload: Some(payload),
                 fatal: false,
             }
@@ -1693,6 +1744,7 @@ mod tests {
         fn always_fatal() -> Self {
             Self {
                 transient_failures_remaining: Mutex::new(0),
+                empty_polls_remaining: Mutex::new(0),
                 slot_payload: None,
                 fatal: true,
             }
@@ -1736,6 +1788,13 @@ mod tests {
                     message: "synthetic transient timeout".to_string(),
                 });
             }
+            drop(remaining);
+
+            let mut empty = self.empty_polls_remaining.lock().unwrap();
+            if *empty > 0 {
+                *empty -= 1;
+                return Ok(None);
+            }
             Ok(self.slot_payload.clone())
         }
         async fn delete_session(
@@ -1767,6 +1826,20 @@ mod tests {
             wait_for_pairing_slot_bytes(&relay, "rendezvous-hex", PairingSlot::Init, "PairingInit")
                 .await;
         assert!(result.is_err(), "fatal relay error should abort the wait");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_pairing_slot_bytes_allows_human_paced_empty_polls() {
+        // Empty-slot polling must outlive the old ~5s cap.
+        let relay = FlakyPairingRelay::empty_polls_then_ok(250, b"credential-bundle".to_vec());
+        let result = wait_for_pairing_slot_bytes(
+            &relay,
+            "rendezvous-hex",
+            PairingSlot::Credentials,
+            "credential bundle",
+        )
+        .await;
+        assert_eq!(result.unwrap(), b"credential-bundle".to_vec());
     }
 
     #[test]
@@ -1813,10 +1886,8 @@ mod tests {
         )
         .unwrap();
 
-        let device_ids: Vec<&str> = post_registration_entries
-            .iter()
-            .map(|entry| entry.device_id.as_str())
-            .collect();
+        let device_ids: Vec<&str> =
+            post_registration_entries.iter().map(|entry| entry.device_id.as_str()).collect();
         assert_eq!(device_ids, vec![current_device_id, joiner_device_id]);
     }
 
@@ -1947,10 +2018,7 @@ mod tests {
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
             unimplemented!()
         }
-        async fn batch_exists(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<Vec<String>, RelayError> {
+        async fn batch_exists(&self, _: &[String]) -> std::result::Result<Vec<String>, RelayError> {
             unimplemented!()
         }
         async fn send_ephemeral(
@@ -1964,10 +2032,7 @@ mod tests {
         ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
             unimplemented!()
         }
-        async fn ack_ephemeral(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<(), RelayError> {
+        async fn ack_ephemeral(&self, _: &[String]) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -2004,6 +2069,7 @@ mod tests {
         rekey_artifacts: HashMap<(i32, String), Vec<u8>>,
         signed_registry: Option<SignedRegistryResponse>,
         advance_after_artifact_fetch: Option<(i32, i32)>,
+        fail_next_register: bool,
     }
 
     #[derive(Clone, Default)]
@@ -2021,6 +2087,7 @@ mod tests {
                     rekey_artifacts: HashMap::new(),
                     signed_registry: None,
                     advance_after_artifact_fetch: None,
+                    fail_next_register: false,
                 })),
             }
         }
@@ -2040,6 +2107,10 @@ mod tests {
         fn advance_active_devices_after_artifact_fetch(&self, trigger_epoch: i32, new_epoch: i32) {
             self.state.lock().unwrap().advance_after_artifact_fetch =
                 Some((trigger_epoch, new_epoch));
+        }
+
+        fn fail_next_register(&self) {
+            self.state.lock().unwrap().fail_next_register = true;
         }
     }
 
@@ -2074,6 +2145,13 @@ mod tests {
             req: RegisterRequest,
         ) -> std::result::Result<RegisterResponse, RelayError> {
             let mut state = self.state.lock().unwrap();
+            if state.fail_next_register {
+                state.fail_next_register = false;
+                return Err(RelayError::Server {
+                    status_code: 503,
+                    message: "synthetic one-shot registration failure".to_string(),
+                });
+            }
             state.register_requests.push(req.clone());
             if let Some(approval) = &req.registry_approval {
                 let registry_version = state
@@ -2257,10 +2335,7 @@ mod tests {
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
             unimplemented!()
         }
-        async fn batch_exists(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<Vec<String>, RelayError> {
+        async fn batch_exists(&self, _: &[String]) -> std::result::Result<Vec<String>, RelayError> {
             unimplemented!()
         }
         async fn send_ephemeral(
@@ -2274,10 +2349,7 @@ mod tests {
         ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
             unimplemented!()
         }
-        async fn ack_ephemeral(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<(), RelayError> {
+        async fn ack_ephemeral(&self, _: &[String]) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -2898,6 +2970,137 @@ mod tests {
         assert!(err.to_string().contains("session not found"));
     }
 
+    #[tokio::test]
+    async fn joiner_retry_uses_cached_terminal_credential_bundle_after_consumed_slot() {
+        let password = "bootstrap-password";
+        let relay_url = "https://relay.example.com";
+        let sync_id = "b1b2b3b4b5b6b1b2b3b4b5b6b1b2b3b4b5b6b1b2b3b4b5b6b1b2b3b4b5b6b1b2";
+
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let current_generation = 5;
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut key_hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = key_hierarchy.initialize(password, &secret_key).unwrap();
+
+        let inviter_signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let inviter_exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let inviter_pq_signing_key =
+            device_secret.ml_dsa_65_keypair_v(&device_id, current_generation).unwrap();
+        let inviter_pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let inviter_xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+
+        let registry_relay = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 0,
+            status: "active".to_string(),
+            ed25519_public_key: inviter_signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: inviter_exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: inviter_pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: inviter_pq_kem_key.public_key_bytes(),
+            x_wing_public_key: inviter_xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: current_generation,
+            needs_rekey: false,
+        }]));
+        registry_relay.fail_next_register();
+
+        let initiator_store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &initiator_store,
+            &device_secret,
+            &device_id,
+            sync_id,
+            relay_url,
+            &wrapped_dek,
+            &salt,
+        );
+        initiator_store.set("registration_token", b"relay-registration-token").unwrap();
+        let initiator_service = PairingService::new(initiator_store.clone());
+
+        let joiner_store = Arc::new(MemStore::default());
+        let joiner_service = PairingService::new(joiner_store.clone());
+        let mailbox = Arc::new(MockPairingRelay::new());
+
+        let (mut joiner, token) =
+            joiner_service.start_bootstrap_pairing(mailbox.as_ref(), relay_url).await.unwrap();
+        let (initiator, initiator_sas) =
+            initiator_service.start_bootstrap_initiator(token, mailbox.as_ref()).await.unwrap();
+
+        let rendezvous_id = joiner.rendezvous_id_hex();
+        let init_bytes = wait_for_slot(mailbox.as_ref(), &rendezvous_id, PairingSlot::Init).await;
+        let joiner_sas = joiner.process_pairing_init(&init_bytes).unwrap();
+        assert_eq!(joiner_sas.words, initiator_sas.words);
+
+        let initiator_mailbox = mailbox.clone();
+        let initiator_relay = registry_relay.clone();
+        let initiator_storage =
+            initiator_storage_with_self(sync_id, &device_secret, &device_id, current_generation);
+        let initiator_handle = tokio::spawn(async move {
+            initiator_service
+                .complete_bootstrap_initiator(
+                    &initiator,
+                    initiator_mailbox.as_ref(),
+                    password,
+                    &mnemonic,
+                    initiator_relay.as_ref(),
+                    initiator_storage.as_ref(),
+                )
+                .await
+        });
+
+        let first_relay = registry_relay.clone();
+        let first = joiner_service
+            .complete_bootstrap_join(
+                &joiner,
+                mailbox.as_ref(),
+                &[],
+                password,
+                |_sync_id, _device_id, _token| Ok(first_relay as Arc<dyn SyncRelay>),
+            )
+            .await;
+        assert!(
+            first.as_ref().err().is_some_and(|e| e.to_string().contains("registration failed")),
+            "first join should fail at synthetic registration failure"
+        );
+
+        let credential_cache_key =
+            pairing_terminal_cache_key(PAIRING_CREDENTIAL_BUNDLE_CACHE_PREFIX, &rendezvous_id);
+        assert!(
+            joiner_store.get(&credential_cache_key).unwrap().is_some(),
+            "credential bytes must be cached before the fallible registration step"
+        );
+
+        // Simulate one-shot terminal-slot consumption.
+        mailbox.remove_slot_for_test(&rendezvous_id, PairingSlot::Credentials);
+
+        let retry_relay = registry_relay.clone();
+        let retry = joiner_service
+            .complete_bootstrap_join(
+                &joiner,
+                mailbox.as_ref(),
+                &[],
+                password,
+                |_sync_id, _device_id, _token| Ok(retry_relay as Arc<dyn SyncRelay>),
+            )
+            .await
+            .expect("retry should use cached terminal credential bundle");
+        assert!(
+            joiner_store.get(&credential_cache_key).unwrap().is_none(),
+            "successful retry should clear the terminal credential cache"
+        );
+        assert!(
+            retry.1.entries.iter().any(|entry| entry.device_id == joiner.device_id()),
+            "retry snapshot should include the joiner"
+        );
+
+        initiator_handle
+            .await
+            .unwrap()
+            .expect("initiator should complete after retry posts joiner bundle");
+    }
+
     /// NEGATIVE TEST 1 (C2 / existing-device X-Wing swap + relay injection).
     ///
     /// The pairing rekey is driven ENTIRELY by the verified signed registry, so
@@ -3136,8 +3339,7 @@ mod tests {
         // The posted signed snapshot carries the peer's TRUE X-Wing key, not the
         // relay's swapped key.
         let register_req = state.register_requests.last().expect("joiner registered");
-        let approval =
-            register_req.registry_approval.as_ref().expect("registry approval present");
+        let approval = register_req.registry_approval.as_ref().expect("registry approval present");
         let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
             &approval.signed_registry_snapshot,
             &inviter_signing_key.public_key_bytes(),
@@ -3247,12 +3449,10 @@ mod tests {
 
         // Capture the joiner's TRUE permanent X-Wing key from the genuine
         // bootstrap record the relay holds before tampering.
-        let genuine_bootstrap_bytes =
-            mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap();
-        let genuine_record = crate::bootstrap::JoinerBootstrapRecord::from_canonical_bytes(
-            &genuine_bootstrap_bytes,
-        )
-        .unwrap();
+        let genuine_bootstrap_bytes = mailbox.get_bootstrap(&joiner_rendezvous_id).await.unwrap();
+        let genuine_record =
+            crate::bootstrap::JoinerBootstrapRecord::from_canonical_bytes(&genuine_bootstrap_bytes)
+                .unwrap();
         let joiner_true_xwing = genuine_record.permanent_xwing_public_key.clone();
         assert!(!joiner_true_xwing.is_empty());
 
@@ -3268,10 +3468,8 @@ mod tests {
         // joiner's permanent X-Wing (and ML-KEM) keys for attacker-controlled
         // ones. The commitment the human verified is NOT updated.
         let attacker_secret = DeviceSecret::generate();
-        let attacker_xwing = attacker_secret
-            .xwing_keypair("attacker")
-            .unwrap()
-            .encapsulation_key_bytes();
+        let attacker_xwing =
+            attacker_secret.xwing_keypair("attacker").unwrap().encapsulation_key_bytes();
         let attacker_ml_kem =
             attacker_secret.ml_kem_768_keypair("attacker").unwrap().public_key_bytes();
         assert_ne!(joiner_true_xwing, attacker_xwing);
@@ -3316,8 +3514,7 @@ mod tests {
         // bootstrap record.
         let state = registry_relay.state.lock().unwrap();
         let register_req = state.register_requests.last().expect("joiner registered");
-        let approval =
-            register_req.registry_approval.as_ref().expect("registry approval present");
+        let approval = register_req.registry_approval.as_ref().expect("registry approval present");
         let snapshot = SignedRegistrySnapshot::verify_and_decode_hybrid(
             &approval.signed_registry_snapshot,
             &inviter_signing_key.public_key_bytes(),
@@ -3860,8 +4057,7 @@ mod tests {
                 .unwrap()
         });
 
-        let initiator_storage =
-            initiator_storage_with_self(sync_id, &device_secret, &device_id, 0);
+        let initiator_storage = initiator_storage_with_self(sync_id, &device_secret, &device_id, 0);
         initiator_service
             .complete_bootstrap_initiator(
                 &initiator,
@@ -4378,13 +4574,11 @@ mod tests {
             }
             async fn fetch_pending_ephemeral(
                 &self,
-            ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
+            ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError>
+            {
                 unimplemented!()
             }
-            async fn ack_ephemeral(
-                &self,
-                _: &[String],
-            ) -> std::result::Result<(), RelayError> {
+            async fn ack_ephemeral(&self, _: &[String]) -> std::result::Result<(), RelayError> {
                 unimplemented!()
             }
         }
@@ -4688,12 +4882,12 @@ mod tests {
         let key2 = vec![0xA2u8; 32];
         let key3 = vec![0xA3u8; 32];
         let mut hashes = std::collections::BTreeMap::new();
-        hashes.insert(0, compute_epoch_key_hash(hierarchy.epoch_key(0).unwrap().try_into().unwrap()));
+        hashes
+            .insert(0, compute_epoch_key_hash(hierarchy.epoch_key(0).unwrap().try_into().unwrap()));
         hashes.insert(1, compute_epoch_key_hash(&[0xA1u8; 32]));
         hashes.insert(2, compute_epoch_key_hash(&[0xA2u8; 32]));
         hashes.insert(3, compute_epoch_key_hash(&[0xA3u8; 32]));
-        let snapshot =
-            SignedRegistrySnapshot::new_with_epoch_binding(Vec::new(), 1, 3, hashes);
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(Vec::new(), 1, 3, hashes);
 
         let bundle_keys = std::collections::BTreeMap::from([
             (1u32, key1.clone()),
@@ -4730,13 +4924,12 @@ mod tests {
         let mut hashes = std::collections::BTreeMap::new();
         // Registry commits to the GOOD key for epoch 1.
         hashes.insert(1, compute_epoch_key_hash(&[0xB1u8; 32]));
-        let snapshot =
-            SignedRegistrySnapshot::new_with_epoch_binding(Vec::new(), 1, 2, hashes);
+        let snapshot = SignedRegistrySnapshot::new_with_epoch_binding(Vec::new(), 1, 2, hashes);
 
         // Bundle ships the tampered key.
         let bundle_keys = std::collections::BTreeMap::from([(1u32, tampered)]);
-        let err =
-            install_bundle_epoch_keys(&store, &mut hierarchy, &bundle_keys, 2, &snapshot).unwrap_err();
+        let err = install_bundle_epoch_keys(&store, &mut hierarchy, &bundle_keys, 2, &snapshot)
+            .unwrap_err();
         assert!(
             matches!(err, CoreError::EpochKeyMismatch { epoch: 1, .. }),
             "expected epoch-1 mismatch, got {err:?}"
@@ -4807,15 +5000,9 @@ mod tests {
         let epoch_1_key = [0x71u8; 32];
         let epoch_2_key = [0x72u8; 32];
         let epoch_3_key = [0x73u8; 32];
-        initiator_store
-            .set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes())
-            .unwrap();
-        initiator_store
-            .set("epoch_key_2", STANDARD.encode(epoch_2_key).as_bytes())
-            .unwrap();
-        initiator_store
-            .set("epoch_key_3", STANDARD.encode(epoch_3_key).as_bytes())
-            .unwrap();
+        initiator_store.set("epoch_key_1", STANDARD.encode(epoch_1_key).as_bytes()).unwrap();
+        initiator_store.set("epoch_key_2", STANDARD.encode(epoch_2_key).as_bytes()).unwrap();
+        initiator_store.set("epoch_key_3", STANDARD.encode(epoch_3_key).as_bytes()).unwrap();
         initiator_store.set("registration_token", b"relay-registration-token").unwrap();
 
         let mut current_epoch_hashes = build_epoch_key_hashes(&key_hierarchy).unwrap();
@@ -4897,9 +5084,7 @@ mod tests {
 
         // The joiner persisted every epoch key the initiator held, each verified
         // against the bundle's signed registry before install.
-        for (epoch, key) in
-            [(1u32, epoch_1_key), (2u32, epoch_2_key), (3u32, epoch_3_key)]
-        {
+        for (epoch, key) in [(1u32, epoch_1_key), (2u32, epoch_2_key), (3u32, epoch_3_key)] {
             let stored = joiner_store
                 .get(&format!("epoch_key_{epoch}"))
                 .unwrap()
