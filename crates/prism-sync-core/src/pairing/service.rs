@@ -109,6 +109,18 @@ impl PairingService {
         let _ = self.secure_store.set(marker, key.as_bytes());
     }
 
+    /// Clear the cache marker only if it still points at our key. An overlapping
+    /// newer ceremony may have already claimed the marker (and now tracks its own
+    /// terminal cache); deleting it unconditionally would strand that orphan from
+    /// the startup sweep. Best-effort.
+    fn clear_terminal_cache_marker_if(&self, marker: &str, key: &str) {
+        if let Ok(Some(prev)) = self.secure_store.get(marker) {
+            if prev.as_slice() == key.as_bytes() {
+                let _ = self.secure_store.delete(marker);
+            }
+        }
+    }
+
     fn stored_min_signature_version_floor(&self) -> Result<Option<u8>> {
         self.secure_store
             .get(MIN_SIGNATURE_VERSION_FLOOR_KEY)?
@@ -638,7 +650,10 @@ impl PairingService {
             .map_err(|e| CoreError::from_relay_with_context(Some("posting joiner bundle"), e))?;
 
         self.secure_store.delete(&credential_cache_key)?;
-        let _ = self.secure_store.delete(PAIRING_PENDING_CREDENTIAL_CACHE_KEY);
+        self.clear_terminal_cache_marker_if(
+            PAIRING_PENDING_CREDENTIAL_CACHE_KEY,
+            &credential_cache_key,
+        );
         self.secure_store.delete("setup_rollback_marker")?;
         self.secure_store.delete("pending_device_secret")?;
         self.secure_store.delete("pending_device_id")?;
@@ -1128,7 +1143,10 @@ impl PairingService {
             .await
             .map_err(|e| CoreError::from_relay_with_context(Some("deleting pairing session"), e))?;
         self.secure_store.delete(&joiner_bundle_cache_key)?;
-        let _ = self.secure_store.delete(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY);
+        self.clear_terminal_cache_marker_if(
+            PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY,
+            &joiner_bundle_cache_key,
+        );
         self.secure_store.delete("bootstrap_joiner_bundle")?;
         self.secure_store.delete("bootstrap_joiner_device_id")?;
 
@@ -3191,6 +3209,30 @@ mod tests {
             store.get(&k2).unwrap().is_some(),
             "same-key re-record must keep the live cache"
         );
+    }
+
+    #[test]
+    fn clear_terminal_cache_marker_if_preserves_a_newer_ceremonys_marker() {
+        let store = Arc::new(MemStore::default());
+        let service = PairingService::new(store.clone());
+        let key_a = pairing_terminal_cache_key(PAIRING_JOINER_BUNDLE_CACHE_PREFIX, "rid-a");
+        let key_b = pairing_terminal_cache_key(PAIRING_JOINER_BUNDLE_CACHE_PREFIX, "rid-b");
+
+        // A newer ceremony (B) currently owns the marker.
+        store.set(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, key_b.as_bytes()).unwrap();
+
+        // An older ceremony (A) finishing late must NOT clear B's marker, or B's
+        // orphan would be stranded from the startup sweep.
+        service.clear_terminal_cache_marker_if(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, &key_a);
+        assert_eq!(
+            store.get(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY).unwrap().unwrap(),
+            key_b.as_bytes(),
+            "a late older ceremony must not strand the newer ceremony's orphan"
+        );
+
+        // The owning ceremony (B) does clear it.
+        service.clear_terminal_cache_marker_if(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, &key_b);
+        assert!(store.get(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY).unwrap().is_none());
     }
 
     #[tokio::test]
