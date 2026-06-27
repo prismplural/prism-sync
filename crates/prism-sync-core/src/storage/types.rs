@@ -134,6 +134,31 @@ pub struct PullStall {
     pub last_seen_at: DateTime<Utc>,
 }
 
+/// Sender-level inbound pull-liveness health, accumulated per
+/// `(sync_id, sender_device_id, reason)`.
+///
+/// The per-seq [`PullStall`] / [`QuarantinedPullBatch`] rows answer "is THIS
+/// server_seq stuck?"; they cannot answer "is a given PEER's inbound stream
+/// persistently failing to apply while our push to them still succeeds?" — the
+/// asymmetric one-way-sync symptom. This row accumulates, per sender/reason, how
+/// many live cycles stalled (`live_stall_count`), how many of that sender's
+/// batches converted to a durable quarantine (`quarantined_batch_count`), and
+/// the last resolution error, so a persistently unresolvable sender is
+/// observable and attributable instead of looking like ordinary transient
+/// retries. Diagnostic only — it never gates verification. Device-local, never
+/// replicated, never snapshotted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSenderHealth {
+    pub sync_id: String,
+    pub sender_device_id: String,
+    pub reason: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub live_stall_count: i64,
+    pub quarantined_batch_count: i64,
+    pub last_error: Option<String>,
+}
+
 /// A staged-but-uncommitted epoch rotation (write-ahead journal).
 ///
 /// Written BEFORE a revoke/rekey is committed to the relay: the new epoch key

@@ -380,6 +380,72 @@ fn query_pull_stalls(conn: &Connection, sync_id: &str) -> Result<Vec<PullStall>>
     Ok(out)
 }
 
+fn row_to_pull_sender_health(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullSenderHealth> {
+    let first_seen_at: String = row.get("first_seen_at")?;
+    let last_seen_at: String = row.get("last_seen_at")?;
+    Ok(PullSenderHealth {
+        sync_id: row.get("sync_id")?,
+        sender_device_id: row.get("sender_device_id")?,
+        reason: row.get("reason")?,
+        first_seen_at: DateTime::parse_from_rfc3339(&first_seen_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        last_seen_at: DateTime::parse_from_rfc3339(&last_seen_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        live_stall_count: row.get("live_stall_count")?,
+        quarantined_batch_count: row.get("quarantined_batch_count")?,
+        last_error: row.get("last_error")?,
+    })
+}
+
+fn query_pull_sender_health(conn: &Connection, sync_id: &str) -> Result<Vec<PullSenderHealth>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM pull_sender_health WHERE sync_id = ?1 ORDER BY last_seen_at DESC",
+    )?;
+    let rows = stmt.query_map(params![sync_id], row_to_pull_sender_health)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn query_pull_sender_health_one(
+    conn: &Connection,
+    sync_id: &str,
+    sender_device_id: &str,
+    reason: &str,
+) -> Result<Option<PullSenderHealth>> {
+    conn.query_row(
+        "SELECT * FROM pull_sender_health \
+         WHERE sync_id = ?1 AND sender_device_id = ?2 AND reason = ?3",
+        params![sync_id, sender_device_id, reason],
+        row_to_pull_sender_health,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_quarantined_pull_batches_by_sender(
+    conn: &Connection,
+    sync_id: &str,
+    sender_device_id: &str,
+) -> Result<Vec<QuarantinedPullBatch>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM quarantined_pull_batches \
+         WHERE sync_id = ?1 AND sender_device_id = ?2 \
+         ORDER BY server_seq ASC, quarantined_at ASC, batch_id ASC",
+    )?;
+    let rows =
+        stmt.query_map(params![sync_id, sender_device_id], row_to_quarantined_pull_batch)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn row_to_consumer_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConsumerDelivery> {
     let created_at: String = row.get("created_at")?;
     Ok(ConsumerDelivery {
@@ -892,6 +958,51 @@ fn exec_clear_all_pull_stalls(conn: &Connection, sync_id: &str) -> Result<()> {
     // re-issued seq's first transient failure straight to quarantine-and-advance,
     // skipping an unapplied batch. Drop them all alongside the cursor reset.
     conn.execute("DELETE FROM pull_stall WHERE sync_id = ?1", params![sync_id])?;
+    Ok(())
+}
+
+fn exec_bump_pull_sender_health(
+    conn: &Connection,
+    sync_id: &str,
+    sender_device_id: &str,
+    reason: &str,
+    stall_delta: i64,
+    quarantine_delta: i64,
+    last_error: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO pull_sender_health \
+         (sync_id, sender_device_id, reason, first_seen_at, last_seen_at, \
+          live_stall_count, quarantined_batch_count, last_error) \
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(sync_id, sender_device_id, reason) DO UPDATE SET \
+         live_stall_count = live_stall_count + ?5, \
+         quarantined_batch_count = quarantined_batch_count + ?6, \
+         last_seen_at = excluded.last_seen_at, \
+         last_error = COALESCE(excluded.last_error, last_error)",
+        params![
+            sync_id,
+            sender_device_id,
+            reason,
+            now,
+            stall_delta,
+            quarantine_delta,
+            last_error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn exec_clear_pull_sender_health(
+    conn: &Connection,
+    sync_id: &str,
+    sender_device_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pull_sender_health WHERE sync_id = ?1 AND sender_device_id = ?2",
+        params![sync_id, sender_device_id],
+    )?;
     Ok(())
 }
 
@@ -1818,6 +1929,30 @@ impl SyncStorage for RusqliteSyncStorage {
         query_pull_stalls(&conn, sync_id)
     }
 
+    fn list_pull_sender_health(&self, sync_id: &str) -> Result<Vec<PullSenderHealth>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_pull_sender_health(&conn, sync_id)
+    }
+
+    fn get_pull_sender_health(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+        reason: &str,
+    ) -> Result<Option<PullSenderHealth>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_pull_sender_health_one(&conn, sync_id, sender_device_id, reason)
+    }
+
+    fn list_quarantined_pull_batches_by_sender(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+    ) -> Result<Vec<QuarantinedPullBatch>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_quarantined_pull_batches_by_sender(&conn, sync_id, sender_device_id)
+    }
+
     fn list_consumer_deliveries(
         &self,
         sync_id: &str,
@@ -2144,6 +2279,36 @@ impl SyncStorageTx for RusqliteTx<'_> {
 
     fn clear_all_pull_stalls(&mut self, sync_id: &str) -> Result<()> {
         exec_clear_all_pull_stalls(&self.conn, sync_id)
+    }
+
+    // ── Sender-level pull-liveness health ──
+
+    fn bump_pull_sender_health(
+        &mut self,
+        sync_id: &str,
+        sender_device_id: &str,
+        reason: &str,
+        stall_delta: i64,
+        quarantine_delta: i64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        exec_bump_pull_sender_health(
+            &self.conn,
+            sync_id,
+            sender_device_id,
+            reason,
+            stall_delta,
+            quarantine_delta,
+            last_error,
+        )
+    }
+
+    fn clear_pull_sender_health(
+        &mut self,
+        sync_id: &str,
+        sender_device_id: &str,
+    ) -> Result<()> {
+        exec_clear_pull_sender_health(&self.conn, sync_id, sender_device_id)
     }
 
     // ── Epoch-rotation write-ahead journal ──

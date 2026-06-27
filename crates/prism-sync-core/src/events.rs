@@ -101,6 +101,36 @@ pub enum SyncEvent {
         reason: String,
         attempt: i64,
     },
+    /// A specific *peer's* inbound batches are repeatedly failing to apply on
+    /// this device (transient sender-resolution stall or conversion to a durable
+    /// quarantine) while this device's own push to the group still succeeds — the
+    /// asymmetric one-way-sync symptom. This is the sender-level rollup of the
+    /// per-seq `PullStalled` / `PullBatchQuarantined` events: `live_stall_count`
+    /// is how many live cycles have stalled on this sender/reason and
+    /// `quarantined_batch_count` is how many of its batches have converted to a
+    /// durable (Phase 0b-replayable) quarantine. It lets the app distinguish
+    /// "sync completed but a peer's data is not applying" from ordinary transient
+    /// retries. Fail-closed semantics are unchanged — nothing is applied
+    /// unverified; this is a diagnostic signal only. `reason` is the persisted
+    /// stall/quarantine reason. Additive event — the Dart decoder ignores unknown
+    /// event types.
+    PullSenderStalled {
+        sender_device_id: String,
+        reason: String,
+        live_stall_count: i64,
+        quarantined_batch_count: i64,
+        last_error: String,
+    },
+    /// A peer that was previously stalled/quarantined locally became resolvable
+    /// again: Phase 0b replay verified and applied `replayed_batch_count` of its
+    /// previously quarantined batches, and the sender's accumulated health rows
+    /// were cleared. The inverse of `PullSenderStalled`. Additive event — the
+    /// Dart decoder ignores unknown event types.
+    PullSenderRecovered {
+        sender_device_id: String,
+        reason: String,
+        replayed_batch_count: i64,
+    },
     /// A forward clock excursion poisoned this device's own HLCs (watermark and
     /// self-authored `field_versions` winners drifted past the drift bound) and
     /// the relay-anchored repair rewrote those winners at sane HLCs and

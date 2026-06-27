@@ -944,6 +944,28 @@ fn sync_event_to_json(event: &prism_sync_core::events::SyncEvent) -> serde_json:
             "reason": reason,
             "attempt": attempt,
         }),
+        SyncEvent::PullSenderStalled {
+            sender_device_id,
+            reason,
+            live_stall_count,
+            quarantined_batch_count,
+            last_error,
+        } => serde_json::json!({
+            "type": "PullSenderStalled",
+            "sender_device_id": sender_device_id,
+            "reason": reason,
+            "live_stall_count": live_stall_count,
+            "quarantined_batch_count": quarantined_batch_count,
+            "last_error": redact_sensitive_message(last_error),
+        }),
+        SyncEvent::PullSenderRecovered { sender_device_id, reason, replayed_batch_count } => {
+            serde_json::json!({
+                "type": "PullSenderRecovered",
+                "sender_device_id": sender_device_id,
+                "reason": reason,
+                "replayed_batch_count": replayed_batch_count,
+            })
+        }
         SyncEvent::ClockExcursionRepaired { field_count, max_drift_ms } => serde_json::json!({
             "type": "ClockExcursionRepaired",
             "field_count": field_count,

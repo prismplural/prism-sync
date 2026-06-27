@@ -254,6 +254,34 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL
     );
     ",
+    "-- V11: Sender-level inbound pull-liveness tracking (one-way-sync diagnostics).
+    --
+    -- `pull_sender_health` is the durable sender-level companion to the per-seq
+    -- `pull_stall` budget and the `quarantined_pull_batches` custody log. The
+    -- per-seq rows answer 'is THIS server_seq stuck?'; they cannot answer 'is a
+    -- given PEER's inbound stream persistently failing to apply while our push to
+    -- them still succeeds?' — the asymmetric one-way-sync symptom. This table
+    -- accumulates, per (sender, reason): how many live cycles stalled
+    -- (`live_stall_count`), how many of that sender's batches converted to a
+    -- durable quarantine (`quarantined_batch_count`), and the last resolution
+    -- error. It is a diagnostic counter only — it NEVER gates verification and a
+    -- missed increment is benign. Cleared on Phase 0b replay recovery for that
+    -- sender. Keyed by (sync_id, sender_device_id, reason): a sender's identity
+    -- survives a relay-log lineage reset (unlike the seq-keyed `pull_stall`), so
+    -- this is intentionally NOT dropped on lineage reset. Device-local, never
+    -- replicated, never snapshotted.
+    CREATE TABLE IF NOT EXISTS pull_sender_health (
+        sync_id TEXT NOT NULL,
+        sender_device_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        live_stall_count INTEGER NOT NULL DEFAULT 0,
+        quarantined_batch_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        PRIMARY KEY (sync_id, sender_device_id, reason)
+    );
+    ",
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), String> {
@@ -335,6 +363,8 @@ mod tests {
             "consumer_deliveries",
             // V10: the epoch-rotation write-ahead journal.
             "pending_epoch_rotation",
+            // V11: the sender-level pull-liveness tracker.
+            "pull_sender_health",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -422,6 +452,41 @@ mod tests {
     fn pending_epoch_rotation_table_count(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pending_epoch_rotation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v11_adds_pull_sender_health_table_and_is_idempotent() {
+        // Stamp a DB at V10 (before the sender-health tracker) and upgrade: V11
+        // must create `pull_sender_health` exactly once, and re-applying is a
+        // no-op.
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(10) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 10i64).unwrap();
+        assert_eq!(
+            pull_sender_health_table_count(&conn),
+            0,
+            "V10 DB has no pull_sender_health table yet"
+        );
+
+        apply(&mut conn).unwrap();
+        assert_eq!(pull_sender_health_table_count(&conn), 1, "V11 adds the table");
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // Re-running is a no-op (version gate plus the IF NOT EXISTS guard).
+        apply(&mut conn).unwrap();
+        assert_eq!(pull_sender_health_table_count(&conn), 1, "table not double-created");
+    }
+
+    fn pull_sender_health_table_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pull_sender_health'",
             [],
             |row| row.get(0),
         )

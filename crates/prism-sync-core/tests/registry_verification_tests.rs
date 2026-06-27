@@ -1026,6 +1026,7 @@ struct F13Fixture {
     entity: Arc<MockTaskEntity>,
     engine: SyncEngine,
     signing_key_a: ed25519_dalek::SigningKey,
+    ml_dsa_a: prism_sync_crypto::DevicePqSigningKey,
     device_a_id: &'static str,
     device_b_id: &'static str,
     signed_blob: Vec<u8>,
@@ -1147,6 +1148,7 @@ fn setup_f13_fixture_with_config(config: SyncConfig) -> F13Fixture {
         entity,
         engine,
         signing_key_a,
+        ml_dsa_a,
         device_a_id,
         device_b_id,
         signed_blob,
@@ -1164,6 +1166,46 @@ fn drain_pull_stalled(
             event
         {
             out.push((server_seq, reason, attempt));
+        }
+    }
+    out
+}
+
+/// Collected `PullSenderStalled` events: (sender_device_id, reason,
+/// live_stall_count, quarantined_batch_count).
+fn drain_pull_sender_stalled(
+    rx: &mut tokio::sync::broadcast::Receiver<prism_sync_core::events::SyncEvent>,
+) -> Vec<(String, String, i64, i64)> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::PullSenderStalled {
+            sender_device_id,
+            reason,
+            live_stall_count,
+            quarantined_batch_count,
+            ..
+        } = event
+        {
+            out.push((sender_device_id, reason, live_stall_count, quarantined_batch_count));
+        }
+    }
+    out
+}
+
+/// Collected `PullSenderRecovered` events: (sender_device_id, reason,
+/// replayed_batch_count).
+fn drain_pull_sender_recovered(
+    rx: &mut tokio::sync::broadcast::Receiver<prism_sync_core::events::SyncEvent>,
+) -> Vec<(String, String, i64)> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let prism_sync_core::events::SyncEvent::PullSenderRecovered {
+            sender_device_id,
+            reason,
+            replayed_batch_count,
+        } = event
+        {
+            out.push((sender_device_id, reason, replayed_batch_count));
         }
     }
     out
@@ -2873,5 +2915,394 @@ async fn f16_stale_generation_budget_exhaustion_quarantines_then_replay_applies(
     assert!(
         storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
         "quarantine row deleted after a successful replay"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// One-way-sync liveness: sender-level pull-health tracking
+//
+// The per-seq `pull_stall` / `quarantined_pull_batches` rows answer "is THIS
+// server_seq stuck?". `pull_sender_health` answers the asymmetric one-way
+// question: "is a given PEER's inbound stream persistently failing to apply
+// while our push to the group still succeeds?". These tests reproduce that
+// symptom and prove the diagnostics identify the broken sender and reason, and
+// that recovery clears the state.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Find the single sender-health row for `(sender, reason)`, failing the test
+/// with the full table dumped if it is absent.
+fn sender_health_row(
+    storage: &RusqliteSyncStorage,
+    sender: &str,
+    reason: &str,
+) -> prism_sync_core::storage::PullSenderHealth {
+    let rows = storage.list_pull_sender_health(SYNC_ID).unwrap();
+    rows.iter()
+        .find(|h| h.sender_device_id == sender && h.reason == reason)
+        .cloned()
+        .unwrap_or_else(|| panic!("no pull_sender_health for ({sender}, {reason}); rows: {rows:?}"))
+}
+
+/// A persistently-unresolvable sender produces a rolling per-cycle stall stream:
+/// each sync cycle re-stalls the same batch and bumps the sender-level
+/// `live_stall_count`, so the broken peer is attributable instead of looking
+/// like ordinary transient retries. Cursor stays frozen and nothing applies
+/// (fail-closed), and no quarantine forms while the batch is within budget.
+#[tokio::test]
+async fn rolling_sender_stalls_are_sender_tracked() {
+    // Default budget (8 attempts) so three cycles all stay within budget and
+    // keep stalling live rather than converting to quarantine.
+    let mut f = setup_f13_fixture();
+
+    // No signed registry set: get_signed_registry returns Ok(None) every cycle,
+    // an ambiguous transient verdict -> stall.
+    for _ in 0..3 {
+        let r = f
+            .engine
+            .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+            .await
+            .unwrap();
+        assert!(r.error.is_none(), "stall is non-fatal: {:?}", r.error);
+    }
+
+    // The sender-level rollup accumulated one live stall per cycle.
+    let health = sender_health_row(&f.storage, f.device_b_id, "sender_unresolved");
+    assert_eq!(health.live_stall_count, 3, "one live stall accrued per cycle");
+    assert_eq!(health.quarantined_batch_count, 0, "still within budget — no quarantine yet");
+    assert!(health.last_error.is_some(), "last resolution error captured for diagnostics");
+
+    // Fail-closed: cursor frozen, B's data never applied, batch not yet quarantined.
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor frozen across the rolling stalls"
+    );
+    assert_eq!(f.entity.get_field("task-1", "title"), None, "nothing applied (fail closed)");
+    assert!(f.storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty());
+
+    // The app sees a sender-level liveness signal, not just per-seq stalls.
+    let events = drain_pull_sender_stalled(&mut f.event_rx);
+    assert!(
+        events.iter().any(|(s, r, live, _)| s == f.device_b_id
+            && r == "sender_unresolved"
+            && *live >= 1),
+        "expected a PullSenderStalled for device B; got {events:?}"
+    );
+}
+
+/// While a peer's inbound batch stalls and never applies, this device's own push
+/// to the group still succeeds — the asymmetric one-way symptom. A single cycle
+/// proves both halves: A's pending op is pushed while B's batch stalls, never
+/// applies, and a sender-level liveness event is emitted.
+#[tokio::test]
+async fn device_a_pushes_while_device_b_inbound_stalls() {
+    let mut f = setup_f13_fixture();
+
+    // Give device A a local pending op so the push phase has something to send.
+    let hlc_a = Hlc::now(f.device_a_id, None);
+    let op_a = CrdtChange {
+        op_id: format!("tasks:task-a:title:{}:{}", hlc_a, f.device_a_id),
+        batch_id: Some("batch-a1".to_string()),
+        entity_id: "task-a".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Hello from A\"".to_string(),
+        client_hlc: hlc_a.to_string(),
+        is_delete: false,
+        device_id: f.device_a_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    };
+    insert_pending_ops(&f.storage, std::slice::from_ref(&op_a), "batch-a1");
+
+    // One cycle: B is the unknown sender (no registry) -> pull stalls; push runs.
+    let r = f
+        .engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, Some(&f.ml_dsa_a), f.device_a_id, 0)
+        .await
+        .unwrap();
+    assert!(r.error.is_none(), "asymmetric cycle is non-fatal: {:?}", r.error);
+
+    // Outbound (push) succeeded.
+    assert!(
+        !f.relay.push_call_batch_ids().is_empty(),
+        "device A's push must run even while device B's inbound batch stalls"
+    );
+    assert!(r.pushed >= 1, "A's pending op was pushed: {r:?}");
+
+    // Inbound (pull) stalled — fail-closed, nothing from B applied.
+    assert_eq!(f.entity.get_field("task-1", "title"), None, "B's batch did not apply");
+    assert_eq!(
+        f.storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
+        0,
+        "cursor held behind B's stalled batch"
+    );
+    let health = sender_health_row(&f.storage, f.device_b_id, "sender_unresolved");
+    assert_eq!(health.live_stall_count, 1);
+
+    // The degraded-inbound signal is surfaced.
+    let events = drain_pull_sender_stalled(&mut f.event_rx);
+    assert!(
+        events.iter().any(|(s, _, _, _)| s == f.device_b_id),
+        "expected a PullSenderStalled for device B; got {events:?}"
+    );
+}
+
+/// Budget exhaustion converts the stall to a durable quarantine and the
+/// sender-level `quarantined_batch_count` records it. Once the registry imports
+/// and Phase 0b replay applies the batch, the sender's health is cleared and a
+/// `PullSenderRecovered` is emitted — the inverse signal.
+#[tokio::test]
+async fn sender_health_tracks_quarantine_then_recovery() {
+    let mut f = setup_f13_fixture_with_config(SyncConfig {
+        pull_stall_max_attempts: 2,
+        quarantine_replay_backoff_base_ms: 0,
+        ..SyncConfig::default()
+    });
+
+    // Cycle 1: stall (attempt 1) -> live_stall_count = 1.
+    f.engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+    // Cycle 2: attempt 2 hits the budget -> quarantine-and-advance.
+    f.engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+
+    let health = sender_health_row(&f.storage, f.device_b_id, "sender_unresolved");
+    assert_eq!(health.live_stall_count, 1, "one within-budget live stall before conversion");
+    assert_eq!(health.quarantined_batch_count, 1, "the conversion is tallied per sender");
+
+    // The per-sender quarantine drill-down sees B's unapplied backlog.
+    let by_sender = f
+        .storage
+        .list_quarantined_pull_batches_by_sender(SYNC_ID, f.device_b_id)
+        .unwrap();
+    assert_eq!(by_sender.len(), 1);
+    assert_eq!(by_sender[0].reason, "sender_unresolved");
+
+    // The quarantine-conversion cycle surfaced a sender-level event carrying the
+    // quarantine count.
+    let stalled = drain_pull_sender_stalled(&mut f.event_rx);
+    assert!(
+        stalled.iter().any(|(s, _, _, q)| s == f.device_b_id && *q == 1),
+        "expected PullSenderStalled with quarantined_batch_count=1; got {stalled:?}"
+    );
+
+    // Make the sender resolvable, then sync: Phase 0b replay applies the batch.
+    f.relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: f.signed_blob.clone(),
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+    f.engine
+        .sync(SYNC_ID, &f.key_hierarchy, &f.signing_key_a, None, f.device_a_id, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        f.entity.get_field("task-1", "title"),
+        Some(SyncValue::String("Hello from B".to_string())),
+        "Phase 0b replay applied B's batch once the registry imported"
+    );
+    assert!(
+        f.storage.list_pull_sender_health(SYNC_ID).unwrap().is_empty(),
+        "sender health cleared on recovery"
+    );
+    let recovered = drain_pull_sender_recovered(&mut f.event_rx);
+    assert!(
+        recovered
+            .iter()
+            .any(|(s, r, n)| s == f.device_b_id && r == "sender_unresolved" && *n == 1),
+        "expected PullSenderRecovered for device B; got {recovered:?}"
+    );
+}
+
+/// A stale-generation stall is tracked under the `stale_key_generation` reason
+/// (distinct from `sender_unresolved`), so diagnostics distinguish a peer whose
+/// registry generation has not propagated from one whose keys are entirely
+/// unresolvable. Recovery via gen-1 import clears it and emits the matching
+/// `PullSenderRecovered`.
+#[tokio::test]
+async fn stale_generation_sender_health_tracks_and_recovers() {
+    let key_hierarchy = init_key_hierarchy();
+
+    let verifier_id = "device-verifier";
+    let verifier_secret = DeviceSecret::generate();
+    let verifier_signing =
+        verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
+
+    let sender_id = "device-sender";
+    let sender_secret = DeviceSecret::generate();
+    let sender_ed25519 = sender_secret.ed25519_keypair(sender_id).unwrap();
+    let sender_x25519 = sender_secret.x25519_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen0 = sender_secret.ml_dsa_65_keypair(sender_id).unwrap();
+    let sender_ml_dsa_gen1 = sender_secret.ml_dsa_65_keypair_v(sender_id, 1).unwrap();
+    let sender_ml_kem = sender_secret.ml_kem_768_keypair(sender_id).unwrap();
+
+    let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
+    setup_sync_metadata(&storage, verifier_id);
+    register_device_in_storage(
+        &storage,
+        verifier_id,
+        &verifier_secret.ed25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.x25519_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_dsa_65_keypair(verifier_id).unwrap().public_key_bytes(),
+        &verifier_secret.ml_kem_768_keypair(verifier_id).unwrap().public_key_bytes(),
+        0,
+    );
+    // Verifier knows the sender only at gen 0.
+    register_device_in_storage(
+        &storage,
+        sender_id,
+        &sender_ed25519.public_key_bytes(),
+        &sender_x25519.public_key_bytes(),
+        &sender_ml_dsa_gen0.public_key_bytes(),
+        &sender_ml_kem.public_key_bytes(),
+        0,
+    );
+
+    // The sender rotated and pushed a gen-1 batch.
+    let sender_ed25519_pk = sender_ed25519.public_key_bytes().to_vec();
+    let signing_key_sender = sender_ed25519.into_signing_key();
+    let hlc = Hlc::now(sender_id, None);
+    let ops = vec![CrdtChange {
+        op_id: format!("tasks:task-rot:title:{}:{}", hlc, sender_id),
+        batch_id: Some("batch-rotated".to_string()),
+        entity_id: "task-rot".to_string(),
+        entity_table: "tasks".to_string(),
+        field_name: "title".to_string(),
+        encoded_value: "\"Edit after rotation\"".to_string(),
+        client_hlc: hlc.to_string(),
+        is_delete: false,
+        device_id: sender_id.to_string(),
+        epoch: 0,
+        server_seq: None,
+    }];
+    let envelope = make_encrypted_batch_at_generation(
+        &ops,
+        &key_hierarchy,
+        &signing_key_sender,
+        &sender_ml_dsa_gen1,
+        "batch-rotated",
+        sender_id,
+        1,
+    );
+
+    let relay = Arc::new(MockRelay::new());
+    relay.inject_batch(envelope);
+
+    let entity = Arc::new(MockTaskEntity::new());
+    let entity_ref: Arc<dyn SyncableEntity> = entity.clone();
+    let (event_tx, mut event_rx) =
+        tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(64);
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig {
+            pull_stall_max_attempts: 2,
+            quarantine_replay_backoff_base_ms: 0,
+            ..SyncConfig::default()
+        },
+    )
+    .with_event_sink(event_tx);
+
+    // Cycle 1: gen 1 > local gen 0, no registry to refresh -> stall.
+    engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+    // Cycle 2: budget hit -> quarantine (reason stale_key_generation).
+    engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+
+    let health = sender_health_row(&storage, sender_id, "stale_key_generation");
+    assert_eq!(health.live_stall_count, 1);
+    assert_eq!(health.quarantined_batch_count, 1);
+    // The sender-unresolved reason must NOT be what we recorded here.
+    assert!(
+        storage
+            .list_pull_sender_health(SYNC_ID)
+            .unwrap()
+            .iter()
+            .all(|h| h.reason == "stale_key_generation"),
+        "a generation stall is attributed to stale_key_generation, not sender_unresolved"
+    );
+
+    // Publish the gen-1 registry, then sync: Phase 0b replay imports gen 1,
+    // verifies, applies, and recovery clears the sender health.
+    let entries = vec![
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: verifier_id.to_string(),
+            ed25519_public_key: verifier_secret
+                .ed25519_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            x25519_public_key: verifier_secret
+                .x25519_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
+            ml_dsa_65_public_key: verifier_secret
+                .ml_dsa_65_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes(),
+            ml_kem_768_public_key: verifier_secret
+                .ml_kem_768_keypair(verifier_id)
+                .unwrap()
+                .public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 0,
+            remote_wipe: false,
+        },
+        RegistrySnapshotEntry {
+            sync_id: SYNC_ID.to_string(),
+            device_id: sender_id.to_string(),
+            ed25519_public_key: sender_ed25519_pk.clone(),
+            x25519_public_key: sender_x25519.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: sender_ml_dsa_gen1.public_key_bytes(),
+            ml_kem_768_public_key: sender_ml_kem.public_key_bytes(),
+            x_wing_public_key: vec![],
+            status: "active".to_string(),
+            ml_dsa_key_generation: 1,
+            remote_wipe: false,
+        },
+    ];
+    let signed_blob = build_signed_registry_blob(entries, &verifier_secret, verifier_id);
+    relay.set_signed_registry(SignedRegistryResponse {
+        registry_version: 1,
+        artifact_blob: signed_blob,
+        artifact_kind: "signed_registry_snapshot".to_string(),
+    });
+
+    engine
+        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        entity.get_field("task-rot", "title"),
+        Some(SyncValue::String("Edit after rotation".to_string())),
+        "Phase 0b replay applied the rotated batch once gen-1 imported"
+    );
+    assert!(
+        storage.list_pull_sender_health(SYNC_ID).unwrap().is_empty(),
+        "sender health cleared on stale-generation recovery"
+    );
+    let recovered = drain_pull_sender_recovered(&mut event_rx);
+    assert!(
+        recovered
+            .iter()
+            .any(|(s, r, n)| s == sender_id && r == "stale_key_generation" && *n == 1),
+        "expected PullSenderRecovered(stale_key_generation) for the sender; got {recovered:?}"
     );
 }

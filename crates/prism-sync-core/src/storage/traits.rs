@@ -74,6 +74,40 @@ pub trait SyncStorage: Send + Sync {
         Ok(vec![])
     }
 
+    /// List sender-level inbound pull-liveness rows for this sync group, ordered
+    /// by `last_seen_at` descending (most-recently-failing sender first). A
+    /// support/diagnostics surface: a nonempty list means one or more peers'
+    /// inbound batches are repeatedly stalling/quarantining locally even though
+    /// this device's own push still succeeds (the asymmetric one-way symptom).
+    /// Default: empty (no-op for in-memory impls).
+    fn list_pull_sender_health(&self, _sync_id: &str) -> Result<Vec<PullSenderHealth>> {
+        Ok(vec![])
+    }
+
+    /// Fetch the sender-health row for one `(sync_id, sender_device_id, reason)`,
+    /// or `None` if that sender/reason has no recorded failures.
+    /// Default: `None` (no-op for in-memory impls).
+    fn get_pull_sender_health(
+        &self,
+        _sync_id: &str,
+        _sender_device_id: &str,
+        _reason: &str,
+    ) -> Result<Option<PullSenderHealth>> {
+        Ok(None)
+    }
+
+    /// List durably-quarantined pull batches from a specific sender, ordered by
+    /// `server_seq` ascending. Companion to [`list_pull_sender_health`] for
+    /// drilling into one peer's unapplied backlog.
+    /// Default: empty (no-op for in-memory impls).
+    fn list_quarantined_pull_batches_by_sender(
+        &self,
+        _sync_id: &str,
+        _sender_device_id: &str,
+    ) -> Result<Vec<QuarantinedPullBatch>> {
+        Ok(vec![])
+    }
+
     /// List up to `limit` undrained consumer-delivery journal rows for this sync
     /// group with `id > after_id`, ordered by `id` ascending. The drain walks
     /// the journal in `id` order; `after_id = 0` returns from the start. Returns
@@ -459,6 +493,40 @@ pub trait SyncStorageTx {
     /// past the wall-clock ceiling would quarantine-and-advance a re-issued seq on
     /// its first transient hiccup. Default: no-op for in-memory impls.
     fn clear_all_pull_stalls(&mut self, _sync_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    // ── Sender-level pull-liveness health ──
+
+    /// Record a sender-level pull failure against `(sync_id, sender_device_id,
+    /// reason)`, adding `stall_delta` to `live_stall_count` and
+    /// `quarantine_delta` to `quarantined_batch_count` and refreshing
+    /// `last_seen_at`/`last_error`. On first insert both timestamps are now and
+    /// the deltas seed the counters; on conflict the counters are incremented and
+    /// `first_seen_at` is preserved. `last_error` is `COALESCE`d so a pure touch
+    /// (both deltas 0, `last_error = None`) does not erase a prior error. This is
+    /// a diagnostic counter only — it never gates verification. Default: no-op for
+    /// in-memory impls.
+    fn bump_pull_sender_health(
+        &mut self,
+        _sync_id: &str,
+        _sender_device_id: &str,
+        _reason: &str,
+        _stall_delta: i64,
+        _quarantine_delta: i64,
+        _last_error: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear every sender-health row for a sender whose batch finally applied via
+    /// Phase 0b replay (full recovery — the sender is resolvable again, so all of
+    /// its accumulated reason rows are stale). Default: no-op for in-memory impls.
+    fn clear_pull_sender_health(
+        &mut self,
+        _sync_id: &str,
+        _sender_device_id: &str,
+    ) -> Result<()> {
         Ok(())
     }
 

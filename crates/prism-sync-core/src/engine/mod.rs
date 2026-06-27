@@ -27,8 +27,8 @@ use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::snapshot_limits;
 use crate::storage::StorageError;
 use crate::storage::{
-    is_tombstone_value, AppliedOp, DeviceRecord, FieldVersion, FieldVersionEntry, QuarantinedOp,
-    QuarantinedPullBatch, SyncMetadata, SyncStorage,
+    is_tombstone_value, AppliedOp, DeviceRecord, FieldVersion, FieldVersionEntry,
+    PullSenderHealth, QuarantinedOp, QuarantinedPullBatch, SyncMetadata, SyncStorage,
 };
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
@@ -194,6 +194,17 @@ fn quarantine_replay_eligible(
     let wait_ms = base_ms.saturating_mul(1i64 << exp);
     let next_eligible = last + chrono::Duration::milliseconds(wait_ms);
     now >= next_eligible
+}
+
+/// Whether a persisted pull-failure `reason` is one the sender-level liveness
+/// tracker (`pull_sender_health`) accounts for. Only the two sender-resolution
+/// reasons describe a peer whose inbound stream is failing to apply while our
+/// push still succeeds (the asymmetric one-way symptom); deterministic permanent
+/// reasons (invalid signature, decode, attribution, missing epoch key) are
+/// batch-intrinsic, not a sender-liveness condition, so they are excluded.
+fn is_sender_health_reason(reason: &str) -> bool {
+    reason == PermanentPullReason::SenderUnresolved.as_str()
+        || reason == PermanentPullReason::StaleKeyGeneration.as_str()
 }
 
 /// Whether a `RelayError` corresponds to the relay's 413 `PayloadTooLarge`
@@ -1071,6 +1082,7 @@ impl SyncEngine {
                 // batch becomes Phase 0b-replayable (and the relay is no longer
                 // held off its prune floor) without ever silently dropping it.
                 SenderResolution::TransientlyUnavailable(e) => {
+                    let err_str = e.to_string();
                     let attempts = self
                         .stall_pull_batch(
                             sync_id,
@@ -1099,6 +1111,16 @@ impl SyncEngine {
                             Some(batch.server_seq),
                         )
                         .await?;
+                        // Sender-level rollup: another of this peer's batches quarantined.
+                        self.note_sender_pull_failure(
+                            sync_id,
+                            &envelope.sender_device_id,
+                            PermanentPullReason::SenderUnresolved.as_str(),
+                            0,
+                            1,
+                            &err_str,
+                        )
+                        .await?;
                         total_pulled += 1;
                         continue;
                     }
@@ -1123,6 +1145,16 @@ impl SyncEngine {
                         reason: TransientPullReason::SenderUnresolved.as_str().to_string(),
                         attempt: attempts,
                     });
+                    // Sender-level rollup; once per cycle (the page loop breaks right after).
+                    self.note_sender_pull_failure(
+                        sync_id,
+                        &envelope.sender_device_id,
+                        TransientPullReason::SenderUnresolved.as_str(),
+                        1,
+                        0,
+                        &err_str,
+                    )
+                    .await?;
                     stalled = true;
                     break;
                 }
@@ -1154,6 +1186,11 @@ impl SyncEngine {
                 // receiver's registry is behind (or, for an older generation, the
                 // key was never witnessed/archived). STALL and retry; the
                 // generation propagates via Phase 0b replay or a later import.
+                let err_str = format!(
+                    "ML-DSA generation {} not resolvable (local gen {})",
+                    envelope.sender_ml_dsa_key_generation,
+                    sender_key_info.ml_dsa_key_generation,
+                );
                 let attempts = self
                     .stall_pull_batch(
                         sync_id,
@@ -1180,6 +1217,15 @@ impl SyncEngine {
                         Some(batch.server_seq),
                     )
                     .await?;
+                    self.note_sender_pull_failure(
+                        sync_id,
+                        &envelope.sender_device_id,
+                        PermanentPullReason::StaleKeyGeneration.as_str(),
+                        0,
+                        1,
+                        &err_str,
+                    )
+                    .await?;
                     total_pulled += 1;
                     continue;
                 }
@@ -1196,6 +1242,15 @@ impl SyncEngine {
                     reason: TransientPullReason::StaleKeyGeneration.as_str().to_string(),
                     attempt: attempts,
                 });
+                self.note_sender_pull_failure(
+                    sync_id,
+                    &envelope.sender_device_id,
+                    TransientPullReason::StaleKeyGeneration.as_str(),
+                    1,
+                    0,
+                    &err_str,
+                )
+                .await?;
                 stalled = true;
                 break;
             };
@@ -2507,6 +2562,109 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// Record a sender-level inbound pull failure in `pull_sender_health` and
+    /// emit [`SyncEvent::PullSenderStalled`] carrying the rolled-up counts.
+    ///
+    /// This is the sender-level companion to the per-seq `pull_stall`/quarantine
+    /// machinery: the per-seq rows answer "is THIS server_seq stuck?", this
+    /// answers "is a given PEER's inbound stream persistently failing while our
+    /// push still succeeds?" — the asymmetric one-way-sync symptom. `stall_delta`
+    /// is 1 on a within-budget live stall, `quarantine_delta` is 1 on the
+    /// budget-exhaustion conversion to a durable quarantine. Diagnostic only:
+    /// this never gates verification, and a missed increment is benign.
+    async fn note_sender_pull_failure(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+        reason: &str,
+        stall_delta: i64,
+        quarantine_delta: i64,
+        last_error: &str,
+    ) -> Result<()> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let sender = sender_device_id.to_string();
+        let reason = reason.to_string();
+        let err = last_error.to_string();
+        let health = tokio::task::spawn_blocking(move || -> Result<PullSenderHealth> {
+            let mut tx = storage.begin_tx()?;
+            tx.bump_pull_sender_health(
+                &sid,
+                &sender,
+                &reason,
+                stall_delta,
+                quarantine_delta,
+                Some(&err),
+            )?;
+            tx.commit()?;
+            // Read back the rolled-up row for the event (commit released the
+            // write lock, same as `stall_pull_batch`'s attempts read-back).
+            storage.get_pull_sender_health(&sid, &sender, &reason)?.ok_or_else(|| {
+                CoreError::Storage(StorageError::Logic(
+                    "pull_sender_health row missing immediately after upsert".to_string(),
+                ))
+            })
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+
+        self.emit_event(SyncEvent::PullSenderStalled {
+            sender_device_id: health.sender_device_id,
+            reason: health.reason,
+            live_stall_count: health.live_stall_count,
+            quarantined_batch_count: health.quarantined_batch_count,
+            last_error: health.last_error.unwrap_or_default(),
+        });
+        Ok(())
+    }
+
+    /// Refresh `last_error`/`last_seen_at` on an existing sender-health row
+    /// without incrementing any counter (a Phase 0b replay attempt failed again
+    /// for the same sender/reason). Does not emit an event — the per-cycle
+    /// background backoff would otherwise be noisy. Counts are unchanged so the
+    /// quarantine total stays accurate.
+    async fn touch_sender_pull_health(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+        reason: &str,
+        last_error: &str,
+    ) -> Result<()> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let sender = sender_device_id.to_string();
+        let reason = reason.to_string();
+        let err = last_error.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = storage.begin_tx()?;
+            tx.bump_pull_sender_health(&sid, &sender, &reason, 0, 0, Some(&err))?;
+            tx.commit()
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        Ok(())
+    }
+
+    /// Clear every sender-health row for a sender whose batch finally applied via
+    /// Phase 0b replay — full recovery, the sender is resolvable again.
+    async fn clear_sender_pull_health(
+        &self,
+        sync_id: &str,
+        sender_device_id: &str,
+    ) -> Result<()> {
+        let storage = self.storage.clone();
+        let sid = sync_id.to_string();
+        let sender = sender_device_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = storage.begin_tx()?;
+            tx.clear_pull_sender_health(&sid, &sender)?;
+            tx.commit()
+        })
+        .await
+        .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
+        Ok(())
+    }
+
     /// Durably quarantine a poison pull batch and advance the cursor past it, in
     /// one transaction, then emit [`SyncEvent::PullBatchQuarantined`].
     ///
@@ -2614,6 +2772,10 @@ impl SyncEngine {
         let mut all_entity_changes: Vec<EntityChange> = Vec::new();
         let now = Utc::now();
         let backoff_base_ms = self.config.quarantine_replay_backoff_base_ms;
+        // Per-(sender, reason) tally of batches that applied this pass; drives the
+        // post-loop recovery (clear health + emit PullSenderRecovered).
+        let mut recovered: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
 
         for q in quarantined {
             // Reason-aware eligibility for the missing-epoch-key arm: a row
@@ -2662,6 +2824,13 @@ impl SyncEngine {
                 Ok(Some((merged, changes))) => {
                     total_merged += merged;
                     all_entity_changes.extend(changes);
+                    // Tally toward recovery; only the sender-resolution reasons
+                    // count (other permanent reasons are batch-intrinsic).
+                    if is_sender_health_reason(&q.reason) {
+                        *recovered
+                            .entry((q.sender_device_id.clone(), q.reason.clone()))
+                            .or_insert(0) += 1;
+                    }
                     let storage = self.storage.clone();
                     let sid = sync_id.to_string();
                     let sender = q.sender_device_id.clone();
@@ -2702,6 +2871,16 @@ impl SyncEngine {
                         reason = %q.reason,
                         "Quarantined pull batch still unapplicable: {e}"
                     );
+                    // Refresh last_error only — the quarantine was already tallied.
+                    if is_sender_health_reason(&q.reason) {
+                        self.touch_sender_pull_health(
+                            sync_id,
+                            &q.sender_device_id,
+                            &q.reason,
+                            &e.to_string(),
+                        )
+                        .await?;
+                    }
                     let storage = self.storage.clone();
                     let sid = sync_id.to_string();
                     let sender = q.sender_device_id.clone();
@@ -2715,6 +2894,17 @@ impl SyncEngine {
                     .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
                 }
             }
+        }
+
+        // Recovery: clear the sender's health and emit PullSenderRecovered.
+        // Clearing by sender is idempotent across multiple recovered reasons.
+        for ((sender, reason), replayed_batch_count) in recovered {
+            self.clear_sender_pull_health(sync_id, &sender).await?;
+            self.emit_event(SyncEvent::PullSenderRecovered {
+                sender_device_id: sender,
+                reason,
+                replayed_batch_count,
+            });
         }
 
         Ok((total_merged, all_entity_changes))
