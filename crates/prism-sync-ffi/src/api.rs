@@ -4976,7 +4976,11 @@ pub fn encode_image(
         .map_err(|e| format!("Failed to decode image: {e}"))?;
     img.apply_orientation(orientation);
 
-    let resized = img.resize(max_width, max_height, image::imageops::FilterType::Lanczos3);
+    let resized = if img.width() <= max_width && img.height() <= max_height {
+        img
+    } else {
+        img.resize(max_width, max_height, image::imageops::FilterType::Lanczos3)
+    };
 
     // The color *type* carrying an alpha channel does not mean the image
     // actually uses transparency — opaque PNGs / exported screenshots commonly
@@ -6720,6 +6724,47 @@ mod tests {
 
         let image = image::load_from_memory(&encoded).unwrap();
         assert_eq!((image.width(), image.height()), (40, 80));
+    }
+
+    #[test]
+    fn encode_image_accepts_avif_input() {
+        let source = tiny_avif();
+
+        let (encoded, mime_type) = encode_image(source, 80, 80, 85).unwrap();
+
+        assert_eq!(mime_type, "image/jpeg");
+        let image = image::load_from_memory(&encoded).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 1));
+    }
+
+    #[test]
+    fn encode_image_accepts_static_gif_input() {
+        let source = static_gif(2, 1);
+
+        let (encoded, mime_type) = encode_image(source, 80, 80, 85).unwrap();
+
+        assert_eq!(mime_type, "image/jpeg");
+        let image = image::load_from_memory(&encoded).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 1));
+    }
+
+    fn tiny_avif() -> Vec<u8> {
+        BASE64
+            .decode(
+                "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUEAAADrbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAAB5pbG9jAAAAAEQAAAEAAQAAAAEAAAETAAAAOwAAAChpaW5mAAAAAAABAAAAGmluZmUCAAAAAAEAAGF2MDFDb2xvcgAAAABqaXBycAAAAEtpcGNvAAAAFGlzcGUAAAAAAAAAAgAAAAEAAAAQcGl4aQAAAAADCAgIAAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAGgAAAABdpcG1hAAAAAAAAAAEAAQQBAoMEAAAAQ21kYXQSAAoHOAAmkBDQaTIuE8JjJoDDDD8AgACQSGBFxD2QYunmLfpoyASgdaogAVoY/Gk6VGxuOkEiRAtC1A==",
+            )
+            .unwrap()
+    }
+
+    fn static_gif(width: u32, height: u32) -> Vec<u8> {
+        use image::codecs::gif::GifEncoder;
+
+        let source = image::RgbaImage::from_pixel(width, height, image::Rgba([20, 80, 140, 255]));
+        let mut gif = Vec::new();
+        GifEncoder::new(&mut gif)
+            .encode(source.as_raw(), width, height, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        gif
     }
 
     fn jpeg_with_orientation_6(width: u32, height: u32) -> Vec<u8> {

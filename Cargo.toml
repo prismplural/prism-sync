@@ -86,7 +86,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Image processing
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["avif-native", "gif", "jpeg", "png", "webp"] }
 
 # IDs
 uuid = { version = "1", features = ["v4"] }
