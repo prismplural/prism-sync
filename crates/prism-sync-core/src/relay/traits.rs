@@ -495,6 +495,10 @@ pub enum SyncNotification {
     RekeyNeeded,
     /// Session token was rotated (handled internally).
     TokenRotated { new_token: String },
+    /// WebSocket authentication failed after any recoverable session refresh
+    /// path was exhausted. This is terminal for the reconnect loop, but not a
+    /// verified device revocation.
+    WebSocketAuthFailed { status: u16, message: String },
     /// WebSocket connection state changed (for UI display).
     ConnectionStateChanged { connected: bool },
 }

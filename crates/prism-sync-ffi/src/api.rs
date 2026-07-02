@@ -1975,7 +1975,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 
     // Connect WebSocket for real-time relay notifications (best-effort;
     // connect() spawns a background reconnect loop and never blocks).
-    if let Err(e) = relay.connect_websocket().await {
+    if let Err(e) = ServerRelay::connect_websocket_arc(&relay).await {
         // Non-fatal: WebSocket will reconnect automatically with backoff.
         tracing::warn!(
             error = %redact_display(&e),
@@ -2605,7 +2605,7 @@ pub async fn reconnect_websocket(handle: &PrismSyncHandle) -> Result<(), String>
             // disconnect drops the old client (and its stale backoff loop),
             // then connect starts fresh with attempt=0.
             let _ = relay.disconnect_websocket().await;
-            relay.connect_websocket().await.map_err(|e| e.to_string())?;
+            ServerRelay::connect_websocket_arc(&relay).await.map_err(|e| e.to_string())?;
         }
     }
     Ok(())

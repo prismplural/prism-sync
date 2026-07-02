@@ -356,6 +356,16 @@ pub fn spawn_notification_handler(
                     }
                     let _ = event_tx.send(SyncEvent::SessionTokenRotated { token: new_token });
                 }
+                SyncNotification::WebSocketAuthFailed { status, message } => {
+                    let _ = event_tx.send(SyncEvent::Error(SyncError {
+                        kind: SyncErrorKind::Auth,
+                        message: format!("{message} HTTP {status}."),
+                        retryable: false,
+                        code: Some("websocket_auth_failed".to_string()),
+                        remote_wipe: None,
+                    }));
+                    let _ = event_tx.send(SyncEvent::WebSocketStateChanged { connected: false });
+                }
                 SyncNotification::ConnectionStateChanged { connected } => {
                     let _ = event_tx.send(SyncEvent::WebSocketStateChanged { connected });
                     if connected {
@@ -1564,6 +1574,55 @@ mod tests {
         assert!(
             matches!(event, SyncEvent::SessionTokenRotated { ref token } if token == "fresh-token")
         );
+
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn notification_handler_websocket_auth_failed_emits_terminal_auth_error() {
+        let (trigger_tx, _trigger_rx) = mpsc::channel::<SyncTrigger>(16);
+        let (event_tx, mut event_rx) = broadcast::channel::<SyncEvent>(16);
+
+        let notifications =
+            futures_util::stream::iter(vec![SyncNotification::WebSocketAuthFailed {
+                status: 401,
+                message: "Sync could not authenticate with the relay after session refresh."
+                    .to_string(),
+            }]);
+        let pinned: std::pin::Pin<Box<dyn futures_util::Stream<Item = SyncNotification> + Send>> =
+            Box::pin(notifications);
+
+        let handle = spawn_notification_handler(
+            pinned,
+            "my-device".to_string(),
+            trigger_tx,
+            event_tx,
+            None,
+            None,
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("should receive auth error")
+            .expect("not lagged");
+        assert!(
+            matches!(
+                event,
+                SyncEvent::Error(SyncError {
+                    kind: SyncErrorKind::Auth,
+                    retryable: false,
+                    code: Some(ref code),
+                    ..
+                }) if code == "websocket_auth_failed"
+            ),
+            "expected terminal websocket auth error, got {event:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("should receive disconnected state")
+            .expect("not lagged");
+        assert!(matches!(event, SyncEvent::WebSocketStateChanged { connected: false }));
 
         let _ = handle.await;
     }

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey};
+use futures_util::future::BoxFuture;
 use futures_util::Stream;
 use prism_sync_crypto::pq::hybrid_signature_contexts;
 use rand::RngCore;
@@ -17,7 +18,9 @@ use tracing::debug;
 
 use super::redact_url;
 use super::traits::*;
-use super::websocket::WebSocketClient;
+use super::websocket::{
+    RefreshSessionCallback, RefreshSessionPolicy, RefreshSessionResult, WebSocketClient,
+};
 
 const SNAPSHOT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
@@ -65,6 +68,7 @@ pub struct ServerRelay {
     sync_id: String,
     device_id: String,
     device_session_token: RwLock<String>,
+    refresh_session_lock: tokio::sync::Mutex<()>,
     request_signing_key: SigningKey,
     request_ml_dsa_signing_key: prism_sync_crypto::DevicePqSigningKey,
     registration_token: Option<String>,
@@ -120,6 +124,7 @@ impl ServerRelay {
             sync_id,
             device_id,
             device_session_token: RwLock::new(device_session_token),
+            refresh_session_lock: tokio::sync::Mutex::new(()),
             request_signing_key,
             request_ml_dsa_signing_key,
             registration_token,
@@ -141,10 +146,19 @@ impl ServerRelay {
         format!("/v1/sync/{}{}", self.sync_id, suffix)
     }
 
-    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn apply_auth_with_token(
+        &self,
+        builder: reqwest::RequestBuilder,
+        session_token: &str,
+    ) -> reqwest::RequestBuilder {
         builder
-            .header("Authorization", format!("Bearer {}", self.current_session_token()))
+            .header("Authorization", format!("Bearer {session_token}"))
             .header("X-Device-Id", &self.device_id)
+    }
+
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let session_token = self.current_session_token();
+        self.apply_auth_with_token(builder, &session_token)
     }
 
     fn current_session_token(&self) -> String {
@@ -155,12 +169,69 @@ impl ServerRelay {
         *self.device_session_token.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
     }
 
+    fn websocket_refresh_session_callback(relay: &Arc<Self>) -> RefreshSessionCallback {
+        let relay = Arc::downgrade(relay);
+        Arc::new(
+            move |failed_token: String,
+                  policy: RefreshSessionPolicy|
+                  -> BoxFuture<'static, Result<Option<RefreshSessionResult>, RelayError>> {
+            let relay = relay.clone();
+            Box::pin(async move {
+                match relay.upgrade() {
+                    Some(relay) => {
+                        relay.refresh_session_after_auth_failure(failed_token, policy).await
+                    }
+                    None => Ok(None),
+                }
+            })
+        })
+    }
+
+    async fn connect_websocket_inner(
+        &self,
+        refresh_session: Option<RefreshSessionCallback>,
+    ) -> Result<(), RelayError> {
+        let ws_url = self.ws_url();
+        debug!("[prism_relay] connect_websocket url={}", redact_url(&ws_url));
+
+        let ws = WebSocketClient::new(
+            ws_url,
+            self.device_id.clone(),
+            self.current_session_token(),
+            refresh_session,
+            self.notification_tx.clone(),
+        );
+        ws.connect().await;
+
+        *self.ws_client.lock().await = Some(ws);
+        Ok(())
+    }
+
+    /// Connect WebSocket notifications with the relay's signed
+    /// `/session/refresh` recovery path available to the background reconnect
+    /// loop. Use this when the concrete relay is held as `Arc<ServerRelay>`.
+    pub async fn connect_websocket_arc(relay: &Arc<Self>) -> Result<(), RelayError> {
+        relay.connect_websocket_inner(Some(Self::websocket_refresh_session_callback(relay))).await
+    }
+
     fn apply_signed_auth(
         &self,
         builder: reqwest::RequestBuilder,
         method: &str,
         canonical_path: &str,
         body: &[u8],
+    ) -> reqwest::RequestBuilder {
+        let session_token = self.current_session_token();
+        self.apply_signed_auth_with_token(builder, method, canonical_path, body, &session_token)
+    }
+
+    fn apply_signed_auth_with_token(
+        &self,
+        builder: reqwest::RequestBuilder,
+        method: &str,
+        canonical_path: &str,
+        body: &[u8],
+        session_token: &str,
     ) -> reqwest::RequestBuilder {
         let timestamp = Utc::now().timestamp().to_string();
         let mut nonce_bytes = [0u8; 16];
@@ -184,7 +255,7 @@ impl ServerRelay {
         wire.extend_from_slice(&hybrid_sig.to_bytes());
         let signature_b64 = BASE64.encode(&wire);
 
-        self.apply_auth(builder)
+        self.apply_auth_with_token(builder, session_token)
             .header("X-Prism-Timestamp", timestamp)
             .header("X-Prism-Nonce", nonce)
             .header("X-Prism-Signature", signature_b64)
@@ -280,11 +351,9 @@ impl ServerRelay {
                                 .map(str::to_owned)
                                 .unwrap_or_else(|| format!("HTTP {status}: {body}"));
                             return match (local_epoch, relay_epoch) {
-                                (Some(local_epoch), Some(relay_epoch)) => RelayError::EpochMismatch {
-                                    local_epoch,
-                                    relay_epoch,
-                                    message,
-                                },
+                                (Some(local_epoch), Some(relay_epoch)) => {
+                                    RelayError::EpochMismatch { local_epoch, relay_epoch, message }
+                                }
                                 _ => RelayError::Protocol {
                                     message: format!(
                                         "malformed epoch_mismatch response: HTTP {status}: {body}"
@@ -385,6 +454,7 @@ impl ServerRelay {
                 status_code: status,
                 message: format!("Payload too large: {body}"),
             },
+            429 => RelayError::Server { status_code: status, message: body.to_string() },
             500..=599 => RelayError::Server { status_code: status, message: body.to_string() },
             _ => RelayError::Protocol { message: format!("Unexpected HTTP {status}: {body}") },
         }
@@ -513,8 +583,11 @@ impl ServerRelay {
     /// [`pull_changes`]: SyncTransport::pull_changes
     /// [`pull_changes_paged`]: SyncTransport::pull_changes_paged
     async fn do_pull(&self, since: i64, limit: Option<i64>) -> Result<PullResponse, RelayError> {
-        match self.do_pull_once(since, limit).await {
-            Err(RelayError::Auth { .. }) if self.try_refresh_session().await => {
+        let failed_token = self.current_session_token();
+        match self.do_pull_once_with_token(since, limit, &failed_token).await {
+            Err(RelayError::Auth { .. })
+                if self.try_refresh_session_after_auth_failure(&failed_token).await =>
+            {
                 // The session was expired; we minted a fresh one. Retry exactly
                 // once with the new token (the request rebuilds with the live
                 // token). A second 401 is surfaced — no retry loop.
@@ -529,6 +602,16 @@ impl ServerRelay {
         since: i64,
         limit: Option<i64>,
     ) -> Result<PullResponse, RelayError> {
+        let session_token = self.current_session_token();
+        self.do_pull_once_with_token(since, limit, &session_token).await
+    }
+
+    async fn do_pull_once_with_token(
+        &self,
+        since: i64,
+        limit: Option<i64>,
+        session_token: &str,
+    ) -> Result<PullResponse, RelayError> {
         let url = match limit {
             Some(n) => format!("{}/changes?since={since}&limit={n}", self.base_path()),
             None => format!("{}/changes?since={since}", self.base_path()),
@@ -536,7 +619,7 @@ impl ServerRelay {
         debug!("pull_changes since={since} limit={limit:?}");
 
         let resp = self
-            .apply_auth(self.client.get(&url))
+            .apply_auth_with_token(self.client.get(&url), session_token)
             .timeout(self.request_timeout)
             .send()
             .await
@@ -558,8 +641,8 @@ impl ServerRelay {
         // the same classifier as the original send error so it lands as Network
         // (transient, retryable) instead of Protocol (hard error). The next sync
         // cycle re-pulls cleanly and the user never sees a spurious failure.
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| RelayError::Network { message: e.to_string() })?;
+        let json: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| RelayError::Network { message: e.to_string() })?;
 
         let max_server_seq = json["max_server_seq"].as_i64().unwrap_or(0);
         let min_acked_seq = json["min_acked_seq"].as_i64();
@@ -585,8 +668,7 @@ impl ServerRelay {
 
         // Additive lineage fields. Absent against an old relay → None → the
         // engine's lineage tracking stays inert and behavior is unchanged.
-        let log_token =
-            json.get("log_token").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let log_token = json.get("log_token").and_then(|v| v.as_str()).map(|s| s.to_string());
         let log_head_seq = json.get("log_head_seq").and_then(|v| v.as_i64());
 
         Ok(PullResponse {
@@ -606,17 +688,16 @@ impl SyncTransport for ServerRelay {
         self.do_pull(since, None).await
     }
 
-    async fn pull_changes_paged(
-        &self,
-        since: i64,
-        limit: i64,
-    ) -> Result<PullResponse, RelayError> {
+    async fn pull_changes_paged(&self, since: i64, limit: i64) -> Result<PullResponse, RelayError> {
         self.do_pull(since, Some(limit)).await
     }
 
     async fn push_changes(&self, batch: OutgoingBatch) -> Result<i64, RelayError> {
-        match self.push_changes_once(&batch).await {
-            Err(RelayError::Auth { .. }) if self.try_refresh_session().await => {
+        let failed_token = self.current_session_token();
+        match self.push_changes_once_with_token(&batch, &failed_token).await {
+            Err(RelayError::Auth { .. })
+                if self.try_refresh_session_after_auth_failure(&failed_token).await =>
+            {
                 self.push_changes_once(&batch).await
             }
             other => other,
@@ -624,8 +705,11 @@ impl SyncTransport for ServerRelay {
     }
 
     async fn ack(&self, server_seq: i64) -> Result<(), RelayError> {
-        match self.ack_once(server_seq).await {
-            Err(RelayError::Auth { .. }) if self.try_refresh_session().await => {
+        let failed_token = self.current_session_token();
+        match self.ack_once_with_token(server_seq, &failed_token).await {
+            Err(RelayError::Auth { .. })
+                if self.try_refresh_session_after_auth_failure(&failed_token).await =>
+            {
                 self.ack_once(server_seq).await
             }
             other => other,
@@ -639,6 +723,15 @@ impl SyncTransport for ServerRelay {
 
 impl ServerRelay {
     async fn push_changes_once(&self, batch: &OutgoingBatch) -> Result<i64, RelayError> {
+        let session_token = self.current_session_token();
+        self.push_changes_once_with_token(batch, &session_token).await
+    }
+
+    async fn push_changes_once_with_token(
+        &self,
+        batch: &OutgoingBatch,
+        session_token: &str,
+    ) -> Result<i64, RelayError> {
         let url = format!("{}/changes", self.base_path());
         let path = self.canonical_path("/changes");
         debug!("push_changes batch_id={}", batch.batch_id);
@@ -648,7 +741,13 @@ impl ServerRelay {
         })?;
 
         let resp = self
-            .apply_signed_auth(self.client.put(&url), "PUT", &path, &body_bytes)
+            .apply_signed_auth_with_token(
+                self.client.put(&url),
+                "PUT",
+                &path,
+                &body_bytes,
+                session_token,
+            )
             .header("X-Batch-Id", &batch.batch_id)
             .header("Content-Type", "application/json")
             .body(body_bytes)
@@ -671,6 +770,15 @@ impl ServerRelay {
     }
 
     async fn ack_once(&self, server_seq: i64) -> Result<(), RelayError> {
+        let session_token = self.current_session_token();
+        self.ack_once_with_token(server_seq, &session_token).await
+    }
+
+    async fn ack_once_with_token(
+        &self,
+        server_seq: i64,
+        session_token: &str,
+    ) -> Result<(), RelayError> {
         let url = format!("{}/ack", self.base_path());
         let path = self.canonical_path("/ack");
         debug!("ack server_seq={server_seq}");
@@ -681,7 +789,13 @@ impl ServerRelay {
             })?;
 
         let resp = self
-            .apply_signed_auth(self.client.post(&url), "POST", &path, &body_bytes)
+            .apply_signed_auth_with_token(
+                self.client.post(&url),
+                "POST",
+                &path,
+                &body_bytes,
+                session_token,
+            )
             .header("Content-Type", "application/json")
             .body(body_bytes)
             .timeout(self.request_timeout)
@@ -698,14 +812,34 @@ impl ServerRelay {
         Ok(())
     }
 
-    /// Best-effort session refresh for the retry-once-on-401 path. Returns
-    /// `true` only when a fresh token was minted and installed (so a retry is
-    /// worthwhile). A revoked answer, an old relay (404/405), or any other
-    /// failure returns `false` so the original 401 propagates unchanged — a
-    /// `DeviceRevoked` answer is surfaced by the explicit `do_refresh_session`
-    /// path the engine drives, not swallowed here.
-    async fn try_refresh_session(&self) -> bool {
-        matches!(self.do_refresh_session().await, Ok(Some(_)))
+    async fn try_refresh_session_after_auth_failure(&self, failed_token: &str) -> bool {
+        matches!(
+            self.refresh_session_after_auth_failure(
+                failed_token.to_string(),
+                RefreshSessionPolicy::AllowRefresh,
+            )
+            .await,
+            Ok(Some(_))
+        )
+    }
+
+    async fn refresh_session_after_auth_failure(
+        &self,
+        failed_token: String,
+        policy: RefreshSessionPolicy,
+    ) -> Result<Option<RefreshSessionResult>, RelayError> {
+        let _guard = self.refresh_session_lock.lock().await;
+        let current_token = self.current_session_token();
+        if current_token != failed_token {
+            return Ok(Some(RefreshSessionResult::CurrentToken(current_token)));
+        }
+        if policy == RefreshSessionPolicy::ExistingTokenOnly {
+            return Ok(None);
+        }
+
+        self.do_refresh_session_locked()
+            .await
+            .map(|token| token.map(RefreshSessionResult::Refreshed))
     }
 
     /// Signed `POST /session/refresh`. On success rotates the in-memory session
@@ -715,6 +849,18 @@ impl ServerRelay {
     /// `RelayError::DeviceRevoked`. An old relay that does not know the route
     /// (404/405) returns `Ok(None)` so callers stay in reconnecting.
     async fn do_refresh_session(&self) -> Result<Option<String>, RelayError> {
+        let failed_token = self.current_session_token();
+        match self
+            .refresh_session_after_auth_failure(failed_token, RefreshSessionPolicy::AllowRefresh)
+            .await?
+        {
+            Some(RefreshSessionResult::Refreshed(token))
+            | Some(RefreshSessionResult::CurrentToken(token)) => Ok(Some(token)),
+            None => Ok(None),
+        }
+    }
+
+    async fn do_refresh_session_locked(&self) -> Result<Option<String>, RelayError> {
         let path = self.canonical_path("/session/refresh");
         let url = format!("{}{}", self.base_url, path);
         debug!("refresh_session device_id={}", self.device_id);
@@ -762,7 +908,8 @@ impl ServerRelay {
         // Surface the rotation so the engine re-persists the credential. A
         // lagging receiver is fine — refresh-on-401 at next launch is the
         // fallback if the broadcast is missed.
-        let _ = self.notification_tx.send(SyncNotification::TokenRotated { new_token: token.clone() });
+        let _ =
+            self.notification_tx.send(SyncNotification::TokenRotated { new_token: token.clone() });
 
         Ok(Some(token))
     }
@@ -1141,10 +1288,9 @@ impl SnapshotExchange for ServerRelay {
         // Cap the snapshot body before buffering it — reqwest has no default
         // body limit. Mirrors the relay's own MAX_SNAPSHOT_WIRE_BYTES bound.
         let body = Self::read_body_capped(resp, MAX_SNAPSHOT_RESPONSE_BYTES, "/snapshot").await?;
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| RelayError::Protocol {
-                message: format!("Failed to parse snapshot response: {e}"),
-            })?;
+        let json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+            RelayError::Protocol { message: format!("Failed to parse snapshot response: {e}") }
+        })?;
 
         let epoch = json["epoch"].as_i64().unwrap_or(0) as i32;
         let server_seq_at = json["server_seq_at"].as_i64().unwrap_or(0);
@@ -1293,8 +1439,7 @@ impl MediaRelay for ServerRelay {
         data: Vec<u8>,
         ttl_secs: Option<u64>,
     ) -> Result<MediaUploadOutcome, RelayError> {
-        self.upload_media_classified(media_id, content_hash, data, ttl_secs, false)
-            .await
+        self.upload_media_classified(media_id, content_hash, data, ttl_secs, false).await
     }
 
     async fn upload_media_classified(
@@ -1307,7 +1452,9 @@ impl MediaRelay for ServerRelay {
     ) -> Result<MediaUploadOutcome, RelayError> {
         let url = format!("{}/media", self.base_path());
         let path = self.canonical_path("/media");
-        debug!("upload_media media_id={media_id} ttl_secs={ttl_secs:?} pairing_push={pairing_push}");
+        debug!(
+            "upload_media media_id={media_id} ttl_secs={ttl_secs:?} pairing_push={pairing_push}"
+        );
 
         // X-Media-TTL / X-Media-Upload-Class are NOT part of the signed request
         // bytes (signing covers body/path/device/timestamp/nonce), so an old
@@ -1398,9 +1545,7 @@ impl MediaRelay for ServerRelay {
         // A 200 without `present` is malformed; "all absent" would request
         // every missing blob.
         match body.get("present").and_then(|p| p.as_array()) {
-            Some(arr) => {
-                Ok(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            }
+            Some(arr) => Ok(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
             None => Err(RelayError::Protocol {
                 message: "batch-exists response missing 'present' array".into(),
             }),
@@ -1485,10 +1630,8 @@ impl MediaRelay for ServerRelay {
             };
             let Ok(epoch_id) = u32::try_from(epoch_id) else { continue };
             let Ok(payload) = BASE64.decode(payload_b64) else { continue };
-            let recipient_device_id = m
-                .get("recipient_device_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let recipient_device_id =
+                m.get("recipient_device_id").and_then(|v| v.as_str()).map(|s| s.to_string());
             out.push(crate::ephemeral::EphemeralEnvelope {
                 message_id: message_id.to_string(),
                 epoch_id,
@@ -1555,19 +1698,7 @@ impl SyncRelay for ServerRelay {
     }
 
     async fn connect_websocket(&self) -> Result<(), RelayError> {
-        let ws_url = self.ws_url();
-        debug!("[prism_relay] connect_websocket url={}", redact_url(&ws_url));
-
-        let ws = WebSocketClient::new(
-            ws_url,
-            self.device_id.clone(),
-            self.current_session_token(),
-            self.notification_tx.clone(),
-        );
-        ws.connect().await;
-
-        *self.ws_client.lock().await = Some(ws);
-        Ok(())
+        self.connect_websocket_inner(None).await
     }
 
     async fn disconnect_websocket(&self) -> Result<(), RelayError> {
@@ -1627,9 +1758,7 @@ fn build_register_device_body(req: &RegisterRequest) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::ServerRelay;
-    use crate::relay::traits::{
-        MediaUploadOutcome, RegisterRequest, RegistryApproval, RelayError,
-    };
+    use crate::relay::traits::{MediaUploadOutcome, RegisterRequest, RegistryApproval, RelayError};
 
     #[test]
     fn media_upload_status_maps_to_outcome() {
@@ -1659,6 +1788,13 @@ mod tests {
             ServerRelay::classify_error(405, "method not allowed"),
             RelayError::Protocol { .. }
         ));
+    }
+
+    #[test]
+    fn classify_error_treats_429_as_retryable_server() {
+        let err = ServerRelay::classify_error(429, "Too Many Requests");
+
+        assert!(matches!(err, RelayError::Server { status_code: 429, .. }));
     }
 
     fn test_relay(initial_session_token: &str) -> ServerRelay {
@@ -1949,6 +2085,7 @@ mod tests {
     // ── session-refresh retry-once semantics ──
 
     use crate::relay::traits::SyncTransport;
+    use crate::relay::websocket::{RefreshSessionPolicy, RefreshSessionResult};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1965,10 +2102,21 @@ mod tests {
         refresh_body: &'static str,
         ok_body: &'static str,
     ) -> (String, Arc<AtomicUsize>) {
+        spawn_retry_stub_with_initial_rejections(refresh_status, refresh_body, ok_body, 0)
+    }
+
+    fn spawn_retry_stub_with_initial_rejections(
+        refresh_status: u16,
+        refresh_body: &'static str,
+        ok_body: &'static str,
+        initial_auth_failures: usize,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let refresh_count = Arc::new(AtomicUsize::new(0));
         let counter = refresh_count.clone();
+        let auth_failures_remaining = Arc::new(AtomicUsize::new(initial_auth_failures));
+        let auth_failures = auth_failures_remaining.clone();
 
         std::thread::spawn(move || {
             for conn in listener.incoming() {
@@ -1980,6 +2128,13 @@ mod tests {
                 let (status, body) = if first_line.contains("/session/refresh") {
                     counter.fetch_add(1, Ordering::SeqCst);
                     (refresh_status, refresh_body)
+                } else if auth_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    (401, "Unauthorized")
                 } else if counter.load(Ordering::SeqCst) == 0 {
                     // No refresh yet -> the (expired) session is rejected.
                     (401, "Unauthorized")
@@ -2032,6 +2187,73 @@ mod tests {
         assert_eq!(refresh_count.load(Ordering::SeqCst), 1, "exactly one refresh");
         // The transport rotated to the refreshed token.
         assert_eq!(relay.current_session_token(), "fresh-token");
+    }
+
+    #[tokio::test]
+    async fn concurrent_pull_401s_share_single_refresh() {
+        let (url, refresh_count) = spawn_retry_stub_with_initial_rejections(
+            200,
+            r#"{"device_session_token":"fresh-token"}"#,
+            r#"{"max_server_seq":0,"batches":[]}"#,
+            2,
+        );
+        let relay = Arc::new(test_relay_at(&url));
+
+        let first = {
+            let relay = Arc::clone(&relay);
+            async move { relay.pull_changes(0).await }
+        };
+        let second = {
+            let relay = Arc::clone(&relay);
+            async move { relay.pull_changes(0).await }
+        };
+        let (first, second) = tokio::join!(first, second);
+
+        assert!(first.is_ok(), "first pull should recover via refresh: {first:?}");
+        assert!(second.is_ok(), "second pull should reuse refreshed token: {second:?}");
+        assert_eq!(
+            refresh_count.load(Ordering::SeqCst),
+            1,
+            "concurrent 401s must coalesce into one refresh POST"
+        );
+        assert_eq!(relay.current_session_token(), "fresh-token");
+    }
+
+    #[tokio::test]
+    async fn refresh_session_after_auth_failure_reuses_current_token_without_post() {
+        let (url, refresh_count) = spawn_retry_stub(
+            200,
+            r#"{"device_session_token":"fresh-token"}"#,
+            r#"{"max_server_seq":0,"batches":[]}"#,
+        );
+        let relay = test_relay_at(&url);
+        relay.update_session_token("fresh-token".to_string());
+
+        let reused = relay
+            .refresh_session_after_auth_failure(
+                "expired-token".to_string(),
+                RefreshSessionPolicy::AllowRefresh,
+            )
+            .await
+            .expect("current token check succeeds");
+        assert!(matches!(
+            reused,
+            Some(RefreshSessionResult::CurrentToken(ref token)) if token == "fresh-token"
+        ));
+
+        let existing_only = relay
+            .refresh_session_after_auth_failure(
+                "fresh-token".to_string(),
+                RefreshSessionPolicy::ExistingTokenOnly,
+            )
+            .await
+            .expect("existing-token-only check succeeds");
+        assert!(existing_only.is_none());
+        assert_eq!(
+            refresh_count.load(Ordering::SeqCst),
+            0,
+            "current-token and ExistingTokenOnly paths must not POST refresh"
+        );
     }
 
     #[tokio::test]
