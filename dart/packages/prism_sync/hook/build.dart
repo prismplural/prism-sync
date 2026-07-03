@@ -28,13 +28,20 @@ Map<String, String> _cargoEnvironmentFor(CodeConfig codeConfig) {
     };
   }
 
-  // Windows: link a prebuilt OpenSSL instead of vendoring it. SQLCipher
-  // otherwise builds OpenSSL from source, whose deeply nested object paths
-  // overflow Windows' 260-char MAX_PATH under .dart_tool/hooks_runner. This map
-  // is the only channel that reaches openssl-sys's build script — RustBuilder
-  // doesn't forward the ambient environment — so the hook discovers OpenSSL
-  // itself rather than relying on env vars set by the build wrapper.
   if (codeConfig.targetOS == OS.windows) {
+    final environment = _selectedEnvironment(const [
+      'DAV1D_NO_PKG_CONFIG',
+      'PKG_CONFIG',
+      'PKG_CONFIG_ALLOW_SYSTEM_CFLAGS',
+      'PKG_CONFIG_ALLOW_SYSTEM_LIBS',
+      'PKG_CONFIG_LIBDIR',
+      'PKG_CONFIG_PATH',
+      'PKG_CONFIG_SYSROOT_DIR',
+    ]);
+
+    // Windows: link a prebuilt OpenSSL instead of vendoring it. SQLCipher
+    // otherwise builds OpenSSL from source, whose deeply nested object paths
+    // overflow Windows' 260-char MAX_PATH under .dart_tool/hooks_runner.
     final dir =
         Platform.environment['OPENSSL_DIR']?.ifEmpty() ??
         _firstExistingDir(const [
@@ -48,14 +55,15 @@ Map<String, String> _cargoEnvironmentFor(CodeConfig codeConfig) {
       final libDir = Directory.systemTemp.createTempSync('prism_openssl_').path;
       File('$mdDir\\libcrypto_static.lib').copySync('$libDir\\libcrypto.lib');
       File('$mdDir\\libssl_static.lib').copySync('$libDir\\libssl.lib');
-      return {
+      environment.addAll({
         'OPENSSL_NO_VENDOR': '1',
         'OPENSSL_STATIC': '1',
         'OPENSSL_DIR': dir,
         'OPENSSL_LIB_DIR': libDir,
         'OPENSSL_INCLUDE_DIR': '$dir\\include',
-      };
+      });
     }
+    return environment;
   }
 
   return const {};
@@ -70,4 +78,12 @@ String? _firstExistingDir(List<String> candidates) {
     if (Directory(dir).existsSync()) return dir;
   }
   return null;
+}
+
+Map<String, String> _selectedEnvironment(List<String> names) {
+  return {
+    for (final name in names)
+      if (Platform.environment[name]?.isNotEmpty ?? false)
+        name: Platform.environment[name]!,
+  };
 }
