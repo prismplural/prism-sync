@@ -39,6 +39,20 @@ Map<String, String> _cargoEnvironmentFor(CodeConfig codeConfig) {
       'PKG_CONFIG_SYSROOT_DIR',
     ]);
 
+    final dav1dPkgConfigDir =
+        Platform.environment['PKG_CONFIG_PATH']?.ifEmpty() ??
+        _firstExistingFileParent(const [
+          r'C:\vcpkg\installed\x64-windows-static\lib\pkgconfig\dav1d.pc',
+          r'C:\vcpkg\installed\x64-windows\lib\pkgconfig\dav1d.pc',
+        ]);
+    if (dav1dPkgConfigDir != null) {
+      environment.addAll({
+        'PKG_CONFIG_PATH': dav1dPkgConfigDir,
+        'PKG_CONFIG_ALLOW_SYSTEM_CFLAGS': '1',
+        'PKG_CONFIG_ALLOW_SYSTEM_LIBS': '1',
+      });
+    }
+
     // Windows: link a prebuilt OpenSSL instead of vendoring it. SQLCipher
     // otherwise builds OpenSSL from source, whose deeply nested object paths
     // overflow Windows' 260-char MAX_PATH under .dart_tool/hooks_runner.
@@ -76,6 +90,14 @@ extension on String {
 String? _firstExistingDir(List<String> candidates) {
   for (final dir in candidates) {
     if (Directory(dir).existsSync()) return dir;
+  }
+  return null;
+}
+
+String? _firstExistingFileParent(List<String> candidates) {
+  for (final path in candidates) {
+    final file = File(path);
+    if (file.existsSync()) return file.parent.path;
   }
   return null;
 }
