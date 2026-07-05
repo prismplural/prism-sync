@@ -1182,29 +1182,6 @@ Future<String> hexEncode({required List<int> bytes}) =>
 Future<Uint8List> hexDecode({required String hexStr}) =>
     RustLib.instance.api.crateApiHexDecode(hexStr: hexStr);
 
-/// Decode an image (JPEG/PNG/WebP/etc.), resize to fit within
-/// `max_width × max_height` (Lanczos3, aspect-ratio preserving), and
-/// re-encode in the best format based on content:
-///
-/// - **Uses transparency** (a pixel with alpha < 255) → lossless WebP
-///   (preserves transparency, small for flat-color art/banners/dividers).
-/// - **Opaque** (no alpha channel, or an alpha channel that is fully opaque) →
-///   JPEG at `quality` (1–100). Compact for photographic content.
-///
-/// Returns `(encoded_bytes, mime_type)` where mime_type is `"image/webp"` or
-/// `"image/jpeg"`.
-Future<(Uint8List, String)> encodeImage({
-  required List<int> imageBytes,
-  required int maxWidth,
-  required int maxHeight,
-  required int quality,
-}) => RustLib.instance.api.crateApiEncodeImage(
-  imageBytes: imageBytes,
-  maxWidth: maxWidth,
-  maxHeight: maxHeight,
-  quality: quality,
-);
-
 /// Start the joiner side of the relay-based PQ pairing ceremony.
 ///
 /// Generates bootstrap keys, uploads them to the relay, and returns

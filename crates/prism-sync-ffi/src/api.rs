@@ -4943,79 +4943,6 @@ pub fn hex_decode(hex_str: String) -> Result<Vec<u8>, String> {
     prism_sync_crypto::hex::decode(&hex_str).map_err(|e| e.to_string())
 }
 
-/// Decode an image (JPEG/PNG/WebP/etc.), resize to fit within
-/// `max_width × max_height` (Lanczos3, aspect-ratio preserving), and
-/// re-encode in the best format based on content:
-///
-/// - **Uses transparency** (a pixel with alpha < 255) → lossless WebP
-///   (preserves transparency, small for flat-color art/banners/dividers).
-/// - **Opaque** (no alpha channel, or an alpha channel that is fully opaque) →
-///   JPEG at `quality` (1–100). Compact for photographic content.
-///
-/// Returns `(encoded_bytes, mime_type)` where mime_type is `"image/webp"` or
-/// `"image/jpeg"`.
-pub fn encode_image(
-    image_bytes: Vec<u8>,
-    max_width: u32,
-    max_height: u32,
-    quality: u32,
-) -> Result<(Vec<u8>, String), String> {
-    use image::codecs::jpeg::JpegEncoder;
-    use image::codecs::webp::WebPEncoder;
-    use image::{ImageDecoder, ImageReader};
-    use std::io::Cursor;
-
-    let reader = ImageReader::new(Cursor::new(&image_bytes))
-        .with_guessed_format()
-        .map_err(|e| format!("Failed to read image: {e}"))?;
-
-    let mut decoder = reader.into_decoder().map_err(|e| format!("Failed to decode image: {e}"))?;
-    let orientation =
-        decoder.orientation().map_err(|e| format!("Failed to read image orientation: {e}"))?;
-    let mut img = image::DynamicImage::from_decoder(decoder)
-        .map_err(|e| format!("Failed to decode image: {e}"))?;
-    img.apply_orientation(orientation);
-
-    let resized = if img.width() <= max_width && img.height() <= max_height {
-        img
-    } else {
-        img.resize(max_width, max_height, image::imageops::FilterType::Lanczos3)
-    };
-
-    // The color *type* carrying an alpha channel does not mean the image
-    // actually uses transparency — opaque PNGs / exported screenshots commonly
-    // carry a fully-opaque alpha channel. Encoding those as lossless WebP
-    // bloats the output (often past the caller's 5 MB cap, rejecting a
-    // perfectly valid photo). So only take the lossless-WebP path when at least
-    // one pixel is actually non-opaque; otherwise fall through to JPEG.
-    let rgba_buf = if resized.color().has_alpha() {
-        let buf = resized.to_rgba8();
-        let uses_alpha = buf.pixels().any(|p| p.0[3] != 255);
-        if uses_alpha {
-            Some(buf)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let mut output = Vec::new();
-
-    if let Some(rgba) = rgba_buf {
-        WebPEncoder::new_lossless(&mut output)
-            .encode(rgba.as_raw(), rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8)
-            .map_err(|e| format!("Failed to encode WebP: {e}"))?;
-        Ok((output, "image/webp".to_string()))
-    } else {
-        let rgb = resized.to_rgb8();
-        JpegEncoder::new_with_quality(&mut output, quality.min(100) as u8)
-            .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
-            .map_err(|e| format!("Failed to encode JPEG: {e}"))?;
-        Ok((output, "image/jpeg".to_string()))
-    }
-}
-
 // ══════════════════════════════════════════════════════════════════════
 // Relay-based PQ pairing ceremony (Phase 3 bootstrap)
 // ══════════════════════════════════════════════════════════════════════
@@ -6354,12 +6281,10 @@ pub async fn get_ml_dsa_key_generation(handle: &PrismSyncHandle) -> Result<u32, 
 mod tests {
     use super::*;
     use chrono::Utc;
-    use image::ImageDecoder;
     use prism_sync_core::relay::{DeviceInfo, MockRelay, SignedRegistryResponse};
     use prism_sync_core::secure_store::SecureStore;
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
-    use std::io::Cursor;
     use std::sync::Arc;
 
     #[test]
@@ -6705,96 +6630,6 @@ mod tests {
             revoked_at: None,
             ml_dsa_key_generation: generation,
         }
-    }
-
-    #[test]
-    fn encode_image_applies_exif_orientation() {
-        let source = jpeg_with_orientation_6(80, 40);
-        {
-            let mut decoder = image::ImageReader::new(Cursor::new(&source))
-                .with_guessed_format()
-                .unwrap()
-                .into_decoder()
-                .unwrap();
-            assert_eq!(decoder.orientation().unwrap(), image::metadata::Orientation::Rotate90);
-        }
-
-        let (encoded, mime_type) = encode_image(source, 80, 80, 85).unwrap();
-        assert_eq!(mime_type, "image/jpeg");
-
-        let image = image::load_from_memory(&encoded).unwrap();
-        assert_eq!((image.width(), image.height()), (40, 80));
-    }
-
-    #[test]
-    fn encode_image_accepts_avif_input() {
-        let source = tiny_avif();
-
-        let (encoded, mime_type) = encode_image(source, 80, 80, 85).unwrap();
-
-        assert_eq!(mime_type, "image/jpeg");
-        let image = image::load_from_memory(&encoded).unwrap();
-        assert_eq!((image.width(), image.height()), (2, 1));
-    }
-
-    #[test]
-    fn encode_image_accepts_static_gif_input() {
-        let source = static_gif(2, 1);
-
-        let (encoded, mime_type) = encode_image(source, 80, 80, 85).unwrap();
-
-        assert_eq!(mime_type, "image/jpeg");
-        let image = image::load_from_memory(&encoded).unwrap();
-        assert_eq!((image.width(), image.height()), (2, 1));
-    }
-
-    fn tiny_avif() -> Vec<u8> {
-        BASE64
-            .decode(
-                "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUEAAADrbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAAB5pbG9jAAAAAEQAAAEAAQAAAAEAAAETAAAAOwAAAChpaW5mAAAAAAABAAAAGmluZmUCAAAAAAEAAGF2MDFDb2xvcgAAAABqaXBycAAAAEtpcGNvAAAAFGlzcGUAAAAAAAAAAgAAAAEAAAAQcGl4aQAAAAADCAgIAAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAGgAAAABdpcG1hAAAAAAAAAAEAAQQBAoMEAAAAQ21kYXQSAAoHOAAmkBDQaTIuE8JjJoDDDD8AgACQSGBFxD2QYunmLfpoyASgdaogAVoY/Gk6VGxuOkEiRAtC1A==",
-            )
-            .unwrap()
-    }
-
-    fn static_gif(width: u32, height: u32) -> Vec<u8> {
-        use image::codecs::gif::GifEncoder;
-
-        let source = image::RgbaImage::from_pixel(width, height, image::Rgba([20, 80, 140, 255]));
-        let mut gif = Vec::new();
-        GifEncoder::new(&mut gif)
-            .encode(source.as_raw(), width, height, image::ExtendedColorType::Rgba8)
-            .unwrap();
-        gif
-    }
-
-    fn jpeg_with_orientation_6(width: u32, height: u32) -> Vec<u8> {
-        use image::codecs::jpeg::JpegEncoder;
-
-        let source = image::RgbImage::from_pixel(width, height, image::Rgb([20, 80, 140]));
-        let mut jpeg = Vec::new();
-        JpegEncoder::new_with_quality(&mut jpeg, 90)
-            .encode(source.as_raw(), width, height, image::ExtendedColorType::Rgb8)
-            .unwrap();
-        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
-
-        let app1 = [
-            0xff, 0xe1, 0x00, 0x22, // APP1 marker + length.
-            b'E', b'x', b'i', b'f', 0x00, 0x00, // Exif header.
-            b'I', b'I', 0x2a, 0x00, // Little-endian TIFF header.
-            0x08, 0x00, 0x00, 0x00, // IFD0 offset.
-            0x01, 0x00, // One IFD entry.
-            0x12, 0x01, // Orientation tag.
-            0x03, 0x00, // SHORT.
-            0x01, 0x00, 0x00, 0x00, // One value.
-            0x06, 0x00, 0x00, 0x00, // Rotate 90 degrees clockwise.
-            0x00, 0x00, 0x00, 0x00, // No next IFD.
-        ];
-
-        let mut out = Vec::with_capacity(jpeg.len() + app1.len());
-        out.extend_from_slice(&jpeg[..2]);
-        out.extend_from_slice(&app1);
-        out.extend_from_slice(&jpeg[2..]);
-        out
     }
 
     fn make_device_info(
