@@ -1679,6 +1679,14 @@ pub async fn unlock(
     })
     .await
     .map_err(|e| format!("task failed: {e}"))??;
+    {
+        // Password unlock and runtime-cache restore are equivalent relaunch
+        // paths. Both must hydrate retained epoch keys before the engine pulls
+        // encrypted batches; otherwise configure succeeds but post-restart
+        // batches for the current epoch are silently skipped as undecryptable.
+        let mut inner = handle.inner.lock().await;
+        restore_persisted_epoch_keys(&mut inner)?;
+    }
     ratchet_handle_min_signature_version_floor(handle, None).await
 }
 
@@ -7435,6 +7443,41 @@ mod tests {
         restore_runtime_keys(&handle, vec![0xAA; 32], vec![0xBB; 32])
             .await
             .expect("restore runtime keys");
+
+        let inner = handle.inner.lock().await;
+        assert_eq!(inner.key_hierarchy().known_epochs(), vec![0, 4]);
+        assert_eq!(inner.key_hierarchy().epoch_key(4).unwrap(), epoch_4_key);
+    }
+
+    #[tokio::test]
+    async fn password_unlock_loads_noncontiguous_epoch_keys_from_seeded_store() {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+        let password = b"test-password".to_vec();
+        let secret_key = vec![0xCC; 32];
+        initialize(&handle, password.clone(), secret_key.clone())
+            .await
+            .expect("initialize");
+        lock(&handle).await;
+
+        let epoch_4_key = [0x44u8; 32];
+        seed_secure_store(
+            &handle,
+            HashMap::from([
+                ("epoch".to_string(), b"4".to_vec()),
+                ("epoch_key_4".to_string(), epoch_4_key.to_vec()),
+            ]),
+        )
+        .await
+        .expect("seed secure store");
+
+        unlock(&handle, password, secret_key).await.expect("unlock");
 
         let inner = handle.inner.lock().await;
         assert_eq!(inner.key_hierarchy().known_epochs(), vec![0, 4]);
