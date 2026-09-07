@@ -123,6 +123,20 @@ pub trait SyncStorage: Send + Sync {
         Ok(vec![])
     }
 
+    /// Read the bounded journal prefix and current winners for its entities in
+    /// one storage snapshot. Durable implementations override this atomically.
+    fn read_consumer_delivery_page(
+        &self,
+        sync_id: &str,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<ConsumerDeliveryPage> {
+        Ok(ConsumerDeliveryPage {
+            rows: self.list_consumer_deliveries(sync_id, after_id, limit)?,
+            current_field_versions: vec![],
+        })
+    }
+
     /// Count the consumer-delivery journal rows for this sync group. Used by the
     /// retention cap to decide whether the oldest rows must spill into the Dart
     /// quarantine lane. Default: 0 (no-op for in-memory impls).

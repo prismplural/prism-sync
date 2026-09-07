@@ -239,6 +239,14 @@ pub struct ConsumerDelivery {
     pub created_at: DateTime<Utc>,
 }
 
+/// One bounded consumer-journal page plus the authoritative current winners
+/// for every entity touched by that page.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerDeliveryPage {
+    pub rows: Vec<ConsumerDelivery>,
+    pub current_field_versions: Vec<FieldVersion>,
+}
+
 /// Local device registry record for signature verification on pull.
 #[derive(Debug, Clone)]
 pub struct DeviceRecord {

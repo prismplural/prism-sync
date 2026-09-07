@@ -29,7 +29,10 @@ use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
 use prism_sync_core::schema::{parse_datetime_utc, SyncSchema, SyncType, SyncValue};
-use prism_sync_core::storage::{ConsumerDelivery, RusqliteSyncStorage, SyncMetadata, SyncStorage};
+use prism_sync_core::storage::{
+    is_tombstone_value, ConsumerDelivery, FieldVersion, RusqliteSyncStorage,
+    SyncMetadata, SyncStorage,
+};
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
     background_runtime, spawn_notification_handler, DeviceRegistryManager,
@@ -3093,6 +3096,50 @@ fn coalesce_consumer_deliveries(rows: &[ConsumerDelivery]) -> Vec<serde_json::Va
         .collect()
 }
 
+fn hydrate_consumer_deliveries(
+    rows: &[ConsumerDelivery],
+    current: &[FieldVersion],
+) -> Vec<serde_json::Value> {
+    let mut deliveries = coalesce_consumer_deliveries(rows);
+    let mut winners: HashMap<(&str, &str), Vec<&FieldVersion>> = HashMap::new();
+    for version in current {
+        winners
+            .entry((&version.entity_table, &version.entity_id))
+            .or_default()
+            .push(version);
+    }
+    for delivery in &mut deliveries {
+        let table = delivery["table"].as_str().map(str::to_owned);
+        let entity_id = delivery["entity_id"].as_str().map(str::to_owned);
+        let (Some(table), Some(entity_id)) = (table, entity_id) else { continue };
+        let Some(versions) = winners.get(&(table.as_str(), entity_id.as_str())) else { continue };
+        let tombstoned = versions.iter().any(|version| {
+            version.field_name == "is_deleted"
+                && is_tombstone_value(version.winning_encoded_value.as_deref())
+        });
+        if tombstoned {
+            delivery["is_delete"] = serde_json::Value::Bool(true);
+            delivery["fields"] = serde_json::json!({});
+            continue;
+        }
+        let fields = delivery["fields"]
+            .as_object_mut()
+            .expect("delivery fields object");
+        fields.clear();
+        for version in versions {
+            if version.field_name != "is_deleted" {
+                let value = version
+                    .winning_encoded_value
+                    .as_deref()
+                    .map(encoded_value_to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                fields.insert(version.field_name.clone(), value);
+            }
+        }
+    }
+    deliveries
+}
+
 /// Drain up to `limit` rows from the durable consumer-delivery journal — the
 /// at-least-once delivery channel that replaces applying directly from the
 /// fire-and-forget `RemoteChanges` event. The Dart drain loops
@@ -3147,8 +3194,10 @@ pub async fn take_undelivered_changes(
             return Ok::<_, String>(empty_undelivered_changes_json());
         }
 
-        let rows =
-            storage.list_consumer_deliveries(&sync_id, 0, limit).map_err(|e| e.to_string())?;
+        let page = storage
+            .read_consumer_delivery_page(&sync_id, 0, limit)
+            .map_err(|e| e.to_string())?;
+        let rows = page.rows;
         if rows.is_empty() {
             return Ok(empty_undelivered_changes_json());
         }
@@ -3159,7 +3208,10 @@ pub async fn take_undelivered_changes(
             consumer_delivery_spill_threshold(&rows, total, CONSUMER_DELIVERY_JOURNAL_CAP);
 
         let max_id = rows.iter().map(|r| r.id).max().unwrap_or(0);
-        let deliveries = coalesce_consumer_deliveries(&rows);
+        let deliveries = hydrate_consumer_deliveries(
+            &rows,
+            &page.current_field_versions,
+        );
 
         let json = serde_json::json!({
             "deliveries": deliveries,
@@ -7983,6 +8035,72 @@ mod tests {
             server_seq: id,
             created_at: Utc::now(),
         }
+    }
+
+    fn winner(entity: &str, field: &str, value: Option<&str>, hlc: &str) -> FieldVersion {
+        FieldVersion {
+            sync_id: "sync-1".into(),
+            entity_table: "fronting_sessions".into(),
+            entity_id: entity.into(),
+            field_name: field.into(),
+            winning_op_id: format!("{entity}-{field}"),
+            winning_device_id: "device-new".into(),
+            winning_hlc: hlc.into(),
+            winning_encoded_value: value.map(str::to_owned),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn hydration_reconstructs_required_fields_split_beyond_raw_page() {
+        let mut member = delivery(
+            200,
+            "front-1",
+            Some("member_id"),
+            Some("\"stale-member\""),
+        );
+        member.entity_table = "fronting_sessions".into();
+        let current = vec![
+            winner("front-1", "member_id", Some("\"real-member\""), "2:0:peer"),
+            winner(
+                "front-1",
+                "start_time",
+                Some("\"2026-09-07T12:00:00.000Z\""),
+                "1:0:peer",
+            ),
+            winner("front-1", "notes", Some("\"complete payload\""), "1:0:peer"),
+            winner("front-1", "is_deleted", Some("false"), "1:0:peer"),
+        ];
+
+        let out = hydrate_consumer_deliveries(&[member], &current);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], 200);
+        assert_eq!(out[0]["fields"]["member_id"], "real-member");
+        assert_eq!(
+            out[0]["fields"]["start_time"],
+            "2026-09-07T12:00:00.000Z"
+        );
+        assert_eq!(out[0]["fields"]["notes"], "complete payload");
+        assert!(out[0]["fields"].get("is_deleted").is_none());
+    }
+
+    #[test]
+    fn hydration_never_revives_authoritatively_tombstoned_entity() {
+        let mut stale = delivery(
+            201,
+            "front-1",
+            Some("start_time"),
+            Some("\"2026-09-07T12:00:00Z\""),
+        );
+        stale.entity_table = "fronting_sessions".into();
+        let current = vec![
+            winner("front-1", "member_id", Some("\"real-member\""), "1:0:peer"),
+            winner("front-1", "is_deleted", Some("true"), "2:0:peer"),
+        ];
+
+        let out = hydrate_consumer_deliveries(&[stale], &current);
+        assert_eq!(out[0]["is_delete"], true);
+        assert!(out[0]["fields"].as_object().unwrap().is_empty());
     }
 
     #[test]

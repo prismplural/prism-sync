@@ -483,6 +483,35 @@ fn query_list_consumer_deliveries(
     Ok(out)
 }
 
+fn query_consumer_delivery_page(
+    conn: &Connection,
+    sync_id: &str,
+    after_id: i64,
+    limit: i64,
+) -> Result<ConsumerDeliveryPage> {
+    let rows = query_list_consumer_deliveries(conn, sync_id, after_id, limit)?;
+    let entities: HashSet<_> = rows
+        .iter()
+        .map(|row| (row.entity_table.as_str(), row.entity_id.as_str()))
+        .collect();
+    let mut current_field_versions = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT * FROM field_versions \
+         WHERE sync_id = ?1 AND entity_table = ?2 AND entity_id = ?3 \
+         ORDER BY field_name ASC",
+    )?;
+    for (table, entity_id) in entities {
+        let versions = stmt.query_map(
+            params![sync_id, table, entity_id],
+            row_to_field_version,
+        )?;
+        for version in versions {
+            current_field_versions.push(version?);
+        }
+    }
+    Ok(ConsumerDeliveryPage { rows, current_field_versions })
+}
+
 fn query_count_consumer_deliveries(conn: &Connection, sync_id: &str) -> Result<i64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM consumer_deliveries WHERE sync_id = ?1",
@@ -1961,6 +1990,16 @@ impl SyncStorage for RusqliteSyncStorage {
     ) -> Result<Vec<ConsumerDelivery>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_list_consumer_deliveries(&conn, sync_id, after_id, limit)
+    }
+
+    fn read_consumer_delivery_page(
+        &self,
+        sync_id: &str,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<ConsumerDeliveryPage> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        query_consumer_delivery_page(&conn, sync_id, after_id, limit)
     }
 
     fn count_consumer_deliveries(&self, sync_id: &str) -> Result<i64> {
@@ -4744,6 +4783,63 @@ mod tests {
         let capped = storage.list_consumer_deliveries("sync-1", 0, 1).unwrap();
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].entity_id, "ent-1");
+    }
+
+    #[test]
+    fn consumer_delivery_page_bounds_rows_and_reads_current_winners_for_touched_entities() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        for (entity, field, seq) in [
+            ("front-1", "member_id", 1),
+            ("member-1", "name", 2),
+            ("outside-page", "name", 3),
+        ] {
+            let mut row = sample_consumer_delivery("sync-1", entity, Some(field), seq);
+            row.entity_table = if entity == "front-1" {
+                "fronting_sessions".to_string()
+            } else {
+                "members".to_string()
+            };
+            tx.insert_consumer_delivery(&row).unwrap();
+        }
+        for (table, entity, field, value, hlc) in [
+            ("fronting_sessions", "front-1", "member_id", "\"new-member\"", "2:0:peer"),
+            ("fronting_sessions", "front-1", "start_time", "\"2026-09-07T12:00:00Z\"", "1:0:peer"),
+            ("members", "member-1", "name", "\"Current\"", "2:0:peer"),
+            ("members", "outside-page", "name", "\"Outside\"", "2:0:peer"),
+        ] {
+            tx.upsert_field_version(&FieldVersion {
+                sync_id: "sync-1".to_string(),
+                entity_table: table.to_string(),
+                entity_id: entity.to_string(),
+                field_name: field.to_string(),
+                winning_op_id: format!("{entity}-{field}"),
+                winning_device_id: "peer".to_string(),
+                winning_hlc: hlc.to_string(),
+                winning_encoded_value: Some(value.to_string()),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        // Limit 2 models both the normal page boundary and a retention-spill
+        // prefix: hydration includes all current fields for only those two
+        // touched entities, never the third row/entity beyond the boundary.
+        let page = storage.read_consumer_delivery_page("sync-1", 0, 2).unwrap();
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.current_field_versions.len(), 3);
+        assert!(page.current_field_versions.iter().any(|fv| {
+            fv.entity_id == "front-1"
+                && fv.field_name == "member_id"
+                && fv.winning_encoded_value.as_deref() == Some("\"new-member\"")
+        }));
+        assert!(page.current_field_versions.iter().any(|fv| {
+            fv.entity_id == "front-1" && fv.field_name == "start_time"
+        }));
+        assert!(!page.current_field_versions.iter().any(|fv| {
+            fv.entity_id == "outside-page"
+        }));
     }
 
     #[test]
