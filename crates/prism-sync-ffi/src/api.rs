@@ -1680,10 +1680,7 @@ pub async fn unlock(
     .await
     .map_err(|e| format!("task failed: {e}"))??;
     {
-        // Password unlock and runtime-cache restore are equivalent relaunch
-        // paths. Both must hydrate retained epoch keys before the engine pulls
-        // encrypted batches; otherwise configure succeeds but post-restart
-        // batches for the current epoch are silently skipped as undecryptable.
+        // Without retained epoch keys, post-restart batches can be skipped.
         let mut inner = handle.inner.lock().await;
         restore_persisted_epoch_keys(&mut inner)?;
     }

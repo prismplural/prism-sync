@@ -4823,9 +4823,7 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        // Limit 2 models both the normal page boundary and a retention-spill
-        // prefix: hydration includes all current fields for only those two
-        // touched entities, never the third row/entity beyond the boundary.
+        // Hydrate only the entities touched by the bounded journal prefix.
         let page = storage.read_consumer_delivery_page("sync-1", 0, 2).unwrap();
         assert_eq!(page.rows.len(), 2);
         assert_eq!(page.current_field_versions.len(), 3);
