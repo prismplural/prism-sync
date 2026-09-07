@@ -4,7 +4,11 @@
 .DS_Store
 
 # Dart / Flutter generated state
+dart/.dart_tool/
+dart/.idea/
+dart/**/*.iml
 dart/packages/*/.dart_tool/
+dart/packages/*/pubspec_overrides.yaml
 dart/packages/*/.flutter-plugins-dependencies
 dart/packages/*/build/
 

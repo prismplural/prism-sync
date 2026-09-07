@@ -10,14 +10,16 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
+use rusqlite::Connection;
 
 use prism_sync_core::engine::MergeEngine;
 use prism_sync_core::schema::{SyncSchema, SyncType};
-use prism_sync_core::storage::FieldVersion;
+use prism_sync_core::storage::{AppliedOp, FieldVersion, RusqliteSyncStorage, SyncStorage};
 use prism_sync_core::CrdtChange;
 
 use common::*;
@@ -239,7 +241,7 @@ fn merge_sequential(
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 500,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
         .. ProptestConfig::default()
     })]
 
@@ -278,13 +280,288 @@ proptest! {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Stateful durable delete/replay coverage
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Each transition reopens SQLite; replay resends an earlier operation.
+#[derive(Clone, Debug)]
+enum StateAction {
+    Apply(OperationSpec),
+    Replay(u8),
+}
+
+#[derive(Clone, Debug)]
+struct OperationSpec {
+    entity_id: String,
+    field_name: String,
+    timestamp: i64,
+    counter: u32,
+    device_id: String,
+    epoch: i32,
+    is_delete: bool,
+}
+
+fn arb_state_action() -> impl Strategy<Value = StateAction> {
+    prop_oneof![
+        (
+            prop_oneof![Just("t1".to_string()), Just("t2".to_string())],
+            prop_oneof![
+                Just(("title".to_string(), false)),
+                Just(("done".to_string(), false)),
+                Just(("is_deleted".to_string(), true)),
+            ],
+            1_i64..100,
+            0_u32..8,
+            arb_device_id(),
+            0_i32..3,
+        )
+            .prop_map(
+                |(entity_id, (field_name, is_delete), timestamp, counter, device_id, epoch)| {
+                    StateAction::Apply(OperationSpec {
+                        entity_id,
+                        field_name,
+                        timestamp,
+                        counter,
+                        device_id,
+                        epoch,
+                        is_delete,
+                    })
+                },
+            ),
+        (0_u8..24).prop_map(StateAction::Replay),
+    ]
+}
+
+fn state_encoded_value(field_name: &str, timestamp: i64) -> String {
+    match field_name {
+        "done" => (timestamp % 2 == 0).to_string(),
+        _ => format!("\"value-{timestamp}\""),
+    }
+}
+
+fn state_operation(spec: &OperationSpec) -> CrdtChange {
+    let client_hlc = format!("{}:{}:{}", spec.timestamp, spec.counter, spec.device_id);
+    let op_id = format!(
+        "tasks:{}:{}:{}:{}:e{}",
+        spec.entity_id, spec.field_name, client_hlc, spec.device_id, spec.epoch
+    );
+    CrdtChange {
+        op_id,
+        batch_id: Some("state-machine".to_string()),
+        entity_id: spec.entity_id.clone(),
+        entity_table: "tasks".to_string(),
+        field_name: spec.field_name.clone(),
+        encoded_value: if spec.is_delete {
+            "true".to_string()
+        } else {
+            state_encoded_value(&spec.field_name, spec.timestamp)
+        },
+        client_hlc,
+        is_delete: spec.is_delete,
+        device_id: spec.device_id.clone(),
+        epoch: spec.epoch,
+        server_seq: None,
+    }
+}
+
+/// Independent LWW oracle; must not call production `wins_over`.
+fn independently_wins(candidate: &CrdtChange, current: &CrdtChange) -> bool {
+    fn rank(op: &CrdtChange) -> (i64, u32, &str, &str, &str) {
+        let mut parts = op.client_hlc.splitn(3, ':');
+        let timestamp = parts.next().unwrap().parse().unwrap();
+        let counter = parts.next().unwrap().parse().unwrap();
+        let node_id = parts.next().unwrap();
+        (timestamp, counter, node_id, &op.device_id, &op.op_id)
+    }
+
+    rank(candidate) > rank(current)
+}
+
+#[derive(Default)]
+struct ObservableModel {
+    applied: HashSet<String>,
+    deleted: HashSet<String>,
+    live_fields: HashMap<(String, String), CrdtChange>,
+}
+
+impl ObservableModel {
+    fn apply(&mut self, op: &CrdtChange) {
+        if !self.applied.insert(op.op_id.clone()) {
+            return;
+        }
+        if op.is_delete {
+            self.deleted.insert(op.entity_id.clone());
+            self.live_fields.retain(|(entity_id, _), _| entity_id != &op.entity_id);
+            return;
+        }
+        if self.deleted.contains(&op.entity_id) {
+            return;
+        }
+
+        let key = (op.entity_id.clone(), op.field_name.clone());
+        match self.live_fields.get(&key) {
+            Some(current) if !independently_wins(op, current) => {}
+            _ => {
+                self.live_fields.insert(key, op.clone());
+            }
+        }
+    }
+}
+
+fn open_state_storage(path: &Path) -> Result<RusqliteSyncStorage, String> {
+    RusqliteSyncStorage::new(Connection::open(path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())
+}
+
+/// Models remote apply: persist all replay markers, but only winning versions.
+fn apply_and_persist_state_op(path: &Path, op: &CrdtChange) -> Result<(), String> {
+    let storage = open_state_storage(path)?;
+    let merge = MergeEngine::new(test_merge_schema());
+    let winners = merge
+        .determine_winners(
+            std::slice::from_ref(op),
+            &|sync_id, table, entity_id, field| {
+                storage.get_field_version(sync_id, table, entity_id, field)
+            },
+            &|op_id| storage.is_op_applied(op_id),
+            SYNC_ID,
+        )
+        .map_err(|error| error.to_string())?;
+
+    let already_applied = storage.is_op_applied(&op.op_id).map_err(|error| error.to_string())?;
+    let mut tx = storage.begin_tx().map_err(|error| error.to_string())?;
+    if !already_applied {
+        tx.insert_applied_op(&AppliedOp {
+            op_id: op.op_id.clone(),
+            sync_id: SYNC_ID.to_string(),
+            epoch: op.epoch,
+            device_id: op.device_id.clone(),
+            client_hlc: op.client_hlc.clone(),
+            server_seq: 1,
+            applied_at: chrono::Utc::now(),
+        })
+        .map_err(|error| error.to_string())?;
+    }
+    for winner in winners.into_values() {
+        let winner = winner.op;
+        tx.upsert_field_version(&FieldVersion {
+            sync_id: SYNC_ID.to_string(),
+            entity_table: winner.entity_table.clone(),
+            entity_id: winner.entity_id.clone(),
+            field_name: winner.field_name.clone(),
+            winning_op_id: winner.op_id.clone(),
+            winning_device_id: winner.device_id.clone(),
+            winning_hlc: winner.client_hlc.clone(),
+            winning_encoded_value: Some(winner.encoded_value.clone()),
+            updated_at: chrono::Utc::now(),
+        })
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn assert_observable_state(path: &Path, model: &ObservableModel) -> Result<(), String> {
+    let storage = open_state_storage(path)?;
+    for entity_id in ["t1", "t2"] {
+        let tombstone = storage
+            .get_field_version(SYNC_ID, "tasks", entity_id, "is_deleted")
+            .map_err(|error| error.to_string())?;
+        let actual_deleted = tombstone
+            .as_ref()
+            .map(|version| version.winning_encoded_value.as_deref() != Some("false"))
+            .unwrap_or(false);
+        let expected_deleted = model.deleted.contains(entity_id);
+        if actual_deleted != expected_deleted {
+            return Err(format!(
+                "delete state for {entity_id} differed: expected {expected_deleted}, got {actual_deleted}"
+            ));
+        }
+
+        // Tombstones may retain historical versions; compare only live state.
+        if expected_deleted {
+            continue;
+        }
+        for field_name in ["title", "done"] {
+            let actual = storage
+                .get_field_version(SYNC_ID, "tasks", entity_id, field_name)
+                .map_err(|error| error.to_string())?;
+            let expected = model.live_fields.get(&(entity_id.to_string(), field_name.to_string()));
+            match (actual, expected) {
+                (None, None) => {}
+                (Some(actual), Some(expected))
+                    if actual.winning_op_id == expected.op_id
+                        && actual.winning_encoded_value.as_deref()
+                            == Some(expected.encoded_value.as_str()) => {}
+                (actual, expected) => {
+                    return Err(format!(
+                        "live field {entity_id}.{field_name} differed: actual={actual:?}, expected={expected:?}"
+                    ));
+                }
+            }
+        }
+    }
+    for op_id in &model.applied {
+        if !storage.is_op_applied(op_id).map_err(|error| error.to_string())? {
+            return Err(format!("replay marker for {op_id} was lost after reopen"));
+        }
+    }
+    Ok(())
+}
+
+fn run_state_machine(actions: &[StateAction]) -> Result<(), String> {
+    let temp_dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let db_path = temp_dir.path().join("state-machine.sqlite");
+    {
+        let storage = open_state_storage(&db_path)?;
+        setup_sync_metadata(&storage, "device-local");
+    }
+
+    let mut history = Vec::new();
+    let mut model = ObservableModel::default();
+    for action in actions {
+        let operation = match action {
+            StateAction::Apply(spec) => {
+                let operation = state_operation(spec);
+                history.push(operation.clone());
+                Some(operation)
+            }
+            StateAction::Replay(index) if !history.is_empty() => {
+                Some(history[usize::from(*index) % history.len()].clone())
+            }
+            StateAction::Replay(_) => None,
+        };
+        if let Some(operation) = operation {
+            apply_and_persist_state_op(&db_path, &operation)?;
+            model.apply(&operation);
+        }
+        assert_observable_state(&db_path, &model)?;
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 96,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
+        .. ProptestConfig::default()
+    })]
+
+    /// Sequential replay/reopen contract, not arbitrary tombstone batch ordering.
+    #[test]
+    fn stateful_delete_replay_and_reopen(actions in prop::collection::vec(arb_state_action(), 1..20)) {
+        let result = run_state_machine(&actions);
+        prop_assert!(result.is_ok(), "state machine failed: {}", result.unwrap_err());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Property 2: Idempotency — merge(a, a) == a
 // ═══════════════════════════════════════════════════════════════════════════
 
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 500,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
         .. ProptestConfig::default()
     })]
 
@@ -326,7 +603,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 300,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
         .. ProptestConfig::default()
     })]
 
@@ -384,7 +661,7 @@ fn reconstruct_ops_from_outcome(
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 200,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
         .. ProptestConfig::default()
     })]
 
@@ -425,7 +702,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 500,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
         .. ProptestConfig::default()
     })]
 

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ae36f5eb80152d2369ea241f4735810d14a6fa9c18ff67b759a3defa0185ab53 # shrinks to actions = [Apply(OperationSpec { entity_id: "t1", field_name: "is_deleted", timestamp: 1, counter: 0, device_id: "dev-a", epoch: 0, is_delete: true })]

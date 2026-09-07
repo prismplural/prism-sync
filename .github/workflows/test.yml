@@ -1,0 +1,108 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  msrv:
+    name: Rust 1.88 compatibility
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --workspace --locked --all-targets
+
+  production:
+    name: Default production build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: prism-sync-production
+      - run: just check-production
+
+  codegen:
+    name: Generated bindings are current
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: rustup component add rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: prism-sync-codegen
+      - name: Install pinned generator
+        run: |
+          cargo install cargo-expand --version 1.0.122 --locked
+          cargo install flutter_rust_bridge_codegen --version 2.12.0 --locked
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.1'
+          channel: stable
+          cache: true
+      - run: just codegen-check
+
+  fast:
+    name: Rust and Dart package tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: prism-sync-tests
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.1'
+          channel: stable
+          cache: true
+      - name: Bootstrap Dart packages
+        run: |
+          dart pub global activate melos 6.3.3
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+          cd dart && "$HOME/.pub-cache/bin/melos" bootstrap
+      - run: scripts/test_lane.sh fast
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prism-sync-fast-results
+          path: test-results/
+          if-no-files-found: warn
+
+  native:
+    name: Native artifacts (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: prism-sync-native-tests
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.1'
+          channel: stable
+          cache: true
+      - name: Bootstrap Dart packages
+        run: |
+          dart pub global activate melos 6.3.3
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+          cd dart && "$HOME/.pub-cache/bin/melos" bootstrap
+      - run: scripts/test_lane.sh native
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prism-sync-native-results
+          path: test-results/
+          if-no-files-found: warn

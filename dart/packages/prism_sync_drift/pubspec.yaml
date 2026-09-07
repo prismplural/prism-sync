@@ -9,3 +9,6 @@ environment:
 dependencies:
   prism_sync:
     path: ../prism_sync
+
+dev_dependencies:
+  test: ^1.25.0

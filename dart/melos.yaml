@@ -5,3 +5,8 @@ packages:
 command:
   bootstrap:
     usePubspecOverrides: true
+
+scripts:
+  test:
+    description: Run every Dart/Flutter package with a test directory.
+    run: melos exec --dir-exists=test -- flutter test

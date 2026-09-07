@@ -26,7 +26,7 @@ repo-local.
 
 ## Build And Test
 
-Rust MSRV is `1.75`. The workspace uses Rust 2021.
+Rust MSRV is `1.88`. The workspace uses Rust 2021.
 
 ```bash
 cargo build --workspace
@@ -52,7 +52,7 @@ Per-crate checks:
 cargo test -p prism-sync-crypto
 cargo test -p prism-sync-core
 cargo test -p prism-sync-relay
-cargo test -p prism-sync-crypto --test cross_language_vectors -- --ignored
+cargo test -p prism-sync-crypto --test cross_language_vectors
 ```
 
 Run cross-language vector tests when touching crypto, serialization formats, or

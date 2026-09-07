@@ -15,7 +15,9 @@ If you're here to deploy a relay rather than work on the code, the
 
 ## What's in here
 
-Rust 2021 (MSRV 1.75), tokio, Axum for the relay, `rusqlite` (bundled SQLite),
+Rust 2021 (MSRV 1.88, validated with `cargo +1.88.0 check --workspace --locked
+--all-targets`), tokio,
+Axum for the relay, `rusqlite` (bundled SQLite),
 RustCrypto for symmetric crypto and signatures, `ml-dsa` / `ml-kem` / `x-wing`
 for the post-quantum layer, and `flutter_rust_bridge` 2.12.0 for the FFI.
 
@@ -57,13 +59,42 @@ cargo fmt --all
 A `justfile` wraps these (`just build`, `just test`, `just test-crate <name>`,
 `just lint`, `just fmt`).
 
+## Test lanes
+
+Bootstrap the Dart workspace before a lane that includes Dart packages. The
+Melos test command discovers every package with a `test/` directory, so a new
+package-local test suite is included without maintaining a second package list.
+
+```bash
+cd dart && melos bootstrap
+cd ..
+just test-fast        # workspace Rust tests and discovered Dart package tests
+just test-native      # release FFI + relay artifacts, then Dart package tests
+just check-production # default-feature release build
+just codegen-check    # regenerate into a temporary directory and diff semantic generated output
+just benchmark -- --help
+```
+
+`just benchmark` is a deliberate local relay workload and accepts the
+`prism-sync-bench` arguments after `--`; it is not a PR timing threshold. The
+ordinary PR workflow runs the fast lane and preserves its logs, tool versions,
+duration, and exit status as artifacts.
+The native app lane additionally verifies artifact source revision and host
+provenance in prism-app. Code-generation drift validation remains separate from
+the runtime native-asset smoke. `codegen-check` requires
+`flutter_rust_bridge_codegen 2.12.0` and `rustfmt`; it normalizes the committed
+and regenerated Rust bindings with the same formatter before comparing them.
+Lane result inventories require Node.js and are written even if a lane fails.
+
+Rust 1.88 is the supported minimum after an all-targets locked workspace check.
+
 Per-crate testing:
 
 ```bash
 cargo test -p prism-sync-crypto
 cargo test -p prism-sync-core
 cargo test -p prism-sync-relay
-cargo test -p prism-sync-crypto --test cross_language_vectors -- --ignored
+cargo test -p prism-sync-crypto --test cross_language_vectors
 ```
 
 The cross-language vector tests verify crypto outputs byte-for-byte against
@@ -87,7 +118,7 @@ The `dart/packages/` workspace is managed via Melos.
 
 ```bash
 cd dart
-dart pub global activate melos
+dart pub global activate melos 6.3.3
 melos bootstrap
 melos run test
 ```

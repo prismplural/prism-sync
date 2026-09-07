@@ -2,6 +2,7 @@
 name = "prism_sync_ffi"
 version = "0.1.1"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "FFI layer for prism-sync, bridging to Dart/Flutter via flutter_rust_bridge"
 
