@@ -564,6 +564,10 @@ impl PrismSync {
         self.sync_service.set_auto_sync(config)
     }
 
+    pub fn auto_sync_config(&self) -> &AutoSyncConfig {
+        self.sync_service.auto_sync_config()
+    }
+
     /// Trigger a full sync cycle (pull + merge + push).
     ///
     /// Requires [`configure_engine`](Self::configure_engine) to have been

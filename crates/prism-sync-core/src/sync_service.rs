@@ -51,6 +51,7 @@ pub enum SyncTrigger {
 }
 
 /// Configuration for automatic sync behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoSyncConfig {
     /// Whether auto-sync is enabled.
     pub enabled: bool,
@@ -738,6 +739,10 @@ impl SyncService {
 
         self.auto_sync_config = config;
         result
+    }
+
+    pub fn auto_sync_config(&self) -> &AutoSyncConfig {
+        &self.auto_sync_config
     }
 
     /// Returns whether an engine has been configured.

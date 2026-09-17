@@ -237,6 +237,8 @@ fn effective_allow_insecure(requested: bool, url: &str) -> bool {
 /// constructed on the Rust side — Dart never passes trait objects across FFI.
 pub struct PrismSyncHandle {
     inner: Arc<Mutex<PrismSync>>,
+    /// Prevents relay and task ownership changes from interleaving.
+    lifecycle: Mutex<()>,
     relay_url: String,
     allow_insecure: bool,
     /// The active relay after `configure_engine` is called. Stored here so
@@ -1618,6 +1620,7 @@ pub fn create_prism_sync(
 
     Ok(PrismSyncHandle {
         inner: Arc::new(Mutex::new(prism_sync)),
+        lifecycle: Mutex::new(()),
         relay_url,
         allow_insecure,
         relay: std::sync::Mutex::new(None),
@@ -1899,7 +1902,9 @@ fn heal_configured_epoch(
 /// The `epoch` defaults to 0 (the starting epoch for new sync groups).
 /// If the secure store contains an `epoch` key, that value is used instead.
 pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
+    let _lifecycle = handle.lifecycle.lock().await;
     let mut inner = handle.inner.lock().await;
+    let auto_sync_config = inner.auto_sync_config().clone();
     ratchet_min_signature_version_floor(inner.secure_store().as_ref(), None)?;
     ensure_app_supports_stored_floor(inner.secure_store().as_ref())?;
 
@@ -1981,6 +1986,26 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
         None,
     )?;
 
+    // Join old handlers before swapping engines to exclude stale relay events.
+    stop_auto_sync_tasks(handle).await;
+
+    // Configure engine
+    inner.configure_engine(relay.clone(), sync_id, device_id, epoch, ml_dsa_key_generation);
+    drop(inner);
+
+    let old_relay = lock_or_recover(&handle.relay).replace(relay.clone());
+    drop(old_relay);
+
+    // Subscribe before connecting so initial notifications cannot be missed.
+    let relay_for_auto_sync: Arc<dyn prism_sync_core::relay::SyncRelay> = relay.clone();
+    apply_auto_sync_config(
+        handle,
+        auto_sync_config,
+        Some(relay_for_auto_sync),
+        true,
+    )
+    .await?;
+
     // Connect WebSocket for real-time relay notifications (best-effort;
     // connect() spawns a background reconnect loop and never blocks).
     if let Err(e) = ServerRelay::connect_websocket_arc(&relay).await {
@@ -1990,12 +2015,6 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
             "[prism_sync_ffi] WebSocket connect failed (non-fatal)"
         );
     }
-
-    // Store relay so set_auto_sync can wire up the notification handler.
-    *lock_or_recover(&handle.relay) = Some(relay.clone());
-
-    // Configure engine
-    inner.configure_engine(relay, sync_id, device_id, epoch, ml_dsa_key_generation);
 
     Ok(())
 }
@@ -2363,41 +2382,36 @@ pub async fn acknowledge_snapshot_applied(handle: &PrismSyncHandle) -> Result<()
 
 // ── Sync control ──
 
-/// Configure auto-sync (debounced push after mutations + WebSocket pull).
-///
-/// When `enabled` is true:
-/// - Mutations are coalesced via a debounce timer and pushed after
-///   `debounce_ms` of quiet time.
-/// - A driver task listens on the trigger channel and calls `sync_now()`
-///   for each `SyncTrigger` received (mutation debounce or WebSocket).
-/// - If a relay is connected, a notification handler translates relay
-///   `new_data` WebSocket messages into sync triggers so Device B pulls
-///   immediately when Device A pushes.
-pub async fn set_auto_sync(
-    handle: &PrismSyncHandle,
-    enabled: bool,
-    debounce_ms: u64,
-    retry_delay_ms: u64,
-    max_retries: u32,
-) -> Result<(), String> {
-    // Abort any existing driver / notification / backoff tasks before reconfiguring.
-    if let Some(h) = lock_or_recover(&handle.driver_handle).take() {
+/// Join aborted tasks so obsolete relay handlers cannot outlive replacement.
+async fn stop_auto_sync_tasks(handle: &PrismSyncHandle) {
+    let notification = lock_or_recover(&handle.notification_handle).take();
+    let driver = lock_or_recover(&handle.driver_handle).take();
+    if let Some(h) = &notification {
         h.abort();
     }
-    if let Some(h) = lock_or_recover(&handle.notification_handle).take() {
+    if let Some(h) = &driver {
         h.abort();
     }
     if let Some(h) = lock_or_recover(&handle.backoff_handle).take() {
         h.abort();
     }
+    if let Some(h) = notification {
+        let _ = h.await;
+    }
+    if let Some(h) = driver {
+        let _ = h.await;
+    }
+}
 
-    let config = AutoSyncConfig {
-        enabled,
-        debounce: std::time::Duration::from_millis(debounce_ms),
-        retry_delay: std::time::Duration::from_millis(retry_delay_ms),
-        max_retries,
-        enable_pruning: false,
-    };
+/// Replace the complete auto-sync runtime while the caller holds
+/// `handle.lifecycle`.
+async fn apply_auto_sync_config(
+    handle: &PrismSyncHandle,
+    config: AutoSyncConfig,
+    relay: Option<Arc<dyn prism_sync_core::relay::SyncRelay>>,
+    kick_catch_up: bool,
+) -> Result<(), String> {
+    stop_auto_sync_tasks(handle).await;
 
     // Configure auto-sync inside the lock, capturing what we need to spawn tasks.
     let (trigger_rx, event_tx, device_id, notification_trigger_tx) = {
@@ -2543,12 +2557,10 @@ pub async fn set_auto_sync(
         // new_data messages trigger auto-pull on this device. Pass the
         // PrismSync handle and relay so epoch rotation can be recovered
         // inline before triggering sync.
-        let relay = lock_or_recover(&handle.relay).clone();
-        if let (Some(trigger_tx), Some(relay)) = (notification_trigger_tx, relay) {
+        if let (Some(trigger_tx), Some(relay)) = (notification_trigger_tx.clone(), relay) {
             let notifications = relay.notifications();
             let inner_for_notif = Some(handle.inner.clone());
-            let relay_for_notif: Option<Arc<dyn prism_sync_core::relay::SyncRelay>> =
-                Some(relay.clone() as Arc<dyn prism_sync_core::relay::SyncRelay>);
+            let relay_for_notif = Some(relay.clone());
             let notif = spawn_notification_handler(
                 notifications,
                 device_id,
@@ -2559,9 +2571,53 @@ pub async fn set_auto_sync(
             );
             *lock_or_recover(&handle.notification_handle) = Some(notif);
         }
+
+        // Catch up durable work whose debounce or notification was lost on replacement.
+        if kick_catch_up {
+            if let Some(trigger_tx) = notification_trigger_tx {
+                let _ = trigger_tx.try_send(prism_sync_core::sync_service::SyncTrigger::ManualSync);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn should_kick_auto_sync(enabled: bool, relay_configured: bool) -> bool {
+    enabled && relay_configured
+}
+
+/// Configure auto-sync (debounced push after mutations + WebSocket pull).
+///
+/// When `enabled` is true:
+/// - Mutations are coalesced via a debounce timer and pushed after
+///   `debounce_ms` of quiet time.
+/// - A driver task listens on the trigger channel and calls `sync_now()`
+///   for each `SyncTrigger` received (mutation debounce or WebSocket).
+/// - If a relay is connected, a notification handler translates relay
+///   `new_data` WebSocket messages into sync triggers so Device B pulls
+///   immediately when Device A pushes.
+pub async fn set_auto_sync(
+    handle: &PrismSyncHandle,
+    enabled: bool,
+    debounce_ms: u64,
+    retry_delay_ms: u64,
+    max_retries: u32,
+) -> Result<(), String> {
+    let _lifecycle = handle.lifecycle.lock().await;
+    let config = AutoSyncConfig {
+        enabled,
+        debounce: std::time::Duration::from_millis(debounce_ms),
+        retry_delay: std::time::Duration::from_millis(retry_delay_ms),
+        max_retries,
+        enable_pruning: false,
+    };
+    let relay = lock_or_recover(&handle.relay)
+        .clone()
+        .map(|relay| relay as Arc<dyn prism_sync_core::relay::SyncRelay>);
+    let kick_catch_up = should_kick_auto_sync(enabled, relay.is_some());
+    // Catch up missed notifications, but only after a relay is configured.
+    apply_auto_sync_config(handle, config, relay, kick_catch_up).await
 }
 
 /// Trigger a manual sync cycle (pull + merge + push).
@@ -2607,6 +2663,7 @@ pub fn is_websocket_connected(handle: &PrismSyncHandle) -> bool {
 /// resetting the exponential backoff. No-op if no relay is configured.
 /// Non-fatal: errors are logged but not propagated.
 pub async fn reconnect_websocket(handle: &PrismSyncHandle) -> Result<(), String> {
+    let _lifecycle = handle.lifecycle.lock().await;
     let relay = handle.relay.lock().ok().and_then(|g| g.clone());
     if let Some(relay) = relay {
         if !relay.is_websocket_connected() {
@@ -4376,8 +4433,16 @@ fn rollback_outcome_failed(stage: &str, reason: impl Into<String>) -> String {
 /// have been called) — for the cleanup-resume path that runs without a
 /// configured engine, use [`clear_sync_state`] instead.
 pub async fn reset_sync_state(handle: &PrismSyncHandle) -> Result<(), String> {
+    let _lifecycle = handle.lifecycle.lock().await;
     let mut inner = handle.inner.lock().await;
-    inner.reset_sync_state().await.map_err(|e| e.to_string())
+    inner.reset_sync_state().await.map_err(|e| e.to_string())?;
+    drop(inner);
+
+    // Discard old tasks and relay so configuration cannot revive pre-reset auto-sync.
+    stop_auto_sync_tasks(handle).await;
+    let old_relay = lock_or_recover(&handle.relay).take();
+    drop(old_relay);
+    Ok(())
 }
 
 /// Clear all sync-DB rows for the given `sync_id`.
@@ -8352,5 +8417,180 @@ mod tests {
         assert_eq!(heal_configured_epoch(Some(3), Some(2), |e| e == 2), 3);
         assert_eq!(heal_configured_epoch(Some(3), None, |_| true), 3);
         assert_eq!(heal_configured_epoch(None, None, |_| true), 0);
+    }
+
+    async fn make_auto_sync_test_handle() -> PrismSyncHandle {
+        let handle = create_prism_sync(
+            "https://localhost:8080".into(),
+            ":memory:".into(),
+            false,
+            String::new(),
+            None,
+        )
+        .expect("create test handle");
+        handle
+            .inner
+            .lock()
+            .await
+            .initialize("test-password", &[1u8; 16])
+            .expect("initialize test handle");
+        handle
+    }
+
+    async fn replace_with_mock_relay(handle: &PrismSyncHandle, relay: Arc<MockRelay>) {
+        let _lifecycle = handle.lifecycle.lock().await;
+        stop_auto_sync_tasks(handle).await;
+        let config = {
+            let mut inner = handle.inner.lock().await;
+            let config = inner.auto_sync_config().clone();
+            inner.configure_engine(
+                relay.clone(),
+                "sync-1".to_string(),
+                "a1b2c3d4e5f6".to_string(),
+                0,
+                0,
+            );
+            config
+        };
+        let relay_for_notifications: Arc<dyn prism_sync_core::relay::SyncRelay> = relay;
+        apply_auto_sync_config(
+            handle,
+            config,
+            Some(relay_for_notifications),
+            true,
+        )
+        .await
+        .expect("replace auto-sync runtime");
+    }
+
+    async fn set_mock_auto_sync(
+        handle: &PrismSyncHandle,
+        relay: Arc<MockRelay>,
+        config: AutoSyncConfig,
+    ) {
+        let _lifecycle = handle.lifecycle.lock().await;
+        let relay_for_notifications: Arc<dyn prism_sync_core::relay::SyncRelay> = relay;
+        let kick_catch_up = config.enabled;
+        apply_auto_sync_config(
+            handle,
+            config,
+            Some(relay_for_notifications),
+            kick_catch_up,
+        )
+        .await
+        .expect("set mock auto-sync");
+    }
+
+    async fn wait_for_pull(relay: &MockRelay, after: u32) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while relay.pull_call_count() <= after {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("notification should drive a pull");
+    }
+
+    #[test]
+    fn auto_sync_catch_up_requires_enabled_configured_relay() {
+        assert!(should_kick_auto_sync(true, true));
+        assert!(!should_kick_auto_sync(true, false));
+        assert!(!should_kick_auto_sync(false, true));
+        assert!(!should_kick_auto_sync(false, false));
+    }
+
+    #[tokio::test]
+    async fn auto_sync_notification_binding_follows_repeated_reconfiguration() {
+        let handle = make_auto_sync_test_handle().await;
+        let first = Arc::new(MockRelay::new());
+        replace_with_mock_relay(&handle, first.clone()).await;
+
+        let config = AutoSyncConfig {
+            enabled: true,
+            debounce: std::time::Duration::from_millis(37),
+            retry_delay: std::time::Duration::from_millis(83),
+            max_retries: 7,
+            enable_pruning: false,
+        };
+        set_mock_auto_sync(&handle, first.clone(), config.clone()).await;
+        wait_for_pull(&first, 0).await; // enabling catches up without another notification
+        let before_reenable = first.pull_call_count();
+        set_mock_auto_sync(&handle, first.clone(), config.clone()).await;
+        wait_for_pull(&first, before_reenable).await;
+        let first_before = first.pull_call_count();
+        first.send_notification(prism_sync_core::relay::SyncNotification::NewData {
+            server_seq: 1,
+        });
+        wait_for_pull(&first, first_before).await;
+
+        let second = Arc::new(MockRelay::new());
+        replace_with_mock_relay(&handle, second.clone()).await;
+        wait_for_pull(&second, 0).await; // replacement catch-up preserves pending work
+        assert_eq!(handle.inner.lock().await.auto_sync_config(), &config);
+
+        let second_before = second.pull_call_count();
+        first.send_notification(prism_sync_core::relay::SyncNotification::NewData {
+            server_seq: 2,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            second.pull_call_count(),
+            second_before,
+            "the retired relay must not trigger the replacement engine"
+        );
+        second.send_notification(prism_sync_core::relay::SyncNotification::NewData {
+            server_seq: 3,
+        });
+        wait_for_pull(&second, second_before).await;
+
+        let third = Arc::new(MockRelay::new());
+        replace_with_mock_relay(&handle, third.clone()).await;
+        wait_for_pull(&third, 0).await;
+        let third_before = third.pull_call_count();
+        third.send_notification(prism_sync_core::relay::SyncNotification::NewData {
+            server_seq: 4,
+        });
+        wait_for_pull(&third, third_before).await;
+        assert_eq!(handle.inner.lock().await.auto_sync_config(), &config);
+
+        stop_auto_sync_tasks(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_auto_sync_stays_disabled_across_reconfiguration_and_reset() {
+        let handle = make_auto_sync_test_handle().await;
+        let first = Arc::new(MockRelay::new());
+        replace_with_mock_relay(&handle, first).await;
+
+        let disabled = AutoSyncConfig {
+            enabled: false,
+            debounce: std::time::Duration::from_millis(91),
+            retry_delay: std::time::Duration::from_millis(177),
+            max_retries: 11,
+            enable_pruning: false,
+        };
+        let second = Arc::new(MockRelay::new());
+        set_mock_auto_sync(&handle, second.clone(), disabled.clone()).await;
+        replace_with_mock_relay(&handle, second.clone()).await;
+        second.send_notification(prism_sync_core::relay::SyncNotification::NewData {
+            server_seq: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(second.pull_call_count(), 0);
+        assert_eq!(handle.inner.lock().await.auto_sync_config(), &disabled);
+
+        reset_sync_state(&handle).await.expect("reset sync state");
+        let third = Arc::new(MockRelay::new());
+        replace_with_mock_relay(&handle, third.clone()).await;
+        third.send_notification(prism_sync_core::relay::SyncNotification::NewData {
+            server_seq: 2,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(third.pull_call_count(), 0);
+        assert_eq!(
+            handle.inner.lock().await.auto_sync_config(),
+            &AutoSyncConfig::default(),
+            "reset must not allow a later configure to revive auto-sync"
+        );
     }
 }

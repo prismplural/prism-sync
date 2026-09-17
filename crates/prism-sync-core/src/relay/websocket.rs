@@ -21,6 +21,47 @@ const MAX_RECONNECT_DELAY_SECS: u64 = 30;
 /// Ping interval in seconds.
 const PING_INTERVAL_SECS: u64 = 30;
 
+const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+
+/// Allows one missed Pong before retiring a half-open connection.
+const RECEIVE_DEADLINE_SECS: u64 = 70;
+
+#[derive(Clone, Copy)]
+struct WebSocketTiming {
+    handshake_timeout: Duration,
+    ping_interval: Duration,
+    receive_deadline: Duration,
+    reconnect_base_delay: Duration,
+    reconnect_max_delay: Duration,
+    reconnect_max_jitter: Duration,
+}
+
+impl WebSocketTiming {
+    const fn production() -> Self {
+        Self {
+            handshake_timeout: Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+            ping_interval: Duration::from_secs(PING_INTERVAL_SECS),
+            receive_deadline: Duration::from_secs(RECEIVE_DEADLINE_SECS),
+            reconnect_base_delay: Duration::from_secs(1),
+            reconnect_max_delay: Duration::from_secs(MAX_RECONNECT_DELAY_SECS),
+            reconnect_max_jitter: Duration::from_millis(500),
+        }
+    }
+
+    fn reconnect_delay(self, attempt: u32) -> (Duration, Duration) {
+        let multiplier = 1u32 << attempt.min(31);
+        let base =
+            self.reconnect_base_delay.saturating_mul(multiplier).min(self.reconnect_max_delay);
+        let max_jitter_ms = self.reconnect_max_jitter.as_millis() as u64;
+        let jitter = if max_jitter_ms == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(rand::thread_rng().gen_range(0..max_jitter_ms))
+        };
+        (base, jitter)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshSessionPolicy {
     AllowRefresh,
@@ -141,6 +182,10 @@ impl WebSocketClient {
     /// where FRB's async executor is not a Tokio runtime and `tokio::spawn`
     /// would panic.
     pub async fn connect(&self) {
+        self.connect_with_timing(WebSocketTiming::production()).await;
+    }
+
+    async fn connect_with_timing(&self, timing: WebSocketTiming) {
         // Abort any existing task first (sync lock — no await needed).
         if let Some(h) = self.task_handle.lock().unwrap().take() {
             h.abort();
@@ -174,17 +219,19 @@ impl WebSocketClient {
 
                 info!("[prism_ws] Connecting to {safe_url} (attempt {attempt})");
                 connected.store(false, Ordering::SeqCst);
+                let connection_started_at = time::Instant::now();
 
                 // Wrap in catch_unwind to surface panics (e.g. rustls
                 // CryptoProvider not installed) as visible errors instead of
                 // silently killing the reconnect loop.
-                let run_result = std::panic::AssertUnwindSafe(Self::run_connection(
+                let run_result = std::panic::AssertUnwindSafe(Self::run_connection_with_timing(
                     &ws_url,
                     &device_id,
                     &auth_token,
                     &notification_tx,
                     &intentional_close,
                     &connected,
+                    timing,
                 ))
                 .catch_unwind()
                 .await;
@@ -196,6 +243,10 @@ impl WebSocketClient {
                         .send(SyncNotification::ConnectionStateChanged { connected: false });
                     refresh_attempted_for_current_token = false;
                     post_refresh_retry_consumed_for_current_token = false;
+                    // Brief authenticated failures must retain outage backoff.
+                    if connection_started_at.elapsed() >= timing.receive_deadline {
+                        attempt = 0;
+                    }
                 }
 
                 match run_result {
@@ -219,7 +270,6 @@ impl WebSocketClient {
                         }
                         // Unexpected clean close — reconnect.
                         warn!("[prism_ws] Connection closed cleanly (unexpected), reconnecting");
-                        attempt = 0;
                     }
                     Ok(Err(WebSocketRunError::AuthStatus(status))) => {
                         warn!(
@@ -237,10 +287,7 @@ impl WebSocketClient {
                         )
                         .await
                         {
-                            AuthFailureAction::RetryWithToken {
-                                token,
-                                refresh_attempted,
-                            } => {
+                            AuthFailureAction::RetryWithToken { token, refresh_attempted } => {
                                 auth_token = token;
                                 refresh_attempted_for_current_token = refresh_attempted;
                                 post_refresh_retry_consumed_for_current_token = false;
@@ -268,10 +315,9 @@ impl WebSocketClient {
 
                 // Exponential backoff with jitter: min(2^attempt, MAX_RECONNECT_DELAY_SECS) + rand(0..500ms).
                 // Jitter prevents thundering herd when many clients reconnect simultaneously.
-                let base_secs = (1u64 << attempt.min(5)).min(MAX_RECONNECT_DELAY_SECS);
-                let jitter_ms = rand::thread_rng().gen_range(0u64..500);
-                let delay = Duration::from_secs(base_secs) + Duration::from_millis(jitter_ms);
-                info!("WebSocket reconnecting in {base_secs}s +{jitter_ms}ms jitter (attempt {attempt})");
+                let (base, jitter) = timing.reconnect_delay(attempt);
+                let delay = base + jitter;
+                info!("WebSocket reconnecting in {base:?} +{jitter:?} jitter (attempt {attempt})");
                 time::sleep(delay).await;
                 attempt = attempt.saturating_add(1);
             }
@@ -289,13 +335,14 @@ impl WebSocketClient {
     }
 
     /// Run a single WebSocket connection until it closes or errors.
-    async fn run_connection(
+    async fn run_connection_with_timing(
         ws_url: &str,
         _device_id: &str,
         auth_token: &str,
         notification_tx: &broadcast::Sender<SyncNotification>,
         intentional_close: &AtomicBool,
         connected: &AtomicBool,
+        timing: WebSocketTiming,
     ) -> Result<(), WebSocketRunError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
@@ -315,7 +362,12 @@ impl WebSocketClient {
 
         let safe_url = redact_url(ws_url);
         info!("[prism_ws] TCP/TLS connecting to {safe_url}");
-        let connect_result = tokio_tungstenite::connect_async(request).await;
+        let connect_result =
+            time::timeout(timing.handshake_timeout, tokio_tungstenite::connect_async(request))
+                .await
+                .map_err(|_| {
+                    WebSocketRunError::Other("WS handshake deadline exceeded".to_string())
+                })?;
         let (ws_stream, _response) = match connect_result {
             Ok(result) => result,
             Err(e) => {
@@ -336,9 +388,12 @@ impl WebSocketClient {
         debug!("[prism_ws] WebSocket upgraded, waiting for messages");
 
         // Ping timer.
-        let mut ping_interval = time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+        let mut ping_interval = time::interval(timing.ping_interval);
         // Skip the immediate first tick.
         ping_interval.tick().await;
+
+        // Bound Ping writes too, so a blocked send cannot hide receive failure.
+        let mut receive_deadline = Box::pin(time::sleep(timing.receive_deadline));
 
         loop {
             tokio::select! {
@@ -347,13 +402,29 @@ impl WebSocketClient {
                         let _ = write.send(Message::Close(None)).await;
                         break;
                     }
-                    if let Err(e) = write.send(Message::Ping(vec![])).await {
-                        return Err(WebSocketRunError::Other(format!("WS ping send failed: {e}")));
+                    match time::timeout_at(receive_deadline.deadline(), write.send(Message::Ping(vec![]))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            return Err(WebSocketRunError::Other(format!("WS ping send failed: {e}")));
+                        }
+                        Err(_) => {
+                            return Err(WebSocketRunError::Other(
+                                "WS receive deadline exceeded while sending Ping".to_string(),
+                            ));
+                        }
                     }
+                }
+                _ = &mut receive_deadline => {
+                    return Err(WebSocketRunError::Other(
+                        "WS receive deadline exceeded".to_string(),
+                    ));
                 }
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
+                            receive_deadline
+                                .as_mut()
+                                .reset(time::Instant::now() + timing.receive_deadline);
                             Self::handle_message(&text, notification_tx, connected);
                         }
                         Some(Ok(Message::Close(_))) => {
@@ -361,7 +432,9 @@ impl WebSocketClient {
                             break;
                         }
                         Some(Ok(_)) => {
-                            // Binary, Ping, Pong — ignore.
+                            receive_deadline
+                                .as_mut()
+                                .reset(time::Instant::now() + timing.receive_deadline);
                         }
                         Some(Err(e)) => {
                             return Err(WebSocketRunError::Other(format!("WS read error: {e}")));
@@ -1116,5 +1189,244 @@ mod tests {
         );
 
         client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn silent_open_socket_exceeds_receive_deadline() {
+        let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+
+        let (notification_tx, notification_rx) = broadcast::channel(8);
+        drop(notification_rx);
+        let intentional_close = AtomicBool::new(false);
+        let connected = AtomicBool::new(false);
+        let ws_url = format!("ws://{addr}/v1/sync/test/ws");
+
+        let timing = WebSocketTiming {
+            handshake_timeout: Duration::from_secs(1),
+            ping_interval: Duration::from_millis(200),
+            receive_deadline: Duration::from_millis(500),
+            reconnect_base_delay: Duration::from_millis(50),
+            reconnect_max_delay: Duration::from_millis(500),
+            reconnect_max_jitter: Duration::ZERO,
+        };
+        let run = WebSocketClient::run_connection_with_timing(
+            &ws_url,
+            "device-1",
+            "token",
+            &notification_tx,
+            &intentional_close,
+            &connected,
+            timing,
+        );
+        tokio::pin!(run);
+
+        let _server_ws = tokio::select! {
+            result = &mut run => panic!("connection ended during handshake: {result:?}"),
+            result = server => result.unwrap(),
+        };
+
+        let result = time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("silent WebSocket must exceed its receive deadline");
+        assert!(
+            matches!(result, Err(WebSocketRunError::Other(ref msg)) if msg.contains("deadline")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_pong_refreshes_receive_deadline() {
+        let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+
+        let (notification_tx, notification_rx) = broadcast::channel(8);
+        drop(notification_rx);
+        let intentional_close = AtomicBool::new(false);
+        let connected = AtomicBool::new(false);
+        let ws_url = format!("ws://{addr}/v1/sync/test/ws");
+        let timing = WebSocketTiming {
+            handshake_timeout: Duration::from_secs(1),
+            ping_interval: Duration::from_millis(200),
+            receive_deadline: Duration::from_millis(500),
+            reconnect_base_delay: Duration::from_millis(50),
+            reconnect_max_delay: Duration::from_millis(500),
+            reconnect_max_jitter: Duration::ZERO,
+        };
+
+        let run = WebSocketClient::run_connection_with_timing(
+            &ws_url,
+            "device-1",
+            "token",
+            &notification_tx,
+            &intentional_close,
+            &connected,
+            timing,
+        );
+        tokio::pin!(run);
+        let mut server_ws = tokio::select! {
+            result = &mut run => panic!("connection ended during handshake: {result:?}"),
+            result = server => result.unwrap(),
+        };
+
+        time::sleep(Duration::from_millis(400)).await;
+        server_ws.send(Message::Pong(vec![])).await.unwrap();
+
+        let still_running = time::timeout(Duration::from_millis(300), &mut run).await;
+        assert!(
+            still_running.is_err(),
+            "Pong did not extend the receive deadline: {still_running:?}"
+        );
+
+        let result = time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("connection must expire after the refreshed deadline");
+        assert!(
+            matches!(result, Err(WebSocketRunError::Other(ref msg)) if msg.contains("deadline")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn brief_authenticated_clean_closes_retain_exponential_backoff() {
+        let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            for _ in 0..6 {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted_tx.send(time::Instant::now()).unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                ws.send(Message::Text(r#"{"type":"auth_ok"}"#.into())).await.unwrap();
+                time::sleep(Duration::from_millis(5)).await;
+                let _ = ws.send(Message::Close(None)).await;
+            }
+        });
+
+        let (notification_tx, notification_rx) = broadcast::channel(16);
+        drop(notification_rx);
+        let client = WebSocketClient::new(
+            format!("ws://{addr}/v1/sync/test/ws"),
+            "device-1".to_string(),
+            "token".to_string(),
+            None,
+            notification_tx,
+        );
+        let timing = WebSocketTiming {
+            handshake_timeout: Duration::from_secs(1),
+            ping_interval: Duration::from_secs(1),
+            receive_deadline: Duration::from_secs(2),
+            reconnect_base_delay: Duration::from_millis(20),
+            reconnect_max_delay: Duration::from_secs(1),
+            reconnect_max_jitter: Duration::ZERO,
+        };
+
+        client.connect_with_timing(timing).await;
+        let mut accepted_at = Vec::new();
+        for _ in 0..6 {
+            accepted_at.push(
+                time::timeout(Duration::from_secs(3), accepted_rx.recv())
+                    .await
+                    .expect("client must continue reconnecting")
+                    .expect("server accept stream must remain open"),
+            );
+        }
+
+        let elapsed = accepted_at[5].duration_since(accepted_at[0]);
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "brief authenticated clean closes did not retain exponential backoff: {elapsed:?}"
+        );
+
+        client.disconnect().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn receive_deadline_reconnects_and_resets_prior_backoff() {
+        let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let (authenticated_tx, authenticated_rx) = tokio::sync::oneshot::channel();
+        let (reconnected_tx, reconnected_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            let mut authenticated_tx = Some(authenticated_tx);
+            let mut reconnected_tx = Some(reconnected_tx);
+            for index in 0..7 {
+                let (stream, _) = listener.accept().await.unwrap();
+                if index < 5 {
+                    drop(stream);
+                    continue;
+                }
+
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                if index == 5 {
+                    ws.send(Message::Text(r#"{"type":"auth_ok"}"#.into())).await.unwrap();
+                    let _ = authenticated_tx.take().unwrap().send(time::Instant::now());
+                    tokio::spawn(async move {
+                        // Leave Pings unread to simulate an inbound blackhole.
+                        time::sleep(Duration::from_secs(1)).await;
+                        drop(ws);
+                    });
+                } else {
+                    let _ = reconnected_tx.take().unwrap().send(time::Instant::now());
+                }
+            }
+        });
+
+        let (notification_tx, mut notification_rx) = broadcast::channel(8);
+        let client = WebSocketClient::new(
+            format!("ws://{addr}/v1/sync/test/ws"),
+            "device-1".to_string(),
+            "token".to_string(),
+            None,
+            notification_tx,
+        );
+        let timing = WebSocketTiming {
+            handshake_timeout: Duration::from_secs(1),
+            ping_interval: Duration::from_millis(40),
+            receive_deadline: Duration::from_millis(120),
+            reconnect_base_delay: Duration::from_millis(25),
+            reconnect_max_delay: Duration::from_secs(1),
+            reconnect_max_jitter: Duration::ZERO,
+        };
+
+        client.connect_with_timing(timing).await;
+        let authenticated_at = time::timeout(Duration::from_secs(3), authenticated_rx)
+            .await
+            .expect("client reached the authenticated connection")
+            .unwrap();
+        let connected = time::timeout(Duration::from_secs(1), notification_rx.recv())
+            .await
+            .expect("connected notification")
+            .unwrap();
+        assert!(matches!(connected, SyncNotification::ConnectionStateChanged { connected: true }));
+
+        let reconnected_at = time::timeout(Duration::from_millis(500), reconnected_rx)
+            .await
+            .expect("deadline must trigger an automatic reconnect using reset backoff")
+            .unwrap();
+        assert!(
+            reconnected_at.duration_since(authenticated_at) >= timing.receive_deadline,
+            "reconnected before the receive deadline"
+        );
+
+        client.disconnect().await;
+        server.await.unwrap();
     }
 }

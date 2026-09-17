@@ -59,7 +59,7 @@ async fn handle_ws(state: AppState, sync_id: String, device_id: String, socket: 
     );
 
     // Step 1: Register — last-connection-wins (old connection's channel is dropped)
-    let mut rx = state.register_ws(&sync_id, &device_id).await;
+    let (mut rx, conn_id) = state.register_ws(&sync_id, &device_id).await;
 
     // Ensure device receipt exists
     {
@@ -114,8 +114,8 @@ async fn handle_ws(state: AppState, sync_id: String, device_id: String, socket: 
         }
     }
 
-    // Step 4: Cleanup
-    state.unregister_ws(&sync_id, &device_id).await;
+    // A replaced socket must not unregister its successor.
+    state.unregister_ws(&sync_id, &device_id, conn_id).await;
     send_task.abort();
 
     tracing::debug!(

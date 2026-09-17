@@ -10,7 +10,8 @@ use tokio::sync::{mpsc, RwLock};
 const WS_CHANNEL_CAPACITY: usize = 64;
 
 pub type WsSender = mpsc::Sender<String>;
-type WsConnections = HashMap<String, HashMap<String, WsSender>>;
+/// Connection IDs prevent stale teardown from removing a replacement socket.
+type WsConnections = HashMap<String, HashMap<String, (u64, WsSender)>>;
 
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -190,6 +191,8 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub config: Arc<Config>,
     pub ws_connections: Arc<RwLock<WsConnections>>,
+    /// Sequence for connection ownership checks.
+    pub ws_conn_seq: Arc<AtomicU64>,
     pub metrics: Arc<Metrics>,
     pub nonce_rate_limiter: RateLimiter,
     pub revoke_rate_limiter: RateLimiter,
@@ -258,6 +261,7 @@ impl AppState {
             db: Arc::new(db),
             config: Arc::new(config),
             ws_connections: Arc::new(RwLock::new(HashMap::new())),
+            ws_conn_seq: Arc::new(AtomicU64::new(0)),
             metrics,
             nonce_rate_limiter: RateLimiter::default(),
             revoke_rate_limiter: RateLimiter::default(),
@@ -291,7 +295,7 @@ impl AppState {
                     devices
                         .iter()
                         .filter(|(device_id, _)| exclude_device != Some(device_id.as_str()))
-                        .map(|(id, sender)| (id.clone(), sender.clone()))
+                        .map(|(id, (_conn_id, sender))| (id.clone(), sender.clone()))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -324,18 +328,34 @@ impl AppState {
         }
     }
 
-    /// Register a WebSocket connection. Last-connection-wins: if a sender already
-    /// exists for this (sync_id, device_id), the old one is replaced (its receiver
-    /// will see the channel close).
-    pub async fn register_ws(&self, sync_id: &str, device_id: &str) -> mpsc::Receiver<String> {
+    /// Replace the current sender; pass the returned ID to [`Self::unregister_ws`].
+    pub async fn register_ws(
+        &self,
+        sync_id: &str,
+        device_id: &str,
+    ) -> (mpsc::Receiver<String>, u64) {
+        let conn_id = self.ws_conn_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(WS_CHANNEL_CAPACITY);
         let mut conns = self.ws_connections.write().await;
-        conns.entry(sync_id.to_string()).or_default().insert(device_id.to_string(), tx);
-        rx
+        conns.entry(sync_id.to_string()).or_default().insert(device_id.to_string(), (conn_id, tx));
+        (rx, conn_id)
     }
 
-    /// Unregister a WebSocket connection.
-    pub async fn unregister_ws(&self, sync_id: &str, device_id: &str) {
+    /// Remove the sender only if this connection still owns the slot.
+    pub async fn unregister_ws(&self, sync_id: &str, device_id: &str, conn_id: u64) {
+        let mut conns = self.ws_connections.write().await;
+        if let Some(devices) = conns.get_mut(sync_id) {
+            if matches!(devices.get(device_id), Some((existing, _)) if *existing == conn_id) {
+                devices.remove(device_id);
+            }
+            if devices.is_empty() {
+                conns.remove(sync_id);
+            }
+        }
+    }
+
+    /// Disconnect the current sender regardless of connection ID, for revocation.
+    pub async fn disconnect_ws(&self, sync_id: &str, device_id: &str) {
         let mut conns = self.ws_connections.write().await;
         if let Some(devices) = conns.get_mut(sync_id) {
             devices.remove(device_id);
@@ -343,12 +363,6 @@ impl AppState {
                 conns.remove(sync_id);
             }
         }
-    }
-
-    /// Drop the current WebSocket sender for a device so it stops receiving
-    /// future notifications immediately.
-    pub async fn disconnect_ws(&self, sync_id: &str, device_id: &str) {
-        self.unregister_ws(sync_id, device_id).await;
     }
 
     /// Count total connected WebSocket devices.
@@ -385,9 +399,9 @@ mod tests {
         let sync_id = "sync-1";
 
         // dev_a registers but never reads — its 64-slot channel will fill up.
-        let _dev_a_rx = state.register_ws(sync_id, "dev-a").await;
+        let (_dev_a_rx, _) = state.register_ws(sync_id, "dev-a").await;
         // dev_b registers — we just need it to exist for the fanout loop.
-        let _dev_b_rx = state.register_ws(sync_id, "dev-b").await;
+        let (_dev_b_rx, _) = state.register_ws(sync_id, "dev-b").await;
 
         // Send 80 notifications. Without the fix, calls #65+ block on
         // dev_a's full channel for many seconds (the WS sender's
@@ -412,6 +426,69 @@ mod tests {
             dropped >= 16,
             "expected >= 16 dropped notifications for dev_a (80 sends - 64 buffer), got {dropped}"
         );
+    }
+
+    #[tokio::test]
+    async fn unregister_ws_does_not_evict_a_replacement_connection() {
+        let state = test_app_state();
+        let sync_id = "sync-1";
+        let device_id = "dev-a";
+
+        let (_rx_a, conn_id_a) = state.register_ws(sync_id, device_id).await;
+        let (mut rx_b, _conn_id_b) = state.register_ws(sync_id, device_id).await;
+
+        // The old connection finishes after its replacement registers.
+        state.unregister_ws(sync_id, device_id, conn_id_a).await;
+
+        state.notify_devices(sync_id, None, "new_data").await;
+        let message = tokio::time::timeout(std::time::Duration::from_millis(100), rx_b.recv())
+            .await
+            .expect("stale connection A's teardown must not remove B's live registration")
+            .expect("replacement connection B's channel must remain open");
+        assert_eq!(message, "new_data");
+    }
+
+    #[tokio::test]
+    async fn unregister_ws_removes_the_current_connection() {
+        let state = test_app_state();
+        let sync_id = "sync-1";
+        let device_id = "dev-a";
+
+        let (mut rx, conn_id) = state.register_ws(sync_id, device_id).await;
+        state.unregister_ws(sync_id, device_id, conn_id).await;
+
+        assert_eq!(state.connected_device_count().await, 0);
+        assert!(
+            rx.recv().await.is_none(),
+            "the current connection's cleanup must close its notification channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_ws_removes_only_the_target_current_connection() {
+        let state = test_app_state();
+        let sync_id = "sync-1";
+        let other_sync_id = "sync-2";
+        let target_device_id = "dev-a";
+
+        let (_old_target_rx, _) = state.register_ws(sync_id, target_device_id).await;
+        let (mut target_rx, _) = state.register_ws(sync_id, target_device_id).await;
+        let (mut peer_rx, _) = state.register_ws(sync_id, "dev-b").await;
+        let (mut other_group_rx, _) = state.register_ws(other_sync_id, target_device_id).await;
+
+        state.disconnect_ws(sync_id, target_device_id).await;
+
+        assert_eq!(state.connected_device_count().await, 2);
+        assert!(
+            target_rx.recv().await.is_none(),
+            "forced teardown must close the target's current notification channel"
+        );
+
+        state.notify_devices(sync_id, None, "same-group").await;
+        assert_eq!(peer_rx.recv().await, Some("same-group".to_string()));
+
+        state.notify_devices(other_sync_id, None, "other-group").await;
+        assert_eq!(other_group_rx.recv().await, Some("other-group".to_string()));
     }
 
     #[test]
