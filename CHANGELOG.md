@@ -2,6 +2,37 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.15.0] - 2026-09-15
+
+Tagged for the matching `prism-app 0.15.0+15004` release. Cargo crate versions
+remain `0.1.1`. The app's pin moves from `prism-sync` `bf2890c6` to
+`prism-sync v0.15.0`.
+
+### Added
+- Inbound pull liveness tracking surfaces peer health over the FFI boundary.
+- `pullSenderHealth` lets the app query and repair a stalled sender's liveness
+  on demand.
+
+### Changed
+- Consumer-delivery hydration now reads from the current winners, so delivered
+  payloads reach the right consumer after membership or epoch changes.
+
+### Fixed
+- Sync recovers from an epoch mismatch instead of stalling.
+- Stale websocket sessions are recovered instead of blocking delivery.
+- Epoch keys are restored after a password unlock, so re-encryption resumes
+  with the correct key material.
+- Orphaned pairing terminal caches are swept, and pairing retries tolerate
+  consumed ceremony slots without clearing another ceremony's pairing marker.
+- AVIF and static GIF inputs decode correctly.
+- The media codec moved out of the FFI crate (the app now owns the image
+  codec), and the Windows native build receives its pkg-config environment.
+
+### Internal
+- Restored the sync benchmark against the PQC relay.
+- Covered the initiator cached-bundle pairing retry with a regression test.
+- Shortened sync comments for readability.
+
 ## [0.13.1] - 2026-06-17
 
 Tagged for the matching `prism-app 0.13.1+13101` release. Cargo crate versions
