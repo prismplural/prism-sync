@@ -2,6 +2,22 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.15.1] - 2026-09-17
+
+Tagged for the matching `prism-app 0.15.1+15101` release. Cargo crate
+versions remain `0.1.1`. The app's sync pin moves from `prism-sync v0.15.0`
+to `prism-sync v0.15.1`.
+
+### Fixed
+- Notification connections now replace themselves after a silent stall, so
+  automatic sync resumes without requiring a manual sync or app restart.
+- Reconfiguring or resetting sync replaces the active notification connection
+  without leaving an older connection bound to automatic sync.
+
+### Internal
+- Added durable CRDT property coverage and Drift adapter tests.
+- Added enforced Rust, Dart, MSRV, and generated-binding checks for sync changes.
+
 ## [0.15.0] - 2026-09-15
 
 Tagged for the matching `prism-app 0.15.0+15004` release. Cargo crate versions
