@@ -59,6 +59,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@just
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned FFI toolchain
+        run: cd crates/prism-sync-ffi && rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: prism-sync-tests
@@ -87,6 +89,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@just
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned FFI toolchain
+        run: cd crates/prism-sync-ffi && rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: prism-sync-native-tests
