@@ -1311,7 +1311,7 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 accepted_tx.send(time::Instant::now()).unwrap();
                 let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-                ws.send(Message::Text(r#"{"type":"auth_ok"}"#.into())).await.unwrap();
+                let _ = ws.send(Message::Text(r#"{"type":"auth_ok"}"#.into())).await;
                 time::sleep(Duration::from_millis(5)).await;
                 let _ = ws.send(Message::Close(None)).await;
             }

@@ -7662,7 +7662,7 @@ mod tests {
             assert_eq!(post.encoded_value, original.encoded_value);
             assert_eq!(post.is_delete, original.is_delete);
             assert_eq!(post.client_hlc, original.client_hlc);
-            assert_eq!(post.created_at, original.created_at);
+            assert_eq!(post.created_at.timestamp_micros(), original.created_at.timestamp_micros());
             assert_eq!(post.pushed_at, original.pushed_at);
             assert_ne!(
                 post.local_batch_id, original.local_batch_id,
