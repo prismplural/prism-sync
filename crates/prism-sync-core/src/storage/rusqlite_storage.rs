@@ -1216,6 +1216,8 @@ fn exec_clear_sync_state(conn: &Connection, sync_id: &str) -> Result<()> {
     // Archived verification keys are scoped to this group's device registry; a
     // reset/re-pair rebuilds the registry, so superseded-key history must go too.
     conn.execute("DELETE FROM device_key_history WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM pending_epoch_rotation WHERE sync_id = ?1", params![sync_id])?;
+    conn.execute("DELETE FROM pull_sender_health WHERE sync_id = ?1", params![sync_id])?;
     conn.execute("DELETE FROM sync_metadata WHERE sync_id = ?1", params![sync_id])?;
     Ok(())
 }
@@ -2805,6 +2807,62 @@ mod tests {
         assert!(!storage.is_op_applied("applied-1").unwrap());
         assert!(storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().is_none());
         assert!(storage.list_device_records("sync-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_sync_state_scopes_rotation_and_sender_health_to_group() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        for sync_id in ["sync-1", "sync-2"] {
+            tx.set_pending_epoch_rotation(sync_id, 2, Some("dev-1")).unwrap();
+            tx.bump_pull_sender_health(sync_id, "dev-1", "signature_failure", 1, 0, None).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        tx.clear_sync_state("sync-1").unwrap();
+        tx.commit().unwrap();
+
+        assert!(storage.get_pending_epoch_rotation("sync-1").unwrap().is_none());
+        assert!(storage
+            .get_pull_sender_health("sync-1", "dev-1", "signature_failure")
+            .unwrap()
+            .is_none());
+        assert!(storage.get_pending_epoch_rotation("sync-2").unwrap().is_some());
+        assert!(storage
+            .get_pull_sender_health("sync-2", "dev-1", "signature_failure")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn clear_sync_state_error_rolls_back_rotation_and_sender_health() {
+        let storage = make_storage();
+        let mut tx = storage.begin_tx().unwrap();
+        tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
+        tx.set_pending_epoch_rotation("sync-1", 2, Some("dev-1")).unwrap();
+        tx.bump_pull_sender_health("sync-1", "dev-1", "signature_failure", 1, 0, None).unwrap();
+        tx.commit().unwrap();
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_sync_clear BEFORE DELETE ON sync_metadata \
+             BEGIN SELECT RAISE(ABORT, 'injected reset failure'); END;",
+            )
+            .unwrap();
+
+        let mut tx = storage.begin_tx().unwrap();
+        assert!(tx.clear_sync_state("sync-1").is_err());
+        drop(tx);
+
+        assert!(storage.get_sync_metadata("sync-1").unwrap().is_some());
+        assert!(storage.get_pending_epoch_rotation("sync-1").unwrap().is_some());
+        assert!(storage
+            .get_pull_sender_health("sync-1", "dev-1", "signature_failure")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

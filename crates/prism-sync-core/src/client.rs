@@ -7082,6 +7082,12 @@ mod tests {
         let mut sync = make_sync();
         configure(&mut sync);
         seed_all_tables(sync.storage(), "sync-1");
+        {
+            let mut tx = sync.storage().begin_tx().unwrap();
+            tx.set_pending_epoch_rotation("sync-1", 2, Some("dev2")).unwrap();
+            tx.bump_pull_sender_health("sync-1", "dev2", "signature_failure", 1, 0, None).unwrap();
+            tx.commit().unwrap();
+        }
 
         // Sanity: every table has data before the wipe.
         assert!(sync.storage().get_sync_metadata("sync-1").unwrap().is_some());
@@ -7093,6 +7099,12 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(!sync.storage().list_device_records("sync-1").unwrap().is_empty());
+        assert!(sync.storage().get_pending_epoch_rotation("sync-1").unwrap().is_some());
+        assert!(sync
+            .storage()
+            .get_pull_sender_health("sync-1", "dev2", "signature_failure")
+            .unwrap()
+            .is_some());
 
         sync.reset_sync_state().await.unwrap();
 
@@ -7106,6 +7118,12 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(sync.storage().list_device_records("sync-1").unwrap().is_empty());
+        assert!(sync.storage().get_pending_epoch_rotation("sync-1").unwrap().is_none());
+        assert!(sync
+            .storage()
+            .get_pull_sender_health("sync-1", "dev2", "signature_failure")
+            .unwrap()
+            .is_none());
     }
 
     /// `reset_sync_state` must also tear down the in-memory runtime state
