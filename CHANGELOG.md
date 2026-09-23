@@ -2,6 +2,19 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.15.2] - 2026-09-22
+
+Tagged for the matching `prism-app 0.15.2+15201` release. Cargo crate
+versions remain `0.1.1`. The app's sync pin moves from `v0.15.1` to
+`v0.15.2`.
+
+### Fixed
+- Resetting a sync group also clears its pending key-rotation and sender-health
+  state, without affecting other groups. The cleanup rolls back if reset fails.
+
+### Internal
+- Refreshed generated bindings and stabilized the test and CI setup.
+
 ## [0.15.1] - 2026-09-17
 
 Tagged for the matching `prism-app 0.15.1+15101` release. Cargo crate
