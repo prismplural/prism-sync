@@ -40,12 +40,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::{AppError, UploadError};
 use crate::snapshot_limits::MAX_TARGETED_SNAPSHOTS_PER_GROUP;
@@ -155,60 +157,80 @@ pub struct ChunkResponse {
     pub absolute_expires_at: i64,
 }
 
-/// Build the `/v1/sync/{sync_id}/snapshot/uploads` sub-router.
-///
-/// Deliberately split from the shared authenticated router so each operation can
-/// carry its own body limit, timeout, and concurrency layer:
-///
-/// - `create` gets a small JSON body cap;
-/// - `status`/`abort` are bodyless;
-/// - `chunk` gets the exact protocol chunk cap plus a dedicated chunk-write
-///   concurrency limit that sheds as retryable `503 upload_busy`;
-/// - `complete` gets a dedicated completion concurrency limit (it is the heavy
-///   hashing/publication step).
-///
-/// `chunk` needs a *separate* router because `GlobalConcurrencyLimitLayer` cannot
-/// be applied per-route with distinct values on one router: applying
-/// `route_layer` to a merged router would multiply the caps into a product, so
-/// each layer group is a real sub-router that is merged at the root.
+/// Admission covers request bodies and blocking work, including work that
+/// survives the HTTP timeout. Controls remain available while hashing is busy.
 pub fn routes(state: AppState) -> Router<AppState> {
-    let chunk_concurrency = state.config.snapshot_upload_chunk_concurrency();
-
-    // Chunk: exact protocol body limit + dedicated concurrency + long timeout.
     let chunk_routes = Router::new()
         .route("/v1/sync/{sync_id}/snapshot/uploads/{upload_id}/chunks/{offset}", put(put_chunk))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(DefaultBodyLimit::max(CHUNK_BODY_LIMIT))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(CHUNK_BODY_LIMIT))
-        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(chunk_concurrency))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(crate::uploads::SNAPSHOT_UPLOAD_CHUNK_TIMEOUT_SECS),
-        ));
+        ))
+        .layer(middleware::from_fn_with_state(state.upload_chunk_work.clone(), admit_upload_work));
 
-    // Create/status/complete/abort: small bodies, one timeout, shared
-    // concurrency through the default authenticated router's outer cap.
     let control_routes = Router::new()
         .route("/v1/sync/{sync_id}/snapshot/uploads", post(create_upload))
         .route("/v1/sync/{sync_id}/snapshot/uploads/{upload_id}", get(upload_status))
         .route("/v1/sync/{sync_id}/snapshot/uploads/{upload_id}", delete(abort_upload))
-        .route("/v1/sync/{sync_id}/snapshot/uploads/{upload_id}/complete", post(complete_upload))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        // Create carries a small JSON body; status/abort/complete are bodyless.
-        // Using the larger of the two (the create cap) as the shared control
-        // limit keeps one layer while still bounding every control request well
-        // below the chunk route.
         .layer(DefaultBodyLimit::max(CREATE_BODY_LIMIT))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(CREATE_BODY_LIMIT))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(crate::uploads::SNAPSHOT_UPLOAD_CONTROL_TIMEOUT_SECS),
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.upload_control_work.clone(),
+            admit_upload_work,
         ));
 
-    Router::new().merge(chunk_routes).merge(control_routes)
+    let completion_routes = Router::new()
+        .route("/v1/sync/{sync_id}/snapshot/uploads/{upload_id}/complete", post(complete_upload))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(DefaultBodyLimit::max(CREATE_BODY_LIMIT))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(CREATE_BODY_LIMIT))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(crate::uploads::SNAPSHOT_UPLOAD_CONTROL_TIMEOUT_SECS),
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.upload_completion_work.clone(),
+            admit_upload_work,
+        ));
+
+    Router::new().merge(chunk_routes).merge(control_routes).merge(completion_routes)
 }
 
-use axum::middleware;
+#[derive(Clone)]
+struct UploadWorkPermit(Arc<OwnedSemaphorePermit>);
+
+impl UploadWorkPermit {
+    fn spawn_blocking<F, R>(&self, work: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let permit = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            // Dropping the request cannot release a still-running disk job.
+            let _permit = permit;
+            work()
+        })
+    }
+}
+
+async fn admit_upload_work(
+    State(slots): State<Arc<Semaphore>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let permit = slots.try_acquire_owned().map_err(|_| AppError::Upload(UploadError::Busy))?;
+    request.extensions_mut().insert(UploadWorkPermit(Arc::new(permit)));
+    Ok(next.run(request).await)
+}
 
 // ───────────────────────────── create ─────────────────────────────
 
@@ -217,8 +239,9 @@ use axum::middleware;
 /// Idempotent on `(sync_id, uploader_device_id, upload_key)`. A **new** key
 /// supersedes any other nonterminal session owned by the same uploader, so a
 /// lost abort cannot poison later pairing attempts.
-pub async fn create_upload(
+async fn create_upload(
     State(state): State<AppState>,
+    Extension(permit): Extension<UploadWorkPermit>,
     Extension(auth): Extension<AuthIdentity>,
     Path(path_sync_id): Path<String>,
     headers: HeaderMap,
@@ -296,39 +319,40 @@ pub async fn create_upload(
     // precheck, and insert — is one blocking operation under the writer mutex.
     // The only thing outside it is the free-space probe, which must not run under
     // the writer lock.
-    let outcome = tokio::task::spawn_blocking(move || {
-        // Free-space probe first: `statvfs` on the snapshot volume is a syscall
-        // that must never be taken while holding the SQLite writer mutex.
-        let free = uploads::available_bytes(&storage_root)
-            .map_err(|_| AppError::Upload(UploadError::InsufficientStorage))?;
-        db.with_conn(|conn| {
-            crate::db::create_snapshot_upload(
-                conn,
-                crate::db::CreateSnapshotUpload {
-                    upload_id: &upload_id,
-                    upload_key: &upload_key,
-                    sync_id: &sid,
-                    uploader_device_id: &did,
-                    target_device_id: &target,
-                    epoch,
-                    server_seq_at,
-                    snapshot_ttl_secs: ttl_secs,
-                    total_bytes: total_bytes as i64,
-                    chunk_bytes: crate::uploads::SNAPSHOT_UPLOAD_CHUNK_BYTES as i64,
-                    body_sha256: &body_sha256,
-                    blob_ref: &blob_ref,
-                    global_reserved_limit: quotas.global_reserved_bytes,
-                    group_reserved_limit: quotas.group_reserved_bytes,
-                    audience_cap: MAX_TARGETED_SNAPSHOTS_PER_GROUP,
-                    free_bytes: free,
-                    free_space_reserve,
-                },
-            )
+    let outcome = permit
+        .spawn_blocking(move || {
+            // Free-space probe first: `statvfs` on the snapshot volume is a syscall
+            // that must never be taken while holding the SQLite writer mutex.
+            let free = uploads::available_bytes(&storage_root)
+                .map_err(|_| AppError::Upload(UploadError::InsufficientStorage))?;
+            db.with_conn(|conn| {
+                crate::db::create_snapshot_upload(
+                    conn,
+                    crate::db::CreateSnapshotUpload {
+                        upload_id: &upload_id,
+                        upload_key: &upload_key,
+                        sync_id: &sid,
+                        uploader_device_id: &did,
+                        target_device_id: &target,
+                        epoch,
+                        server_seq_at,
+                        snapshot_ttl_secs: ttl_secs,
+                        total_bytes: total_bytes as i64,
+                        chunk_bytes: crate::uploads::SNAPSHOT_UPLOAD_CHUNK_BYTES as i64,
+                        body_sha256: &body_sha256,
+                        blob_ref: &blob_ref,
+                        global_reserved_limit: quotas.global_reserved_bytes,
+                        group_reserved_limit: quotas.group_reserved_bytes,
+                        audience_cap: MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+                        free_bytes: free,
+                        free_space_reserve,
+                    },
+                )
+            })
+            .map_err(AppError::from)
         })
-        .map_err(AppError::from)
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))??;
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
 
     match outcome {
         crate::db::CreateSnapshotUploadOutcome::Created { session, superseded } => {
@@ -404,8 +428,9 @@ pub async fn create_upload(
 /// `GET /v1/sync/{sync_id}/snapshot/uploads/{upload_id}`
 ///
 /// Never extends either expiry. Successfully accepted chunks do; status does not.
-pub async fn upload_status(
+async fn upload_status(
     State(state): State<AppState>,
+    Extension(permit): Extension<UploadWorkPermit>,
     Extension(auth): Extension<AuthIdentity>,
     Path((path_sync_id, upload_id)): Path<(String, String)>,
     headers: HeaderMap,
@@ -425,11 +450,13 @@ pub async fn upload_status(
     let sid = auth.sync_id.clone();
     let did = auth.device_id.clone();
     let uid = upload_id.clone();
-    let session = tokio::task::spawn_blocking(move || {
-        db.with_read_conn(|conn| crate::db::get_snapshot_upload(conn, &uid)).map_err(AppError::from)
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))??;
+    let session = permit
+        .spawn_blocking(move || {
+            db.with_read_conn(|conn| crate::db::get_snapshot_upload(conn, &uid))
+                .map_err(AppError::from)
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
 
     let session = owned_session(session, &sid, &did)?;
     Ok(Json(status_to_response(&session)).into_response())
@@ -442,8 +469,9 @@ pub async fn upload_status(
 /// `upload_id` and decimal `offset` are in the **signed canonical path**, and
 /// the signature binds the chunk body hash, so neither an unsigned offset nor an
 /// unsigned checksum can be authoritative.
-pub async fn put_chunk(
+async fn put_chunk(
     State(state): State<AppState>,
+    Extension(permit): Extension<UploadWorkPermit>,
     Extension(auth): Extension<AuthIdentity>,
     Path((path_sync_id, upload_id, offset)): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -488,25 +516,26 @@ pub async fn put_chunk(
     let (sid_job, did_job, uid_job, root_job) =
         (sid.clone(), did.clone(), uid.clone(), storage_root.clone());
 
-    let outcome = tokio::task::spawn_blocking(move || {
-        // The per-upload lock lives INSIDE the blocking task and is held through
-        // the file write, the file sync, and the conditional offset commit. A
-        // request timeout cannot stop this work, so the lock is what prevents a
-        // still-running stale write from interleaving with a newer one.
-        let _guard = lock.lock().expect("upload mutation lock poisoned");
-        crate::db::apply_snapshot_upload_chunk(
-            &db,
-            &root_job,
-            &sid_job,
-            &did_job,
-            &uid_job,
-            offset,
-            &body,
-            free_space_reserve,
-        )
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let outcome = permit
+        .spawn_blocking(move || {
+            // The per-upload lock lives INSIDE the blocking task and is held through
+            // the file write, the file sync, and the conditional offset commit. A
+            // request timeout cannot stop this work, so the lock is what prevents a
+            // still-running stale write from interleaving with a newer one.
+            let _guard = lock.lock().expect("upload mutation lock poisoned");
+            crate::db::apply_snapshot_upload_chunk(
+                &db,
+                &root_job,
+                &sid_job,
+                &did_job,
+                &uid_job,
+                offset,
+                &body,
+                free_space_reserve,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     match outcome {
         Ok(committed) => {
@@ -579,8 +608,9 @@ fn chunk_rejection_to_error(state: &AppState, rejection: crate::db::ChunkRejecti
 /// no client snapshot keys — exactly as the existing single PUT does not. The
 /// outer SHA-256 detects transport/staging corruption; end-to-end verification
 /// remains mandatory on the joiner.
-pub async fn complete_upload(
+async fn complete_upload(
     State(state): State<AppState>,
+    Extension(permit): Extension<UploadWorkPermit>,
     Extension(auth): Extension<AuthIdentity>,
     Path((path_sync_id, upload_id)): Path<(String, String)>,
     headers: HeaderMap,
@@ -610,20 +640,21 @@ pub async fn complete_upload(
     let (sid_job, did_job, uid_job, root_job) =
         (sid.clone(), did.clone(), uid.clone(), storage_root.clone());
 
-    let outcome = tokio::task::spawn_blocking(move || {
-        let _guard = lock.lock().expect("upload mutation lock poisoned");
-        crate::db::complete_snapshot_upload(
-            &db,
-            &root_job,
-            &sid_job,
-            &did_job,
-            &uid_job,
-            audience_cap,
-            free_space_reserve,
-        )
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let outcome = permit
+        .spawn_blocking(move || {
+            let _guard = lock.lock().expect("upload mutation lock poisoned");
+            crate::db::complete_snapshot_upload(
+                &db,
+                &root_job,
+                &sid_job,
+                &did_job,
+                &uid_job,
+                audience_cap,
+                free_space_reserve,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     match outcome {
         Ok(crate::db::CompletionOutcome::Published { replaced_blob_ref }) => {
@@ -634,10 +665,11 @@ pub async fn complete_upload(
             if let Some(old) = replaced_blob_ref {
                 let root = storage_root.clone();
                 let sid = sid.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    uploads::remove_candidate(&root, &sid, &old);
-                })
-                .await;
+                let _ = permit
+                    .spawn_blocking(move || {
+                        uploads::remove_candidate(&root, &sid, &old);
+                    })
+                    .await;
             }
             tracing::debug!(
                 sync_id = %trunc(&sid),
@@ -765,8 +797,9 @@ fn completion_rejection_to_error(
 /// transition, then removes the candidate outside the writer lock. Repeated
 /// abort is idempotent. Aborting a completed session never deletes the published
 /// snapshot.
-pub async fn abort_upload(
+async fn abort_upload(
     State(state): State<AppState>,
+    Extension(permit): Extension<UploadWorkPermit>,
     Extension(auth): Extension<AuthIdentity>,
     Path((path_sync_id, upload_id)): Path<(String, String)>,
     headers: HeaderMap,
@@ -788,13 +821,16 @@ pub async fn abort_upload(
     let uid = upload_id.clone();
     let (sid_job, did_job, uid_job) = (sid.clone(), did.clone(), uid.clone());
 
-    let outcome = tokio::task::spawn_blocking(move || {
-        let _guard = lock.lock().expect("upload mutation lock poisoned");
-        db.with_conn(|conn| crate::db::abort_snapshot_upload(conn, &sid_job, &did_job, &uid_job))
+    let outcome = permit
+        .spawn_blocking(move || {
+            let _guard = lock.lock().expect("upload mutation lock poisoned");
+            db.with_conn(|conn| {
+                crate::db::abort_snapshot_upload(conn, &sid_job, &did_job, &uid_job)
+            })
             .map_err(AppError::from)
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))??;
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
 
     match outcome {
         crate::db::AbortOutcome::Aborted { blob_ref } => {
@@ -804,10 +840,11 @@ pub async fn abort_upload(
             if let Some(blob_ref) = blob_ref {
                 let root = root.clone();
                 let sid = sid.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    uploads::remove_candidate(&root, &sid, &blob_ref);
-                })
-                .await;
+                let _ = permit
+                    .spawn_blocking(move || {
+                        uploads::remove_candidate(&root, &sid, &blob_ref);
+                    })
+                    .await;
             }
             Ok(StatusCode::NO_CONTENT.into_response())
         }
@@ -922,6 +959,70 @@ fn trunc(value: &str) -> &str {
 mod tests {
     use super::*;
     use crate::uploads::{StagingError, UploadState};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn timed_out_upload_keeps_its_slot_until_blocking_work_finishes() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = std::sync::mpsc::channel();
+        let job = Arc::new(Mutex::new(Some((started, finish_rx))));
+        let app = Router::new()
+            .route(
+                "/work",
+                post(move |Extension(permit): Extension<UploadWorkPermit>| {
+                    let job = job.clone();
+                    async move {
+                        let (started, finish_rx) = job.lock().unwrap().take().unwrap();
+                        permit
+                            .spawn_blocking(move || {
+                                let _ = started.send(());
+                                let _ = finish_rx.recv();
+                            })
+                            .await
+                            .unwrap();
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                std::time::Duration::from_millis(50),
+            ))
+            .layer(middleware::from_fn_with_state(slots.clone(), admit_upload_work));
+        let request = || Request::post("/work").body(axum::body::Body::empty()).unwrap();
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        started_rx.await.unwrap();
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(app.oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(slots.available_permits(), 0);
+        finish.send(()).unwrap();
+        let released = tokio::time::timeout(std::time::Duration::from_secs(1), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(released);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn busy_upload_rejects_without_polling_the_request_body() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = Arc::new(Semaphore::new(1));
+        let _busy = slots.clone().acquire_owned().await.unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body_polls = polls.clone();
+        let body = axum::body::Body::from_stream(futures::stream::once(async move {
+            body_polls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, std::io::Error>(Bytes::from_static(b"chunk"))
+        }));
+        let app = Router::new()
+            .route("/chunk", put(|_: Bytes| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn_with_state(slots, admit_upload_work));
+        let response = app.oneshot(Request::put("/chunk").body(body).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn upload_key_accepts_both_alphabets_and_requires_32_bytes() {

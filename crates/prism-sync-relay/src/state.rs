@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 
 /// Bounded channel capacity for WebSocket notification senders.
 const WS_CHANNEL_CAPACITY: usize = 64;
@@ -383,6 +383,10 @@ pub struct AppState {
     /// file sync, and the conditional DB update, so a request cancelled by a
     /// timeout cannot let its still-running work interleave with a newer one.
     pub upload_locks: crate::routes::uploads::UploadLocks,
+    /// Shared by HTTP requests and any blocking work that outlives them.
+    pub upload_chunk_work: Arc<Semaphore>,
+    pub upload_completion_work: Arc<Semaphore>,
+    pub upload_control_work: Arc<Semaphore>,
     pub ws_upgrade_rate_limiter: RateLimiter,
     pub sharing_fetch_rate_limiter: RateLimiter,
     pub sharing_init_rate_limiter: RateLimiter,
@@ -480,6 +484,13 @@ impl AppState {
 
         Self {
             db: Arc::new(db),
+            upload_chunk_work: Arc::new(Semaphore::new(config.snapshot_upload_chunk_concurrency())),
+            upload_completion_work: Arc::new(Semaphore::new(
+                config.snapshot_upload_concurrency.max(1),
+            )),
+            upload_control_work: Arc::new(Semaphore::new(
+                config.default_request_concurrency.max(1),
+            )),
             config: Arc::new(config),
             snapshot_storage,
             ws_connections: Arc::new(RwLock::new(HashMap::new())),

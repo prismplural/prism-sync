@@ -29,7 +29,7 @@ All configuration via environment variables:
 | SNAPSHOT_REQUEST_TIMEOUT_SECS | 300 | Per-request timeout for `PUT /snapshot` (5 min for large uploads on slow connections) |
 | MEDIA_REQUEST_TIMEOUT_SECS | 120 | Per-request timeout for media upload/download (covers up to response headers; streamed download bodies continue past) |
 | DEFAULT_REQUEST_CONCURRENCY | 512 | Max in-flight light requests (must be ≥ 1) |
-| SNAPSHOT_UPLOAD_CONCURRENCY | 8 | Max in-flight snapshot PUTs; bounds peak memory (must be ≥ 1) |
+| SNAPSHOT_UPLOAD_CONCURRENCY | 8 | Max in-flight snapshot PUTs, and a separate cap for resumable completions (must be ≥ 1) |
 | MEDIA_UPLOAD_CONCURRENCY | 32 | Max in-flight media uploads/downloads (must be ≥ 1) |
 | MEDIA_STORAGE_PATH | data/media | Root for media and (derived) snapshot blobs. In containers set an explicit absolute path on the persistent mount, e.g. `/data/media`. |
 | SNAPSHOT_FILE_BACKING_ENABLED | (unset) | Set `true` to enable file-backed snapshot writes and require an absolute, writable persistent root. Unset or `false` keeps new snapshots inline in SQLite, even with a valid root; existing blob files remain readable. |
@@ -79,6 +79,11 @@ failures return the same `404 upload_not_found`, so the endpoint is not an exist
 
 Contract summary.
 
+- **Bounded upload work.** Chunk requests, completion requests, and control requests
+  have independent budgets. Excess requests return retryable `503 upload_busy` before
+  their bodies are buffered. Upload handlers retain admission while their blocking
+  file/database work runs, even if the HTTP request times out. Completion uses
+  `SNAPSHOT_UPLOAD_CONCURRENCY`; controls use `DEFAULT_REQUEST_CONCURRENCY`.
 - **Fixed protocol shape.** Chunk size is 8 MiB and the wire maximum is 150 MiB, both
   compile-time constants rather than runtime configuration. The route body limit is the
   protocol maximum, so a restart or config change cannot wedge a live session before

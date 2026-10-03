@@ -9754,8 +9754,7 @@ mod tests {
 
     #[test]
     fn pairing_lease_constants_match_the_v1_profile() {
-        // Relay-local duplicates of the core values; the relay cannot depend on
-        // core, so this pins the agreed numbers the route agent must honor.
+        // Relay and core must enforce the same lease limits.
         assert_eq!(PAIRING_LEASE_VERIFIER_LEN, 32, "verifier/secret is 32 bytes");
         assert_eq!(PAIRING_LEASE_IDLE_EXTENSION_SECS, 1800, "idle extension is 30m");
         assert_eq!(PAIRING_LEASE_ABSOLUTE_CAP_SECS, 14400, "absolute cap is 4h");

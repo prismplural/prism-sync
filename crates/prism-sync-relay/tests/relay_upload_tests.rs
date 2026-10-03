@@ -2966,3 +2966,55 @@ async fn bytes_freed_by_a_stale_refusal_are_reusable_by_the_next_create() {
         "the reservation a stale refusal released must be reusable at once"
     );
 }
+
+#[tokio::test]
+async fn saturated_upload_work_returns_retryable_busy_without_starving_controls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fixture(tmp.path()).await;
+    let bytes = b"bounded upload work";
+    let upload_id = upload_envelope(&f, bytes, 1).await;
+    let chunk_guard = f
+        .state
+        .upload_chunk_work
+        .clone()
+        .try_acquire_many_owned(f.state.config.snapshot_upload_chunk_concurrency() as u32)
+        .unwrap();
+    let completion_guard = f
+        .state
+        .upload_completion_work
+        .clone()
+        .try_acquire_many_owned(f.state.config.snapshot_upload_concurrency as u32)
+        .unwrap();
+
+    for response in
+        [put_chunk(&f, &upload_id, 0, bytes).await, complete_upload(&f, &upload_id).await]
+    {
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap()["error"], "upload_busy");
+    }
+    assert_eq!(status_upload(&f, &upload_id).await.status(), 200);
+    assert_eq!(abort_upload(&f, &upload_id).await.status(), 204);
+    drop(chunk_guard);
+    drop(completion_guard);
+}
+
+#[tokio::test]
+async fn saturated_upload_controls_shed_before_starting_database_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fixture(tmp.path()).await;
+    let bytes = b"control work";
+    let upload_id = upload_envelope(&f, bytes, 1).await;
+    let control_guard = f
+        .state
+        .upload_control_work
+        .clone()
+        .try_acquire_many_owned(f.state.config.default_request_concurrency as u32)
+        .unwrap();
+    for response in [status_upload(&f, &upload_id).await, abort_upload(&f, &upload_id).await] {
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap()["error"], "upload_busy");
+    }
+    drop(control_guard);
+    assert_eq!(status_upload(&f, &upload_id).await.status(), 200);
+    assert_eq!(abort_upload(&f, &upload_id).await.status(), 204);
+}
