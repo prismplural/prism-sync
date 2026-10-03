@@ -79,15 +79,11 @@ async fn credential_release_without_a_verified_ceremony_is_refused() {
     );
 }
 
-/// Credential release with a verified-but-unfinished upload is refused. The
-/// upload half cannot have run here (there is no verified ceremony at all), but
-/// the invariant that matters — a distinct, upload-gated release step — is
-/// asserted by the lib-level `credential_release_gate` tests, which cover the
-/// verified/no-upload combination directly.
+/// The public split release entry point rejects a bare handle. Unit tests cover
+/// the separate verified-but-unpublished gate with retained ceremony state.
 #[tokio::test]
 async fn credential_release_is_a_separate_gated_step() {
     let handle = make_handle();
-    // The one-shot API must not have been silently repointed at the split path.
     let error = api::complete_initiator_resumable_ceremony(
         &handle,
         b"password".to_vec(),
@@ -111,13 +107,11 @@ async fn cancellation_with_nothing_in_progress_is_a_noop() {
     api::cancel_pairing_ceremony(&handle).await.expect("cancelling twice must succeed");
 }
 
-/// Cancellation clears a pending verified ceremony, so the release half can no
-/// longer run and the lease secret is dropped.
+/// Cancelling a bare handle does not make it eligible to release credentials.
 #[tokio::test]
 async fn cancellation_blocks_the_credential_release_half() {
     let handle = make_handle();
-    // Simulate the post-verify state without a relay: the release half must see
-    // no verified ceremony both before and after cancellation.
+    // This bare handle has no verified ceremony before or after cancellation.
     let before = api::complete_initiator_resumable_ceremony(
         &handle,
         b"password".to_vec(),

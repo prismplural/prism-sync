@@ -3570,6 +3570,11 @@ impl SyncEngine {
         progress: Option<SnapshotUploadProgress>,
         lease_hook: Option<&mut dyn crate::snapshot_upload::SnapshotUploadProgressHook>,
     ) -> Result<Option<String>> {
+        let cancellation =
+            lease_hook.as_ref().and_then(|hook| hook.cancellation()).unwrap_or_default();
+        let check_cancelled =
+            || cancellation.check().map_err(|error| CoreError::from(error.to_relay_error()));
+        check_cancelled()?;
         // 0. Pull to relay head before cutting the snapshot. `sync` runs
         // pull-then-push, so the initiator's own most recent pushes always sit
         // above its `last_pulled_server_seq` cursor; cutting the snapshot at that
@@ -3581,6 +3586,7 @@ impl SyncEngine {
         // pull never wedges the pairing flow.
         self.pull_phase(sync_id, key_hierarchy, device_id).await?;
 
+        check_cancelled()?;
         // 1. Export snapshot from storage (already zstd-compressed)
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
@@ -3588,6 +3594,7 @@ impl SyncEngine {
             .await
             .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
+        check_cancelled()?;
         // 1b. Size probe — reject oversized snapshots BEFORE encrypting or
         // contacting the relay. This is the compressed-byte gate; the outer
         // wire-byte limit is enforced relay-side.
@@ -3605,6 +3612,7 @@ impl SyncEngine {
         .await
         .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))??;
 
+        check_cancelled()?;
         // 3. Encrypt with epoch key + snapshot AAD (binds metadata to ciphertext)
         let epoch_key = key_hierarchy
             .epoch_key(epoch as u32)
@@ -3666,7 +3674,8 @@ impl SyncEngine {
                     &envelope_bytes,
                     request,
                 )
-                .with_progress(progress.clone());
+                .with_progress(progress.clone())
+                .with_cancellation(cancellation.clone());
 
                 match uploader.run(lease_hook).await {
                     Ok(crate::snapshot_upload::SnapshotUploadOutcome::Uploaded {
@@ -3700,7 +3709,11 @@ impl SyncEngine {
             }
         }
 
-        match self
+        check_cancelled()?;
+        let published = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => { check_cancelled()?; unreachable!() },
+            result = self
             .relay
             .put_snapshot(
                 epoch,
@@ -3710,9 +3723,9 @@ impl SyncEngine {
                 for_device_id,
                 device_id.to_string(),
                 progress,
-            )
-            .await
-        {
+            ) => result,
+        };
+        match published {
             Ok(()) => Ok(None),
             Err(other) => self
                 .classify_snapshot_upload_failure(sync_id, server_seq, our_target.as_deref(), other)

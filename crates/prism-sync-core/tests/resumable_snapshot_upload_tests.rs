@@ -37,10 +37,10 @@ use prism_sync_core::relay::pairing_relay::{MockPairingRelay, PairingRelay};
 use prism_sync_core::relay::traits::RelayError;
 use prism_sync_core::snapshot_upload::{
     CapabilityUnavailableReason, ChunkResponse, CreateUploadRequest, CreateUploadResponse,
-    NoopProgressHook, ResumableSnapshotTransport, ResumableUploadError, SnapshotUploadCapability,
-    SnapshotUploadOutcome, SnapshotUploadProgressHook, SnapshotUploadRequest,
-    SnapshotUploadRetryPolicy, SnapshotUploader, UploadErrorCode, UploadState,
-    UploadStatusResponse, MAX_UPLOAD_STATE_TRANSITIONS, SNAPSHOT_UPLOAD_CHUNK_BYTES,
+    NoopProgressHook, ResumableSnapshotTransport, ResumableUploadError, SnapshotUploadCancellation,
+    SnapshotUploadCapability, SnapshotUploadOutcome, SnapshotUploadProgressHook,
+    SnapshotUploadRequest, SnapshotUploadRetryPolicy, SnapshotUploader, UploadErrorCode,
+    UploadState, UploadStatusResponse, MAX_UPLOAD_STATE_TRANSITIONS, SNAPSHOT_UPLOAD_CHUNK_BYTES,
     SNAPSHOT_UPLOAD_KEY_BYTES, SNAPSHOT_UPLOAD_VERSION_V1,
 };
 
@@ -117,6 +117,7 @@ struct Session {
 /// In-memory model of the relay's resumable routes.
 struct MockResumableRelay {
     faults: Mutex<Faults>,
+    create_barrier: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     sessions: Mutex<HashMap<String, Session>>,
     /// `(sync_id, uploader, upload_key) -> upload_id`, the idempotency index.
     by_key: Mutex<HashMap<String, String>>,
@@ -144,6 +145,7 @@ impl MockResumableRelay {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             faults: Mutex::new(Faults::default()),
+            create_barrier: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             by_key: Mutex::new(HashMap::new()),
             capability: Mutex::new(Ok(SnapshotUploadCapability {
@@ -333,7 +335,13 @@ impl ResumableSnapshotTransport for MockResumableRelay {
             Some(other) => panic!("unsupported create fault: {other:?}"),
             None => {}
         }
-        Ok(self.commit_create(body))
+        let created = self.commit_create(body);
+        let barrier = self.create_barrier.lock().unwrap().clone();
+        if let Some((accepted, release)) = barrier {
+            accepted.notify_one();
+            release.notified().await;
+        }
+        Ok(created)
     }
 
     async fn snapshot_upload_status(
@@ -2242,4 +2250,25 @@ async fn a_failed_upload_leaves_the_reported_session_abortable() {
     abort_upload_best_effort(relay.as_ref(), &sessions[0]).await;
     assert_eq!(relay.abort_calls(), 1, "the reported session is abortable");
     assert!(relay.published().is_none(), "aborting must not publish anything");
+}
+
+#[tokio::test]
+async fn cancelled_delayed_create_is_aborted_before_any_chunk_or_complete() {
+    let relay = MockResumableRelay::new();
+    let accepted = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *relay.create_barrier.lock().unwrap() = Some((accepted.clone(), release.clone()));
+    let cancellation = SnapshotUploadCancellation::default();
+    let envelope = multi_chunk_envelope();
+    let uploader = uploader(&relay, &envelope).with_cancellation(cancellation.clone());
+    let (result, ()) = tokio::join!(uploader.run(None), async {
+        accepted.notified().await;
+        cancellation.cancel();
+        release.notify_one();
+    });
+    assert!(result.is_err());
+    assert_eq!(relay.create_calls.load(Ordering::Acquire), 1);
+    assert_eq!(relay.chunk_calls.load(Ordering::Acquire), 0);
+    assert_eq!(relay.complete_calls.load(Ordering::Acquire), 0);
+    assert_eq!(relay.abort_calls.load(Ordering::Acquire), 1);
 }

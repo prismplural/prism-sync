@@ -43,6 +43,40 @@ use sha2::{Digest, Sha256};
 
 use crate::relay::traits::{RelayError, SnapshotUploadProgress};
 
+/// Sticky cancellation shared by all stages of one pairing attempt.
+#[derive(Clone, Debug)]
+pub struct SnapshotUploadCancellation(tokio::sync::watch::Sender<bool>);
+
+impl Default for SnapshotUploadCancellation {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+}
+
+impl SnapshotUploadCancellation {
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+    pub async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
+    pub fn check(&self) -> Result<(), ResumableUploadError> {
+        if self.is_cancelled() {
+            Err(ResumableUploadError::new(
+                499,
+                UploadErrorCode::Unknown("upload_cancelled".into()),
+                "pairing attempt cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 // ── Protocol constants (mirror of `prism-sync-relay::uploads`) ──────────────
 
 /// Wire protocol version this client speaks.
@@ -751,6 +785,11 @@ impl SnapshotUploadOutcome {
 /// nonfatal and continues.
 #[async_trait]
 pub trait SnapshotUploadProgressHook: Send {
+    /// Cancellation remains observable even before the relay returns a session id.
+    fn cancellation(&self) -> Option<SnapshotUploadCancellation> {
+        None
+    }
+
     /// Called after the relay created **or recovered** the session, with the
     /// opaque relay-generated session identifier.
     ///
@@ -862,6 +901,7 @@ pub struct SnapshotUploader<'a> {
     upload_key: String,
     body_sha256: String,
     progress_cb: Option<SnapshotUploadProgress>,
+    cancellation: SnapshotUploadCancellation,
 }
 
 impl<'a> SnapshotUploader<'a> {
@@ -883,6 +923,7 @@ impl<'a> SnapshotUploader<'a> {
             upload_key,
             body_sha256,
             progress_cb: None,
+            cancellation: SnapshotUploadCancellation::default(),
         }
     }
 
@@ -895,6 +936,12 @@ impl<'a> SnapshotUploader<'a> {
     /// Attach the legacy byte-progress callback so app UI needs no new surface.
     pub fn with_progress(mut self, progress: Option<SnapshotUploadProgress>) -> Self {
         self.progress_cb = progress;
+        self
+    }
+
+    /// Share the owning ceremony's sticky cancellation across transport stages.
+    pub fn with_cancellation(mut self, cancellation: SnapshotUploadCancellation) -> Self {
+        self.cancellation = cancellation;
         self
     }
 
@@ -918,12 +965,15 @@ impl<'a> SnapshotUploader<'a> {
         &self,
         hook: Option<&mut dyn SnapshotUploadProgressHook>,
     ) -> Result<SnapshotUploadOutcome, ResumableUploadError> {
+        self.cancellation.check()?;
         let total = self.envelope.len() as u64;
 
         let capability = match self.transport.resumable_snapshot_capability().await {
             Ok(capability) => capability,
             Err(reason) => return Ok(SnapshotUploadOutcome::CapabilityUnavailable { reason }),
         };
+
+        self.cancellation.check()?;
 
         // Locally reject an envelope the relay cannot accept, before any
         // session is created. This is a specific pairing error, not a downgrade:
@@ -966,7 +1016,7 @@ impl<'a> SnapshotUploader<'a> {
         };
 
         let created =
-            self.retry_operation(|| self.transport.create_snapshot_upload(&create_body)).await?;
+            self.retry_create(|| self.transport.create_snapshot_upload(&create_body)).await?;
 
         let upload_id = created.upload_id.clone();
         // Hand the session identifier to the hook before the first chunk. A
@@ -974,6 +1024,10 @@ impl<'a> SnapshotUploader<'a> {
         // this session if it cancels, expires, or fails mid-transfer.
         if let Some(hook) = hook.as_deref_mut() {
             hook.on_session_created(&upload_id).await;
+        }
+        if self.cancellation.is_cancelled() {
+            abort_upload_best_effort(self.transport, &upload_id).await;
+            self.cancellation.check()?;
         }
         // The session's persisted chunk size is authoritative, not the
         // capability's: a restart or config change cannot wedge the session.
@@ -1011,6 +1065,7 @@ impl<'a> SnapshotUploader<'a> {
         // are therefore transitions, not nested recovery loops.
         let mut guard = 0usize;
         while !published {
+            self.cancellation.check()?;
             guard += 1;
             if guard > MAX_UPLOAD_STATE_TRANSITIONS {
                 return Err(ResumableUploadError::new(
@@ -1080,6 +1135,7 @@ impl<'a> SnapshotUploader<'a> {
                 }
             }
 
+            self.cancellation.check()?;
             self.emit_progress(committed, total);
             self.maybe_advance_lease(hook, &mut last_renewed_offset, committed).await;
         }
@@ -1189,6 +1245,26 @@ impl<'a> SnapshotUploader<'a> {
     /// (the signing layer generates one per request). Auth, conflict, hash,
     /// expiry, quota, and other semantic rejections are returned immediately.
     async fn retry_operation<T, F, Fut>(&self, mut operation: F) -> Result<T, ResumableUploadError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ResumableUploadError>>,
+    {
+        self.retry_create(|| {
+            let future = operation();
+            async {
+                self.cancellation.check()?;
+                tokio::select! {
+                    biased;
+                    _ = self.cancellation.cancelled() => { self.cancellation.check()?; unreachable!() },
+                    result = future => result,
+                }
+            }
+        }).await
+    }
+
+    // Preserve ambiguous create attempts until their id can be recovered and
+    // aborted. Exhausted retries still rely on relay-side session expiry.
+    async fn retry_create<T, F, Fut>(&self, mut operation: F) -> Result<T, ResumableUploadError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, ResumableUploadError>>,

@@ -260,6 +260,8 @@ pub struct PrismSyncHandle {
     joiner_ceremony: std::sync::Mutex<Option<JoinerCeremony>>,
     /// In-progress initiator ceremony state (relay-based PQ pairing).
     initiator_ceremony: std::sync::Mutex<Option<InitiatorCeremony>>,
+    initiator_attempt:
+        std::sync::Mutex<Option<Arc<prism_sync_core::snapshot_upload::SnapshotUploadCancellation>>>,
     /// Initiated pairing ceremony whose joiner confirmation has already been
     /// verified, waiting for the snapshot upload to succeed before credentials
     /// may be released.
@@ -1503,7 +1505,8 @@ fn guard_ceremony_in_progress(
     handle: &PrismSyncHandle,
     kind: CeremonyGuardKind,
 ) -> Result<(), String> {
-    let initiator_present = lock_or_recover(&handle.initiator_ceremony).is_some();
+    let initiator_present = lock_or_recover(&handle.initiator_ceremony).is_some()
+        || lock_or_recover(&handle.initiator_attempt).is_some();
     let joiner_present = lock_or_recover(&handle.joiner_ceremony).is_some();
     let verified_present = lock_or_recover(&handle.initiator_verified).is_some();
     match kind {
@@ -1661,6 +1664,7 @@ pub fn create_prism_sync(
         backoff_handle: Arc::new(std::sync::Mutex::new(None)),
         joiner_ceremony: std::sync::Mutex::new(None),
         initiator_ceremony: std::sync::Mutex::new(None),
+        initiator_attempt: std::sync::Mutex::new(None),
         initiator_verified: Arc::new(std::sync::Mutex::new(None)),
         active_upload: Arc::new(std::sync::Mutex::new(None)),
     })
@@ -5173,56 +5177,45 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
 /// and ignored so cancellation remains idempotent and can recover from
 /// partially connected/offline states.
 pub async fn cancel_pairing_ceremony(handle: &PrismSyncHandle) -> Result<(), String> {
-    let mut rendezvous_ids = Vec::new();
-
-    // A verified-but-unfinished split ceremony owns a resumable upload session.
-    // Take the run state here so cancellation can best-effort abort that exact
-    // session: a local cancel must not leave a reservation behind until
-    // relay-side expiry. Dropping the verified slot also zeroizes the retained
-    // lease secret.
-    let pending_upload = lock_or_recover(&handle.initiator_verified).take();
-    let abort_target = pending_upload.as_ref().and_then(|slot| {
-        if !should_abort_upload(slot.upload_completed.load(std::sync::atomic::Ordering::Acquire)) {
-            // A published snapshot must never be aborted. Its session is already
-            // terminal on the relay, so there is nothing to clean up.
-            return None;
+    let (mut rendezvous_ids, abort_target) = {
+        // Invalidate ownership before clearing slots, including state temporarily
+        // held by verification or credential-release futures.
+        let mut owner = lock_or_recover(&handle.initiator_attempt);
+        if let Some(attempt) = owner.take() {
+            attempt.cancel();
         }
-        lock_or_recover(&handle.active_upload).as_ref().map(|active| {
-            (active.relay_url.clone(), Arc::clone(&active.cell), Arc::clone(&active.transport))
-        })
-    });
-
-    // Take the engine lock LAST. Cancellation must issue its resource cleanup
-    // even while a snapshot upload still holds that lock, so the abort below
-    // runs first and never waits behind a multi-minute transfer.
-    if let Some(ceremony) = handle
-        .joiner_ceremony
-        .lock()
-        .map_err(|e| format!("failed to lock joiner_ceremony: {e}"))?
-        .take()
-    {
-        rendezvous_ids.push(ceremony.rendezvous_id_hex());
-    }
-
-    if let Some(ceremony) = handle
-        .initiator_ceremony
-        .lock()
-        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
-        .take()
-    {
-        rendezvous_ids.push(ceremony.rendezvous_id_hex());
-    }
+        let pending = lock_or_recover(&handle.initiator_verified).take();
+        let active = lock_or_recover(&handle.active_upload).take();
+        let abort_target = active
+            .filter(|_| {
+                pending.as_ref().is_none_or(|slot| {
+                    should_abort_upload(
+                        slot.upload_completed.load(std::sync::atomic::Ordering::Acquire),
+                    )
+                })
+            })
+            .map(|active| (active.relay_url, active.cell, active.transport));
+        let mut ids = Vec::new();
+        if let Some(slot) = pending {
+            ids.push(slot.ceremony.rendezvous_id_hex());
+        }
+        if let Some(ceremony) = lock_or_recover(&handle.joiner_ceremony).take() {
+            ids.push(ceremony.rendezvous_id_hex());
+        }
+        if let Some(ceremony) = lock_or_recover(&handle.initiator_ceremony).take() {
+            ids.push(ceremony.rendezvous_id_hex());
+        }
+        (ids, abort_target)
+    };
 
     rendezvous_ids.sort();
     rendezvous_ids.dedup();
 
     if let Some((relay_url, cell, transport)) = abort_target {
-        // Clear the slot first so a concurrent cancellation cannot abort twice.
-        lock_or_recover(&handle.active_upload).take();
         let upload_id = lock_or_recover(&cell.upload_id).clone();
         if upload_id.is_empty() {
             tracing::debug!(
-                "[prism_sync_ffi] pairing cancel: resumable session not created yet; nothing to abort"
+                "[prism_sync_ffi] pairing cancel: resumable create pending; uploader will abort its delayed response"
             );
         } else {
             abort_resumable_upload_best_effort(&relay_url, transport.as_ref(), &upload_id).await;
@@ -5639,37 +5632,62 @@ pub async fn start_initiator_ceremony(
     handle: &PrismSyncHandle,
     token_bytes: Vec<u8>,
 ) -> Result<String, String> {
-    ensure_handle_supports_signature_version_floor(handle).await?;
     guard_ceremony_in_progress(handle, CeremonyGuardKind::StartInitiator)?;
-    let token = RendezvousToken::from_bytes(&token_bytes)
-        .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
-
-    let pairing_relay = build_pairing_relay(handle)?;
-
-    let inner = handle.inner.lock().await;
-    let secure_store = inner.secure_store().clone();
-    drop(inner);
-
-    let pairing = PairingService::new(secure_store);
-    let (ceremony, sas) = match pairing.start_bootstrap_initiator(token, &pairing_relay).await {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(encode_handle_core_error(handle, "start_bootstrap_initiator", error).await);
+    let attempt = {
+        let mut owner = lock_or_recover(&handle.initiator_attempt);
+        if owner.is_some() {
+            return Err("CEREMONY_IN_PROGRESS: initiator start already in progress".into());
         }
+        let attempt = Arc::new(Default::default());
+        owner.replace(Arc::clone(&attempt));
+        attempt
     };
+    let start = async {
+        ensure_handle_supports_signature_version_floor(handle).await?;
+        let token = RendezvousToken::from_bytes(&token_bytes)
+            .ok_or_else(|| "failed to parse RendezvousToken from bytes".to_string())?;
 
-    let joiner_device_id = ceremony.joiner_device_id().to_string();
+        let pairing_relay = build_pairing_relay(handle)?;
 
-    // Store ceremony state for complete_initiator_ceremony
-    handle
-        .initiator_ceremony
-        .lock()
-        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
-        .replace(ceremony);
+        let inner = handle.inner.lock().await;
+        let secure_store = inner.secure_store().clone();
+        drop(inner);
 
-    let mut result = sas_display_json(&sas);
-    result["joiner_device_id"] = serde_json::Value::String(joiner_device_id);
-    Ok(result.to_string())
+        let pairing = PairingService::new(secure_store);
+        let (ceremony, sas) = match pairing.start_bootstrap_initiator(token, &pairing_relay).await {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(
+                    encode_handle_core_error(handle, "start_bootstrap_initiator", error).await
+                );
+            }
+        };
+
+        let joiner_device_id = ceremony.joiner_device_id().to_string();
+
+        // Only this still-current start may publish its ceremony.
+        let _owner = current_attempt(handle, &attempt)?;
+        handle
+            .initiator_ceremony
+            .lock()
+            .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
+            .replace(ceremony);
+
+        let mut result = sas_display_json(&sas);
+        result["joiner_device_id"] = serde_json::Value::String(joiner_device_id);
+        Ok(result.to_string())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = attempt.cancelled() => Err("pairing attempt cancelled".into()),
+        result = start => result,
+    };
+    if result.is_err() {
+        if let Ok(mut owner) = current_attempt(handle, &attempt) {
+            owner.take();
+        }
+    }
+    result
 }
 
 /// Complete the initiator side of the ceremony after SAS verification.
@@ -5698,6 +5716,7 @@ pub async fn complete_initiator_ceremony(
     guard_ceremony_in_progress(handle, CeremonyGuardKind::CompleteInitiator)?;
     let pairing_relay = build_pairing_relay(handle)?;
 
+    let attempt = lock_or_recover(&handle.initiator_attempt).clone();
     // Take the ceremony out — it won't be needed again after completion
     let ceremony = handle
         .initiator_ceremony
@@ -5761,9 +5780,14 @@ pub async fn complete_initiator_ceremony(
     {
         Ok(version) => version,
         Err(error) => {
+            let _owner = match attempt.as_ref() {
+                Some(attempt) => Some(current_attempt(handle, attempt)?),
+                None => None,
+            };
             if let Ok(mut slot) = handle.initiator_ceremony.lock() {
                 slot.replace(ceremony);
             }
+            drop(_owner);
             return Err(
                 encode_handle_core_error(handle, "complete_bootstrap_initiator", error).await
             );
@@ -5779,6 +5803,11 @@ pub async fn complete_initiator_ceremony(
     )
     .await?;
 
+    if let Some(attempt) = attempt {
+        if let Ok(mut owner) = current_attempt(handle, &attempt) {
+            owner.take();
+        }
+    }
     Ok("ok".to_string())
 }
 
@@ -5819,20 +5848,17 @@ async fn finalize_initiator_completion(
         }
     }
 
-    // Align the live client with the post-rekey epoch. complete_bootstrap_initiator
-    // calls EpochManager::post_rekey which writes `epoch` and `epoch_key_{new}`
-    // to secure_store, but the pairing service does not own the PrismSync
-    // client, so self.epoch, the op_emitter, sync_metadata.current_epoch, and
-    // key_hierarchy stay at the pre-rekey value. Leaving them stale breaks the
-    // next pairing attempt: upload_pairing_snapshot reads self.epoch (old) while
-    // complete_bootstrap_initiator reads secure_store.epoch (new) for the
-    // credential bundle, so the joiner receives the new epoch key but the
-    // snapshot is encrypted with the old one, and bootstrap_from_snapshot fails.
-    // Mirror what commit_epoch_rotation does: load the new epoch key into the
-    // live key hierarchy, update sync_metadata, and advance the runtime epoch.
     let mut inner = handle.inner.lock().await;
-    let secure_store = inner.secure_store().clone();
+    reconcile_pairing_epoch(&mut inner, sync_id, device_id)
+}
 
+/// Reconcile a durably stored pairing rekey even when relay cleanup was cancelled.
+fn reconcile_pairing_epoch(
+    inner: &mut PrismSync,
+    sync_id: &str,
+    device_id: &str,
+) -> Result<(), String> {
+    let secure_store = inner.secure_store().clone();
     let new_epoch_str = secure_store
         .get("epoch")
         .map_err(|e| format!("read epoch after pairing: {e}"))?
@@ -5958,6 +5984,7 @@ const FFI_RESUMABLE_DEFAULT_TTL_SECS: u64 = 86_400;
 /// point: the secret lives only for the duration of one ceremony and is never
 /// persisted.
 struct InitiatorVerifiedSlot {
+    attempt: Arc<prism_sync_core::snapshot_upload::SnapshotUploadCancellation>,
     ceremony: InitiatorCeremony,
     /// The opaque lease handle. Held behind its own lock so the upload half can
     /// take it for the duration of the transfer and put it back afterwards.
@@ -6115,6 +6142,7 @@ async fn build_resumable_transport(handle: &PrismSyncHandle) -> Result<Arc<dyn S
 /// that keeps the borrow inside this hook and prevents any second borrow of the
 /// lease secret.
 struct FfiLeaseUploadHook<'a> {
+    cancellation: prism_sync_core::snapshot_upload::SnapshotUploadCancellation,
     handle: &'a mut PairingLeaseHandle,
     pairing_relay: &'a dyn PairingRelay,
     session: Arc<UploadSessionCell>,
@@ -6124,6 +6152,9 @@ struct FfiLeaseUploadHook<'a> {
 
 #[async_trait::async_trait]
 impl PrismSnapshotUploadProgressHook for FfiLeaseUploadHook<'_> {
+    fn cancellation(&self) -> Option<prism_sync_core::snapshot_upload::SnapshotUploadCancellation> {
+        Some(self.cancellation.clone())
+    }
     async fn on_session_created(&mut self, upload_id: &str) {
         // Publish the session id immediately so a concurrent cancellation can
         // abort exactly this session even though the upload future is still
@@ -6190,6 +6221,25 @@ fn resumable_legacy_budget(lease_capable: bool) -> Option<std::time::Duration> {
     }
 }
 
+fn current_attempt<'a>(
+    handle: &'a PrismSyncHandle,
+    attempt: &Arc<prism_sync_core::snapshot_upload::SnapshotUploadCancellation>,
+) -> Result<
+    std::sync::MutexGuard<
+        'a,
+        Option<Arc<prism_sync_core::snapshot_upload::SnapshotUploadCancellation>>,
+    >,
+    String,
+> {
+    let owner = lock_or_recover(&handle.initiator_attempt);
+    if attempt.is_cancelled()
+        || !owner.as_ref().is_some_and(|current| Arc::ptr_eq(current, attempt))
+    {
+        return Err("pairing attempt cancelled or superseded".into());
+    }
+    Ok(owner)
+}
+
 /// Verify the joiner's confirmation and retain resumable ceremony state.
 ///
 /// **Step 1** of the split initiator ceremony. Waits for the joiner's protected
@@ -6209,16 +6259,16 @@ fn resumable_legacy_budget(lease_capable: bool) -> Option<std::time::Duration> {
 pub async fn verify_initiator_confirmation_resumable(
     handle: &PrismSyncHandle,
 ) -> Result<bool, String> {
-    ensure_handle_supports_signature_version_floor(handle).await?;
-
-    let ceremony = handle
-        .initiator_ceremony
-        .lock()
-        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
-        .take()
-        .ok_or_else(|| {
+    let (attempt, ceremony) = {
+        let mut owner = lock_or_recover(&handle.initiator_attempt);
+        let ceremony = lock_or_recover(&handle.initiator_ceremony).take().ok_or_else(|| {
             "no initiator ceremony in progress — call start_initiator_ceremony first".to_string()
         })?;
+        let attempt = owner.get_or_insert_with(|| Arc::new(Default::default())).clone();
+        (attempt, ceremony)
+    };
+    ensure_handle_supports_signature_version_floor(handle).await?;
+    drop(current_attempt(handle, &attempt)?);
 
     let pairing_relay = build_pairing_relay(handle)?;
     let pairing = {
@@ -6235,25 +6285,31 @@ pub async fn verify_initiator_confirmation_resumable(
         LeasePollBackoff::for_legacy_deadline()
     };
 
-    let (state, lease_handle) =
-        match pairing.verify_initiator_confirmation(&ceremony, &pairing_relay, lease_wait).await {
-            Ok(value) => value,
-            Err(error) => {
-                // Hand the ceremony back: the app may still cancel it, and its
-                // rollback-sensitive state must not be dropped silently.
-                let _ = lock_or_recover(&handle.initiator_ceremony).replace(ceremony);
-                return Err(redact_sensitive_message(&error.to_string()));
-            }
-        };
+    let (state, lease_handle) = match tokio::select! {
+        biased;
+        _ = attempt.cancelled() => return Err("pairing attempt cancelled".into()),
+        result = pairing.verify_initiator_confirmation(&ceremony, &pairing_relay, lease_wait) => result,
+    } {
+        Ok(value) => value,
+        Err(error) => {
+            // Hand the ceremony back: the app may still cancel it, and its
+            // rollback-sensitive state must not be dropped silently.
+            let _owner = current_attempt(handle, &attempt)?;
+            let _ = lock_or_recover(&handle.initiator_ceremony).replace(ceremony);
+            return Err(redact_sensitive_message(&error.to_string()));
+        }
+    };
 
     let target_device_id = ceremony.joiner_device_id().to_string();
     let lease_active = lease_handle.is_lease_capable();
     let retained = InitiatorVerifiedSlot {
+        attempt: Arc::clone(&attempt),
         ceremony,
         lease: Arc::new(std::sync::Mutex::new(Some(lease_handle))),
         target_device_id,
         upload_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+    let _owner = current_attempt(handle, &attempt)?;
     lock_or_recover(&handle.initiator_verified).replace(retained);
     drop(state);
 
@@ -6277,64 +6333,41 @@ pub async fn verify_initiator_confirmation_resumable(
 /// twice for the same ceremony. On success it records publication on the retained
 /// ceremony, which is what authorizes [`complete_initiator_resumable_ceremony`].
 ///
-/// The upload runs inline on the caller's task, because the device's ML-DSA
-/// signing key is not `Clone` and cannot be moved into a spawned task. A
-/// cancellation from another task therefore cannot stop the transfer itself, but
-/// it can abort the relay session as soon as the create response has published the
-/// session id (see [`cancel_pairing_ceremony`]).
-///
-/// **The app must call [`cancel_pairing_ceremony`] to end an abandoned upload.**
-/// Nothing here times the upload out on the app's behalf: the relay holds the
-/// session's byte reservation until the session goes terminal, and only an abort
-/// (or the relay's own idle/absolute expiry) ends it. Dropping the caller's future
-/// is not enough — the upload may be suspended at an await point, and the relay
-/// session outlives it. The upload id is the only handle on that session; it is
-/// published to the shared cell on the first successful create and retained until
-/// the session is terminal, so a cancellation arriving at any point after the
-/// create can abort exactly that session. A cancellation that arrives before the
-/// create returned has nothing to abort, which is correct: no session exists yet.
+/// Cancellation is sticky across export, capability lookup, and upload. A create
+/// already sent is allowed to return its session id so it can be aborted; later
+/// chunks and credential release stop when this attempt loses ownership.
 pub async fn upload_pairing_snapshot_resumable(
     handle: &PrismSyncHandle,
     ttl_secs: Option<u64>,
 ) -> Result<ResumableSnapshotUploadResult, String> {
-    // Refuse unless verified, and refuse a second upload for this ceremony.
-    {
+    let (attempt, mut lease, target_device_id, upload_completed) = {
+        let _owner = lock_or_recover(&handle.initiator_attempt);
         let slot = lock_or_recover(&handle.initiator_verified);
-        let slot = slot.as_ref().ok_or_else(|| {
-            "no verified initiator ceremony — call verify_initiator_confirmation_resumable first"
-                .to_string()
+        let slot = slot.as_ref().ok_or_else(|| "no verified initiator ceremony — call verify_initiator_confirmation_resumable first".to_string())?;
+        let lease = lock_or_recover(&slot.lease).take().ok_or_else(|| {
+            "CEREMONY_IN_PROGRESS: this ceremony's snapshot upload already started".to_string()
         })?;
-        if slot.lease.lock().map_err(|e| e.to_string())?.is_none() {
-            return Err(
-                "CEREMONY_IN_PROGRESS: this ceremony's snapshot upload already started".to_string()
-            );
-        }
-    }
+        (
+            Arc::clone(&slot.attempt),
+            lease,
+            slot.target_device_id.clone(),
+            Arc::clone(&slot.upload_completed),
+        )
+    };
 
     let (epoch, device_id, sync_id) = {
-        let inner = handle.inner.lock().await;
+        let mut inner = handle.inner.lock().await;
         let store = inner.secure_store();
+        let device_id = require_secure_string(store.as_ref(), "device_id")?;
+        let sync_id = require_secure_string(store.as_ref(), "sync_id")?;
+        reconcile_pairing_epoch(&mut inner, &sync_id, &device_id)?;
         (
             inner
                 .epoch()
                 .ok_or_else(|| "epoch not set — call configure_engine first".to_string())?,
-            require_secure_string(store.as_ref(), "device_id")?,
-            require_secure_string(store.as_ref(), "sync_id")?,
+            device_id,
+            sync_id,
         )
-    };
-
-    // Take the lease handle for the duration of the transfer, and publish the
-    // session cell so a concurrent cancellation can abort mid-flight.
-    let (mut lease, target_device_id, upload_completed) = {
-        let slot = lock_or_recover(&handle.initiator_verified);
-        let slot = slot.as_ref().ok_or_else(|| {
-            "no verified initiator ceremony — call verify_initiator_confirmation_resumable first"
-                .to_string()
-        })?;
-        let lease = slot.lease.lock().map_err(|e| e.to_string())?.take().ok_or_else(|| {
-            "CEREMONY_IN_PROGRESS: this ceremony's snapshot upload already started".to_string()
-        })?;
-        (lease, slot.target_device_id.clone(), Arc::clone(&slot.upload_completed))
     };
 
     let session = Arc::new(UploadSessionCell::new());
@@ -6344,11 +6377,14 @@ pub async fn upload_pairing_snapshot_resumable(
     // mid-transfer can abort immediately instead of waiting on the engine mutex
     // this upload holds for its whole duration.
     let abort_transport = build_resumable_transport(handle).await?;
-    lock_or_recover(&handle.active_upload).replace(ActiveUpload {
-        relay_url: handle.relay_url.clone(),
-        cell: Arc::clone(&session),
-        transport: abort_transport,
-    });
+    {
+        let _owner = current_attempt(handle, &attempt)?;
+        lock_or_recover(&handle.active_upload).replace(ActiveUpload {
+            relay_url: handle.relay_url.clone(),
+            cell: Arc::clone(&session),
+            transport: abort_transport,
+        });
+    }
 
     let pairing_relay = build_pairing_relay(handle)?;
     let ttl_secs = Some(ttl_secs.unwrap_or(FFI_RESUMABLE_DEFAULT_TTL_SECS));
@@ -6375,6 +6411,7 @@ pub async fn upload_pairing_snapshot_resumable(
 
     let upload_future = async {
         let mut hook = FfiLeaseUploadHook {
+            cancellation: (*attempt).clone(),
             handle: &mut lease,
             pairing_relay: &pairing_relay,
             session: Arc::clone(&session),
@@ -6412,7 +6449,7 @@ pub async fn upload_pairing_snapshot_resumable(
         Some(budget) => match tokio::time::timeout(budget, upload_future).await {
             Ok(result) => result,
             Err(_) => {
-                restore_lease_handle(handle, lease);
+                restore_lease_handle(handle, &attempt, lease);
                 return Err(format!(
                     "snapshot upload did not finish within the legacy \
                      {FFI_RESUMABLE_LEGACY_BUDGET_SECS}s budget"
@@ -6423,10 +6460,11 @@ pub async fn upload_pairing_snapshot_resumable(
     };
 
     let (lease_capable, renewed, _terminal) = lease_flags(&lease);
-    restore_lease_handle(handle, lease);
+    restore_lease_handle(handle, &attempt, lease);
 
     match result {
         Ok(upload_id) => {
+            let _owner = current_attempt(handle, &attempt)?;
             let total_bytes = offset_cell.load(std::sync::atomic::Ordering::Acquire);
             upload_completed.store(true, std::sync::atomic::Ordering::Release);
             let (transport, upload_id) = match upload_id {
@@ -6451,7 +6489,14 @@ pub async fn upload_pairing_snapshot_resumable(
 }
 
 /// Put the lease handle back so the credential-release half can use it.
-fn restore_lease_handle(handle: &PrismSyncHandle, lease: PairingLeaseHandle) {
+fn restore_lease_handle(
+    handle: &PrismSyncHandle,
+    attempt: &Arc<prism_sync_core::snapshot_upload::SnapshotUploadCancellation>,
+    lease: PairingLeaseHandle,
+) {
+    let Ok(_owner) = current_attempt(handle, attempt) else {
+        return;
+    };
     let slot = lock_or_recover(&handle.initiator_verified);
     if let Some(slot) = slot.as_ref() {
         *lock_or_recover(&slot.lease) = Some(lease);
@@ -6483,98 +6528,116 @@ pub async fn complete_initiator_resumable_ceremony(
     let password_text = secret_text("password", &password)?;
     let mnemonic_text = secret_text("mnemonic", &mnemonic)?;
 
-    // The gate: credentials may only be released after a published snapshot.
-    {
-        let slot = lock_or_recover(&handle.initiator_verified);
-        let upload_completed = slot
-            .as_ref()
-            .map(|slot| slot.upload_completed.load(std::sync::atomic::Ordering::Acquire))
-            .unwrap_or(false);
-        credential_release_gate(slot.is_some(), upload_completed)?;
-    }
-
-    ensure_handle_supports_signature_version_floor(handle).await?;
-
-    let pairing_relay = build_pairing_relay(handle)?;
-    let (storage, secure_store, device_id, sync_id, session_token, device_secret_bytes) = {
-        let inner = handle.inner.lock().await;
-        let store = inner.secure_store();
-        (
-            inner.storage().clone(),
-            store.clone(),
-            require_secure_string(store.as_ref(), "device_id")?,
-            require_secure_string(store.as_ref(), "sync_id")?,
-            decode_optional_utf8(store.as_ref(), "session_token")?.unwrap_or_default(),
-            store.get("device_secret").map_err(|e| e.to_string())?,
-        )
+    let retained = {
+        let _owner = lock_or_recover(&handle.initiator_attempt);
+        let mut slot = lock_or_recover(&handle.initiator_verified);
+        credential_release_gate(
+            slot.is_some(),
+            slot.as_ref().is_some_and(|slot| {
+                slot.upload_completed.load(std::sync::atomic::Ordering::Acquire)
+            }),
+        )?;
+        slot.take().expect("gate checked")
     };
-    let ml_dsa_key_generation =
-        load_device_ml_dsa_generation(storage.clone(), sync_id.clone(), device_id.clone()).await?;
+    let attempt = Arc::clone(&retained.attempt);
+    drop(current_attempt(handle, &attempt)?);
+    let completion = async {
+        ensure_handle_supports_signature_version_floor(handle).await?;
 
-    let relay = build_relay(
-        &handle.relay_url,
-        &sync_id,
-        &device_id,
-        &session_token,
-        device_secret_bytes,
-        ml_dsa_key_generation,
-        handle.allow_insecure,
-        None,
-    )?;
-
-    // Consume the retained ceremony: after a successful release the ceremony is
-    // over, and on failure the app cancels rather than retrying release.
-    let retained =
-        match lock_or_recover(&handle.initiator_verified).take() {
-            Some(retained) => retained,
-            None => return Err(
-                "no verified initiator ceremony — call verify_initiator_confirmation_resumable \
-                 first"
-                    .to_string(),
-            ),
-        };
-    lock_or_recover(&handle.active_upload).take();
-
-    let mut lease = lock_or_recover(&retained.lease)
-        .take()
-        .ok_or_else(|| "the snapshot upload has not returned its lease state".to_string())?;
-
-    let pairing = PairingService::new(secure_store);
-    let released = pairing
-        .complete_bootstrap_initiator_split(
-            &retained.ceremony.verified_state(),
-            &retained.ceremony,
-            &pairing_relay,
-            password_text,
-            mnemonic_text,
-            relay.as_ref(),
-            storage.as_ref(),
-            &mut lease,
-        )
-        .await;
-
-    let (lease_capable, lease_renewed, _terminal) = lease_flags(&lease);
-
-    match released {
-        Ok(published_registry_version) => {
-            finalize_initiator_completion(
-                handle,
-                storage.clone(),
-                &sync_id,
-                &device_id,
-                published_registry_version,
+        let pairing_relay = build_pairing_relay(handle)?;
+        let (storage, secure_store, device_id, sync_id, session_token, device_secret_bytes) = {
+            let inner = handle.inner.lock().await;
+            let store = inner.secure_store();
+            (
+                inner.storage().clone(),
+                store.clone(),
+                require_secure_string(store.as_ref(), "device_id")?,
+                require_secure_string(store.as_ref(), "sync_id")?,
+                decode_optional_utf8(store.as_ref(), "session_token")?.unwrap_or_default(),
+                store.get("device_secret").map_err(|e| e.to_string())?,
             )
-            .await?;
-            Ok(ResumableCeremonyCompletion {
-                completed: true,
-                lease_active: lease_capable,
-                lease_renewed,
-                lease_capable,
-                error: None,
-            })
+        };
+        let ml_dsa_key_generation =
+            load_device_ml_dsa_generation(storage.clone(), sync_id.clone(), device_id.clone())
+                .await?;
+
+        let relay = build_relay(
+            &handle.relay_url,
+            &sync_id,
+            &device_id,
+            &session_token,
+            device_secret_bytes,
+            ml_dsa_key_generation,
+            handle.allow_insecure,
+            None,
+        )?;
+
+        {
+            let _owner = current_attempt(handle, &attempt)?;
+            lock_or_recover(&handle.active_upload).take();
         }
-        Err(error) => Err(redact_sensitive_message(&error.to_string())),
+
+        let mut lease = lock_or_recover(&retained.lease)
+            .take()
+            .ok_or_else(|| "the snapshot upload has not returned its lease state".to_string())?;
+
+        let pairing = PairingService::new(secure_store);
+        let released = pairing
+            .complete_bootstrap_initiator_split(
+                &retained.ceremony.verified_state(),
+                &retained.ceremony,
+                &pairing_relay,
+                password_text,
+                mnemonic_text,
+                relay.as_ref(),
+                storage.as_ref(),
+                &mut lease,
+            )
+            .await;
+
+        let (lease_capable, lease_renewed, _terminal) = lease_flags(&lease);
+
+        match released {
+            Ok(published_registry_version) => {
+                finalize_initiator_completion(
+                    handle,
+                    storage.clone(),
+                    &sync_id,
+                    &device_id,
+                    published_registry_version,
+                )
+                .await?;
+                Ok(ResumableCeremonyCompletion {
+                    completed: true,
+                    lease_active: lease_capable,
+                    lease_renewed,
+                    lease_capable,
+                    error: None,
+                })
+            }
+            Err(error) => Err(redact_sensitive_message(&error.to_string())),
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = attempt.cancelled() => Err("pairing attempt cancelled".into()),
+        result = completion => result,
+    };
+    // Once a rekey reached durable local storage, cancellation must not leave
+    // the next snapshot encrypted with the previous runtime epoch.
+    {
+        let mut inner = handle.inner.lock().await;
+        let store = inner.secure_store();
+        if store.get("epoch").map_err(|error| error.to_string())?.is_some() {
+            let sync_id = require_secure_string(store.as_ref(), "sync_id")?;
+            let device_id = require_secure_string(store.as_ref(), "device_id")?;
+            reconcile_pairing_epoch(&mut inner, &sync_id, &device_id)?;
+        }
     }
+    if let Ok(mut owner) = current_attempt(handle, &attempt) {
+        owner.take();
+    }
+    result
 }
 
 /// Resumable snapshot capability as this device sees it.
@@ -7321,6 +7384,7 @@ mod tests {
         let renewed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut hook = FfiLeaseUploadHook {
+            cancellation: Default::default(),
             handle: &mut handle,
             pairing_relay: &relay,
             session: Arc::clone(&session),
@@ -7381,7 +7445,10 @@ mod tests {
             [0u8; 32],
             prism_sync_core::pairing::lease::LeaseUnavailableReason::LegacyConfirmation,
         );
+        let attempt = Arc::new(Default::default());
+        lock_or_recover(&handle.initiator_attempt).replace(Arc::clone(&attempt));
         lock_or_recover(&handle.initiator_verified).replace(InitiatorVerifiedSlot {
+            attempt,
             ceremony,
             lease: Arc::new(std::sync::Mutex::new(Some(
                 prism_sync_core::pairing::lease::PairingLeaseHandle::new(&state),
@@ -7395,6 +7462,157 @@ mod tests {
             transport: relay,
         });
         cell
+    }
+
+    async fn poll_pending_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut future = future;
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_cannot_overwrite_retry_ceremony() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .unwrap();
+        let engine = handle.inner.lock().await;
+        let start = start_initiator_ceremony(&handle, vec![]);
+        tokio::pin!(start);
+        poll_pending_once(start.as_mut()).await;
+        let cancel = cancel_pairing_ceremony(&handle);
+        tokio::pin!(cancel);
+        poll_pending_once(cancel.as_mut()).await;
+        let retry = make_real_initiator_ceremony().await;
+        let id = retry.rendezvous_id_hex();
+        lock_or_recover(&handle.initiator_ceremony).replace(retry);
+        drop(engine);
+        let (cancelled, started) = tokio::join!(cancel, start);
+        cancelled.unwrap();
+        assert!(started.unwrap_err().contains("cancelled"));
+        assert_eq!(
+            lock_or_recover(&handle.initiator_ceremony).as_ref().unwrap().rendezvous_id_hex(),
+            id
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_verification_cannot_take_retry_ceremony() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .unwrap();
+        let ceremony = make_real_initiator_ceremony().await;
+        lock_or_recover(&handle.initiator_ceremony).replace(ceremony);
+        let engine = handle.inner.lock().await;
+        let verify = verify_initiator_confirmation_resumable(&handle);
+        tokio::pin!(verify);
+        poll_pending_once(verify.as_mut()).await;
+        let cancel = cancel_pairing_ceremony(&handle);
+        tokio::pin!(cancel);
+        poll_pending_once(cancel.as_mut()).await;
+        let retry = make_real_initiator_ceremony().await;
+        let retry_id = retry.rendezvous_id_hex();
+        lock_or_recover(&handle.initiator_ceremony).replace(retry);
+        drop(engine);
+        let (cancelled, verified) = tokio::join!(cancel, verify);
+        cancelled.unwrap();
+        assert!(verified.unwrap_err().contains("cancelled"));
+        assert_eq!(
+            lock_or_recover(&handle.initiator_ceremony).as_ref().unwrap().rendezvous_id_hex(),
+            retry_id
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_completion_cannot_consume_unuploaded_retry() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .unwrap();
+        let relay = Arc::new(MockRelay::new());
+        plant_active_upload(&handle, relay.clone(), None, true).await;
+        let mut engine = handle.inner.lock().await;
+        engine.advance_epoch(1);
+        engine.secure_store().set("sync_id", b"sync-1").unwrap();
+        engine.secure_store().set("device_id", b"device-1").unwrap();
+        engine.secure_store().set("epoch", b"2").unwrap();
+        engine.secure_store().set("epoch_key_2", BASE64.encode([7u8; 32]).as_bytes()).unwrap();
+        let complete =
+            complete_initiator_resumable_ceremony(&handle, b"123456".to_vec(), b"phrase".to_vec());
+        tokio::pin!(complete);
+        poll_pending_once(complete.as_mut()).await;
+        let cancel = cancel_pairing_ceremony(&handle);
+        tokio::pin!(cancel);
+        poll_pending_once(cancel.as_mut()).await;
+        plant_active_upload(&handle, relay, None, false).await;
+        let retry = lock_or_recover(&handle.initiator_attempt).as_ref().unwrap().clone();
+        drop(engine);
+        let (cancelled, completed) = tokio::join!(cancel, complete);
+        cancelled.unwrap();
+        assert!(completed.unwrap_err().contains("cancelled"));
+        {
+            let inner = handle.inner.lock().await;
+            assert_eq!(inner.epoch(), Some(2));
+            assert_eq!(
+                inner.storage().get_sync_metadata("sync-1").unwrap().unwrap().current_epoch,
+                2
+            );
+        }
+        let slot = lock_or_recover(&handle.initiator_verified);
+        assert!(Arc::ptr_eq(&slot.as_ref().unwrap().attempt, &retry));
+        assert!(!slot
+            .as_ref()
+            .unwrap()
+            .upload_completed
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_cannot_restore_lease_into_retry() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .unwrap();
+        let relay = Arc::new(MockRelay::new());
+        plant_active_upload(&handle, relay.clone(), None, false).await;
+        let old_attempt = lock_or_recover(&handle.initiator_attempt).as_ref().unwrap().clone();
+        let old_lease = {
+            let slot = lock_or_recover(&handle.initiator_verified);
+            let lease = lock_or_recover(&slot.as_ref().unwrap().lease).take().unwrap();
+            lease
+        };
+        cancel_pairing_ceremony(&handle).await.unwrap();
+        plant_active_upload(&handle, relay, None, false).await;
+        let retry_lease = {
+            let slot = lock_or_recover(&handle.initiator_verified);
+            Arc::clone(&slot.as_ref().unwrap().lease)
+        };
+        lock_or_recover(&retry_lease).take();
+        restore_lease_handle(&handle, &old_attempt, old_lease);
+        assert!(
+            lock_or_recover(&retry_lease).is_none(),
+            "cancelled attempt restored its lease into the retry"
+        );
     }
 
     /// Cancellation mid-upload aborts exactly the recorded session, once.
