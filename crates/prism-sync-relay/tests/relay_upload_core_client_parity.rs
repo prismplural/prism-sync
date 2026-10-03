@@ -104,7 +104,7 @@ struct Fixture {
 
 async fn fixture(tmp: &Path) -> Fixture {
     let (config, snapshot_root) = resumable_config(tmp);
-    let (url, _server, db, _state) = start_test_relay_with_state(config).await;
+    let (url, _server, db, _state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 

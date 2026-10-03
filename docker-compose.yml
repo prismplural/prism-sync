@@ -15,11 +15,9 @@ services:
       # image workdir and can be ephemeral or unwritable, which would leave
       # snapshot rows referencing blobs that were never durably stored.
       - MEDIA_STORAGE_PATH=/data/media
-      # Resumable pair-time snapshot uploads (lean v1). Requires file-backed
-      # snapshot storage, which MEDIA_STORAGE_PATH above provides. Dark by
-      # default: leaving this false keeps the capability unadvertised and every
-      # client on the existing single PUT. Before enabling, size the byte
-      # ceilings below from the volume behind /data.
+      # Both flags are required for resumable uploads. Keep file writes opt-in;
+      # when enabled, /data must persist both media and its sibling snapshot tree.
+      - SNAPSHOT_FILE_BACKING_ENABLED=${SNAPSHOT_FILE_BACKING_ENABLED:-false}
       - SNAPSHOT_UPLOAD_ENABLED=${SNAPSHOT_UPLOAD_ENABLED:-false}
       # /metrics is served only to loopback peers when METRICS_TOKEN is empty
       # (the relay fails closed — it is never world-readable). To scrape from

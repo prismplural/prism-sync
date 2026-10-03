@@ -97,7 +97,7 @@ async fn single_device_fixture(tmp: &Path) -> Fixture {
 
 async fn fixture_with(tmp: &Path, with_sibling: bool) -> Fixture {
     let (config, snapshot_root) = resumable_config(tmp);
-    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let (url, _server, db, state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 
@@ -1033,7 +1033,7 @@ async fn reservation_ceilings_reject_and_release_atomically() {
         ..SnapshotUploadConfig::default()
     };
     let snapshot_root = canonical_tmp.join("media-snapshots").to_str().unwrap().to_string();
-    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let (url, _server, db, state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -1107,7 +1107,7 @@ async fn insufficient_free_space_is_refused_at_create() {
         create_rate_limit: 10_000,
         ..SnapshotUploadConfig::default()
     };
-    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let (url, _server, db, state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -1857,7 +1857,7 @@ async fn capability_is_advertised_only_when_enabled_and_file_backed() {
 
     // (a) Enabled + file-backed: advertised.
     let (config, _root) = resumable_config(tmp.path());
-    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let (url, _server, _db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -1927,7 +1927,7 @@ async fn capability_is_advertised_only_when_enabled_and_file_backed() {
 async fn metrics_are_aggregate_only_and_track_lifecycle_outcomes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, _root) = resumable_config(tmp.path());
-    let (url, _server, _db, state) = start_test_relay_with_state(config).await;
+    let (url, _server, _db, state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -2514,7 +2514,7 @@ async fn configured_free_space_reserve_is_enforced_on_chunks_and_completion() {
 
     let snapshot_root = canonical_tmp.join("media-snapshots").to_str().unwrap().to_string();
     let (url, _server, db, state) =
-        start_test_relay_with_state(reserve_config(&media, reserve)).await;
+        start_file_backed_test_relay_with_state(reserve_config(&media, reserve)).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -2632,7 +2632,7 @@ async fn a_satisfiable_configured_reserve_still_publishes_end_to_end() {
 
     let snapshot_root = canonical_tmp.join("media-snapshots").to_str().unwrap().to_string();
     let (url, _server, db, state) =
-        start_test_relay_with_state(reserve_config(&media, reserve)).await;
+        start_file_backed_test_relay_with_state(reserve_config(&media, reserve)).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -2878,7 +2878,7 @@ async fn bytes_freed_by_a_stale_refusal_are_reusable_by_the_next_create() {
         ..SnapshotUploadConfig::default()
     };
     let snapshot_root = canonical_tmp.join("media-snapshots").to_str().unwrap().to_string();
-    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let (url, _server, db, state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();

@@ -24,11 +24,9 @@ services:
       # mount. Keep the explicit absolute path: a relative default resolves
       # under the image workdir and can be ephemeral or unwritable.
       MEDIA_STORAGE_PATH: /data/media
-      # Resumable pair-time snapshot uploads (lean v1). Requires file-backed
-      # snapshot storage, which MEDIA_STORAGE_PATH above provides. Dark by
-      # default; enabling it advertises the capability and stages session bytes
-      # under the same persistent volume. See SELF-HOSTING.md before turning it
-      # on, and size the byte ceilings from the volume behind /data.
+      # Both flags are required for resumable uploads. Size quotas and back up
+      # the persistent /data volume before enabling snapshot file writes.
+      SNAPSHOT_FILE_BACKING_ENABLED: ${SNAPSHOT_FILE_BACKING_ENABLED:-false}
       SNAPSHOT_UPLOAD_ENABLED: ${SNAPSHOT_UPLOAD_ENABLED:-false}
     env_file: .env
     ulimits:

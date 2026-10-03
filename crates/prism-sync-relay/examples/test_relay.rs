@@ -66,7 +66,9 @@ async fn main() {
         }
         _ => prism_sync_relay::db::Database::in_memory().expect("in-memory db"),
     };
-    let state = prism_sync_relay::state::AppState::new(db, config);
+    let file_backing = std::env::var("TEST_RELAY_RESUMABLE").as_deref() == Ok("1");
+    let storage = config.resolve_snapshot_storage(file_backing).expect("snapshot storage");
+    let state = prism_sync_relay::state::AppState::with_snapshot_storage(db, config, storage);
     let app = prism_sync_relay::routes::router(state);
 
     let port: u16 = std::env::var("TEST_RELAY_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);

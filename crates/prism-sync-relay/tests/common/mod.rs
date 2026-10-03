@@ -140,12 +140,40 @@ pub async fn start_test_relay_with_config(
 pub async fn start_test_relay_with_state(
     config: Config,
 ) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>, AppState) {
+    let storage = config.resolve_snapshot_storage(false).expect("inline snapshot storage");
+    start_test_relay_with_storage(config, storage).await
+}
+
+pub async fn start_file_backed_test_relay_with_state(
+    config: Config,
+) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>, AppState) {
+    let storage = config.resolve_snapshot_storage(true).expect("file-backed snapshot storage");
+    start_test_relay_with_storage(config, storage).await
+}
+
+pub async fn start_file_backed_test_relay_with_config(
+    config: Config,
+) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>) {
+    let (url, handle, db, _) = start_file_backed_test_relay_with_state(config).await;
+    (url, handle, db)
+}
+
+pub async fn start_test_relay_with_storage(
+    config: Config,
+    storage: prism_sync_relay::SnapshotStorage,
+) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>, AppState) {
     let db = if config.db_path == ":memory:" {
         Database::in_memory().expect("in-memory db")
     } else {
         Database::open(&config.db_path, config.reader_pool_size).expect("test db")
     };
-    let state = AppState::new(db, config);
+    let state = AppState::with_snapshot_storage(db, config, storage);
+    start_test_relay_with_app_state(state).await
+}
+
+pub async fn start_test_relay_with_app_state(
+    state: AppState,
+) -> (String, tokio::task::JoinHandle<()>, std::sync::Arc<Database>, AppState) {
     let db = state.db.clone();
     let state_handle = state.clone();
     let app = routes::router(state);

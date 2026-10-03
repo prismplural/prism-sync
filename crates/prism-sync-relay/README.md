@@ -32,7 +32,7 @@ All configuration via environment variables:
 | SNAPSHOT_UPLOAD_CONCURRENCY | 8 | Max in-flight snapshot PUTs; bounds peak memory (must be ≥ 1) |
 | MEDIA_UPLOAD_CONCURRENCY | 32 | Max in-flight media uploads/downloads (must be ≥ 1) |
 | MEDIA_STORAGE_PATH | data/media | Root for media and (derived) snapshot blobs. In containers set an explicit absolute path on the persistent mount, e.g. `/data/media`. |
-| SNAPSHOT_FILE_BACKING_ENABLED | (unset) | Set `true` to require file-backed snapshot storage and refuse startup if the derived root is unusable (relative, non-creatable, or unwritable). Unset downgrades to inline snapshot writes instead. |
+| SNAPSHOT_FILE_BACKING_ENABLED | (unset) | Set `true` to enable file-backed snapshot writes and require an absolute, writable persistent root. Unset or `false` keeps new snapshots inline in SQLite, even with a valid root; existing blob files remain readable. |
 | TRUSTED_PROXY_CIDRS | (none) | Comma-separated CIDRs of reverse proxies/tunnels whose forwarded client-IP headers (`CF-Connecting-IP`, `X-Forwarded-For`, `Forwarded`) are trusted. Required before enabling `PAIRING_LEASE_ENABLED` in a proxy-fronted deployment. |
 | PAIRING_LEASE_ENABLED | false | Offer the opaque pairing lease (v1). Dark by default. When `false`, a create request that offers lease metadata is downgraded to a fixed-TTL session with no `lease_version` echo, and `/lease/renew` returns the uniform not-found. |
 | PAIRING_LEASE_MAX_CONCURRENT_SESSIONS | 256 | Global cap on concurrently leased pairing rows. Renewal of an already-leased row is never blocked by this cap. |

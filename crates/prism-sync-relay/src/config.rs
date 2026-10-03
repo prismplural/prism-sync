@@ -39,8 +39,9 @@ pub enum ConfigError {
 pub enum SnapshotStorage {
     /// Write snapshot bytes to `<root>/<sync_id>/<blob_ref>`.
     FileBacked(std::path::PathBuf),
-    /// Keep snapshot bytes inline in the SQLite `snapshots.data` column — the
-    /// legacy behavior, retained when the file-backed root failed validation.
+    /// Write new snapshots inline while retaining access to existing blob files.
+    InlineWithExistingFiles(std::path::PathBuf),
+    /// Keep snapshot bytes inline in the SQLite `snapshots.data` column.
     Inline,
 }
 
@@ -50,10 +51,11 @@ impl SnapshotStorage {
         matches!(self, Self::FileBacked(_))
     }
 
-    /// The canonical storage root, when file-backed.
+    /// The canonical root for reading and cleaning up existing blobs.
+    /// New writes must also check [`Self::is_file_backed`].
     pub fn root(&self) -> Option<&std::path::Path> {
         match self {
-            Self::FileBacked(root) => Some(root),
+            Self::FileBacked(root) | Self::InlineWithExistingFiles(root) => Some(root),
             Self::Inline => None,
         }
     }
@@ -174,11 +176,10 @@ impl Default for PairingLeaseConfig {
     }
 }
 
-/// Whether `SNAPSHOT_FILE_BACKING_ENABLED` was set in the environment.
+/// Whether snapshot file writes were explicitly enabled at startup.
 ///
-/// An explicit `true` means an invalid storage root must refuse startup; an
-/// unset or explicit `false` allows the inline fallback. Kept separate from
-/// [`Config`] because it is a one-time startup decision, not runtime config.
+/// Only `true` enables file writes and requires a valid durable root. Unset or
+/// `false` keeps new snapshots inline, including with an absolute media path.
 pub fn snapshot_file_backing_explicitly_requested(env: impl Fn(&str) -> Option<String>) -> bool {
     env("SNAPSHOT_FILE_BACKING_ENABLED")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -716,39 +717,33 @@ impl Config {
         Ok(canonical)
     }
 
-    /// Apply the snapshot storage gate, returning the resolved policy.
+    /// Resolve snapshot storage without silently changing legacy writes.
     ///
-    /// Two acceptable outcomes, per the Phase 0 spec:
-    /// - the root validates → [`SnapshotStorage::FileBacked`] with the
-    ///   canonical root; or
-    /// - the root does not validate and file backing was **not** explicitly
-    ///   requested → log loudly and return [`SnapshotStorage::Inline`], so
-    ///   single PUT retains the legacy inline-BLOB write path.
-    ///
-    /// `explicit_file_backing` is true only when the operator set
-    /// `SNAPSHOT_FILE_BACKING_ENABLED` in the environment. In that case an
-    /// invalid root is a hard [`ConfigError::SnapshotStorageInvalid`] (refuse
-    /// startup) rather than a silent downgrade — a deploy that demanded file
-    /// backing must not quietly run on ephemeral storage instead.
+    /// File writes require explicit opt-in and a validated absolute, writable
+    /// root. Otherwise new snapshots remain inline. An existing absolute root
+    /// stays available for reads and cleanup after file writes are disabled;
+    /// disabled startup never creates or probes a new snapshot directory.
     pub fn resolve_snapshot_storage(
         &self,
-        explicit_file_backing: bool,
+        file_backing_enabled: bool,
     ) -> Result<SnapshotStorage, ConfigError> {
-        match self.validate_snapshot_storage() {
-            Ok(root) => Ok(SnapshotStorage::FileBacked(root)),
-            Err(reason) => {
-                if explicit_file_backing {
-                    return Err(ConfigError::SnapshotStorageInvalid { reason });
+        if file_backing_enabled {
+            return self
+                .validate_snapshot_storage()
+                .map(SnapshotStorage::FileBacked)
+                .map_err(|reason| ConfigError::SnapshotStorageInvalid { reason });
+        }
+
+        let configured = self.snapshot_storage_path();
+        let path = std::path::Path::new(&configured);
+        if path.is_absolute() {
+            if let Ok(root) = std::fs::canonicalize(path) {
+                if root.is_dir() {
+                    return Ok(SnapshotStorage::InlineWithExistingFiles(root));
                 }
-                tracing::warn!(
-                    reason = %reason,
-                    "snapshot storage root unusable — retaining inline snapshot writes \
-                     (set MEDIA_STORAGE_PATH to an absolute persistent path, or set \
-                     SNAPSHOT_FILE_BACKING_ENABLED=true to refuse startup instead)"
-                );
-                Ok(SnapshotStorage::Inline)
             }
         }
+        Ok(SnapshotStorage::Inline)
     }
 
     pub fn try_from_env() -> Result<Self, ConfigError> {
@@ -1674,5 +1669,31 @@ mod tests {
         assert!(!value_of(Some("false")), "explicit false keeps the inline fallback");
         assert!(!value_of(Some("1")), "only `true` opts in");
         assert!(!value_of(None), "unset keeps the inline fallback");
+    }
+    #[test]
+    fn disabled_file_backing_does_not_create_a_valid_absolute_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        let config =
+            config_from_env_pairs(&[("MEDIA_STORAGE_PATH", media.to_str().unwrap())]).unwrap();
+        let root = std::path::PathBuf::from(config.snapshot_storage_path());
+        assert!(!root.exists());
+        assert_eq!(config.resolve_snapshot_storage(false).unwrap(), SnapshotStorage::Inline);
+        assert!(!root.exists(), "disabled startup must not create a snapshot directory");
+    }
+
+    #[test]
+    fn disabling_file_writes_retains_existing_root_without_advertising_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        let mut config =
+            config_from_env_pairs(&[("MEDIA_STORAGE_PATH", media.to_str().unwrap())]).unwrap();
+        config.snapshot_upload.enabled = true;
+        let enabled = config.resolve_snapshot_storage(true).unwrap();
+        assert!(config.snapshot_upload_capability(&enabled).is_some());
+        let disabled = config.resolve_snapshot_storage(false).unwrap();
+        assert!(!disabled.is_file_backed());
+        assert_eq!(disabled.root(), enabled.root());
+        assert!(config.snapshot_upload_capability(&disabled).is_none());
     }
 }

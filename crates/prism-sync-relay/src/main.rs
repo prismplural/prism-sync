@@ -38,11 +38,8 @@ async fn main() -> anyhow::Result<()> {
     let mut config = Config::try_from_env().context("invalid relay configuration")?;
     let port = config.port;
 
-    // Phase 0 storage gate: resolve the snapshot blob root before serving. An
-    // unusable root either refuses startup (when the operator explicitly
-    // demanded file backing) or downgrades to the legacy inline-BLOB write
-    // path, so a snapshot row can never commit while its bytes were never
-    // durably stored.
+    // File writes require explicit opt-in and a valid durable root. Otherwise
+    // new snapshots stay inline while existing blob files remain readable.
     let explicit_file_backing =
         prism_sync_relay::config::snapshot_file_backing_explicitly_requested(|key| {
             std::env::var(key).ok()
@@ -57,10 +54,14 @@ async fn main() -> anyhow::Result<()> {
                 "snapshot file backing enabled"
             );
         }
-        prism_sync_relay::SnapshotStorage::Inline => {
-            tracing::warn!(
-                "snapshot file backing disabled — snapshot bytes will be written inline in SQLite"
+        prism_sync_relay::SnapshotStorage::InlineWithExistingFiles(root) => {
+            tracing::info!(
+                snapshot_root = %root.display(),
+                "snapshot file writes disabled; existing blobs remain readable"
             );
+        }
+        prism_sync_relay::SnapshotStorage::Inline => {
+            tracing::info!("snapshot file writes disabled; new snapshots remain inline in SQLite");
         }
     }
 
@@ -107,8 +108,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(
             "SNAPSHOT_UPLOAD_ENABLED=true but snapshot file backing is not active (snapshot \
              storage resolved to inline writes); resumable snapshot uploads stay dark. Set \
-             MEDIA_STORAGE_PATH to an absolute persistent path (or \
-             SNAPSHOT_FILE_BACKING_ENABLED=true to refuse startup instead)."
+             SNAPSHOT_FILE_BACKING_ENABLED=true with MEDIA_STORAGE_PATH on an absolute \
+             writable persistent path to enable them."
         );
     }
     if let Some(capability) = config.snapshot_upload_capability(&snapshot_storage) {

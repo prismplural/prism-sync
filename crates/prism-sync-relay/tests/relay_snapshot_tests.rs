@@ -58,7 +58,7 @@ fn snapshot_files(snapshot_root: &str, sync_id: &str) -> Vec<std::path::PathBuf>
 async fn file_backed_put_stores_blob_on_disk_and_get_roundtrips() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let (url, _server, db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -116,7 +116,7 @@ async fn file_backed_put_stores_blob_on_disk_and_get_roundtrips() {
 async fn file_backed_replace_unlinks_old_blob() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let (url, _server, _db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -176,7 +176,7 @@ async fn file_backed_replace_unlinks_old_blob() {
 async fn stale_put_cleans_up_its_own_blob() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let (url, _server, _db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -232,7 +232,7 @@ async fn stale_put_cleans_up_its_own_blob() {
 async fn delete_snapshot_unlinks_blob() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let (url, _server, db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 
@@ -278,7 +278,7 @@ async fn delete_snapshot_unlinks_blob() {
 async fn ttl_expiry_cleanup_unlinks_blob() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let (url, _server, db, state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 
@@ -339,7 +339,7 @@ async fn cap_reject_writes_no_blob() {
     // so a 409 too_many_targeted_snapshots never leaves an orphan blob on disk.
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let (url, _server, db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
 
@@ -397,7 +397,7 @@ async fn cap_reject_writes_no_blob() {
 async fn legacy_inline_snapshot_still_served_and_replaceable() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let (url, _server, db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -457,7 +457,7 @@ async fn legacy_inline_snapshot_still_served_and_replaceable() {
 async fn delete_account_removes_snapshot_dir() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let (url, _server, _db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -2103,7 +2103,7 @@ async fn targeted_upload_without_ttl_gets_default_ttl() {
 async fn valid_absolute_root_enables_file_backing() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (_url, _server, _db, state) = start_test_relay_with_state(config).await;
+    let (_url, _server, _db, state) = start_file_backed_test_relay_with_state(config).await;
 
     assert!(
         state.snapshot_storage.is_file_backed(),
@@ -2185,7 +2185,7 @@ async fn missing_published_blob_reads_as_snapshot_absent_with_metric() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let (config, snapshot_root) = storage_under_tmp(tmp.path());
-    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let (url, _server, db, state) = start_file_backed_test_relay_with_state(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -2259,7 +2259,7 @@ async fn symlinked_group_dir_is_refused_by_put() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::create_dir_all(&snapshot_root).unwrap();
 
-    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let (url, _server, db) = start_file_backed_test_relay_with_config(config).await;
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
@@ -2298,4 +2298,143 @@ async fn symlinked_group_dir_is_refused_by_put() {
         })
         .unwrap();
     assert_eq!(rows, 0, "a rejected write publishes no row");
+}
+
+#[tokio::test]
+async fn default_absolute_root_keeps_put_inline_and_upload_routes_dark() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (mut config, root) = storage_under_tmp(tmp.path());
+    config.snapshot_upload.enabled = true;
+    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    assert!(!state.snapshot_storage.is_file_backed());
+    assert!(!std::path::Path::new(&root).exists());
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+    let payload = b"legacy-inline".to_vec();
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        payload.clone(),
+        &[],
+    )
+    .await;
+    assert_eq!(put.status(), 204);
+    let row =
+        db.with_read_conn(|conn| db::get_snapshot(conn, &sync_id, &device_id)).unwrap().unwrap();
+    assert!(row.blob_ref.is_none());
+    assert_eq!(row.data, payload);
+    let downloaded = fetch_snapshot_json(&client, &url, &sync_id, &device_id, &token).await;
+    assert_eq!(BASE64.decode(downloaded["data"].as_str().unwrap()).unwrap(), payload);
+    let caps: serde_json::Value = client
+        .get(format!("{url}/v1/sync/{sync_id}/capabilities"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(caps.get("snapshot_upload").is_none());
+    let resp = client
+        .post(format!("{url}/v1/sync/{sync_id}/snapshot/uploads"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(!std::path::Path::new(&root).exists(), "legacy PUT must not create blob storage");
+}
+
+#[tokio::test]
+async fn disabling_file_writes_preserves_reads_ack_replacement_and_expiry_cleanup() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, root) = storage_under_tmp(tmp.path());
+    let (url, server, db, mut state) = start_file_backed_test_relay_with_state(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let initiator = generate_device_id();
+    let keys = TestDeviceKeys::generate(&initiator);
+    let token = register_device(&client, &url, &sync_id, &initiator, &keys).await;
+    let mut targets = Vec::new();
+    for _ in 0..3 {
+        let target = generate_device_id();
+        let (target_token, target_keys) = prepare_device(&db, &sync_id, &target).await;
+        let put = put_snapshot_signed(
+            &client,
+            &url,
+            &sync_id,
+            &initiator,
+            &token,
+            &keys,
+            "7",
+            b"existing-file".to_vec(),
+            &[("X-For-Device-Id", &target)],
+        )
+        .await;
+        assert_eq!(put.status(), 204);
+        targets.push((target, target_token, target_keys));
+    }
+    assert_eq!(snapshot_files(&root, &sync_id).len(), 3);
+    server.abort();
+    state.snapshot_storage = state.config.resolve_snapshot_storage(false).unwrap();
+    assert!(!state.snapshot_storage.is_file_backed());
+    assert!(state.snapshot_storage.root().is_some());
+    let (url, _server, _, state) = start_test_relay_with_app_state(state).await;
+
+    for (target, target_token, _) in &targets {
+        let data = fetch_snapshot_json(&client, &url, &sync_id, target, target_token).await;
+        assert_eq!(BASE64.decode(data["data"].as_str().unwrap()).unwrap(), b"existing-file");
+    }
+    let (target, target_token, target_keys) = &targets[0];
+    let ack =
+        delete_snapshot_signed(&client, &url, &sync_id, target, target_token, target_keys).await;
+    assert_eq!(ack.status(), 204);
+    assert_eq!(snapshot_files(&root, &sync_id).len(), 2);
+
+    let (target, target_token, _) = &targets[1];
+    let replacement = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator,
+        &token,
+        &keys,
+        "8",
+        b"new-inline".to_vec(),
+        &[("X-For-Device-Id", target)],
+    )
+    .await;
+    assert_eq!(replacement.status(), 204);
+    let row = db.with_read_conn(|conn| db::get_snapshot(conn, &sync_id, target)).unwrap().unwrap();
+    assert!(row.blob_ref.is_none());
+    assert_eq!(row.data, b"new-inline");
+    assert_eq!(snapshot_files(&root, &sync_id).len(), 1, "replacement unlinks the old blob");
+    let data = fetch_snapshot_json(&client, &url, &sync_id, target, target_token).await;
+    assert_eq!(BASE64.decode(data["data"].as_str().unwrap()).unwrap(), b"new-inline");
+
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE snapshots SET expires_at = ?1 WHERE sync_id = ?2 AND target_device_id = ?3",
+            rusqlite::params![db::now_secs() - 1, sync_id, targets[2].0],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    prism_sync_relay::cleanup::run_cleanup(&state).await;
+    assert!(snapshot_files(&root, &sync_id).is_empty());
+    assert!(db
+        .with_read_conn(|conn| db::get_snapshot(conn, &sync_id, &targets[2].0))
+        .unwrap()
+        .is_none());
 }

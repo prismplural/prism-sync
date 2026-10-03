@@ -210,7 +210,7 @@ share one bucket. A relay reached directly by clients needs no allowlist.
 | `MEDIA_UPLOAD_RATE_LIMIT` | `10` | Max uploads per sync group per rate window |
 | `MEDIA_UPLOAD_RATE_WINDOW_SECS` | `60` | Rate limit sliding window |
 | `MEDIA_ORPHAN_CLEANUP_SECS` | `86400` | Interval for cleaning up orphaned media files (24 hours) |
-| `SNAPSHOT_FILE_BACKING_ENABLED` | *(unset)* | Set to `true` to **require** file-backed snapshot storage and refuse startup if the derived root (`<MEDIA_STORAGE_PATH>-snapshots`) is unusable (relative, non-creatable, or unwritable). Unset or `false` keeps the legacy inline-in-SQLite snapshot path as a fallback, so an upgrade against a relative `MEDIA_STORAGE_PATH` degrades instead of failing. Set `true` on a production relay that has an absolute `MEDIA_STORAGE_PATH` so a bad root fails loudly instead of silently writing snapshots inline. |
+| `SNAPSHOT_FILE_BACKING_ENABLED` | *(unset)* | Set to `true` to **enable** file-backed snapshot writes and require an absolute, writable persistent root (`<MEDIA_STORAGE_PATH>-snapshots`); an unusable root refuses startup. Unset or `false` keeps new snapshots inline in SQLite, including with a valid absolute media path, and never creates a new snapshot directory. Existing blob files remain readable and eligible for ACK/expiry cleanup after disabling new file writes. Resumable upload capability requires this flag and `SNAPSHOT_UPLOAD_ENABLED=true`. |
 
 ### Resumable Snapshot Uploads
 
@@ -219,10 +219,10 @@ request. This keeps each request well under common reverse-proxy and CDN per-req
 limits and lets an interrupted upload resume from the relay's acknowledged offset rather
 than restarting at byte zero.
 
-**It is dark by default.** Nothing changes until you set `SNAPSHOT_UPLOAD_ENABLED=true`,
-and even then the relay advertises the capability only when file-backed snapshot storage is
-active (which requires an absolute `MEDIA_STORAGE_PATH`; see
-`SNAPSHOT_FILE_BACKING_ENABLED` above). A relay that does not advertise the capability is
+**Resumable uploads are disabled by default.** To enable them, set both
+`SNAPSHOT_UPLOAD_ENABLED=true` and `SNAPSHOT_FILE_BACKING_ENABLED=true`, with an absolute
+`MEDIA_STORAGE_PATH` on persistent storage. File writes can also be enabled independently
+of resumable uploads. A relay that does not advertise the capability is
 indistinguishable to clients from an older relay: they use the existing single
 `PUT /v1/sync/{sync_id}/snapshot`, whose behavior is unchanged.
 
@@ -255,11 +255,10 @@ Behavior worth knowing before you enable it:
   contract (one process owning the SQLite database and the snapshot filesystem). Do not run
   multiple relay writers behind a shared database or storage volume.
 
-Rollback behavior is documented under [Upgrades and rollback](#upgrades-and-rollback): a
-binary predating this feature ignores the session table entirely, so a downgrade while
-`SNAPSHOT_UPLOAD_ENABLED=true` simply stops advertising the capability. Already-completed
-snapshots remain readable, and any incomplete session is abandoned (its staged bytes are
-swept once no row references them).
+Disabling `SNAPSHOT_UPLOAD_ENABLED` withholds new resumable sessions while keeping completed
+snapshots readable. Disabling file writes also preserves reads and cleanup of existing
+blobs. Downgrading the binary has additional schema and file-format constraints; see
+[Upgrades and rollback](#upgrades-and-rollback).
 
 ### Request Timeouts and Concurrency
 
@@ -357,15 +356,14 @@ copying the file directly.
 Media files live at `MEDIA_STORAGE_PATH` (default `data/media`). Back up this directory
 alongside the database. Media is encrypted ciphertext — safe to store on any backup service.
 
-Pair-time snapshot blobs are stored as separate files alongside media, under the
-`MEDIA_STORAGE_PATH` parent (`<parent>-snapshots`). Because snapshots are file-backed
-rather than stored in the database, **a backup that replicates only SQLite does not
-preserve snapshot blobs** — back up the `MEDIA_STORAGE_PATH` tree too, or a restored
-relay can hold snapshot rows whose bytes are gone (a client then sees the snapshot as
-absent and must re-pair). On startup the relay validates that the snapshot storage root
-is an absolute, writable path; if it is not, the relay either refuses to start (when
-`SNAPSHOT_FILE_BACKING_ENABLED=true` is set explicitly) or falls back to storing snapshot
-bytes inline in SQLite.
+When file writes are enabled, pair-time snapshot blobs live at
+`<MEDIA_STORAGE_PATH>-snapshots` (for example, `/data/media-snapshots` alongside
+`/data/media`). Back up both sibling directories and SQLite: backing up only SQLite or
+only the media directory does not preserve snapshot blobs. A restored row whose file is
+missing reads as an absent snapshot, requiring a new upload/pairing. Explicitly enabling
+file writes requires an absolute, writable root and refuses startup when it is unusable.
+With file writes disabled, new snapshots stay inline, while existing blobs remain readable
+and eligible for cleanup; retain their directory until those snapshots expire or are ACKed.
 
 ## Upgrades and rollback
 
@@ -393,11 +391,10 @@ the older binary, or re-upgrade. Snapshots are short-lived pair-time bootstrap d
 window closes on its own as rows expire, but do not assume a downgraded relay can serve a
 snapshot written after the upgrade.
 
-Resumable snapshot uploads add a third, narrower rollback caveat. The `snapshot_uploads`
-table is additive and a pre-feature binary ignores it completely, so a downgrade is safe:
-the older binary stops advertising the capability, and clients fall back to the existing
-single `PUT /snapshot` — there is no schema or wire change for them to misread. Two
-consequences:
+The `snapshot_uploads` session table is additive, but ignoring it does not remove the
+snapshot schema and file-backing rollback constraints above. A binary that understands
+those formats can continue serving completed snapshots after resumable uploads are disabled.
+Two consequences for incomplete sessions:
 
 - Any **in-progress** session is simply abandoned. Its staged bytes are an unreferenced
   file in the snapshot tree; the newer binary's orphan sweep reclaims it once the grace

@@ -568,12 +568,11 @@ pub async fn put_snapshot(
     // This is the single multi-MB I/O of the request and it runs entirely
     // OUTSIDE the writer mutex.
     //
-    // When the startup storage gate resolved to inline (a root that failed
-    // validation), no file is written at all and the row keeps the bytes in its
-    // `data` column — the legacy behavior — so a bad deployment can never
-    // publish rows whose bytes are missing.
+    // With file writes disabled, retain the root for reading/cleaning up old
+    // blobs, but store new bytes inline even when that directory exists.
     let storage_root = state.snapshot_storage.root().map(std::path::Path::to_path_buf);
-    let blob_ref = storage_root.as_ref().map(|_| crate::snapshot_store::generate_blob_ref());
+    let blob_ref =
+        state.snapshot_storage.is_file_backed().then(crate::snapshot_store::generate_blob_ref);
     let written_path: Option<std::path::PathBuf> = match (&storage_root, &blob_ref) {
         (Some(root), Some(bref)) => {
             let root = root.clone();
