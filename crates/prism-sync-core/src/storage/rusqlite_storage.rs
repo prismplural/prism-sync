@@ -181,11 +181,7 @@ fn query_unpushed_batch_ids(conn: &Connection, sync_id: &str) -> Result<Vec<Stri
                )",
     )?;
     let rows = stmt.query_map(params![sync_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
     })?;
 
     // Per batch keep the minimum typed HLC and the minimum `created_at`. The
@@ -369,9 +365,8 @@ fn row_to_pull_stall(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullStall> {
 }
 
 fn query_pull_stalls(conn: &Connection, sync_id: &str) -> Result<Vec<PullStall>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM pull_stall WHERE sync_id = ?1 ORDER BY server_seq ASC",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT * FROM pull_stall WHERE sync_id = ?1 ORDER BY server_seq ASC")?;
     let rows = stmt.query_map(params![sync_id], row_to_pull_stall)?;
     let mut out = Vec::new();
     for row in rows {
@@ -437,8 +432,7 @@ fn query_quarantined_pull_batches_by_sender(
          WHERE sync_id = ?1 AND sender_device_id = ?2 \
          ORDER BY server_seq ASC, quarantined_at ASC, batch_id ASC",
     )?;
-    let rows =
-        stmt.query_map(params![sync_id, sender_device_id], row_to_quarantined_pull_batch)?;
+    let rows = stmt.query_map(params![sync_id, sender_device_id], row_to_quarantined_pull_batch)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -490,10 +484,8 @@ fn query_consumer_delivery_page(
     limit: i64,
 ) -> Result<ConsumerDeliveryPage> {
     let rows = query_list_consumer_deliveries(conn, sync_id, after_id, limit)?;
-    let entities: HashSet<_> = rows
-        .iter()
-        .map(|row| (row.entity_table.as_str(), row.entity_id.as_str()))
-        .collect();
+    let entities: HashSet<_> =
+        rows.iter().map(|row| (row.entity_table.as_str(), row.entity_id.as_str())).collect();
     let mut current_field_versions = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT * FROM field_versions \
@@ -501,10 +493,7 @@ fn query_consumer_delivery_page(
          ORDER BY field_name ASC",
     )?;
     for (table, entity_id) in entities {
-        let versions = stmt.query_map(
-            params![sync_id, table, entity_id],
-            row_to_field_version,
-        )?;
+        let versions = stmt.query_map(params![sync_id, table, entity_id], row_to_field_version)?;
         for version in versions {
             current_field_versions.push(version?);
         }
@@ -719,8 +708,7 @@ fn exec_update_last_imported_registry_version(
              updated_at = ?3 \
          WHERE sync_id = ?1",
         params![sync_id, version, Utc::now().to_rfc3339()],
-    )
-    ?;
+    )?;
     Ok(())
 }
 
@@ -1010,15 +998,7 @@ fn exec_bump_pull_sender_health(
          quarantined_batch_count = quarantined_batch_count + ?6, \
          last_seen_at = excluded.last_seen_at, \
          last_error = COALESCE(excluded.last_error, last_error)",
-        params![
-            sync_id,
-            sender_device_id,
-            reason,
-            now,
-            stall_delta,
-            quarantine_delta,
-            last_error,
-        ],
+        params![sync_id, sender_device_id, reason, now, stall_delta, quarantine_delta, last_error,],
     )?;
     Ok(())
 }
@@ -1294,9 +1274,8 @@ fn query_self_authored_future_fv(
 ) -> Result<Vec<FieldVersion>> {
     // Filter by author in SQL, parse the HLC and apply the drift bound in Rust
     // (the TEXT encoding is unpadded, so a SQL comparison gets counters wrong).
-    let mut stmt = conn.prepare(
-        "SELECT * FROM field_versions WHERE sync_id = ?1 AND winning_device_id = ?2",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT * FROM field_versions WHERE sync_id = ?1 AND winning_device_id = ?2")?;
     let rows = stmt.query_map(params![sync_id, device_id], row_to_field_version)?;
     let now_ms = Hlc::now_ms();
     let mut result = Vec::new();
@@ -1942,10 +1921,7 @@ impl SyncStorage for RusqliteSyncStorage {
         query_quarantined_ops(&conn, sync_id)
     }
 
-    fn list_quarantined_pull_batches(
-        &self,
-        sync_id: &str,
-    ) -> Result<Vec<QuarantinedPullBatch>> {
+    fn list_quarantined_pull_batches(&self, sync_id: &str) -> Result<Vec<QuarantinedPullBatch>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_quarantined_pull_batches(&conn, sync_id)
     }
@@ -2019,10 +1995,7 @@ impl SyncStorage for RusqliteSyncStorage {
         query_quarantined_batch_count(&conn, sync_id)
     }
 
-    fn get_pending_epoch_rotation(
-        &self,
-        sync_id: &str,
-    ) -> Result<Option<PendingEpochRotation>> {
+    fn get_pending_epoch_rotation(&self, sync_id: &str) -> Result<Option<PendingEpochRotation>> {
         let conn = self.conn.lock().expect("mutex poisoned");
         query_pending_epoch_rotation(&conn, sync_id)
     }
@@ -2247,8 +2220,7 @@ impl SyncStorageTx for RusqliteTx<'_> {
     }
 
     fn delete_pending_op(&mut self, op_id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM pending_ops WHERE op_id = ?1", params![op_id])?;
+        self.conn.execute("DELETE FROM pending_ops WHERE op_id = ?1", params![op_id])?;
         Ok(())
     }
 
@@ -2344,11 +2316,7 @@ impl SyncStorageTx for RusqliteTx<'_> {
         )
     }
 
-    fn clear_pull_sender_health(
-        &mut self,
-        sync_id: &str,
-        sender_device_id: &str,
-    ) -> Result<()> {
+    fn clear_pull_sender_health(&mut self, sync_id: &str, sender_device_id: &str) -> Result<()> {
         exec_clear_pull_sender_health(&self.conn, sync_id, sender_device_id)
     }
 
@@ -3353,7 +3321,8 @@ mod tests {
 
         let dst = make_storage();
         let mut tx = dst.begin_tx().unwrap();
-        let entity_count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
+        let entity_count =
+            tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         // 2 unique entities: (members, ent-1) and (sessions, ent-2)
@@ -3577,7 +3546,9 @@ mod tests {
 
         let count = {
             let mut tx = dst.begin_tx().unwrap();
-            let count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
+            let count = tx
+                .import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS)
+                .unwrap();
             tx.commit().unwrap();
             count
         };
@@ -3713,7 +3684,9 @@ mod tests {
 
         let count = {
             let mut tx = dst.begin_tx().unwrap();
-            let count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
+            let count = tx
+                .import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS)
+                .unwrap();
             tx.commit().unwrap();
             count
         };
@@ -3741,7 +3714,8 @@ mod tests {
         tx.commit().unwrap();
 
         let mut tx = dst.begin_tx().unwrap();
-        let count = tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
+        let count =
+            tx.import_snapshot("sync-1", &blob, crate::clock_drift::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
 
         assert_eq!(count, 2);
@@ -3874,7 +3848,11 @@ mod tests {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
         // Random bytes that aren't valid zstd
-        let result = tx.import_snapshot("sync-1", &[0xFF, 0xFE, 0xFD], crate::clock_drift::MAX_CLOCK_DRIFT_MS);
+        let result = tx.import_snapshot(
+            "sync-1",
+            &[0xFF, 0xFE, 0xFD],
+            crate::clock_drift::MAX_CLOCK_DRIFT_MS,
+        );
         assert!(result.is_err());
     }
 
@@ -4353,8 +4331,7 @@ mod tests {
         tx.mark_batch_pushed("batch-pushed").unwrap();
         tx.commit().unwrap();
 
-        let deleted =
-            storage.delete_unpushed_future_pending_ops("sync-1", "dev1", 60_000).unwrap();
+        let deleted = storage.delete_unpushed_future_pending_ops("sync-1", "dev1", 60_000).unwrap();
         assert_eq!(deleted, 1, "only the self-authored unpushed over-bound op should go");
 
         assert!(storage.load_batch_ops("batch-future").unwrap().is_empty());
@@ -4436,20 +4413,29 @@ mod tests {
         let mut tx = storage.begin_tx().unwrap();
         tx.update_last_pulled_seq("sync-1", 100).unwrap();
         tx.commit().unwrap();
-        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 100);
+        assert_eq!(
+            storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq,
+            100
+        );
 
         // A lower value (e.g. a Phase 0b replay re-applying an old batch) must
         // NOT rewind the cursor.
         let mut tx = storage.begin_tx().unwrap();
         tx.update_last_pulled_seq("sync-1", 40).unwrap();
         tx.commit().unwrap();
-        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 100);
+        assert_eq!(
+            storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq,
+            100
+        );
 
         // A higher value still advances.
         let mut tx = storage.begin_tx().unwrap();
         tx.update_last_pulled_seq("sync-1", 150).unwrap();
         tx.commit().unwrap();
-        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 150);
+        assert_eq!(
+            storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq,
+            150
+        );
     }
 
     #[test]
@@ -4459,7 +4445,10 @@ mod tests {
         tx.upsert_sync_metadata(&sample_metadata("sync-1")).unwrap();
         tx.update_last_pulled_seq("sync-1", 500).unwrap();
         tx.commit().unwrap();
-        assert_eq!(storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq, 500);
+        assert_eq!(
+            storage.get_sync_metadata("sync-1").unwrap().unwrap().last_pulled_server_seq,
+            500
+        );
 
         // The explicit reset escape hatch (bootstrap / relay-log lineage change) is
         // allowed to move the cursor backwards.
@@ -4568,7 +4557,8 @@ mod tests {
         let storage = make_storage();
         assert!(storage.list_quarantined_pull_batches("sync-1").unwrap().is_empty());
 
-        let batch = sample_quarantined_pull_batch("sync-1", "batch-poison", 12, "payload_hash_mismatch");
+        let batch =
+            sample_quarantined_pull_batch("sync-1", "batch-poison", 12, "payload_hash_mismatch");
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_quarantined_pull_batch(&batch).unwrap();
         tx.commit().unwrap();
@@ -4597,15 +4587,24 @@ mod tests {
 
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-1", "b1", 10, "missing_epoch_key",
+            "sync-1",
+            "b1",
+            10,
+            "missing_epoch_key",
         ))
         .unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-1", "b2", 20, "decode_failed",
+            "sync-1",
+            "b2",
+            20,
+            "decode_failed",
         ))
         .unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-other", "b3", 5, "missing_epoch_key",
+            "sync-other",
+            "b3",
+            5,
+            "missing_epoch_key",
         ))
         .unwrap();
         tx.commit().unwrap();
@@ -4623,11 +4622,17 @@ mod tests {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-1", "b-high", 30, "decode_failed",
+            "sync-1",
+            "b-high",
+            30,
+            "decode_failed",
         ))
         .unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-1", "b-low", 10, "decode_failed",
+            "sync-1",
+            "b-low",
+            10,
+            "decode_failed",
         ))
         .unwrap();
         tx.commit().unwrap();
@@ -4642,7 +4647,10 @@ mod tests {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-1", "b", 5, "sender_unresolved",
+            "sync-1",
+            "b",
+            5,
+            "sender_unresolved",
         ))
         .unwrap();
         tx.commit().unwrap();
@@ -4671,11 +4679,17 @@ mod tests {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-1", "b1", 1, "decode_failed",
+            "sync-1",
+            "b1",
+            1,
+            "decode_failed",
         ))
         .unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-other", "b2", 1, "decode_failed",
+            "sync-other",
+            "b2",
+            1,
+            "decode_failed",
         ))
         .unwrap();
         tx.commit().unwrap();
@@ -4695,14 +4709,22 @@ mod tests {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch_from(
-            "sync-1", "shared-id", 10, "invalid_signature", "honest-h",
+            "sync-1",
+            "shared-id",
+            10,
+            "invalid_signature",
+            "honest-h",
         ))
         .unwrap();
         // A compromised device pushes a deliberately-failing batch under the SAME
         // batch_id; with batch_id alone as the key this REPLACE would destroy H's
         // durably-stored envelope.
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch_from(
-            "sync-1", "shared-id", 11, "attribution_mismatch", "compromised-m",
+            "sync-1",
+            "shared-id",
+            11,
+            "attribution_mismatch",
+            "compromised-m",
         ))
         .unwrap();
         tx.commit().unwrap();
@@ -4772,7 +4794,10 @@ mod tests {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
         tx.insert_quarantined_pull_batch(&sample_quarantined_pull_batch(
-            "sync-1", "b", 5, "decode_failed",
+            "sync-1",
+            "b",
+            5,
+            "decode_failed",
         ))
         .unwrap();
         tx.record_pull_stall("sync-1", 5, "sender_unresolved").unwrap();
@@ -4847,11 +4872,9 @@ mod tests {
     fn consumer_delivery_page_bounds_rows_and_reads_current_winners_for_touched_entities() {
         let storage = make_storage();
         let mut tx = storage.begin_tx().unwrap();
-        for (entity, field, seq) in [
-            ("front-1", "member_id", 1),
-            ("member-1", "name", 2),
-            ("outside-page", "name", 3),
-        ] {
+        for (entity, field, seq) in
+            [("front-1", "member_id", 1), ("member-1", "name", 2), ("outside-page", "name", 3)]
+        {
             let mut row = sample_consumer_delivery("sync-1", entity, Some(field), seq);
             row.entity_table = if entity == "front-1" {
                 "fronting_sessions".to_string()
@@ -4890,12 +4913,11 @@ mod tests {
                 && fv.field_name == "member_id"
                 && fv.winning_encoded_value.as_deref() == Some("\"new-member\"")
         }));
-        assert!(page.current_field_versions.iter().any(|fv| {
-            fv.entity_id == "front-1" && fv.field_name == "start_time"
-        }));
-        assert!(!page.current_field_versions.iter().any(|fv| {
-            fv.entity_id == "outside-page"
-        }));
+        assert!(page
+            .current_field_versions
+            .iter()
+            .any(|fv| { fv.entity_id == "front-1" && fv.field_name == "start_time" }));
+        assert!(!page.current_field_versions.iter().any(|fv| { fv.entity_id == "outside-page" }));
     }
 
     #[test]
@@ -4903,8 +4925,7 @@ mod tests {
         let storage = make_storage();
 
         let mut tx = storage.begin_tx().unwrap();
-        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-1", "ent-1", None, 5))
-            .unwrap();
+        tx.insert_consumer_delivery(&sample_consumer_delivery("sync-1", "ent-1", None, 5)).unwrap();
         tx.commit().unwrap();
 
         let rows = storage.list_consumer_deliveries("sync-1", 0, 100).unwrap();

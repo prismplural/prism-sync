@@ -75,6 +75,11 @@ tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "limit"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 
+# OS primitives (safe wrappers; no `unsafe` in relay code)
+# `fs` gives us `statvfs` for the resumable-upload free-space gate and
+# `open(O_NOFOLLOW)` for symlink-resistant candidate opens.
+rustix = { version = "1", features = ["fs"] }
+
 # Database
 rusqlite = "0.37"
 

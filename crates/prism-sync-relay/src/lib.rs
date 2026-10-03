@@ -8,6 +8,8 @@ pub(crate) mod errors;
 pub(crate) mod registration_binding;
 pub mod routes;
 pub mod snapshot_limits;
+pub mod snapshot_store;
 pub mod state;
+pub mod uploads;
 
-pub use config::GifProviderMode;
+pub use config::{GifProviderMode, SnapshotStorage};

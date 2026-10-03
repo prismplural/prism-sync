@@ -27,7 +27,11 @@ pub fn routes() -> Router<AppState> {
 ///   Prometheus or `docker exec`). Any non-loopback peer gets 401. This keeps
 ///   the common internal/firewalled deployment working while closing the
 ///   default-open hole an empty/unset `METRICS_TOKEN` previously left.
-fn authorize_metrics(state: &AppState, headers: &HeaderMap, peer_addr: SocketAddr) -> Result<(), AppError> {
+fn authorize_metrics(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+) -> Result<(), AppError> {
     match state.config.metrics_token.as_deref() {
         Some(expected_token) => {
             let provided = headers
@@ -81,10 +85,29 @@ async fn prometheus_metrics(
     let ws_notifications_dropped = m.ws_notifications_dropped.load(Ordering::Relaxed);
     let snapshots_rejected_stale = m.snapshots_rejected_stale.load(Ordering::Relaxed);
     let reconciliation_missing = m.media_reconciliation_missing_files.load(Ordering::Relaxed);
-    let snapshots_rejected_targeted_cap =
-        m.snapshots_rejected_targeted_cap.load(Ordering::Relaxed);
+    let snapshots_rejected_targeted_cap = m.snapshots_rejected_targeted_cap.load(Ordering::Relaxed);
+    let snapshots_missing_blob = m.snapshots_missing_blob.load(Ordering::Relaxed);
     let log_token_rotations = m.log_token_rotations.load(Ordering::Relaxed);
     let lineage_companion_unreadable = m.lineage_companion_unreadable.load(Ordering::Relaxed);
+    let pairing_lease_renewed = m.pairing_lease_renewed.load(Ordering::Relaxed);
+    let pairing_lease_renew_not_found = m.pairing_lease_renew_not_found.load(Ordering::Relaxed);
+    let pairing_lease_renew_client_limited =
+        m.pairing_lease_renew_client_limited.load(Ordering::Relaxed);
+    let pairing_lease_renew_rejected_rate_limited =
+        m.pairing_lease_renew_rejected_rate_limited.load(Ordering::Relaxed);
+    let leased_pairing_sessions = m.cached_leased_pairing_sessions.load(Ordering::Relaxed);
+    let upload_sessions_active = m.cached_snapshot_upload_sessions_active.load(Ordering::Relaxed);
+    let upload_reserved_bytes = m.cached_snapshot_upload_reserved_bytes.load(Ordering::Relaxed);
+    let upload_chunks_accepted = m.snapshot_upload_chunks_accepted.load(Ordering::Relaxed);
+    let upload_chunks_rejected = m.snapshot_upload_chunks_rejected.load(Ordering::Relaxed);
+    let upload_chunk_bytes = m.snapshot_upload_chunk_bytes.load(Ordering::Relaxed);
+    let upload_completions = m.snapshot_upload_completions.load(Ordering::Relaxed);
+    let upload_quota_rejections = m.snapshot_upload_quota_rejections.load(Ordering::Relaxed);
+    let upload_hash_mismatch = m.snapshot_upload_hash_mismatch.load(Ordering::Relaxed);
+    let upload_staging_corrupt = m.snapshot_upload_staging_corrupt.load(Ordering::Relaxed);
+    let upload_expired = m.snapshot_upload_expired.load(Ordering::Relaxed);
+    let upload_aborted = m.snapshot_upload_aborted.load(Ordering::Relaxed);
+    let upload_superseded = m.snapshot_upload_superseded.load(Ordering::Relaxed);
 
     let output = format!(
         "# HELP prism_connected_devices Current WebSocket connections\n\
@@ -117,12 +140,64 @@ async fn prometheus_metrics(
          # HELP prism_snapshots_rejected_targeted_cap_total Targeted PUT /snapshot rejected with 409 too_many_targeted_snapshots\n\
          # TYPE prism_snapshots_rejected_targeted_cap_total counter\n\
          prism_snapshots_rejected_targeted_cap_total {snapshots_rejected_targeted_cap}\n\
+         # HELP prism_snapshots_missing_blob_total Published file-backed snapshot rows whose on-disk blob was missing or unreadable; served as snapshot-absent\n\
+         # TYPE prism_snapshots_missing_blob_total counter\n\
+         prism_snapshots_missing_blob_total {snapshots_missing_blob}\n\
          # HELP prism_log_token_rotations_total Startup lineage checks that detected a regressed batch sequence and rotated log_token\n\
          # TYPE prism_log_token_rotations_total counter\n\
          prism_log_token_rotations_total {log_token_rotations}\n\
          # HELP prism_lineage_companion_unreadable_total Startup lineage checks that could not read the companion file, forfeiting restore detection for that boot\n\
          # TYPE prism_lineage_companion_unreadable_total counter\n\
-         prism_lineage_companion_unreadable_total {lineage_companion_unreadable}\n",
+         prism_lineage_companion_unreadable_total {lineage_companion_unreadable}\n\
+         # HELP prism_pairing_lease_renewed_total Pairing lease renewals that extended a lease\n\
+         # TYPE prism_pairing_lease_renewed_total counter\n\
+         prism_pairing_lease_renewed_total {pairing_lease_renewed}\n\
+         # HELP prism_pairing_lease_renew_not_found_total Pairing lease renewals that did not extend a lease (unknown/expired/unsupported/pre-confirmation/consumed/saturated/wrong secret); mirrors the uniform not-found response\n\
+         # TYPE prism_pairing_lease_renew_not_found_total counter\n\
+         prism_pairing_lease_renew_not_found_total {pairing_lease_renew_not_found}\n\
+         # HELP prism_pairing_lease_renew_client_limited_total Pairing lease renewals dropped by the trusted-proxy-derived client-IP limiter\n\
+         # TYPE prism_pairing_lease_renew_client_limited_total counter\n\
+         prism_pairing_lease_renew_client_limited_total {pairing_lease_renew_client_limited}\n\
+         # HELP prism_pairing_lease_renew_rejected_rate_limited_total Pairing lease renewal failures that exhausted the per-rendezvous failure bucket\n\
+         # TYPE prism_pairing_lease_renew_rejected_rate_limited_total counter\n\
+         prism_pairing_lease_renew_rejected_rate_limited_total {pairing_lease_renew_rejected_rate_limited}\n\
+         # HELP prism_leased_pairing_sessions Pairing rows currently holding a live lease (absolute deadline set and in the future), refreshed each cleanup cycle\n\
+         # TYPE prism_leased_pairing_sessions gauge\n\
+         prism_leased_pairing_sessions {leased_pairing_sessions}\n\
+         # HELP prism_snapshot_upload_sessions_active Nonterminal resumable-upload sessions (gauge, refreshed each cleanup cycle)\n\
+         # TYPE prism_snapshot_upload_sessions_active gauge\n\
+         prism_snapshot_upload_sessions_active {upload_sessions_active}\n\
+         # HELP prism_snapshot_upload_reserved_bytes Bytes reserved by nonterminal resumable-upload sessions (gauge, refreshed each cleanup cycle)\n\
+         # TYPE prism_snapshot_upload_reserved_bytes gauge\n\
+         prism_snapshot_upload_reserved_bytes {upload_reserved_bytes}\n\
+         # HELP prism_snapshot_upload_chunks_total Resumable upload chunk requests by outcome\n\
+         # TYPE prism_snapshot_upload_chunks_total counter\n\
+         prism_snapshot_upload_chunks_total{{result=\"accepted\"}} {upload_chunks_accepted}\n\
+         prism_snapshot_upload_chunks_total{{result=\"rejected\"}} {upload_chunks_rejected}\n\
+         # HELP prism_snapshot_upload_chunk_bytes_total Bytes durably committed by accepted resumable upload chunks\n\
+         # TYPE prism_snapshot_upload_chunk_bytes_total counter\n\
+         prism_snapshot_upload_chunk_bytes_total {upload_chunk_bytes}\n\
+         # HELP prism_snapshot_upload_completions_total Resumable upload completions that published a snapshot\n\
+         # TYPE prism_snapshot_upload_completions_total counter\n\
+         prism_snapshot_upload_completions_total {upload_completions}\n\
+         # HELP prism_snapshot_upload_quota_rejections_total Resumable upload admission/write rejections from a quota or free-space bound\n\
+         # TYPE prism_snapshot_upload_quota_rejections_total counter\n\
+         prism_snapshot_upload_quota_rejections_total {upload_quota_rejections}\n\
+         # HELP prism_snapshot_upload_hash_mismatch_total Completions rejected because staged bytes did not match the create-time SHA-256\n\
+         # TYPE prism_snapshot_upload_hash_mismatch_total counter\n\
+         prism_snapshot_upload_hash_mismatch_total {upload_hash_mismatch}\n\
+         # HELP prism_snapshot_upload_staging_corrupt_total Sessions failed for staging corruption (missing or short candidate)\n\
+         # TYPE prism_snapshot_upload_staging_corrupt_total counter\n\
+         prism_snapshot_upload_staging_corrupt_total {upload_staging_corrupt}\n\
+         # HELP prism_snapshot_upload_expired_total Resumable upload sessions expired by idle or absolute TTL\n\
+         # TYPE prism_snapshot_upload_expired_total counter\n\
+         prism_snapshot_upload_expired_total {upload_expired}\n\
+         # HELP prism_snapshot_upload_aborted_total Resumable upload sessions ended by an explicit abort\n\
+         # TYPE prism_snapshot_upload_aborted_total counter\n\
+         prism_snapshot_upload_aborted_total {upload_aborted}\n\
+         # HELP prism_snapshot_upload_superseded_total Resumable upload sessions superseded by a newer create from the same uploader\n\
+         # TYPE prism_snapshot_upload_superseded_total counter\n\
+         prism_snapshot_upload_superseded_total {upload_superseded}\n",
         m.last_cleanup_epoch_secs.load(Ordering::Relaxed),
     );
 
@@ -176,10 +251,7 @@ mod tests {
 
     fn bearer(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
+        h.insert("Authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
         h
     }
 

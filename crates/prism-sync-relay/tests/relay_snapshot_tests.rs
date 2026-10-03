@@ -19,6 +19,482 @@ use prism_sync_relay::snapshot_limits::{
 
 use common::*;
 
+// ───────────────── File-backed snapshot blob tests ─────────────────
+//
+// The relay stores snapshot bytes on disk (like media) and keeps only a
+// `blob_ref` in the row, so the writer-mutex hold during PUT is tiny. These
+// tests pin a known storage root so they can assert on the on-disk files
+// directly, then verify PUT/GET/DELETE/expiry/cap/cleanup all keep the file
+// set and the wire semantics consistent.
+
+/// A test config whose media (and therefore the derived snapshot) storage lives
+/// under `tmp`, so both trees are cleaned up when the `TempDir` drops. Returns
+/// the config and the resolved snapshot storage root.
+///
+/// The startup storage gate canonicalizes the configured root, so the returned
+/// root is canonicalized too — otherwise an assertion on the on-disk tree would
+/// compare against a different (symlinked) path on platforms where the temp
+/// directory itself is a symlink.
+fn storage_under_tmp(tmp: &std::path::Path) -> (prism_sync_relay::config::Config, String) {
+    let mut config = test_config();
+    let canonical_tmp = std::fs::canonicalize(tmp).unwrap();
+    let media = canonical_tmp.join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    config.media_storage_path = media.to_str().unwrap().to_string();
+    let snapshot_root = canonical_tmp.join("media-snapshots").to_str().unwrap().to_string();
+    (config, snapshot_root)
+}
+
+/// List the snapshot blob files currently on disk for one group.
+fn snapshot_files(snapshot_root: &str, sync_id: &str) -> Vec<std::path::PathBuf> {
+    let dir = std::path::Path::new(snapshot_root).join(sync_id);
+    match std::fs::read_dir(&dir) {
+        Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn file_backed_put_stores_blob_on_disk_and_get_roundtrips() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let payload = vec![7u8; 1024 * 1024]; // 1 MB
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "42",
+        payload.clone(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+
+    // The row is file-backed: a blob_ref is set and the inline `data` is empty.
+    let (blob_ref, inline_len): (Option<String>, i64) = db
+        .with_read_conn(|conn| {
+            conn.query_row(
+                "SELECT blob_ref, LENGTH(data) FROM snapshots WHERE sync_id = ?1",
+                rusqlite::params![sync_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .unwrap();
+    assert!(blob_ref.is_some(), "row should reference an on-disk blob");
+    assert_eq!(inline_len, 0, "file-backed row stores no inline bytes");
+
+    // Exactly one blob file on disk, holding the raw (verbatim) bytes.
+    let files = snapshot_files(&snapshot_root, &sync_id);
+    assert_eq!(files.len(), 1, "exactly one snapshot blob on disk");
+    assert_eq!(std::fs::read(&files[0]).unwrap(), payload, "blob bytes stored verbatim");
+
+    // GET reads the file back and round-trips the bytes through the wire shape.
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 200);
+    let json: serde_json::Value = get.json().await.unwrap();
+    assert_eq!(json["server_seq_at"].as_i64().unwrap(), 42);
+    assert_eq!(BASE64.decode(json["data"].as_str().unwrap()).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn file_backed_replace_unlinks_old_blob() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let r1 = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        b"v1-bytes".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(r1.status(), 204);
+    let after_v1 = snapshot_files(&snapshot_root, &sync_id);
+    assert_eq!(after_v1.len(), 1, "first upload writes one blob");
+    let first_path = after_v1[0].clone();
+
+    let r2 = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "2",
+        b"v2-bytes-longer".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(r2.status(), 204);
+
+    // The replace wrote a NEW unique file and unlinked the old one: exactly one
+    // blob remains, and it is not the v1 file.
+    let after_v2 = snapshot_files(&snapshot_root, &sync_id);
+    assert_eq!(after_v2.len(), 1, "replace leaves exactly one blob (old unlinked)");
+    assert_ne!(after_v2[0], first_path, "the replacing upload uses a fresh filename");
+    assert!(!first_path.exists(), "the superseded blob was unlinked");
+
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    let json: serde_json::Value = get.json().await.unwrap();
+    assert_eq!(BASE64.decode(json["data"].as_str().unwrap()).unwrap(), b"v2-bytes-longer");
+}
+
+#[tokio::test]
+async fn stale_put_cleans_up_its_own_blob() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let r1 = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "5",
+        b"winner".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(r1.status(), 204);
+    assert_eq!(snapshot_files(&snapshot_root, &sync_id).len(), 1);
+
+    // A stale (lower seq) upload is rejected with 409 — and the file it wrote
+    // before the row guard ran must be cleaned up, leaving no orphan.
+    let r2 = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "3",
+        b"loser".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(r2.status(), 409, "lower-seq upload is stale");
+    let files = snapshot_files(&snapshot_root, &sync_id);
+    assert_eq!(files.len(), 1, "the rejected upload left no orphan blob");
+
+    // The surviving snapshot is still the winner.
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    let json: serde_json::Value = get.json().await.unwrap();
+    assert_eq!(BASE64.decode(json["data"].as_str().unwrap()).unwrap(), b"winner");
+}
+
+#[tokio::test]
+async fn delete_snapshot_unlinks_blob() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator);
+    let token_init = register_device(&client, &url, &sync_id, &initiator, &keys_init).await;
+
+    let joiner = generate_device_id();
+    let (token_joiner, keys_joiner) = prepare_device(&db, &sync_id, &joiner).await;
+
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator,
+        &token_init,
+        &keys_init,
+        "7",
+        b"pair-bootstrap".to_vec(),
+        &[("X-For-Device-Id", &joiner)],
+    )
+    .await;
+    assert_eq!(put.status(), 204);
+    assert_eq!(snapshot_files(&snapshot_root, &sync_id).len(), 1);
+
+    // The target ACK-deletes; the row and its on-disk blob both go away.
+    let del =
+        delete_snapshot_signed(&client, &url, &sync_id, &joiner, &token_joiner, &keys_joiner).await;
+    assert_eq!(del.status(), 204);
+    assert_eq!(snapshot_files(&snapshot_root, &sync_id).len(), 0, "blob unlinked on ACK-delete");
+
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token_joiner}"))
+        .header("X-Device-Id", &joiner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 404);
+}
+
+#[tokio::test]
+async fn ttl_expiry_cleanup_unlinks_blob() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator);
+    let token_init = register_device(&client, &url, &sync_id, &initiator, &keys_init).await;
+    let joiner = generate_device_id();
+    prepare_device(&db, &sync_id, &joiner).await;
+
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator,
+        &token_init,
+        &keys_init,
+        "9",
+        b"expiring-pair".to_vec(),
+        &[("X-Snapshot-TTL", "60"), ("X-For-Device-Id", &joiner)],
+    )
+    .await;
+    assert_eq!(put.status(), 204);
+    assert_eq!(snapshot_files(&snapshot_root, &sync_id).len(), 1);
+
+    // Force the row past its TTL, then run one cleanup pass: the expired row is
+    // deleted AND its on-disk blob is unlinked (file expiry mirrors row expiry).
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE snapshots SET expires_at = ?1 WHERE sync_id = ?2",
+            rusqlite::params![db::now_secs() - 1, sync_id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    prism_sync_relay::cleanup::run_cleanup(&state).await;
+
+    assert_eq!(
+        snapshot_files(&snapshot_root, &sync_id).len(),
+        0,
+        "expired snapshot blob unlinked by cleanup"
+    );
+    let remaining = db
+        .with_read_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE sync_id = ?1",
+                rusqlite::params![sync_id],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(remaining, 0, "expired snapshot row deleted by cleanup");
+}
+
+#[tokio::test]
+async fn cap_reject_writes_no_blob() {
+    // The preflight cap check rejects a fresh audience BEFORE persisting bytes,
+    // so a 409 too_many_targeted_snapshots never leaves an orphan blob on disk.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+
+    let initiator = generate_device_id();
+    let keys_init = TestDeviceKeys::generate(&initiator);
+    let token_init = register_device(&client, &url, &sync_id, &initiator, &keys_init).await;
+
+    for i in 0..MAX_TARGETED_SNAPSHOTS_PER_GROUP {
+        let joiner = generate_device_id();
+        prepare_device(&db, &sync_id, &joiner).await;
+        let resp = put_snapshot_signed(
+            &client,
+            &url,
+            &sync_id,
+            &initiator,
+            &token_init,
+            &keys_init,
+            &format!("{}", 100 + i),
+            b"filler".to_vec(),
+            &[("X-For-Device-Id", &joiner)],
+        )
+        .await;
+        assert_eq!(resp.status(), 204);
+    }
+    // The cap is full: one blob per filler audience.
+    assert_eq!(
+        snapshot_files(&snapshot_root, &sync_id).len() as i64,
+        MAX_TARGETED_SNAPSHOTS_PER_GROUP
+    );
+
+    let overflow = generate_device_id();
+    prepare_device(&db, &sync_id, &overflow).await;
+    let resp = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &initiator,
+        &token_init,
+        &keys_init,
+        "999",
+        b"one-too-many".to_vec(),
+        &[("X-For-Device-Id", &overflow)],
+    )
+    .await;
+    assert_eq!(resp.status(), 409);
+    // No extra blob was written for the rejected audience.
+    assert_eq!(
+        snapshot_files(&snapshot_root, &sync_id).len() as i64,
+        MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+        "a cap-rejected upload writes no blob"
+    );
+}
+
+#[tokio::test]
+async fn legacy_inline_snapshot_still_served_and_replaceable() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    // Seed a legacy INLINE group-wide row (bytes in `data`, no blob_ref) — the
+    // shape every row had before file-backing.
+    let sid = sync_id.clone();
+    db.with_conn(move |conn| {
+        db::upsert_snapshot(conn, &sid, 0, 5, b"legacy-inline", None, None, Some("seed"))
+    })
+    .unwrap();
+    assert_eq!(snapshot_files(&snapshot_root, &sync_id).len(), 0, "inline row has no file");
+
+    // GET serves it straight from the column.
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 200);
+    let json: serde_json::Value = get.json().await.unwrap();
+    assert_eq!(BASE64.decode(json["data"].as_str().unwrap()).unwrap(), b"legacy-inline");
+
+    // A higher-seq file-backed PUT replaces the inline row. The old row had no
+    // blob, so nothing is unlinked; the new bytes come back from disk.
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "6",
+        b"now-file-backed".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(put.status(), 204);
+    assert_eq!(snapshot_files(&snapshot_root, &sync_id).len(), 1, "replacement is file-backed");
+
+    let get2 = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    let json2: serde_json::Value = get2.json().await.unwrap();
+    assert_eq!(BASE64.decode(json2["data"].as_str().unwrap()).unwrap(), b"now-file-backed");
+}
+
+#[tokio::test]
+async fn delete_account_removes_snapshot_dir() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, _db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        b"group-snap".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(put.status(), 204);
+    assert_eq!(snapshot_files(&snapshot_root, &sync_id).len(), 1);
+
+    // The sole active admin deletes the whole group; its snapshot tree is gone.
+    let path = format!("/v1/sync/{sync_id}");
+    let builder = client
+        .delete(format!("{url}{path}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id);
+    let del = apply_signed_headers(builder, &keys, "DELETE", &path, &sync_id, &device_id, &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204);
+
+    let group_dir = std::path::Path::new(&snapshot_root).join(&sync_id);
+    assert!(!group_dir.exists(), "group snapshot dir removed on account delete");
+}
+
 /// PUT a snapshot with signed headers, returning the raw result so callers can
 /// tolerate a connection-level error (e.g. the server closing the connection on
 /// an oversize body). Most callers want [`put_snapshot_signed`].
@@ -63,7 +539,15 @@ async fn put_snapshot_signed(
     extra_headers: &[(&str, &str)],
 ) -> reqwest::Response {
     try_put_snapshot_signed(
-        client, url, sync_id, device_id, token, keys, server_seq_at, snapshot_data, extra_headers,
+        client,
+        url,
+        sync_id,
+        device_id,
+        token,
+        keys,
+        server_seq_at,
+        snapshot_data,
+        extra_headers,
     )
     .await
     .unwrap()
@@ -310,7 +794,15 @@ async fn test_snapshot_rejects_over_wire_limit() {
     let snapshot = vec![0u8; 151 * 1024 * 1024];
     assert!(snapshot.len() > MAX_SNAPSHOT_WIRE_BYTES);
     let result = try_put_snapshot_signed(
-        &client, &url, &sync_id, &device_id, &token, &keys, "1", snapshot, &[],
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "1",
+        snapshot,
+        &[],
     )
     .await;
     if let Ok(resp) = result {
@@ -995,11 +1487,7 @@ async fn put_snapshot_equal_seq_same_uploader_replaces() {
         &[("X-For-Device-Id", &joiner_new)],
     )
     .await;
-    assert_eq!(
-        resp.status(),
-        204,
-        "same uploader, same seq, fresh joiner target must replace"
-    );
+    assert_eq!(resp.status(), 204, "same uploader, same seq, fresh joiner target must replace");
 
     // The new joiner can fetch, so the stored target changed too.
     let snapshot = fetch_snapshot_json(&client, &url, &sync_id, &joiner_new, &token_new).await;
@@ -1349,7 +1837,15 @@ async fn group_wide_only_group_has_no_ack_shortcut() {
 
     // Group-wide upload (no X-For-Device-Id).
     let put = put_snapshot_signed(
-        &client, &url, &sync_id, &device_id, &token, &keys, "5", b"group-wide".to_vec(), &[],
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "5",
+        b"group-wide".to_vec(),
+        &[],
     )
     .await;
     assert_eq!(put.status(), 204);
@@ -1460,8 +1956,14 @@ async fn targeted_cap_counts_only_other_unexpired_audiences() {
         let joiner = generate_device_id();
         prepare_device(&db, &sync_id, &joiner).await;
         let resp = put_snapshot_signed(
-            &client, &url, &sync_id, &initiator_id, &token_init, &keys_init,
-            &format!("{}", 100 + i), b"cap-filler".to_vec(),
+            &client,
+            &url,
+            &sync_id,
+            &initiator_id,
+            &token_init,
+            &keys_init,
+            &format!("{}", 100 + i),
+            b"cap-filler".to_vec(),
             &[("X-For-Device-Id", &joiner)],
         )
         .await;
@@ -1484,8 +1986,15 @@ async fn targeted_cap_counts_only_other_unexpired_audiences() {
     let fresh_joiner = generate_device_id();
     prepare_device(&db, &sync_id, &fresh_joiner).await;
     let resp = put_snapshot_signed(
-        &client, &url, &sync_id, &initiator_id, &token_init, &keys_init,
-        "500", b"fills-freed-slot".to_vec(), &[("X-For-Device-Id", &fresh_joiner)],
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "500",
+        b"fills-freed-slot".to_vec(),
+        &[("X-For-Device-Id", &fresh_joiner)],
     )
     .await;
     assert_eq!(resp.status(), 204, "a fresh audience may reclaim an expired slot");
@@ -1493,8 +2002,15 @@ async fn targeted_cap_counts_only_other_unexpired_audiences() {
     // Re-uploading to the now-expired audience is rejected: the four other
     // audiences are unexpired, so refreshing this one would make five.
     let resp = put_snapshot_signed(
-        &client, &url, &sync_id, &initiator_id, &token_init, &keys_init,
-        "501", b"would-be-fifth".to_vec(), &[("X-For-Device-Id", &expired_joiner)],
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "501",
+        b"would-be-fifth".to_vec(),
+        &[("X-For-Device-Id", &expired_joiner)],
     )
     .await;
     assert_eq!(resp.status(), 409, "refreshing an expired audience can't exceed the cap");
@@ -1534,8 +2050,15 @@ async fn targeted_upload_without_ttl_gets_default_ttl() {
 
     // Group-wide, no TTL header.
     let resp = put_snapshot_signed(
-        &client, &url, &sync_id, &initiator_id, &token_init, &keys_init, "8",
-        b"group-wide".to_vec(), &[],
+        &client,
+        &url,
+        &sync_id,
+        &initiator_id,
+        &token_init,
+        &keys_init,
+        "8",
+        b"group-wide".to_vec(),
+        &[],
     )
     .await;
     assert_eq!(resp.status(), 204);
@@ -1564,4 +2087,215 @@ async fn targeted_upload_without_ttl_gets_default_ttl() {
         Ok(())
     })
     .expect("inspect stored snapshot expiries");
+}
+
+// ───────────────── Phase 0: persistent-storage safety ─────────────────
+//
+// The startup storage gate decides, once, whether snapshot bytes go to a file
+// or stay inline in SQLite. An unusable root must either refuse startup (when
+// the operator explicitly demanded file backing) or retain inline writes — it
+// must never attempt a file-backed write against a bad root, because the row
+// would commit while its bytes were never durably stored.
+
+/// A canonical absolute root enables file backing, and the resolved path is the
+/// canonicalized root the routes will join against.
+#[tokio::test]
+async fn valid_absolute_root_enables_file_backing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (_url, _server, _db, state) = start_test_relay_with_state(config).await;
+
+    assert!(
+        state.snapshot_storage.is_file_backed(),
+        "an absolute, writable, canonical root must enable file backing"
+    );
+    assert_eq!(
+        state.snapshot_storage.root().unwrap(),
+        std::path::Path::new(&snapshot_root),
+        "resolved root is the canonicalized snapshot directory"
+    );
+}
+
+/// A relative storage root downgrades to inline writes: the PUT still succeeds
+/// (old clients keep working) and the row carries its bytes, so no snapshot row
+/// can reference a blob that was never written.
+#[tokio::test]
+async fn relative_storage_root_falls_back_to_inline_writes() {
+    let mut config = test_config();
+    // A relative path resolves under the process CWD — exactly the ephemeral
+    // container case the gate exists to refuse.
+    config.media_storage_path = "data/relative-media-must-not-be-used".to_string();
+
+    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let payload = b"inline-fallback-payload".to_vec();
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "3",
+        payload.clone(),
+        &[],
+    )
+    .await;
+    assert_eq!(put.status(), 204, "inline fallback keeps single PUT working");
+
+    // The row is inline: no blob reference, bytes present in `data`.
+    let (blob_ref, inline_len): (Option<String>, i64) = db
+        .with_read_conn(|conn| {
+            conn.query_row(
+                "SELECT blob_ref, LENGTH(data) FROM snapshots WHERE sync_id = ?1",
+                rusqlite::params![sync_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .unwrap();
+    assert!(blob_ref.is_none(), "no blob reference may be written on a bad root");
+    assert_eq!(inline_len, payload.len() as i64, "bytes are stored inline");
+
+    // And the snapshot round-trips for the downloading device.
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 200);
+    let body: serde_json::Value = get.json().await.unwrap();
+    let decoded = BASE64.decode(body["data"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded, payload, "inline fallback round-trips byte-identically");
+}
+
+/// A published file-backed row whose blob has vanished — a partial restore, a
+/// lost volume, or a manual delete — reads as the SAME snapshot-absent response
+/// as no row at all, counts one bounded metric, and never becomes a generic 500
+/// that a client would retry in a loop.
+#[tokio::test]
+async fn missing_published_blob_reads_as_snapshot_absent_with_metric() {
+    use std::sync::atomic::Ordering;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let (url, _server, db, state) = start_test_relay_with_state(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "11",
+        b"will-vanish".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(put.status(), 204);
+    let files = snapshot_files(&snapshot_root, &sync_id);
+    assert_eq!(files.len(), 1);
+    assert_eq!(state.metrics.snapshots_missing_blob.load(Ordering::Relaxed), 0);
+
+    // Simulate the lost blob while the SQLite row survives (the exact
+    // SQLite-only restore the backup docs must warn about).
+    std::fs::remove_file(&files[0]).unwrap();
+    let row_still_there: i64 = db
+        .with_read_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE sync_id = ?1",
+                rusqlite::params![sync_id],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(row_still_there, 1, "the row outlives its blob");
+
+    let get = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 404, "missing blob degrades to snapshot-absent, not 500");
+    assert_eq!(
+        state.metrics.snapshots_missing_blob.load(Ordering::Relaxed),
+        1,
+        "exactly one bounded observability increment per failed read"
+    );
+
+    // Repeated reads stay bounded: still snapshot-absent, still no 500.
+    let again = client
+        .get(format!("{url}/v1/sync/{sync_id}/snapshot"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Device-Id", &device_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 404);
+}
+
+/// A symlinked group directory is refused outright: the relay must never write
+/// snapshot bytes through a link planted inside the snapshot root.
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_group_dir_is_refused_by_put() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, snapshot_root) = storage_under_tmp(tmp.path());
+    let outside = tmp.path().join("outside-target");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(&snapshot_root).unwrap();
+
+    let (url, _server, db) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let sync_id = generate_sync_id();
+    let device_id = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device_id);
+    let token = register_device(&client, &url, &sync_id, &device_id, &keys).await;
+
+    std::os::unix::fs::symlink(&outside, std::path::Path::new(&snapshot_root).join(&sync_id))
+        .unwrap();
+
+    // No `X-For-Device-Id`, so the write path is reached before any cap check.
+    let put = put_snapshot_signed(
+        &client,
+        &url,
+        &sync_id,
+        &device_id,
+        &token,
+        &keys,
+        "13",
+        b"must-not-escape".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(put.status(), 500, "symlinked group directory is refused");
+
+    assert!(
+        std::fs::read_dir(&outside).unwrap().next().is_none(),
+        "no bytes may be written through the planted symlink"
+    );
+    let rows: i64 = db
+        .with_read_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE sync_id = ?1",
+                rusqlite::params![sync_id],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(rows, 0, "a rejected write publishes no row");
 }

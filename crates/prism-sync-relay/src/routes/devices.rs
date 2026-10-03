@@ -306,7 +306,8 @@ fn do_atomic_revoke(
         return Err(AppError::Conflict("Target device is already revoked"));
     }
 
-    let _ = db::touch_session(&tx, sync_id, target_device_id, THIRTY_DAYS_SECS, session_max_age_secs);
+    let _ =
+        db::touch_session(&tx, sync_id, target_device_id, THIRTY_DAYS_SECS, session_max_age_secs);
     db::update_sync_group_epoch(&tx, sync_id, new_epoch)
         .map_err(|e| AppError::Internal(e.to_string()))?;
     db::set_needs_rekey(&tx, sync_id, false).map_err(|e| AppError::Internal(e.to_string()))?;
@@ -895,9 +896,18 @@ mod atomic_revoke_registry_tests {
             seed_two_active_devices(conn);
             let snapshot = b"signed-registry-epoch-1".to_vec();
 
-            let new_epoch =
-                do_atomic_revoke(conn, SYNC_ID, REQUESTER, TARGET, 1, false, &wrapped_pairs(), 7_776_000, Some(&snapshot))
-                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            let new_epoch = do_atomic_revoke(
+                conn,
+                SYNC_ID,
+                REQUESTER,
+                TARGET,
+                1,
+                false,
+                &wrapped_pairs(),
+                7_776_000,
+                Some(&snapshot),
+            )
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
             assert_eq!(new_epoch, 1);
 
             // The committed registry is visible after the tx commit, and its
@@ -920,9 +930,18 @@ mod atomic_revoke_registry_tests {
         db.with_conn(|conn| {
             seed_two_active_devices(conn);
 
-            let new_epoch =
-                do_atomic_revoke(conn, SYNC_ID, REQUESTER, TARGET, 1, false, &wrapped_pairs(), 7_776_000, None)
-                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            let new_epoch = do_atomic_revoke(
+                conn,
+                SYNC_ID,
+                REQUESTER,
+                TARGET,
+                1,
+                false,
+                &wrapped_pairs(),
+                7_776_000,
+                None,
+            )
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
             assert_eq!(new_epoch, 1);
 
             // Without the field, the behavior is exactly as before: the epoch bumps
@@ -944,7 +963,15 @@ mod atomic_revoke_registry_tests {
             // neither the epoch bump nor the attached registry persists.
             let snapshot = b"signed-registry-epoch-9".to_vec();
             let result = do_atomic_revoke(
-                conn, SYNC_ID, REQUESTER, TARGET, 9, false, &wrapped_pairs(), 7_776_000, Some(&snapshot),
+                conn,
+                SYNC_ID,
+                REQUESTER,
+                TARGET,
+                9,
+                false,
+                &wrapped_pairs(),
+                7_776_000,
+                Some(&snapshot),
             );
             assert!(result.is_err());
 

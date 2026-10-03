@@ -166,6 +166,27 @@ All environment variables with their defaults. Everything is production-ready ou
 | `REVOKE_RATE_LIMIT` | `20` | Max device revocations per group per window |
 | `REVOKE_RATE_WINDOW_SECS` | `3600` | Revocation rate limit window |
 
+### Pairing Lease
+
+The opaque pairing lease (v1) keeps a confirmed pairing rendezvous alive while a
+snapshot upload continues, without linking the rendezvous to the upload. It is
+**off by default**: a relay with `PAIRING_LEASE_ENABLED=false` behaves exactly
+like a pre-lease relay, so clients fall back to fixed-TTL pairing.
+
+If anything fronts your relay (Caddy, nginx, Cloudflare Tunnel), set
+`TRUSTED_PROXY_CIDRS` to the ingress ranges **before** enabling the lease.
+Otherwise every renewal is rate limited by the ingress address and all users
+share one bucket. A relay reached directly by clients needs no allowlist.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAIRING_LEASE_ENABLED` | `false` | Offer the pairing lease. Dark by default; enabling it in a proxy-fronted deployment without `TRUSTED_PROXY_CIDRS` is refused at startup. |
+| `PAIRING_LEASE_MAX_CONCURRENT_SESSIONS` | `256` | Global cap on concurrently leased pairing rows. An already-leased row always renews, even at the cap. |
+| `PAIRING_LEASE_RENEW_RATE_LIMIT` | `120` | Max renewals per trusted-proxy-derived client IP per window. Sized well above the legitimate one-per-ceremony-per-five-minutes. |
+| `PAIRING_LEASE_RENEW_RATE_WINDOW_SECS` | `60` | Window for the per-client-IP renewal limit. |
+| `PAIRING_LEASE_FAILURE_LIMIT` | `20` | Max *failed* verifier attempts per presented rendezvous ID per window. Only failures are counted, so knowing a rendezvous ID cannot starve a legitimate renewal. |
+| `PAIRING_LEASE_FAILURE_WINDOW_SECS` | `60` | Window for the per-rendezvous failure limit. |
+
 ### Maintenance
 
 | Variable | Default | Description |
@@ -182,13 +203,63 @@ All environment variables with their defaults. Everything is production-ready ou
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEDIA_STORAGE_PATH` | `data/media` | Directory for uploaded media |
+| `MEDIA_STORAGE_PATH` | `data/media` | Directory for uploaded media. **Set this to an explicit absolute path on your persistent volume (e.g. `/data/media`)** — pair-time snapshot blobs are derived from the same parent, and a relative path can resolve under the container workdir where it is ephemeral or unwritable. |
 | `MEDIA_MAX_FILE_BYTES` | `10485760` | Maximum size per upload (10 MB) |
 | `MEDIA_QUOTA_BYTES_PER_GROUP` | `1073741824` | Total media per sync group (1 GB) |
 | `MEDIA_RETENTION_DAYS` | `90` | Days before unreferenced media is cleaned up |
 | `MEDIA_UPLOAD_RATE_LIMIT` | `10` | Max uploads per sync group per rate window |
 | `MEDIA_UPLOAD_RATE_WINDOW_SECS` | `60` | Rate limit sliding window |
 | `MEDIA_ORPHAN_CLEANUP_SECS` | `86400` | Interval for cleaning up orphaned media files (24 hours) |
+| `SNAPSHOT_FILE_BACKING_ENABLED` | *(unset)* | Set to `true` to **require** file-backed snapshot storage and refuse startup if the derived root (`<MEDIA_STORAGE_PATH>-snapshots`) is unusable (relative, non-creatable, or unwritable). Unset or `false` keeps the legacy inline-in-SQLite snapshot path as a fallback, so an upgrade against a relative `MEDIA_STORAGE_PATH` degrades instead of failing. Set `true` on a production relay that has an absolute `MEDIA_STORAGE_PATH` so a bad root fails loudly instead of silently writing snapshots inline. |
+
+### Resumable Snapshot Uploads
+
+Pair-time snapshots can be uploaded in bounded, resumable chunks instead of one large
+request. This keeps each request well under common reverse-proxy and CDN per-request
+limits and lets an interrupted upload resume from the relay's acknowledged offset rather
+than restarting at byte zero.
+
+**It is dark by default.** Nothing changes until you set `SNAPSHOT_UPLOAD_ENABLED=true`,
+and even then the relay advertises the capability only when file-backed snapshot storage is
+active (which requires an absolute `MEDIA_STORAGE_PATH`; see
+`SNAPSHOT_FILE_BACKING_ENABLED` above). A relay that does not advertise the capability is
+indistinguishable to clients from an older relay: they use the existing single
+`PUT /v1/sync/{sync_id}/snapshot`, whose behavior is unchanged.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SNAPSHOT_UPLOAD_ENABLED` | `false` | Offer resumable snapshot uploads. Requires file-backed snapshot storage; otherwise the capability stays withheld and the relay logs a warning at startup. |
+| `SNAPSHOT_UPLOAD_GLOBAL_RESERVED_BYTES` | `2516582400` | Relay-wide ceiling on bytes reserved by **in-progress** uploads (16 × the 150 MiB wire cap). Size this from the volume behind `MEDIA_STORAGE_PATH`. |
+| `SNAPSHOT_UPLOAD_GROUP_RESERVED_BYTES` | `629145600` | Per-sync-group ceiling on reserved bytes (4 × the wire cap, matching the targeted-snapshot audience cap). |
+| `SNAPSHOT_UPLOAD_FREE_SPACE_RESERVE_BYTES` | `314572800` | Free space that must remain **after** an upload's declared bytes are reserved. A create or chunk write that cannot preserve this is refused. |
+| `SNAPSHOT_UPLOAD_CREATE_RATE_LIMIT` | `10` | Max session-create requests per device per window. |
+| `SNAPSHOT_UPLOAD_CREATE_RATE_WINDOW_SECS` | `60` | Sliding window for the create rate limit. |
+| `SNAPSHOT_UPLOAD_CHUNK_CONCURRENCY` | `4` | Max simultaneous chunk writes. Excess is shed as retryable `503 upload_busy` (never a quota-coded `429`, so clients back off rather than treating it as a policy rejection). |
+
+Behavior worth knowing before you enable it:
+
+- **One active upload per device.** A new session from the same device supersedes that
+  device's older in-progress session, releasing its reservation. A lost abort cannot poison
+  later pairing attempts.
+- **Sessions expire.** An idle session expires after one hour with no newly accepted
+  offset; the absolute cap is four hours regardless of activity. Expiry and abandonment
+  release the reservation and reclaim the staged bytes.
+- **Nothing is published until completion.** Bytes are staged under
+  `<MEDIA_STORAGE_PATH>-snapshots/<sync_id>/<opaque-id>` and stay invisible until the
+  session completes and publishes the reference through the existing targeted-snapshot
+  row. The final bytes are verified against the SHA-256 declared at create time.
+- **Aggregate-only metrics.** `prism_snapshot_upload_*` metrics carry no sync, device, or
+  upload label, so they cannot become a per-user activity signal. `prism_snapshot_upload_reserved_bytes`
+  and `prism_snapshot_upload_sessions_active` are the two to watch against your ceilings.
+- **Single relay process.** Resumable sessions rely on the documented single-replica
+  contract (one process owning the SQLite database and the snapshot filesystem). Do not run
+  multiple relay writers behind a shared database or storage volume.
+
+Rollback behavior is documented under [Upgrades and rollback](#upgrades-and-rollback): a
+binary predating this feature ignores the session table entirely, so a downgrade while
+`SNAPSHOT_UPLOAD_ENABLED=true` simply stops advertising the capability. Already-completed
+snapshots remain readable, and any incomplete session is abandoned (its staged bytes are
+swept once no row references them).
 
 ### Request Timeouts and Concurrency
 
@@ -286,6 +357,16 @@ copying the file directly.
 Media files live at `MEDIA_STORAGE_PATH` (default `data/media`). Back up this directory
 alongside the database. Media is encrypted ciphertext — safe to store on any backup service.
 
+Pair-time snapshot blobs are stored as separate files alongside media, under the
+`MEDIA_STORAGE_PATH` parent (`<parent>-snapshots`). Because snapshots are file-backed
+rather than stored in the database, **a backup that replicates only SQLite does not
+preserve snapshot blobs** — back up the `MEDIA_STORAGE_PATH` tree too, or a restored
+relay can hold snapshot rows whose bytes are gone (a client then sees the snapshot as
+absent and must re-pair). On startup the relay validates that the snapshot storage root
+is an absolute, writable path; if it is not, the relay either refuses to start (when
+`SNAPSHOT_FILE_BACKING_ENABLED=true` is set explicitly) or falls back to storing snapshot
+bytes inline in SQLite.
+
 ## Upgrades and rollback
 
 Schema migrations run automatically on boot and are idempotent, so upgrading is just a
@@ -298,6 +379,40 @@ existing snapshots readable (devices still pair and pull), but snapshot **upload
 the old binary until you re-upgrade or restore the database from a pre-upgrade backup. In
 practice that means a downgraded relay can serve already-paired devices but cannot complete
 new pairings. If you must run an older binary, restore its matching database backup.
+
+File backing adds a second, independent rollback caveat. A binary that predates file
+backing does not know about the `blob_ref` column and reads snapshot bytes only from the
+inline `data` column. File-backed rows deliberately keep `data` empty (the bytes live in a
+file under the snapshot storage root), so a pre-file-backing binary reads such a row as a
+**zero-byte envelope** — it cannot return the snapshot, and the pairing client sees an empty
+payload rather than a missing one. Legacy inline rows (`blob_ref IS NULL`, written before
+file backup was enabled) keep their bytes in `data` and stay readable by both old and new
+binaries. Because of this, a downgrade is only clean if every stored snapshot is still an
+inline row; if any file-backed rows exist, restore the pre-upgrade database backup to match
+the older binary, or re-upgrade. Snapshots are short-lived pair-time bootstrap data, so this
+window closes on its own as rows expire, but do not assume a downgraded relay can serve a
+snapshot written after the upgrade.
+
+Resumable snapshot uploads add a third, narrower rollback caveat. The `snapshot_uploads`
+table is additive and a pre-feature binary ignores it completely, so a downgrade is safe:
+the older binary stops advertising the capability, and clients fall back to the existing
+single `PUT /snapshot` — there is no schema or wire change for them to misread. Two
+consequences:
+
+- Any **in-progress** session is simply abandoned. Its staged bytes are an unreferenced
+  file in the snapshot tree; the newer binary's orphan sweep reclaims it once the grace
+  period passes, or you can delete the group's snapshot directory after confirming no
+  pairing is active. No published snapshot depends on a staged file — a session only
+  becomes readable after it publishes through the same snapshot row the single PUT uses.
+- Sessions that **completed** before the downgrade are ordinary file-backed snapshot rows,
+  so the file-backing caveat above applies to them, not a new one. Re-upgrading is enough
+  to keep serving them; the session rows are only bookkeeping and their terminal metadata
+  expires on its own.
+
+To be explicit: there is **no** requirement to disable `SNAPSHOT_UPLOAD_ENABLED` before
+rolling back, because the flag only ever controls what the running binary advertises. Set it
+back to `false` on the old binary's config only if you want to be certain the capability
+stays off if you later re-upgrade without review.
 
 ## Monitoring
 
@@ -313,6 +428,50 @@ Key metrics:
 - `prism_db_size_bytes` — database size on disk
 - `prism_freelist_pages` — SQLite pages available for reuse after pruning and cleanup
 - `prism_last_cleanup_timestamp_seconds` — last cleanup cycle
+- `prism_snapshots_missing_blob_total` — published file-backed snapshot rows whose on-disk
+  blob was missing or unreadable at read time. A sustained nonzero value means the snapshot
+  storage tree and the SQLite rows have diverged (typically a restore that carried the DB but
+  not the blob tree) — check your backup coverage.
+
+Resumable snapshot upload metrics (all aggregate — none carry a sync, device, or upload
+label):
+
+- `prism_snapshot_upload_sessions_active` — in-progress upload sessions (gauge, refreshed each
+  cleanup cycle)
+- `prism_snapshot_upload_reserved_bytes` — bytes reserved by those sessions (gauge, refreshed
+  each cleanup cycle). Watch this against `SNAPSHOT_UPLOAD_GLOBAL_RESERVED_BYTES` /
+  `SNAPSHOT_UPLOAD_GROUP_RESERVED_BYTES`
+- `prism_snapshot_upload_chunks_total{result}` — accepted vs. rejected chunk requests
+- `prism_snapshot_upload_chunk_bytes_total` — bytes durably committed
+- `prism_snapshot_upload_completions_total` — completions that published a snapshot
+- `prism_snapshot_upload_quota_rejections_total` — admission/write rejections from a quota or
+  free-space bound
+- `prism_snapshot_upload_hash_mismatch_total` — completions rejected because the staged bytes
+  did not match the create-time SHA-256. **Any nonzero value deserves attention.**
+- `prism_snapshot_upload_staging_corrupt_total` — sessions failed for staging corruption
+  (missing or short candidate). **Any nonzero value means the DB and blob tree have
+  diverged.**
+- `prism_snapshot_upload_expired_total` / `prism_snapshot_upload_aborted_total` /
+  `prism_snapshot_upload_superseded_total` — sessions ended by TTL, explicit abort, or
+  replacement
+
+Alert on: reserved bytes approaching a ceiling, sustained quota rejection, active sessions
+growing without completions, and any hash/staging corruption.
+
+### Disk space observability (Phase 0)
+
+File-backed snapshots and media both write under `MEDIA_STORAGE_PATH`, so a full volume now
+means failed uploads rather than failed DB writes. Host filesystem metrics are the
+observability source: scrape node-exporter's `node_filesystem_avail_bytes` /
+`node_filesystem_size_bytes` for the volume backing `/data` (the root compose file already
+ships a `node-exporter` service with the host rootfs mounted at `/rootfs`, and
+`NODE_EXPORTER_URL` proxies a subset via `/metrics/node`). Alert on that series.
+
+Relay-side **minimum-free-space admission** exists for the resumable snapshot upload path
+only, and only when you enable it: `SNAPSHOT_UPLOAD_FREE_SPACE_RESERVE_BYTES` is checked at
+session create and again before each chunk write, so a resumable upload is refused rather
+than allowed to consume the volume's last bytes. The single `PUT /snapshot` path and the
+media path still rely on the host filesystem signals above.
 
 ## Connecting the App
 

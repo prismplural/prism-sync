@@ -230,9 +230,14 @@ async fn pull_injected_sender_batch_capturing_events(
     relay.inject_batch(envelope);
 
     let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<SyncEvent>(64);
-    let engine =
-        SyncEngine::new(storage.clone(), relay, vec![entity_ref], test_schema(), SyncConfig::default())
-            .with_event_sink(event_tx.clone());
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay,
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    )
+    .with_event_sink(event_tx.clone());
     let result = engine
         .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, None, receiver_id, 0)
         .await
@@ -458,8 +463,13 @@ async fn upload_pairing_snapshot_pulls_to_head_first() {
     let meta_before = storage.get_sync_metadata(SYNC_ID).unwrap().unwrap();
     assert_eq!(meta_before.last_pulled_server_seq, 0, "cursor starts stale");
 
-    let engine =
-        SyncEngine::new(storage.clone(), relay.clone(), vec![entity_ref], test_schema(), SyncConfig::default());
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
     engine
         .upload_pairing_snapshot(
             SYNC_ID,
@@ -587,7 +597,11 @@ async fn quarantines_entire_batch_when_op_device_id_differs_from_envelope_sender
     let (result, storage, entity, events) =
         pull_injected_sender_batch_capturing_events(vec![good, bad]).await;
 
-    assert!(result.error.is_none(), "poison batch must not surface a terminal error: {:?}", result.error);
+    assert!(
+        result.error.is_none(),
+        "poison batch must not surface a terminal error: {:?}",
+        result.error
+    );
     assert_eq!(result.merged, 0, "no op from the tainted batch may be applied");
     assert_eq!(entity.get_field("task-attribution", "title"), None);
     assert_eq!(entity.get_field("task-attribution", "done"), None);
@@ -794,7 +808,14 @@ async fn undecodable_batch_quarantined_with_decode_failed_reason() {
     .with_event_sink(event_tx.clone());
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .unwrap();
 
@@ -823,8 +844,9 @@ async fn undecodable_batch_quarantined_with_decode_failed_reason() {
 
     let mut saw_event = false;
     while let Ok(event) = event_rx.try_recv() {
-        if let prism_sync_core::events::SyncEvent::PullBatchQuarantined { reason, server_seq, .. } =
-            event
+        if let prism_sync_core::events::SyncEvent::PullBatchQuarantined {
+            reason, server_seq, ..
+        } = event
         {
             if reason == "decode_failed" && server_seq == poison_seq {
                 saw_event = true;
@@ -845,7 +867,14 @@ async fn undecodable_batch_quarantined_with_decode_failed_reason() {
     // to 1 — without re-applying anything and without rewinding past the poison
     // batch (its quarantine row keeps its original server_seq).
     let r2 = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .unwrap();
     assert!(r2.error.is_none(), "{:?}", r2.error);
@@ -863,7 +892,14 @@ async fn undecodable_batch_quarantined_with_decode_failed_reason() {
     // the gate prevents per-cycle decode churn (and, structurally, any per-row
     // sender-resolution network fetch the replay would otherwise issue).
     let r3 = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .unwrap();
     assert!(r3.error.is_none(), "{:?}", r3.error);
@@ -938,10 +974,21 @@ async fn missing_epoch_key_batch_quarantines_advances_then_replays_on_key_arriva
     // errored (CoreError::MissingEpochKey), froze the cursor, and the device
     // never acked. Now sync returns Ok and the cursor/ack advance past it.
     let r1 = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .unwrap();
-    assert!(r1.error.is_none(), "missing epoch key must not be a terminal sync error: {:?}", r1.error);
+    assert!(
+        r1.error.is_none(),
+        "missing epoch key must not be a terminal sync error: {:?}",
+        r1.error
+    );
     assert_eq!(r1.merged, 0, "nothing applies while the key is absent");
 
     assert_eq!(
@@ -964,7 +1011,14 @@ async fn missing_epoch_key_batch_quarantines_advances_then_replays_on_key_arriva
     // Cycle 2 with the key STILL absent: the reason-aware gate skips the row with
     // no crypto/network and no retry_count churn (it cannot succeed yet).
     let r2 = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .unwrap();
     assert!(r2.error.is_none());
@@ -977,7 +1031,14 @@ async fn missing_epoch_key_batch_quarantines_advances_then_replays_on_key_arriva
     // replay re-runs the full pipeline and applies the batch.
     key_hierarchy.store_epoch_key(2, zeroize::Zeroizing::new(epoch2_key.to_vec()));
     let r3 = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .unwrap();
     assert!(r3.error.is_none(), "{:?}", r3.error);
@@ -1067,13 +1128,17 @@ async fn decrypt_failed_with_held_key_still_hard_fails() {
     // recoverable-key-error set the engine re-raises), not Ok-with-error and
     // never quarantine-and-advance.
     let err = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .expect_err("a DecryptFailed under a held key must remain a terminal error");
-    assert!(
-        matches!(err, CoreError::DecryptFailed { epoch: 0, .. }),
-        "unexpected error: {err}"
-    );
+    assert!(matches!(err, CoreError::DecryptFailed { epoch: 0, .. }), "unexpected error: {err}");
     assert!(
         storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
         "a held-key decrypt failure must NOT be quarantined (fail-closed)"
@@ -1146,18 +1211,33 @@ async fn poison_batch_quarantined_good_batch_applies_and_push_not_starved() {
 
     let (event_tx, mut event_rx) =
         tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(32);
-    let engine =
-        SyncEngine::new(storage.clone(), relay.clone(), vec![entity_ref], test_schema(), SyncConfig::default())
-            .with_event_sink(event_tx.clone());
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay.clone(),
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    )
+    .with_event_sink(event_tx.clone());
 
     let result = engine
-        .sync(SYNC_ID, &key_hierarchy, &signing_key_receiver, Some(&ml_dsa_key_receiver), receiver_id, 0)
+        .sync(
+            SYNC_ID,
+            &key_hierarchy,
+            &signing_key_receiver,
+            Some(&ml_dsa_key_receiver),
+            receiver_id,
+            0,
+        )
         .await
         .unwrap();
 
     assert!(result.error.is_none(), "no terminal error: {:?}", result.error);
     assert_eq!(result.merged, 1, "only the good batch applies");
-    assert_eq!(entity.get_field("task-good-remote", "title"), Some(SyncValue::String("hello".into())));
+    assert_eq!(
+        entity.get_field("task-good-remote", "title"),
+        Some(SyncValue::String("hello".into()))
+    );
     assert_eq!(entity.get_field("task-poison", "title"), None, "poison op must not apply");
 
     assert_eq!(
@@ -1177,8 +1257,9 @@ async fn poison_batch_quarantined_good_batch_applies_and_push_not_starved() {
 
     let mut saw_event = false;
     while let Ok(event) = event_rx.try_recv() {
-        if let prism_sync_core::events::SyncEvent::PullBatchQuarantined { reason, server_seq, .. } =
-            event
+        if let prism_sync_core::events::SyncEvent::PullBatchQuarantined {
+            reason, server_seq, ..
+        } = event
         {
             if reason == "payload_hash_mismatch" && server_seq == poison_seq {
                 saw_event = true;
@@ -1523,7 +1604,11 @@ async fn quarantined_batch_from_revoked_sender_is_discarded() {
         .await
         .unwrap();
     assert!(r2.error.is_none(), "{:?}", r2.error);
-    assert_eq!(entity.get_field("task-revoke", "title"), None, "revoked sender's op must not apply");
+    assert_eq!(
+        entity.get_field("task-revoke", "title"),
+        None,
+        "revoked sender's op must not apply"
+    );
     assert!(
         storage.list_quarantined_pull_batches(SYNC_ID).unwrap().is_empty(),
         "quarantine row from a revoked sender must be terminally discarded"
@@ -1673,8 +1758,13 @@ async fn future_hlc_op_with_unknown_field_is_not_replayed_or_deleted() {
     assert_eq!(storage.list_quarantined_ops(SYNC_ID).unwrap().len(), 1);
 
     // Engine schema does NOT know `future_note`.
-    let engine =
-        SyncEngine::new(storage.clone(), relay, vec![entity_ref], test_schema(), SyncConfig::default());
+    let engine = SyncEngine::new(
+        storage.clone(),
+        relay,
+        vec![entity_ref],
+        test_schema(),
+        SyncConfig::default(),
+    );
     let result = engine
         .sync(SYNC_ID, &init_key_hierarchy(), &signing_key_receiver, None, receiver_id, 0)
         .await
@@ -2114,10 +2204,7 @@ async fn bootstrap_from_snapshot_imports_within_bound_field() {
 
     assert_eq!(count, 1);
     assert_eq!(entity_changes.len(), 1);
-    assert_eq!(
-        entity_changes[0].fields.get("title"),
-        Some(&"\"Within bound\"".to_string())
-    );
+    assert_eq!(entity_changes[0].fields.get("title"), Some(&"\"Within bound\"".to_string()));
     assert_eq!(
         storage
             .get_field_version(SYNC_ID, "tasks", "task-near", "title")
@@ -3224,17 +3311,9 @@ async fn f07_sync_once(
     config: SyncConfig,
     entity: Arc<dyn SyncableEntity>,
 ) -> SyncResult {
-    let engine = SyncEngine::new(
-        storage.clone(),
-        relay.clone(),
-        vec![entity],
-        test_schema(),
-        config,
-    );
-    engine
-        .sync(SYNC_ID, key_hierarchy, signing_key_receiver, None, receiver_id, 0)
-        .await
-        .unwrap()
+    let engine =
+        SyncEngine::new(storage.clone(), relay.clone(), vec![entity], test_schema(), config);
+    engine.sync(SYNC_ID, key_hierarchy, signing_key_receiver, None, receiver_id, 0).await.unwrap()
 }
 
 #[tokio::test]
@@ -3627,13 +3706,9 @@ async fn superseded_future_drifted_op_is_evicted_not_replayed() {
         !storage.is_op_applied("op-superseded").unwrap(),
         "the superseded op must never be applied (it can't win LWW)",
     );
-    let fv = storage
-        .get_field_version(SYNC_ID, "tasks", "task-sup", "title")
-        .unwrap()
-        .unwrap();
+    let fv = storage.get_field_version(SYNC_ID, "tasks", "task-sup", "title").unwrap().unwrap();
     assert_eq!(fv.winning_op_id, "op-later", "the later winner is untouched");
 }
-
 
 /// An envelope declaring a newer ML-DSA generation than the receiver knows
 /// (a not-yet-propagated rotation) must STALL — cursor frozen, nothing applied,
@@ -4197,7 +4272,11 @@ async fn test_payload_hash_verification() {
 
     // A payload-hash mismatch quarantines the whole envelope and advances
     // the cursor rather than hard-wedging pull (and the push phase) forever.
-    assert!(result.error.is_none(), "poison batch must not surface a terminal error: {:?}", result.error);
+    assert!(
+        result.error.is_none(),
+        "poison batch must not surface a terminal error: {:?}",
+        result.error
+    );
     assert_eq!(result.merged, 0, "no op from the tampered batch may be applied");
     assert_eq!(
         storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
@@ -4294,7 +4373,10 @@ async fn test_sync_sends_ack_after_pull() {
     // batch fully applied the cursor equals the injected seq, so the ack matches.
     let acks = relay.ack_calls();
     assert_eq!(acks.len(), 1, "expected exactly 1 ack call");
-    assert_eq!(acks[0], injected_seq, "ack should report the local pull cursor after applying the batch");
+    assert_eq!(
+        acks[0], injected_seq,
+        "ack should report the local pull cursor after applying the batch"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5199,10 +5281,7 @@ async fn apply_remote_batch_journals_winning_op_with_cursor() {
     assert_eq!(result.merged, 1);
 
     // Cursor advanced.
-    assert_eq!(
-        storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq,
-        1
-    );
+    assert_eq!(storage.get_sync_metadata(SYNC_ID).unwrap().unwrap().last_pulled_server_seq, 1);
 
     // Exactly one journal row, carrying the winner's payload, at the batch seq.
     let journal = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
@@ -5363,9 +5442,5 @@ async fn apply_remote_batch_journal_is_idempotent_on_replayed_batch() {
         .await
         .unwrap();
     let after_second = storage.list_consumer_deliveries(SYNC_ID, 0, 100).unwrap();
-    assert_eq!(
-        after_second.len(),
-        1,
-        "replayed/empty cycle must not add journal rows"
-    );
+    assert_eq!(after_second.len(), 1, "replayed/empty cycle must not add journal rows");
 }

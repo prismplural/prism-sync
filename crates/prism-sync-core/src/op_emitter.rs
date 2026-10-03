@@ -782,11 +782,7 @@ impl OpEmitter {
         // Pre-mint HLCs so a fresh-tick overflow is observed before any write,
         // restoring the watermark on failure (mirrors `emit_multi`).
         let saved_last_hlc = self.last_hlc.clone();
-        let floor_hlc = Hlc::new(
-            BACKFILL_HLC_TIMESTAMP_MS,
-            0,
-            self.device_id.clone(),
-        );
+        let floor_hlc = Hlc::new(BACKFILL_HLC_TIMESTAMP_MS, 0, self.device_id.clone());
         let mut stamped: Vec<(&String, &SyncValue, String, Hlc)> = Vec::with_capacity(plans.len());
         for (field_name, value, encoded, plan) in plans {
             let hlc = match plan {
@@ -1320,7 +1316,8 @@ mod tests {
         // Poison the watermark a full year ahead, as a forward clock excursion
         // would have. A normal `set_last_hlc` cannot move it back; the repair
         // clamp is the one path that may.
-        let poisoned = Hlc::new(now_ms() + 365 * 24 * 60 * 60 * 1000, 0, emitter.last_hlc().node_id.clone());
+        let poisoned =
+            Hlc::new(now_ms() + 365 * 24 * 60 * 60 * 1000, 0, emitter.last_hlc().node_id.clone());
         emitter.set_last_hlc(poisoned);
         assert!(emitter.last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS);
 
@@ -1364,9 +1361,15 @@ mod tests {
                 2 | 3 => {
                     let before = emitter.last_hlc().clone();
                     let minted = emitter.tick().unwrap();
-                    assert!(minted > before, "tick {minted:?} must exceed pre-tick watermark {before:?}");
+                    assert!(
+                        minted > before,
+                        "tick {minted:?} must exceed pre-tick watermark {before:?}"
+                    );
                     if let Some(prev) = &floor {
-                        assert!(minted > *prev, "tick {minted:?} must exceed prior minted {prev:?}");
+                        assert!(
+                            minted > *prev,
+                            "tick {minted:?} must exceed prior minted {prev:?}"
+                        );
                     }
                     floor = Some(minted);
                 }
@@ -2317,7 +2320,13 @@ mod tests {
 
         // A genuine "now" write establishes the current winner.
         emitter
-            .emit_update(&storage, "members", "ent-fv", &single_field("name", SyncValue::String("Beta".into())), "live")
+            .emit_update(
+                &storage,
+                "members",
+                "ent-fv",
+                &single_field("name", SyncValue::String("Beta".into())),
+                "live",
+            )
             .unwrap();
         let winner = fv(&storage, "members", "ent-fv", "name").unwrap();
         let winner_op = winner.winning_op_id.clone();
@@ -2375,7 +2384,10 @@ mod tests {
 
         // Equal field: nothing emitted, winner untouched.
         assert!(!by_field.contains_key("name"), "value-equal field must not emit");
-        assert_eq!(fv(&storage, "member_groups", "g1", "name").unwrap().winning_op_id, equal_winner);
+        assert_eq!(
+            fv(&storage, "member_groups", "g1", "name").unwrap().winning_op_id,
+            equal_winner
+        );
 
         // Divergent field: fresh HLC (above the floor, ~now).
         let color = by_field.get("color_hex").expect("divergent field emits");
@@ -2400,7 +2412,13 @@ mod tests {
 
         // One field already synced (divergent), one never synced.
         emitter
-            .emit_create(&storage, "member_groups", "g2", &single_field("name", SyncValue::String("Existing".into())), "seed2")
+            .emit_create(
+                &storage,
+                "member_groups",
+                "g2",
+                &single_field("name", SyncValue::String("Existing".into())),
+                "seed2",
+            )
             .unwrap();
         let existing_winner = fv(&storage, "member_groups", "g2", "name").unwrap().winning_op_id;
 
@@ -2427,7 +2445,10 @@ mod tests {
         assert_eq!(hlc.node_id, "a1b2c3d4e5f6", "local node_id");
 
         // Divergent winner untouched (first-device-wins).
-        assert_eq!(fv(&storage, "member_groups", "g2", "name").unwrap().winning_op_id, existing_winner);
+        assert_eq!(
+            fv(&storage, "member_groups", "g2", "name").unwrap().winning_op_id,
+            existing_winner
+        );
     }
 
     #[test]
@@ -2437,7 +2458,13 @@ mod tests {
         let storage = make_storage();
         let mut emitter = make_emitter();
         emitter
-            .emit_update(&storage, "members", "ent-b", &single_field("name", SyncValue::String("Live".into())), "live-b")
+            .emit_update(
+                &storage,
+                "members",
+                "ent-b",
+                &single_field("name", SyncValue::String("Live".into())),
+                "live-b",
+            )
             .unwrap();
         let winner = fv(&storage, "members", "ent-b", "name").unwrap();
 

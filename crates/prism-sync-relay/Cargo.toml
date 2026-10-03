@@ -43,6 +43,7 @@ subtle = { workspace = true }
 tempfile = { workspace = true }
 tokio-util = { workspace = true }
 prism-sync-crypto = { workspace = true }
+rustix = { workspace = true }
 
 [lints]
 workspace = true

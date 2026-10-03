@@ -5,6 +5,11 @@ metadata:
 data:
   PORT: "8080"
   DB_PATH: "/data/relay.db"
+  # Media and pair-time snapshot blobs live under the persistent /data mount.
+  # Keep the explicit absolute path: a relative default resolves under the image
+  # workdir and can be ephemeral or unwritable, which would leave snapshot rows
+  # referencing blobs that were never durably stored.
+  MEDIA_STORAGE_PATH: "/data/media"
   RUST_LOG: "info"
   # Private relay defaults — disable anti-abuse measures designed for public relays
   FIRST_DEVICE_POW_DIFFICULTY_BITS: "0"
@@ -27,3 +32,29 @@ data:
   DEFAULT_REQUEST_CONCURRENCY: "512"
   SNAPSHOT_UPLOAD_CONCURRENCY: "8"
   MEDIA_UPLOAD_CONCURRENCY: "32"
+  # Opaque pairing lease (v1). Dark by default: an unconfigured relay behaves
+  # exactly like a pre-lease relay, so leave this false unless you deliberately
+  # want renewals on. Leave it false if anything fronts the relay and
+  # TRUSTED_PROXY_CIDRS is not set — otherwise every client's renewal would key
+  # on the ingress address and share one rate-limit bucket.
+  PAIRING_LEASE_ENABLED: "false"
+  # Only consulted when the relay is reached through an ingress/proxy. List the
+  # ingress CIDRs so the renewal limiter keys on the real client IP. Required
+  # before enabling PAIRING_LEASE_ENABLED behind a proxy or tunnel.
+  TRUSTED_PROXY_CIDRS: ""
+  # Resumable pair-time snapshot uploads (lean v1). Dark by default. Requires
+  # file-backed snapshot storage, which is what MEDIA_STORAGE_PATH above
+  # provides; leaving this "false" keeps the capability unadvertised and clients
+  # on the existing single PUT.
+  SNAPSHOT_UPLOAD_ENABLED: "false"
+  # Byte ceilings for staged (reserved) upload sessions. These conservative
+  # defaults suit a small self-hosted relay. Size them from the volume behind
+  # /data before enabling: the global ceiling bounds how much disk concurrent
+  # pairings may reserve in total.
+  SNAPSHOT_UPLOAD_GLOBAL_RESERVED_BYTES: "2516582400"
+  SNAPSHOT_UPLOAD_GROUP_RESERVED_BYTES: "629145600"
+  # Free space that must remain after reserving an upload's declared bytes.
+  SNAPSHOT_UPLOAD_FREE_SPACE_RESERVE_BYTES: "314572800"
+  # Per-device create rate limit and simultaneous chunk writes.
+  SNAPSHOT_UPLOAD_CREATE_RATE_LIMIT: "10"
+  SNAPSHOT_UPLOAD_CHUNK_CONCURRENCY: "4"

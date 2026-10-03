@@ -1,0 +1,67 @@
+# Test-only relay image for the device resumable-pairing simulator matrix.
+#
+# This file exists so the matrix runner can build the relay from a feature
+# worktree WITHOUT touching the production `Dockerfile`.
+#
+# Why a separate file instead of `-f Dockerfile`:
+#
+# The production `Dockerfile` builds in `rust:1.93-slim` (a trixie-based image)
+# and runs in `debian:bookworm-slim`. A binary linked against trixie's glibc can
+# fail at load time on bookworm's older glibc ("GLIBC_2.4x not found"), which is
+# a silent, environment-shaped failure for a harness whose whole point is to be
+# trustworthy. Both stages here are pinned to **bookworm** so the builder and the
+# runtime agree on glibc.
+#
+# Build (context MUST be the prism-sync checkout root):
+#   container build -f Containerfile.test-relay -t prism-sync-relay:test .
+#
+# Not a release artifact and not referenced by docker-compose.yml or self-host/.
+
+# ── Stage 1: build ──────────────────────────────────────────────────────────
+FROM rust:1.93-bookworm AS builder
+WORKDIR /app
+
+# Copy manifests first so a dependency-only rebuild can be cached even when only
+# crate sources change. The workspace has five members; only prism-sync-relay and
+# its transitive dependencies are compiled.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+RUN cargo build --release -p prism-sync-relay
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────
+# Same Debian release as the builder, so glibc always matches.
+FROM debian:bookworm-slim
+
+# curl backs the container health probe the matrix runner waits on.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/prism-sync-relay /usr/local/bin/prism-sync-relay
+
+# Runs as root, like the production image, so a bind-mounted data directory owned
+# by the host user is writable without a chown.
+
+# Disposable state root. The runner bind-mounts a fresh host directory here so
+# the SQLite DB *and* the file-backed snapshot/media root live on one durable
+# path, which is what makes the resumable upload capability advertisable.
+RUN mkdir -p /data/media
+VOLUME /data
+
+# Feature flags are NOT baked in: the runner passes them explicitly at `run`
+# time so the same image can serve both the resumable and the dark relay. The
+# defaults below only mirror the production image's shape.
+ENV DB_PATH=/data/relay.db
+ENV PORT=8080
+# Absolute path on the writable volume. A relative default would resolve under
+# the image workdir and could make snapshot storage non-file-backed, which
+# silently withholds the resumable upload capability.
+ENV MEDIA_STORAGE_PATH=/data/media
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=12 \
+  CMD curl -fsS "http://localhost:${PORT}/health" || exit 1
+
+CMD ["prism-sync-relay"]

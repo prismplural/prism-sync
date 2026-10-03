@@ -8,7 +8,10 @@ pub mod websocket;
 
 pub use mock::{InjectedPullError, MockRelay};
 pub use mock_sharing_relay::MockSharingRelay;
-pub use pairing_relay::{MockPairingRelay, PairingRelay, PairingSlot, ServerPairingRelay};
+pub use pairing_relay::{
+    CreatePairingSessionOutcome, MockPairingRelay, PairingLeaseOffer, PairingRelay, PairingSlot,
+    ServerPairingRelay,
+};
 pub use server_relay::ServerRelay;
 pub use sharing_relay::{PendingSharingInit, ServerSharingRelay, SharingRelay};
 pub use traits::*;

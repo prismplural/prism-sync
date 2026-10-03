@@ -198,7 +198,9 @@ async fn insecure_non_localhost_relay_is_rejected_without_echoing_url() {
         String::new(),
         None,
     )
-    .expect_err("cleartext non-localhost relay must be rejected when insecure-transport-dev is off");
+    .expect_err(
+        "cleartext non-localhost relay must be rejected when insecure-transport-dev is off",
+    );
 
     assert!(!err.contains("relay.example.com"), "error must not echo host, got: {err}");
     assert!(!err.contains("private/path"), "error must not echo path, got: {err}");

@@ -32,6 +32,12 @@ pub struct GifServiceCapabilities {
 #[derive(Debug, Serialize)]
 pub struct CapabilitiesResponse {
     pub gifs: GifServiceCapabilities,
+    /// Resumable snapshot upload (lean v1). Absent when the capability is
+    /// withheld, which is a safe downgrade: a client falls back to the existing
+    /// single `PUT /snapshot`. Always a sibling — never nested inside `gifs` —
+    /// and unknown to old clients, which ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_upload: Option<super::uploads::SnapshotUploadCapability>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,7 +55,10 @@ pub async fn get_capabilities(
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
 
-    Ok(Json(CapabilitiesResponse { gifs: gif_capabilities(&state.config) }))
+    Ok(Json(CapabilitiesResponse {
+        gifs: gif_capabilities(&state.config),
+        snapshot_upload: state.config.snapshot_upload_capability(&state.snapshot_storage),
+    }))
 }
 
 pub async fn get_trending(

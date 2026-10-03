@@ -153,8 +153,7 @@ pub fn compute_message_id(
     // bogus clock can't panic. `as u64` is safe after the clamp.
     let window = (now_secs.max(0) as u64) / EPHEMERAL_DEDUP_WINDOW_SECS;
 
-    let mut mac =
-        HmacSha256::new_from_slice(&msgid_key).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(&msgid_key).expect("HMAC accepts any key length");
     mac.update(MSGID_DOMAIN);
     mac.update(&[0x00]);
     mac_len_prefixed(&mut mac, sync_id.as_bytes());
@@ -407,25 +406,17 @@ mod tests {
         assert!(env.sender_device_id.is_empty());
         assert!(env.recipient_device_id.is_none());
         let content = open_envelope(KEY_A, "sync1", &env).unwrap();
-        assert_eq!(content, EphemeralContent {
-            kind: "media_request".into(),
-            media_id: "blob-xyz".into(),
-        });
+        assert_eq!(
+            content,
+            EphemeralContent { kind: "media_request".into(), media_id: "blob-xyz".into() }
+        );
     }
 
     #[test]
     fn payload_is_fixed_length_regardless_of_content() {
         let short = seal_envelope(KEY_A, "s", 0, "k", "m", None, 0).unwrap();
-        let long = seal_envelope(
-            KEY_A,
-            "s",
-            0,
-            "media_uploaded",
-            &"a".repeat(120),
-            None,
-            0,
-        )
-        .unwrap();
+        let long =
+            seal_envelope(KEY_A, "s", 0, "media_uploaded", &"a".repeat(120), None, 0).unwrap();
         // 24-byte nonce + 256-byte plaintext + 16-byte tag.
         assert_eq!(short.payload.len(), 24 + PLAINTEXT_LEN + 16);
         assert_eq!(short.payload.len(), long.payload.len());
@@ -503,12 +494,15 @@ mod tests {
             "dev-x",
         );
         let (decoded, acks) = process_ephemeral_drain(&kh, "sync1", std::slice::from_ref(&good));
-        assert_eq!(decoded, vec![DecodedEphemeral {
-            sender_device_id: "dev-x".into(),
-            kind: "media_request".into(),
-            media_id: "blob-1".into(),
-            epoch_id: 2,
-        }]);
+        assert_eq!(
+            decoded,
+            vec![DecodedEphemeral {
+                sender_device_id: "dev-x".into(),
+                kind: "media_request".into(),
+                media_id: "blob-1".into(),
+                epoch_id: 2,
+            }]
+        );
         assert_eq!(acks, vec![good.message_id]);
     }
 
@@ -517,8 +511,7 @@ mod tests {
         // Epoch-rotation case: a message sealed under an epoch whose key this
         // device lacks is skipped *and* acked (lossy-OK; requester re-issues).
         let kh = unlocked_hierarchy_with(2, KEY_A);
-        let newer =
-            seal_envelope(KEY_A, "sync1", 5, "media_request", "blob-1", None, 0).unwrap(); // no key for 5
+        let newer = seal_envelope(KEY_A, "sync1", 5, "media_request", "blob-1", None, 0).unwrap(); // no key for 5
         let (decoded, acks) = process_ephemeral_drain(&kh, "sync1", std::slice::from_ref(&newer));
         assert!(decoded.is_empty());
         assert_eq!(acks, vec![newer.message_id], "skipped message is still acked");

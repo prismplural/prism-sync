@@ -56,11 +56,7 @@ pub fn is_excessively_future(hlc: &Hlc, now_ms: i64, bound_ms: i64) -> bool {
 /// over-bound one is dropped here rather than poisoning the watermark. Returns
 /// `None` when every candidate is over-bound (or the slice is empty).
 pub fn max_inheritable(candidates: &[Hlc], now_ms: i64, bound_ms: i64) -> Option<Hlc> {
-    candidates
-        .iter()
-        .filter(|hlc| !is_excessively_future(hlc, now_ms, bound_ms))
-        .max()
-        .cloned()
+    candidates.iter().filter(|hlc| !is_excessively_future(hlc, now_ms, bound_ms)).max().cloned()
 }
 
 /// Order push-queue batches by their typed minimum HLC, not wall-clock time.
@@ -163,7 +159,11 @@ mod tests {
     fn is_excessively_future_boundary_is_inclusive_of_bound() {
         let now = 1_000_000;
         // Exactly at the bound: accepted (not excessive).
-        assert!(!is_excessively_future(&hlc_at(now + MAX_CLOCK_DRIFT_MS, 0), now, MAX_CLOCK_DRIFT_MS));
+        assert!(!is_excessively_future(
+            &hlc_at(now + MAX_CLOCK_DRIFT_MS, 0),
+            now,
+            MAX_CLOCK_DRIFT_MS
+        ));
         // One ms past the bound: excessive.
         assert!(is_excessively_future(
             &hlc_at(now + MAX_CLOCK_DRIFT_MS + 1, 0),
@@ -171,7 +171,11 @@ mod tests {
             MAX_CLOCK_DRIFT_MS
         ));
         // Well in the past: never excessive.
-        assert!(!is_excessively_future(&hlc_at(now - 10 * MAX_CLOCK_DRIFT_MS, 0), now, MAX_CLOCK_DRIFT_MS));
+        assert!(!is_excessively_future(
+            &hlc_at(now - 10 * MAX_CLOCK_DRIFT_MS, 0),
+            now,
+            MAX_CLOCK_DRIFT_MS
+        ));
     }
 
     #[test]
@@ -179,9 +183,9 @@ mod tests {
         let now = 1_000_000;
         let bound = MAX_CLOCK_DRIFT_MS;
         let candidates = vec![
-            hlc_at(now - 5_000, 0),            // past, eligible
-            hlc_at(now + 10_000, 0),           // near future, eligible (the winner)
-            hlc_at(now + bound + 50_000, 0),   // over bound, excluded
+            hlc_at(now - 5_000, 0),          // past, eligible
+            hlc_at(now + 10_000, 0),         // near future, eligible (the winner)
+            hlc_at(now + bound + 50_000, 0), // over bound, excluded
         ];
         let picked = max_inheritable(&candidates, now, bound).expect("an eligible candidate");
         assert_eq!(picked.timestamp, now + 10_000);
@@ -200,8 +204,7 @@ mod tests {
     fn max_inheritable_breaks_ties_on_counter_then_node() {
         let now = 1_000_000;
         let bound = MAX_CLOCK_DRIFT_MS;
-        let candidates =
-            vec![Hlc::new(now + 1_000, 9, "devA"), Hlc::new(now + 1_000, 10, "devA")];
+        let candidates = vec![Hlc::new(now + 1_000, 9, "devA"), Hlc::new(now + 1_000, 10, "devA")];
         let picked = max_inheritable(&candidates, now, bound).unwrap();
         // :10 beats :9 via typed Ord, not lexical.
         assert_eq!(picked.counter, 10);

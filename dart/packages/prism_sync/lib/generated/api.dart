@@ -6,9 +6,9 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `apply_auto_sync_config`, `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `coalesce_consumer_deliveries`, `compute_registration_key_bundle_hash`, `consumer_delivery_spill_threshold`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `effective_allow_insecure`, `empty_undelivered_changes_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `heal_configured_epoch`, `hydrate_consumer_deliveries`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_localhost_url`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `load_device_ml_dsa_generation`, `lock_or_recover`, `map_media_fetch_error_kind`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_persisted_epoch_keys`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `should_kick_auto_sync`, `skip_ascii_whitespace`, `stop_auto_sync_tasks`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `url_host`, `validate_cached_sharing_id`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `CeremonyGuardKind`, `RollbackCredentialSnapshot`, `SharingHandleContext`, `SharingPendingResultJson`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clear`, `clone`, `delete`, `drop`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `set`, `snapshot`
+// These functions are ignored because they are not marked as `pub`: `abort_resumable_upload_best_effort`, `apply_auto_sync_config`, `build_epoch_key_hashes_for_registry`, `build_pairing_relay`, `build_relay`, `build_resumable_transport`, `build_sharing_context`, `build_sharing_relay`, `cache_sharing_id`, `cas_delete`, `char_at`, `clear_rollback_credentials`, `clear_sharing_id_cache`, `coalesce_consumer_deliveries`, `compute_registration_key_bundle_hash`, `consumer_delivery_spill_threshold`, `credential_release_gate`, `decode_binary_string`, `decode_optional_u8`, `decode_optional_utf8`, `decode_persisted_epoch_key`, `device_info_to_json`, `effective_allow_insecure`, `empty_undelivered_changes_json`, `encode_core_error`, `encode_handle_core_error`, `encoded_value_to_json`, `ensure_app_supports_stored_floor`, `ensure_handle_supports_signature_version_floor`, `ensure_local_sync_metadata`, `finalize_initiator_completion`, `format_handle_relay_error`, `generation_aware_trust_decision_to_str`, `guard_ceremony_in_progress`, `heal_configured_epoch`, `hydrate_consumer_deliveries`, `import_signed_registry`, `install_panic_hook_once`, `install_trace_subscriber_once`, `is_fragment_char`, `is_key_char`, `is_last_active_device_error`, `is_localhost_url`, `is_long_token_like`, `is_sensitive_key_at`, `is_short_hex_identifier`, `is_unquoted_value_delimiter`, `is_uuid_like`, `json_number_to_i64`, `json_value_to_sync_value_for_type`, `json_value_to_sync_value`, `keyed_value_range`, `lease_flags`, `load_device_ml_dsa_generation`, `lock_or_recover`, `map_media_fetch_error_kind`, `new`, `next_registry_snapshot_version`, `now_unix_timestamp`, `parse_epoch_key_name`, `parse_fields_json_for_schema`, `parse_schema_json`, `parse_sharing_id_bytes`, `parse_sharing_process_pending_inputs`, `parse_string_array_json`, `poll_pairing_slot`, `push_redacted_fragment`, `ratchet_handle_min_signature_version_floor`, `ratchet_min_signature_version_floor`, `reconcile_ml_dsa_rotation_commit`, `redact_display`, `redact_keyed_values`, `redact_sensitive_message`, `redact_unkeyed_fragments`, `redacted_identifier_for_log`, `relay_error_category_to_json`, `republish_sharing_identity`, `require_secure_string`, `restore_lease_handle`, `restore_persisted_epoch_keys`, `resumable_legacy_budget`, `rollback_outcome_deregistered`, `rollback_outcome_failed`, `rollback_outcome_group_deleted`, `rollback_outcome_no_op`, `sas_display_json`, `secret_text`, `sharing_rotation_needed`, `should_abort_upload`, `should_kick_auto_sync`, `skip_ascii_whitespace`, `stop_auto_sync_tasks`, `stored_min_signature_version_floor`, `sync_event_to_json`, `sync_ml_dsa_generation_forward`, `sync_result_to_json`, `sync_status_to_json`, `upload_id_hash_for_log`, `url_host`, `validate_cached_sharing_id`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `ActiveUpload`, `CeremonyGuardKind`, `FfiLeaseUploadHook`, `InitiatorVerifiedSlot`, `RollbackCredentialSnapshot`, `SharingHandleContext`, `SharingPendingResultJson`, `UploadSessionCell`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `assert_fields_are_eq`, `clear`, `clone`, `clone`, `clone`, `clone`, `clone`, `delete`, `drop`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `get`, `on_committed_offset_advanced`, `on_session_created`, `set`, `snapshot`
 
 /// Retrieve and clear the most recently captured Rust panic, if any.
 ///
@@ -1170,7 +1170,7 @@ Future<Uint8List> decryptXchacha({
   ciphertext: ciphertext,
 );
 
-/// Generate cryptographically secure random bytes.
+/// Cryptographically secure random bytes.
 Future<Uint8List> randomBytes({required int len}) =>
     RustLib.instance.api.crateApiRandomBytes(len: len);
 
@@ -1300,6 +1300,99 @@ Future<String> completeInitiatorCeremony({
   mnemonic: mnemonic,
 );
 
+/// Verify the joiner's confirmation and retain resumable ceremony state.
+///
+/// **Step 1** of the split initiator ceremony. Waits for the joiner's protected
+/// confirmation, verifies it, retains the opaque ceremony state and the
+/// pairing-lease handle, and performs the initial lease renewal when lease v1 was
+/// negotiated. Credentials are **not** released here — that needs
+/// [`complete_initiator_resumable_ceremony`], which refuses until the snapshot is
+/// durably published.
+///
+/// The wait is owned by core: a lease-capable ceremony may wait through the
+/// four-hour absolute cap with bounded exponential backoff, and a legacy ceremony
+/// keeps the existing fixed deadline. There is deliberately no FFI-side timeout
+/// here, because any fixed wrapper deadline would preempt the lease-aware core
+/// wait.
+///
+/// Returns `lease_active == true` when all three parties negotiated lease v1.
+Future<bool> verifyInitiatorConfirmationResumable({
+  required PrismSyncHandle handle,
+}) => RustLib.instance.api.crateApiVerifyInitiatorConfirmationResumable(
+  handle: handle,
+);
+
+/// Produce and upload the pairing snapshot for a verified ceremony.
+///
+/// **Step 2** of the split initiator ceremony, and the only way to reach the
+/// upload for a verified ceremony.
+///
+/// The snapshot is produced and uploaded by core
+/// (`upload_pairing_snapshot_with_lease_hook`), so the pull-to-head, the export,
+/// the encryption/signing, the resumable transport, the capability downgrade to
+/// single `PUT`, `SnapshotStale` suppression, and the lease-progress renewal
+/// coalescing all remain core's. The FFI supplies only the identity material and
+/// a hook that records the relay's session id and turns acknowledged offsets into
+/// coalesced renewals.
+///
+/// It refuses unless step 1 retained a verified ceremony, and refuses to run
+/// twice for the same ceremony. On success it records publication on the retained
+/// ceremony, which is what authorizes [`complete_initiator_resumable_ceremony`].
+///
+/// The upload runs inline on the caller's task, because the device's ML-DSA
+/// signing key is not `Clone` and cannot be moved into a spawned task. A
+/// cancellation from another task therefore cannot stop the transfer itself, but
+/// it can abort the relay session as soon as the create response has published the
+/// session id (see [`cancel_pairing_ceremony`]).
+///
+/// **The app must call [`cancel_pairing_ceremony`] to end an abandoned upload.**
+/// Nothing here times the upload out on the app's behalf: the relay holds the
+/// session's byte reservation until the session goes terminal, and only an abort
+/// (or the relay's own idle/absolute expiry) ends it. Dropping the caller's future
+/// is not enough — the upload may be suspended at an await point, and the relay
+/// session outlives it. The upload id is the only handle on that session; it is
+/// published to the shared cell on the first successful create and retained until
+/// the session is terminal, so a cancellation arriving at any point after the
+/// create can abort exactly that session. A cancellation that arrives before the
+/// create returned has nothing to abort, which is correct: no session exists yet.
+Future<ResumableSnapshotUploadResult> uploadPairingSnapshotResumable({
+  required PrismSyncHandle handle,
+  BigInt? ttlSecs,
+}) => RustLib.instance.api.crateApiUploadPairingSnapshotResumable(
+  handle: handle,
+  ttlSecs: ttlSecs,
+);
+
+/// Perform the final lease renewal, release credentials, and wait for the
+/// joiner's terminal bundle.
+///
+/// **Step 3**, and the only credential-release path for the split ceremony. It
+/// refuses to run until the upload half recorded a durable publication, so no
+/// caller can publish credentials before the snapshot is stored.
+///
+/// Ordering preserved from core: the final renewal happens immediately before
+/// credential publication (exempt from the five-minute coalescing interval), and
+/// the wait for the joiner's terminal bundle uses core's lease-aware policy, which
+/// can run to the four-hour absolute cap. The joiner's own path still posts its
+/// terminal bundle before downloading/importing the snapshot.
+///
+/// The wait is core-owned; this function adds no wrapper deadline, because a fixed
+/// one would preempt a lease-aware core wait.
+Future<ResumableCeremonyCompletion> completeInitiatorResumableCeremony({
+  required PrismSyncHandle handle,
+  required List<int> password,
+  required List<int> mnemonic,
+}) => RustLib.instance.api.crateApiCompleteInitiatorResumableCeremony(
+  handle: handle,
+  password: password,
+  mnemonic: mnemonic,
+);
+
+/// Resumable snapshot capability as this device sees it.
+Future<SnapshotUploadCapabilityInfo> snapshotUploadCapability({
+  required PrismSyncHandle handle,
+}) => RustLib.instance.api.crateApiSnapshotUploadCapability(handle: handle);
+
 /// Rotate this device's ML-DSA-65 signing key.
 ///
 /// Generates a new ML-DSA keypair at the next generation, creates a
@@ -1401,6 +1494,118 @@ class MediaUploadOutcome {
           inProgress == other.inProgress;
 }
 
+/// Result of [`complete_initiator_resumable_ceremony`].
+///
+/// `Debug` is safe here: no key material and no session identifiers, only the
+/// lease booleans and already-redacted failure text.
+class ResumableCeremonyCompletion {
+  /// Whether the ceremony completed and credentials were released.
+  final bool completed;
+
+  /// Whether the ceremony negotiated the opaque pairing lease (v1).
+  final bool leaseActive;
+
+  /// Whether the relay confirmed at least one lease extension during this
+  /// ceremony. `false` with `lease_active == true` means every renewal attempt
+  /// failed; the ceremony continued under its previously established expiry,
+  /// which is the specified nonfatal behavior.
+  final bool leaseRenewed;
+
+  /// `true` when the ceremony could renew at all.
+  final bool leaseCapable;
+
+  /// Redacted failure text when `completed` is false.
+  final String? error;
+
+  const ResumableCeremonyCompletion({
+    required this.completed,
+    required this.leaseActive,
+    required this.leaseRenewed,
+    required this.leaseCapable,
+    this.error,
+  });
+
+  @override
+  int get hashCode =>
+      completed.hashCode ^
+      leaseActive.hashCode ^
+      leaseRenewed.hashCode ^
+      leaseCapable.hashCode ^
+      error.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ResumableCeremonyCompletion &&
+          runtimeType == other.runtimeType &&
+          completed == other.completed &&
+          leaseActive == other.leaseActive &&
+          leaseRenewed == other.leaseRenewed &&
+          leaseCapable == other.leaseCapable &&
+          error == other.error;
+}
+
+/// Result of [`upload_pairing_snapshot_resumable`].
+///
+/// Carries the terminal byte counts rather than a progress callback: a
+/// Rust-to-Dart callback is not expressible in `flutter_rust_bridge` without a
+/// globally registered port, so progress is reported through the existing
+/// `SyncEvent::SnapshotUploadProgress` stream and this result reports where the
+/// transfer ended. No unsafe global callback is introduced.
+///
+/// `Debug` is safe here: this struct holds no key material, only a session
+/// identifier that is not a bearer capability.
+class ResumableSnapshotUploadResult {
+  /// Which transport published the snapshot.
+  final SnapshotTransportUsed transport;
+
+  /// Relay-generated resumable session id (empty when `transport` is
+  /// `SinglePut`).
+  final String uploadId;
+
+  /// Bytes the relay acknowledged as durably committed.
+  final PlatformInt64 committedBytes;
+
+  /// Total envelope bytes.
+  final PlatformInt64 totalBytes;
+
+  /// Whether the ceremony negotiated the opaque pairing lease (v1).
+  final bool leaseActive;
+
+  /// Whether the relay confirmed at least one lease extension.
+  final bool leaseRenewed;
+
+  const ResumableSnapshotUploadResult({
+    required this.transport,
+    required this.uploadId,
+    required this.committedBytes,
+    required this.totalBytes,
+    required this.leaseActive,
+    required this.leaseRenewed,
+  });
+
+  @override
+  int get hashCode =>
+      transport.hashCode ^
+      uploadId.hashCode ^
+      committedBytes.hashCode ^
+      totalBytes.hashCode ^
+      leaseActive.hashCode ^
+      leaseRenewed.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ResumableSnapshotUploadResult &&
+          runtimeType == other.runtimeType &&
+          transport == other.transport &&
+          uploadId == other.uploadId &&
+          committedBytes == other.committedBytes &&
+          totalBytes == other.totalBytes &&
+          leaseActive == other.leaseActive &&
+          leaseRenewed == other.leaseRenewed;
+}
+
 class SharingProcessPendingInputs {
   final List<String> existingRelationships;
   final Map<String, Uint8List> pinnedIdentities;
@@ -1459,4 +1664,72 @@ class SharingProcessPendingInputsObject {
           existingRelationships == other.existingRelationships &&
           pinnedIdentities == other.pinnedIdentities &&
           verifiedPeers == other.verifiedPeers;
+}
+
+/// How the snapshot reached the relay.
+enum SnapshotTransportUsed {
+  /// Resumable v1 chunks; the session id is reported in `upload_id`.
+  resumable,
+
+  /// The relay did not advertise resumable support and the unchanged single
+  /// `PUT` published the snapshot. A downgrade, not an error.
+  singlePut,
+}
+
+/// Resumable snapshot capability as seen by this device.
+class SnapshotUploadCapabilityInfo {
+  /// Availability state.
+  final SnapshotUploadCapabilityState state;
+
+  /// Protocol version (0 when unavailable).
+  final PlatformInt64 version;
+
+  /// Server-selected chunk size in bytes (0 when unavailable).
+  final PlatformInt64 chunkBytes;
+
+  /// Maximum accepted envelope size in bytes (0 when unavailable).
+  final PlatformInt64 maxWireBytes;
+
+  /// Bounded machine reason for unavailability, for logs/tests.
+  final String? reason;
+
+  const SnapshotUploadCapabilityInfo({
+    required this.state,
+    required this.version,
+    required this.chunkBytes,
+    required this.maxWireBytes,
+    this.reason,
+  });
+
+  @override
+  int get hashCode =>
+      state.hashCode ^
+      version.hashCode ^
+      chunkBytes.hashCode ^
+      maxWireBytes.hashCode ^
+      reason.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SnapshotUploadCapabilityInfo &&
+          runtimeType == other.runtimeType &&
+          state == other.state &&
+          version == other.version &&
+          chunkBytes == other.chunkBytes &&
+          maxWireBytes == other.maxWireBytes &&
+          reason == other.reason;
+}
+
+/// Whether the relay advertises resumable snapshot upload.
+enum SnapshotUploadCapabilityState {
+  /// Resumable v1 is advertised; the resumable path will be used.
+  available,
+
+  /// Not advertised, or the capability lookup failed. The unchanged single
+  /// `PUT` path is used; this is a downgrade, not an error.
+  unavailable,
+
+  /// The engine is not configured, so the transport cannot be inspected.
+  engineUnconfigured,
 }

@@ -60,9 +60,26 @@ pub async fn run_cleanup(state: &AppState) {
                 config.abandoned_brand_new_group_ttl_secs() as i64,
             )?;
 
+            // 5b. Expire resumable upload sessions whose idle or absolute TTL
+            //     passed, releasing their byte reservations in the same
+            //     conditional transition, then delete terminal session metadata
+            //     past its bounded retention.
+            let expired_uploads = crate::db::cleanup_expired_snapshot_uploads(conn)?;
+            let terminal_uploads_purged = crate::db::cleanup_terminal_snapshot_uploads(conn)?;
+
             // 6. Delete expired ephemeral snapshots before snapshot-gated
             //    pruning so stale snapshot rows cannot authorize history loss.
-            let expired_snapshots = crate::db::cleanup_expired_snapshots(conn)?;
+            //    Returns the file-backed rows' `(sync_id, blob_ref)` so their
+            //    on-disk blobs are unlinked after the writer mutex is released
+            //    (mirroring the row's TTL expiry).
+            let expired_snapshot_files = crate::db::cleanup_expired_snapshots(conn)?;
+
+            // 6b. Gauge inputs for the resumable-upload lifecycle. Read here so
+            //     the Prometheus scrape never pays for a live DB query. (The
+            //     orphan sweep reads the session live set separately, in its own
+            //     later transaction, so it gets the freshest view.)
+            let upload_sessions_active = crate::db::count_nonterminal_snapshot_uploads(conn, None)?;
+            let upload_reserved_bytes = crate::db::snapshot_upload_reserved_bytes(conn)?;
 
             // 7. Prune acknowledged batch history only when an unexpired
             //    group-wide snapshot exists for the sync group.
@@ -136,7 +153,11 @@ pub async fn run_cleanup(state: &AppState) {
                 pruned,
                 stale_group_media_ids,
                 abandoned_new_groups,
-                expired_snapshots,
+                expired_uploads,
+                terminal_uploads_purged,
+                expired_snapshot_files,
+                upload_sessions_active,
+                upload_reserved_bytes,
                 pruned_batches,
                 pruned_batches_by_acks,
                 superseded_registry_artifacts,
@@ -163,7 +184,11 @@ pub async fn run_cleanup(state: &AppState) {
             pruned,
             stale_group_media_ids,
             abandoned_new_groups,
-            expired_snapshots,
+            expired_uploads,
+            terminal_uploads_purged,
+            expired_snapshot_files,
+            upload_sessions_active,
+            upload_reserved_bytes,
             pruned_batches,
             pruned_batches_by_acks,
             superseded_registry_artifacts,
@@ -205,6 +230,43 @@ pub async fn run_cleanup(state: &AppState) {
             // Try to remove empty sync_id directories left after media cleanup
             cleanup_empty_media_dirs(&state.config.media_storage_path, &stale_media_items);
             cleanup_empty_media_dirs(&state.config.media_storage_path, &expired_media);
+
+            // Unlink the on-disk blobs of TTL-expired file-backed snapshots
+            // whose rows were just deleted (mirrors the row expiry). Best-effort;
+            // the snapshot orphan sweep below backstops any miss. `expired_snapshots`
+            // counts every deleted row; only the file-backed ones have a blob to
+            // unlink (inline rows carry `None`).
+            let snapshot_root = state.snapshot_storage.root().map(std::path::Path::to_path_buf);
+            let expired_snapshots = expired_snapshot_files.len();
+            let expired_snapshot_blobs: Vec<(String, String)> = expired_snapshot_files
+                .into_iter()
+                .filter_map(|(sync_id, blob_ref)| blob_ref.map(|b| (sync_id, b)))
+                .collect();
+            let expired_snapshot_files_cleaned = match snapshot_root.as_ref() {
+                Some(root) => {
+                    let cleaned = cleanup_snapshot_files(root, &expired_snapshot_blobs);
+                    // Reap now-empty group directories so an idle deployment
+                    // does not accumulate zero-file dirs.
+                    cleanup_empty_media_dirs(root, &expired_snapshot_blobs);
+                    cleaned
+                }
+                None => 0,
+            };
+
+            // Unlink the on-disk candidates of upload sessions that just expired
+            // (mirrors the row transition, which already released the
+            // reservation). Best-effort; the orphan sweep below backstops a miss.
+            state
+                .metrics
+                .inc_by(&state.metrics.snapshot_upload_expired, expired_uploads.len() as u64);
+            let expired_upload_files_cleaned = match snapshot_root.as_ref() {
+                Some(root) => {
+                    let cleaned = cleanup_snapshot_files(root, &expired_uploads);
+                    cleanup_empty_media_dirs(root, &expired_uploads);
+                    cleaned
+                }
+                None => 0,
+            };
 
             // Tell each affected group's surviving devices that a sibling was
             // auto-revoked and that the group now owes a rekey. The
@@ -251,6 +313,17 @@ pub async fn run_cleanup(state: &AppState) {
                 .metrics
                 .last_cleanup_epoch_secs
                 .store(crate::db::now_secs() as u64, std::sync::atomic::Ordering::Relaxed);
+            // Refresh the resumable-upload gauges from the same writer
+            // transaction's view, so the scrape never pays for a live DB query.
+            // Reuse the values already read for the orphan live set.
+            state
+                .metrics
+                .cached_snapshot_upload_sessions_active
+                .store(upload_sessions_active, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .cached_snapshot_upload_reserved_bytes
+                .store(upload_reserved_bytes, std::sync::atomic::Ordering::Relaxed);
             let expired_media_count = expired_media_cleaned + stale_media_cleaned;
             if nonces > 0
                 || signed_request_nonces > 0
@@ -260,6 +333,8 @@ pub async fn run_cleanup(state: &AppState) {
                 || pruned > 0
                 || abandoned_new_groups > 0
                 || expired_snapshots > 0
+                || !expired_uploads.is_empty()
+                || terminal_uploads_purged > 0
                 || pruned_batches > 0
                 || pruned_batches_by_acks > 0
                 || superseded_registry_artifacts > 0
@@ -283,6 +358,10 @@ pub async fn run_cleanup(state: &AppState) {
                     pruned_batches_by_acks,
                     abandoned_new_groups,
                     expired_snapshots,
+                    expired_snapshot_files_cleaned,
+                    expired_uploads = expired_uploads.len(),
+                    expired_upload_files_cleaned,
+                    terminal_uploads_purged,
                     superseded_registry_artifacts,
                     expired_pairing_sessions,
                     revoked_tombstones,
@@ -311,12 +390,18 @@ pub async fn run_cleanup(state: &AppState) {
             db.with_conn(|conn| {
                 let reaped = crate::db::reap_stale_pending_media(conn, grace)?;
                 let known = crate::db::all_media_keys(conn)?;
-                Ok::<_, rusqlite::Error>((reaped, known))
+                let mut known_snapshots = crate::db::all_snapshot_blob_keys(conn)?;
+                // The upload-session live set: a candidate's bytes exist on disk
+                // before any snapshot row references them, so a sweep that only
+                // knew about published rows would treat an in-flight upload's
+                // file as an orphan. Union, not replace.
+                known_snapshots.extend(crate::db::all_snapshot_upload_blob_keys(conn)?);
+                Ok::<_, rusqlite::Error>((reaped, known, known_snapshots))
             })
         })
         .await;
         match result {
-            Ok(Ok((reaped, known))) => {
+            Ok(Ok((reaped, known, known_snapshots))) => {
                 let storage = &state.config.media_storage_path;
                 // Unlink final files for reaped pending rows, then sweep
                 // orphaned finals + abandoned staging files. The orphan sweep
@@ -331,11 +416,19 @@ pub async fn run_cleanup(state: &AppState) {
                 let reaped_cleaned = cleanup_media_files(storage, &reaped);
                 cleanup_empty_media_dirs(storage, &reaped);
                 let orphans_cleaned = sweep_orphan_media_files(storage, &known, orphan_grace);
-                if !reaped.is_empty() || orphans_cleaned > 0 {
+                // Snapshot blobs share the same crash-orphan story (a file
+                // written before its row committed, or a replaced/group-deleted
+                // row whose unlink was missed). Same long age gate as media.
+                let snapshot_orphans_cleaned = match state.snapshot_storage.root() {
+                    Some(root) => sweep_orphan_snapshot_files(root, &known_snapshots, orphan_grace),
+                    None => 0,
+                };
+                if !reaped.is_empty() || orphans_cleaned > 0 || snapshot_orphans_cleaned > 0 {
                     tracing::info!(
                         reaped_pending = reaped.len(),
                         reaped_cleaned,
                         orphans_cleaned,
+                        snapshot_orphans_cleaned,
                         "media pending/orphan sweep complete"
                     );
                 }
@@ -401,6 +494,32 @@ pub async fn run_cleanup(state: &AppState) {
             Ok(Err(e)) => tracing::warn!("metrics cache refresh failed: {e}"),
             Err(e) => tracing::warn!("metrics cache refresh task panicked: {e}"),
         }
+
+        // Refresh the leased-pairing-session gauge alongside the other cached
+        // DB-state values. Like them this is a bounded aggregate count of rows,
+        // never a per-user or per-rendezvous series.
+        let db = state.db.clone();
+        let prev_leased =
+            state.metrics.cached_leased_pairing_sessions.load(std::sync::atomic::Ordering::Relaxed);
+        match tokio::task::spawn_blocking(move || {
+            db.with_read_conn(crate::db::count_nonexpired_leased_pairing_sessions)
+        })
+        .await
+        {
+            Ok(Ok(leased)) => state
+                .metrics
+                .cached_leased_pairing_sessions
+                .store(u64::from(leased), std::sync::atomic::Ordering::Relaxed),
+            Ok(Err(e)) => {
+                // Keep the previous value rather than publishing a misleading 0.
+                tracing::warn!("metrics cache: leased pairing session query failed: {e}");
+                state
+                    .metrics
+                    .cached_leased_pairing_sessions
+                    .store(prev_leased, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!("metrics cache: leased pairing refresh panicked: {e}"),
+        }
     }
 
     // Prune stale entries from in-memory rate limiters.
@@ -408,7 +527,23 @@ pub async fn run_cleanup(state: &AppState) {
     state.nonce_rate_limiter.prune_stale(state.config.nonce_rate_window_secs);
     state.revoke_rate_limiter.prune_stale(state.config.revoke_rate_window_secs);
     state.pairing_rate_limiter.prune_stale(60);
+    // Pairing lease limiters: the renewal limiter uses a short window, while the
+    // per-rendezvous failure bucket is pruned with its own (possibly longer)
+    // window so a burst of failed guesses does not keep its key alive forever.
+    state
+        .pairing_lease_renew_rate_limiter
+        .prune_stale(state.config.pairing_lease_renew_rate_window_secs());
+    state
+        .pairing_lease_failure_limiter
+        .prune_stale(state.config.pairing_lease_failure_window_secs());
     state.media_upload_rate_limiter.prune_stale(state.config.media_upload_rate_window_secs);
+    // Resumable snapshot-upload limiters and per-upload mutation locks: prune on
+    // each cycle so a long-lived relay accumulates neither rate-limiter keys nor
+    // one idle `Arc` per upload ID ever seen.
+    state
+        .snapshot_upload_create_rate_limiter
+        .prune_stale(state.config.snapshot_upload_create_rate_window_secs());
+    state.upload_locks.prune();
     // Re-supply / pairing-push limiters are scaffolding (enforcement lands with
     // media-heal/pairing-push) but are pruned here so their windows don't accumulate.
     state.media_resupply_rate_limiter.prune_stale(state.config.media_resupply_rate_window_secs);
@@ -462,6 +597,97 @@ fn cleanup_media_files(storage_path: &str, items: &[(String, String)]) -> usize 
         .count()
 }
 
+/// Delete snapshot blob files from disk given `(sync_id, blob_ref)` pairs.
+/// Returns the number of files successfully removed. Mirrors
+/// [`cleanup_media_files`] but routes through the validating snapshot path
+/// builder so a malformed `blob_ref` can never resolve outside the group dir.
+fn cleanup_snapshot_files(root: &std::path::Path, items: &[(String, String)]) -> usize {
+    items
+        .iter()
+        .filter(|(sync_id, blob_ref)| {
+            let path = crate::snapshot_store::blob_path(root, sync_id, blob_ref);
+            std::fs::remove_file(&path).is_ok()
+        })
+        .count()
+}
+
+/// Remove snapshot blob files with no backing row (orphans). Pure disk hygiene —
+/// the DB is the source of truth. The snapshot tree mirrors the media layout
+/// (`{root}/{sync_id}/{blob_ref}`) but has no `.staging` directory: snapshot
+/// blobs are written directly to their final, unique-per-upload path, so the
+/// only orphans are crash leftovers (file written, row never committed) and
+/// replaced/group-deleted rows whose unlink was missed. Age-gated like the
+/// media sweep: `known` is a snapshot of the rows that may be slightly stale vs
+/// the filesystem walk, so a file younger than the grace window might belong to
+/// an upload whose row is about to commit. Returns the number removed.
+///
+/// Deliberately does **not** filter candidate names through
+/// `is_valid_blob_ref`. The sweep's contract is "delete what no row references",
+/// so a malformed name (not a 32-hex blob reference) is by definition
+/// unreferenced junk and must be removed — a validity guard would make such
+/// files persist forever, defeating the cleanup. Safety comes from the checks
+/// below instead: only regular files are removed (`meta.is_file()`), symlinks
+/// are skipped via `symlink_metadata` so a planted link can never unlink its
+/// target, and directory recursion skips symlinked group dirs. A row that
+/// genuinely references an unusual name is still protected by `known`.
+fn sweep_orphan_snapshot_files(
+    storage_root: &std::path::Path,
+    known: &[(String, String)],
+    grace_secs: i64,
+) -> usize {
+    use std::collections::HashSet;
+    let known: HashSet<(&str, &str)> =
+        known.iter().map(|(s, b)| (s.as_str(), b.as_str())).collect();
+    let Ok(sync_dirs) = std::fs::read_dir(storage_root) else {
+        return 0;
+    };
+    let now = crate::db::now_secs();
+    let mut removed = 0usize;
+
+    for sync_entry in sync_dirs.flatten() {
+        let sync_path = sync_entry.path();
+        // Only recurse into real directories; skip symlinks outright so the
+        // sweep can never be walked out of the snapshot root, and skip the
+        // reserved invalid-name directory. `symlink_metadata` never follows the
+        // link, and an unreadable path is treated as "skip" (fail closed).
+        let is_real_dir = sync_path.is_dir()
+            && !sync_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(true);
+        if !is_real_dir {
+            continue;
+        }
+        let Some(sync_id) = sync_path.file_name().and_then(|n| n.to_str()).map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(files) = std::fs::read_dir(&sync_path) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            // `symlink_metadata` (never following) keeps a planted symlink from
+            // either being counted as a blob or unlinking its target.
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_file()
+                && !known.contains(&(sync_id.as_str(), name.as_str()))
+                && file_older_than(&path, now, grace_secs)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+
+    removed
+}
+
 /// Remove media files with no backing DB row (orphaned final files) and
 /// abandoned staging files. Pure disk hygiene — the DB is the source of truth.
 ///
@@ -491,8 +717,7 @@ fn sweep_orphan_media_files(
         if !sync_path.is_dir() {
             continue;
         }
-        let Some(sync_id) =
-            sync_path.file_name().and_then(|n| n.to_str()).map(str::to_string)
+        let Some(sync_id) = sync_path.file_name().and_then(|n| n.to_str()).map(str::to_string)
         else {
             continue;
         };
@@ -620,12 +845,14 @@ fn find_missing_media_files(
         .collect()
 }
 
-/// Try to remove empty sync_id directories after media files have been cleaned up.
-fn cleanup_empty_media_dirs(storage_path: &str, items: &[(String, String)]) {
+/// Try to remove empty sync_id directories after media or snapshot files have
+/// been cleaned up. Accepts either a root string or a resolved path.
+fn cleanup_empty_media_dirs(storage_path: impl AsRef<std::path::Path>, items: &[(String, String)]) {
+    let root = storage_path.as_ref();
     let mut seen = std::collections::HashSet::new();
     for (sync_id, _) in items {
         if seen.insert(sync_id.clone()) {
-            let dir = std::path::Path::new(storage_path).join(sync_id);
+            let dir = root.join(sync_id);
             // remove_dir only succeeds if the directory is empty
             let _ = std::fs::remove_dir(&dir);
         }
@@ -729,10 +956,8 @@ mod tests {
         // "present" has a file on disk; "gone" does not (legacy crash row).
         std::fs::write(sync_dir.join("present"), b"x").unwrap();
 
-        let candidates = vec![
-            ("sg".to_string(), "present".to_string()),
-            ("sg".to_string(), "gone".to_string()),
-        ];
+        let candidates =
+            vec![("sg".to_string(), "present".to_string()), ("sg".to_string(), "gone".to_string())];
         let missing = find_missing_media_files(storage, &candidates);
         assert_eq!(missing, vec![("sg".to_string(), "gone".to_string())]);
         // Dry-run: the finder never touches the filesystem rows it inspects.
@@ -751,6 +976,40 @@ mod tests {
         // though it has no backing row it must NOT be removed (protects the
         // snapshot-vs-walk race against a just-committed upload).
         let removed = sweep_orphan_media_files(storage, &[], 86_400);
+        assert_eq!(removed, 0);
+        assert!(sync_dir.join("fresh-orphan").exists());
+    }
+
+    #[test]
+    fn snapshot_orphan_sweep_removes_unbacked_blobs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = tmp.path();
+        let sync_dir = storage.join("sg");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        // One blob a row still references (kept) and one with no backing row
+        // (a crash leftover / missed unlink — reclaimed).
+        std::fs::write(sync_dir.join("keep"), b"k").unwrap();
+        std::fs::write(sync_dir.join("orphan"), b"o").unwrap();
+
+        let known = vec![("sg".to_string(), "keep".to_string())];
+        // age_secs = -1 forces the age gate true regardless of mtime.
+        let removed = sweep_orphan_snapshot_files(storage, &known, -1);
+        assert_eq!(removed, 1, "only the unbacked blob is removed");
+        assert!(sync_dir.join("keep").exists(), "referenced blob survives");
+        assert!(!sync_dir.join("orphan").exists(), "unbacked blob removed");
+    }
+
+    #[test]
+    fn snapshot_orphan_sweep_age_gate_spares_fresh_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = tmp.path();
+        let sync_dir = storage.join("sg");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::write(sync_dir.join("fresh-orphan"), b"x").unwrap();
+
+        // A just-written blob with no row yet (the file-written-before-row-commit
+        // window) is younger than the grace, so it must survive the sweep.
+        let removed = sweep_orphan_snapshot_files(storage, &[], 86_400);
         assert_eq!(removed, 0);
         assert!(sync_dir.join("fresh-orphan").exists());
     }

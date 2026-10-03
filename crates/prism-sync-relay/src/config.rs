@@ -16,6 +16,226 @@ pub enum ConfigError {
     AndroidAttestationEnabledWithoutTrustRoots,
     #[error("{key} must be >= 1 (a zero concurrency cap blocks requests indefinitely)")]
     ConcurrencyLimitZero { key: &'static str },
+    /// Snapshot file backing was explicitly requested but the derived snapshot
+    /// storage root cannot be trusted (relative path, non-absolute, or not
+    /// creatable/writable). Refuse startup rather than risk writing snapshot
+    /// blobs to an ephemeral or unwritable location while the DB row still
+    /// commits — that would publish rows whose bytes are gone.
+    #[error(
+        "SNAPSHOT_FILE_BACKING_ENABLED=true but snapshot storage root is unusable ({reason}); \
+         set MEDIA_STORAGE_PATH to an absolute path on a writable persistent volume, or set \
+         SNAPSHOT_FILE_BACKING_ENABLED=false to retain inline snapshot writes"
+    )]
+    SnapshotStorageInvalid { reason: String },
+}
+
+/// Resolved runtime policy for where `PUT /snapshot` stores its bytes.
+///
+/// Decided once at startup by [`Config::resolve_snapshot_storage`] and held on
+/// `AppState`. The file-backed variant carries the **canonicalized** root, so
+/// every subsequent path join starts from a resolved, symlink-free directory
+/// rather than re-resolving the raw config string per request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotStorage {
+    /// Write snapshot bytes to `<root>/<sync_id>/<blob_ref>`.
+    FileBacked(std::path::PathBuf),
+    /// Keep snapshot bytes inline in the SQLite `snapshots.data` column — the
+    /// legacy behavior, retained when the file-backed root failed validation.
+    Inline,
+}
+
+impl SnapshotStorage {
+    /// True when single PUT should write snapshot bytes to a file.
+    pub fn is_file_backed(&self) -> bool {
+        matches!(self, Self::FileBacked(_))
+    }
+
+    /// The canonical storage root, when file-backed.
+    pub fn root(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::FileBacked(root) => Some(root),
+            Self::Inline => None,
+        }
+    }
+}
+
+// ── Pairing lease protocol constants ─────────────────────────────────────────
+//
+// These mirror `prism_sync_core::pairing::lease` exactly. The relay crate is
+// deliberately standalone (it must not depend on core), so the values are
+// duplicated here and held in lockstep by
+// `tests/relay_pairing_lease_parity.rs`, which imports both crates. That test
+// is the drift alarm: changing one side without the other fails CI rather than
+// silently splitting the wire contract.
+
+/// Lease protocol version understood by this relay (v1).
+pub const PAIRING_LEASE_VERSION_V1: u16 = 1;
+
+/// Length of the random `pairing_lease_secret` (and therefore of
+/// `SHA-256(secret)`), in bytes. The renew route accepts an exact-length body.
+pub const PAIRING_LEASE_SECRET_LEN: usize = 32;
+
+/// Exact request-body length accepted by `POST /v1/pairing/{id}/lease/renew`.
+pub const PAIRING_LEASE_RENEW_REQUEST_BODY_LEN: usize = PAIRING_LEASE_SECRET_LEN;
+
+/// Defensive transport cap for the renewal request body, in bytes.
+///
+/// Deliberately **larger** than [`PAIRING_LEASE_RENEW_REQUEST_BODY_LEN`]. It
+/// bounds how much the handler buffers: `renew_lease` reads the body through a
+/// `to_bytes` call capped here and collapses a read failure — including an
+/// over-cap body — to the same uniform 404 the semantic length check returns. A
+/// layer-imposed limit would instead answer with a *different* status, which is
+/// the oracle the uniform response exists to remove, so the bound is applied in
+/// the handler rather than as a route layer.
+///
+/// This is not the only ceiling in practice: the public router still carries the
+/// global 10 MiB `RequestBodyLimitLayer`, so a body above that is rejected by the
+/// layer before the handler runs. Every size at or below it, which is every
+/// request this endpoint could plausibly receive, is answered uniformly.
+pub const PAIRING_LEASE_RENEW_MAX_BODY_BYTES: usize = 1024;
+
+/// Idle expiry granted by a valid lease renewal (v1 = 30 minutes). The same
+/// constant is enforced in `db::renew_pairing_lease`.
+pub const PAIRING_LEASE_IDLE_EXTENSION_SECS: i64 = 1800;
+
+/// Absolute, nonrenewable lease cap measured from the first valid renewal
+/// (v1 = 4 hours).
+pub const PAIRING_LEASE_ABSOLUTE_CAP_SECS: i64 = 14400;
+
+/// Deployment default cap on concurrently leased pairing rows (v1 = 256).
+pub const PAIRING_LEASE_MAX_CONCURRENT_SESSIONS: u32 = 256;
+
+/// Effective default renewal limiter size: per trusted-proxy-derived client IP,
+/// per [`PairingLeaseConfig::renew_rate_window_secs`].
+///
+/// The legitimate maximum is one renewal per active ceremony per five minutes
+/// (plus one final renewal immediately before credential release), so 120 per
+/// minute leaves room for many concurrent ceremonies behind one client IP — a
+/// shared home NAT or an app reconnecting — without ever being reachable by
+/// honest traffic. The per-rendezvous failure bucket, not this limiter, is what
+/// bounds a single hostile source.
+pub const PAIRING_LEASE_DEFAULT_RENEW_RATE_LIMIT: u32 = 120;
+
+/// Default window for [`PairingLeaseConfig::renew_rate_limit`], in seconds.
+pub const PAIRING_LEASE_DEFAULT_RENEW_RATE_WINDOW_SECS: u64 = 60;
+
+/// Default bound on *failed* verifier attempts per presented rendezvous ID per
+/// [`PairingLeaseConfig::failure_window_secs`].
+pub const PAIRING_LEASE_DEFAULT_FAILURE_LIMIT: u32 = 20;
+
+/// Default window for the per-rendezvous failure bucket, in seconds.
+pub const PAIRING_LEASE_DEFAULT_FAILURE_WINDOW_SECS: u64 = 60;
+
+/// Opaque pairing-lease (v1) runtime configuration.
+///
+/// Split out of [`Config`] so it has a `Default` and so `Config` literals stay
+/// readable. Every field is bounded by an accessor on [`Config`] that enforces a
+/// non-degenerate value, because a `0` cap or a `0`-second window would be a
+/// deployment footgun rather than a useful setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairingLeaseConfig {
+    /// Whether this relay offers the opaque pairing lease (v1) at all.
+    ///
+    /// Dark by default. When `false`, a create request offering lease metadata
+    /// is accepted as an ordinary fixed-TTL session with no `lease_version`
+    /// echo, and the renew route returns the same uniform not-found as an
+    /// unknown rendezvous. Withholding the capability is always a safe
+    /// downgrade: clients fall back to fixed-TTL pairing.
+    pub enabled: bool,
+    /// Global cap on concurrently leased pairing rows, passed to
+    /// [`crate::db::renew_pairing_lease`]. Accessor-clamped to at least 1.
+    pub max_concurrent_sessions: u32,
+    /// Max lease renewals per trusted-proxy-derived client IP per
+    /// [`Self::renew_rate_window_secs`].
+    pub renew_rate_limit: u32,
+    /// Sliding window in seconds for the per-client-IP renewal limiter.
+    pub renew_rate_window_secs: u64,
+    /// Max *failed* verifier attempts per presented rendezvous ID per
+    /// [`Self::failure_window_secs`].
+    ///
+    /// Counts failures only, so a successful renewal can never be starved by
+    /// garbage that merely knows the rendezvous ID.
+    pub failure_limit: u32,
+    /// Sliding window in seconds for the per-rendezvous failure bucket.
+    pub failure_window_secs: u64,
+}
+
+impl Default for PairingLeaseConfig {
+    fn default() -> Self {
+        Self {
+            // Dark by default: enablement is a deliberate per-deployment act.
+            enabled: false,
+            max_concurrent_sessions: PAIRING_LEASE_MAX_CONCURRENT_SESSIONS,
+            renew_rate_limit: PAIRING_LEASE_DEFAULT_RENEW_RATE_LIMIT,
+            renew_rate_window_secs: PAIRING_LEASE_DEFAULT_RENEW_RATE_WINDOW_SECS,
+            failure_limit: PAIRING_LEASE_DEFAULT_FAILURE_LIMIT,
+            failure_window_secs: PAIRING_LEASE_DEFAULT_FAILURE_WINDOW_SECS,
+        }
+    }
+}
+
+/// Whether `SNAPSHOT_FILE_BACKING_ENABLED` was set in the environment.
+///
+/// An explicit `true` means an invalid storage root must refuse startup; an
+/// unset or explicit `false` allows the inline fallback. Kept separate from
+/// [`Config`] because it is a one-time startup decision, not runtime config.
+pub fn snapshot_file_backing_explicitly_requested(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("SNAPSHOT_FILE_BACKING_ENABLED")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Resource policy for resumable snapshot uploads (lean v1).
+///
+/// Protocol shape is **not** configurable here: the chunk size, wire maximum,
+/// and TTL ceilings live in [`crate::uploads`] as compile-time constants. What a
+/// deployment can tune is the resource envelope around them — quotas, free-space
+/// reserve, rate limit, and concurrency — plus the single enable switch.
+///
+/// # Dark by default
+///
+/// `enabled` defaults to `false`. Even when set, capability is advertised only
+/// if file-backed snapshot storage is live, because a resumable session stages
+/// bytes on disk and publishing a reference into an inline-only deployment would
+/// be unsafe. Withholding the capability is always a safe downgrade: clients
+/// fall back to the existing single `PUT /snapshot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotUploadConfig {
+    /// Whether this relay offers resumable snapshot uploads at all.
+    ///
+    /// Requires `SNAPSHOT_FILE_BACKING_ENABLED`-equivalent storage resolution to
+    /// have produced a file-backed root; see [`Config::snapshot_upload_supported`].
+    pub enabled: bool,
+    /// Ceiling on bytes reserved by nonterminal sessions in one group.
+    pub group_reserved_bytes: u64,
+    /// Ceiling on bytes reserved by nonterminal sessions across the relay.
+    pub global_reserved_bytes: u64,
+    /// Free space that must remain after reserving an upload's declared bytes.
+    pub free_space_reserve_bytes: u64,
+    /// Max create requests per uploader device per `create_rate_window_secs`.
+    pub create_rate_limit: u32,
+    /// Sliding window for the per-device create limiter, in seconds.
+    pub create_rate_window_secs: u64,
+    /// Max simultaneous in-flight chunk writes. Exceeding it sheds with a
+    /// retryable `503 upload_busy`, never a quota-coded 429.
+    pub chunk_concurrency: usize,
+}
+
+impl Default for SnapshotUploadConfig {
+    fn default() -> Self {
+        Self {
+            // Dark by default: enablement is a deliberate per-deployment act.
+            enabled: false,
+            group_reserved_bytes: crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_GROUP_RESERVED_BYTES,
+            global_reserved_bytes: crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_GLOBAL_RESERVED_BYTES,
+            free_space_reserve_bytes:
+                crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_FREE_SPACE_RESERVE_BYTES,
+            create_rate_limit: crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_CREATE_RATE_LIMIT,
+            create_rate_window_secs:
+                crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_CREATE_RATE_WINDOW_SECS,
+            chunk_concurrency: crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_CHUNK_CONCURRENCY,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +336,14 @@ pub struct Config {
     pub pairing_session_rate_limit: u32,
     /// Maximum payload size for pairing session slots (bytes).
     pub pairing_session_max_payload_bytes: usize,
+    /// Opaque pairing lease (v1) configuration. Grouped into one value so it
+    /// carries a `Default` and so every existing `Config` literal gains exactly
+    /// one field rather than six.
+    pub pairing_lease: PairingLeaseConfig,
+    /// Resumable snapshot upload (lean v1) resource policy. Grouped like
+    /// [`Self::pairing_lease`] so existing `Config` literals gain one field.
+    /// Dark by default; see [`Config::snapshot_upload_supported`].
+    pub snapshot_upload: SnapshotUploadConfig,
     /// TTL in seconds for sharing-init payloads (default 7 days).
     pub sharing_init_ttl_secs: u64,
     /// Maximum size in bytes for sharing-init payloads.
@@ -143,6 +371,12 @@ pub struct Config {
     /// Signatures with a version below this are rejected with 403.
     pub min_signature_version: u8,
     /// Directory where uploaded media blobs are stored on disk.
+    ///
+    /// Snapshot blobs are derived from this root as a sibling directory
+    /// ([`Config::snapshot_storage_path`]) so both trees share one persistent
+    /// volume mount and one backup story. Container deployments must set this
+    /// to an explicit absolute path (`MEDIA_STORAGE_PATH=/data/media`) on the
+    /// writable persistent mount.
     pub media_storage_path: String,
     /// Maximum size in bytes for a single media upload.
     pub media_max_file_bytes: usize,
@@ -277,6 +511,246 @@ impl Config {
         }
     }
 
+    /// On-disk root for file-backed snapshot blobs, derived as a sibling of
+    /// `media_storage_path` (`<media_storage_path>-snapshots`). Deriving it
+    /// rather than adding a separate setting keeps snapshot bytes co-located
+    /// with media under the same parent directory, so they inherit media's
+    /// volume mount and backup/at-rest story automatically — whatever
+    /// `MEDIA_STORAGE_PATH` resolves to (or its `data/media` default), the
+    /// snapshot tree follows. Like media, the bytes are stored verbatim (the
+    /// already client-encrypted `SignedBatchEnvelope`); the relay adds no
+    /// at-rest layer of its own.
+    pub fn snapshot_storage_path(&self) -> String {
+        format!("{}-snapshots", self.media_storage_path)
+    }
+
+    // ── Pairing lease ────────────────────────────────────────────────────────
+
+    /// Whether this relay advertises and enforces the opaque pairing lease.
+    ///
+    /// This is the **capability gate**. The renew route and the create-time
+    /// `lease_version` echo are both conditional on it, so an unconfigured
+    /// relay behaves exactly like a pre-lease relay: create succeeds without an
+    /// echo and renew returns the uniform not-found. That keeps the feature dark
+    /// until a deployment deliberately turns it on.
+    pub fn pairing_lease_supported(&self) -> bool {
+        self.pairing_lease.enabled
+    }
+
+    // ── Resumable snapshot uploads (lean v1) ─────────────────────────────────
+
+    /// Whether this relay advertises and accepts resumable snapshot uploads.
+    ///
+    /// Two independent gates, both required:
+    ///
+    /// 1. the operator turned the feature on (`SNAPSHOT_UPLOAD_ENABLED`), and
+    /// 2. the resolved storage policy is **file-backed**, so a completed session
+    ///    can publish a `blob_ref` rather than forcing a large inline BLOB write
+    ///    under the SQLite writer mutex.
+    ///
+    /// The `storage` argument is the already-resolved
+    /// [`SnapshotStorage`] policy, so capability can never disagree with what the
+    /// routes will actually do. Withholding capability is always a safe
+    /// downgrade: clients fall back to the existing single PUT.
+    pub fn snapshot_upload_supported(&self, storage: &SnapshotStorage) -> bool {
+        self.snapshot_upload.enabled && storage.is_file_backed()
+    }
+
+    /// Effective chunk-write concurrency, clamped to at least 1 so a misconfigured
+    /// zero cannot deadlock the chunk route.
+    pub fn snapshot_upload_chunk_concurrency(&self) -> usize {
+        self.snapshot_upload.chunk_concurrency.max(1)
+    }
+
+    /// Effective create-rate window: never zero, so the limiter cannot be turned
+    /// into an unbounded counter by a `0`-second window.
+    pub fn snapshot_upload_create_rate_window_secs(&self) -> u64 {
+        self.snapshot_upload.create_rate_window_secs.max(1)
+    }
+
+    /// The capability object this relay advertises, or `None` when withheld.
+    ///
+    /// Advertised only when every prerequisite holds, including the resource
+    /// ceilings being present, positive, and internally valid — the spec makes
+    /// that gate unconditional because the binary cannot distinguish hosted from
+    /// self-host operation. A deployment may be *stricter* than the protocol
+    /// maxima, never looser: `max_wire_bytes` is the minimum of the configured
+    /// ceilings and the protocol cap so a client can never be told it may send
+    /// more than the relay will accept.
+    pub fn snapshot_upload_capability(
+        &self,
+        storage: &SnapshotStorage,
+    ) -> Option<crate::routes::uploads::SnapshotUploadCapability> {
+        if !self.snapshot_upload_supported(storage) {
+            return None;
+        }
+        if self.snapshot_upload.global_reserved_bytes == 0
+            || self.snapshot_upload.group_reserved_bytes == 0
+            || self.snapshot_upload.free_space_reserve_bytes == 0
+            || self.snapshot_upload.group_reserved_bytes
+                > self.snapshot_upload.global_reserved_bytes
+        {
+            return None;
+        }
+        Some(crate::routes::uploads::SnapshotUploadCapability {
+            version: crate::uploads::SNAPSHOT_UPLOAD_VERSION_V1,
+            chunk_bytes: crate::uploads::SNAPSHOT_UPLOAD_CHUNK_BYTES as u64,
+            max_wire_bytes: crate::uploads::SNAPSHOT_UPLOAD_MAX_WIRE_BYTES,
+            session_idle_ttl_secs: crate::uploads::SNAPSHOT_UPLOAD_IDLE_TTL_SECS as u64,
+        })
+    }
+
+    // ── Pairing lease accessors ──────────────────────────────────────────────
+
+    /// Global concurrently-leased cap actually handed to the DB layer.
+    ///
+    /// Clamped to at least 1: a `0` would make every *new* lease unobtainable
+    /// (a row that is already leased still renews, since the cap is only
+    /// consulted on the first renewal), which is a deployment footgun rather
+    /// than a useful setting.
+    pub fn pairing_lease_max_concurrent_sessions(&self) -> u32 {
+        self.pairing_lease.max_concurrent_sessions.max(1)
+    }
+
+    /// Effective renewal window: never zero, so the limiter cannot be turned
+    /// into an unbounded counter by a `0`-second window.
+    pub fn pairing_lease_renew_rate_window_secs(&self) -> u64 {
+        self.pairing_lease.renew_rate_window_secs.max(1)
+    }
+
+    /// Effective failure-bucket window: never zero.
+    pub fn pairing_lease_failure_window_secs(&self) -> u64 {
+        self.pairing_lease.failure_window_secs.max(1)
+    }
+
+    /// Validate that lease enablement has the proxy trust it needs.
+    ///
+    /// The renew endpoint's front limiter keys on the trusted-proxy-derived
+    /// client IP. Behind a reverse proxy (hosted Prism runs behind Cloudflare
+    /// Tunnel) with no `TRUSTED_PROXY_CIDRS` allowlist, every request appears to
+    /// come from the tunnel peer, so **all** users collapse into one limiter
+    /// bucket — a self-inflicted global throttle and a loss of the per-source
+    /// bound. Refusing enablement without an allowlist makes that a startup
+    /// error instead of a production incident.
+    ///
+    /// Self-host with direct peers needs no allowlist: the peer address *is* the
+    /// client address, so the limiter is already correct. That is why this is a
+    /// documented operator obligation rather than an unconditional requirement —
+    /// see [`Config::pairing_lease_trusted_proxy_warning`].
+    pub fn validate_pairing_lease_proxy_trust(
+        &self,
+        hosted_deployment: bool,
+    ) -> Result<(), String> {
+        if self.pairing_lease_supported()
+            && hosted_deployment
+            && self.trusted_proxy_cidrs.is_empty()
+        {
+            return Err(
+                "PAIRING_LEASE_ENABLED=true in a hosted deployment requires a non-empty \
+                 TRUSTED_PROXY_CIDRS allowlist; without it the lease renewal limiter would key \
+                 every user on the tunnel peer address and collapse them into one bucket. Set \
+                 TRUSTED_PROXY_CIDRS to the ingress ranges, or leave PAIRING_LEASE_ENABLED=false."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Non-fatal warning text for a lease-enabled relay with no proxy allowlist.
+    ///
+    /// Emitted at startup so a self-host operator (for whom direct peers are
+    /// normal) still sees the tradeoff: if anything does front the relay, the
+    /// renewal limiter degrades to one shared bucket.
+    pub fn pairing_lease_trusted_proxy_warning(&self) -> Option<&'static str> {
+        if self.pairing_lease_supported() && self.trusted_proxy_cidrs.is_empty() {
+            return Some(
+                "PAIRING_LEASE_ENABLED=true with no TRUSTED_PROXY_CIDRS: pairing lease renewal is \
+                 rate limited by the direct peer address. This is correct for a relay reached \
+                 directly, but if a reverse proxy or tunnel fronts this deployment, forwarded \
+                 client IPs are ignored and all users share one limiter bucket. Set \
+                 TRUSTED_PROXY_CIDRS to the ingress ranges in that case.",
+            );
+        }
+        None
+    }
+
+    /// Resolve the snapshot storage root and prove it is safe for file-backed
+    /// snapshot writes.
+    ///
+    /// Phase 0 gate: before any file-backed single PUT can run, the relay must
+    /// know the derived root is an **absolute**, **writable**, **creatable**
+    /// directory that path resolution can trust. A relative default like
+    /// `data/media` resolves under the process CWD (in a container, the image
+    /// workdir) and may be ephemeral or unwritable, which would let a snapshot
+    /// row commit while its bytes were never durably stored. Failing validation
+    /// is handled by the caller as either a startup refusal (when file backing
+    /// was explicitly requested) or a downgrade to the legacy inline-BLOB write
+    /// path — never a silent file-backed write against a bad root.
+    ///
+    /// Returns the canonicalized root on success. The `reason` on failure is a
+    /// short operator-facing string; it never contains client input.
+    pub fn validate_snapshot_storage(&self) -> Result<std::path::PathBuf, String> {
+        let configured = self.snapshot_storage_path();
+        let path = std::path::Path::new(&configured);
+        if !path.is_absolute() {
+            return Err(format!("{configured:?} is not an absolute path"));
+        }
+        // Create the root if needed. `create_dir_all` on an existing directory
+        // is a no-op, so this both provisions first boot and tolerates the
+        // already-mounted case.
+        if let Err(e) = std::fs::create_dir_all(path) {
+            return Err(format!("{configured:?} is not creatable: {e}"));
+        }
+        // Canonicalize so callers join against a resolved, symlink-free root.
+        // A relative or dangling component would have failed above already.
+        let canonical = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(e) => return Err(format!("{configured:?} is not resolvable: {e}")),
+        };
+        // Prove writability with a real create-new probe rather than trusting
+        // directory permission bits (they can lie under ACLs, read-only
+        // bind-mounts, and full filesystems).
+        if let Err(e) = probe_writable_dir(&canonical) {
+            return Err(format!("{configured:?} is not writable: {e}"));
+        }
+        Ok(canonical)
+    }
+
+    /// Apply the snapshot storage gate, returning the resolved policy.
+    ///
+    /// Two acceptable outcomes, per the Phase 0 spec:
+    /// - the root validates → [`SnapshotStorage::FileBacked`] with the
+    ///   canonical root; or
+    /// - the root does not validate and file backing was **not** explicitly
+    ///   requested → log loudly and return [`SnapshotStorage::Inline`], so
+    ///   single PUT retains the legacy inline-BLOB write path.
+    ///
+    /// `explicit_file_backing` is true only when the operator set
+    /// `SNAPSHOT_FILE_BACKING_ENABLED` in the environment. In that case an
+    /// invalid root is a hard [`ConfigError::SnapshotStorageInvalid`] (refuse
+    /// startup) rather than a silent downgrade — a deploy that demanded file
+    /// backing must not quietly run on ephemeral storage instead.
+    pub fn resolve_snapshot_storage(
+        &self,
+        explicit_file_backing: bool,
+    ) -> Result<SnapshotStorage, ConfigError> {
+        match self.validate_snapshot_storage() {
+            Ok(root) => Ok(SnapshotStorage::FileBacked(root)),
+            Err(reason) => {
+                if explicit_file_backing {
+                    return Err(ConfigError::SnapshotStorageInvalid { reason });
+                }
+                tracing::warn!(
+                    reason = %reason,
+                    "snapshot storage root unusable — retaining inline snapshot writes \
+                     (set MEDIA_STORAGE_PATH to an absolute persistent path, or set \
+                     SNAPSHOT_FILE_BACKING_ENABLED=true to refuse startup instead)"
+                );
+                Ok(SnapshotStorage::Inline)
+            }
+        }
+    }
+
     pub fn try_from_env() -> Result<Self, ConfigError> {
         Self::from_env_values(|key| std::env::var(key).ok())
     }
@@ -395,6 +869,72 @@ impl Config {
                 "PAIRING_SESSION_MAX_PAYLOAD_BYTES",
                 262144, // 256 KB — PQ credential bundles with ML-DSA/ML-KEM/X-Wing keys
             ),
+            // Dark by default: the lease is opt-in per deployment.
+            pairing_lease: PairingLeaseConfig {
+                enabled: parse_bool_env_with(&env, "PAIRING_LEASE_ENABLED", false),
+                max_concurrent_sessions: parse_env_with(
+                    &env,
+                    "PAIRING_LEASE_MAX_CONCURRENT_SESSIONS",
+                    PAIRING_LEASE_MAX_CONCURRENT_SESSIONS,
+                ),
+                renew_rate_limit: parse_env_with(
+                    &env,
+                    "PAIRING_LEASE_RENEW_RATE_LIMIT",
+                    PAIRING_LEASE_DEFAULT_RENEW_RATE_LIMIT,
+                ),
+                renew_rate_window_secs: parse_env_with(
+                    &env,
+                    "PAIRING_LEASE_RENEW_RATE_WINDOW_SECS",
+                    PAIRING_LEASE_DEFAULT_RENEW_RATE_WINDOW_SECS,
+                ),
+                failure_limit: parse_env_with(
+                    &env,
+                    "PAIRING_LEASE_FAILURE_LIMIT",
+                    PAIRING_LEASE_DEFAULT_FAILURE_LIMIT,
+                ),
+                failure_window_secs: parse_env_with(
+                    &env,
+                    "PAIRING_LEASE_FAILURE_WINDOW_SECS",
+                    PAIRING_LEASE_DEFAULT_FAILURE_WINDOW_SECS,
+                ),
+            },
+            // Resumable snapshot uploads. Protocol constants are compile-time;
+            // only the resource envelope and the enable switch are configurable.
+            // Dark by default, and `snapshot_upload_supported` additionally
+            // requires file-backed storage.
+            snapshot_upload: SnapshotUploadConfig {
+                enabled: parse_bool_env_with(&env, "SNAPSHOT_UPLOAD_ENABLED", false),
+                group_reserved_bytes: parse_env_with(
+                    &env,
+                    "SNAPSHOT_UPLOAD_GROUP_RESERVED_BYTES",
+                    crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_GROUP_RESERVED_BYTES,
+                ),
+                global_reserved_bytes: parse_env_with(
+                    &env,
+                    "SNAPSHOT_UPLOAD_GLOBAL_RESERVED_BYTES",
+                    crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_GLOBAL_RESERVED_BYTES,
+                ),
+                free_space_reserve_bytes: parse_env_with(
+                    &env,
+                    "SNAPSHOT_UPLOAD_FREE_SPACE_RESERVE_BYTES",
+                    crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_FREE_SPACE_RESERVE_BYTES,
+                ),
+                create_rate_limit: parse_env_with(
+                    &env,
+                    "SNAPSHOT_UPLOAD_CREATE_RATE_LIMIT",
+                    crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_CREATE_RATE_LIMIT,
+                ),
+                create_rate_window_secs: parse_env_with(
+                    &env,
+                    "SNAPSHOT_UPLOAD_CREATE_RATE_WINDOW_SECS",
+                    crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_CREATE_RATE_WINDOW_SECS,
+                ),
+                chunk_concurrency: parse_env_with(
+                    &env,
+                    "SNAPSHOT_UPLOAD_CHUNK_CONCURRENCY",
+                    crate::uploads::SNAPSHOT_UPLOAD_DEFAULT_CHUNK_CONCURRENCY,
+                ),
+            },
             sharing_init_ttl_secs: parse_env_with(&env, "SHARING_INIT_TTL_SECS", 604800),
             sharing_init_max_payload_bytes: parse_env_with(
                 &env,
@@ -716,6 +1256,33 @@ fn write_registration_token_file(path: &std::path::Path, token: &str) -> std::io
     Ok(())
 }
 
+/// Prove a directory is writable by creating and removing a probe file.
+///
+/// Directory permission bits are not sufficient evidence: ACLs, read-only
+/// bind mounts, and a full filesystem all leave the mode bits looking writable
+/// while every real `open` fails. A create-new probe with a random name (so it
+/// can never clobber an existing file) is the honest check. The probe file is
+/// removed immediately; a failure to remove it is not fatal to startup.
+fn probe_writable_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let probe = dir.join(format!(".snapshot-storage-probe-{}", uuid::Uuid::new_v4().simple()));
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&probe)?;
+        file.write_all(b"probe")?;
+        // Durable enough to prove the volume accepts writes, not just buffers.
+        file.sync_all()?;
+    }
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 fn default_android_attestation_roots() -> Vec<String> {
     vec![
         include_str!("android_attestation_roots/root_rsa.pem").to_string(),
@@ -768,6 +1335,13 @@ pub fn localhost_test_config() -> Config {
         // ML-KEM / X-Wing keys + signed registry) exceed the relay test
         // harness's 32 KB, which would 413 the pairing credentials PUT.
         pairing_session_max_payload_bytes: 262144,
+        // Lease defaults for tests: disabled (matching production default), with
+        // the v1 caps and limiter sizes available for tests that enable it.
+        pairing_lease: PairingLeaseConfig::default(),
+        // Resumable upload defaults for tests: disabled (matching the production
+        // default), with the conservative v1 resource ceilings available for
+        // tests that deliberately enable it.
+        snapshot_upload: SnapshotUploadConfig::default(),
         sharing_init_ttl_secs: 604800,
         sharing_init_max_payload_bytes: 65536,
         sharing_identity_max_bytes: 8192,
@@ -1018,5 +1592,87 @@ mod tests {
     fn zero_default_request_concurrency_is_rejected() {
         let err = config_from_env_pairs(&[("DEFAULT_REQUEST_CONCURRENCY", "0")]).unwrap_err();
         assert_eq!(err, ConfigError::ConcurrencyLimitZero { key: "DEFAULT_REQUEST_CONCURRENCY" });
+    }
+
+    #[test]
+    fn snapshot_storage_root_is_derived_from_media_path() {
+        let config = config_from_env_pairs(&[("MEDIA_STORAGE_PATH", "/data/media")]).unwrap();
+        assert_eq!(config.snapshot_storage_path(), "/data/media-snapshots");
+    }
+
+    #[test]
+    fn explicit_file_backing_refuses_relative_root_instead_of_degrading() {
+        // The bare default `data/media` is relative, so its derived root cannot
+        // be trusted. An operator who explicitly demanded file backing must get
+        // a refusal, not a silent inline downgrade on ephemeral storage.
+        let config = config_from_env_pairs(&[]).unwrap();
+        let err = config.resolve_snapshot_storage(true).unwrap_err();
+        match err {
+            ConfigError::SnapshotStorageInvalid { reason } => {
+                assert!(
+                    reason.contains("not an absolute path"),
+                    "reason should name the relative-path failure: {reason}"
+                );
+            }
+            other => panic!("expected SnapshotStorageInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_file_backing_refuses_uncreatable_root_instead_of_degrading() {
+        // The derived root is `<MEDIA_STORAGE_PATH>-snapshots`, so make its
+        // PARENT a regular file: `<file>/media` derives
+        // `<file>/media-snapshots`, which cannot be created because a path
+        // component is not a directory. Explicit file backing must refuse rather
+        // than enable a file-backed write that could never durably store a blob.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let media = blocker.join("media");
+        let config =
+            config_from_env_pairs(&[("MEDIA_STORAGE_PATH", media.to_str().unwrap())]).unwrap();
+
+        let err = config.resolve_snapshot_storage(true).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SnapshotStorageInvalid { .. }),
+            "expected SnapshotStorageInvalid, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unset_file_backing_degrades_to_inline_on_unusable_root() {
+        // Same relative root, but without the explicit opt-in: the gate logs and
+        // falls back to the legacy inline path so an existing deploy keeps
+        // working after upgrade. This is the "silently enabling" hazard only if
+        // the fallback were file-backed — it is not.
+        let config = config_from_env_pairs(&[]).unwrap();
+        assert_eq!(config.resolve_snapshot_storage(false).unwrap(), SnapshotStorage::Inline);
+    }
+
+    #[test]
+    fn explicit_file_backing_enables_file_backed_for_valid_absolute_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let media = tmp.path().join("media");
+        let config =
+            config_from_env_pairs(&[("MEDIA_STORAGE_PATH", media.to_str().unwrap())]).unwrap();
+
+        let storage = config.resolve_snapshot_storage(true).unwrap();
+        let root = storage.root().expect("valid root must resolve file-backed");
+        assert!(storage.is_file_backed());
+        assert!(root.is_absolute(), "resolved root is canonicalized absolute");
+        assert_eq!(root.file_name().and_then(|n| n.to_str()), Some("media-snapshots"));
+    }
+
+    #[test]
+    fn file_backing_opt_in_parses_only_explicit_true() {
+        let value_of = |v: Option<&str>| {
+            let owned = v.map(str::to_string);
+            snapshot_file_backing_explicitly_requested(move |_| owned.clone())
+        };
+        assert!(value_of(Some("true")));
+        assert!(value_of(Some("  TRUE  ")), "case- and whitespace-insensitive");
+        assert!(!value_of(Some("false")), "explicit false keeps the inline fallback");
+        assert!(!value_of(Some("1")), "only `true` opts in");
+        assert!(!value_of(None), "unset keeps the inline fallback");
     }
 }

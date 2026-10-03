@@ -1132,14 +1132,9 @@ fn setup_f13_fixture_with_config(config: SyncConfig) -> F13Fixture {
 
     let (event_tx, event_rx) =
         tokio::sync::broadcast::channel::<prism_sync_core::events::SyncEvent>(64);
-    let engine = SyncEngine::new(
-        storage.clone(),
-        relay.clone(),
-        vec![entity_ref],
-        test_schema(),
-        config,
-    )
-    .with_event_sink(event_tx);
+    let engine =
+        SyncEngine::new(storage.clone(), relay.clone(), vec![entity_ref], test_schema(), config)
+            .with_event_sink(event_tx);
 
     let signing_key_a = device_secret_a.ed25519_keypair(device_a_id).unwrap().into_signing_key();
 
@@ -2611,8 +2606,7 @@ async fn f16_malicious_future_generation_stalls_then_quarantines() {
 
     let verifier_id = "device-verifier";
     let verifier_secret = DeviceSecret::generate();
-    let verifier_signing =
-        verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
+    let verifier_signing = verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
 
     let attacker_id = "device-attacker";
     let attacker_secret = DeviceSecret::generate();
@@ -2752,8 +2746,7 @@ async fn f16_stale_generation_budget_exhaustion_quarantines_then_replay_applies(
 
     let verifier_id = "device-verifier";
     let verifier_secret = DeviceSecret::generate();
-    let verifier_signing =
-        verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
+    let verifier_signing = verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
 
     let sender_id = "device-sender";
     let sender_secret = DeviceSecret::generate();
@@ -2987,9 +2980,9 @@ async fn rolling_sender_stalls_are_sender_tracked() {
     // The app sees a sender-level liveness signal, not just per-seq stalls.
     let events = drain_pull_sender_stalled(&mut f.event_rx);
     assert!(
-        events.iter().any(|(s, r, live, _)| s == f.device_b_id
-            && r == "sender_unresolved"
-            && *live >= 1),
+        events
+            .iter()
+            .any(|(s, r, live, _)| s == f.device_b_id && r == "sender_unresolved" && *live >= 1),
         "expected a PullSenderStalled for device B; got {events:?}"
     );
 }
@@ -3080,10 +3073,8 @@ async fn sender_health_tracks_quarantine_then_recovery() {
     assert_eq!(health.quarantined_batch_count, 1, "the conversion is tallied per sender");
 
     // The per-sender quarantine drill-down sees B's unapplied backlog.
-    let by_sender = f
-        .storage
-        .list_quarantined_pull_batches_by_sender(SYNC_ID, f.device_b_id)
-        .unwrap();
+    let by_sender =
+        f.storage.list_quarantined_pull_batches_by_sender(SYNC_ID, f.device_b_id).unwrap();
     assert_eq!(by_sender.len(), 1);
     assert_eq!(by_sender[0].reason, "sender_unresolved");
 
@@ -3117,9 +3108,7 @@ async fn sender_health_tracks_quarantine_then_recovery() {
     );
     let recovered = drain_pull_sender_recovered(&mut f.event_rx);
     assert!(
-        recovered
-            .iter()
-            .any(|(s, r, n)| s == f.device_b_id && r == "sender_unresolved" && *n == 1),
+        recovered.iter().any(|(s, r, n)| s == f.device_b_id && r == "sender_unresolved" && *n == 1),
         "expected PullSenderRecovered for device B; got {recovered:?}"
     );
 }
@@ -3135,8 +3124,7 @@ async fn stale_generation_sender_health_tracks_and_recovers() {
 
     let verifier_id = "device-verifier";
     let verifier_secret = DeviceSecret::generate();
-    let verifier_signing =
-        verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
+    let verifier_signing = verifier_secret.ed25519_keypair(verifier_id).unwrap().into_signing_key();
 
     let sender_id = "device-sender";
     let sender_secret = DeviceSecret::generate();
@@ -3216,15 +3204,9 @@ async fn stale_generation_sender_health_tracks_and_recovers() {
     .with_event_sink(event_tx);
 
     // Cycle 1: gen 1 > local gen 0, no registry to refresh -> stall.
-    engine
-        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
-        .await
-        .unwrap();
+    engine.sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0).await.unwrap();
     // Cycle 2: budget hit -> quarantine (reason stale_key_generation).
-    engine
-        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
-        .await
-        .unwrap();
+    engine.sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0).await.unwrap();
 
     let health = sender_health_row(&storage, sender_id, "stale_key_generation");
     assert_eq!(health.live_stall_count, 1);
@@ -3288,10 +3270,7 @@ async fn stale_generation_sender_health_tracks_and_recovers() {
         artifact_kind: "signed_registry_snapshot".to_string(),
     });
 
-    engine
-        .sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0)
-        .await
-        .unwrap();
+    engine.sync(SYNC_ID, &key_hierarchy, &verifier_signing, None, verifier_id, 0).await.unwrap();
 
     assert_eq!(
         entity.get_field("task-rot", "title"),
@@ -3304,9 +3283,7 @@ async fn stale_generation_sender_health_tracks_and_recovers() {
     );
     let recovered = drain_pull_sender_recovered(&mut event_rx);
     assert!(
-        recovered
-            .iter()
-            .any(|(s, r, n)| s == sender_id && r == "stale_key_generation" && *n == 1),
+        recovered.iter().any(|(s, r, n)| s == sender_id && r == "stale_key_generation" && *n == 1),
         "expected PullSenderRecovered(stale_key_generation) for the sender; got {recovered:?}"
     );
 }
@@ -3454,7 +3431,10 @@ async fn sender_recovery_resets_fast_quarantine() {
     // With the shortcut reset, sender_fast_quarantine_tripped must NOT fire even
     // at the fast threshold, because quarantined_batch_count is back to 0.
     assert!(
-        f.storage.get_pull_sender_health(SYNC_ID, f.device_b_id, "sender_unresolved").unwrap().is_none(),
+        f.storage
+            .get_pull_sender_health(SYNC_ID, f.device_b_id, "sender_unresolved")
+            .unwrap()
+            .is_none(),
         "no known-broken signal remains for B after recovery"
     );
 }
@@ -3553,11 +3533,8 @@ fn setup_refresh_fx(local_sender_gen: Option<u32>) -> RefreshFx {
 #[tokio::test]
 async fn refresh_registry_unavailable_preserves_error() {
     let fx = setup_refresh_fx(None); // sender NOT known locally
-    // MockRelay get_signed_registry returns Ok(None) by default.
-    let res = fx
-        .engine
-        .refresh_sender_registry_for_liveness(SYNC_ID, fx.sender_id, Some(0))
-        .await;
+                                     // MockRelay get_signed_registry returns Ok(None) by default.
+    let res = fx.engine.refresh_sender_registry_for_liveness(SYNC_ID, fx.sender_id, Some(0)).await;
     assert!(res.is_err(), "unknown sender with no registry must fail closed");
     let health = fx
         .storage
@@ -3584,10 +3561,7 @@ async fn refresh_registry_stale_missing_sender_preserves_error() {
         artifact_blob: blob,
         artifact_kind: "signed_registry_snapshot".to_string(),
     });
-    let res = fx
-        .engine
-        .refresh_sender_registry_for_liveness(SYNC_ID, fx.sender_id, Some(0))
-        .await;
+    let res = fx.engine.refresh_sender_registry_for_liveness(SYNC_ID, fx.sender_id, Some(0)).await;
     assert!(res.is_err(), "sender absent from the imported registry must fail closed");
     let health = fx
         .storage

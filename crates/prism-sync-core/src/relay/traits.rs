@@ -693,6 +693,157 @@ pub trait SnapshotExchange: Send + Sync {
     /// was present at the moment of the call (the caller may treat this as
     /// idempotent success).
     async fn delete_snapshot(&self) -> std::result::Result<(), RelayError>;
+
+    // ── Resumable pair-time snapshot upload (lean v1) ──────────────────────
+    //
+    // Every method below is **defaulted to the old-relay behaviour**, which is
+    // the whole compatibility contract: a relay (or a test double) that does not
+    // implement the resumable routes reports an absent capability, and
+    // `SyncEngine::upload_pairing_snapshot` falls back to the existing single
+    // `PUT /snapshot` exactly as before. No implementor is forced to change.
+
+    /// Fetch the optional `snapshot_upload` capability.
+    ///
+    /// The default reports absence, so an unknown transport keeps working.
+    /// Implementations must treat a lookup failure as
+    /// [`CapabilityUnavailableReason::LookupFailed`] rather than an error:
+    /// capability discovery never fails pairing.
+    async fn resumable_snapshot_capability(
+        &self,
+    ) -> std::result::Result<
+        crate::snapshot_upload::SnapshotUploadCapability,
+        crate::snapshot_upload::CapabilityUnavailableReason,
+    > {
+        Err(crate::snapshot_upload::CapabilityUnavailableReason::Absent)
+    }
+
+    /// Create or recover a resumable session.
+    async fn create_snapshot_upload(
+        &self,
+        _body: &crate::snapshot_upload::CreateUploadRequest,
+    ) -> std::result::Result<
+        crate::snapshot_upload::CreateUploadResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        Err(crate::snapshot_upload::ResumableUploadError::unsupported())
+    }
+
+    /// Query a resumable session's authoritative state.
+    async fn snapshot_upload_status(
+        &self,
+        _upload_id: &str,
+    ) -> std::result::Result<
+        crate::snapshot_upload::UploadStatusResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        Err(crate::snapshot_upload::ResumableUploadError::unsupported())
+    }
+
+    /// Upload one chunk at `offset`.
+    async fn put_snapshot_upload_chunk(
+        &self,
+        _upload_id: &str,
+        _offset: u64,
+        _chunk: &[u8],
+    ) -> std::result::Result<
+        crate::snapshot_upload::ChunkResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        Err(crate::snapshot_upload::ResumableUploadError::unsupported())
+    }
+
+    /// Complete and publish a resumable session.
+    async fn complete_snapshot_upload(
+        &self,
+        _upload_id: &str,
+    ) -> std::result::Result<(), crate::snapshot_upload::ResumableUploadError> {
+        Err(crate::snapshot_upload::ResumableUploadError::unsupported())
+    }
+
+    /// Best-effort abort of a resumable session.
+    ///
+    /// The default is a successful no-op: there is nothing to abort on a
+    /// transport that has no resumable sessions, and cancellation must never
+    /// fail because of it.
+    async fn abort_snapshot_upload(
+        &self,
+        _upload_id: &str,
+    ) -> std::result::Result<(), crate::snapshot_upload::ResumableUploadError> {
+        Ok(())
+    }
+
+    /// View this transport as a [`ResumableSnapshotTransport`].
+    ///
+    /// Returns `None` by default, which is the exact old-relay semantics: the
+    /// engine then reports capability absence and falls back to single PUT. A
+    /// transport that implements the resumable routes overrides this to return
+    /// `Some(self)`.
+    fn as_resumable_transport(
+        &self,
+    ) -> Option<&dyn crate::snapshot_upload::ResumableSnapshotTransport> {
+        None
+    }
+}
+
+/// Every [`SnapshotExchange`] is usable as a [`ResumableSnapshotTransport`] via
+/// its defaulted resumable methods, so a test double can inject resumable
+/// behavior by overriding only the methods it needs.
+#[async_trait]
+impl<T: SnapshotExchange + ?Sized> crate::snapshot_upload::ResumableSnapshotTransport for T {
+    async fn resumable_snapshot_capability(
+        &self,
+    ) -> std::result::Result<
+        crate::snapshot_upload::SnapshotUploadCapability,
+        crate::snapshot_upload::CapabilityUnavailableReason,
+    > {
+        SnapshotExchange::resumable_snapshot_capability(self).await
+    }
+
+    async fn create_snapshot_upload(
+        &self,
+        body: &crate::snapshot_upload::CreateUploadRequest,
+    ) -> std::result::Result<
+        crate::snapshot_upload::CreateUploadResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        SnapshotExchange::create_snapshot_upload(self, body).await
+    }
+
+    async fn snapshot_upload_status(
+        &self,
+        upload_id: &str,
+    ) -> std::result::Result<
+        crate::snapshot_upload::UploadStatusResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        SnapshotExchange::snapshot_upload_status(self, upload_id).await
+    }
+
+    async fn put_snapshot_upload_chunk(
+        &self,
+        upload_id: &str,
+        offset: u64,
+        chunk: &[u8],
+    ) -> std::result::Result<
+        crate::snapshot_upload::ChunkResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        SnapshotExchange::put_snapshot_upload_chunk(self, upload_id, offset, chunk).await
+    }
+
+    async fn complete_snapshot_upload(
+        &self,
+        upload_id: &str,
+    ) -> std::result::Result<(), crate::snapshot_upload::ResumableUploadError> {
+        SnapshotExchange::complete_snapshot_upload(self, upload_id).await
+    }
+
+    async fn abort_snapshot_upload(
+        &self,
+        upload_id: &str,
+    ) -> std::result::Result<(), crate::snapshot_upload::ResumableUploadError> {
+        SnapshotExchange::abort_snapshot_upload(self, upload_id).await
+    }
 }
 
 /// Outcome of a media upload, distinguishing a committed (servable) blob from a

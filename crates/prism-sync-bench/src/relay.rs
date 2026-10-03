@@ -104,13 +104,9 @@ pub(crate) fn sign_request(
     write_len_prefixed(&mut data, timestamp.as_bytes());
     write_len_prefixed(&mut data, nonce.as_bytes());
 
-    let sig = HybridSignature::sign_v3(
-        &data,
-        hybrid_signature_contexts::HTTP_REQUEST,
-        ed_sk,
-        ml_dsa_sk,
-    )
-    .expect("sign request");
+    let sig =
+        HybridSignature::sign_v3(&data, hybrid_signature_contexts::HTTP_REQUEST, ed_sk, ml_dsa_sk)
+            .expect("sign request");
     let mut versioned = vec![SIGNATURE_VERSION];
     versioned.extend_from_slice(&sig.to_bytes());
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(&versioned);
@@ -119,10 +115,7 @@ pub(crate) fn sign_request(
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 /// Full registration helper: fetches nonce, signs the hybrid challenge,

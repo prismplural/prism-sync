@@ -21,6 +21,10 @@ use super::traits::*;
 use super::websocket::{
     RefreshSessionCallback, RefreshSessionPolicy, RefreshSessionResult, WebSocketClient,
 };
+use crate::snapshot_upload::{
+    CapabilityUnavailableReason, ChunkResponse, CreateUploadRequest, CreateUploadResponse,
+    ResumableUploadError, SnapshotUploadCapability, UploadErrorCode, UploadStatusResponse,
+};
 
 const SNAPSHOT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
@@ -1427,6 +1431,257 @@ impl SnapshotExchange for ServerRelay {
                 Err(RelayError::Http { status, body: body_text })
             }
         }
+    }
+
+    // ── Resumable pair-time snapshot upload (lean v1) ──
+    //
+    // These forward to the inherent HTTP methods above. Overriding them here
+    // (rather than only on the inherent methods) is what lets the blanket
+    // `ResumableSnapshotTransport` adapter and `as_resumable_transport` see a
+    // relay that really speaks the resumable routes.
+
+    async fn resumable_snapshot_capability(
+        &self,
+    ) -> Result<SnapshotUploadCapability, CapabilityUnavailableReason> {
+        self.resumable_http_capability().await
+    }
+
+    async fn create_snapshot_upload(
+        &self,
+        body: &CreateUploadRequest,
+    ) -> Result<CreateUploadResponse, ResumableUploadError> {
+        self.resumable_http_create(body).await
+    }
+
+    async fn snapshot_upload_status(
+        &self,
+        upload_id: &str,
+    ) -> Result<UploadStatusResponse, ResumableUploadError> {
+        self.resumable_http_status(upload_id).await
+    }
+
+    async fn put_snapshot_upload_chunk(
+        &self,
+        upload_id: &str,
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<ChunkResponse, ResumableUploadError> {
+        self.resumable_http_chunk(upload_id, offset, chunk).await
+    }
+
+    async fn complete_snapshot_upload(&self, upload_id: &str) -> Result<(), ResumableUploadError> {
+        self.resumable_http_complete(upload_id).await
+    }
+
+    async fn abort_snapshot_upload(&self, upload_id: &str) -> Result<(), ResumableUploadError> {
+        self.resumable_http_abort(upload_id).await
+    }
+
+    fn as_resumable_transport(
+        &self,
+    ) -> Option<&dyn crate::snapshot_upload::ResumableSnapshotTransport> {
+        Some(self)
+    }
+}
+
+// ── Resumable snapshot upload (lean v1 client transport) ────────────────────
+
+impl ServerRelay {
+    /// Read a response body, classifying a non-2xx into a structured
+    /// [`ResumableUploadError`] parsed from the relay's JSON error body.
+    ///
+    /// The relay's resumable routes always answer with a machine code, but this
+    /// tolerates a plain-text body from an intermediary: an unknown code still
+    /// classifies correctly from the status alone, so a proxy error does not
+    /// become an unhandled protocol failure.
+    async fn resumable_body(
+        resp: reqwest::Response,
+        path_for_log: &str,
+    ) -> Result<Vec<u8>, ResumableUploadError> {
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await.map_err(|e| {
+            // A reset while reading the response body is a transport failure:
+            // the server may have committed the operation, so the caller must
+            // reconcile rather than assume it failed.
+            ResumableUploadError::transport(format!(
+                "reading {path_for_log} response body failed: {}",
+                e.without_url()
+            ))
+        })?;
+        if status >= 400 {
+            let text = String::from_utf8_lossy(&body);
+            return Err(ResumableUploadError::parse(status, &text));
+        }
+        Ok(body.to_vec())
+    }
+
+    fn resumable_uploads_path(&self, suffix: &str) -> String {
+        self.canonical_path(&format!("/snapshot/uploads{suffix}"))
+    }
+
+    fn resumable_uploads_url(&self, suffix: &str) -> String {
+        format!("{}{}", self.base_url, self.resumable_uploads_path(suffix))
+    }
+}
+
+impl ServerRelay {
+    // The real HTTP implementations live here as inherent methods; the
+    // `SnapshotExchange` impl forwards to them so the blanket
+    // `ResumableSnapshotTransport` adapter picks them up.
+
+    async fn resumable_http_capability(
+        &self,
+    ) -> Result<SnapshotUploadCapability, CapabilityUnavailableReason> {
+        let url = format!("{}/capabilities", self.base_path());
+        let response =
+            match self.apply_auth(self.client.get(&url)).timeout(self.request_timeout).send().await
+            {
+                Ok(response) => response,
+                // A capabilities lookup failure must never fail pairing. It is the
+                // documented downgrade to the existing single PUT.
+                Err(_) => return Err(CapabilityUnavailableReason::LookupFailed),
+            };
+
+        if response.status().as_u16() >= 400 {
+            return Err(CapabilityUnavailableReason::LookupFailed);
+        }
+
+        // An old relay returns a body without the sibling; a malformed body is
+        // likewise just an unavailable capability.
+        let Ok(json) = response.json::<serde_json::Value>().await else {
+            return Err(CapabilityUnavailableReason::LookupFailed);
+        };
+        SnapshotUploadCapability::parse(&json)
+    }
+
+    async fn resumable_http_create(
+        &self,
+        body: &CreateUploadRequest,
+    ) -> Result<CreateUploadResponse, ResumableUploadError> {
+        let path = self.resumable_uploads_path("");
+        let url = self.resumable_uploads_url("");
+        let payload = serde_json::to_vec(body).map_err(|e| {
+            ResumableUploadError::new(
+                400,
+                UploadErrorCode::InvalidUpload,
+                format!("serializing create body failed: {e}"),
+            )
+        })?;
+
+        // A fresh signed request per attempt: the nonce is generated inside
+        // `apply_signed_auth`, so a retry can never reuse one.
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &payload)
+            .header("Content-Type", "application/json")
+            .body(payload)
+            .timeout(self.snapshot_timeout)
+            .send()
+            .await
+            .map_err(|e| ResumableUploadError::transport(format!("create request failed: {e}")))?;
+
+        let body = Self::resumable_body(resp, "/snapshot/uploads").await?;
+        serde_json::from_slice(&body).map_err(|e| {
+            ResumableUploadError::new(
+                502,
+                UploadErrorCode::Unknown("malformed_create_response".to_string()),
+                format!("parsing create response failed: {e}"),
+            )
+        })
+    }
+
+    async fn resumable_http_status(
+        &self,
+        upload_id: &str,
+    ) -> Result<UploadStatusResponse, ResumableUploadError> {
+        let path = self.resumable_uploads_path(&format!("/{upload_id}"));
+        let url = self.resumable_uploads_url(&format!("/{upload_id}"));
+
+        // Signed with an empty body, matching the relay's verification.
+        let resp = self
+            .apply_signed_auth(self.client.get(&url), "GET", &path, &[])
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(|e| ResumableUploadError::transport(format!("status request failed: {e}")))?;
+
+        let body = Self::resumable_body(resp, "/snapshot/uploads/{upload_id}").await?;
+        serde_json::from_slice(&body).map_err(|e| {
+            ResumableUploadError::new(
+                502,
+                UploadErrorCode::Unknown("malformed_status_response".to_string()),
+                format!("parsing status response failed: {e}"),
+            )
+        })
+    }
+
+    async fn resumable_http_chunk(
+        &self,
+        upload_id: &str,
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<ChunkResponse, ResumableUploadError> {
+        let suffix = format!("/{upload_id}/chunks/{offset}");
+        let path = self.resumable_uploads_path(&suffix);
+        let url = self.resumable_uploads_url(&suffix);
+
+        // The offset is in the signed canonical path and the signature binds the
+        // chunk body hash, so neither an unsigned offset nor a checksum header is
+        // authoritative.
+        let resp = self
+            .apply_signed_auth(self.client.put(&url), "PUT", &path, chunk)
+            .header("Content-Type", "application/octet-stream")
+            .body(chunk.to_vec())
+            .timeout(self.snapshot_timeout)
+            .send()
+            .await
+            .map_err(|e| ResumableUploadError::transport(format!("chunk request failed: {e}")))?;
+
+        let body = Self::resumable_body(resp, "/snapshot/uploads/{upload_id}/chunks").await?;
+        serde_json::from_slice(&body).map_err(|e| {
+            ResumableUploadError::new(
+                502,
+                UploadErrorCode::Unknown("malformed_chunk_response".to_string()),
+                format!("parsing chunk response failed: {e}"),
+            )
+        })
+    }
+
+    async fn resumable_http_complete(&self, upload_id: &str) -> Result<(), ResumableUploadError> {
+        let suffix = format!("/{upload_id}/complete");
+        let path = self.resumable_uploads_path(&suffix);
+        let url = self.resumable_uploads_url(&suffix);
+
+        // Empty body, so the signature binds nothing but the request framing.
+        let resp = self
+            .apply_signed_auth(self.client.post(&url), "POST", &path, &[])
+            .timeout(self.snapshot_timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                // An ambiguous complete is exactly the case the caller must
+                // reconcile: the response may have been lost after publication
+                // committed.
+                ResumableUploadError::transport(format!("complete request failed: {e}"))
+            })?;
+
+        Self::resumable_body(resp, "/snapshot/uploads/{upload_id}/complete").await?;
+        Ok(())
+    }
+
+    async fn resumable_http_abort(&self, upload_id: &str) -> Result<(), ResumableUploadError> {
+        let suffix = format!("/{upload_id}");
+        let path = self.resumable_uploads_path(&suffix);
+        let url = self.resumable_uploads_url(&suffix);
+
+        let resp = self
+            .apply_signed_auth(self.client.delete(&url), "DELETE", &path, &[])
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(|e| ResumableUploadError::transport(format!("abort request failed: {e}")))?;
+
+        Self::resumable_body(resp, "/snapshot/uploads/{upload_id}").await?;
+        Ok(())
     }
 }
 

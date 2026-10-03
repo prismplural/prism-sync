@@ -339,24 +339,68 @@ pub async fn get_snapshot(
         "Get snapshot"
     );
 
-    match snapshot {
-        Some(snap) => {
-            // Retention is ACK-gated: the target device issues
-            // `DELETE /v1/sync/{sync_id}/snapshot` once the snapshot has
-            // been applied locally. TTL-based cleanup still fires via
-            // `cleanup_expired_snapshots` for snapshots uploaded with an
-            // explicit `X-Snapshot-TTL`.
-            let b64 = base64::engine::general_purpose::STANDARD;
-            Ok(Json(serde_json::json!({
-                "epoch": snap.epoch,
-                "server_seq_at": snap.server_seq_at,
-                "data": b64.encode(&snap.data),
-                "sender_device_id": snap.uploaded_by_device_id.unwrap_or_default(),
-            }))
-            .into_response())
+    let snap = match snapshot {
+        Some(snap) => snap,
+        None => return Ok(StatusCode::NOT_FOUND.into_response()),
+    };
+
+    // File-backed rows carry the bytes on disk (read here, AFTER the reader
+    // connection is released, so a 150 MB read never holds a pool connection);
+    // legacy inline rows keep them in `data`.
+    //
+    // A published file-backed row whose blob is missing or unreadable — a
+    // partial restore, a lost volume, or a hand-deleted file — must read as the
+    // SAME snapshot-absent response as no row at all, with a bounded metric and
+    // one structured error log. It must not become a generic 500 that a client
+    // retries in a loop: the bytes are simply gone, and the client's correct
+    // recovery is to re-pair/re-upload, not to retry the GET.
+    let bytes = match snap.blob_ref {
+        Some(blob_ref) => {
+            let root = state.snapshot_storage.root().map(std::path::Path::to_path_buf);
+            let sid = auth.sync_id.clone();
+            let log_ref = trunc(&blob_ref).to_string();
+            let read = tokio::task::spawn_blocking(move || match root {
+                Some(root) => {
+                    std::fs::read(crate::snapshot_store::blob_path(&root, &sid, &blob_ref))
+                }
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "snapshot file backing unavailable (storage root failed validation)",
+                )),
+            })
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+            match read {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    state.metrics.inc(&state.metrics.snapshots_missing_blob);
+                    tracing::error!(
+                        sync_id = %trunc(&auth.sync_id),
+                        device_id = %trunc(&auth.device_id),
+                        blob_ref = %log_ref,
+                        error = %error,
+                        "file-backed snapshot blob missing or unreadable; reporting snapshot-absent"
+                    );
+                    return Ok(StatusCode::NOT_FOUND.into_response());
+                }
+            }
         }
-        None => Ok(StatusCode::NOT_FOUND.into_response()),
-    }
+        None => snap.data,
+    };
+
+    // Retention is ACK-gated: the target device issues
+    // `DELETE /v1/sync/{sync_id}/snapshot` once the snapshot has been applied
+    // locally. TTL-based cleanup still fires via `cleanup_expired_snapshots`
+    // for snapshots uploaded with an explicit `X-Snapshot-TTL`.
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(Json(serde_json::json!({
+        "epoch": snap.epoch,
+        "server_seq_at": snap.server_seq_at,
+        "data": b64.encode(&bytes),
+        "sender_device_id": snap.uploaded_by_device_id.unwrap_or_default(),
+    }))
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -395,11 +439,27 @@ pub async fn delete_snapshot(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    if !deleted {
-        // No row targeted at the caller: either it never existed, TTL cleanup
-        // removed it, another concurrent pairing's row is all that remains, or
-        // the group is group-wide-only (NULL target — not ACK-deletable).
-        return Err(AppError::NotFound);
+    let blob_ref = match deleted {
+        Some(blob_ref) => blob_ref,
+        None => {
+            // No row targeted at the caller: either it never existed, TTL cleanup
+            // removed it, another concurrent pairing's row is all that remains, or
+            // the group is group-wide-only (NULL target — not ACK-deletable).
+            return Err(AppError::NotFound);
+        }
+    };
+
+    // The row is gone; unlink its on-disk blob (file-backed rows only) after the
+    // writer mutex is released. Best-effort — a leftover file is reclaimed by
+    // the snapshot orphan sweep.
+    if let Some(blob_ref) = blob_ref {
+        if let Some(root) = state.snapshot_storage.root().map(std::path::Path::to_path_buf) {
+            let sid = auth.sync_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::snapshot_store::remove_blob(&root, &sid, &blob_ref);
+            })
+            .await;
+        }
     }
 
     tracing::debug!(
@@ -477,20 +537,75 @@ pub async fn put_snapshot(
         "Put snapshot request"
     );
 
+    // Preflight cap reject (read-only) BEFORE writing the bytes to disk: a fresh
+    // targeted audience beyond the cap would be rejected by the authoritative
+    // atomic check below anyway, so reject it here to avoid persisting up to
+    // 150 MB only to delete it. This is an optimization, not the guard — the
+    // count+upsert under the writer mutex remains the atomic enforcer.
+    if let Some(target) = target_device_id.as_deref() {
+        let db = state.db.clone();
+        let sid = sync_id.clone();
+        let tgt = target.to_string();
+        let other_audiences = tokio::task::spawn_blocking(move || {
+            db.with_read_conn(|conn| db::count_unexpired_targeted_snapshots(conn, &sid, Some(&tgt)))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+        if other_audiences >= MAX_TARGETED_SNAPSHOTS_PER_GROUP {
+            state.metrics.inc(&state.metrics.snapshots_rejected_targeted_cap);
+            return Err(AppError::TooManyTargetedSnapshots {
+                max: MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+            });
+        }
+    }
+
+    // Write the bytes to a fresh, uniquely-named file at its FINAL path BEFORE
+    // committing the row that references it. The name is unique per upload, so
+    // no concurrent reader or writer ever touches this file — a GET only learns
+    // the name once the row is committed, by which point the bytes are fully
+    // written and the file plus its parent directory are durably synchronized.
+    // This is the single multi-MB I/O of the request and it runs entirely
+    // OUTSIDE the writer mutex.
+    //
+    // When the startup storage gate resolved to inline (a root that failed
+    // validation), no file is written at all and the row keeps the bytes in its
+    // `data` column — the legacy behavior — so a bad deployment can never
+    // publish rows whose bytes are missing.
+    let storage_root = state.snapshot_storage.root().map(std::path::Path::to_path_buf);
+    let blob_ref = storage_root.as_ref().map(|_| crate::snapshot_store::generate_blob_ref());
+    let written_path: Option<std::path::PathBuf> = match (&storage_root, &blob_ref) {
+        (Some(root), Some(bref)) => {
+            let root = root.clone();
+            let bref = bref.clone();
+            let sid = sync_id.clone();
+            let data = body.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::snapshot_store::write_blob_durably(&root, &sid, &bref, &data)
+                })
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .map_err(|e| AppError::Internal(format!("Failed to write snapshot blob: {e}")))?,
+            )
+        }
+        _ => None,
+    };
+
     let db = state.db.clone();
     let sid = sync_id.clone();
     let did = device_id;
-    // `body` is a `bytes::Bytes` — cheap to move into the blocking task
-    // (reference-counted, no allocation). Avoid an extra ~150 MB copy via
-    // `body.to_vec()` that the handler used to do.
-    let upsert_result = tokio::task::spawn_blocking(move || {
+    let bref = blob_ref.clone();
+    let inline_data = body;
+    let put_result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             Ok(do_put_snapshot(
                 conn,
                 &sid,
                 &did,
                 server_seq_at,
-                &body,
+                bref.as_deref(),
+                &inline_data,
                 expires_at,
                 target_device_id.as_deref(),
             ))
@@ -500,30 +615,60 @@ pub async fn put_snapshot(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    match &upsert_result {
-        Err(AppError::SnapshotStale { .. }) => {
-            state.metrics.inc(&state.metrics.snapshots_rejected_stale);
+    match put_result {
+        Ok(old_blob_ref) => {
+            // Our write won. The new file is now referenced; unlink the blob the
+            // replaced row used to point at (a fresh insert has none, and a
+            // replaced legacy inline row reports `None` — its bytes vanished
+            // with the row update). Best-effort; the orphan sweep backstops.
+            if let (Some(root), Some(old)) = (storage_root.as_ref(), old_blob_ref) {
+                let root = root.clone();
+                let sid = sync_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::snapshot_store::remove_blob(&root, &sid, &old);
+                })
+                .await;
+            }
+            tracing::debug!(sync_id = %trunc(&sync_id), "Put snapshot stored");
+            Ok(StatusCode::NO_CONTENT)
         }
-        Err(AppError::TooManyTargetedSnapshots { .. }) => {
-            state.metrics.inc(&state.metrics.snapshots_rejected_targeted_cap);
+        Err(e) => {
+            // Rejected (stale seq / cap / missing device): the file we just wrote
+            // is referenced by no row, so remove it to avoid an orphan.
+            if let Some(path) = written_path {
+                let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+            }
+            if let AppError::SnapshotStale { .. } = e {
+                state.metrics.inc(&state.metrics.snapshots_rejected_stale);
+            } else if let AppError::TooManyTargetedSnapshots { .. } = e {
+                state.metrics.inc(&state.metrics.snapshots_rejected_targeted_cap);
+            }
+            Err(e)
         }
-        _ => {}
     }
-    upsert_result?;
-
-    tracing::debug!(sync_id = %trunc(&sync_id), "Put snapshot stored");
-    Ok(StatusCode::NO_CONTENT)
 }
 
+/// Commit the snapshot ROW under the writer mutex so the targeted-snapshot cap
+/// count and the upsert stay atomic.
+///
+/// `blob_ref == Some` writes a tiny reference (the bytes already durably on
+/// disk outside this lock); `None` writes the bytes inline in the row — the
+/// legacy path, retained when file backing is unavailable.
+///
+/// On success returns the previous row's `blob_ref` (if any) so the caller can
+/// unlink the now-orphaned old blob; on a guard rejection returns the same
+/// `SnapshotStale` / `TooManyTargetedSnapshots` errors as before.
+#[allow(clippy::too_many_arguments)]
 fn do_put_snapshot(
     conn: &rusqlite::Connection,
     sync_id: &str,
     device_id: &str,
     server_seq_at: i64,
-    data: &[u8],
+    blob_ref: Option<&str>,
+    inline_data: &[u8],
     expires_at: Option<i64>,
     target_device_id: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<Option<String>, AppError> {
     // Look up the device's current epoch from the devices table
     let device = db::get_device(conn, sync_id, device_id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -534,8 +679,10 @@ fn do_put_snapshot(
     // audience, so re-uploading to an existing audience updates it in place and
     // never trips the cap — and an expired-then-refreshed caller row can't push
     // the live unexpired total to cap+1 (the slack the expiry-agnostic precheck
-    // used to leave until hourly cleanup). The whole handler runs under
-    // `with_conn`'s writer mutex, so the count and the upsert are atomic.
+    // used to leave until hourly cleanup). This function is only the DB
+    // critical section: the caller already wrote any blob bytes to disk outside
+    // the lock, so the count read, the old-blob lookup, and the upsert all run
+    // under `with_conn`'s writer mutex together and stay atomic.
     if let Some(target) = target_device_id {
         let other_audiences = db::count_unexpired_targeted_snapshots(conn, sync_id, Some(target))
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -546,16 +693,35 @@ fn do_put_snapshot(
         }
     }
 
-    let affected = db::upsert_snapshot(
-        conn,
-        sync_id,
-        epoch,
-        server_seq_at,
-        data,
-        expires_at,
-        target_device_id,
-        Some(device_id),
-    )
+    // Read the old blob_ref for this audience BEFORE the upsert (same writer
+    // mutex, so no other writer can mutate the row in between). A winning upsert
+    // that REPLACES an existing file-backed row orphans this old file; the
+    // handler unlinks it after the lock is released.
+    let old_blob_ref = db::get_snapshot_blob_ref(conn, sync_id, target_device_id.unwrap_or(""))
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let affected = match blob_ref {
+        Some(blob_ref) => db::upsert_snapshot_ref(
+            conn,
+            sync_id,
+            epoch,
+            server_seq_at,
+            blob_ref,
+            expires_at,
+            target_device_id,
+            Some(device_id),
+        ),
+        None => db::upsert_snapshot(
+            conn,
+            sync_id,
+            epoch,
+            server_seq_at,
+            inline_data,
+            expires_at,
+            target_device_id,
+            Some(device_id),
+        ),
+    }
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if affected == 0 {
@@ -576,7 +742,7 @@ fn do_put_snapshot(
                 .unwrap_or((0, None));
         return Err(AppError::SnapshotStale { current_server_seq_at, current_target_device_id });
     }
-    Ok(())
+    Ok(old_blob_ref)
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +775,7 @@ pub async fn delete_account(
     let did = device_id;
 
     let media_storage_path = state.config.media_storage_path.clone();
+    let snapshot_root = state.snapshot_storage.root().map(std::path::Path::to_path_buf);
 
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| Ok(do_delete_account(conn, &sid, &did)))
@@ -626,6 +793,14 @@ pub async fn delete_account(
             }
             let dir = std::path::Path::new(&media_storage_path).join(&sync_id);
             let _ = std::fs::remove_dir(&dir);
+
+            // Snapshot blobs live one-per-file under the group's snapshot dir;
+            // the group's rows are already gone, so drop the whole tree (the
+            // helper refuses to follow a symlinked group directory). The
+            // snapshot orphan sweep backstops anything left behind.
+            if let Some(root) = snapshot_root.as_ref() {
+                crate::snapshot_store::remove_group_dir(root, &sync_id);
+            }
 
             tracing::debug!(sync_id = %trunc(&sync_id), "Sync group deleted");
             Ok(StatusCode::NO_CONTENT)

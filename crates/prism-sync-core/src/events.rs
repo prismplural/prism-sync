@@ -96,11 +96,7 @@ pub enum SyncEvent {
     /// the batch is retried next cycle, bounded by the stall budget — after
     /// which it converts to a `PullBatchQuarantined`. `attempt` is the running
     /// `pull_stall.attempts` count; `reason` is the persisted stall reason.
-    PullStalled {
-        server_seq: i64,
-        reason: String,
-        attempt: i64,
-    },
+    PullStalled { server_seq: i64, reason: String, attempt: i64 },
     /// A specific *peer's* inbound batches are repeatedly failing to apply on
     /// this device (transient sender-resolution stall or conversion to a durable
     /// quarantine) while this device's own push to the group still succeeds — the
@@ -126,11 +122,7 @@ pub enum SyncEvent {
     /// previously quarantined batches, and the sender's accumulated health rows
     /// were cleared. The inverse of `PullSenderStalled`. Additive event — the
     /// Dart decoder ignores unknown event types.
-    PullSenderRecovered {
-        sender_device_id: String,
-        reason: String,
-        replayed_batch_count: i64,
-    },
+    PullSenderRecovered { sender_device_id: String, reason: String, replayed_batch_count: i64 },
     /// A forward clock excursion poisoned this device's own HLCs (watermark and
     /// self-authored `field_versions` winners drifted past the drift bound) and
     /// the relay-anchored repair rewrote those winners at sane HLCs and

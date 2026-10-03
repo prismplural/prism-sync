@@ -51,11 +51,17 @@ pub struct BatchEntry {
 
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
+    /// Inline snapshot bytes for legacy rows (`blob_ref IS NULL`). File-backed
+    /// rows store an empty blob here and carry the bytes on disk under
+    /// `blob_ref`; the GET handler reads the file instead of this field.
     pub data: Vec<u8>,
     pub epoch: i64,
     pub server_seq_at: i64,
     pub target_device_id: Option<String>,
     pub uploaded_by_device_id: Option<String>,
+    /// On-disk blob filename (relative to `<snapshot_storage_path>/<sync_id>/`)
+    /// when the snapshot bytes are file-backed; `None` for a legacy inline row.
+    pub blob_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +445,11 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         -- not a sync_id-only primary key, so concurrent pairings can't clobber
         -- each other's targeted row. NULL stays the group-wide sentinel so an
         -- older relay binary still reads these rows correctly after a rollback.
+        -- `blob_ref` is the on-disk filename when the snapshot bytes are
+        -- file-backed (kept off the writer mutex; `data` then holds an empty
+        -- blob). A NULL `blob_ref` is a legacy inline row whose bytes live in
+        -- `data`. The column is added to pre-existing tables by
+        -- migrate_snapshots_blob_ref() below.
         CREATE TABLE IF NOT EXISTS snapshots (
             sync_id                 TEXT NOT NULL,
             epoch                   INTEGER NOT NULL,
@@ -448,6 +459,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             expires_at              INTEGER,
             target_device_id        TEXT,
             uploaded_by_device_id   TEXT,
+            blob_ref                TEXT,
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
         -- The per-audience UNIQUE index is created by
@@ -512,6 +524,14 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             joiner_bundle       BLOB,
             credential_bundle_consumed_at INTEGER,
             joiner_bundle_consumed_at     INTEGER,
+            -- Pairing lease (privacy-preserving, post-confirmation). A legacy
+            -- fixed-TTL session leaves all three NULL. `lease_key_hash` is the
+            -- immutable create-time verifier, `lease_capability` an optional
+            -- nonterminal slot, and `lease_absolute_expires_at` is only set by a
+            -- valid renewal (never by create). No upload/device/sync linkage.
+            lease_key_hash              BLOB,
+            lease_capability            BLOB,
+            lease_absolute_expires_at   INTEGER,
             created_at          INTEGER NOT NULL,
             expires_at          INTEGER NOT NULL
         );
@@ -672,6 +692,10 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     // with the columns already present. For pre-existing tables we need to add them.
     migrate_snapshots_ephemeral(conn)?;
     migrate_snapshots_per_audience(conn)?;
+    // Must run AFTER the per-audience rebuild: that rebuild copies a fixed
+    // column set and predates `blob_ref`, so the column is added once the table
+    // has settled on its final per-audience shape.
+    migrate_snapshots_blob_ref(conn)?;
     migrate_devices_remote_wipe(conn)?;
     migrate_devices_pq_columns(conn)?;
     migrate_devices_xwing_column(conn)?;
@@ -681,8 +705,16 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_sync_groups_pruned_floor_seq(conn)?;
     migrate_devices_ml_dsa_rotation(conn)?;
     migrate_pairing_session_consumed_columns(conn)?;
+    migrate_pairing_session_lease_columns(conn)?;
     migrate_media_lifecycle_columns(conn)?;
     migrate_media_metadata_sync_scoped_key(conn)?;
+    // Resumable snapshot upload sessions (lean v1). Additive and idempotent:
+    // `CREATE TABLE IF NOT EXISTS` plus indexes, so an existing relay gains the
+    // table on upgrade and a fresh one creates it here.
+    conn.execute_batch(crate::uploads::SNAPSHOT_UPLOADS_SCHEMA)?;
+    // Must run after the schema batch: `CREATE TABLE IF NOT EXISTS` is a no-op on
+    // a relay that already created the table without the terminal-detail columns.
+    migrate_snapshot_upload_terminal_detail(conn)?;
 
     Ok(())
 }
@@ -893,16 +925,20 @@ fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Err
              expires_at              INTEGER,
              target_device_id        TEXT,
              uploaded_by_device_id   TEXT,
+             blob_ref                TEXT,
              FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
          );
          -- Copy the newest row per audience. Legacy tables can only hold one
          -- row per sync_id, but a future re-run (or a hand-doctored DB) might
          -- carry duplicates; the window keeps the latest and drops the rest.
+         -- The rebuilt table carries `blob_ref` so it matches the final schema
+         -- (legacy rows are inline, so it copies as NULL); migrate_snapshots_blob_ref
+         -- then no-ops on this path.
          INSERT INTO snapshots_per_audience_new
              (sync_id, epoch, server_seq_at, data, created_at, expires_at,
-              target_device_id, uploaded_by_device_id)
+              target_device_id, uploaded_by_device_id, blob_ref)
          SELECT sync_id, epoch, server_seq_at, data, created_at, expires_at,
-                target_device_id, uploaded_by_device_id
+                target_device_id, uploaded_by_device_id, NULL
          FROM (
              SELECT *, ROW_NUMBER() OVER (
                  PARTITION BY sync_id, COALESCE(target_device_id, '')
@@ -920,6 +956,19 @@ fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Err
     )?;
     tx.commit()?;
 
+    Ok(())
+}
+
+/// Add the `blob_ref` column to an existing `snapshots` table. File-backed
+/// uploads store the snapshot bytes on disk and only a filename reference in
+/// the row; pre-existing rows are inline (`blob_ref IS NULL`) and keep being
+/// served from `data`, so this is a pure additive ADD COLUMN with no data
+/// rewrite — large legacy blobs are never read or copied at migration time.
+/// Safe to call repeatedly (checks for the column first).
+fn migrate_snapshots_blob_ref(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !snapshot_has_column(conn, "blob_ref")? {
+        conn.execute_batch("ALTER TABLE snapshots ADD COLUMN blob_ref TEXT;")?;
+    }
     Ok(())
 }
 
@@ -1060,6 +1109,29 @@ fn pairing_session_has_column(conn: &Connection, column: &str) -> Result<bool, r
         }
     }
     Ok(false)
+}
+
+/// Add the recorded stale-conflict detail columns to `snapshot_uploads` on an
+/// existing relay. Safe to call repeatedly — checks for column existence first.
+///
+/// A relay that created the table after these columns were added already has
+/// them, so both `ALTER`s are no-ops there.
+fn migrate_snapshot_upload_terminal_detail(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(snapshot_uploads)")?;
+    let existing: Vec<String> =
+        stmt.query_map([], |row| row.get::<_, String>(1))?.filter_map(|r| r.ok()).collect();
+    drop(stmt);
+    if !existing.iter().any(|c| c == "terminal_server_seq_at") {
+        conn.execute_batch(
+            "ALTER TABLE snapshot_uploads ADD COLUMN terminal_server_seq_at INTEGER;",
+        )?;
+    }
+    if !existing.iter().any(|c| c == "terminal_target_device_id") {
+        conn.execute_batch(
+            "ALTER TABLE snapshot_uploads ADD COLUMN terminal_target_device_id TEXT;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Add password_version column to an existing `sync_groups` table.
@@ -1218,6 +1290,33 @@ fn migrate_pairing_session_consumed_columns(conn: &Connection) -> Result<(), rus
     if !has_joiner_consumed {
         conn.execute_batch(
             "ALTER TABLE pairing_sessions ADD COLUMN joiner_bundle_consumed_at INTEGER;",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Add the pairing-lease columns to an existing `pairing_sessions` table.
+///
+/// Additive and idempotent, mirroring [`migrate_pairing_session_consumed_columns`].
+/// All three columns are nullable, so legacy fixed-TTL rows from before this
+/// migration read back as `NULL` == "no lease" with no backfill. Only new
+/// columns are added: this never renames, drops, or rewrites existing rows, so
+/// any file-backing changes already present in this table are untouched.
+fn migrate_pairing_session_lease_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_key_hash = pairing_session_has_column(conn, "lease_key_hash")?;
+    let has_capability = pairing_session_has_column(conn, "lease_capability")?;
+    let has_absolute = pairing_session_has_column(conn, "lease_absolute_expires_at")?;
+
+    if !has_key_hash {
+        conn.execute_batch("ALTER TABLE pairing_sessions ADD COLUMN lease_key_hash BLOB;")?;
+    }
+    if !has_capability {
+        conn.execute_batch("ALTER TABLE pairing_sessions ADD COLUMN lease_capability BLOB;")?;
+    }
+    if !has_absolute {
+        conn.execute_batch(
+            "ALTER TABLE pairing_sessions ADD COLUMN lease_absolute_expires_at INTEGER;",
         )?;
     }
 
@@ -2123,7 +2222,10 @@ pub fn get_latest_seq(conn: &Connection, sync_id: &str) -> Result<i64, rusqlite:
 // Snapshot queries
 // ---------------------------------------------------------------------------
 
-/// Insert or replace the per-sync snapshot row.
+/// Insert or replace the per-sync snapshot row, storing the bytes INLINE in the
+/// `data` column (`blob_ref` cleared). Used by tests and any caller that keeps
+/// snapshot bytes in-row; the production PUT path uses
+/// [`upsert_snapshot_ref`] to keep large blobs off the writer mutex.
 ///
 /// Equal-seq retries from the same uploader may retarget a stranded pair
 /// snapshot. Returns 1 on write and 0 when the guard rejects the upsert.
@@ -2138,18 +2240,78 @@ pub fn upsert_snapshot(
     target_device_id: Option<&str>,
     uploaded_by_device_id: Option<&str>,
 ) -> Result<usize, rusqlite::Error> {
+    upsert_snapshot_inner(
+        conn,
+        sync_id,
+        epoch,
+        server_seq_at,
+        data,
+        None,
+        expires_at,
+        target_device_id,
+        uploaded_by_device_id,
+    )
+}
+
+/// Insert or replace the per-sync snapshot row as a FILE-BACKED entry: the
+/// bytes already live on disk under `blob_ref`, so the row stores only the
+/// reference and an empty `data` blob. This keeps the writer-mutex hold tiny —
+/// the multi-MB bytes were written outside the lock. Same conflict guard and
+/// return contract as [`upsert_snapshot`].
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_snapshot_ref(
+    conn: &Connection,
+    sync_id: &str,
+    epoch: i64,
+    server_seq_at: i64,
+    blob_ref: &str,
+    expires_at: Option<i64>,
+    target_device_id: Option<&str>,
+    uploaded_by_device_id: Option<&str>,
+) -> Result<usize, rusqlite::Error> {
+    upsert_snapshot_inner(
+        conn,
+        sync_id,
+        epoch,
+        server_seq_at,
+        &[],
+        Some(blob_ref),
+        expires_at,
+        target_device_id,
+        uploaded_by_device_id,
+    )
+}
+
+/// Shared upsert for both the inline and file-backed paths. The conflict guard
+/// (seq / expiry / same-uploader-equal-seq) is written once here so the two
+/// representations can never drift; `data` and `blob_ref` are written verbatim
+/// (inline rows pass real bytes + `None`; file-backed rows pass `&[]` +
+/// `Some(filename)`).
+#[allow(clippy::too_many_arguments)]
+fn upsert_snapshot_inner(
+    conn: &Connection,
+    sync_id: &str,
+    epoch: i64,
+    server_seq_at: i64,
+    data: &[u8],
+    blob_ref: Option<&str>,
+    expires_at: Option<i64>,
+    target_device_id: Option<&str>,
+    uploaded_by_device_id: Option<&str>,
+) -> Result<usize, rusqlite::Error> {
     let now = now_secs();
     // The conflict target is the per-audience expression index, so the
     // seq/expiry/same-uploader replacement guard only ever compares against the
     // row for THIS audience. An upload targeted at one joiner can never replace
     // the group-wide row or another joiner's targeted row.
     let affected = conn.execute(
-        "INSERT INTO snapshots (sync_id, epoch, server_seq_at, data, created_at, expires_at, target_device_id, uploaded_by_device_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO snapshots (sync_id, epoch, server_seq_at, data, blob_ref, created_at, expires_at, target_device_id, uploaded_by_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(sync_id, COALESCE(target_device_id, '')) DO UPDATE SET
             epoch = excluded.epoch,
             server_seq_at = excluded.server_seq_at,
             data = excluded.data,
+            blob_ref = excluded.blob_ref,
             created_at = excluded.created_at,
             expires_at = excluded.expires_at,
             target_device_id = excluded.target_device_id,
@@ -2166,6 +2328,7 @@ pub fn upsert_snapshot(
             epoch,
             server_seq_at,
             data,
+            blob_ref,
             now,
             expires_at,
             target_device_id,
@@ -2173,6 +2336,26 @@ pub fn upsert_snapshot(
         ],
     )?;
     Ok(affected)
+}
+
+/// Read the `blob_ref` of the snapshot row for one audience (the caller's own
+/// targeted row, keyed by `COALESCE(target_device_id, '')`). `Ok(None)` covers
+/// both "no row" and "inline row (no file)"; in either case there is nothing on
+/// disk to unlink. The PUT path calls this — under the writer mutex, just
+/// before the upsert — to learn which old blob a successful replace orphans.
+pub fn get_snapshot_blob_ref(
+    conn: &Connection,
+    sync_id: &str,
+    audience_device_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT blob_ref FROM snapshots
+         WHERE sync_id = ?1 AND COALESCE(target_device_id, '') = ?2",
+        params![sync_id, audience_device_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|outer| outer.flatten())
 }
 
 /// Look up `(server_seq_at, target_device_id)` of the stored snapshot for one
@@ -2214,7 +2397,7 @@ pub fn get_snapshot(
     requesting_device_id: &str,
 ) -> Result<Option<SnapshotRecord>, rusqlite::Error> {
     conn.query_row(
-        "SELECT data, epoch, server_seq_at, target_device_id, uploaded_by_device_id
+        "SELECT data, epoch, server_seq_at, target_device_id, uploaded_by_device_id, blob_ref
          FROM snapshots
          WHERE sync_id = ?1
            AND (target_device_id = ?2 OR target_device_id IS NULL)
@@ -2229,6 +2412,7 @@ pub fn get_snapshot(
                 server_seq_at: row.get(2)?,
                 target_device_id: row.get(3)?,
                 uploaded_by_device_id: row.get(4)?,
+                blob_ref: row.get(5)?,
             })
         },
     )
@@ -2236,29 +2420,59 @@ pub fn get_snapshot(
 }
 
 /// Conditionally ACK-delete the caller's own targeted snapshot row. The single
-/// `DELETE ... WHERE sync_id = ?1 AND target_device_id = ?2` statement is the
-/// whole writer — no read-then-delete, so there is no TOCTOU window for a
-/// concurrent pairing to lose its row. Group-wide rows (NULL target) are never
-/// ACK-deletable, so they are not matched. Returns `true` if a row was deleted.
+/// `DELETE ... RETURNING blob_ref` statement is the whole writer — no
+/// read-then-delete, so there is no TOCTOU window for a concurrent pairing to
+/// lose its row. Group-wide rows (NULL target) are never ACK-deletable, so they
+/// are not matched.
+///
+/// `Ok(None)` means no row matched (the handler maps it to 404). `Ok(Some(_))`
+/// means a row was deleted; the inner `Option<String>` is its on-disk
+/// `blob_ref` (file-backed → `Some`, legacy inline → `None`), which the handler
+/// unlinks after releasing the writer.
 pub fn delete_snapshot(
     conn: &Connection,
     sync_id: &str,
     target_device_id: &str,
-) -> Result<bool, rusqlite::Error> {
-    let rows = conn.execute(
-        "DELETE FROM snapshots WHERE sync_id = ?1 AND target_device_id = ?2",
+) -> Result<Option<Option<String>>, rusqlite::Error> {
+    conn.query_row(
+        "DELETE FROM snapshots WHERE sync_id = ?1 AND target_device_id = ?2
+         RETURNING blob_ref",
         params![sync_id, target_device_id],
-    )?;
-    Ok(rows > 0)
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
 }
 
-/// Delete all snapshots whose TTL has expired. Returns the number of rows deleted.
-pub fn cleanup_expired_snapshots(conn: &Connection) -> Result<usize, rusqlite::Error> {
-    let rows = conn.execute(
-        "DELETE FROM snapshots WHERE expires_at IS NOT NULL AND expires_at < unixepoch()",
-        [],
+/// Delete all snapshots whose TTL has expired, returning one
+/// `(sync_id, blob_ref)` per row removed so the caller can both count the
+/// deletions and unlink the on-disk blobs (mirroring the snapshot row's
+/// expiry). `blob_ref` is `Some` for file-backed rows and `None` for legacy
+/// inline rows (nothing on disk to unlink).
+pub fn cleanup_expired_snapshots(
+    conn: &Connection,
+) -> Result<Vec<(String, Option<String>)>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "DELETE FROM snapshots WHERE expires_at IS NOT NULL AND expires_at < unixepoch()
+         RETURNING sync_id, blob_ref",
     )?;
-    Ok(rows)
+    let pairs: Vec<(String, Option<String>)> = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(pairs)
+}
+
+/// Every `(sync_id, blob_ref)` currently referenced by a file-backed snapshot
+/// row — the set of snapshot blob files that legitimately back a row. Used by
+/// the orphan-file sweep: any file under the snapshot tree NOT in this set is
+/// reclaimable (a crash between writing the file and committing the row, or a
+/// replaced/group-deleted row whose unlink was missed).
+pub fn all_snapshot_blob_keys(conn: &Connection) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT sync_id, blob_ref FROM snapshots WHERE blob_ref IS NOT NULL")?;
+    let pairs: Vec<(String, String)> =
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.filter_map(|r| r.ok()).collect();
+    Ok(pairs)
 }
 
 /// Lowest `server_seq_at` across this group's unexpired snapshot rows of EVERY
@@ -2308,6 +2522,1350 @@ pub fn count_unexpired_targeted_snapshots(
         params![sync_id, exclude_target],
         |row| row.get(0),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Resumable snapshot upload sessions (lean v1)
+// ---------------------------------------------------------------------------
+//
+// The row IS the reservation: reserved bytes are derived by an indexed
+// `SUM(total_bytes)` over nonterminal sessions inside the serialized writer
+// transaction, so there is no second counter table to drift or repair. Every
+// transition out of a nonterminal state therefore ends its reservation in the
+// same transaction — there is deliberately no separate "release" step.
+//
+// All functions here take an already-locked `&Connection` (via
+// `Database::with_conn`) except the chunk/complete entry points, which own a
+// per-upload mutation lock and do their file I/O outside the writer mutex.
+
+use crate::uploads::{self, StagingError, UploadState};
+
+/// One upload session row.
+#[derive(Debug, Clone)]
+pub struct SnapshotUploadRow {
+    pub upload_id: String,
+    pub sync_id: String,
+    pub uploader_device_id: String,
+    pub target_device_id: String,
+    pub epoch: i64,
+    pub server_seq_at: i64,
+    pub snapshot_ttl_secs: i64,
+    pub total_bytes: i64,
+    pub chunk_bytes: i64,
+    pub committed_offset: i64,
+    pub body_sha256: [u8; 32],
+    pub blob_ref: String,
+    pub state: UploadState,
+    pub terminal_code: Option<String>,
+    pub terminal_status: Option<i64>,
+    /// Recorded competing-snapshot seq for a `stale_snapshot_seq` terminal
+    /// result, so an idempotent retry replays the original structured body.
+    pub terminal_server_seq_at: Option<i64>,
+    /// Recorded competing-snapshot audience for a `stale_snapshot_seq` result.
+    /// `Some(None)`-vs-NULL is not distinguished on the row: the column is NULL
+    /// for every non-stale terminal code, and a stale result always has at least
+    /// a seq, which is what gates the replay.
+    pub terminal_target_device_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub idle_expires_at: i64,
+    pub absolute_expires_at: i64,
+}
+
+impl SnapshotUploadRow {
+    /// True when either expiry is in the past.
+    pub fn is_expired_at(&self, now: i64) -> bool {
+        self.state.is_nonterminal()
+            && (self.idle_expires_at <= now || self.absolute_expires_at <= now)
+    }
+}
+
+const SNAPSHOT_UPLOAD_COLUMNS: &str = "upload_id, upload_key, sync_id, uploader_device_id, \
+     target_device_id, epoch, server_seq_at, snapshot_ttl_secs, total_bytes, chunk_bytes, \
+     committed_offset, body_sha256, blob_ref, state, terminal_code, terminal_status, \
+     terminal_expires_at, created_at, updated_at, idle_expires_at, absolute_expires_at, \
+     terminal_server_seq_at, terminal_target_device_id";
+
+fn snapshot_upload_row(row: &rusqlite::Row<'_>) -> Result<SnapshotUploadRow, rusqlite::Error> {
+    let body_sha256: Vec<u8> = row.get(11)?;
+    let mut digest = [0u8; 32];
+    if body_sha256.len() == 32 {
+        digest.copy_from_slice(&body_sha256);
+    }
+    let state: String = row.get(13)?;
+    Ok(SnapshotUploadRow {
+        upload_id: row.get(0)?,
+        sync_id: row.get(2)?,
+        uploader_device_id: row.get(3)?,
+        target_device_id: row.get(4)?,
+        epoch: row.get(5)?,
+        server_seq_at: row.get(6)?,
+        snapshot_ttl_secs: row.get(7)?,
+        total_bytes: row.get(8)?,
+        chunk_bytes: row.get(9)?,
+        committed_offset: row.get(10)?,
+        body_sha256: digest,
+        blob_ref: row.get(12)?,
+        state: UploadState::from_db(&state),
+        terminal_code: row.get(14)?,
+        terminal_status: row.get(15)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+        idle_expires_at: row.get(19)?,
+        absolute_expires_at: row.get(20)?,
+        terminal_server_seq_at: row.get(21)?,
+        terminal_target_device_id: row.get(22)?,
+    })
+}
+
+/// Read one session by its opaque ID. Owner-agnostic: callers must still check
+/// ownership, because an upload ID is never authority.
+pub fn get_snapshot_upload(
+    conn: &Connection,
+    upload_id: &str,
+) -> Result<Option<SnapshotUploadRow>, rusqlite::Error> {
+    conn.query_row(
+        &format!("SELECT {SNAPSHOT_UPLOAD_COLUMNS} FROM snapshot_uploads WHERE upload_id = ?1"),
+        params![upload_id],
+        snapshot_upload_row,
+    )
+    .optional()
+}
+
+/// Inputs for one admission decision. Grouped into a struct so the argument list
+/// stays reviewable and so a new quota cannot be silently omitted at a call
+/// site.
+pub struct CreateSnapshotUpload<'a> {
+    pub upload_id: &'a str,
+    pub upload_key: &'a str,
+    pub sync_id: &'a str,
+    pub uploader_device_id: &'a str,
+    pub target_device_id: &'a str,
+    pub epoch: i64,
+    pub server_seq_at: i64,
+    pub snapshot_ttl_secs: i64,
+    pub total_bytes: i64,
+    pub chunk_bytes: i64,
+    pub body_sha256: &'a [u8; 32],
+    pub blob_ref: &'a str,
+    pub global_reserved_limit: u64,
+    pub group_reserved_limit: u64,
+    pub audience_cap: i64,
+    /// Free bytes on the snapshot volume, probed by the caller **outside** this
+    /// writer transaction.
+    pub free_bytes: u64,
+    pub free_space_reserve: u64,
+}
+
+/// Result of one admission decision.
+#[derive(Debug)]
+pub enum CreateSnapshotUploadOutcome {
+    /// A brand-new session was created and its reservation taken.
+    /// `superseded` is how many older **active** sessions this create ended
+    /// (their candidates are unreferenced and the orphan sweep reclaims them).
+    Created { session: SnapshotUploadRow, superseded: u64 },
+    /// An existing session with the same idempotency key was returned unchanged.
+    Recovered(SnapshotUploadRow),
+    /// A `finalizing` session for this uploader already holds the group/audience
+    /// slot. A create never supersedes it: doing so would let a new upload key
+    /// pull a live publication out from under completion and silently discard the
+    /// bytes being published. Reported as a retryable structured rejection until
+    /// publication resolves.
+    UploadBusy,
+    /// The idempotency key exists with different immutable metadata.
+    KeyConflict,
+    /// A byte-reservation ceiling was reached. `scope` is a bounded metric label.
+    QuotaExceeded(&'static str),
+    /// The free-space reserve could not be preserved.
+    InsufficientStorage,
+    /// A fresh targeted audience would exceed the per-group audience cap.
+    AudienceCapReached,
+    /// The uploader is not an active device in this group.
+    DeviceInvalid,
+    /// The uploader's registered epoch differs from the create request's.
+    EpochMismatch { relay_epoch: i64 },
+}
+
+/// Create-or-recover a resumable upload session, atomically reserving its
+/// declared bytes.
+///
+/// Ordering is load-bearing:
+///
+/// 1. **Idempotency lookup first.** Retrying the current create must be able to
+///    find and return its own session, so the supersession step below can never
+///    abort the very session the caller is asking about.
+/// 2. **Supersede** any other *active* session owned by the same uploader, before
+///    quotas and audience counting, so a new pairing attempt cannot accumulate
+///    stranded reservations. This is what makes a lost abort harmless.
+///
+///    A `finalizing` session is deliberately **not** superseded — see
+///    [`CreateSnapshotUploadOutcome::UploadBusy`]. Once a completion owns the
+///    session, its bytes are being hashed, synced, and published; aborting or
+///    replacing the row underneath it would discard a publication the client may
+///    still be told succeeded.
+/// 3. **Authoritative checks** (device/epoch, byte ceilings, free space,
+///    audience precheck) then the insert — all under the caller's writer mutex,
+///    so two concurrent creates cannot both observe spare quota.
+///
+/// The audience count here is a *fast precheck*; completion repeats the
+/// authoritative atomic check.
+pub fn create_snapshot_upload(
+    conn: &Connection,
+    input: CreateSnapshotUpload<'_>,
+) -> Result<CreateSnapshotUploadOutcome, rusqlite::Error> {
+    // 1. Idempotency: same (sync_id, uploader_device_id, upload_key)?
+    let existing = conn
+        .query_row(
+            &format!(
+                "SELECT {SNAPSHOT_UPLOAD_COLUMNS} FROM snapshot_uploads
+                 WHERE sync_id = ?1 AND uploader_device_id = ?2 AND upload_key = ?3"
+            ),
+            params![input.sync_id, input.uploader_device_id, input.upload_key],
+            snapshot_upload_row,
+        )
+        .optional()?;
+    if let Some(row) = existing {
+        let immutable_matches = row.target_device_id == input.target_device_id
+            && row.epoch == input.epoch
+            && row.server_seq_at == input.server_seq_at
+            && row.snapshot_ttl_secs == input.snapshot_ttl_secs
+            && row.total_bytes == input.total_bytes
+            && row.body_sha256 == *input.body_sha256;
+        if !immutable_matches {
+            return Ok(CreateSnapshotUploadOutcome::KeyConflict);
+        }
+        // A terminal row is returned as-is: the client must generate a new key.
+        // A completed row reports its full offset so a lost create/complete
+        // response does not force a re-upload.
+        return Ok(CreateSnapshotUploadOutcome::Recovered(row));
+    }
+
+    // 2. Authoritative device/epoch check before reserving anything.
+    let device = match get_device(conn, input.sync_id, input.uploader_device_id)? {
+        Some(device) => device,
+        None => return Ok(CreateSnapshotUploadOutcome::DeviceInvalid),
+    };
+    if device.status != "active" {
+        return Ok(CreateSnapshotUploadOutcome::DeviceInvalid);
+    }
+    if device.epoch != input.epoch {
+        return Ok(CreateSnapshotUploadOutcome::EpochMismatch { relay_epoch: device.epoch });
+    }
+
+    let now = now_secs();
+    let tx = conn.unchecked_transaction()?;
+
+    // A live publication owns this uploader's slot. Checked *before* superseding
+    // so a new key can never end the session a completion is publishing from. The
+    // client is asked to retry: once publication resolves the row is terminal
+    // (`completed`, or `failed` from a semantic rejection), the sweep reclaims an
+    // abandoned `finalizing` row on its idle expiry, and the retry proceeds.
+    let finalizing: Option<String> = tx
+        .query_row(
+            "SELECT upload_id FROM snapshot_uploads
+              WHERE sync_id = ?1 AND uploader_device_id = ?2 AND state = 'finalizing'
+              LIMIT 1",
+            params![input.sync_id, input.uploader_device_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if finalizing.is_some() {
+        return Ok(CreateSnapshotUploadOutcome::UploadBusy);
+    }
+
+    // Supersede any other *active* session from this uploader. Marking it
+    // `failed` ends its reservation in the same transaction (rows are the
+    // ledger), so the replacement is admitted against released bytes. A
+    // `finalizing` row can never reach this statement.
+    let superseded_blob_refs: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT blob_ref FROM snapshot_uploads
+             WHERE sync_id = ?1 AND uploader_device_id = ?2 AND state = 'active'",
+        )?;
+        let refs: Vec<String> = stmt
+            .query_map(params![input.sync_id, input.uploader_device_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        refs
+    };
+    if !superseded_blob_refs.is_empty() {
+        tx.execute(
+            "UPDATE snapshot_uploads
+                SET state = 'failed', terminal_code = 'superseded', terminal_status = 409,
+                    terminal_expires_at = ?3, updated_at = ?4
+              WHERE sync_id = ?1 AND uploader_device_id = ?2 AND state = 'active'",
+            params![
+                input.sync_id,
+                input.uploader_device_id,
+                now + SNAPSHOT_UPLOAD_TERMINAL_TTL,
+                now
+            ],
+        )?;
+    }
+
+    // 3a. Byte-reservation ceilings, derived from the rows themselves.
+    let global_reserved = sum_reserved_bytes(&tx, None)?;
+    if global_reserved.saturating_add(input.total_bytes as u64) > input.global_reserved_limit {
+        return Ok(CreateSnapshotUploadOutcome::QuotaExceeded("global"));
+    }
+    let group_reserved = sum_reserved_bytes(&tx, Some(input.sync_id))?;
+    if group_reserved.saturating_add(input.total_bytes as u64) > input.group_reserved_limit {
+        return Ok(CreateSnapshotUploadOutcome::QuotaExceeded("group"));
+    }
+
+    // 3b. Free-space reserve, accounting for transient replacement overhead:
+    // the old published file, the full candidate, and the reserve may coexist
+    // until completion cleanup, so the declared bytes must fit *and* leave the
+    // reserve intact.
+    let required = (input.total_bytes as u64).saturating_add(input.free_space_reserve);
+    if input.free_bytes < required {
+        return Ok(CreateSnapshotUploadOutcome::InsufficientStorage);
+    }
+
+    // 3c. Audience precheck: a fresh target beyond the cap is rejected here so we
+    // never stage up to 150 MB only to fail the authoritative check later. A
+    // completed unexpired snapshot for the same target counts once, as does any
+    // other active reservation, without double-counting the same target.
+    let other_audiences =
+        count_unexpired_targeted_snapshots(&tx, input.sync_id, Some(input.target_device_id))?;
+    if other_audiences >= input.audience_cap {
+        return Ok(CreateSnapshotUploadOutcome::AudienceCapReached);
+    }
+
+    let idle_expires_at = now + SNAPSHOT_UPLOAD_IDLE_TTL;
+    let absolute_expires_at = now + SNAPSHOT_UPLOAD_MAX_SESSION_SECS;
+    tx.execute(
+        "INSERT INTO snapshot_uploads
+            (upload_id, upload_key, sync_id, uploader_device_id, target_device_id, epoch,
+             server_seq_at, snapshot_ttl_secs, total_bytes, chunk_bytes, committed_offset,
+             body_sha256, blob_ref, state, terminal_code, terminal_status, terminal_expires_at,
+             created_at, updated_at, idle_expires_at, absolute_expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, 'active', NULL, NULL,
+                 NULL, ?13, ?13, ?14, ?15)",
+        params![
+            input.upload_id,
+            input.upload_key,
+            input.sync_id,
+            input.uploader_device_id,
+            input.target_device_id,
+            input.epoch,
+            input.server_seq_at,
+            input.snapshot_ttl_secs,
+            input.total_bytes,
+            input.chunk_bytes,
+            &input.body_sha256[..],
+            input.blob_ref,
+            now,
+            idle_expires_at,
+            absolute_expires_at,
+        ],
+    )?;
+    tx.commit()?;
+
+    let superseded = superseded_blob_refs.len() as u64;
+
+    let row = get_snapshot_upload(conn, input.upload_id)?
+        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+    Ok(CreateSnapshotUploadOutcome::Created { session: row, superseded })
+}
+
+/// Indexed `SUM(total_bytes)` over live reservations, optionally for one group.
+fn sum_reserved_bytes(conn: &Connection, sync_id: Option<&str>) -> Result<u64, rusqlite::Error> {
+    let total: Option<i64> = match sync_id {
+        Some(sync_id) => conn.query_row(
+            "SELECT COALESCE(SUM(total_bytes), 0) FROM snapshot_uploads
+             WHERE sync_id = ?1 AND state IN ('active', 'finalizing')",
+            params![sync_id],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COALESCE(SUM(total_bytes), 0) FROM snapshot_uploads
+             WHERE state IN ('active', 'finalizing')",
+            [],
+            |row| row.get(0),
+        )?,
+    };
+    Ok(total.unwrap_or(0).max(0) as u64)
+}
+
+/// Reserved bytes across the relay, for the `prism_snapshot_upload_reserved_bytes`
+/// gauge and for tests.
+pub fn snapshot_upload_reserved_bytes(conn: &Connection) -> Result<u64, rusqlite::Error> {
+    sum_reserved_bytes(conn, None)
+}
+
+/// Count nonterminal sessions, for the active-sessions gauge and for tests.
+pub fn count_nonterminal_snapshot_uploads(
+    conn: &Connection,
+    sync_id: Option<&str>,
+) -> Result<u64, rusqlite::Error> {
+    let count: i64 = match sync_id {
+        Some(sync_id) => conn.query_row(
+            "SELECT COUNT(*) FROM snapshot_uploads
+             WHERE sync_id = ?1 AND state IN ('active', 'finalizing')",
+            params![sync_id],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM snapshot_uploads WHERE state IN ('active', 'finalizing')",
+            [],
+            |row| row.get(0),
+        )?,
+    };
+    Ok(count.max(0) as u64)
+}
+
+/// Successful chunk commit, echoed to the client as the authoritative offset.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkCommit {
+    pub committed_offset: i64,
+    pub idle_expires_at: i64,
+    pub absolute_expires_at: i64,
+}
+
+/// Why a chunk was not applied. Each maps to exactly one machine code.
+#[derive(Debug)]
+pub enum ChunkRejection {
+    NotFound,
+    NotOwned,
+    Finalizing,
+    Completed,
+    Failed,
+    Expired,
+    /// Ahead of, or partially overlapping, the committed prefix. Carries the
+    /// relay's authoritative offset so the client can resume from it.
+    OffsetMismatch {
+        committed_offset: i64,
+    },
+    /// Longer than the session's chunk size.
+    ChunkTooLarge {
+        chunk_bytes: i64,
+    },
+    /// A **non-final** chunk shorter than the session's chunk size. Distinct from
+    /// `ChunkTooLarge` because the offending body is too *short*, and the spec
+    /// gives it its own machine code. Carries the unchanged committed offset so
+    /// the client can resume from the relay's authoritative value.
+    ShortChunk {
+        chunk_bytes: i64,
+        committed_offset: i64,
+    },
+    /// Would pass the declared total / the server maximum.
+    BeyondTotal {
+        max_wire_bytes: u64,
+    },
+    StagingCorrupt,
+    InsufficientStorage,
+    Internal(String),
+}
+
+/// Either a successful commit or an idempotent acknowledgment of an already
+/// committed range (which returns the current offset and refreshes nothing).
+pub type ChunkOutcome = Result<ChunkCommit, ChunkRejection>;
+
+/// Apply one chunk to an active session: the whole crash-consistency boundary.
+///
+/// Steps, in order (and all under the caller's per-upload mutation lock):
+///
+/// 1. load and authorize the active session;
+/// 2. reject terminal/expired states early;
+/// 3. classify the requested offset against `committed_offset`;
+/// 4. reconcile the on-disk file length with the committed offset;
+/// 5. positioned write + `sync_data` (never append);
+/// 6. conditionally commit the higher offset **and** refreshed idle expiry for
+///    the expected state and old offset;
+/// 7. release.
+///
+/// The free-space check and the file work deliberately happen while the SQLite
+/// writer mutex is **released**; only the small load, the conditional update, and
+/// the corruption-marking update touch the writer.
+///
+/// `free_space_reserve` is the deployment's configured reserve, threaded from
+/// `Config::snapshot_upload.free_space_reserve_bytes` — never a compiled-in
+/// default — so a host that raises the reserve actually gets it enforced on
+/// every accepted chunk.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_snapshot_upload_chunk(
+    db: &Database,
+    storage_root: &std::path::Path,
+    sync_id: &str,
+    device_id: &str,
+    upload_id: &str,
+    offset: u64,
+    body: &[u8],
+    free_space_reserve: u64,
+) -> ChunkOutcome {
+    let now = now_secs();
+
+    // 1. Load + authorize. A read connection is enough: every mutation below is
+    //    conditioned on the state/offset this read observed.
+    let row = db
+        .with_read_conn(|conn| get_snapshot_upload(conn, upload_id))
+        .map_err(|e| ChunkRejection::Internal(e.to_string()))?
+        .ok_or(ChunkRejection::NotFound)?;
+    if row.sync_id != sync_id || row.uploader_device_id != device_id {
+        return Err(ChunkRejection::NotOwned);
+    }
+    if row.body_sha256.iter().all(|b| *b == 0) && row.total_bytes <= 0 {
+        return Err(ChunkRejection::Failed);
+    }
+
+    // 2. Terminal / expiry gates. An absolutely-expired session is rejected even
+    //    if cleanup has not run yet.
+    match row.state {
+        UploadState::Finalizing => return Err(ChunkRejection::Finalizing),
+        UploadState::Completed => return Err(ChunkRejection::Completed),
+        UploadState::Failed => return Err(ChunkRejection::Failed),
+        UploadState::Active => {}
+    }
+    if row.is_expired_at(now) {
+        // Expire it here so the reservation is released even before the sweeper
+        // runs, then report the terminal outcome.
+        let _ = db.with_conn(|conn| expire_snapshot_upload(conn, upload_id));
+        return Err(ChunkRejection::Expired);
+    }
+
+    let committed_offset = row.committed_offset.max(0) as u64;
+    let total_bytes = row.total_bytes.max(0) as u64;
+    let chunk_bytes = row.chunk_bytes.max(0) as u64;
+    let body_len = body.len() as u64;
+
+    // 3. Body bounds.
+    if body_len == 0 || body_len > chunk_bytes {
+        return Err(ChunkRejection::ChunkTooLarge { chunk_bytes: row.chunk_bytes });
+    }
+
+    // Offset classification. A wholly committed range is an idempotent retry:
+    // return the current offset without reading, comparing, writing, or
+    // refreshing expiry. Different retry bytes wholly inside the prefix cannot
+    // change storage — completion verifies the whole file against the immutable
+    // create-time SHA-256.
+    if offset + body_len <= committed_offset {
+        return Ok(ChunkCommit {
+            committed_offset: row.committed_offset,
+            idle_expires_at: row.idle_expires_at,
+            absolute_expires_at: row.absolute_expires_at,
+        });
+    }
+    if offset != committed_offset {
+        // Ahead of the relay, or partially overlapping its committed prefix.
+        return Err(ChunkRejection::OffsetMismatch { committed_offset: row.committed_offset });
+    }
+    if offset + body_len > total_bytes {
+        return Err(ChunkRejection::BeyondTotal {
+            max_wire_bytes: crate::uploads::SNAPSHOT_UPLOAD_MAX_WIRE_BYTES,
+        });
+    }
+    // Non-final chunks are exactly one chunk; only the final chunk may be short.
+    let is_final = offset + body_len == total_bytes;
+    if !is_final && body_len != chunk_bytes {
+        return Err(ChunkRejection::ShortChunk {
+            chunk_bytes: row.chunk_bytes,
+            committed_offset: row.committed_offset,
+        });
+    }
+
+    // 4b. Free-space gate before writing: the candidate's growth must still leave
+    //     the configured reserve intact. Checked here (not in step 1) so an
+    //     idempotent retry never pays for a `statvfs`. The declared total (not the
+    //     residual) is the requirement so the candidate can always finish.
+    let required = total_bytes.saturating_add(free_space_reserve);
+    match uploads::available_bytes(storage_root) {
+        Ok(free) if free < required => return Err(ChunkRejection::InsufficientStorage),
+        Ok(_) => {}
+        // An unreadable filesystem is not proof of space; fail closed.
+        Err(_) => return Err(ChunkRejection::InsufficientStorage),
+    }
+
+    // 4. Reconcile file length, then 5. positioned write + sync. Both happen
+    //    while the writer mutex is released.
+    let mut file = match uploads::open_candidate_reconciled(
+        storage_root,
+        sync_id,
+        &row.blob_ref,
+        committed_offset,
+    ) {
+        Ok(file) => file,
+        Err(StagingError::StagingCorrupt(_)) | Err(StagingError::Missing(_)) => {
+            mark_snapshot_upload_staging_corrupt(db, upload_id, now);
+            return Err(ChunkRejection::StagingCorrupt);
+        }
+        Err(StagingError::Io(e)) => return Err(ChunkRejection::Internal(e.to_string())),
+    };
+    if let Err(e) = uploads::write_chunk_at(&mut file, offset, body) {
+        return match e {
+            StagingError::Io(e) => Err(ChunkRejection::Internal(e.to_string())),
+            other => Err(ChunkRejection::Internal(other.to_string())),
+        };
+    }
+    drop(file);
+
+    let new_offset = (offset + body_len) as i64;
+    // 6. Conditional commit: only if the row is STILL active at the SAME offset
+    //    we read. A delayed duplicate (or a cleanup expiry) therefore cannot
+    //    apply its stale view. Idle expiry is refreshed, capped by the immutable
+    //    absolute expiry.
+    let new_idle = now.saturating_add(SNAPSHOT_UPLOAD_IDLE_TTL).min(row.absolute_expires_at);
+    let updated = db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE snapshot_uploads
+                    SET committed_offset = ?4, updated_at = ?5, idle_expires_at = ?6
+                  WHERE upload_id = ?1 AND state = 'active' AND committed_offset = ?2
+                    AND sync_id = ?3",
+                params![upload_id, row.committed_offset, sync_id, new_offset, now, new_idle],
+            )
+        })
+        .map_err(|e| ChunkRejection::Internal(e.to_string()))?;
+
+    if updated == 0 {
+        // Another task moved the offset, or the session left `active`. Re-read to
+        // report the authoritative state rather than guessing.
+        let current = db
+            .with_read_conn(|conn| get_snapshot_upload(conn, upload_id))
+            .map_err(|e| ChunkRejection::Internal(e.to_string()))?;
+        return match current {
+            Some(row) => match row.state {
+                UploadState::Finalizing => Err(ChunkRejection::Finalizing),
+                UploadState::Completed => Err(ChunkRejection::Completed),
+                UploadState::Failed => Err(ChunkRejection::Failed),
+                UploadState::Active => {
+                    Err(ChunkRejection::OffsetMismatch { committed_offset: row.committed_offset })
+                }
+            },
+            None => Err(ChunkRejection::NotFound),
+        };
+    }
+
+    Ok(ChunkCommit {
+        committed_offset: new_offset,
+        idle_expires_at: new_idle,
+        absolute_expires_at: row.absolute_expires_at,
+    })
+}
+
+/// Idle TTL used by the chunk path.
+const SNAPSHOT_UPLOAD_IDLE_TTL: i64 = crate::uploads::SNAPSHOT_UPLOAD_IDLE_TTL_SECS;
+const SNAPSHOT_UPLOAD_MAX_SESSION_SECS: i64 = crate::uploads::SNAPSHOT_UPLOAD_MAX_SESSION_SECS;
+const SNAPSHOT_UPLOAD_TERMINAL_TTL: i64 = crate::uploads::SNAPSHOT_UPLOAD_TERMINAL_TTL_SECS;
+
+/// Mark a session terminally failed for staging corruption, releasing its
+/// reservation in the same statement.
+fn mark_snapshot_upload_staging_corrupt(db: &Database, upload_id: &str, now: i64) {
+    let _ = db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE snapshot_uploads
+                SET state = 'failed', terminal_code = 'staging_corrupt', terminal_status = 409,
+                    terminal_expires_at = ?2, updated_at = ?3
+              WHERE upload_id = ?1 AND state IN ('active', 'finalizing')",
+            params![upload_id, now + SNAPSHOT_UPLOAD_TERMINAL_TTL, now],
+        )
+    });
+}
+
+/// Conditionally expire one session, releasing its reservation. Returns the
+/// candidate's `blob_ref` when the transition happened.
+pub fn expire_snapshot_upload(
+    conn: &Connection,
+    upload_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let now = now_secs();
+    conn.query_row(
+        "UPDATE snapshot_uploads
+            SET state = 'failed', terminal_code = 'upload_expired', terminal_status = 410,
+                terminal_expires_at = ?2, updated_at = ?3
+          WHERE upload_id = ?1 AND state IN ('active', 'finalizing')
+          RETURNING blob_ref",
+        params![upload_id, now + SNAPSHOT_UPLOAD_TERMINAL_TTL, now],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Successful publication of a staged candidate.
+#[derive(Debug)]
+pub enum CompletionOutcome {
+    /// The snapshot row now references the candidate. `replaced_blob_ref` is the
+    /// superseded snapshot's old blob, to unlink after the lock is released.
+    Published { replaced_blob_ref: Option<String> },
+    /// The session had already completed **and its snapshot row still references
+    /// this candidate's blob**. Only this shape — verified, not inferred from the
+    /// upload-row state alone — may be answered as an idempotent success without
+    /// republishing.
+    AlreadyCompleted,
+    /// The session was already terminal-failed; reproduce the recorded result.
+    ///
+    /// `stale_detail` carries the competing snapshot's `(server_seq_at, audience)`
+    /// recorded when a `stale_snapshot_seq` refusal ended the session, so the
+    /// replay sends the identical structured body the original refusal sent. It is
+    /// `None` for every other code and for a pre-migration row that never recorded
+    /// the detail.
+    Succeeded { status: u16, code: Option<String>, stale_detail: Option<(i64, Option<String>)> },
+}
+
+/// Result of the guarded publication transaction.
+///
+/// This is deliberately not an `Option`: collapsing "a concurrent completion
+/// already won" into the same value as "this session was superseded or aborted
+/// mid-publication" is what let a lost race answer `204 No Content` for bytes
+/// that were never published.
+enum PublishOutcome {
+    /// The snapshot row now references the candidate.
+    Published { replaced_blob_ref: Option<String> },
+    /// The row was already `completed` *and* the published snapshot still
+    /// references this candidate — a genuine lost-response retry.
+    AlreadyPublished,
+    /// The session left `active`/`finalizing` without publishing (superseded,
+    /// aborted, or expired between the pre-check and the transaction).
+    LostPublication,
+    /// A semantic rejection; the caller records it as the terminal result.
+    Rejected(CompletionRejection),
+}
+
+/// Why completion did not publish. Semantic failures transition the session to
+/// terminal `failed` inside this call, ending its reservation.
+#[derive(Debug)]
+pub enum CompletionRejection {
+    NotFound,
+    NotOwned,
+    Incomplete {
+        committed_offset: i64,
+    },
+    Finalizing,
+    Failed,
+    Expired,
+    HashMismatch,
+    EpochInvalid,
+    OwnerInvalid,
+    AudienceCapReached,
+    Stale {
+        current_server_seq_at: i64,
+        current_target_device_id: Option<String>,
+    },
+    StagingCorrupt,
+    /// The session left `active`/`finalizing` without publishing while this
+    /// completion was in flight (superseded, aborted, or expired). Distinct from
+    /// a successful idempotent retry so a `204` always implies published bytes.
+    SessionLost,
+    /// The configured free-space reserve could not be preserved at publication.
+    InsufficientStorage,
+    Internal(String),
+}
+
+/// Complete a session: verify the staged file, rerun the authoritative checks,
+/// and publish the existing file-backed snapshot representation atomically.
+///
+/// The whole operation holds the caller's per-upload mutation lock. Only step 5
+/// (the publication transaction) touches the SQLite writer, and it never touches
+/// file data — the multi-MB hash and `sync_all` already happened outside it.
+pub fn complete_snapshot_upload(
+    db: &Database,
+    storage_root: &std::path::Path,
+    sync_id: &str,
+    device_id: &str,
+    upload_id: &str,
+    audience_cap: i64,
+    free_space_reserve: u64,
+) -> Result<CompletionOutcome, CompletionRejection> {
+    let now = now_secs();
+
+    // 1. Load + authorize.
+    let row = db
+        .with_read_conn(|conn| get_snapshot_upload(conn, upload_id))
+        .map_err(|e| CompletionRejection::Internal(e.to_string()))?
+        .ok_or(CompletionRejection::NotFound)?;
+    if row.sync_id != sync_id || row.uploader_device_id != device_id {
+        return Err(CompletionRejection::NotOwned);
+    }
+
+    // Lost-response idempotency: a completed session returns success again; a
+    // terminal failure reproduces its recorded result.
+    match row.state {
+        // A row that reached `completed` through the crash-recovery transition
+        // below did so without publishing, so the upload-row state alone is not
+        // proof that bytes are published. Report it as "retry the publication
+        // step" (identical to the `entered == 0` path) and let the transaction
+        // below decide between idempotent success, republish, and state loss.
+        UploadState::Completed => {
+            return verify_and_publish(
+                db,
+                storage_root,
+                &row,
+                audience_cap,
+                sync_id,
+                device_id,
+                free_space_reserve,
+                now,
+            )
+        }
+        UploadState::Failed => {
+            return Ok(CompletionOutcome::Succeeded {
+                status: row.terminal_status.unwrap_or(409) as u16,
+                code: row.terminal_code.clone(),
+                stale_detail: recorded_stale_detail(&row),
+            })
+        }
+        UploadState::Finalizing => return Err(CompletionRejection::Finalizing),
+        UploadState::Active => {}
+    }
+    if row.is_expired_at(now) {
+        let _ = db.with_conn(|conn| expire_snapshot_upload(conn, upload_id));
+        return Err(CompletionRejection::Expired);
+    }
+
+    // 2. All bytes required.
+    if row.committed_offset != row.total_bytes {
+        return Err(CompletionRejection::Incomplete { committed_offset: row.committed_offset });
+    }
+
+    // 3. Enter `finalizing` conditionally, refreshing idle (never absolute)
+    //    expiry. This is the observable state that makes a crash mid-completion
+    //    recoverable: chunks answer `409 upload_finalizing` while it holds.
+    let new_idle = now.saturating_add(SNAPSHOT_UPLOAD_IDLE_TTL).min(row.absolute_expires_at);
+    let entered = db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE snapshot_uploads
+                    SET state = 'finalizing', updated_at = ?2, idle_expires_at = ?3
+                  WHERE upload_id = ?1 AND state = 'active' AND committed_offset = total_bytes",
+                params![upload_id, now, new_idle],
+            )
+        })
+        .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+    if entered == 0 {
+        let current = db
+            .with_read_conn(|conn| get_snapshot_upload(conn, upload_id))
+            .map_err(|e| CompletionRejection::Internal(e.to_string()))?
+            .ok_or(CompletionRejection::NotFound)?;
+        return match current.state {
+            // A `finalizing` row with every byte committed can only mean a
+            // publication was interrupted after this conditional update — the
+            // state is never re-entered and never exits except to a terminal
+            // state. Report the loss instead of a silent `204`.
+            UploadState::Finalizing => Err(CompletionRejection::Finalizing),
+            UploadState::Completed => verify_and_publish(
+                db,
+                storage_root,
+                &current,
+                audience_cap,
+                sync_id,
+                device_id,
+                free_space_reserve,
+                now,
+            ),
+            UploadState::Failed => Ok(CompletionOutcome::Succeeded {
+                status: current.terminal_status.unwrap_or(409) as u16,
+                code: current.terminal_code.clone(),
+                stale_detail: recorded_stale_detail(&current),
+            }),
+            UploadState::Active => {
+                Err(CompletionRejection::Incomplete { committed_offset: current.committed_offset })
+            }
+        };
+    }
+
+    // 4. Verify length + hash, then make the file and its directory entry
+    //    durable. All of this runs OUTSIDE the writer mutex.
+    verify_and_publish(
+        db,
+        storage_root,
+        &row,
+        audience_cap,
+        sync_id,
+        device_id,
+        free_space_reserve,
+        now,
+    )
+}
+
+/// Step 4/5 shared by the fresh-completion path and the "row already
+/// `completed`" recovery path.
+///
+/// The free-space recheck, the hash verification, and the publication
+/// transaction are identical in both cases; only the decision to *enter* the
+/// operation differs.
+#[allow(clippy::too_many_arguments)]
+fn verify_and_publish(
+    db: &Database,
+    storage_root: &std::path::Path,
+    row: &SnapshotUploadRow,
+    audience_cap: i64,
+    sync_id: &str,
+    device_id: &str,
+    free_space_reserve: u64,
+    now: i64,
+) -> Result<CompletionOutcome, CompletionRejection> {
+    // The publication step replaces the stored candidate with the published
+    // snapshot: both the old published file and this candidate are live until the
+    // replaced blob is unlinked, so the write must still leave the configured
+    // reserve intact. Re-probed here (never under the writer mutex) because the
+    // volume can have filled since create, and a probe error is not proof of
+    // space. The rejection is recorded like every other post-`finalizing`
+    // failure, so the session cannot be left wedged in `finalizing` and a retry
+    // replays the same 507 instead of re-probing.
+    let reserve_ok =
+        matches!(uploads::available_bytes(storage_root), Ok(free) if free >= free_space_reserve);
+    if !reserve_ok {
+        let rejection = CompletionRejection::InsufficientStorage;
+        let (code, status) = completion_code_for(&rejection);
+        fail_snapshot_upload(db, row.upload_id.as_str(), code, status as i64, now);
+        return Err(rejection);
+    }
+
+    if let Err(e) = uploads::verify_and_sync_candidate(
+        storage_root,
+        sync_id,
+        &row.blob_ref,
+        row.total_bytes.max(0) as u64,
+        &row.body_sha256,
+    ) {
+        // A hash mismatch is a distinct, client-actionable outcome (the sender's
+        // bytes do not match what it declared) while every other corruption is
+        // unrecoverable staging damage. Both are terminal, but they get different
+        // machine codes so an operator can tell tampering/injection apart from a
+        // truncated or lost file.
+        let mismatch = matches!(&e, StagingError::StagingCorrupt(_))
+            && e.to_string().contains("hash mismatch");
+        let (code, rejection) = if mismatch {
+            ("snapshot_hash_mismatch", CompletionRejection::HashMismatch)
+        } else {
+            ("staging_corrupt", CompletionRejection::StagingCorrupt)
+        };
+        fail_snapshot_upload(db, row.upload_id.as_str(), code, 422, now);
+        return Err(rejection);
+    }
+
+    // 5. Authoritative rechecks + publication, one writer transaction.
+    let outcome = db
+        .with_conn(|conn| {
+            Ok::<_, rusqlite::Error>(publish_snapshot_upload(
+                conn,
+                row,
+                audience_cap,
+                sync_id,
+                device_id,
+                now,
+            ))
+        })
+        .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+    match outcome {
+        PublishOutcome::Published { replaced_blob_ref } => {
+            Ok(CompletionOutcome::Published { replaced_blob_ref })
+        }
+        PublishOutcome::AlreadyPublished => Ok(CompletionOutcome::AlreadyCompleted),
+        PublishOutcome::LostPublication => Err(CompletionRejection::SessionLost),
+        // The rejection was already recorded inside `publish_snapshot_upload`'s
+        // writer critical section, which released the reservation atomically. Do
+        // not record again here: a second, out-of-lock write would reintroduce the
+        // window this change closes.
+        PublishOutcome::Rejected(rejection) => Err(rejection),
+    }
+}
+
+/// Build the machine code + status for one completion rejection, so the recorded
+/// terminal result reproduces the same response on retry.
+fn completion_code_for(rejection: &CompletionRejection) -> (&'static str, u16) {
+    match rejection {
+        CompletionRejection::NotFound | CompletionRejection::NotOwned => ("upload_not_found", 404),
+        CompletionRejection::Incomplete { .. } => ("upload_incomplete", 409),
+        CompletionRejection::Finalizing => ("upload_finalizing", 409),
+        CompletionRejection::Failed => ("upload_failed", 409),
+        CompletionRejection::Expired => ("upload_expired", 410),
+        CompletionRejection::HashMismatch => ("snapshot_hash_mismatch", 422),
+        CompletionRejection::EpochInvalid => ("upload_epoch_invalid", 422),
+        CompletionRejection::OwnerInvalid => ("upload_owner_invalid", 422),
+        CompletionRejection::AudienceCapReached => ("too_many_targeted_snapshots", 409),
+        CompletionRejection::Stale { .. } => ("stale_snapshot_seq", 409),
+        CompletionRejection::StagingCorrupt => ("staging_corrupt", 409),
+        CompletionRejection::SessionLost => ("upload_failed", 409),
+        CompletionRejection::InsufficientStorage => ("insufficient_storage", 507),
+        CompletionRejection::Internal(_) => ("upload_failed", 500),
+    }
+}
+
+/// The publication transaction. Runs under the writer mutex and performs only
+/// the small, guarded row swap — the candidate's bytes are already durable.
+///
+/// Every exit distinguishes a real publication, a genuine idempotent retry, a
+/// late arrival, and state loss. The previous shape returned a single "nothing to
+/// do" value for all of the latter three, which made a `204` compatible with
+/// bytes that were never published.
+fn publish_snapshot_upload(
+    conn: &Connection,
+    row: &SnapshotUploadRow,
+    audience_cap: i64,
+    sync_id: &str,
+    device_id: &str,
+    now: i64,
+) -> PublishOutcome {
+    // What is the row doing right now, and does the published snapshot still
+    // point at this candidate? Both answers are needed to tell a lost-response
+    // retry apart from a session that was pulled out from under this completion.
+    let observed: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT state, (SELECT blob_ref FROM snapshots
+                             WHERE snapshots.sync_id = snapshot_uploads.sync_id
+                               AND snapshots.target_device_id = snapshot_uploads.target_device_id)
+               FROM snapshot_uploads WHERE upload_id = ?1",
+            params![row.upload_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .unwrap_or(None);
+    let Some((state, live_blob_ref)) = observed else {
+        return PublishOutcome::LostPublication;
+    };
+    let already_published = live_blob_ref.as_deref() == Some(row.blob_ref.as_str());
+    match state.as_str() {
+        // Already published from this candidate: the retried completion is
+        // idempotent success and must not republish.
+        "completed" if already_published => return PublishOutcome::AlreadyPublished,
+        // Completed, but the snapshot no longer references this candidate (it was
+        // replaced later, or the snapshot expired). Fall through and republish so
+        // the reported success is true of the current state.
+        "completed" => {}
+        // A concurrent abort or supersession ended the session. Report the loss;
+        // never claim publication.
+        "failed" => return PublishOutcome::LostPublication,
+        "active" | "finalizing" => {}
+        // An unrecognized state is not something this path may publish over.
+        _ => return PublishOutcome::LostPublication,
+    }
+
+    let result = (|| -> Result<Option<Option<String>>, CompletionRejection> {
+        // Authoritative device/epoch recheck: the uploader may have been revoked
+        // or rotated while the bytes were in flight.
+        let device = get_device(conn, sync_id, device_id)
+            .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+        let device = match device {
+            Some(device) if device.status == "active" => device,
+            Some(_) | None => return Err(CompletionRejection::OwnerInvalid),
+        };
+        if device.epoch != row.epoch {
+            return Err(CompletionRejection::EpochInvalid);
+        }
+
+        // Authoritative audience cap, excluding this session's own target so a
+        // replacement never trips it.
+        let other_audiences =
+            count_unexpired_targeted_snapshots(conn, sync_id, Some(&row.target_device_id))
+                .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+        if other_audiences >= audience_cap {
+            return Err(CompletionRejection::AudienceCapReached);
+        }
+
+        let old_blob_ref = get_snapshot_blob_ref(conn, sync_id, &row.target_device_id)
+            .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+
+        // Reconfirm the session is still publishable and fully committed, as one
+        // guarded step: a session that was aborted, superseded, or expired in the
+        // meantime must not be published over. Non-mutating, because the caller's
+        // writer transaction already holds the writer mutex for this entire
+        // closure — the guard only has to be true at the moment the upsert runs.
+        let publishable: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM snapshot_uploads
+                  WHERE upload_id = ?1
+                    AND state IN ('active', 'finalizing', 'completed')
+                    AND committed_offset = total_bytes
+                    AND blob_ref = ?2",
+                params![row.upload_id, row.blob_ref],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+        if publishable.is_none() {
+            return Ok(None);
+        }
+
+        // The existing audience-aware guarded upsert, writing a blob reference
+        // rather than a BLOB. Same staleness guard, same per-audience conflict
+        // target as single PUT, so `SnapshotStale` semantics are unchanged.
+        let expires_at = now.saturating_add(row.snapshot_ttl_secs);
+        let affected = upsert_snapshot_ref(
+            conn,
+            sync_id,
+            row.epoch,
+            row.server_seq_at,
+            &row.blob_ref,
+            Some(expires_at),
+            Some(&row.target_device_id),
+            Some(device_id),
+        )
+        .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+
+        if affected == 0 {
+            // The guard refused, so nothing was published. The terminal result is
+            // recorded by the caller's tail, still inside this writer critical
+            // section, so the row leaves its nonterminal state — and releases its
+            // byte reservation — atomically with the refusal.
+            let (current_server_seq_at, current_target_device_id) =
+                get_snapshot_seq_and_target(conn, sync_id, &row.target_device_id)
+                    .map_err(|e| CompletionRejection::Internal(e.to_string()))?
+                    .unwrap_or((0, None));
+            return Err(CompletionRejection::Stale {
+                current_server_seq_at,
+                current_target_device_id,
+            });
+        }
+
+        // Mark completed + record the terminal result. Because reservations are
+        // derived from nonterminal rows, this single transition ends the
+        // reservation in the same transaction — there is no separate release step.
+        conn.execute(
+            "UPDATE snapshot_uploads
+                SET state = 'completed', terminal_code = NULL, terminal_status = 204,
+                    terminal_expires_at = ?2, updated_at = ?3
+              WHERE upload_id = ?1",
+            params![row.upload_id, now + SNAPSHOT_UPLOAD_TERMINAL_TTL, now],
+        )
+        .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
+
+        Ok(Some(old_blob_ref))
+    })();
+
+    match result {
+        Ok(Some(old_blob_ref)) => PublishOutcome::Published { replaced_blob_ref: old_blob_ref },
+        // The claim failed: re-read so the caller reports the real reason rather
+        // than a guessed one.
+        Ok(None) => match get_snapshot_upload(conn, row.upload_id.as_str()) {
+            Ok(Some(current)) if current.state == UploadState::Completed => {
+                PublishOutcome::AlreadyPublished
+            }
+            _ => PublishOutcome::LostPublication,
+        },
+        Err(rejection) => {
+            // Record the terminal result HERE, inside the publication critical
+            // section. Recording is the reservation release (rows are the ledger),
+            // so doing it in the same critical section means no interleaving writer
+            // can observe a nonterminal row for a rejection that is already
+            // decided — the window the out-of-transaction `fail_snapshot_upload`
+            // left open.
+            match record_rejection(conn, row.upload_id.as_str(), &rejection, now) {
+                Ok(()) => PublishOutcome::Rejected(rejection),
+                Err(e) => PublishOutcome::Rejected(CompletionRejection::Internal(e.to_string())),
+            }
+        }
+    }
+}
+
+/// Record one completion rejection as the session's terminal result, in the
+/// caller's writer critical section.
+///
+/// The code/status come from the same table the response uses, so the recorded
+/// outcome and the first response never drift. A `Stale` rejection also persists
+/// the competing `(server_seq_at, audience)` so an idempotent retry replays the
+/// identical structured body — the client's suppression matrix compares exactly
+/// those fields.
+fn record_rejection(
+    conn: &Connection,
+    upload_id: &str,
+    rejection: &CompletionRejection,
+    now: i64,
+) -> Result<(), rusqlite::Error> {
+    let (code, status) = completion_code_for(rejection);
+    let stale = match rejection {
+        CompletionRejection::Stale { current_server_seq_at, current_target_device_id } => {
+            Some((*current_server_seq_at, current_target_device_id.as_deref()))
+        }
+        _ => None,
+    };
+    record_terminal_failure(conn, upload_id, code, status as i64, stale, now)?;
+    Ok(())
+}
+
+/// Transition a session to terminal `failed` and record its stable result.
+fn fail_snapshot_upload(db: &Database, upload_id: &str, code: &str, status: i64, now: i64) {
+    let _ = db.with_conn(|conn| record_terminal_failure(conn, upload_id, code, status, None, now));
+}
+
+/// Record a terminal `failed` result **inside the caller's writer transaction**,
+/// which is what makes the transition and the byte-reservation release atomic:
+/// reservations are derived from nonterminal rows, so this single UPDATE is the
+/// release.
+///
+/// `stale` carries the competing snapshot's `(server_seq_at, audience)` for a
+/// `stale_snapshot_seq` result. It is persisted so an idempotent completion retry
+/// replays the **identical** structured body: the client's suppression matrix
+/// compares those two fields against its own, so a zeroed replay could silently
+/// flip a real refusal into a suppressed success.
+///
+/// The conditional `state IN ('active', 'finalizing')` guard means a completed or
+/// already-terminal row is never touched — a published snapshot is never
+/// un-published, and a repeated record is a no-op.
+fn record_terminal_failure(
+    conn: &Connection,
+    upload_id: &str,
+    code: &str,
+    status: i64,
+    stale: Option<(i64, Option<&str>)>,
+    now: i64,
+) -> Result<usize, rusqlite::Error> {
+    let (stale_seq, stale_target) = match stale {
+        Some((seq, target)) => (Some(seq), target),
+        None => (None, None),
+    };
+    conn.execute(
+        "UPDATE snapshot_uploads
+            SET state = 'failed', terminal_code = ?2, terminal_status = ?3,
+                terminal_server_seq_at = ?4, terminal_target_device_id = ?5,
+                terminal_expires_at = ?6, updated_at = ?7
+          WHERE upload_id = ?1 AND state IN ('active', 'finalizing')",
+        params![
+            upload_id,
+            code,
+            status,
+            stale_seq,
+            stale_target,
+            now + SNAPSHOT_UPLOAD_TERMINAL_TTL,
+            now
+        ],
+    )
+}
+
+/// Rebuild the recorded `stale_snapshot_seq` detail from a terminal row, so the
+/// idempotent-retry path reproduces the original refusal's fields.
+///
+/// Gated on the machine code *and* the presence of a recorded seq: the seq column
+/// is only written by the stale transition, and a stale result always has one, so
+/// a legacy row (pre-migration) yields `None` rather than a fabricated zero.
+fn recorded_stale_detail(row: &SnapshotUploadRow) -> Option<(i64, Option<String>)> {
+    if row.terminal_code.as_deref() != Some("stale_snapshot_seq") {
+        return None;
+    }
+    row.terminal_server_seq_at.map(|seq| (seq, row.terminal_target_device_id.clone()))
+}
+
+/// Result of an abort.
+#[derive(Debug)]
+pub enum AbortOutcome {
+    /// A nonterminal session was made terminal; unlink the candidate.
+    Aborted {
+        blob_ref: Option<String>,
+    },
+    /// It was already terminal-failed: still idempotent success.
+    AlreadyFailed,
+    /// It was already completed: the published snapshot is never removed.
+    Completed,
+    NotFound,
+    NotOwned,
+}
+
+/// Abort a session: make a nonterminal one terminal, releasing its reservation
+/// in the same statement, and report the candidate to unlink outside the lock.
+pub fn abort_snapshot_upload(
+    conn: &Connection,
+    sync_id: &str,
+    device_id: &str,
+    upload_id: &str,
+) -> Result<AbortOutcome, rusqlite::Error> {
+    let row = get_snapshot_upload(conn, upload_id)?;
+    let Some(row) = row else {
+        return Ok(AbortOutcome::NotFound);
+    };
+    if row.sync_id != sync_id || row.uploader_device_id != device_id {
+        return Ok(AbortOutcome::NotOwned);
+    }
+
+    let now = now_secs();
+    // A single conditional UPDATE that refuses to touch `completed` rows. If the
+    // publication transaction already committed, this matches nothing and the
+    // published snapshot survives — which is the required behavior.
+    let aborted: Option<String> = conn
+        .query_row(
+            "UPDATE snapshot_uploads
+                SET state = 'failed', terminal_code = 'aborted', terminal_status = 409,
+                    terminal_expires_at = ?2, updated_at = ?3
+              WHERE upload_id = ?1 AND state IN ('active', 'finalizing')
+              RETURNING blob_ref",
+            params![upload_id, now + SNAPSHOT_UPLOAD_TERMINAL_TTL, now],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(blob_ref) = aborted {
+        return Ok(AbortOutcome::Aborted { blob_ref: Some(blob_ref) });
+    }
+
+    // Nothing matched: re-read to distinguish the terminal cases.
+    let current = get_snapshot_upload(conn, upload_id)?;
+    Ok(match current {
+        Some(row) if row.state == UploadState::Completed => AbortOutcome::Completed,
+        Some(_) => AbortOutcome::AlreadyFailed,
+        None => AbortOutcome::NotFound,
+    })
+}
+
+/// Expire every `active`/`finalizing` session whose idle or absolute expiry has
+/// passed, returning `(sync_id, blob_ref)` for each so the caller can unlink
+/// candidates outside the writer lock. Also releases the reservation
+/// transactionally, since the row leaves its nonterminal state here.
+pub fn cleanup_expired_snapshot_uploads(
+    conn: &Connection,
+) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    let now = now_secs();
+    let mut stmt = conn.prepare(
+        "UPDATE snapshot_uploads
+            SET state = 'failed', terminal_code = 'upload_expired', terminal_status = 410,
+                terminal_expires_at = ?2, updated_at = ?3
+          WHERE state IN ('active', 'finalizing')
+            AND (idle_expires_at <= ?1 OR absolute_expires_at <= ?1)
+          RETURNING sync_id, blob_ref",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![now, now + SNAPSHOT_UPLOAD_TERMINAL_TTL, now], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Delete terminal session metadata after `terminal_expires_at`. Returns the
+/// number of rows removed.
+pub fn cleanup_terminal_snapshot_uploads(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = now_secs();
+    conn.execute(
+        "DELETE FROM snapshot_uploads
+          WHERE state IN ('completed', 'failed')
+            AND terminal_expires_at IS NOT NULL
+            AND terminal_expires_at <= ?1",
+        params![now],
+    )
+}
+
+/// Every `(sync_id, blob_ref)` referenced by a **live** session — active,
+/// finalizing, or a terminal row still within retention. The orphan sweep's live
+/// set is this union with the published snapshot references; anything in neither
+/// is reclaimable after the grace period.
+pub fn all_snapshot_upload_blob_keys(
+    conn: &Connection,
+) -> Result<Vec<(String, String)>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT sync_id, blob_ref FROM snapshot_uploads")?;
+    let pairs: Vec<(String, String)> =
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.filter_map(|r| r.ok()).collect();
+    Ok(pairs)
+}
+
+/// Delete every upload session row for one group. Used by account deletion (the
+/// FK cascade also covers it, but an explicit delete keeps the ordering obvious
+/// and works for a legacy DB whose FK cascade is untrusted).
+pub fn delete_snapshot_uploads_for_group(
+    conn: &Connection,
+    sync_id: &str,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute("DELETE FROM snapshot_uploads WHERE sync_id = ?1", params![sync_id])
+}
+
+/// Count sessions in one exact state (tests and diagnostics).
+pub fn count_snapshot_uploads_in_state(
+    conn: &Connection,
+    state: UploadState,
+) -> Result<u64, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM snapshot_uploads WHERE state = ?1",
+        params![state.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -2721,6 +4279,12 @@ pub fn delete_sync_group(conn: &Connection, sync_id: &str) -> Result<Vec<String>
     tx.execute("DELETE FROM batches WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM snapshots WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM media_metadata WHERE sync_id = ?1", params![sync_id])?;
+    // Resumable upload sessions. The group FK cascades, but deleting explicitly
+    // keeps the ordering obvious, releases the byte reservations in this same
+    // transaction, and works even if a legacy DB's FK cascade is not trusted.
+    // The caller drops the group's snapshot directory afterwards, which is where
+    // every session's candidate file lives.
+    tx.execute("DELETE FROM snapshot_uploads WHERE sync_id = ?1", params![sync_id])?;
     // Ephemeral mailbox: acks first, then messages (FK to sync_groups).
     tx.execute("DELETE FROM device_message_acks WHERE sync_id = ?1", params![sync_id])?;
     tx.execute("DELETE FROM device_messages WHERE sync_id = ?1", params![sync_id])?;
@@ -2833,8 +4397,28 @@ pub fn prune_stale_sync_groups(
 // ---------------------------------------------------------------------------
 
 /// Valid pairing slot column names.
-const PAIRING_SLOTS: &[&str] =
-    &["pairing_init", "joiner_confirmation", "credential_bundle", "joiner_bundle"];
+const PAIRING_SLOTS: &[&str] = &[
+    "pairing_init",
+    "joiner_confirmation",
+    "credential_bundle",
+    "joiner_bundle",
+    "lease_capability",
+];
+
+/// The per-slot "already consumed" timestamp column, or `None` for a
+/// **nonterminal** slot that is never consumed.
+///
+/// Only the two terminal payload slots (`credential_bundle`, `joiner_bundle`)
+/// are take-once. Every earlier ceremony slot — including the optional
+/// `lease_capability` — stays pollable, because the peer may retry while waiting
+/// for the next ceremony step and must never see a spurious `Consumed`.
+fn pairing_terminal_consumed_column(col: &'static str) -> Option<&'static str> {
+    match col {
+        "credential_bundle" => Some("credential_bundle_consumed_at"),
+        "joiner_bundle" => Some("joiner_bundle_consumed_at"),
+        _ => None,
+    }
+}
 
 fn validate_pairing_slot(slot: &str) -> Result<&'static str, rusqlite::Error> {
     PAIRING_SLOTS.iter().find(|&&s| s == slot).copied().ok_or_else(|| {
@@ -2842,19 +4426,69 @@ fn validate_pairing_slot(slot: &str) -> Result<&'static str, rusqlite::Error> {
     })
 }
 
+/// Length of the create-time lease verifier in bytes: `SHA-256(lease_secret)`.
+///
+/// Duplicated from `prism_sync_core::pairing::lease::LEASE_SECRET_LEN` (the
+/// pre-image length is also 32) because the relay crate may not depend on core.
+/// A parity test keeps the two in lockstep.
+pub const PAIRING_LEASE_VERIFIER_LEN: usize = 32;
+
+/// Idle expiry granted by a valid lease renewal, in seconds.
+///
+/// Mirrors `LEASE_IDLE_EXTENSION_SECS` (v1 = 30 minutes).
+pub const PAIRING_LEASE_IDLE_EXTENSION_SECS: i64 = 1800;
+
+/// Absolute, nonrenewable lease cap measured from the first valid renewal.
+///
+/// Mirrors `LEASE_ABSOLUTE_CAP_SECS` (v1 = 4 hours).
+pub const PAIRING_LEASE_ABSOLUTE_CAP_SECS: i64 = 14400;
+
+/// Deployment default cap on concurrently leased pairing rows.
+///
+/// Mirrors `LEASE_MAX_CONCURRENT_LEASED_SESSIONS` (v1 = 256).
+pub const PAIRING_LEASE_MAX_CONCURRENT_SESSIONS: u32 = 256;
+
 /// Create a new pairing session with the given rendezvous ID and joiner bootstrap data.
+///
+/// Legacy entry point: creates a fixed-TTL session with **no** lease verifier, so
+/// the row is never lease-capable until it is recreated. Retained so existing
+/// callers and older clients keep working unchanged.
 pub fn create_pairing_session(
     conn: &Connection,
     rendezvous_id: &str,
     joiner_bootstrap: &[u8],
     ttl_secs: u64,
 ) -> Result<(), rusqlite::Error> {
+    create_pairing_session_with_lease(conn, rendezvous_id, joiner_bootstrap, ttl_secs, None)
+}
+
+/// Create a new pairing session, optionally committing the joiner's lease
+/// verifier at create time.
+///
+/// `lease_key_hash` is the exact 32-byte `SHA-256(lease_secret)` the joiner
+/// generated before creating the rendezvous. It is written **once** here and is
+/// never updated afterwards: there is no setter, and the column is not a valid
+/// pairing slot, so the only way to change it is to replace the whole row (which
+/// requires knowing the rendezvous ID and passing the `PRIMARY KEY` guard).
+///
+/// A `None` verifier is a plain legacy fixed-TTL session. `lease_absolute_expires_at`
+/// is deliberately left `NULL` — only a valid renewal starts the absolute clock.
+/// No sync ID, device ID, upload ID, offset, size, or history is stored.
+pub fn create_pairing_session_with_lease(
+    conn: &Connection,
+    rendezvous_id: &str,
+    joiner_bootstrap: &[u8],
+    ttl_secs: u64,
+    lease_key_hash: Option<&[u8; PAIRING_LEASE_VERIFIER_LEN]>,
+) -> Result<(), rusqlite::Error> {
     let now = now_secs();
     let expires_at = now + ttl_secs as i64;
+    let verifier: Option<&[u8]> = lease_key_hash.map(|v| v.as_slice());
     conn.execute(
-        "INSERT INTO pairing_sessions (rendezvous_id, joiner_bootstrap, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![rendezvous_id, joiner_bootstrap, now, expires_at],
+        "INSERT INTO pairing_sessions
+             (rendezvous_id, joiner_bootstrap, created_at, expires_at, lease_key_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![rendezvous_id, joiner_bootstrap, now, expires_at, verifier],
     )?;
     Ok(())
 }
@@ -2909,6 +4543,12 @@ pub fn set_pairing_slot(
                AND joiner_bundle IS NULL
                AND joiner_bundle_consumed_at IS NULL"
         }
+        // Optional, nonterminal lease capability: set-once like the other
+        // ceremony slots, but never consumed, so a late poller can still read it.
+        "lease_capability" => {
+            "UPDATE pairing_sessions SET lease_capability = ?1
+             WHERE rendezvous_id = ?2 AND expires_at > ?3 AND lease_capability IS NULL"
+        }
         _ => unreachable!(),
     };
     let changed = conn.execute(sql, params![data, rendezvous_id, now])?;
@@ -2941,6 +4581,10 @@ pub fn get_pairing_slot(
             "SELECT joiner_bundle FROM pairing_sessions
              WHERE rendezvous_id = ?1 AND expires_at > ?2"
         }
+        "lease_capability" => {
+            "SELECT lease_capability FROM pairing_sessions
+             WHERE rendezvous_id = ?1 AND expires_at > ?2"
+        }
         _ => unreachable!(),
     };
     // The column may be NULL (not yet set) — query_row returns the row,
@@ -2968,15 +4612,13 @@ pub fn take_pairing_slot(
     slot: &str,
 ) -> Result<PairingSlotRead, rusqlite::Error> {
     let col = validate_pairing_slot(slot)?;
-    let consumed_col = match col {
-        "credential_bundle" => "credential_bundle_consumed_at",
-        "joiner_bundle" => "joiner_bundle_consumed_at",
-        _ => {
-            return get_pairing_slot(conn, rendezvous_id, col).map(|value| match value {
-                Some(data) => PairingSlotRead::Present(data),
-                None => PairingSlotRead::NotSet,
-            });
-        }
+    let Some(consumed_col) = pairing_terminal_consumed_column(col) else {
+        // Nonterminal slot (pairing_init, joiner_confirmation, lease_capability):
+        // plain repeatable read, never consumed.
+        return get_pairing_slot(conn, rendezvous_id, col).map(|value| match value {
+            Some(data) => PairingSlotRead::Present(data),
+            None => PairingSlotRead::NotSet,
+        });
     };
 
     let tx = conn.unchecked_transaction()?;
@@ -3055,6 +4697,372 @@ pub fn pairing_session_exists(
     )
     .optional()
     .map(|opt| opt.is_some())
+}
+
+// ---------------------------------------------------------------------------
+// Pairing lease persistence
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`renew_pairing_lease`].
+///
+/// The variant set is the *uniform* one the spec requires: a legitimate renewal,
+/// saturation, and every rejection collapse to [`Self::NotFound`] on the wire, so
+/// the endpoint is not a state oracle. [`Self::Renewed`] is the only outcome that
+/// mutates the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingLeaseRenewOutcome {
+    /// The lease was extended. Carries the row's new `expires_at`.
+    Renewed {
+        /// The idle expiry after this renewal.
+        expires_at: i64,
+        /// The absolute deadline (initialized on the first renewal).
+        absolute_expires_at: i64,
+    },
+    /// The row exists and is live but the global concurrently-leased cap is
+    /// already reached, so this otherwise-valid renewal could not be granted.
+    /// Mapped to the same not-found response as every other rejection.
+    Saturated,
+    /// Any other rejection: no committed v1 verifier (legacy / lease-declined),
+    /// the row is unknown or expired, the lease already hit its absolute cap, the
+    /// joiner has not confirmed yet, or the credential/joiner slots are already
+    /// consumed. Mapped to the same not-found response.
+    NotFound,
+}
+
+impl PairingLeaseRenewOutcome {
+    /// Whether this outcome extended the lease.
+    pub fn is_renewed(self) -> bool {
+        matches!(self, Self::Renewed { .. })
+    }
+
+    /// Whether the caller should answer with the uniform not-found response.
+    pub fn is_not_found(self) -> bool {
+        matches!(self, Self::NotFound | Self::Saturated)
+    }
+}
+
+/// Count the pairing sessions that currently hold a lease.
+///
+/// A row counts as **leased** exactly when its absolute deadline is set and is
+/// still in the future:
+///
+/// ```sql
+/// lease_absolute_expires_at IS NOT NULL AND lease_absolute_expires_at > now
+/// ```
+///
+/// That is the precise set bounded by [`PAIRING_LEASE_MAX_CONCURRENT_SESSIONS`].
+/// A created-but-never-renewed row has `lease_absolute_expires_at = NULL` and is
+/// therefore **not** counted: until the first valid renewal it behaves exactly
+/// like a legacy fixed-TTL session. An expired lease also stops counting the
+/// instant it lapses, so the *count* slot is released immediately — the cap never
+/// waits for a reaper. The row itself, by contrast, lingers until
+/// [`cleanup_expired_pairing_sessions`] deletes it; releasing the count and
+/// deleting the row are two separate events.
+///
+/// Counts rows only, never touching any upload/device/sync/offset/size field, so
+/// it cannot become a pairing↔upload correlation channel.
+pub fn count_nonexpired_leased_pairing_sessions(conn: &Connection) -> Result<u32, rusqlite::Error> {
+    let now = now_secs();
+    conn.query_row(
+        "SELECT COUNT(*) FROM pairing_sessions
+         WHERE lease_absolute_expires_at IS NOT NULL
+           AND lease_absolute_expires_at > ?1",
+        params![now],
+        |row| row.get(0),
+    )
+}
+
+/// Outcome of the pure renewal-decision function, before any write.
+///
+/// Exposed separately so the arithmetic can be unit-tested without a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingLeaseRenewDecision {
+    /// Grant the renewal and write these expiries.
+    Grant {
+        /// The new idle expiry.
+        expires_at: i64,
+        /// The absolute deadline (now initialized on the first renewal).
+        absolute_expires_at: i64,
+    },
+    /// The row exists and is live but the global leased cap is reached.
+    Saturated,
+    /// Any uniform rejection.
+    NotFound,
+}
+
+/// Decide a renewal from the four inputs the DB row supplies.
+///
+/// `present_verifier_matches` is `true` only when the row carries a committed
+/// 32-byte v1 verifier **and** the presented secret hashed to it. The relay-side
+/// hashing and constant-time comparison live in the route; this layer takes the
+/// comparison result so the persistence predicate stays uniform.
+///
+/// Inputs, in order, and the rejection they cause:
+///
+/// - `active` — the row exists and is not expired. `false` ⇒ not-found (an
+///   expired row is not resurrected; there is no revive path, so a stale lease
+///   can never be brought back to life).
+/// - `present_verifier_matches` — a committed v1 verifier matched. `false` ⇒
+///   not-found (legacy or lease-declined rows carry no verifier at all).
+/// - `joiner_confirmed` — the joiner has posted its confirmation. `false` ⇒
+///   not-found: renewal is post-confirmation only.
+/// - `terminal_slots_unconsumed` — neither terminal slot was consumed. `false`
+///   ⇒ not-found: a consumed credential/joiner bundle is terminal and must not
+///   extend the row.
+/// - `already_leased` — `lease_absolute_expires_at` was already set. On the
+///   first valid renewal this is `false` and the absolute deadline *starts*.
+/// - `saturated` — the global leased-session cap is already reached for a row
+///   that is not yet counted as leased. ⇒ saturated.
+///
+/// Arithmetic is fully checked; `None` from `checked_add`/`checked_sub` on the
+/// extreme timestamps the SQL layer can hold becomes not-found rather than a
+/// wrapping (and therefore wrong) deadline.
+///
+/// ```text
+/// absolute = already_leased ? absolute_expires_at : now + 14400
+/// expires  = max(expires_at, min(now + 1800, absolute))
+/// ```
+///
+/// `expires_at` is therefore only ever raised, and `absolute_expires_at` is never
+/// moved once set: later renewals can never shorten the idle window and never
+/// extend the absolute cap.
+pub(crate) fn decide_pairing_lease_renewal(
+    now: i64,
+    expires_at: i64,
+    absolute_expires_at: Option<i64>,
+    active: bool,
+    present_verifier_matches: bool,
+    joiner_confirmed: bool,
+    terminal_slots_unconsumed: bool,
+    saturated: bool,
+) -> PairingLeaseRenewDecision {
+    use PairingLeaseRenewDecision::{Grant, NotFound, Saturated};
+
+    // Every predicate is a plain boolean, so no rejection can distinguish
+    // "wrong secret" from "unknown row" by timing on the decision path.
+    if !active || !present_verifier_matches || !joiner_confirmed || !terminal_slots_unconsumed {
+        return NotFound;
+    }
+
+    // First valid renewal starts the nonrenewable absolute clock; later renewals
+    // reuse the stored deadline verbatim so it never moves.
+    let absolute_expires_at = match absolute_expires_at {
+        Some(existing) => existing,
+        None => {
+            if saturated {
+                return Saturated;
+            }
+            match now.checked_add(PAIRING_LEASE_ABSOLUTE_CAP_SECS) {
+                Some(value) => value,
+                None => return NotFound,
+            }
+        }
+    };
+
+    // A renewal only ever helps if there is a finite future deadline to aim at.
+    if absolute_expires_at <= now {
+        return NotFound;
+    }
+
+    let Some(idle_target) = now.checked_add(PAIRING_LEASE_IDLE_EXTENSION_SECS) else {
+        return NotFound;
+    };
+    let capped = idle_target.min(absolute_expires_at);
+
+    // `max(existing, capped)`: monotone, so a renewal can never shorten a longer
+    // remaining idle window.
+    let expires_at = expires_at.max(capped);
+
+    Grant { expires_at, absolute_expires_at }
+}
+
+/// How the caller supplies the lease verifier to [`renew_pairing_lease`].
+///
+/// The comparison always happens inside the renewal call, under the sole writer
+/// mutex, so a verifier can never be checked against a row state that a
+/// concurrent writer has already changed — and no caller-side boolean can be
+/// replayed into a stale decision.
+#[derive(Debug, Clone, Copy)]
+pub enum PairingLeaseVerifier<'a> {
+    /// The caller already hashed the presented body and compared it in constant
+    /// time, and passes the boolean result. The row's committed verifier is still
+    /// re-checked for presence and length before the write.
+    Precomputed(bool),
+    /// The exact 32-byte `pairing_lease_secret` posted to the renew endpoint.
+    /// The relay hashes and constant-time-compares it internally.
+    Secret(&'a [u8; PAIRING_LEASE_VERIFIER_LEN]),
+}
+
+/// Decision inputs sampled atomically from the row.
+struct PairingLeaseRowState {
+    expires_at: i64,
+    lease_key_hash: Option<Vec<u8>>,
+    absolute_expires_at: Option<i64>,
+    joiner_confirmation: Option<Vec<u8>>,
+    credential_consumed_at: Option<i64>,
+    joiner_consumed_at: Option<i64>,
+}
+
+impl PairingLeaseRowState {
+    /// Whether the presented verifier matches this row's committed verifier.
+    ///
+    /// A row with no committed v1 verifier can never match: legacy and
+    /// lease-declined rows are not renewable through this path.
+    fn verifier_matches(&self, verifier: PairingLeaseVerifier<'_>) -> bool {
+        let Some(committed) = self.lease_key_hash.as_deref() else {
+            return false;
+        };
+        if committed.len() != PAIRING_LEASE_VERIFIER_LEN {
+            return false;
+        }
+        match verifier {
+            PairingLeaseVerifier::Precomputed(matched) => matched,
+            PairingLeaseVerifier::Secret(secret) => {
+                use subtle::ConstantTimeEq;
+                let mut hasher = Sha256::new();
+                hasher.update(secret);
+                let presented: [u8; PAIRING_LEASE_VERIFIER_LEN] = hasher.finalize().into();
+                // Constant-time compare: a byte-wise early exit would leak how
+                // many leading bytes of the secret were guessed correctly.
+                bool::from(committed.ct_eq(presented.as_slice()))
+            }
+        }
+    }
+}
+
+/// Atomically renew a pairing lease under the v1 predicate set.
+///
+/// Runs as one transaction so the read of the row's lease state, the leased
+/// count check, the verifier comparison, and the write cannot half-apply: a
+/// failure leaves the row untouched. Statement atomicity is the transaction's
+/// job. Serialization *between* concurrent renewals, consumptions, and deletes is
+/// a property of the current single-writer architecture instead: every mutating
+/// pairing path runs through [`Database::with_conn`], which holds the sole writer
+/// mutex, so this read-then-write is already exclusive before the transaction
+/// begins. The transaction is belt-and-braces on top of that, not the source of
+/// the isolation guarantee — SQLite would still admit a second writer to
+/// interleave with a deferred transaction that had not yet upgraded to a write
+/// lock.
+///
+/// `verifier` decides how the presented secret is checked (see
+/// [`PairingLeaseVerifier`]). **Every other predicate is read from the row itself
+/// inside this transaction** — expiry, committed verifier presence, joiner
+/// confirmation, and terminal-slot consumption — so no caller can extend an
+/// unconfirmed or already-consumed session by passing a stale observation.
+///
+/// `max_leased` is the global concurrently-leased cap (deployment default
+/// [`PAIRING_LEASE_MAX_CONCURRENT_SESSIONS`]). It is only consulted for a row
+/// that is not already leased, so an in-flight lease can always be renewed even
+/// when the table is at the cap.
+pub fn renew_pairing_lease(
+    conn: &Connection,
+    rendezvous_id: &str,
+    verifier: PairingLeaseVerifier<'_>,
+    max_leased: u32,
+) -> Result<PairingLeaseRenewOutcome, rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    let now = now_secs();
+
+    let row = tx
+        .query_row(
+            "SELECT expires_at,
+                    lease_key_hash,
+                    lease_absolute_expires_at,
+                    joiner_confirmation,
+                    credential_bundle_consumed_at,
+                    joiner_bundle_consumed_at
+               FROM pairing_sessions
+              WHERE rendezvous_id = ?1",
+            params![rendezvous_id],
+            |row| {
+                Ok(PairingLeaseRowState {
+                    expires_at: row.get(0)?,
+                    lease_key_hash: row.get(1)?,
+                    absolute_expires_at: row.get(2)?,
+                    joiner_confirmation: row.get(3)?,
+                    credential_consumed_at: row.get(4)?,
+                    joiner_consumed_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+
+    // Unknown row ⇒ uniform not-found; nothing to write.
+    let Some(state) = row else {
+        tx.commit()?;
+        return Ok(PairingLeaseRenewOutcome::NotFound);
+    };
+
+    let active = state.expires_at > now;
+    let joiner_confirmed = state.joiner_confirmation.is_some();
+    let terminal_slots_unconsumed =
+        state.credential_consumed_at.is_none() && state.joiner_consumed_at.is_none();
+
+    // Cap check is skipped for a row that is already leased: it is already
+    // counted, so it must always be able to extend itself.
+    let saturated = if state.absolute_expires_at.is_none() {
+        let leased = count_leased_pairing_sessions_at(&tx, now)?;
+        leased >= u64::from(max_leased)
+    } else {
+        false
+    };
+
+    // Compare only after the cheap predicates pass, and only in the same
+    // transaction, so a rejected renewal cannot be distinguished by when the
+    // compare ran.
+    let present_verifier_matches = state.verifier_matches(verifier);
+
+    let decision = decide_pairing_lease_renewal(
+        now,
+        state.expires_at,
+        state.absolute_expires_at,
+        active,
+        present_verifier_matches,
+        joiner_confirmed,
+        terminal_slots_unconsumed,
+        saturated,
+    );
+
+    let outcome = match decision {
+        PairingLeaseRenewDecision::Grant { expires_at: new_expires, absolute_expires_at } => {
+            // The WHERE clause restates the non-negotiable predicates so a row
+            // that became ineligible between the read and the write cannot be
+            // extended. `expires_at` is only ever raised.
+            let changed = tx.execute(
+                "UPDATE pairing_sessions
+                    SET expires_at = ?1, lease_absolute_expires_at = ?2
+                  WHERE rendezvous_id = ?3
+                    AND lease_key_hash IS NOT NULL
+                    AND credential_bundle_consumed_at IS NULL
+                    AND joiner_bundle_consumed_at IS NULL
+                    AND joiner_confirmation IS NOT NULL
+                    AND expires_at > ?4",
+                params![new_expires, absolute_expires_at, rendezvous_id, now],
+            )?;
+            if changed == 0 {
+                // Raced out of eligibility between the read and the write.
+                PairingLeaseRenewOutcome::NotFound
+            } else {
+                PairingLeaseRenewOutcome::Renewed { expires_at: new_expires, absolute_expires_at }
+            }
+        }
+        PairingLeaseRenewDecision::Saturated => PairingLeaseRenewOutcome::Saturated,
+        PairingLeaseRenewDecision::NotFound => PairingLeaseRenewOutcome::NotFound,
+    };
+
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Leased-row count evaluated at a fixed `now`, reusing an open transaction.
+fn count_leased_pairing_sessions_at(conn: &Connection, now: i64) -> Result<u64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pairing_sessions
+         WHERE lease_absolute_expires_at IS NOT NULL
+           AND lease_absolute_expires_at > ?1",
+        params![now],
+        |row| row.get(0),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3618,11 +5626,7 @@ pub fn bump_counter(conn: &Connection, name: &str, n: u64) -> Result<(), rusqlit
 
 /// Read the current log-lineage token.
 pub fn get_log_token(conn: &Connection) -> Result<String, rusqlite::Error> {
-    conn.query_row(
-        "SELECT value FROM relay_meta WHERE key = 'log_token'",
-        [],
-        |row| row.get(0),
-    )
+    conn.query_row("SELECT value FROM relay_meta WHERE key = 'log_token'", [], |row| row.get(0))
 }
 
 /// The highest batch rowid this log has ever issued, read from SQLite's
@@ -4751,6 +6755,88 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_and_inline_snapshot_rows_have_distinct_shapes() {
+        // Pins the row representation that makes a binary predating file
+        // backing incompatible with file-backed rows. That old binary selects
+        // only the inline `data` column (it does not know `blob_ref`), so the
+        // shape asserted here is exactly what it would serve: a zero-byte
+        // envelope for a file-backed row, and the real bytes for a legacy
+        // inline row. We assert the representation rather than execute an old
+        // binary — the incompatibility is a property of the stored bytes.
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+
+            // Legacy inline row: bytes live in `data`, no file reference. An old
+            // binary reads these bytes correctly.
+            upsert_snapshot(conn, "sg1", 1, 10, b"legacy-inline", None, None, Some("dev1"))?;
+            let inline = get_snapshot(conn, "sg1", "dev1")?.unwrap();
+            assert_eq!(inline.blob_ref, None, "inline row has no blob reference");
+            assert_eq!(
+                inline.data, b"legacy-inline",
+                "inline row keeps its bytes in `data`, readable by an old binary"
+            );
+
+            // File-backed row: an empty `data` blob plus a non-null `blob_ref`.
+            // An old binary, selecting only `data`, would decode this as a
+            // zero-byte envelope — it cannot see the on-disk bytes.
+            upsert_snapshot_ref(
+                conn,
+                "sg1",
+                2,
+                20,
+                "0123456789abcdef0123456789abcdef",
+                None,
+                None,
+                Some("dev1"),
+            )?;
+            let file_backed = get_snapshot(conn, "sg1", "dev1")?.unwrap();
+            assert_eq!(
+                file_backed.blob_ref.as_deref(),
+                Some("0123456789abcdef0123456789abcdef"),
+                "file-backed row must carry a non-null blob_ref"
+            );
+            assert!(
+                file_backed.data.is_empty(),
+                "file-backed row stores an EMPTY inline `data` — the bytes are on disk"
+            );
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn replacing_inline_with_file_backed_clears_inline_bytes() {
+        // A file-backed PUT that replaces an inline row must clear `data` (not
+        // leave stale inline bytes behind the new blob_ref), or a reader that
+        // trusted `data` would serve bytes inconsistent with the file.
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+
+            upsert_snapshot(conn, "sg1", 1, 10, b"old-inline-bytes", None, None, Some("dev1"))?;
+            upsert_snapshot_ref(
+                conn,
+                "sg1",
+                1,
+                11,
+                "ffffffffffffffffffffffffffffffff",
+                None,
+                None,
+                Some("dev1"),
+            )?;
+
+            let row = get_snapshot(conn, "sg1", "dev1")?.unwrap();
+            assert_eq!(row.blob_ref.as_deref(), Some("ffffffffffffffffffffffffffffffff"));
+            assert!(row.data.is_empty(), "replaced inline bytes must be cleared");
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn test_device_receipt_and_min_acked_seq() {
         let db = test_db();
         db.with_conn(|conn| {
@@ -5334,28 +7420,99 @@ mod tests {
         db.with_conn(|conn| {
             create_sync_group(conn, "sg1", 0)?;
 
-            // Delete with no targeted row returns false.
-            assert!(!delete_snapshot(conn, "sg1", "dev2")?);
+            // Delete with no targeted row returns None.
+            assert!(delete_snapshot(conn, "sg1", "dev2")?.is_none());
 
             // ACK-delete only ever removes the caller's own targeted row.
             upsert_snapshot(conn, "sg1", 1, 10, b"data", None, Some("dev2"), Some("dev1"))?;
             assert!(get_snapshot(conn, "sg1", "dev2")?.is_some());
 
             // A non-target device cannot ACK-delete it.
-            assert!(!delete_snapshot(conn, "sg1", "dev3")?);
+            assert!(delete_snapshot(conn, "sg1", "dev3")?.is_none());
             assert!(get_snapshot(conn, "sg1", "dev2")?.is_some());
 
-            // The target device removes exactly its own row.
-            assert!(delete_snapshot(conn, "sg1", "dev2")?);
+            // The target device removes exactly its own row. The inline row
+            // carries no blob_ref, so the deleted-row signal is `Some(None)`.
+            assert_eq!(delete_snapshot(conn, "sg1", "dev2")?, Some(None));
             assert!(get_snapshot(conn, "sg1", "dev2")?.is_none());
 
-            // Second delete returns false.
-            assert!(!delete_snapshot(conn, "sg1", "dev2")?);
+            // Second delete returns None.
+            assert!(delete_snapshot(conn, "sg1", "dev2")?.is_none());
 
             // A group-wide (NULL target) row is NOT ACK-deletable.
             upsert_snapshot(conn, "sg1", 1, 11, b"group", None, None, Some("dev1"))?;
-            assert!(!delete_snapshot(conn, "sg1", "dev2")?);
+            assert!(delete_snapshot(conn, "sg1", "dev2")?.is_none());
             assert!(get_snapshot(conn, "sg1", "dev2")?.is_some());
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn upsert_snapshot_ref_is_file_backed_and_tracks_blobs() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "sg1", 0)?;
+
+            // A file-backed upsert stores the reference + an empty inline blob.
+            assert_eq!(
+                upsert_snapshot_ref(conn, "sg1", 0, 10, "blob-a", None, None, Some("dev1"))?,
+                1
+            );
+            let snap = get_snapshot(conn, "sg1", "dev_any")?.unwrap();
+            assert_eq!(snap.blob_ref.as_deref(), Some("blob-a"));
+            assert!(snap.data.is_empty(), "file-backed row carries no inline bytes");
+
+            // The audience's current blob is reported (for unlink-on-replace).
+            assert_eq!(get_snapshot_blob_ref(conn, "sg1", "")?.as_deref(), Some("blob-a"));
+
+            // A higher-seq replace swaps the blob_ref; the old one is reported as
+            // the prior value by reading it BEFORE the upsert (route does this).
+            let prior = get_snapshot_blob_ref(conn, "sg1", "")?;
+            assert_eq!(prior.as_deref(), Some("blob-a"));
+            assert_eq!(
+                upsert_snapshot_ref(conn, "sg1", 0, 11, "blob-b", None, None, Some("dev1"))?,
+                1
+            );
+            assert_eq!(get_snapshot_blob_ref(conn, "sg1", "")?.as_deref(), Some("blob-b"));
+
+            // The orphan-sweep key set reflects the live reference only.
+            let keys = all_snapshot_blob_keys(conn)?;
+            assert_eq!(keys, vec![("sg1".to_string(), "blob-b".to_string())]);
+
+            // A stale (lower-seq) ref upsert is rejected and changes nothing.
+            assert_eq!(
+                upsert_snapshot_ref(conn, "sg1", 0, 5, "blob-c", None, None, Some("dev1"))?,
+                0
+            );
+            assert_eq!(get_snapshot_blob_ref(conn, "sg1", "")?.as_deref(), Some("blob-b"));
+
+            // Deleting a file-backed (targeted) row returns its blob_ref so the
+            // caller can unlink it. Seed a targeted file-backed row first.
+            assert_eq!(
+                upsert_snapshot_ref(conn, "sg1", 0, 3, "blob-t", None, Some("dev2"), Some("dev1"))?,
+                1
+            );
+            assert_eq!(delete_snapshot(conn, "sg1", "dev2")?, Some(Some("blob-t".to_string())));
+
+            // Expiring a file-backed row reports its blob_ref for unlinking.
+            let past = now_secs() - 60;
+            assert_eq!(
+                upsert_snapshot_ref(
+                    conn,
+                    "sg1",
+                    0,
+                    4,
+                    "blob-x",
+                    Some(past),
+                    Some("dev3"),
+                    Some("dev1")
+                )?,
+                1
+            );
+            let expired = cleanup_expired_snapshots(conn)?;
+            assert!(expired.contains(&("sg1".to_string(), Some("blob-x".to_string()))));
 
             Ok(())
         })
@@ -5628,7 +7785,7 @@ mod tests {
 
             // Cleanup should remove only the expired one
             let cleaned = cleanup_expired_snapshots(conn)?;
-            assert_eq!(cleaned, 1);
+            assert_eq!(cleaned.len(), 1);
 
             // sg1 gone, sg2 and sg3 still present
             assert!(get_snapshot(conn, "sg1", "dev1")?.is_none());
@@ -5637,7 +7794,7 @@ mod tests {
 
             // Running again removes nothing
             let cleaned = cleanup_expired_snapshots(conn)?;
-            assert_eq!(cleaned, 0);
+            assert_eq!(cleaned.len(), 0);
 
             Ok(())
         })
@@ -5681,7 +7838,7 @@ mod tests {
             assert_eq!(snap.uploaded_by_device_id.as_deref(), Some("dev_a"));
 
             // Target device ACK-deletes its own row.
-            assert!(delete_snapshot(conn, "sg1", "dev_b")?);
+            assert!(delete_snapshot(conn, "sg1", "dev_b")?.is_some());
 
             // Subsequent download returns None (404)
             let snap = get_snapshot(conn, "sg1", "dev_b")?;
@@ -6034,7 +8191,7 @@ mod tests {
             // to just below it — the relay no longer holds the formerly-protected
             // targeted tail, proving the protection window is bounded by the live
             // snapshot set.
-            assert!(delete_snapshot(conn, "sg1", "joiner")?);
+            assert!(delete_snapshot(conn, "sg1", "joiner")?.is_some());
             let pruned2 = prune_batches_with_unexpired_snapshots(conn, 3600)?;
             assert_eq!(pruned2, 1, "next prune advances to just below the group-wide seq");
             assert_eq!(get_pruned_floor_seq(conn, "sg1")?, group_wide - 1);
@@ -6193,7 +8350,7 @@ mod tests {
 
             // Run cleanup — should NOT delete legacy snapshot
             let cleaned = cleanup_expired_snapshots(conn)?;
-            assert_eq!(cleaned, 0, "legacy snapshot should not be cleaned up");
+            assert_eq!(cleaned.len(), 0, "legacy snapshot should not be cleaned up");
 
             // Verify still accessible
             let snap = get_snapshot(conn, "sg1", "dev1")?.unwrap();
@@ -6222,12 +8379,15 @@ mod tests {
             upsert_snapshot(conn, "sg_b", 1, 5, b"expired", Some(past), None, Some("dev2"))?;
 
             let cleaned = cleanup_expired_snapshots(conn)?;
-            assert_eq!(cleaned, 1, "only expired snapshot should be cleaned");
+            assert_eq!(cleaned.len(), 1, "only expired snapshot should be cleaned");
 
             // sg_a still exists
             assert!(get_snapshot(conn, "sg_a", "dev1")?.is_some(), "valid snapshot should exist");
             // sg_b gone
-            assert!(get_snapshot(conn, "sg_b", "dev2")?.is_none(), "expired snapshot should be gone");
+            assert!(
+                get_snapshot(conn, "sg_b", "dev2")?.is_none(),
+                "expired snapshot should be gone"
+            );
 
             Ok(())
         })
@@ -6281,18 +8441,27 @@ mod tests {
             let future = now_secs() + 300;
 
             // Device A uploads a snapshot targeted at device B.
-            upsert_snapshot(conn, "sg1", 0, 10, b"snap", Some(future), Some("dev_b"), Some("dev_a"))?;
+            upsert_snapshot(
+                conn,
+                "sg1",
+                0,
+                10,
+                b"snap",
+                Some(future),
+                Some("dev_b"),
+                Some("dev_a"),
+            )?;
 
             // Reads never delete: B can fetch it repeatedly.
             assert!(get_snapshot(conn, "sg1", "dev_b")?.is_some());
             assert!(get_snapshot(conn, "sg1", "dev_b")?.is_some());
 
             // A non-target ACK-delete does nothing.
-            assert!(!delete_snapshot(conn, "sg1", "dev_a")?);
+            assert!(delete_snapshot(conn, "sg1", "dev_a")?.is_none());
             assert!(get_snapshot(conn, "sg1", "dev_b")?.is_some());
 
             // The target device's ACK-delete removes its own row.
-            assert!(delete_snapshot(conn, "sg1", "dev_b")?);
+            assert!(delete_snapshot(conn, "sg1", "dev_b")?.is_some());
             assert!(
                 get_snapshot(conn, "sg1", "dev_b")?.is_none(),
                 "snapshot should be gone after the target ACK-deletes it"
@@ -7462,8 +9631,7 @@ mod tests {
         {
             let conn = Connection::open(path).unwrap();
             conn.execute("DELETE FROM batches", []).unwrap();
-            conn.execute("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'batches'", [])
-                .unwrap();
+            conn.execute("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'batches'", []).unwrap();
         }
 
         // Reopen: the companion (rowid 2) is now ahead of the DB (rowid 0).
@@ -7518,5 +9686,1167 @@ mod tests {
             })
             .unwrap();
         assert_eq!(token1, token2, "log_token is stable across clean restarts");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pairing lease persistence
+    // -----------------------------------------------------------------------
+
+    const LEASE_COLUMNS: &[&str] =
+        &["lease_key_hash", "lease_capability", "lease_absolute_expires_at"];
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn pairing_column_names(conn: &Connection) -> Vec<String> {
+        column_names(conn, "pairing_sessions")
+    }
+
+    fn lease_verifier(byte: u8) -> [u8; PAIRING_LEASE_VERIFIER_LEN] {
+        [byte; PAIRING_LEASE_VERIFIER_LEN]
+    }
+
+    fn hash_secret(secret: &[u8; PAIRING_LEASE_VERIFIER_LEN]) -> [u8; PAIRING_LEASE_VERIFIER_LEN] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(secret);
+        hasher.finalize().into()
+    }
+
+    fn row_expiries(conn: &Connection, rid: &str) -> (i64, Option<i64>) {
+        conn.query_row(
+            "SELECT expires_at, lease_absolute_expires_at FROM pairing_sessions
+              WHERE rendezvous_id = ?1",
+            params![rid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn set_lease_absolute_raw(conn: &Connection, rid: &str, absolute: i64, expires: i64) {
+        conn.execute(
+            "UPDATE pairing_sessions
+                SET lease_absolute_expires_at = ?1, expires_at = ?2
+              WHERE rendezvous_id = ?3",
+            params![absolute, expires, rid],
+        )
+        .unwrap();
+    }
+
+    /// Create a lease-capable session, optionally with its joiner confirmation
+    /// already posted.
+    fn seed_lease_session(
+        conn: &Connection,
+        rid: &str,
+        ttl_secs: u64,
+        verifier: Option<[u8; PAIRING_LEASE_VERIFIER_LEN]>,
+        confirmed: bool,
+    ) {
+        create_pairing_session_with_lease(conn, rid, b"bootstrap", ttl_secs, verifier.as_ref())
+            .unwrap();
+        if confirmed {
+            assert!(set_pairing_slot(conn, rid, "joiner_confirmation", b"confirmation").unwrap());
+        }
+    }
+
+    #[test]
+    fn pairing_lease_constants_match_the_v1_profile() {
+        // Relay-local duplicates of the core values; the relay cannot depend on
+        // core, so this pins the agreed numbers the route agent must honor.
+        assert_eq!(PAIRING_LEASE_VERIFIER_LEN, 32, "verifier/secret is 32 bytes");
+        assert_eq!(PAIRING_LEASE_IDLE_EXTENSION_SECS, 1800, "idle extension is 30m");
+        assert_eq!(PAIRING_LEASE_ABSOLUTE_CAP_SECS, 14400, "absolute cap is 4h");
+        assert_eq!(PAIRING_LEASE_MAX_CONCURRENT_SESSIONS, 256, "global leased cap");
+    }
+
+    #[test]
+    fn migrate_pairing_session_lease_columns_is_idempotent_and_nullable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pairing_sessions (
+                 rendezvous_id       TEXT PRIMARY KEY,
+                 joiner_bootstrap    BLOB,
+                 pairing_init        BLOB,
+                 joiner_confirmation BLOB,
+                 credential_bundle   BLOB,
+                 joiner_bundle       BLOB,
+                 created_at          INTEGER NOT NULL,
+                 expires_at          INTEGER NOT NULL
+             );
+             INSERT INTO pairing_sessions (rendezvous_id, created_at, expires_at)
+                 VALUES ('legacy', 1, 9999999999);",
+        )
+        .unwrap();
+
+        // Running the migration more than once must be a no-op, not an error:
+        // SQLite has no ADD COLUMN IF NOT EXISTS, so the guard is what makes the
+        // second boot safe.
+        for _ in 0..3 {
+            migrate_pairing_session_lease_columns(&conn).expect("idempotent");
+        }
+
+        let columns = pairing_column_names(&conn);
+        for column in LEASE_COLUMNS {
+            assert!(columns.iter().any(|c| c == column), "missing {column}");
+        }
+
+        // The pre-existing row reads back as "no lease" with no backfill.
+        let (key_hash, capability, absolute): (Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>) =
+            conn.query_row(
+                "SELECT lease_key_hash, lease_capability, lease_absolute_expires_at
+                   FROM pairing_sessions WHERE rendezvous_id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(key_hash.is_none(), "legacy verifier stays NULL");
+        assert!(capability.is_none(), "legacy capability stays NULL");
+        assert!(absolute.is_none(), "legacy absolute stays NULL");
+
+        assert_eq!(
+            count_nonexpired_leased_pairing_sessions(&conn).unwrap(),
+            0,
+            "a legacy row is never counted as leased"
+        );
+    }
+
+    /// The terminal-detail columns (recorded stale seq/audience) are added
+    /// additively on an existing relay and are NULL for a legacy row.
+    ///
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the guard is what makes a
+    /// second boot safe; and a legacy row must read back as "no recorded detail"
+    /// rather than a fabricated zero, which is what keeps its replay conservative.
+    #[test]
+    fn migrate_snapshot_upload_terminal_detail_is_idempotent_and_nullable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::uploads::SNAPSHOT_UPLOADS_SCHEMA).unwrap();
+        // The table's group FK would require a `sync_groups` row; this test is
+        // about the additive columns, not the FK, so seed the row directly.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshot_uploads
+                 (upload_id, upload_key, sync_id, uploader_device_id, target_device_id, epoch,
+                  server_seq_at, snapshot_ttl_secs, total_bytes, chunk_bytes, committed_offset,
+                  body_sha256, blob_ref, state, created_at, updated_at, idle_expires_at,
+                  absolute_expires_at)
+             VALUES ('legacy-upload', 'key', 'sg1', 'd1', 't1', 1, 10, 60, 100, 100, 100,
+                     X'0000000000000000000000000000000000000000000000000000000000000000',
+                     'blob', 'failed', 1, 1, 9999999999, 9999999999);",
+        )
+        .unwrap();
+
+        // The freshly created table already has the columns; re-running is a
+        // no-op, and so is running it against a table that never had them.
+        for _ in 0..3 {
+            migrate_snapshot_upload_terminal_detail(&conn).expect("idempotent");
+        }
+
+        let columns = column_names(&conn, "snapshot_uploads");
+        for column in ["terminal_server_seq_at", "terminal_target_device_id"] {
+            assert!(columns.iter().any(|c| c == column), "missing {column}");
+        }
+
+        let (seq, target): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT terminal_server_seq_at, terminal_target_device_id
+                   FROM snapshot_uploads WHERE upload_id = 'legacy-upload'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(seq.is_none(), "a legacy row records no stale detail");
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn database_open_migrates_legacy_pairing_table_to_lease_columns() {
+        // A real pre-lease DB file: the original pairing_sessions shape (no
+        // consumed columns, no lease columns). Opening it must add both column
+        // families without disturbing the seeded row.
+        let path =
+            std::env::temp_dir().join(format!("prism_relay_lease_legacy_{}.db", Uuid::new_v4()));
+        let path_str = path.to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pairing_sessions (
+                     rendezvous_id       TEXT PRIMARY KEY,
+                     joiner_bootstrap    BLOB,
+                     pairing_init        BLOB,
+                     joiner_confirmation BLOB,
+                     credential_bundle   BLOB,
+                     joiner_bundle       BLOB,
+                     created_at          INTEGER NOT NULL,
+                     expires_at          INTEGER NOT NULL
+                 );
+                 INSERT INTO pairing_sessions
+                     (rendezvous_id, joiner_confirmation, created_at, expires_at)
+                     VALUES ('legacy', X'01', 1, 9999999999);",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path_str, 2).expect("relay must boot on a legacy pairing DB");
+        db.with_conn(|conn| {
+            let columns = pairing_column_names(conn);
+            for column in [
+                "credential_bundle_consumed_at",
+                "joiner_bundle_consumed_at",
+                "lease_key_hash",
+                "lease_capability",
+                "lease_absolute_expires_at",
+            ] {
+                assert!(columns.iter().any(|c| c == column), "missing {column}");
+            }
+
+            // The legacy row survived and is uniformly nonrenewable: it has a
+            // confirmation and is unexpired, but carries no committed verifier.
+            assert!(paired_legacy_row_survives(conn));
+            assert_eq!(
+                renew_pairing_lease(
+                    conn,
+                    "legacy",
+                    PairingLeaseVerifier::Precomputed(true),
+                    PAIRING_LEASE_MAX_CONCURRENT_SESSIONS,
+                )
+                .unwrap(),
+                PairingLeaseRenewOutcome::NotFound,
+                "a legacy row can never be leased, even with the right secret"
+            );
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        // Reopening (a second boot) is also idempotent.
+        let db2 = Database::open(&path_str, 2).expect("second boot");
+        db2.with_conn(|conn| {
+            for column in LEASE_COLUMNS {
+                assert!(pairing_session_has_column(conn, column).unwrap());
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn paired_legacy_row_survives(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pairing_sessions WHERE rendezvous_id = 'legacy'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn pairing_lease_columns_carry_no_upload_or_device_linkage() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let columns = pairing_column_names(conn);
+            let expected = [
+                "rendezvous_id",
+                "joiner_bootstrap",
+                "pairing_init",
+                "joiner_confirmation",
+                "credential_bundle",
+                "joiner_bundle",
+                "credential_bundle_consumed_at",
+                "joiner_bundle_consumed_at",
+                "lease_key_hash",
+                "lease_capability",
+                "lease_absolute_expires_at",
+                "created_at",
+                "expires_at",
+            ];
+            for column in expected {
+                assert!(columns.iter().any(|c| c == column), "missing {column}");
+            }
+            assert_eq!(columns.len(), expected.len(), "no extra linkage columns: {columns:?}");
+
+            // The spec forbids pairing↔upload linkage outright.
+            for column in &columns {
+                let lowered = column.to_ascii_lowercase();
+                for banned in ["upload", "device_id", "sync_id", "offset", "size", "history"] {
+                    assert!(!lowered.contains(banned), "leaked linkage column: {column}");
+                }
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn create_legacy_wrapper_leaves_lease_columns_null() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_pairing_session(conn, "rid-legacy", b"bootstrap", 3600).unwrap();
+            let (key_hash, absolute): (Option<Vec<u8>>, Option<i64>) = conn
+                .query_row(
+                    "SELECT lease_key_hash, lease_absolute_expires_at
+                       FROM pairing_sessions WHERE rendezvous_id = 'rid-legacy'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(key_hash.is_none());
+            assert!(absolute.is_none(), "create never starts the absolute clock");
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 0);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn create_with_lease_commits_verifier_set_once_and_immutably() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let verifier = lease_verifier(0xAB);
+            create_pairing_session_with_lease(
+                conn,
+                "rid-lease",
+                b"bootstrap",
+                3600,
+                Some(&verifier),
+            )
+            .unwrap();
+
+            let stored: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT lease_key_hash FROM pairing_sessions WHERE rendezvous_id = 'rid-lease'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored.as_deref(), Some(verifier.as_slice()));
+            // Create does not lease: the absolute deadline is still unset.
+            assert_eq!(row_expiries(conn, "rid-lease").1, None);
+
+            // The verifier is not addressable through the slot API at all, so
+            // there is no setter that could rewrite it.
+            assert!(validate_pairing_slot("lease_key_hash").is_err());
+            assert!(set_pairing_slot(conn, "rid-lease", "lease_key_hash", b"override").is_err());
+
+            // Re-creating the same rendezvous id cannot silently replace the
+            // verifier: the primary key rejects the second insert.
+            let other = lease_verifier(0xCD);
+            assert!(
+                create_pairing_session_with_lease(
+                    conn,
+                    "rid-lease",
+                    b"bootstrap",
+                    3600,
+                    Some(&other)
+                )
+                .is_err(),
+                "set-once verifier must not be replaceable by re-create"
+            );
+            let still: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT lease_key_hash FROM pairing_sessions WHERE rendezvous_id = 'rid-lease'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(still, stored, "verifier unchanged after a rejected re-create");
+
+            // Deleting the row deletes the verifier with it.
+            assert!(delete_pairing_session(conn, "rid-lease").unwrap());
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM pairing_sessions", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn lease_capability_slot_is_repeatable_and_non_consuming() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_pairing_session_with_lease(conn, "rid-cap", b"bootstrap", 3600, None).unwrap();
+
+            // Unset reads as NotSet through both accessors.
+            assert_eq!(get_pairing_slot(conn, "rid-cap", "lease_capability").unwrap(), None);
+            assert_eq!(
+                take_pairing_slot(conn, "rid-cap", "lease_capability").unwrap(),
+                PairingSlotRead::NotSet
+            );
+
+            assert!(
+                set_pairing_slot(conn, "rid-cap", "lease_capability", b"capability-frame").unwrap()
+            );
+
+            // Set-once: a second post loses.
+            assert!(
+                !set_pairing_slot(conn, "rid-cap", "lease_capability", b"second").unwrap(),
+                "lease_capability is write-once"
+            );
+
+            // Repeatable, non-consuming: unlike the terminal slots, repeated
+            // takes keep returning the value instead of transitioning to
+            // Consumed. An old joiner that never polls must not destroy it for a
+            // new one, and a retrying peer must not see a spurious 404.
+            for _ in 0..3 {
+                assert_eq!(
+                    get_pairing_slot(conn, "rid-cap", "lease_capability").unwrap(),
+                    Some(b"capability-frame".to_vec())
+                );
+                assert_eq!(
+                    take_pairing_slot(conn, "rid-cap", "lease_capability").unwrap(),
+                    PairingSlotRead::Present(b"capability-frame".to_vec())
+                );
+            }
+
+            // Terminal slots still behave as before.
+            assert!(set_pairing_slot(conn, "rid-cap", "credential_bundle", b"creds").unwrap());
+            assert_eq!(
+                take_pairing_slot(conn, "rid-cap", "credential_bundle").unwrap(),
+                PairingSlotRead::Present(b"creds".to_vec())
+            );
+            assert_eq!(
+                take_pairing_slot(conn, "rid-cap", "credential_bundle").unwrap(),
+                PairingSlotRead::Consumed
+            );
+
+            // The nonterminal capability is unaffected by terminal consumption.
+            assert_eq!(
+                get_pairing_slot(conn, "rid-cap", "lease_capability").unwrap(),
+                Some(b"capability-frame".to_vec())
+            );
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn lease_capability_slot_is_expiry_bounded() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            create_pairing_session_with_lease(conn, "rid-exp", b"bootstrap", 3600, None).unwrap();
+            conn.execute(
+                "UPDATE pairing_sessions SET expires_at = ?1 WHERE rendezvous_id = 'rid-exp'",
+                params![now_secs() - 1],
+            )
+            .unwrap();
+
+            assert!(!set_pairing_slot(conn, "rid-exp", "lease_capability", b"late").unwrap());
+            assert_eq!(get_pairing_slot(conn, "rid-exp", "lease_capability").unwrap(), None);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn decide_renewal_rejects_each_failed_predicate() {
+        use PairingLeaseRenewDecision::{Grant, NotFound};
+        let now = 1_000_000;
+
+        // Baseline: every predicate satisfied on a first renewal grants.
+        let base = |expires, absolute, active, verifier, confirmed, unconsumed, saturated| {
+            decide_pairing_lease_renewal(
+                now, expires, absolute, active, verifier, confirmed, unconsumed, saturated,
+            )
+        };
+        assert!(matches!(base(now + 60, None, true, true, true, true, false), Grant { .. }));
+
+        // Each predicate alone defeats an otherwise-perfect renewal.
+        assert_eq!(base(now + 60, None, false, true, true, true, false), NotFound, "inactive");
+        assert_eq!(
+            base(now + 60, None, true, false, true, true, false),
+            NotFound,
+            "verifier mismatch"
+        );
+        assert_eq!(
+            base(now + 60, None, true, true, false, true, false),
+            NotFound,
+            "pre-confirmation"
+        );
+        assert_eq!(
+            base(now + 60, None, true, true, true, false, false),
+            NotFound,
+            "terminal slot consumed"
+        );
+
+        // Saturation only blocks the *first* renewal; an already-leased row is
+        // always allowed to extend itself.
+        assert_eq!(
+            base(now + 60, None, true, true, true, true, true),
+            PairingLeaseRenewDecision::Saturated
+        );
+        assert!(matches!(
+            base(now + 60, Some(now + 14400), true, true, true, true, true),
+            Grant { .. }
+        ));
+    }
+
+    #[test]
+    fn decide_renewal_first_then_later_math() {
+        use PairingLeaseRenewDecision::Grant;
+        let now = 1_000_000;
+
+        // First valid renewal: absolute starts at now + 14400 and the idle target
+        // is min(now + 1800, absolute).
+        let first = decide_pairing_lease_renewal(
+            now,
+            now + 60, // short original TTL
+            None,
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            first,
+            Grant { expires_at: now + 1800, absolute_expires_at: now + 14400 },
+            "first renewal raises the idle expiry to 1800s and starts the 4h clock"
+        );
+
+        // Later renewal: the absolute deadline is reused verbatim, and the idle
+        // expiry still targets now + 1800 capped by that deadline.
+        let absolute = now + 14400;
+        let later = decide_pairing_lease_renewal(
+            now + 600,
+            now + 1800,
+            Some(absolute),
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            later,
+            Grant { expires_at: now + 600 + 1800, absolute_expires_at: absolute },
+            "later renewal extends the idle window without moving the absolute cap"
+        );
+    }
+
+    #[test]
+    fn decide_renewal_never_shortens_the_idle_window() {
+        use PairingLeaseRenewDecision::Grant;
+        let now = 1_000_000;
+
+        // The existing expiry is already past what this renewal would grant
+        // (min(now+1800, absolute) is only now+1800 here), so max() keeps it.
+        let existing = now + 3600;
+        let decision = decide_pairing_lease_renewal(
+            now,
+            existing,
+            Some(now + 14400),
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            decision,
+            Grant { expires_at: existing, absolute_expires_at: now + 14400 },
+            "a renewal must never lower expires_at"
+        );
+
+        // Monotonicity sweep: for any existing expiry the result is >= it.
+        for offset in [-100, 0, 1, 60, 1799, 1800, 3600, 14400, 99999] {
+            let candidate = now + offset;
+            let Grant { expires_at, .. } = decide_pairing_lease_renewal(
+                now,
+                candidate,
+                Some(now + 14400),
+                true,
+                true,
+                true,
+                true,
+                false,
+            ) else {
+                panic!("expected a grant at offset {offset}");
+            };
+            assert!(expires_at >= candidate, "shortened at offset {offset}");
+        }
+    }
+
+    #[test]
+    fn decide_renewal_binds_to_the_absolute_deadline() {
+        use PairingLeaseRenewDecision::{Grant, NotFound};
+        let now = 1_000_000;
+
+        // Well inside the cap, the idle window is the binding constraint.
+        assert_eq!(
+            decide_pairing_lease_renewal(
+                now,
+                now + 10,
+                Some(now + 14400),
+                true,
+                true,
+                true,
+                true,
+                false
+            ),
+            Grant { expires_at: now + 1800, absolute_expires_at: now + 14400 }
+        );
+
+        // Near the cap, the absolute deadline wins: the granted idle expiry is
+        // clamped to it and the deadline itself is unchanged.
+        assert_eq!(
+            decide_pairing_lease_renewal(
+                now,
+                now + 10,
+                Some(now + 100),
+                true,
+                true,
+                true,
+                true,
+                false
+            ),
+            Grant { expires_at: now + 100, absolute_expires_at: now + 100 }
+        );
+
+        // A reached absolute deadline is terminal: no resurrection, and nothing
+        // about the row's other state can revive it.
+        for expired in [now, now - 1, now - 14400, i64::MIN + 1] {
+            assert_eq!(
+                decide_pairing_lease_renewal(
+                    now,
+                    now + 60,
+                    Some(expired),
+                    true,
+                    true,
+                    true,
+                    true,
+                    false
+                ),
+                NotFound,
+                "expired absolute must stay dead: {expired}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_renewal_is_checked_against_overflowing_timestamps() {
+        use PairingLeaseRenewDecision::NotFound;
+        // Extreme row values must not wrap into a valid-looking deadline.
+        assert_eq!(
+            decide_pairing_lease_renewal(i64::MAX, i64::MAX, None, true, true, true, true, false),
+            NotFound
+        );
+        assert_eq!(
+            decide_pairing_lease_renewal(
+                i64::MAX - 1,
+                i64::MAX,
+                None,
+                true,
+                true,
+                true,
+                true,
+                false
+            ),
+            NotFound
+        );
+    }
+
+    #[test]
+    fn renew_happy_path_initializes_absolute_and_extends_idle() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let secret = lease_verifier(0x11);
+            let verifier = hash_secret(&secret);
+            seed_lease_session(conn, "rid-ok", 60, Some(verifier), true);
+
+            let before = now_secs();
+            let outcome =
+                renew_pairing_lease(conn, "rid-ok", PairingLeaseVerifier::Secret(&secret), 256)
+                    .unwrap();
+            let after = now_secs();
+
+            let PairingLeaseRenewOutcome::Renewed { expires_at, absolute_expires_at } = outcome
+            else {
+                panic!("expected renewal, got {outcome:?}");
+            };
+            assert!(outcome.is_renewed());
+            assert!(!outcome.is_not_found());
+
+            assert!(
+                absolute_expires_at >= before + PAIRING_LEASE_ABSOLUTE_CAP_SECS
+                    && absolute_expires_at <= after + PAIRING_LEASE_ABSOLUTE_CAP_SECS,
+                "absolute must be now + 14400"
+            );
+            assert!(
+                expires_at > before + 60,
+                "idle window must have genuinely grown past the original TTL"
+            );
+            assert!(
+                expires_at <= absolute_expires_at,
+                "idle expiry can never exceed the absolute cap"
+            );
+
+            // The write actually landed.
+            let (stored_expires, stored_absolute) = row_expiries(conn, "rid-ok");
+            assert_eq!(stored_expires, expires_at);
+            assert_eq!(stored_absolute, Some(absolute_expires_at));
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renew_secret_variant_hashes_and_rejects_the_wrong_secret() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let secret = lease_verifier(0x22);
+            let verifier = hash_secret(&secret);
+            seed_lease_session(conn, "rid-secret", 60, Some(verifier), true);
+
+            // The right secret renews.
+            assert!(renew_pairing_lease(
+                conn,
+                "rid-secret",
+                PairingLeaseVerifier::Secret(&secret),
+                256
+            )
+            .unwrap()
+            .is_renewed());
+
+            // Every single-bit neighbour of the secret is rejected, and the row
+            // is not extended by a failure.
+            let (good_expires, good_absolute) = row_expiries(conn, "rid-secret");
+            let mut wrong = secret;
+            wrong[0] ^= 0x01;
+            assert_eq!(
+                renew_pairing_lease(conn, "rid-secret", PairingLeaseVerifier::Secret(&wrong), 256)
+                    .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+            let wrong2 = lease_verifier(0x23);
+            assert_eq!(
+                renew_pairing_lease(conn, "rid-secret", PairingLeaseVerifier::Secret(&wrong2), 256)
+                    .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+
+            let (after_expires, after_absolute) = row_expiries(conn, "rid-secret");
+            assert_eq!(after_expires, good_expires, "a rejected renewal must not write");
+            assert_eq!(after_absolute, good_absolute, "a rejected renewal must not write");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renew_rejects_preconfirmation_sessions() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let verifier = lease_verifier(0x33);
+            // Lease-capable but the joiner has not confirmed yet.
+            seed_lease_session(conn, "rid-pre", 3600, Some(verifier), false);
+            assert_eq!(
+                renew_pairing_lease(conn, "rid-pre", PairingLeaseVerifier::Precomputed(true), 256)
+                    .unwrap(),
+                PairingLeaseRenewOutcome::NotFound,
+                "renewal is post-confirmation only"
+            );
+            assert_eq!(row_expiries(conn, "rid-pre").1, None);
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 0);
+
+            // Once the confirmation lands, the same call succeeds.
+            assert!(set_pairing_slot(conn, "rid-pre", "joiner_confirmation", b"conf").unwrap());
+            assert!(renew_pairing_lease(
+                conn,
+                "rid-pre",
+                PairingLeaseVerifier::Precomputed(true),
+                256
+            )
+            .unwrap()
+            .is_renewed());
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renew_rejects_consumed_terminal_slots() {
+        for slot in ["credential_bundle", "joiner_bundle"] {
+            let db = test_db();
+            db.with_conn(|conn| {
+                let verifier = lease_verifier(0x44);
+                seed_lease_session(conn, "rid-cons", 3600, Some(verifier), true);
+
+                // A valid renewal works before consumption.
+                assert!(renew_pairing_lease(
+                    conn,
+                    "rid-cons",
+                    PairingLeaseVerifier::Precomputed(true),
+                    256
+                )
+                .unwrap()
+                .is_renewed());
+                let leased = row_expiries(conn, "rid-cons");
+
+                // Post and take the terminal bundle.
+                assert!(set_pairing_slot(conn, "rid-cons", slot, b"bundle").unwrap());
+                assert!(matches!(
+                    take_pairing_slot(conn, "rid-cons", slot).unwrap(),
+                    PairingSlotRead::Present(_)
+                ));
+
+                assert_eq!(
+                    renew_pairing_lease(
+                        conn,
+                        "rid-cons",
+                        PairingLeaseVerifier::Precomputed(true),
+                        256
+                    )
+                    .unwrap(),
+                    PairingLeaseRenewOutcome::NotFound,
+                    "{slot} consumption is terminal"
+                );
+                assert_eq!(row_expiries(conn, "rid-cons"), leased, "no write after consumption");
+                Ok::<_, rusqlite::Error>(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn renew_rejects_legacy_and_unverifiable_rows() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            // Legacy create: no committed verifier at all. Even a caller that
+            // claims a verifier match cannot lease it.
+            create_pairing_session(conn, "rid-nolease", b"bootstrap", 3600).unwrap();
+            assert!(set_pairing_slot(conn, "rid-nolease", "joiner_confirmation", b"conf").unwrap());
+            assert_eq!(
+                renew_pairing_lease(
+                    conn,
+                    "rid-nolease",
+                    PairingLeaseVerifier::Precomputed(true),
+                    256
+                )
+                .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+            assert_eq!(row_expiries(conn, "rid-nolease").1, None);
+
+            // A wrong-length committed verifier is also rejected: it cannot have
+            // come from a valid v1 create.
+            let short = lease_verifier(0x55);
+            create_pairing_session_with_lease(conn, "rid-short", b"bootstrap", 3600, Some(&short))
+                .unwrap();
+            assert!(set_pairing_slot(conn, "rid-short", "joiner_confirmation", b"conf").unwrap());
+            conn.execute(
+                "UPDATE pairing_sessions SET lease_key_hash = ?1 WHERE rendezvous_id = 'rid-short'",
+                params![vec![0u8; 8]],
+            )
+            .unwrap();
+            assert_eq!(
+                renew_pairing_lease(
+                    conn,
+                    "rid-short",
+                    PairingLeaseVerifier::Precomputed(true),
+                    256
+                )
+                .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+
+            // A lease-capable session whose verifier is unset (never offered the
+            // lease) is equally nonrenewable.
+            create_pairing_session_with_lease(conn, "rid-null", b"bootstrap", 3600, None).unwrap();
+            assert!(set_pairing_slot(conn, "rid-null", "joiner_confirmation", b"conf").unwrap());
+            assert_eq!(
+                renew_pairing_lease(conn, "rid-null", PairingLeaseVerifier::Precomputed(true), 256)
+                    .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renew_rejects_unknown_and_expired_rows_without_resurrection() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            // Unknown rendezvous id.
+            assert_eq!(
+                renew_pairing_lease(conn, "missing", PairingLeaseVerifier::Precomputed(true), 256)
+                    .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+
+            // Expired row: the confirmation landed but the session is dead, so
+            // it must not be revived by a renewal.
+            let verifier = lease_verifier(0x66);
+            seed_lease_session(conn, "rid-dead", 3600, Some(verifier), true);
+            let (expires, _) = row_expiries(conn, "rid-dead");
+            conn.execute(
+                "UPDATE pairing_sessions SET expires_at = ?1 WHERE rendezvous_id = 'rid-dead'",
+                params![now_secs() - 1],
+            )
+            .unwrap();
+            assert_eq!(
+                renew_pairing_lease(conn, "rid-dead", PairingLeaseVerifier::Precomputed(true), 256)
+                    .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+            let (after, absolute) = row_expiries(conn, "rid-dead");
+            assert!(after <= expires, "an expired row is left alone");
+            assert_eq!(absolute, None);
+
+            // Deleting the row removes the lease entirely.
+            assert!(delete_pairing_session(conn, "rid-dead").unwrap());
+            assert_eq!(
+                renew_pairing_lease(conn, "rid-dead", PairingLeaseVerifier::Precomputed(true), 256)
+                    .unwrap(),
+                PairingLeaseRenewOutcome::NotFound
+            );
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renew_is_monotone_and_does_not_move_the_absolute_deadline() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let verifier = lease_verifier(0x77);
+            seed_lease_session(conn, "rid-mono", 60, Some(verifier), true);
+
+            let mut last_expires = 0;
+            let mut absolute = None;
+            for _ in 0..5 {
+                let outcome = renew_pairing_lease(
+                    conn,
+                    "rid-mono",
+                    PairingLeaseVerifier::Precomputed(true),
+                    256,
+                )
+                .unwrap();
+                let PairingLeaseRenewOutcome::Renewed { expires_at, absolute_expires_at } = outcome
+                else {
+                    panic!("expected renewal, got {outcome:?}");
+                };
+                assert!(expires_at >= last_expires, "expires_at must never decrease");
+                match absolute {
+                    None => absolute = Some(absolute_expires_at),
+                    Some(first) => {
+                        assert_eq!(
+                            absolute_expires_at, first,
+                            "later renewals must never move the absolute deadline"
+                        );
+                    }
+                }
+                last_expires = expires_at;
+            }
+
+            // Even after the idle window elapses, the absolute deadline is the
+            // same stored value, proving repeated renewal cannot extend the cap.
+            conn.execute(
+                "UPDATE pairing_sessions SET expires_at = ?1 WHERE rendezvous_id = 'rid-mono'",
+                params![now_secs() + 10],
+            )
+            .unwrap();
+            let outcome =
+                renew_pairing_lease(conn, "rid-mono", PairingLeaseVerifier::Precomputed(true), 256)
+                    .unwrap();
+            match outcome {
+                PairingLeaseRenewOutcome::Renewed { absolute_expires_at, .. } => {
+                    assert_eq!(absolute_expires_at, absolute.unwrap());
+                }
+                other => panic!("expected renewal, got {other:?}"),
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renew_clamps_to_the_absolute_deadline() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let verifier = lease_verifier(0x88);
+            seed_lease_session(conn, "rid-clamp", 60, Some(verifier), true);
+
+            // Simulate a lease that has nearly reached its 4h cap: absolute is
+            // only 100s out, and the idle expiry is lower still.
+            let now = now_secs();
+            let absolute = now + 100;
+            set_lease_absolute_raw(conn, "rid-clamp", absolute, now + 10);
+
+            let outcome = renew_pairing_lease(
+                conn,
+                "rid-clamp",
+                PairingLeaseVerifier::Precomputed(true),
+                256,
+            )
+            .unwrap();
+            let PairingLeaseRenewOutcome::Renewed { expires_at, absolute_expires_at } = outcome
+            else {
+                panic!("expected renewal, got {outcome:?}");
+            };
+            assert!(
+                expires_at <= absolute_expires_at,
+                "idle expiry is clamped by the absolute deadline"
+            );
+            assert!(
+                expires_at >= now + 100 - 1 && expires_at <= now + 100 + 1,
+                "clamped expiry should sit at the absolute deadline"
+            );
+            assert_eq!(absolute_expires_at, absolute, "the deadline does not move");
+
+            // Once the absolute deadline is reached, renewal is terminal.
+            let now = now_secs();
+            set_lease_absolute_raw(conn, "rid-clamp", now - 1, now + 10);
+            assert_eq!(
+                renew_pairing_lease(
+                    conn,
+                    "rid-clamp",
+                    PairingLeaseVerifier::Precomputed(true),
+                    256
+                )
+                .unwrap(),
+                PairingLeaseRenewOutcome::NotFound,
+                "the absolute cap is nonrenewable"
+            );
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renew_enforces_the_global_leased_cap() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let verifier_a = lease_verifier(0x99);
+            let verifier_b = lease_verifier(0xAA);
+            seed_lease_session(conn, "rid-a", 60, Some(verifier_a), true);
+            seed_lease_session(conn, "rid-b", 60, Some(verifier_b), true);
+
+            // Cap of 1: the first lease fits, the second is saturated.
+            assert!(renew_pairing_lease(conn, "rid-a", PairingLeaseVerifier::Precomputed(true), 1)
+                .unwrap()
+                .is_renewed());
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+
+            let saturated =
+                renew_pairing_lease(conn, "rid-b", PairingLeaseVerifier::Precomputed(true), 1)
+                    .unwrap();
+            assert_eq!(saturated, PairingLeaseRenewOutcome::Saturated);
+            assert!(saturated.is_not_found(), "saturation is the uniform not-found");
+            assert!(!saturated.is_renewed());
+            assert_eq!(row_expiries(conn, "rid-b").1, None, "saturated row gets no lease");
+
+            // The saturated row cannot be made to look leased, and the count is
+            // unchanged — saturation is not a state oracle and leaks no slot.
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+
+            // The already-leased row can always extend itself even at the cap:
+            // an in-flight lease must never be starved by newcomers.
+            assert!(renew_pairing_lease(conn, "rid-a", PairingLeaseVerifier::Precomputed(true), 1)
+                .unwrap()
+                .is_renewed());
+
+            // Freeing the slot (lease expiry, no reaper needed) lets the waiting
+            // row in.
+            let now = now_secs();
+            set_lease_absolute_raw(conn, "rid-a", now - 1, now + 60);
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 0);
+            assert!(renew_pairing_lease(conn, "rid-b", PairingLeaseVerifier::Precomputed(true), 1)
+                .unwrap()
+                .is_renewed());
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn leased_count_semantics() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let now = now_secs();
+
+            // (1) Created but never renewed: absolute unset ⇒ not leased.
+            seed_lease_session(conn, "c-unrenewed", 3600, Some(lease_verifier(0xB0)), true);
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 0);
+
+            // (2) Absolute set and in the future ⇒ leased.
+            seed_lease_session(conn, "c-leased", 3600, Some(lease_verifier(0xB1)), true);
+            set_lease_absolute_raw(conn, "c-leased", now + 3600, now + 600);
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+
+            // (3) Absolute set but in the past ⇒ not leased, even though the
+            // absolute column is non-NULL.
+            seed_lease_session(conn, "c-expired", 3600, Some(lease_verifier(0xB2)), true);
+            set_lease_absolute_raw(conn, "c-expired", now - 1, now + 60);
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+
+            // (4) Absolute exactly now ⇒ not leased (strict >, so it frees).
+            set_lease_absolute_raw(conn, "c-leased", now, now + 60);
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 0);
+
+            // (5) Legacy rows and pre-confirmation rows are never leased.
+            create_pairing_session(conn, "c-legacy", b"bootstrap", 3600).unwrap();
+            seed_lease_session(conn, "c-pre", 3600, Some(lease_verifier(0xB3)), false);
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 0);
+
+            // (6) Consumed rows still count if their lease is live: the count is
+            // purely about the lease slot, matching "concurrently leased rows".
+            set_lease_absolute_raw(conn, "c-leased", now + 3600, now + 600);
+            assert!(set_pairing_slot(conn, "c-leased", "credential_bundle", b"creds").unwrap());
+            assert!(matches!(
+                take_pairing_slot(conn, "c-leased", "credential_bundle").unwrap(),
+                PairingSlotRead::Present(_)
+            ));
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+
+            // A real renewal path drives the count too.
+            seed_lease_session(conn, "c-real", 60, Some(lease_verifier(0xB4)), true);
+            assert!(renew_pairing_lease(
+                conn,
+                "c-real",
+                PairingLeaseVerifier::Precomputed(true),
+                256
+            )
+            .unwrap()
+            .is_renewed());
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 2);
+
+            // Deleting the row drops it from the count immediately.
+            assert!(delete_pairing_session(conn, "c-real").unwrap());
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renewal_survives_cleanup_expired_pairing_sessions() {
+        let db = test_db();
+        db.with_conn(|conn| {
+            let verifier = lease_verifier(0xC0);
+            seed_lease_session(conn, "rid-live", 60, Some(verifier), true);
+            assert!(renew_pairing_lease(
+                conn,
+                "rid-live",
+                PairingLeaseVerifier::Precomputed(true),
+                256
+            )
+            .unwrap()
+            .is_renewed());
+
+            // A session the lease has kept alive must not be swept as expired.
+            assert_eq!(cleanup_expired_pairing_sessions(conn).unwrap(), 0);
+            assert!(pairing_session_exists(conn, "rid-live").unwrap());
+            assert_eq!(count_nonexpired_leased_pairing_sessions(conn).unwrap(), 1);
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
     }
 }

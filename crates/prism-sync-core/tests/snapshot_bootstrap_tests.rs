@@ -1064,7 +1064,7 @@ async fn test_bootstrap_skips_locally_tombstoned_entity() {
     // The locally-tombstoned entity yields no live upsert.
     let doomed = entity_changes.iter().find(|c| c.entity_id == "task-doomed");
     assert!(
-        doomed.map_or(true, |c| c.is_delete && c.fields.is_empty()),
+        doomed.is_none_or(|c| c.is_delete && c.fields.is_empty()),
         "a locally-tombstoned entity must not be revived as a live upsert by bootstrap, got: {doomed:?}"
     );
 
@@ -1090,10 +1090,12 @@ async fn test_bootstrap_skips_locally_tombstoned_entity() {
 async fn test_bootstrap_skips_residual_fields_of_unpruned_local_tombstone() {
     use prism_sync_core::storage::{FieldVersion, SyncStorage};
 
-    let (relay, key_hierarchy, _sk_a, sk_b, _ml_a, ml_b, storage_b) = push_and_create_snapshot(
-        vec![("task-doomed", "doomed", false, "batch-1"), ("task-alive", "alive", false, "batch-2")],
-    )
-    .await;
+    let (relay, key_hierarchy, _sk_a, sk_b, _ml_a, ml_b, storage_b) =
+        push_and_create_snapshot(vec![
+            ("task-doomed", "doomed", false, "batch-1"),
+            ("task-alive", "alive", false, "batch-2"),
+        ])
+        .await;
 
     // --- Device C: replicate device B's (== the snapshot's) task-doomed fields
     //     byte-for-byte so the residuals are identical to what the snapshot
@@ -1159,7 +1161,7 @@ async fn test_bootstrap_skips_residual_fields_of_unpruned_local_tombstone() {
     // are absorbed even though they byte-match post-import storage.
     let doomed = entity_changes.iter().find(|c| c.entity_id == "task-doomed");
     assert!(
-        doomed.map_or(true, |c| c.is_delete && c.fields.is_empty()),
+        doomed.is_none_or(|c| c.is_delete && c.fields.is_empty()),
         "an unpruned locally-tombstoned entity must not be revived as a live upsert, got: {doomed:?}"
     );
 

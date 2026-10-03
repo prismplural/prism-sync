@@ -22,6 +22,7 @@ insecure-transport-dev = []
 [dependencies]
 prism-sync-core = { workspace = true }
 prism-sync-crypto = { workspace = true }
+async-trait = { workspace = true }
 flutter_rust_bridge = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

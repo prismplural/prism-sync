@@ -510,6 +510,8 @@ mod tests {
             pairing_session_ttl_secs: 300,
             pairing_session_rate_limit: 5,
             pairing_session_max_payload_bytes: 32768,
+            pairing_lease: crate::config::PairingLeaseConfig::default(),
+            snapshot_upload: crate::config::SnapshotUploadConfig::default(),
             sharing_init_ttl_secs: 604800,
             sharing_init_max_payload_bytes: 65536,
             sharing_identity_max_bytes: 8192,

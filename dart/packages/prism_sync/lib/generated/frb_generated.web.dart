@@ -162,6 +162,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   (String, String) dco_decode_record_string_string(dynamic raw);
 
   @protected
+  ResumableCeremonyCompletion dco_decode_resumable_ceremony_completion(
+    dynamic raw,
+  );
+
+  @protected
+  ResumableSnapshotUploadResult dco_decode_resumable_snapshot_upload_result(
+    dynamic raw,
+  );
+
+  @protected
   SharingProcessPendingInputs dco_decode_sharing_process_pending_inputs(
     dynamic raw,
   );
@@ -169,6 +179,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   SharingProcessPendingInputsObject
   dco_decode_sharing_process_pending_inputs_object(dynamic raw);
+
+  @protected
+  SnapshotTransportUsed dco_decode_snapshot_transport_used(dynamic raw);
+
+  @protected
+  SnapshotUploadCapabilityInfo dco_decode_snapshot_upload_capability_info(
+    dynamic raw,
+  );
+
+  @protected
+  SnapshotUploadCapabilityState dco_decode_snapshot_upload_capability_state(
+    dynamic raw,
+  );
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -337,6 +360,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ResumableCeremonyCompletion sse_decode_resumable_ceremony_completion(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  ResumableSnapshotUploadResult sse_decode_resumable_snapshot_upload_result(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   SharingProcessPendingInputs sse_decode_sharing_process_pending_inputs(
     SseDeserializer deserializer,
   );
@@ -344,6 +377,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   SharingProcessPendingInputsObject
   sse_decode_sharing_process_pending_inputs_object(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  SnapshotTransportUsed sse_decode_snapshot_transport_used(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  SnapshotUploadCapabilityInfo sse_decode_snapshot_upload_capability_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  SnapshotUploadCapabilityState sse_decode_snapshot_upload_capability_state(
     SseDeserializer deserializer,
   );
 
@@ -546,6 +594,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_resumable_ceremony_completion(
+    ResumableCeremonyCompletion self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_resumable_snapshot_upload_result(
+    ResumableSnapshotUploadResult self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_sharing_process_pending_inputs(
     SharingProcessPendingInputs self,
     SseSerializer serializer,
@@ -554,6 +614,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_sharing_process_pending_inputs_object(
     SharingProcessPendingInputsObject self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_snapshot_transport_used(
+    SnapshotTransportUsed self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_snapshot_upload_capability_info(
+    SnapshotUploadCapabilityInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_snapshot_upload_capability_state(
+    SnapshotUploadCapabilityState self,
     SseSerializer serializer,
   );
 

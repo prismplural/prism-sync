@@ -27,8 +27,8 @@ use crate::schema::{SyncSchema, SyncType, SyncValue};
 use crate::snapshot_limits;
 use crate::storage::StorageError;
 use crate::storage::{
-    is_tombstone_value, AppliedOp, DeviceRecord, FieldVersion, FieldVersionEntry,
-    PullSenderHealth, QuarantinedOp, QuarantinedPullBatch, SyncMetadata, SyncStorage,
+    is_tombstone_value, AppliedOp, DeviceRecord, FieldVersion, FieldVersionEntry, PullSenderHealth,
+    QuarantinedOp, QuarantinedPullBatch, SyncMetadata, SyncStorage,
 };
 use crate::sync_aad;
 use crate::syncable_entity::SyncableEntity;
@@ -1073,12 +1073,8 @@ impl SyncEngine {
                     // Clear any prior-cycle stall row in the same tx as the
                     // advance so a crash can't strand a stall row behind the
                     // moved cursor.
-                    self.advance_cursor_past_seq(
-                        sync_id,
-                        batch.server_seq,
-                        Some(batch.server_seq),
-                    )
-                    .await?;
+                    self.advance_cursor_past_seq(sync_id, batch.server_seq, Some(batch.server_seq))
+                        .await?;
                     total_pulled += 1;
                     continue;
                 }
@@ -1095,9 +1091,7 @@ impl SyncEngine {
                             TransientPullReason::SenderUnresolved,
                         )
                         .await?;
-                    if self
-                        .stall_budget_exhausted(sync_id, batch.server_seq, attempts)
-                        .await?
+                    if self.stall_budget_exhausted(sync_id, batch.server_seq, attempts).await?
                         || self
                             .sender_fast_quarantine_tripped(
                                 sync_id,
@@ -1201,8 +1195,7 @@ impl SyncEngine {
                 // generation propagates via Phase 0b replay or a later import.
                 let err_str = format!(
                     "ML-DSA generation {} not resolvable (local gen {})",
-                    envelope.sender_ml_dsa_key_generation,
-                    sender_key_info.ml_dsa_key_generation,
+                    envelope.sender_ml_dsa_key_generation, sender_key_info.ml_dsa_key_generation,
                 );
                 let attempts = self
                     .stall_pull_batch(
@@ -1211,9 +1204,7 @@ impl SyncEngine {
                         TransientPullReason::StaleKeyGeneration,
                     )
                     .await?;
-                if self
-                    .stall_budget_exhausted(sync_id, batch.server_seq, attempts)
-                    .await?
+                if self.stall_budget_exhausted(sync_id, batch.server_seq, attempts).await?
                     || self
                         .sender_fast_quarantine_tripped(
                             sync_id,
@@ -1853,9 +1844,11 @@ impl SyncEngine {
     /// for one entity into a delete chunk and a later sparse-field chunk that
     /// would resurrect the row at-least-once between acks (the FFI coalescer's
     /// absorbing rule only protects within a single chunk).
-    fn winner_should_journal(op: &CrdtChange, deleted_entities: &HashSet<(String, String)>) -> bool {
-        op.is_delete
-            || !deleted_entities.contains(&(op.entity_table.clone(), op.entity_id.clone()))
+    fn winner_should_journal(
+        op: &CrdtChange,
+        deleted_entities: &HashSet<(String, String)>,
+    ) -> bool {
+        op.is_delete || !deleted_entities.contains(&(op.entity_table.clone(), op.entity_id.clone()))
     }
 
     /// Entities tombstoned by a delete winner in this batch — used to drop the
@@ -2178,7 +2171,9 @@ impl SyncEngine {
                 if Self::winner_should_journal(op, &deleted_entities) {
                     let server_seq =
                         seq_by_op_for_journal.get(&op.op_id).copied().unwrap_or_default();
-                    tx.insert_consumer_delivery(&Self::journal_row_for_winner(&sid, op, server_seq))?;
+                    tx.insert_consumer_delivery(&Self::journal_row_for_winner(
+                        &sid, op, server_seq,
+                    ))?;
                 }
             }
 
@@ -2771,11 +2766,7 @@ impl SyncEngine {
 
     /// Clear every sender-health row for a sender whose batch finally applied via
     /// Phase 0b replay — full recovery, the sender is resolvable again.
-    async fn clear_sender_pull_health(
-        &self,
-        sync_id: &str,
-        sender_device_id: &str,
-    ) -> Result<()> {
+    async fn clear_sender_pull_health(&self, sync_id: &str, sender_device_id: &str) -> Result<()> {
         let storage = self.storage.clone();
         let sid = sync_id.to_string();
         let sender = sender_device_id.to_string();
@@ -2820,8 +2811,7 @@ impl SyncEngine {
             // timestamp if this batch was already quarantined on a prior cycle
             // (read via the SyncStorage view before opening the write tx).
             let existing = storage.list_quarantined_pull_batches(&sid)?.into_iter().find(|b| {
-                b.batch_id == envelope.batch_id
-                    && b.sender_device_id == envelope.sender_device_id
+                b.batch_id == envelope.batch_id && b.sender_device_id == envelope.sender_device_id
             });
             let (retry_count, quarantined_at, last_retry_at) = match existing {
                 Some(prev) => (prev.retry_count, prev.quarantined_at, prev.last_retry_at),
@@ -2913,9 +2903,7 @@ impl SyncEngine {
             // (catch-up / WS recovery / journal resume / bundle history) —
             // not after waiting out whatever exponential window it had accrued.
             if q.reason == PermanentPullReason::MissingEpochKey.as_str() {
-                let key_present = q
-                    .epoch
-                    .is_some_and(|e| key_hierarchy.has_epoch_key(e as u32));
+                let key_present = q.epoch.is_some_and(|e| key_hierarchy.has_epoch_key(e as u32));
                 if !key_present {
                     tracing::trace!(
                         batch_id = %q.batch_id,
@@ -2926,8 +2914,12 @@ impl SyncEngine {
                 }
                 // Key present — fall through to replay unconditionally (no backoff
                 // gate); the merge path is idempotent on applied_ops.
-            } else if !quarantine_replay_eligible(now, q.retry_count, q.last_retry_at, backoff_base_ms)
-            {
+            } else if !quarantine_replay_eligible(
+                now,
+                q.retry_count,
+                q.last_retry_at,
+                backoff_base_ms,
+            ) {
                 // Time-aware eligibility gate for every other reason: skip a row
                 // still inside its exponential backoff window. This must run BEFORE
                 // try_replay_quarantined_batch so an ineligible row triggers no
@@ -3465,6 +3457,119 @@ impl SyncEngine {
         for_device_id: Option<String>,
         progress: Option<SnapshotUploadProgress>,
     ) -> Result<()> {
+        self.upload_pairing_snapshot_with_hook(
+            sync_id,
+            key_hierarchy,
+            epoch,
+            device_id,
+            signing_key,
+            ml_dsa_signing_key,
+            ml_dsa_key_generation,
+            ttl_secs,
+            for_device_id,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::upload_pairing_snapshot`], with a pairing-lease progress hook.
+    ///
+    /// The hook is how a split pairing ceremony renews its opaque lease while
+    /// bytes are still progressing: it is invoked only after the relay
+    /// acknowledged a **strictly increased** committed offset, so status polls,
+    /// duplicate acknowledgments, and retries without new bytes never earn a
+    /// renewal, and the relay learns nothing about which upload is related to a
+    /// ceremony.
+    ///
+    /// A hook failure is the hook's business and is never fatal here — lease
+    /// renewal in particular continues under the expiry already in force.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_pairing_snapshot_with_hook(
+        &self,
+        sync_id: &str,
+        key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+        epoch: i32,
+        device_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+        ml_dsa_key_generation: u32,
+        ttl_secs: Option<u64>,
+        for_device_id: Option<String>,
+        progress: Option<SnapshotUploadProgress>,
+        lease_hook: Option<&mut dyn crate::snapshot_upload::SnapshotUploadProgressHook>,
+    ) -> Result<()> {
+        self.upload_pairing_snapshot_inner(
+            sync_id,
+            key_hierarchy,
+            epoch,
+            device_id,
+            signing_key,
+            ml_dsa_signing_key,
+            ml_dsa_key_generation,
+            ttl_secs,
+            for_device_id,
+            progress,
+            lease_hook,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`Self::upload_pairing_snapshot_with_hook`], but reporting the resumable
+    /// session identifier.
+    ///
+    /// Returns `Ok(Some(upload_id))` when the resumable transport published the
+    /// snapshot, and `Ok(None)` when the unchanged single `PUT` path did. The
+    /// identifier is what lets a caller that owns the ceremony best-effort abort
+    /// exactly that session after a cancellation or ceremony expiry, instead of
+    /// leaving a reservation to the relay's independent expiry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_pairing_snapshot_with_lease_hook(
+        &self,
+        sync_id: &str,
+        key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+        epoch: i32,
+        device_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+        ml_dsa_key_generation: u32,
+        ttl_secs: Option<u64>,
+        for_device_id: Option<String>,
+        progress: Option<SnapshotUploadProgress>,
+        lease_hook: Option<&mut dyn crate::snapshot_upload::SnapshotUploadProgressHook>,
+    ) -> Result<Option<String>> {
+        self.upload_pairing_snapshot_inner(
+            sync_id,
+            key_hierarchy,
+            epoch,
+            device_id,
+            signing_key,
+            ml_dsa_signing_key,
+            ml_dsa_key_generation,
+            ttl_secs,
+            for_device_id,
+            progress,
+            lease_hook,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_pairing_snapshot_inner(
+        &self,
+        sync_id: &str,
+        key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+        epoch: i32,
+        device_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+        ml_dsa_key_generation: u32,
+        ttl_secs: Option<u64>,
+        for_device_id: Option<String>,
+        progress: Option<SnapshotUploadProgress>,
+        lease_hook: Option<&mut dyn crate::snapshot_upload::SnapshotUploadProgressHook>,
+    ) -> Result<Option<String>> {
         // 0. Pull to relay head before cutting the snapshot. `sync` runs
         // pull-then-push, so the initiator's own most recent pushes always sit
         // above its `last_pulled_server_seq` cursor; cutting the snapshot at that
@@ -3528,12 +3633,73 @@ impl SyncEngine {
             ciphertext,
         )?;
 
-        // 5. Serialize the envelope to JSON bytes and upload
+        // 5. Serialize the envelope to JSON bytes and upload.
         let envelope_bytes =
             serde_json::to_vec(&envelope).map_err(|e| CoreError::Serialization(e.to_string()))?;
-        // Clone before `for_device_id` is moved into `put_snapshot`;
-        // the SnapshotStale arm below feeds it to the suppression matrix.
+        // Clone before `for_device_id` is moved into the upload; the
+        // SnapshotStale handling below feeds it to the suppression matrix.
         let our_target = for_device_id.clone();
+
+        // 5a. Prefer the resumable transport when this relay advertises a usable
+        // `snapshot_upload` capability. Capability absence, a lookup failure, or
+        // a locally invalid capability all fall through to the unchanged single
+        // PUT — the documented downgrade. Note that a *semantic* rejection is
+        // never downgraded: only local unavailability reaches the fallback.
+        if let Some(transport) = self.relay.as_resumable_transport() {
+            let target_device_id = match for_device_id.clone() {
+                Some(target) if !target.is_empty() => Some(target),
+                // v1 resumable uploads are targeted-only. A group-wide request
+                // is not a downgrade-worthy case: it simply uses the existing
+                // single PUT below, which still supports it.
+                _ => None,
+            };
+            if let Some(target_device_id) = target_device_id {
+                let request = crate::snapshot_upload::SnapshotUploadRequest {
+                    epoch,
+                    server_seq_at: server_seq,
+                    target_device_id,
+                    ttl_secs: ttl_secs
+                        .unwrap_or(crate::snapshot_upload::SNAPSHOT_UPLOAD_DEFAULT_TTL_SECS),
+                };
+                let uploader = crate::snapshot_upload::SnapshotUploader::new(
+                    transport,
+                    &envelope_bytes,
+                    request,
+                )
+                .with_progress(progress.clone());
+
+                match uploader.run(lease_hook).await {
+                    Ok(crate::snapshot_upload::SnapshotUploadOutcome::Uploaded {
+                        upload_id,
+                        ..
+                    }) => {
+                        return Ok(Some(upload_id));
+                    }
+                    Ok(crate::snapshot_upload::SnapshotUploadOutcome::CapabilityUnavailable {
+                        reason,
+                    }) => {
+                        // Log the specific downgrade reason (a bounded label,
+                        // never an identifier) and fall through to single PUT.
+                        tracing::debug!(
+                            sync_id = %sync_id,
+                            reason = reason.as_str(),
+                            "resumable snapshot upload unavailable; falling back to single PUT"
+                        );
+                    }
+                    Err(error) => {
+                        return self
+                            .classify_snapshot_upload_failure(
+                                sync_id,
+                                server_seq,
+                                our_target.as_deref(),
+                                error.to_relay_error(),
+                            )
+                            .map(|()| None);
+                    }
+                }
+            }
+        }
+
         match self
             .relay
             .put_snapshot(
@@ -3547,18 +3713,36 @@ impl SyncEngine {
             )
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(None),
+            Err(other) => self
+                .classify_snapshot_upload_failure(sync_id, server_seq, our_target.as_deref(), other)
+                .map(|()| None),
+        }
+    }
+
+    /// Route an upload failure through the stale-snapshot suppression matrix.
+    ///
+    /// Shared by the resumable and single-PUT paths so both audiences resolve
+    /// identically: only the audience-compatible cases (both untargeted, or the
+    /// same specific target) are success-equivalent. Every other relay error
+    /// becomes a `CoreError::Relay`.
+    fn classify_snapshot_upload_failure(
+        &self,
+        sync_id: &str,
+        server_seq: i64,
+        our_target: Option<&str>,
+        error: crate::relay::traits::RelayError,
+    ) -> Result<()> {
+        match error {
             // Route the 409 through the suppression matrix
             // (`should_suppress_stale_snapshot`) instead of letting it
-            // become a generic `CoreError::Relay` event — only the
-            // audience-compatible cases (both untargeted, or same
-            // specific target) are success-equivalent.
-            Err(crate::relay::traits::RelayError::SnapshotStale {
+            // become a generic `CoreError::Relay` event.
+            crate::relay::traits::RelayError::SnapshotStale {
                 current_server_seq_at,
                 current_target_device_id,
-            }) => {
+            } => {
                 if should_suppress_stale_snapshot(
-                    our_target.as_deref(),
+                    our_target,
                     current_target_device_id.as_deref(),
                     server_seq,
                     current_server_seq_at,
@@ -3587,7 +3771,7 @@ impl SyncEngine {
                     }))
                 }
             }
-            Err(other) => Err(CoreError::from_relay(other)),
+            other => Err(CoreError::from_relay(other)),
         }
     }
 
@@ -3954,10 +4138,8 @@ impl SyncEngine {
                 })
                 .map(|fv| (fv.entity_table.clone(), fv.entity_id.clone()))
                 .collect();
-            let accepted_entities: HashSet<(String, String)> = accepted
-                .iter()
-                .map(|fv| (fv.entity_table.clone(), fv.entity_id.clone()))
-                .collect();
+            let accepted_entities: HashSet<(String, String)> =
+                accepted.iter().map(|fv| (fv.entity_table.clone(), fv.entity_id.clone())).collect();
             for (entity_table, entity_id) in &accepted_entities {
                 if tombstoned.contains(&(entity_table.clone(), entity_id.clone())) {
                     continue;
@@ -3990,11 +4172,7 @@ impl SyncEngine {
                     entity_table: fv.entity_table.clone(),
                     entity_id: fv.entity_id.clone(),
                     field_name: if is_delete { None } else { Some(fv.field_name.clone()) },
-                    encoded_value: if is_delete {
-                        None
-                    } else {
-                        fv.winning_encoded_value.clone()
-                    },
+                    encoded_value: if is_delete { None } else { fv.winning_encoded_value.clone() },
                     is_delete,
                     server_seq: seq,
                     created_at: chrono::Utc::now(),
@@ -4247,11 +4425,8 @@ mod tests {
         let boundary = drift_op("op-boundary", bound, sender);
         let far_future = drift_op("op-future", 120_000, sender);
 
-        let outcome = SyncEngine::filter_batch_ops(
-            vec![in_tolerance, boundary, far_future],
-            sender,
-            bound,
-        );
+        let outcome =
+            SyncEngine::filter_batch_ops(vec![in_tolerance, boundary, far_future], sender, bound);
         match outcome {
             BatchFilterOutcome::Accepted { accepted, deferred } => {
                 let acc: Vec<&str> = accepted.iter().map(|o| o.op_id.as_str()).collect();
@@ -4387,11 +4562,12 @@ mod tests {
 
     // -- Ephemeral mailbox drain -------------------------------------------
 
-    fn drain_test_engine(relay: Arc<crate::relay::MockRelay>) -> (SyncEngine, broadcast::Receiver<SyncEvent>) {
+    fn drain_test_engine(
+        relay: Arc<crate::relay::MockRelay>,
+    ) -> (SyncEngine, broadcast::Receiver<SyncEvent>) {
         let storage = Arc::new(crate::storage::RusqliteSyncStorage::in_memory().unwrap());
         let schema = crate::schema::SyncSchema::builder().build();
-        let engine =
-            SyncEngine::new(storage, relay, vec![], schema, SyncConfig::default());
+        let engine = SyncEngine::new(storage, relay, vec![], schema, SyncConfig::default());
         let (tx, rx) = broadcast::channel(16);
         (engine.with_event_sink(tx), rx)
     }
@@ -4411,13 +4587,25 @@ mod tests {
 
         // One decryptable (epoch 2) + one unreadable (epoch 9, no key) message.
         let mut good = crate::ephemeral::seal_envelope(
-            &epoch_key, "sync-1", 2, "media_request", "blob-1", None, 0,
+            &epoch_key,
+            "sync-1",
+            2,
+            "media_request",
+            "blob-1",
+            None,
+            0,
         )
         .unwrap();
         good.sender_device_id = "dev-2".into();
         relay.seed_ephemeral(good.clone());
         let bad = crate::ephemeral::seal_envelope(
-            &epoch_key, "sync-1", 9, "media_request", "blob-2", None, 0,
+            &epoch_key,
+            "sync-1",
+            9,
+            "media_request",
+            "blob-2",
+            None,
+            0,
         )
         .unwrap();
         relay.seed_ephemeral(bad.clone());
@@ -4578,10 +4766,7 @@ mod tests {
             &[]
         }
 
-        async fn read_row(
-            &self,
-            _entity_id: &str,
-        ) -> Result<Option<HashMap<String, SyncValue>>> {
+        async fn read_row(&self, _entity_id: &str) -> Result<Option<HashMap<String, SyncValue>>> {
             Ok(None)
         }
 
@@ -4671,17 +4856,11 @@ mod tests {
         let c = Arc::new(FallibleEntity::new("c"));
         b.fail_commit.store(true, AtomicOrdering::SeqCst);
 
-        let entities: Vec<Arc<dyn SyncableEntity>> =
-            vec![a.clone(), b.clone(), c.clone()];
+        let entities: Vec<Arc<dyn SyncableEntity>> = vec![a.clone(), b.clone(), c.clone()];
         let storage = Arc::new(RusqliteSyncStorage::in_memory().unwrap());
         let relay = Arc::new(MockRelay::new());
-        let engine = SyncEngine::new(
-            storage,
-            relay,
-            entities,
-            three_table_schema(),
-            SyncConfig::default(),
-        );
+        let engine =
+            SyncEngine::new(storage, relay, entities, three_table_schema(), SyncConfig::default());
 
         let winning = vec![
             winning_op_for("a", "dev"),

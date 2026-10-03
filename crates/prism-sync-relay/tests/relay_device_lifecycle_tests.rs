@@ -79,7 +79,13 @@ async fn refresh_session_with(
     let path = format!("/v1/sync/{sync_id}/session/refresh");
     let ml_dsa_key = sign_with.device_secret.ml_dsa_65_keypair(device_id).unwrap();
     let signing_data = prism_sync_relay::auth::build_request_signing_data_v2(
-        "POST", &path, sync_id, device_id, &body_bytes, timestamp, nonce,
+        "POST",
+        &path,
+        sync_id,
+        device_id,
+        &body_bytes,
+        timestamp,
+        nonce,
     );
     let m_prime = prism_sync_crypto::pq::build_hybrid_message_representative(
         hybrid_signature_contexts::HTTP_REQUEST,
@@ -260,7 +266,8 @@ async fn expired_session_recovers_via_refresh_then_push_succeeds() {
     assert_eq!(device_status(&db, &sync_id, device_id).as_deref(), Some("active"));
 
     // The stranded push now succeeds with the new token.
-    let push = push_signed(&client, &url, &sync_id, device_id, &new_token, &keys, "stranded-1").await;
+    let push =
+        push_signed(&client, &url, &sync_id, device_id, &new_token, &keys, "stranded-1").await;
     assert!(push.status().is_success(), "post-refresh push should succeed: {}", push.status());
     let push_json: Value = push.json().await.unwrap();
     assert!(push_json["server_seq"].as_i64().unwrap() > 0);
@@ -284,7 +291,14 @@ async fn refresh_for_revoked_returns_signed_registry() {
     let sid = sync_id.clone();
     db.with_conn(move |conn| {
         db::upsert_registry_state(conn, &sid, 1, "hash-1")?;
-        db::store_registry_artifact(conn, &sid, 1, "hash-1", "signed_registry_snapshot", b"registry-blob")
+        db::store_registry_artifact(
+            conn,
+            &sid,
+            1,
+            "hash-1",
+            "signed_registry_snapshot",
+            b"registry-blob",
+        )
     })
     .expect("store registry artifact");
 
@@ -327,7 +341,14 @@ async fn refresh_rejects_wrong_key_replay_and_skew() {
     // (1) Wrong signing keys -> 401, still stale.
     let wrong_keys = TestDeviceKeys::generate(device_id);
     let resp = refresh_session_with(
-        &client, &url, &sync_id, device_id, &keys, &wrong_keys, &now, "nonce-wrong-key",
+        &client,
+        &url,
+        &sync_id,
+        device_id,
+        &keys,
+        &wrong_keys,
+        &now,
+        "nonce-wrong-key",
     )
     .await;
     assert_eq!(resp.status(), 401, "wrong-key refresh must be rejected");
@@ -336,7 +357,14 @@ async fn refresh_rejects_wrong_key_replay_and_skew() {
     // (2) Skewed timestamp (well beyond the 60s window) -> 401, still stale.
     let skewed = (db::now_secs() - 3600).to_string();
     let resp = refresh_session_with(
-        &client, &url, &sync_id, device_id, &keys, &keys, &skewed, "nonce-skew",
+        &client,
+        &url,
+        &sync_id,
+        device_id,
+        &keys,
+        &keys,
+        &skewed,
+        "nonce-skew",
     )
     .await;
     assert_eq!(resp.status(), 401, "skewed-timestamp refresh must be rejected");
@@ -347,15 +375,13 @@ async fn refresh_rejects_wrong_key_replay_and_skew() {
     // attempt is observably a no-op on a now-active device — instead we assert
     // the replay is 401 directly.
     let ts = db::now_secs().to_string();
-    let first = refresh_session_with(
-        &client, &url, &sync_id, device_id, &keys, &keys, &ts, "nonce-replay",
-    )
-    .await;
+    let first =
+        refresh_session_with(&client, &url, &sync_id, device_id, &keys, &keys, &ts, "nonce-replay")
+            .await;
     assert_eq!(first.status(), 200, "first use of a fresh nonce should succeed");
-    let replay = refresh_session_with(
-        &client, &url, &sync_id, device_id, &keys, &keys, &ts, "nonce-replay",
-    )
-    .await;
+    let replay =
+        refresh_session_with(&client, &url, &sync_id, device_id, &keys, &keys, &ts, "nonce-replay")
+            .await;
     assert_eq!(replay.status(), 401, "replayed nonce must be rejected");
 }
 
@@ -371,7 +397,8 @@ async fn stale_reregister_reactivates_mismatch_and_revoked_rejected() {
     // through the existing-group / registry-approval path.
     let admin_id = common::generate_device_id();
     let admin_keys = TestDeviceKeys::generate(&admin_id);
-    let _admin_token = common::register_device(&client, &url, &sync_id, &admin_id, &admin_keys).await;
+    let _admin_token =
+        common::register_device(&client, &url, &sync_id, &admin_id, &admin_keys).await;
 
     // Insert the joiner directly so we control its keys, then age it to stale.
     let dev_id = common::generate_device_id();
@@ -395,7 +422,14 @@ async fn stale_reregister_reactivates_mismatch_and_revoked_rejected() {
     run_mark_stale_devices(&db, STALE_DEVICE_SECS);
     let wrong_keys = TestDeviceKeys::generate(&dev_id);
     let resp = reregister(
-        &client, &url, &sync_id, &admin_id, &admin_keys, &dev_id, &wrong_keys, &dev_keys,
+        &client,
+        &url,
+        &sync_id,
+        &admin_id,
+        &admin_keys,
+        &dev_id,
+        &wrong_keys,
+        &dev_keys,
     )
     .await;
     assert_eq!(resp.status(), 401, "mismatched keys must yield DeviceIdentityMismatch");
@@ -533,7 +567,8 @@ async fn atomic_revoke_of_stale_target_succeeds_and_then_refresh_is_401() {
     // Admin (the revoker) registers over HTTP so it has a valid session/token.
     let admin_id = common::generate_device_id();
     let admin_keys = TestDeviceKeys::generate(&admin_id);
-    let admin_token = common::register_device(&client, &url, &sync_id, &admin_id, &admin_keys).await;
+    let admin_token =
+        common::register_device(&client, &url, &sync_id, &admin_id, &admin_keys).await;
 
     // Target joins via DB so we control its keys, then ages to stale (30–90d).
     let target_id = common::generate_device_id();
@@ -637,7 +672,15 @@ async fn refresh_signed_for_one_sync_is_rejected_against_another() {
     let ml_kem_pk = keys_a.ml_kem_pk.clone();
     db.with_conn(move |conn| {
         db::register_device_with_pq(
-            conn, &sb2, &did, &signing_pk, &x25519_pk, &ml_dsa_pk, &ml_kem_pk, &[], 0,
+            conn,
+            &sb2,
+            &did,
+            &signing_pk,
+            &x25519_pk,
+            &ml_dsa_pk,
+            &ml_kem_pk,
+            &[],
+            0,
         )?;
         Ok::<_, rusqlite::Error>(())
     })
@@ -675,8 +718,7 @@ async fn refresh_signed_for_one_sync_is_rejected_against_another() {
 /// Read WS text frames until one with `type == wanted` arrives (or timeout).
 /// Returns the matching frame's JSON. Skips `auth_ok`/`pong` and unrelated types.
 async fn await_ws_frame(
-    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-              + Unpin),
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
     wanted: &str,
 ) -> Value {
     let deadline = std::time::Duration::from_secs(5);
@@ -743,10 +785,8 @@ async fn auto_revoke_parks_session_and_cleanup_emits_both_ws_frames() {
         .replacen("http://", "ws://", 1)
         .into_client_request()
         .unwrap();
-    req.headers_mut().insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {survivor_token}")).unwrap(),
-    );
+    req.headers_mut()
+        .insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {survivor_token}")).unwrap());
     let (mut ws, _) = connect_async(req).await.expect("survivor WS upgrade");
     // Drain the initial auth_ok so it doesn't shadow our matching below.
     let _ = await_ws_frame(&mut ws, "auth_ok").await;

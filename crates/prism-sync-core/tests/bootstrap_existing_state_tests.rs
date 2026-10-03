@@ -338,7 +338,8 @@ async fn bootstrap_round_trips_through_snapshot() {
     let fresh = RusqliteSyncStorage::in_memory().unwrap();
     let count = {
         let mut tx = fresh.begin_tx().unwrap();
-        let count = tx.import_snapshot(SYNC_ID, &blob, prism_sync_core::MAX_CLOCK_DRIFT_MS).unwrap();
+        let count =
+            tx.import_snapshot(SYNC_ID, &blob, prism_sync_core::MAX_CLOCK_DRIFT_MS).unwrap();
         tx.commit().unwrap();
         count
     };

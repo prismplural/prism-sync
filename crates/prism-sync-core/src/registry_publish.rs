@@ -79,9 +79,8 @@ pub fn ratchet_last_imported_registry_version(
         return Ok(());
     }
 
-    let current = storage
-        .get_sync_metadata(sync_id)?
-        .and_then(|meta| meta.last_imported_registry_version);
+    let current =
+        storage.get_sync_metadata(sync_id)?.and_then(|meta| meta.last_imported_registry_version);
 
     // Strictly-greater early-out: equal or older versions never rewind or
     // rewrite the baseline. A missing row also can't be advanced (no row to
@@ -187,12 +186,7 @@ pub fn build_signed_registry_from_pinned(
         )));
     }
 
-    Ok(SignedRegistrySnapshot::new_with_epoch_binding(
-        entries,
-        version,
-        epoch,
-        epoch_key_hashes,
-    ))
+    Ok(SignedRegistrySnapshot::new_with_epoch_binding(entries, version, epoch, epoch_key_hashes))
 }
 
 /// Normalize a locally-pinned device status to the registry alphabet.
@@ -227,8 +221,7 @@ fn registry_entry_from_record(
     wipe_target: Option<&str>,
 ) -> Result<RegistrySnapshotEntry> {
     let status = normalize_registry_status(&record.status)?;
-    let remote_wipe =
-        status == "revoked" && wipe_target == Some(record.device_id.as_str());
+    let remote_wipe = status == "revoked" && wipe_target == Some(record.device_id.as_str());
     Ok(RegistrySnapshotEntry {
         sync_id: record.sync_id.clone(),
         device_id: record.device_id.clone(),
@@ -271,10 +264,7 @@ mod tests {
     }
 
     fn read_baseline(storage: &dyn SyncStorage) -> Option<i64> {
-        storage
-            .get_sync_metadata(SYNC_ID)
-            .unwrap()
-            .and_then(|m| m.last_imported_registry_version)
+        storage.get_sync_metadata(SYNC_ID).unwrap().and_then(|m| m.last_imported_registry_version)
     }
 
     fn seed_metadata(storage: &dyn SyncStorage, baseline: Option<i64>) {

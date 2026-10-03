@@ -478,12 +478,9 @@ fn app_dir_with_sync_schema() -> Option<PathBuf> {
     }
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    [
-        manifest_dir.join("../../../prism-app"),
-        manifest_dir.join("../../../app"),
-    ]
-    .into_iter()
-    .find(|candidate| schema_path(candidate).exists())
+    [manifest_dir.join("../../../prism-app"), manifest_dir.join("../../../app")]
+        .into_iter()
+        .find(|candidate| schema_path(candidate).exists())
 }
 
 fn app_sync_schema_json(app_dir: &Path) -> String {
@@ -565,14 +562,16 @@ fn app_fixture_json_value_to_sync_value(
     }
 }
 
-fn app_full_restore_fixture_records(
-    schema: &SyncSchema,
-    fixture_json: &str,
-) -> (
+type RestoreFixtureRecords = (
     Vec<SeedRecord>,
     BTreeMap<(String, String), BTreeMap<String, String>>,
     BTreeMap<String, Vec<SyncFieldDef>>,
-) {
+);
+
+fn app_full_restore_fixture_records(
+    schema: &SyncSchema,
+    fixture_json: &str,
+) -> RestoreFixtureRecords {
     let value: serde_json::Value =
         serde_json::from_str(fixture_json).expect("full remote payload fixture should parse");
     let order = value["order"]
@@ -1046,11 +1045,8 @@ async fn e2e_clock_excursion_repair_recovers_poisoned_self_authored_field() {
     assert!(a_sync.error.is_none(), "A sync failed: {:?}", a_sync.error);
 
     // The poisoned unpushed pending op is gone (replaced by a sane re-emit).
-    let poison_still_present = storage_a
-        .load_batch_ops("poison-batch")
-        .unwrap()
-        .iter()
-        .any(|op| op.op_id == "poison-op");
+    let poison_still_present =
+        storage_a.load_batch_ops("poison-batch").unwrap().iter().any(|op| op.op_id == "poison-op");
     assert!(!poison_still_present, "the over-bound pending op should be deleted");
 
     // The FV winner was rewritten downward to a sane HLC by the re-emit.
@@ -4088,7 +4084,8 @@ async fn run_e2e_revoke_signed_wipe(remote_wipe: bool) {
     pin_full_device_record(&storage_a, &sync_id, &victim_id, &keys_c);
     setup_sync_metadata(&storage_a, &sync_id, &admin_id);
 
-    let relay_a = Arc::new(make_server_relay(&localhost_url, &sync_id, &admin_id, &token_a, &keys_a));
+    let relay_a =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &admin_id, &token_a, &keys_a));
     let mut admin = PrismSync::builder()
         .schema(fronting_test_schema())
         .storage(storage_a.clone())
@@ -4125,7 +4122,8 @@ async fn run_e2e_revoke_signed_wipe(remote_wipe: bool) {
     )
     .unwrap();
 
-    let relay_c = Arc::new(make_server_relay(&localhost_url, &sync_id, &victim_id, &token_c, &keys_c));
+    let relay_c =
+        Arc::new(make_server_relay(&localhost_url, &sync_id, &victim_id, &token_c, &keys_c));
     let mut victim = PrismSync::builder()
         .schema(fronting_test_schema())
         .storage(storage_c.clone())

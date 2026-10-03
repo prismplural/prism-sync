@@ -9,6 +9,7 @@ pub mod registry;
 pub mod session;
 pub mod sharing;
 pub mod sync;
+pub mod uploads;
 pub mod ws;
 
 use axum::{
@@ -489,6 +490,7 @@ pub fn router(state: AppState) -> Router {
         .merge(default_timeout_routes)
         .merge(snapshot_put_route)
         .merge(media_routes)
+        .merge(uploads::routes(state.clone()))
         .layer(cors)
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(
@@ -761,15 +763,9 @@ mod allowlist_tests {
     #[test]
     fn allows_only_get_registry_exact_path() {
         // The single allowed read.
-        assert!(is_revoked_device_registry_read(
-            &Method::GET,
-            "/v1/sync/abc123/registry"
-        ));
+        assert!(is_revoked_device_registry_read(&Method::GET, "/v1/sync/abc123/registry"));
         // Tolerate a trailing slash (router-normalized variant).
-        assert!(is_revoked_device_registry_read(
-            &Method::GET,
-            "/v1/sync/abc123/registry/"
-        ));
+        assert!(is_revoked_device_registry_read(&Method::GET, "/v1/sync/abc123/registry/"));
     }
 
     #[test]

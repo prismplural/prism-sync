@@ -850,6 +850,77 @@ impl SyncService {
         result
     }
 
+    /// [`Self::upload_pairing_snapshot`], with a progress/lease hook.
+    ///
+    /// Returns the relay's resumable session identifier when the resumable
+    /// transport was used, so a cancelling ceremony can best-effort abort that
+    /// exact session. `Ok(None)` means the unchanged single `PUT` path ran.
+    ///
+    /// The hook sees the session identifier as soon as it exists and one
+    /// committed-offset signal per strictly increased acknowledged offset. Hook
+    /// failures are never fatal.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_pairing_snapshot_with_lease_hook(
+        &self,
+        key_hierarchy: &prism_sync_crypto::KeyHierarchy,
+        sync_id: &str,
+        epoch: i32,
+        device_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+        ml_dsa_key_generation: u32,
+        ttl_secs: Option<u64>,
+        for_device_id: Option<String>,
+        progress: Option<SnapshotUploadProgress>,
+        lease_hook: Option<&mut dyn crate::snapshot_upload::SnapshotUploadProgressHook>,
+    ) -> Result<Option<String>> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            CoreError::Storage(StorageError::Logic("sync engine not configured".into()))
+        })?;
+
+        // Emit the same progress event the one-shot path does, unless the
+        // caller supplied its own callback (the FFI polls its own state).
+        let progress = match progress {
+            Some(progress) => Some(progress),
+            None => {
+                let event_tx = self.event_tx.clone();
+                let sync_id_cb = sync_id.to_string();
+                Some(Arc::new(move |bytes_sent: u64, bytes_total: u64| {
+                    let _ = event_tx.send(SyncEvent::SnapshotUploadProgress {
+                        sync_id: sync_id_cb.clone(),
+                        bytes_sent,
+                        bytes_total,
+                    });
+                }) as SnapshotUploadProgress)
+            }
+        };
+
+        let result = engine
+            .upload_pairing_snapshot_with_lease_hook(
+                sync_id,
+                key_hierarchy,
+                epoch,
+                device_id,
+                signing_key,
+                ml_dsa_signing_key,
+                ml_dsa_key_generation,
+                ttl_secs,
+                for_device_id,
+                progress,
+                lease_hook,
+            )
+            .await;
+
+        if let Err(ref e) = result {
+            let _ = self.event_tx.send(SyncEvent::SnapshotUploadFailed {
+                sync_id: sync_id.to_string(),
+                reason: e.to_string(),
+            });
+        }
+
+        result
+    }
+
     /// Seed local `field_versions` from pre-existing data (first-device
     /// bootstrap). Delegates to [`SyncEngine::bootstrap_existing_state`].
     pub async fn bootstrap_existing_state(

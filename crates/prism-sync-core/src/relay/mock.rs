@@ -95,6 +95,62 @@ struct MockRelayState {
     /// relay; `None` mimics an old relay that omits the field (no behavior
     /// change). Rotating this simulates a restore-induced lineage change.
     log_token: Option<String>,
+    /// Advertised resumable-snapshot capability. `None` models an old relay
+    /// that dark-launches or lacks the feature, so the engine falls back to the
+    /// existing single PUT.
+    resumable_capability: Option<crate::snapshot_upload::SnapshotUploadCapability>,
+    /// Resumable sessions by upload ID.
+    resumable_sessions: HashMap<String, MockResumableSession>,
+    /// `(target, upload_key) -> upload_id`, the idempotency index.
+    resumable_by_key: HashMap<(String, String), String>,
+    /// Monotonic suffix for generated upload IDs.
+    resumable_next_id: u64,
+    /// Per-operation fault injection for the resumable routes.
+    resumable_faults: MockResumableFaults,
+    /// Operation names whose injected fault re-arms after every call, so a test
+    /// can exhaust the client's bounded retry budget deterministically.
+    resumable_repeating_faults: std::collections::HashSet<String>,
+    /// The exact envelope bytes most recently published through a resumable
+    /// session, so a test can prove byte-for-byte equality.
+    resumable_published: Option<Vec<u8>>,
+    /// Counts for assertions.
+    resumable_create_calls: u64,
+    resumable_chunk_calls: u64,
+    resumable_complete_calls: u64,
+    resumable_abort_calls: u64,
+    /// Upload ids passed to an abort, in call order (see
+    /// [`MockRelay::resumable_aborted_upload_ids`]).
+    resumable_aborted_upload_ids: Vec<String>,
+}
+
+/// Fault applied to the next call of one resumable operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MockResumableFault {
+    /// A retryable transport failure; the mutation does not happen.
+    TransportError,
+    /// The mutation happens, then the response is lost.
+    CommitThenTransportError,
+    /// A structured error with this status and machine code.
+    Structured(u16, String),
+}
+
+#[derive(Default, Clone, Debug)]
+struct MockResumableFaults {
+    create: Option<MockResumableFault>,
+    status: Option<MockResumableFault>,
+    chunk: Option<MockResumableFault>,
+    complete: Option<MockResumableFault>,
+    abort: Option<MockResumableFault>,
+}
+
+/// One resumable session, mirroring the relay's authoritative columns.
+struct MockResumableSession {
+    total_bytes: u64,
+    committed_offset: u64,
+    body_sha256: String,
+    state: crate::snapshot_upload::UploadState,
+    stored: Vec<u8>,
+    target_device_id: String,
 }
 
 /// How an injected `pull_changes` failure should present on the wire.
@@ -166,6 +222,20 @@ impl MockRelay {
                 ephemeral_acked: HashSet::new(),
                 ephemeral_feature_absent: false,
                 log_token: Some(uuid::Uuid::new_v4().to_string()),
+                // Dark by default, matching the relay's own default: a test must
+                // opt in explicitly so a fallback test cannot pass by accident.
+                resumable_capability: None,
+                resumable_sessions: HashMap::new(),
+                resumable_by_key: HashMap::new(),
+                resumable_next_id: 1,
+                resumable_faults: MockResumableFaults::default(),
+                resumable_repeating_faults: std::collections::HashSet::new(),
+                resumable_published: None,
+                resumable_create_calls: 0,
+                resumable_chunk_calls: 0,
+                resumable_complete_calls: 0,
+                resumable_abort_calls: 0,
+                resumable_aborted_upload_ids: Vec::new(),
             }),
             notification_tx,
         }
@@ -676,6 +746,514 @@ impl SnapshotExchange for MockRelay {
         } else {
             Err(RelayError::NotFound)
         }
+    }
+
+    // ── Resumable pair-time snapshot upload (lean v1) ──
+
+    fn as_resumable_transport(
+        &self,
+    ) -> Option<&dyn crate::snapshot_upload::ResumableSnapshotTransport> {
+        Some(self)
+    }
+
+    async fn resumable_snapshot_capability(
+        &self,
+    ) -> Result<
+        crate::snapshot_upload::SnapshotUploadCapability,
+        crate::snapshot_upload::CapabilityUnavailableReason,
+    > {
+        match self.state.lock().unwrap().resumable_capability {
+            Some(capability) => Ok(capability),
+            None => Err(crate::snapshot_upload::CapabilityUnavailableReason::Absent),
+        }
+    }
+
+    async fn create_snapshot_upload(
+        &self,
+        body: &crate::snapshot_upload::CreateUploadRequest,
+    ) -> Result<
+        crate::snapshot_upload::CreateUploadResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        let mut state = self.state.lock().unwrap();
+        state.resumable_create_calls += 1;
+        // Faults are single-shot, matching how a real transient failure clears,
+        // unless the test asked for a repeating one.
+        let create_fault = state.resumable_faults.create.take();
+        Self::rearm_resumable_fault(&mut state, "create", &create_fault);
+        if let Some(fault) = create_fault {
+            match fault {
+                MockResumableFault::TransportError => {
+                    return Err(crate::snapshot_upload::ResumableUploadError::transport(
+                        "connection reset",
+                    ))
+                }
+                MockResumableFault::Structured(status, code) => {
+                    return Err(crate::snapshot_upload::ResumableUploadError::new(
+                        status,
+                        crate::snapshot_upload::UploadErrorCode::parse(&code),
+                        "injected create failure",
+                    ))
+                }
+                MockResumableFault::CommitThenTransportError => {
+                    // The create takes effect, then the response is lost. The
+                    // stable upload key is what lets the retry recover it.
+                    let _ = Self::mock_commit_create(&mut state, body);
+                    state.resumable_repeating_faults.remove("create");
+                    return Err(crate::snapshot_upload::ResumableUploadError::transport(
+                        "connection reset after commit",
+                    ));
+                }
+            }
+        }
+        Ok(Self::mock_commit_create(&mut state, body))
+    }
+
+    async fn snapshot_upload_status(
+        &self,
+        upload_id: &str,
+    ) -> Result<
+        crate::snapshot_upload::UploadStatusResponse,
+        crate::snapshot_upload::ResumableUploadError,
+    > {
+        let mut state = self.state.lock().unwrap();
+        let status_fault = state.resumable_faults.status.take();
+        Self::rearm_resumable_fault(&mut state, "status", &status_fault);
+        if let Some(fault) = status_fault {
+            return Err(Self::mock_resumable_fault_error(fault, "status"));
+        }
+        let session = state.resumable_sessions.get(upload_id).ok_or_else(|| {
+            crate::snapshot_upload::ResumableUploadError::new(
+                404,
+                crate::snapshot_upload::UploadErrorCode::NotFound,
+                "unknown session",
+            )
+        })?;
+        Ok(crate::snapshot_upload::UploadStatusResponse {
+            state: Some(Self::mock_state_str(session.state).to_string()),
+            total_bytes: session.total_bytes as i64,
+            committed_offset: session.committed_offset as i64,
+            chunk_bytes: crate::snapshot_upload::SNAPSHOT_UPLOAD_CHUNK_BYTES as i64,
+            idle_expires_at: 1_789_590_000,
+            absolute_expires_at: 1_789_600_800,
+        })
+    }
+
+    async fn put_snapshot_upload_chunk(
+        &self,
+        upload_id: &str,
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<crate::snapshot_upload::ChunkResponse, crate::snapshot_upload::ResumableUploadError>
+    {
+        let mut state = self.state.lock().unwrap();
+        state.resumable_chunk_calls += 1;
+        let chunk_fault = state.resumable_faults.chunk.take();
+        Self::rearm_resumable_fault(&mut state, "chunk", &chunk_fault);
+        if let Some(fault) = chunk_fault {
+            match fault {
+                MockResumableFault::TransportError => {
+                    return Err(crate::snapshot_upload::ResumableUploadError::transport(
+                        "connection reset",
+                    ))
+                }
+                MockResumableFault::Structured(status, code) => {
+                    return Err(crate::snapshot_upload::ResumableUploadError::new(
+                        status,
+                        crate::snapshot_upload::UploadErrorCode::parse(&code),
+                        "injected chunk failure",
+                    ))
+                }
+                MockResumableFault::CommitThenTransportError => {
+                    Self::mock_commit_chunk(&mut state, upload_id, offset, chunk)?;
+                    // The write settled, so a repeating "lost response" fault
+                    // must not re-execute the write: clear it explicitly.
+                    state.resumable_repeating_faults.remove("chunk");
+                    return Err(crate::snapshot_upload::ResumableUploadError::transport(
+                        "connection reset after commit",
+                    ));
+                }
+            }
+        }
+        Self::mock_commit_chunk(&mut state, upload_id, offset, chunk)
+    }
+
+    async fn complete_snapshot_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<(), crate::snapshot_upload::ResumableUploadError> {
+        let mut state = self.state.lock().unwrap();
+        state.resumable_complete_calls += 1;
+        let complete_fault = state.resumable_faults.complete.take();
+        Self::rearm_resumable_fault(&mut state, "complete", &complete_fault);
+        if let Some(fault) = complete_fault {
+            match fault {
+                MockResumableFault::TransportError => {
+                    return Err(crate::snapshot_upload::ResumableUploadError::transport(
+                        "connection reset",
+                    ))
+                }
+                MockResumableFault::Structured(status, code) => {
+                    return Err(crate::snapshot_upload::ResumableUploadError::new(
+                        status,
+                        crate::snapshot_upload::UploadErrorCode::parse(&code),
+                        "injected complete failure",
+                    ))
+                }
+                MockResumableFault::CommitThenTransportError => {
+                    Self::mock_commit_complete(&mut state, upload_id)?;
+                    // Publication committed, so stop re-arming: a repeating
+                    // lost-response fault must not re-run publication.
+                    state.resumable_repeating_faults.remove("complete");
+                    return Err(crate::snapshot_upload::ResumableUploadError::transport(
+                        "connection reset after commit",
+                    ));
+                }
+            }
+        }
+        Self::mock_commit_complete(&mut state, upload_id)
+    }
+
+    async fn abort_snapshot_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<(), crate::snapshot_upload::ResumableUploadError> {
+        let mut state = self.state.lock().unwrap();
+        state.resumable_abort_calls += 1;
+        state.resumable_aborted_upload_ids.push(upload_id.to_string());
+        let abort_fault = state.resumable_faults.abort.take();
+        Self::rearm_resumable_fault(&mut state, "abort", &abort_fault);
+        if let Some(fault) = abort_fault {
+            return Err(Self::mock_resumable_fault_error(fault, "abort"));
+        }
+        if let Some(session) = state.resumable_sessions.get_mut(upload_id) {
+            if session.state == crate::snapshot_upload::UploadState::Completed {
+                return Err(crate::snapshot_upload::ResumableUploadError::new(
+                    409,
+                    crate::snapshot_upload::UploadErrorCode::Completed,
+                    "already completed",
+                ));
+            }
+            session.state = crate::snapshot_upload::UploadState::Failed;
+        }
+        Ok(())
+    }
+}
+
+impl MockRelay {
+    fn mock_state_str(state: crate::snapshot_upload::UploadState) -> &'static str {
+        match state {
+            crate::snapshot_upload::UploadState::Active => "active",
+            crate::snapshot_upload::UploadState::Finalizing => "finalizing",
+            crate::snapshot_upload::UploadState::Completed => "completed",
+            crate::snapshot_upload::UploadState::Failed => "failed",
+            crate::snapshot_upload::UploadState::Unknown => "unknown",
+        }
+    }
+
+    fn mock_resumable_fault_error(
+        fault: MockResumableFault,
+        operation: &str,
+    ) -> crate::snapshot_upload::ResumableUploadError {
+        match fault {
+            MockResumableFault::TransportError | MockResumableFault::CommitThenTransportError => {
+                crate::snapshot_upload::ResumableUploadError::transport(format!(
+                    "connection reset during {operation}"
+                ))
+            }
+            MockResumableFault::Structured(status, code) => {
+                crate::snapshot_upload::ResumableUploadError::new(
+                    status,
+                    crate::snapshot_upload::UploadErrorCode::parse(&code),
+                    format!("injected {operation} failure"),
+                )
+            }
+        }
+    }
+
+    fn mock_commit_create(
+        state: &mut MockRelayState,
+        body: &crate::snapshot_upload::CreateUploadRequest,
+    ) -> crate::snapshot_upload::CreateUploadResponse {
+        let key = (body.target_device_id.clone(), body.upload_key.clone());
+        // Idempotent recovery: the same key returns the existing session and its
+        // current offset, so a lost create/complete response never re-uploads.
+        if let Some(existing) = state.resumable_by_key.get(&key).cloned() {
+            if let Some(session) = state.resumable_sessions.get(&existing) {
+                return crate::snapshot_upload::CreateUploadResponse {
+                    upload_id: existing,
+                    state: Some(Self::mock_state_str(session.state).to_string()),
+                    chunk_bytes: crate::snapshot_upload::SNAPSHOT_UPLOAD_CHUNK_BYTES as i64,
+                    total_bytes: session.total_bytes as i64,
+                    committed_offset: session.committed_offset as i64,
+                    idle_expires_at: 1_789_590_000,
+                    absolute_expires_at: 1_789_600_800,
+                };
+            }
+        }
+
+        let upload_id = format!("mock-upload-{:016x}", state.resumable_next_id);
+        state.resumable_next_id += 1;
+        state.resumable_sessions.insert(
+            upload_id.clone(),
+            MockResumableSession {
+                total_bytes: u64::try_from(body.total_bytes).unwrap_or(0),
+                committed_offset: 0,
+                body_sha256: body.body_sha256.clone(),
+                state: crate::snapshot_upload::UploadState::Active,
+                stored: Vec::new(),
+                target_device_id: body.target_device_id.clone(),
+            },
+        );
+        state.resumable_by_key.insert(key, upload_id.clone());
+
+        crate::snapshot_upload::CreateUploadResponse {
+            upload_id,
+            state: Some("active".to_string()),
+            chunk_bytes: crate::snapshot_upload::SNAPSHOT_UPLOAD_CHUNK_BYTES as i64,
+            total_bytes: body.total_bytes,
+            committed_offset: 0,
+            idle_expires_at: 1_789_590_000,
+            absolute_expires_at: 1_789_600_800,
+        }
+    }
+
+    fn mock_commit_chunk(
+        state: &mut MockRelayState,
+        upload_id: &str,
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<crate::snapshot_upload::ChunkResponse, crate::snapshot_upload::ResumableUploadError>
+    {
+        use crate::snapshot_upload::{ResumableUploadError, UploadErrorCode, UploadState};
+
+        let session = state.resumable_sessions.get_mut(upload_id).ok_or_else(|| {
+            ResumableUploadError::new(404, UploadErrorCode::NotFound, "unknown session")
+        })?;
+
+        match session.state {
+            UploadState::Active => {}
+            UploadState::Finalizing => {
+                return Err(ResumableUploadError::new(
+                    409,
+                    UploadErrorCode::Finalizing,
+                    "completion owns the session",
+                ))
+            }
+            UploadState::Completed => {
+                return Err(ResumableUploadError::new(
+                    409,
+                    UploadErrorCode::Completed,
+                    "already completed",
+                ))
+            }
+            _ => {
+                return Err(ResumableUploadError::new(
+                    409,
+                    UploadErrorCode::Failed,
+                    "session failed",
+                ))
+            }
+        }
+
+        if chunk.is_empty()
+            || chunk.len() as u64 > crate::snapshot_upload::SNAPSHOT_UPLOAD_CHUNK_BYTES
+        {
+            return Err(ResumableUploadError::new(
+                413,
+                UploadErrorCode::ChunkTooLarge,
+                "bad chunk length",
+            ));
+        }
+
+        let offset_end = offset + chunk.len() as u64;
+        if offset == session.committed_offset {
+            if offset_end > session.total_bytes {
+                return Err(ResumableUploadError::new(
+                    413,
+                    UploadErrorCode::SnapshotTooLarge,
+                    "past declared total",
+                ));
+            }
+            let new_len = offset_end as usize;
+            if session.stored.len() < new_len {
+                session.stored.resize(new_len, 0);
+            }
+            session.stored[offset as usize..new_len].copy_from_slice(chunk);
+            session.committed_offset = offset_end;
+        } else if offset_end <= session.committed_offset {
+            // A wholly-committed range is an idempotent retry: no write, no
+            // expiry refresh.
+        } else {
+            return Err(ResumableUploadError::new(
+                409,
+                UploadErrorCode::OffsetMismatch,
+                "offset does not match the committed prefix",
+            )
+            .with_committed_offset(session.committed_offset));
+        }
+
+        Ok(crate::snapshot_upload::ChunkResponse {
+            committed_offset: session.committed_offset as i64,
+            idle_expires_at: 1_789_590_000,
+            absolute_expires_at: 1_789_600_800,
+        })
+    }
+
+    fn mock_commit_complete(
+        state: &mut MockRelayState,
+        upload_id: &str,
+    ) -> Result<(), crate::snapshot_upload::ResumableUploadError> {
+        use crate::snapshot_upload::{ResumableUploadError, UploadErrorCode, UploadState};
+        use sha2::{Digest, Sha256};
+
+        let session = state.resumable_sessions.get_mut(upload_id).ok_or_else(|| {
+            ResumableUploadError::new(404, UploadErrorCode::NotFound, "unknown session")
+        })?;
+
+        // Idempotent after a lost success response.
+        if session.state == UploadState::Completed {
+            return Ok(());
+        }
+        if session.state == UploadState::Failed {
+            return Err(ResumableUploadError::new(409, UploadErrorCode::Failed, "session failed"));
+        }
+        if session.committed_offset < session.total_bytes {
+            return Err(ResumableUploadError::new(
+                409,
+                UploadErrorCode::Incomplete,
+                "bytes are incomplete",
+            )
+            .with_committed_offset(session.committed_offset));
+        }
+
+        let digest = hex::encode(Sha256::digest(&session.stored));
+        if digest != session.body_sha256 {
+            session.state = UploadState::Failed;
+            return Err(ResumableUploadError::new(
+                422,
+                UploadErrorCode::HashMismatch,
+                "staged file does not match create metadata",
+            ));
+        }
+
+        let stored = session.stored.clone();
+        let target = session.target_device_id.clone();
+        let total = session.total_bytes;
+        session.state = UploadState::Completed;
+
+        // Publication: the completed bytes become the targeted snapshot row.
+        state.snapshot = Some(SnapshotResponse {
+            epoch: 0,
+            server_seq_at: 0,
+            data: stored.clone(),
+            sender_device_id: String::new(),
+        });
+        state.snapshot_target_device_id = Some(target);
+        state.resumable_published = Some(stored);
+        let _ = total;
+        Ok(())
+    }
+
+    /// Advertise the resumable capability, so the engine prefers the resumable
+    /// path. `None` restores the old-relay behavior.
+    pub fn set_resumable_capability(
+        &self,
+        capability: Option<crate::snapshot_upload::SnapshotUploadCapability>,
+    ) {
+        self.state.lock().unwrap().resumable_capability = capability;
+    }
+
+    /// Inject a fault into the next call of one resumable operation
+    /// (`create`, `status`, `chunk`, `complete`, or `abort`).
+    ///
+    /// Single-shot: it clears once consumed, matching how a real transient
+    /// failure clears.
+    pub fn inject_resumable_fault(&self, operation: &str, fault: MockResumableFault) {
+        let mut state = self.state.lock().unwrap();
+        Self::store_resumable_fault(&mut state, operation, fault);
+    }
+
+    /// Inject a fault that re-arms after every call, so the client's bounded
+    /// retry budget can be exhausted deterministically.
+    pub fn inject_resumable_fault_repeating(&self, operation: &str, fault: MockResumableFault) {
+        let mut state = self.state.lock().unwrap();
+        state.resumable_repeating_faults.insert(operation.to_string());
+        Self::store_resumable_fault(&mut state, operation, fault);
+    }
+
+    fn store_resumable_fault(
+        state: &mut MockRelayState,
+        operation: &str,
+        fault: MockResumableFault,
+    ) {
+        match operation {
+            "create" => state.resumable_faults.create = Some(fault),
+            "status" => state.resumable_faults.status = Some(fault),
+            "chunk" => state.resumable_faults.chunk = Some(fault),
+            "complete" => state.resumable_faults.complete = Some(fault),
+            "abort" => state.resumable_faults.abort = Some(fault),
+            other => panic!("unknown resumable operation {other}"),
+        }
+    }
+
+    /// Re-arm a taken fault when the operation was marked repeating.
+    fn rearm_resumable_fault(
+        state: &mut MockRelayState,
+        operation: &str,
+        fault: &Option<MockResumableFault>,
+    ) {
+        if !state.resumable_repeating_faults.contains(operation) {
+            return;
+        }
+        if let Some(fault) = fault.clone() {
+            Self::store_resumable_fault(state, operation, fault);
+        }
+    }
+
+    /// The exact envelope bytes most recently published through a resumable
+    /// session.
+    pub fn resumable_published_bytes(&self) -> Option<Vec<u8>> {
+        self.state.lock().unwrap().resumable_published.clone()
+    }
+
+    /// Number of resumable sessions that were created.
+    pub fn resumable_session_count(&self) -> usize {
+        self.state.lock().unwrap().resumable_sessions.len()
+    }
+
+    /// Number of resumable create calls (including retries).
+    pub fn resumable_create_calls(&self) -> u64 {
+        self.state.lock().unwrap().resumable_create_calls
+    }
+
+    /// Number of resumable chunk calls (including retries).
+    pub fn resumable_chunk_calls(&self) -> u64 {
+        self.state.lock().unwrap().resumable_chunk_calls
+    }
+
+    /// Number of resumable completion calls (including retries).
+    pub fn resumable_complete_calls(&self) -> u64 {
+        self.state.lock().unwrap().resumable_complete_calls
+    }
+
+    /// Number of resumable abort calls.
+    pub fn resumable_abort_calls(&self) -> u64 {
+        self.state.lock().unwrap().resumable_abort_calls
+    }
+
+    /// The upload ids this relay was asked to abort, in call order.
+    ///
+    /// The count alone cannot tell "aborted the right session exactly once" apart
+    /// from "aborted something twice", which is the invariant a racing
+    /// cancellation must preserve.
+    pub fn resumable_aborted_upload_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().resumable_aborted_upload_ids.clone()
+    }
+
+    /// Current lifecycle state of a resumable session.
+    pub fn resumable_state(&self, upload_id: &str) -> Option<crate::snapshot_upload::UploadState> {
+        self.state.lock().unwrap().resumable_sessions.get(upload_id).map(|session| session.state)
     }
 }
 

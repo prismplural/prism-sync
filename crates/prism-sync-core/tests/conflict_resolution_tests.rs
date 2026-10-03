@@ -1266,16 +1266,16 @@ fn test_tombstoned_entity_rejects_phantom_undelete() {
 #[test]
 fn test_tombstone_absorbs_undelete_in_same_batch() {
     let merge = MergeEngine::new(test_schema());
-    let no_fv = |_: &str, _: &str, _: &str, _: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
-        Ok(None)
-    };
+    let no_fv =
+        |_: &str, _: &str, _: &str, _: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+            Ok(None)
+        };
 
     // delete first, then a FRESHER (higher-HLC) un-delete in the same batch.
     let del = make_op("t-x", "is_deleted", "true", &Hlc::new(200, 0, "d"), "d", None);
     let undel = make_op("t-x", "is_deleted", "false", &Hlc::new(300, 0, "d"), "d", None);
-    let winners = merge
-        .determine_winners(&[del.clone(), undel], &no_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&[del.clone(), undel], &no_fv, &no_ops_applied, SYNC_ID).unwrap();
     assert_eq!(winners.len(), 1, "exactly one is_deleted winner");
     let w = winners.values().next().unwrap();
     assert_eq!(w.op.encoded_value, "true", "delete absorbs a fresher in-batch un-delete");
@@ -1287,15 +1287,15 @@ fn test_tombstone_absorbs_undelete_in_same_batch() {
 #[test]
 fn test_tombstone_absorbs_reordered_undelete_in_same_batch() {
     let merge = MergeEngine::new(test_schema());
-    let no_fv = |_: &str, _: &str, _: &str, _: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
-        Ok(None)
-    };
+    let no_fv =
+        |_: &str, _: &str, _: &str, _: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+            Ok(None)
+        };
 
     let undel = make_op("t-y", "is_deleted", "false", &Hlc::new(300, 0, "d"), "d", None); // higher HLC, first
     let del = make_op("t-y", "is_deleted", "true", &Hlc::new(200, 0, "d"), "d", None); // lower HLC, second
-    let winners = merge
-        .determine_winners(&[undel, del.clone()], &no_fv, &no_ops_applied, SYNC_ID)
-        .unwrap();
+    let winners =
+        merge.determine_winners(&[undel, del.clone()], &no_fv, &no_ops_applied, SYNC_ID).unwrap();
     assert_eq!(winners.len(), 1);
     let w = winners.values().next().unwrap();
     assert_eq!(
@@ -1310,23 +1310,24 @@ fn test_tombstone_absorbs_reordered_undelete_in_same_batch() {
 #[test]
 fn test_malformed_is_deleted_cannot_resurrect_tombstone() {
     let merge = MergeEngine::new(test_schema());
-    let tomb_fv = |_: &str, _: &str, _: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
-        if field == "is_deleted" {
-            Ok(Some(FieldVersion {
-                sync_id: SYNC_ID.to_string(),
-                entity_table: "tasks".to_string(),
-                entity_id: "t-z".to_string(),
-                field_name: "is_deleted".to_string(),
-                winning_op_id: "del-op".to_string(),
-                winning_device_id: "d".to_string(),
-                winning_hlc: Hlc::new(100, 0, "d").to_string(),
-                winning_encoded_value: Some("true".to_string()),
-                updated_at: chrono::Utc::now(),
-            }))
-        } else {
-            Ok(None)
-        }
-    };
+    let tomb_fv =
+        |_: &str, _: &str, _: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+            if field == "is_deleted" {
+                Ok(Some(FieldVersion {
+                    sync_id: SYNC_ID.to_string(),
+                    entity_table: "tasks".to_string(),
+                    entity_id: "t-z".to_string(),
+                    field_name: "is_deleted".to_string(),
+                    winning_op_id: "del-op".to_string(),
+                    winning_device_id: "d".to_string(),
+                    winning_hlc: Hlc::new(100, 0, "d").to_string(),
+                    winning_encoded_value: Some("true".to_string()),
+                    updated_at: chrono::Utc::now(),
+                }))
+            } else {
+                Ok(None)
+            }
+        };
 
     let garbage = make_op("t-z", "is_deleted", "1", &Hlc::new(9000, 0, "d"), "d", None);
     let winners = merge.determine_winners(&[garbage], &tomb_fv, &no_ops_applied, SYNC_ID).unwrap();
@@ -1339,26 +1340,29 @@ fn test_malformed_is_deleted_cannot_resurrect_tombstone() {
 #[test]
 fn test_lower_hlc_delete_absorbs_persisted_undelete() {
     let merge = MergeEngine::new(test_schema());
-    let live_fv = |_: &str, _: &str, _: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
-        if field == "is_deleted" {
-            Ok(Some(FieldVersion {
-                sync_id: SYNC_ID.to_string(),
-                entity_table: "tasks".to_string(),
-                entity_id: "t-l".to_string(),
-                field_name: "is_deleted".to_string(),
-                winning_op_id: "undel".to_string(),
-                winning_device_id: "d".to_string(),
-                winning_hlc: Hlc::new(9000, 0, "d").to_string(),
-                winning_encoded_value: Some("false".to_string()),
-                updated_at: chrono::Utc::now(),
-            }))
-        } else {
-            Ok(None)
-        }
-    };
+    let live_fv =
+        |_: &str, _: &str, _: &str, field: &str| -> prism_sync_core::Result<Option<FieldVersion>> {
+            if field == "is_deleted" {
+                Ok(Some(FieldVersion {
+                    sync_id: SYNC_ID.to_string(),
+                    entity_table: "tasks".to_string(),
+                    entity_id: "t-l".to_string(),
+                    field_name: "is_deleted".to_string(),
+                    winning_op_id: "undel".to_string(),
+                    winning_device_id: "d".to_string(),
+                    winning_hlc: Hlc::new(9000, 0, "d").to_string(),
+                    winning_encoded_value: Some("false".to_string()),
+                    updated_at: chrono::Utc::now(),
+                }))
+            } else {
+                Ok(None)
+            }
+        };
 
     let del = make_op("t-l", "is_deleted", "true", &Hlc::new(200, 0, "d"), "d", None);
-    let winners = merge.determine_winners(&[del.clone()], &live_fv, &no_ops_applied, SYNC_ID).unwrap();
+    let winners = merge
+        .determine_winners(std::slice::from_ref(&del), &live_fv, &no_ops_applied, SYNC_ID)
+        .unwrap();
     assert_eq!(winners.len(), 1, "a lower-HLC delete absorbs a persisted higher-HLC un-delete");
     assert_eq!(winners.values().next().unwrap().op.encoded_value, "true");
 }
@@ -1451,10 +1455,7 @@ fn fronting_close_converges_over_open_create() {
     let ops = vec![make_fronting_op("sess-1", "end_time", TS_LATE, &close_hlc, "device-b")];
 
     let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
-    assert!(
-        winners.contains_key(&ops[0].op_id),
-        "a later close must win over the open create"
-    );
+    assert!(winners.contains_key(&ops[0].op_id), "a later close must win over the open create");
 }
 
 #[test]
@@ -1468,10 +1469,7 @@ fn fronting_stale_reopen_does_not_revert_close() {
     let ops = vec![make_fronting_op("sess-1", "end_time", "null", &stale_hlc, "device-a")];
 
     let winners = merge.determine_winners(&ops, &get_fv, &no_ops_applied, SYNC_ID).unwrap();
-    assert!(
-        !winners.contains_key(&ops[0].op_id),
-        "a stale reopen must not revert a newer close"
-    );
+    assert!(!winners.contains_key(&ops[0].op_id), "a stale reopen must not revert a newer close");
 }
 
 #[test]
@@ -1506,19 +1504,13 @@ fn fronting_concurrent_closes_resolve_deterministically() {
         &Hlc::new(2000, 0, "device-a"),
         "device-a",
     );
-    let op_b = make_fronting_op(
-        "sess-1",
-        "end_time",
-        TS_LATE,
-        &Hlc::new(2000, 0, "device-b"),
-        "device-b",
-    );
+    let op_b =
+        make_fronting_op("sess-1", "end_time", TS_LATE, &Hlc::new(2000, 0, "device-b"), "device-b");
 
     // Arrival order within the batch must not change the outcome.
     for ops in [vec![op_a.clone(), op_b.clone()], vec![op_b.clone(), op_a.clone()]] {
-        let winners = merge
-            .determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID)
-            .unwrap();
+        let winners =
+            merge.determine_winners(&ops, &no_field_versions, &no_ops_applied, SYNC_ID).unwrap();
         assert!(winners.contains_key(&op_b.op_id), "device-b's close wins deterministically");
         assert!(!winners.contains_key(&op_a.op_id), "the losing close is not a winner");
     }

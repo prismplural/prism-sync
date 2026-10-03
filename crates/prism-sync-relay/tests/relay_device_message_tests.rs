@@ -2,8 +2,8 @@
 
 mod common;
 
-use common::*;
 use base64::Engine;
+use common::*;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -143,7 +143,8 @@ async fn targeted_message_only_to_recipient() {
     let (t2, k2, id2) = &dev[1];
     let (t3, k3, id3) = &dev[2];
 
-    let resp = send(&client, &url, t1, k1, &sync_id, id1, &mid("b1"), Some(id2.as_str()), b"x").await;
+    let resp =
+        send(&client, &url, t1, k1, &sync_id, id1, &mid("b1"), Some(id2.as_str()), b"x").await;
     assert_eq!(resp.status(), 201);
 
     assert_eq!(message_ids(&pending(&client, &url, t2, k2, &sync_id, id2).await), vec![mid("b1")]);
@@ -179,9 +180,15 @@ async fn duplicate_message_id_coalesces() {
     let (t1, k1, id1) = &dev[0];
     let (t2, k2, id2) = &dev[1];
 
-    assert_eq!(send(&client, &url, t1, k1, &sync_id, id1, &mid("d1"), None, b"x").await.status(), 201);
+    assert_eq!(
+        send(&client, &url, t1, k1, &sync_id, id1, &mid("d1"), None, b"x").await.status(),
+        201
+    );
     // Re-send same id → coalesced, still a success, only one delivered.
-    assert_eq!(send(&client, &url, t1, k1, &sync_id, id1, &mid("d1"), None, b"x").await.status(), 201);
+    assert_eq!(
+        send(&client, &url, t1, k1, &sync_id, id1, &mid("d1"), None, b"x").await.status(),
+        201
+    );
     assert_eq!(pending(&client, &url, t2, k2, &sync_id, id2).await.len(), 1);
 }
 
@@ -197,8 +204,14 @@ async fn pending_cap_rejects_when_exceeded() {
     let id1 = generate_device_id();
     let (t1, k1) = prepare_device(&db, &sync_id, &id1).await;
 
-    assert_eq!(send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("a"), None, b"x").await.status(), 201);
-    assert_eq!(send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("b"), None, b"x").await.status(), 201);
+    assert_eq!(
+        send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("a"), None, b"x").await.status(),
+        201
+    );
+    assert_eq!(
+        send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("b"), None, b"x").await.status(),
+        201
+    );
     assert_eq!(
         send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("c"), None, b"x").await.status(),
         429,
@@ -218,8 +231,14 @@ async fn send_rate_limited_per_device() {
     let id1 = generate_device_id();
     let (t1, k1) = prepare_device(&db, &sync_id, &id1).await;
 
-    assert_eq!(send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("a"), None, b"x").await.status(), 201);
-    assert_eq!(send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("b"), None, b"x").await.status(), 201);
+    assert_eq!(
+        send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("a"), None, b"x").await.status(),
+        201
+    );
+    assert_eq!(
+        send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("b"), None, b"x").await.status(),
+        201
+    );
     assert_eq!(
         send(&client, &url, &t1, &k1, &sync_id, &id1, &mid("c"), None, b"x").await.status(),
         429,

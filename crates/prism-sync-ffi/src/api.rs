@@ -19,19 +19,23 @@ use prism_sync_core::bootstrap::{
 use prism_sync_core::client::PrismSync;
 use prism_sync_core::pairing::service::PairingService;
 use prism_sync_core::pairing::{
-    compute_epoch_key_hash, RegistrySnapshotEntry, SignedRegistrySnapshot,
+    compute_epoch_key_hash, LeasePollBackoff, PairingLeaseHandle, RegistrySnapshotEntry,
+    SignedRegistrySnapshot, UploadProgressLeaseRenewer,
 };
 use prism_sync_core::relay::traits::{FirstDeviceAdmissionProof, RegistrationNonceResponse};
-use prism_sync_core::relay::PairingRelay as _;
+use prism_sync_core::relay::PairingRelay;
 use prism_sync_core::relay::ServerPairingRelay;
 use prism_sync_core::relay::{ServerRelay, ServerSharingRelay};
+use prism_sync_core::snapshot_upload::{
+    ResumableSnapshotTransport, SnapshotUploadProgressHook as PrismSnapshotUploadProgressHook,
+};
 // Import the trait for method resolution only — NOT exposed in any public FFI signature.
 use prism_sync_core::relay::SharingRelay as _;
 use prism_sync_core::relay::{DeviceRegistry, MediaRelay, SyncRelay};
 use prism_sync_core::schema::{parse_datetime_utc, SyncSchema, SyncType, SyncValue};
 use prism_sync_core::storage::{
-    is_tombstone_value, ConsumerDelivery, FieldVersion, RusqliteSyncStorage,
-    SyncMetadata, SyncStorage,
+    is_tombstone_value, ConsumerDelivery, FieldVersion, RusqliteSyncStorage, SyncMetadata,
+    SyncStorage,
 };
 use prism_sync_core::sync_service::AutoSyncConfig;
 use prism_sync_core::{
@@ -256,6 +260,27 @@ pub struct PrismSyncHandle {
     joiner_ceremony: std::sync::Mutex<Option<JoinerCeremony>>,
     /// In-progress initiator ceremony state (relay-based PQ pairing).
     initiator_ceremony: std::sync::Mutex<Option<InitiatorCeremony>>,
+    /// Initiated pairing ceremony whose joiner confirmation has already been
+    /// verified, waiting for the snapshot upload to succeed before credentials
+    /// may be released.
+    ///
+    /// Present only between [`verify_initiator_confirmation_resumable`] and
+    /// [`complete_initiator_resumable_ceremony`] (or cancellation). Holding the
+    /// verified state here is what makes the credential gate structural: the
+    /// release half refuses to run unless the upload half recorded success, so
+    /// no caller can publish credentials before the snapshot is durable.
+    ///
+    /// `Arc`-shared so the cancellation half can take the same slot while the
+    /// upload half runs inline on its caller's task, and so the retained verified
+    /// state outlives the enclosing `&PrismSyncHandle` borrow that the upload call
+    /// site holds.
+    initiator_verified: Arc<std::sync::Mutex<Option<InitiatorVerifiedSlot>>>,
+    /// The resumable session a cancellation must abort, if any.
+    ///
+    /// Kept separate from the verified ceremony slot so the upload task can
+    /// record the relay's session id without holding the ceremony lock, and so a
+    /// cancellation can read it without waiting on the same mutex.
+    active_upload: Arc<std::sync::Mutex<Option<ActiveUpload>>>,
 }
 
 impl std::fmt::Debug for PrismSyncHandle {
@@ -1480,12 +1505,19 @@ fn guard_ceremony_in_progress(
 ) -> Result<(), String> {
     let initiator_present = lock_or_recover(&handle.initiator_ceremony).is_some();
     let joiner_present = lock_or_recover(&handle.joiner_ceremony).is_some();
+    let verified_present = lock_or_recover(&handle.initiator_verified).is_some();
     match kind {
         CeremonyGuardKind::StartInitiator => {
             if initiator_present {
                 return Err(format!(
                     "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is already in progress; \
                      complete or abandon the existing one before starting a new one"
+                ));
+            }
+            if verified_present {
+                return Err(format!(
+                    "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is awaiting its snapshot \
+                     upload; complete, cancel, or abandon it before starting a new one"
                 ));
             }
             if joiner_present {
@@ -1502,7 +1534,7 @@ fn guard_ceremony_in_progress(
                      complete or abandon the existing one before starting a new one"
                 ));
             }
-            if initiator_present {
+            if initiator_present || verified_present {
                 return Err(format!(
                     "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is in progress; \
                      cannot start a joiner ceremony on the same handle"
@@ -1518,7 +1550,7 @@ fn guard_ceremony_in_progress(
             }
         }
         CeremonyGuardKind::CompleteJoiner => {
-            if initiator_present {
+            if initiator_present || verified_present {
                 return Err(format!(
                     "{CEREMONY_IN_PROGRESS_PREFIX}: an initiator ceremony is in progress; \
                      cannot complete a joiner ceremony on the same handle"
@@ -1629,6 +1661,8 @@ pub fn create_prism_sync(
         backoff_handle: Arc::new(std::sync::Mutex::new(None)),
         joiner_ceremony: std::sync::Mutex::new(None),
         initiator_ceremony: std::sync::Mutex::new(None),
+        initiator_verified: Arc::new(std::sync::Mutex::new(None)),
+        active_upload: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -1998,13 +2032,7 @@ pub async fn configure_engine(handle: &PrismSyncHandle) -> Result<(), String> {
 
     // Subscribe before connecting so initial notifications cannot be missed.
     let relay_for_auto_sync: Arc<dyn prism_sync_core::relay::SyncRelay> = relay.clone();
-    apply_auto_sync_config(
-        handle,
-        auto_sync_config,
-        Some(relay_for_auto_sync),
-        true,
-    )
-    .await?;
+    apply_auto_sync_config(handle, auto_sync_config, Some(relay_for_auto_sync), true).await?;
 
     // Connect WebSocket for real-time relay notifications (best-effort;
     // connect() spawns a background reconnect loop and never blocks).
@@ -3165,10 +3193,7 @@ fn hydrate_consumer_deliveries(
     let mut deliveries = coalesce_consumer_deliveries(rows);
     let mut winners: HashMap<(&str, &str), Vec<&FieldVersion>> = HashMap::new();
     for version in current {
-        winners
-            .entry((&version.entity_table, &version.entity_id))
-            .or_default()
-            .push(version);
+        winners.entry((&version.entity_table, &version.entity_id)).or_default().push(version);
     }
     for delivery in &mut deliveries {
         let table = delivery["table"].as_str().map(str::to_owned);
@@ -3184,9 +3209,7 @@ fn hydrate_consumer_deliveries(
             delivery["fields"] = serde_json::json!({});
             continue;
         }
-        let fields = delivery["fields"]
-            .as_object_mut()
-            .expect("delivery fields object");
+        let fields = delivery["fields"].as_object_mut().expect("delivery fields object");
         fields.clear();
         for version in versions {
             if version.field_name != "is_deleted" {
@@ -3256,9 +3279,8 @@ pub async fn take_undelivered_changes(
             return Ok::<_, String>(empty_undelivered_changes_json());
         }
 
-        let page = storage
-            .read_consumer_delivery_page(&sync_id, 0, limit)
-            .map_err(|e| e.to_string())?;
+        let page =
+            storage.read_consumer_delivery_page(&sync_id, 0, limit).map_err(|e| e.to_string())?;
         let rows = page.rows;
         if rows.is_empty() {
             return Ok(empty_undelivered_changes_json());
@@ -3270,10 +3292,7 @@ pub async fn take_undelivered_changes(
             consumer_delivery_spill_threshold(&rows, total, CONSUMER_DELIVERY_JOURNAL_CAP);
 
         let max_id = rows.iter().map(|r| r.id).max().unwrap_or(0);
-        let deliveries = hydrate_consumer_deliveries(
-            &rows,
-            &page.current_field_versions,
-        );
+        let deliveries = hydrate_consumer_deliveries(&rows, &page.current_field_versions);
 
         let json = serde_json::json!({
             "deliveries": deliveries,
@@ -5050,7 +5069,7 @@ pub fn decrypt_xchacha(key: Vec<u8>, ciphertext: Vec<u8>) -> Result<Vec<u8>, Str
     prism_sync_crypto::aead::xchacha_decrypt(&key, &ciphertext).map_err(|e| e.to_string())
 }
 
-/// Generate cryptographically secure random bytes.
+/// Cryptographically secure random bytes.
 pub fn random_bytes(len: u32) -> Vec<u8> {
     prism_sync_crypto::random_bytes(len as usize)
 }
@@ -5156,6 +5175,26 @@ pub async fn start_joiner_ceremony(handle: &PrismSyncHandle) -> Result<String, S
 pub async fn cancel_pairing_ceremony(handle: &PrismSyncHandle) -> Result<(), String> {
     let mut rendezvous_ids = Vec::new();
 
+    // A verified-but-unfinished split ceremony owns a resumable upload session.
+    // Take the run state here so cancellation can best-effort abort that exact
+    // session: a local cancel must not leave a reservation behind until
+    // relay-side expiry. Dropping the verified slot also zeroizes the retained
+    // lease secret.
+    let pending_upload = lock_or_recover(&handle.initiator_verified).take();
+    let abort_target = pending_upload.as_ref().and_then(|slot| {
+        if !should_abort_upload(slot.upload_completed.load(std::sync::atomic::Ordering::Acquire)) {
+            // A published snapshot must never be aborted. Its session is already
+            // terminal on the relay, so there is nothing to clean up.
+            return None;
+        }
+        lock_or_recover(&handle.active_upload).as_ref().map(|active| {
+            (active.relay_url.clone(), Arc::clone(&active.cell), Arc::clone(&active.transport))
+        })
+    });
+
+    // Take the engine lock LAST. Cancellation must issue its resource cleanup
+    // even while a snapshot upload still holds that lock, so the abort below
+    // runs first and never waits behind a multi-minute transfer.
     if let Some(ceremony) = handle
         .joiner_ceremony
         .lock()
@@ -5176,6 +5215,19 @@ pub async fn cancel_pairing_ceremony(handle: &PrismSyncHandle) -> Result<(), Str
 
     rendezvous_ids.sort();
     rendezvous_ids.dedup();
+
+    if let Some((relay_url, cell, transport)) = abort_target {
+        // Clear the slot first so a concurrent cancellation cannot abort twice.
+        lock_or_recover(&handle.active_upload).take();
+        let upload_id = lock_or_recover(&cell.upload_id).clone();
+        if upload_id.is_empty() {
+            tracing::debug!(
+                "[prism_sync_ffi] pairing cancel: resumable session not created yet; nothing to abort"
+            );
+        } else {
+            abort_resumable_upload_best_effort(&relay_url, transport.as_ref(), &upload_id).await;
+        }
+    }
 
     {
         let inner = handle.inner.lock().await;
@@ -5224,6 +5276,61 @@ pub async fn cancel_pairing_ceremony(handle: &PrismSyncHandle) -> Result<(), Str
     }
 
     Ok(())
+}
+
+/// Best-effort abort of one resumable snapshot session.
+///
+/// Every failure is swallowed and logged at debug: the relay's independent
+/// session expiry reclaims a lost abort, and a cancel or ceremony failure must
+/// never be replaced by an abort error. A completed session is never aborted —
+/// the caller checks `upload_completed` before reaching here.
+async fn abort_resumable_upload_best_effort(
+    relay_url: &str,
+    transport: &dyn SyncRelay,
+    upload_id: &str,
+) {
+    // The relay URL is recorded with the abort target for diagnostics only; the
+    // transport is already resolved, so this never waits on the engine mutex an
+    // in-flight upload holds.
+    let _ = relay_url;
+
+    // The relay is a `SyncRelay`; the resumable routes live on the
+    // `ResumableSnapshotTransport` view of the same object, which is `None` only
+    // for a transport that does not implement them (nothing to abort).
+    let Some(resumable) = transport.as_resumable_transport() else {
+        tracing::debug!(
+            upload_hash = %upload_id_hash_for_log(upload_id),
+            "[prism_sync_ffi] skipping best-effort upload abort: transport has no resumable routes"
+        );
+        return;
+    };
+
+    // The core helper swallows its own errors and records nothing sensitive;
+    // bounding it here keeps a hung relay from stalling cancellation.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(FFI_UPLOAD_ABORT_TIMEOUT_SECS),
+        prism_sync_core::snapshot_upload::abort_upload_best_effort(resumable, upload_id),
+    )
+    .await
+    {
+        Ok(()) => tracing::debug!(
+            upload_hash = %upload_id_hash_for_log(upload_id),
+            "[prism_sync_ffi] best-effort upload abort completed"
+        ),
+        Err(_) => tracing::debug!(
+            upload_hash = %upload_id_hash_for_log(upload_id),
+            "[prism_sync_ffi] best-effort upload abort timed out"
+        ),
+    }
+}
+
+/// Short, non-reversible session tag for logs.
+///
+/// A full upload id is an identifier the spec says never to log; the short hash
+/// is enough to correlate one session's log lines without being usable as one.
+fn upload_id_hash_for_log(upload_id: &str) -> String {
+    let digest = Sha256::digest(upload_id.as_bytes());
+    hex::encode(&digest[..6])
 }
 
 /// Wait for the initiator's PairingInit and return the SAS display codes.
@@ -5663,13 +5770,37 @@ pub async fn complete_initiator_ceremony(
         }
     };
 
+    finalize_initiator_completion(
+        handle,
+        storage.clone(),
+        &sync_id,
+        &device_id,
+        published_registry_version,
+    )
+    .await?;
+
+    Ok("ok".to_string())
+}
+
+/// Post-credential finalization shared by both initiator ceremony shapes.
+///
+/// Runs after credentials have been released: ratchets this long-lived
+/// inviter's registry freshness baseline, then aligns the live client with the
+/// post-rekey epoch.
+async fn finalize_initiator_completion(
+    handle: &PrismSyncHandle,
+    storage: Arc<dyn SyncStorage>,
+    sync_id: &str,
+    device_id: &str,
+    published_registry_version: i64,
+) -> Result<(), String> {
     // Ratchet this (long-lived inviter) device's freshness baseline to the
     // registry version it just published during the ceremony — the
     // PairingService has no storage handle, so the ratchet happens here. The
     // pairing already committed, so a ratchet failure is logged, not fatal.
     {
         let storage = storage.clone();
-        let sid = sync_id.clone();
+        let sid = sync_id.to_string();
         if let Err(e) = tokio::task::spawn_blocking(move || {
             prism_sync_core::registry_publish::ratchet_last_imported_registry_version(
                 storage.as_ref(),
@@ -5699,63 +5830,61 @@ pub async fn complete_initiator_ceremony(
     // snapshot is encrypted with the old one, and bootstrap_from_snapshot fails.
     // Mirror what commit_epoch_rotation does: load the new epoch key into the
     // live key hierarchy, update sync_metadata, and advance the runtime epoch.
-    {
-        let mut inner = handle.inner.lock().await;
-        let secure_store = inner.secure_store().clone();
+    let mut inner = handle.inner.lock().await;
+    let secure_store = inner.secure_store().clone();
 
-        let new_epoch_str = secure_store
-            .get("epoch")
-            .map_err(|e| format!("read epoch after pairing: {e}"))?
-            .and_then(|b| String::from_utf8(b).ok())
-            .ok_or_else(|| "epoch missing from secure store after pairing".to_string())?;
-        let new_epoch: u32 =
-            new_epoch_str.parse().map_err(|e| format!("invalid epoch in secure store: {e}"))?;
+    let new_epoch_str = secure_store
+        .get("epoch")
+        .map_err(|e| format!("read epoch after pairing: {e}"))?
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or_else(|| "epoch missing from secure store after pairing".to_string())?;
+    let new_epoch: u32 =
+        new_epoch_str.parse().map_err(|e| format!("invalid epoch in secure store: {e}"))?;
 
-        let current_client_epoch = inner.epoch().unwrap_or(0);
-        if (new_epoch as i32) > current_client_epoch {
-            // Load the rekey epoch key from secure_store into the live key
-            // hierarchy. The pairing service base64-encodes it (see
-            // pairing/service.rs post_rekey path); fall back to raw bytes to
-            // match the tolerant decode in restore_runtime_keys.
-            let key_name = format!("epoch_key_{new_epoch}");
-            if let Some(stored_bytes) =
-                secure_store.get(&key_name).map_err(|e| format!("read {key_name}: {e}"))?
-            {
-                let key_bytes = if let Ok(decoded) = BASE64.decode(&stored_bytes) {
-                    if decoded.len() == 32 {
-                        decoded
-                    } else {
-                        stored_bytes
-                    }
+    let current_client_epoch = inner.epoch().unwrap_or(0);
+    if (new_epoch as i32) > current_client_epoch {
+        // Load the rekey epoch key from secure_store into the live key
+        // hierarchy. The pairing service base64-encodes it (see
+        // pairing/service.rs post_rekey path); fall back to raw bytes to
+        // match the tolerant decode in restore_runtime_keys.
+        let key_name = format!("epoch_key_{new_epoch}");
+        if let Some(stored_bytes) =
+            secure_store.get(&key_name).map_err(|e| format!("read {key_name}: {e}"))?
+        {
+            let key_bytes = if let Ok(decoded) = BASE64.decode(&stored_bytes) {
+                if decoded.len() == 32 {
+                    decoded
                 } else {
                     stored_bytes
-                };
-                if key_bytes.len() != 32 {
-                    return Err(format!(
-                        "{key_name} has wrong length ({}, expected 32)",
-                        key_bytes.len()
-                    ));
                 }
-                inner
-                    .key_hierarchy_mut()
-                    .store_epoch_key(new_epoch, zeroize::Zeroizing::new(key_bytes));
             } else {
-                return Err(format!("{key_name} missing from secure store after post_rekey"));
+                stored_bytes
+            };
+            if key_bytes.len() != 32 {
+                return Err(format!(
+                    "{key_name} has wrong length ({}, expected 32)",
+                    key_bytes.len()
+                ));
             }
-
-            // Update sync_metadata.current_epoch so configure_engine on the
-            // next launch reads the same epoch we're advancing to. Without
-            // this, restart drops self.epoch back to the pre-rekey value
-            // (configure_engine prefers sync_metadata over secure_store).
-            let ne = new_epoch as i32;
-            ensure_local_sync_metadata(inner.storage().as_ref(), &sync_id, &device_id, ne)
-                .map_err(|e| format!("update sync_metadata.current_epoch: {e}"))?;
-
-            inner.advance_epoch(new_epoch as i32);
+            inner
+                .key_hierarchy_mut()
+                .store_epoch_key(new_epoch, zeroize::Zeroizing::new(key_bytes));
+        } else {
+            return Err(format!("{key_name} missing from secure store after post_rekey"));
         }
+
+        // Update sync_metadata.current_epoch so configure_engine on the
+        // next launch reads the same epoch we're advancing to. Without
+        // this, restart drops self.epoch back to the pre-rekey value
+        // (configure_engine prefers sync_metadata over secure_store).
+        let ne = new_epoch as i32;
+        ensure_local_sync_metadata(inner.storage().as_ref(), sync_id, device_id, ne)
+            .map_err(|e| format!("update sync_metadata.current_epoch: {e}"))?;
+
+        inner.advance_epoch(new_epoch as i32);
     }
 
-    Ok("ok".to_string())
+    Ok(())
 }
 
 /// Poll a pairing relay slot with exponential backoff (~60s budget).
@@ -5795,6 +5924,692 @@ async fn poll_pairing_slot(
         }
     }
     Err(format!("timeout waiting for pairing slot {slot:?}"))
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Resumable pairing snapshot upload (split initiator ceremony)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Upper bound on the resumable phase, used ONLY when the ceremony did not
+/// negotiate a pairing lease.
+///
+/// This mirrors the core's legacy slot-wait budget and the pre-existing
+/// wrapper deadlines (the joiner's ~60 s `poll_pairing_slot` and the relay
+/// client's per-request timeouts). A lease-capable ceremony is never bounded by
+/// it: there the core's own absolute-cap-aware wait owns the timing, so this
+/// wrapper only exists to keep cancellation from hanging forever on a relay that
+/// accepted a connection and stopped responding.
+const FFI_RESUMABLE_LEGACY_BUDGET_SECS: u64 = 300;
+
+/// Upper bound on one best-effort abort. Short by design: an abort that cannot
+/// be delivered is reclaimed by the relay's independent session expiry, so it
+/// must never delay a user-visible cancellation.
+const FFI_UPLOAD_ABORT_TIMEOUT_SECS: u64 = 10;
+
+/// Default snapshot TTL for the resumable ceremony, matching the app's existing
+/// 24-hour pairing-snapshot request.
+const FFI_RESUMABLE_DEFAULT_TTL_SECS: u64 = 86_400;
+
+/// Retained ceremony state for an initiator whose joiner confirmation has been
+/// verified, waiting for the snapshot upload to succeed before credentials may
+/// be released.
+///
+/// Dropping this slot zeroizes the negotiated pairing-lease secret, which is the
+/// point: the secret lives only for the duration of one ceremony and is never
+/// persisted.
+struct InitiatorVerifiedSlot {
+    ceremony: InitiatorCeremony,
+    /// The opaque lease handle. Held behind its own lock so the upload half can
+    /// take it for the duration of the transfer and put it back afterwards.
+    lease: Arc<std::sync::Mutex<Option<PairingLeaseHandle>>>,
+    /// The ceremony's joiner, i.e. the upload's target audience.
+    target_device_id: String,
+    /// Set only after the upload half observed a successful publication. The
+    /// credential-release half refuses to run until this is true, which makes the
+    /// required ordering structural rather than a caller convention.
+    upload_completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Mutable state of one resumable upload half.
+///
+/// The session id is published to a shared cell as soon as the relay creates the
+/// session, so a cancellation can abort exactly that session. The id is not a
+/// bearer capability: every resumable operation still requires the owning
+/// device's session token and hybrid signature.
+struct UploadSessionCell {
+    upload_id: std::sync::Mutex<String>,
+}
+
+impl UploadSessionCell {
+    fn new() -> Self {
+        Self { upload_id: std::sync::Mutex::new(String::new()) }
+    }
+}
+
+/// A resumable session a cancellation must abort.
+struct ActiveUpload {
+    relay_url: String,
+    /// Upload id cell shared with the in-flight upload.
+    cell: Arc<UploadSessionCell>,
+    /// The relay the session lives on, captured before the upload starts.
+    ///
+    /// Held as a ready transport so cancellation never has to take the engine
+    /// mutex, which an in-flight upload holds for its whole duration. A
+    /// cancellation must be able to issue its abort immediately, not queue
+    /// behind a multi-minute transfer.
+    transport: Arc<dyn SyncRelay>,
+}
+
+/// How the snapshot reached the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotTransportUsed {
+    /// Resumable v1 chunks; the session id is reported in `upload_id`.
+    Resumable,
+    /// The relay did not advertise resumable support and the unchanged single
+    /// `PUT` published the snapshot. A downgrade, not an error.
+    SinglePut,
+}
+
+/// Result of [`upload_pairing_snapshot_resumable`].
+///
+/// Carries the terminal byte counts rather than a progress callback: a
+/// Rust-to-Dart callback is not expressible in `flutter_rust_bridge` without a
+/// globally registered port, so progress is reported through the existing
+/// `SyncEvent::SnapshotUploadProgress` stream and this result reports where the
+/// transfer ended. No unsafe global callback is introduced.
+///
+/// `Debug` is safe here: this struct holds no key material, only a session
+/// identifier that is not a bearer capability.
+#[derive(Debug, Clone)]
+pub struct ResumableSnapshotUploadResult {
+    /// Which transport published the snapshot.
+    pub transport: SnapshotTransportUsed,
+    /// Relay-generated resumable session id (empty when `transport` is
+    /// `SinglePut`).
+    pub upload_id: String,
+    /// Bytes the relay acknowledged as durably committed.
+    pub committed_bytes: i64,
+    /// Total envelope bytes.
+    pub total_bytes: i64,
+    /// Whether the ceremony negotiated the opaque pairing lease (v1).
+    pub lease_active: bool,
+    /// Whether the relay confirmed at least one lease extension.
+    pub lease_renewed: bool,
+}
+
+/// Result of [`complete_initiator_resumable_ceremony`].
+///
+/// `Debug` is safe here: no key material and no session identifiers, only the
+/// lease booleans and already-redacted failure text.
+#[derive(Debug, Clone)]
+pub struct ResumableCeremonyCompletion {
+    /// Whether the ceremony completed and credentials were released.
+    pub completed: bool,
+    /// Whether the ceremony negotiated the opaque pairing lease (v1).
+    pub lease_active: bool,
+    /// Whether the relay confirmed at least one lease extension during this
+    /// ceremony. `false` with `lease_active == true` means every renewal attempt
+    /// failed; the ceremony continued under its previously established expiry,
+    /// which is the specified nonfatal behavior.
+    pub lease_renewed: bool,
+    /// `true` when the ceremony could renew at all.
+    pub lease_capable: bool,
+    /// Redacted failure text when `completed` is false.
+    pub error: Option<String>,
+}
+
+/// Whether the relay advertises resumable snapshot upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotUploadCapabilityState {
+    /// Resumable v1 is advertised; the resumable path will be used.
+    Available,
+    /// Not advertised, or the capability lookup failed. The unchanged single
+    /// `PUT` path is used; this is a downgrade, not an error.
+    Unavailable,
+    /// The engine is not configured, so the transport cannot be inspected.
+    EngineUnconfigured,
+}
+
+/// Resumable snapshot capability as seen by this device.
+pub struct SnapshotUploadCapabilityInfo {
+    /// Availability state.
+    pub state: SnapshotUploadCapabilityState,
+    /// Protocol version (0 when unavailable).
+    pub version: i64,
+    /// Server-selected chunk size in bytes (0 when unavailable).
+    pub chunk_bytes: i64,
+    /// Maximum accepted envelope size in bytes (0 when unavailable).
+    pub max_wire_bytes: i64,
+    /// Bounded machine reason for unavailability, for logs/tests.
+    pub reason: Option<String>,
+}
+
+/// Build a transport for the resumable routes from a live engine.
+///
+/// The returned relay is the same object the engine talks to, so the resumable
+/// capability lookup and best-effort abort reuse the existing bearer-token and
+/// hybrid request-signing path.
+async fn build_resumable_transport(handle: &PrismSyncHandle) -> Result<Arc<dyn SyncRelay>, String> {
+    let relay = {
+        let inner = handle.inner.lock().await;
+        inner
+            .sync_service()
+            .relay()
+            .cloned()
+            .ok_or_else(|| "sync engine not configured".to_string())?
+    };
+    Ok(relay)
+}
+
+/// Progress/lease hook for one resumable upload half.
+///
+/// Composes the retained `PairingLeaseHandle` with
+/// [`UploadProgressLeaseRenewer`], so the uploader's single progress signal does
+/// two jobs that must not be conflated: it records the app-visible byte count,
+/// and it may earn a **coalesced, nonfatal** lease renewal once the relay has
+/// acknowledged a strictly larger committed offset. Status polls, duplicate
+/// acknowledgments, and retries that advanced nothing therefore renew nothing,
+/// and the relay never learns what progressed.
+///
+/// The renewer is constructed per call because it borrows the handle mutably;
+/// that keeps the borrow inside this hook and prevents any second borrow of the
+/// lease secret.
+struct FfiLeaseUploadHook<'a> {
+    handle: &'a mut PairingLeaseHandle,
+    pairing_relay: &'a dyn PairingRelay,
+    session: Arc<UploadSessionCell>,
+    offset_cell: Arc<std::sync::atomic::AtomicU64>,
+    lease_renewed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl PrismSnapshotUploadProgressHook for FfiLeaseUploadHook<'_> {
+    async fn on_session_created(&mut self, upload_id: &str) {
+        // Publish the session id immediately so a concurrent cancellation can
+        // abort exactly this session even though the upload future is still
+        // running.
+        *lock_or_recover(&self.session.upload_id) = upload_id.to_string();
+    }
+
+    async fn on_committed_offset_advanced(&mut self, committed_offset: u64) {
+        self.offset_cell.store(committed_offset, std::sync::atomic::Ordering::Release);
+        let mut renewer = UploadProgressLeaseRenewer::new(self.handle, self.pairing_relay);
+        renewer.on_committed_offset_advanced(committed_offset).await;
+        self.lease_renewed
+            .store(renewer.last_outcome().is_renewed(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Lease flags for a handle: `(capable, renewed, terminal)`.
+fn lease_flags(handle: &PairingLeaseHandle) -> (bool, bool, bool) {
+    (handle.is_lease_capable(), handle.last_outcome().is_renewed(), handle.is_terminal())
+}
+
+/// The credential-release gate, as a pure function.
+///
+/// Split-ceremony credentials may be released only when both halves exist: a
+/// verified ceremony that has already observed a durable snapshot publication.
+/// Encoding it here keeps the FFI entry point and its test on the same rule.
+fn credential_release_gate(
+    has_verified_ceremony: bool,
+    upload_completed: bool,
+) -> Result<(), String> {
+    if !has_verified_ceremony {
+        return Err(
+            "no verified initiator ceremony — call verify_initiator_confirmation_resumable first"
+                .to_string(),
+        );
+    }
+    if !upload_completed {
+        return Err("snapshot upload must succeed before credentials may be released; call \
+             upload_pairing_snapshot_resumable first"
+            .to_string());
+    }
+    Ok(())
+}
+
+/// Whether a cancelled ceremony should abort its resumable session.
+///
+/// A completed upload is never aborted: its session is already terminal on the
+/// relay and the published snapshot must stand.
+fn should_abort_upload(upload_completed: bool) -> bool {
+    !upload_completed
+}
+
+/// The fixed wall-clock budget the FFI may impose on the resumable phase.
+///
+/// `None` for a lease-capable ceremony: the lease absolute cap is enforced by
+/// core's own waits, and any fixed wrapper here would preempt a lease-aware core
+/// wait. `Some` only for a legacy fixed-TTL ceremony, where there is no lease to
+/// preempt and the pre-existing bounded deadline is retained.
+fn resumable_legacy_budget(lease_capable: bool) -> Option<std::time::Duration> {
+    if lease_capable {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(FFI_RESUMABLE_LEGACY_BUDGET_SECS))
+    }
+}
+
+/// Verify the joiner's confirmation and retain resumable ceremony state.
+///
+/// **Step 1** of the split initiator ceremony. Waits for the joiner's protected
+/// confirmation, verifies it, retains the opaque ceremony state and the
+/// pairing-lease handle, and performs the initial lease renewal when lease v1 was
+/// negotiated. Credentials are **not** released here — that needs
+/// [`complete_initiator_resumable_ceremony`], which refuses until the snapshot is
+/// durably published.
+///
+/// The wait is owned by core: a lease-capable ceremony may wait through the
+/// four-hour absolute cap with bounded exponential backoff, and a legacy ceremony
+/// keeps the existing fixed deadline. There is deliberately no FFI-side timeout
+/// here, because any fixed wrapper deadline would preempt the lease-aware core
+/// wait.
+///
+/// Returns `lease_active == true` when all three parties negotiated lease v1.
+pub async fn verify_initiator_confirmation_resumable(
+    handle: &PrismSyncHandle,
+) -> Result<bool, String> {
+    ensure_handle_supports_signature_version_floor(handle).await?;
+
+    let ceremony = handle
+        .initiator_ceremony
+        .lock()
+        .map_err(|e| format!("failed to lock initiator_ceremony: {e}"))?
+        .take()
+        .ok_or_else(|| {
+            "no initiator ceremony in progress — call start_initiator_ceremony first".to_string()
+        })?;
+
+    let pairing_relay = build_pairing_relay(handle)?;
+    let pairing = {
+        let inner = handle.inner.lock().await;
+        PairingService::new(inner.secure_store().clone())
+    };
+
+    // A lease-capable ceremony waits through the core's absolute cap; a legacy
+    // one keeps the core's fixed deadline. The selector is the ceremony's
+    // authenticated negotiation, never bare relay metadata.
+    let lease_wait = if ceremony.lease_negotiation().is_v1() {
+        LeasePollBackoff::for_absolute_cap()
+    } else {
+        LeasePollBackoff::for_legacy_deadline()
+    };
+
+    let (state, lease_handle) =
+        match pairing.verify_initiator_confirmation(&ceremony, &pairing_relay, lease_wait).await {
+            Ok(value) => value,
+            Err(error) => {
+                // Hand the ceremony back: the app may still cancel it, and its
+                // rollback-sensitive state must not be dropped silently.
+                let _ = lock_or_recover(&handle.initiator_ceremony).replace(ceremony);
+                return Err(redact_sensitive_message(&error.to_string()));
+            }
+        };
+
+    let target_device_id = ceremony.joiner_device_id().to_string();
+    let lease_active = lease_handle.is_lease_capable();
+    let retained = InitiatorVerifiedSlot {
+        ceremony,
+        lease: Arc::new(std::sync::Mutex::new(Some(lease_handle))),
+        target_device_id,
+        upload_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    lock_or_recover(&handle.initiator_verified).replace(retained);
+    drop(state);
+
+    Ok(lease_active)
+}
+
+/// Produce and upload the pairing snapshot for a verified ceremony.
+///
+/// **Step 2** of the split initiator ceremony, and the only way to reach the
+/// upload for a verified ceremony.
+///
+/// The snapshot is produced and uploaded by core
+/// (`upload_pairing_snapshot_with_lease_hook`), so the pull-to-head, the export,
+/// the encryption/signing, the resumable transport, the capability downgrade to
+/// single `PUT`, `SnapshotStale` suppression, and the lease-progress renewal
+/// coalescing all remain core's. The FFI supplies only the identity material and
+/// a hook that records the relay's session id and turns acknowledged offsets into
+/// coalesced renewals.
+///
+/// It refuses unless step 1 retained a verified ceremony, and refuses to run
+/// twice for the same ceremony. On success it records publication on the retained
+/// ceremony, which is what authorizes [`complete_initiator_resumable_ceremony`].
+///
+/// The upload runs inline on the caller's task, because the device's ML-DSA
+/// signing key is not `Clone` and cannot be moved into a spawned task. A
+/// cancellation from another task therefore cannot stop the transfer itself, but
+/// it can abort the relay session as soon as the create response has published the
+/// session id (see [`cancel_pairing_ceremony`]).
+///
+/// **The app must call [`cancel_pairing_ceremony`] to end an abandoned upload.**
+/// Nothing here times the upload out on the app's behalf: the relay holds the
+/// session's byte reservation until the session goes terminal, and only an abort
+/// (or the relay's own idle/absolute expiry) ends it. Dropping the caller's future
+/// is not enough — the upload may be suspended at an await point, and the relay
+/// session outlives it. The upload id is the only handle on that session; it is
+/// published to the shared cell on the first successful create and retained until
+/// the session is terminal, so a cancellation arriving at any point after the
+/// create can abort exactly that session. A cancellation that arrives before the
+/// create returned has nothing to abort, which is correct: no session exists yet.
+pub async fn upload_pairing_snapshot_resumable(
+    handle: &PrismSyncHandle,
+    ttl_secs: Option<u64>,
+) -> Result<ResumableSnapshotUploadResult, String> {
+    // Refuse unless verified, and refuse a second upload for this ceremony.
+    {
+        let slot = lock_or_recover(&handle.initiator_verified);
+        let slot = slot.as_ref().ok_or_else(|| {
+            "no verified initiator ceremony — call verify_initiator_confirmation_resumable first"
+                .to_string()
+        })?;
+        if slot.lease.lock().map_err(|e| e.to_string())?.is_none() {
+            return Err(
+                "CEREMONY_IN_PROGRESS: this ceremony's snapshot upload already started".to_string()
+            );
+        }
+    }
+
+    let (epoch, device_id, sync_id) = {
+        let inner = handle.inner.lock().await;
+        let store = inner.secure_store();
+        (
+            inner
+                .epoch()
+                .ok_or_else(|| "epoch not set — call configure_engine first".to_string())?,
+            require_secure_string(store.as_ref(), "device_id")?,
+            require_secure_string(store.as_ref(), "sync_id")?,
+        )
+    };
+
+    // Take the lease handle for the duration of the transfer, and publish the
+    // session cell so a concurrent cancellation can abort mid-flight.
+    let (mut lease, target_device_id, upload_completed) = {
+        let slot = lock_or_recover(&handle.initiator_verified);
+        let slot = slot.as_ref().ok_or_else(|| {
+            "no verified initiator ceremony — call verify_initiator_confirmation_resumable first"
+                .to_string()
+        })?;
+        let lease = slot.lease.lock().map_err(|e| e.to_string())?.take().ok_or_else(|| {
+            "CEREMONY_IN_PROGRESS: this ceremony's snapshot upload already started".to_string()
+        })?;
+        (lease, slot.target_device_id.clone(), Arc::clone(&slot.upload_completed))
+    };
+
+    let session = Arc::new(UploadSessionCell::new());
+    let offset_cell = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let lease_renewed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Resolve the relay BEFORE the upload starts, so a cancellation arriving
+    // mid-transfer can abort immediately instead of waiting on the engine mutex
+    // this upload holds for its whole duration.
+    let abort_transport = build_resumable_transport(handle).await?;
+    lock_or_recover(&handle.active_upload).replace(ActiveUpload {
+        relay_url: handle.relay_url.clone(),
+        cell: Arc::clone(&session),
+        transport: abort_transport,
+    });
+
+    let pairing_relay = build_pairing_relay(handle)?;
+    let ttl_secs = Some(ttl_secs.unwrap_or(FFI_RESUMABLE_DEFAULT_TTL_SECS));
+
+    // A lease-capable ceremony is bounded by the lease absolute cap, enforced by
+    // core's own waits, so it must NOT be wrapped in a fixed FFI deadline. A
+    // legacy ceremony keeps the pre-existing fixed budget; a bounded wrapper there
+    // cannot preempt any lease-aware wait, because there is no lease.
+    let legacy_budget = resumable_legacy_budget(lease.is_lease_capable());
+
+    // Resolve the signing material up front, outside the upload future, so a
+    // missing key is reported as a plain FFI error rather than an upload
+    // failure. The keys are not `Clone`, so they stay borrowed from the locked
+    // engine for the call.
+    {
+        let inner = handle.inner.lock().await;
+        if inner.device_signing_key().is_none() {
+            return Err("signing key not set — call configure_engine first".to_string());
+        }
+        if inner.ml_dsa_signing_key().is_none() {
+            return Err("ML-DSA signing key not set — call configure_engine first".to_string());
+        }
+    }
+
+    let upload_future = async {
+        let mut hook = FfiLeaseUploadHook {
+            handle: &mut lease,
+            pairing_relay: &pairing_relay,
+            session: Arc::clone(&session),
+            offset_cell: Arc::clone(&offset_cell),
+            lease_renewed: Arc::clone(&lease_renewed),
+        };
+
+        // The signing keys are borrowed from the engine for the duration of the
+        // call. They are not `Clone`, which is why this upload is driven inline
+        // rather than from a spawned task.
+        let inner = handle.inner.lock().await;
+        let signing_key = inner.device_signing_key().expect("checked above");
+        let ml_dsa_signing_key = inner.ml_dsa_signing_key().expect("checked above");
+        let ml_dsa_key_generation = inner.ml_dsa_key_generation().unwrap_or(0);
+
+        let result = inner
+            .upload_pairing_snapshot_with_lease_hook(
+                sync_id.as_str(),
+                epoch,
+                &device_id,
+                signing_key,
+                ml_dsa_signing_key,
+                ml_dsa_key_generation,
+                ttl_secs,
+                Some(target_device_id.clone()),
+                None,
+                Some(&mut hook),
+            )
+            .await;
+        drop(inner);
+        result
+    };
+
+    let result = match legacy_budget {
+        Some(budget) => match tokio::time::timeout(budget, upload_future).await {
+            Ok(result) => result,
+            Err(_) => {
+                restore_lease_handle(handle, lease);
+                return Err(format!(
+                    "snapshot upload did not finish within the legacy \
+                     {FFI_RESUMABLE_LEGACY_BUDGET_SECS}s budget"
+                ));
+            }
+        },
+        None => upload_future.await,
+    };
+
+    let (lease_capable, renewed, _terminal) = lease_flags(&lease);
+    restore_lease_handle(handle, lease);
+
+    match result {
+        Ok(upload_id) => {
+            let total_bytes = offset_cell.load(std::sync::atomic::Ordering::Acquire);
+            upload_completed.store(true, std::sync::atomic::Ordering::Release);
+            let (transport, upload_id) = match upload_id {
+                Some(upload_id) => (SnapshotTransportUsed::Resumable, upload_id),
+                None => (SnapshotTransportUsed::SinglePut, String::new()),
+            };
+            Ok(ResumableSnapshotUploadResult {
+                transport,
+                upload_id,
+                committed_bytes: i64::try_from(total_bytes).unwrap_or(i64::MAX),
+                total_bytes: i64::try_from(total_bytes).unwrap_or(i64::MAX),
+                lease_active: lease_capable,
+                lease_renewed: lease_renewed.load(std::sync::atomic::Ordering::Acquire) || renewed,
+            })
+        }
+        Err(error) => {
+            // Upload failed: credentials must not be released. The app should
+            // cancel, which aborts the session recorded in the shared cell.
+            Err(redact_sensitive_message(&error.to_string()))
+        }
+    }
+}
+
+/// Put the lease handle back so the credential-release half can use it.
+fn restore_lease_handle(handle: &PrismSyncHandle, lease: PairingLeaseHandle) {
+    let slot = lock_or_recover(&handle.initiator_verified);
+    if let Some(slot) = slot.as_ref() {
+        *lock_or_recover(&slot.lease) = Some(lease);
+    }
+}
+
+/// Perform the final lease renewal, release credentials, and wait for the
+/// joiner's terminal bundle.
+///
+/// **Step 3**, and the only credential-release path for the split ceremony. It
+/// refuses to run until the upload half recorded a durable publication, so no
+/// caller can publish credentials before the snapshot is stored.
+///
+/// Ordering preserved from core: the final renewal happens immediately before
+/// credential publication (exempt from the five-minute coalescing interval), and
+/// the wait for the joiner's terminal bundle uses core's lease-aware policy, which
+/// can run to the four-hour absolute cap. The joiner's own path still posts its
+/// terminal bundle before downloading/importing the snapshot.
+///
+/// The wait is core-owned; this function adds no wrapper deadline, because a fixed
+/// one would preempt a lease-aware core wait.
+pub async fn complete_initiator_resumable_ceremony(
+    handle: &PrismSyncHandle,
+    password: Vec<u8>,
+    mnemonic: Vec<u8>,
+) -> Result<ResumableCeremonyCompletion, String> {
+    let password = zeroize::Zeroizing::new(password);
+    let mnemonic = zeroize::Zeroizing::new(mnemonic);
+    let password_text = secret_text("password", &password)?;
+    let mnemonic_text = secret_text("mnemonic", &mnemonic)?;
+
+    // The gate: credentials may only be released after a published snapshot.
+    {
+        let slot = lock_or_recover(&handle.initiator_verified);
+        let upload_completed = slot
+            .as_ref()
+            .map(|slot| slot.upload_completed.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(false);
+        credential_release_gate(slot.is_some(), upload_completed)?;
+    }
+
+    ensure_handle_supports_signature_version_floor(handle).await?;
+
+    let pairing_relay = build_pairing_relay(handle)?;
+    let (storage, secure_store, device_id, sync_id, session_token, device_secret_bytes) = {
+        let inner = handle.inner.lock().await;
+        let store = inner.secure_store();
+        (
+            inner.storage().clone(),
+            store.clone(),
+            require_secure_string(store.as_ref(), "device_id")?,
+            require_secure_string(store.as_ref(), "sync_id")?,
+            decode_optional_utf8(store.as_ref(), "session_token")?.unwrap_or_default(),
+            store.get("device_secret").map_err(|e| e.to_string())?,
+        )
+    };
+    let ml_dsa_key_generation =
+        load_device_ml_dsa_generation(storage.clone(), sync_id.clone(), device_id.clone()).await?;
+
+    let relay = build_relay(
+        &handle.relay_url,
+        &sync_id,
+        &device_id,
+        &session_token,
+        device_secret_bytes,
+        ml_dsa_key_generation,
+        handle.allow_insecure,
+        None,
+    )?;
+
+    // Consume the retained ceremony: after a successful release the ceremony is
+    // over, and on failure the app cancels rather than retrying release.
+    let retained =
+        match lock_or_recover(&handle.initiator_verified).take() {
+            Some(retained) => retained,
+            None => return Err(
+                "no verified initiator ceremony — call verify_initiator_confirmation_resumable \
+                 first"
+                    .to_string(),
+            ),
+        };
+    lock_or_recover(&handle.active_upload).take();
+
+    let mut lease = lock_or_recover(&retained.lease)
+        .take()
+        .ok_or_else(|| "the snapshot upload has not returned its lease state".to_string())?;
+
+    let pairing = PairingService::new(secure_store);
+    let released = pairing
+        .complete_bootstrap_initiator_split(
+            &retained.ceremony.verified_state(),
+            &retained.ceremony,
+            &pairing_relay,
+            password_text,
+            mnemonic_text,
+            relay.as_ref(),
+            storage.as_ref(),
+            &mut lease,
+        )
+        .await;
+
+    let (lease_capable, lease_renewed, _terminal) = lease_flags(&lease);
+
+    match released {
+        Ok(published_registry_version) => {
+            finalize_initiator_completion(
+                handle,
+                storage.clone(),
+                &sync_id,
+                &device_id,
+                published_registry_version,
+            )
+            .await?;
+            Ok(ResumableCeremonyCompletion {
+                completed: true,
+                lease_active: lease_capable,
+                lease_renewed,
+                lease_capable,
+                error: None,
+            })
+        }
+        Err(error) => Err(redact_sensitive_message(&error.to_string())),
+    }
+}
+
+/// Resumable snapshot capability as this device sees it.
+pub async fn snapshot_upload_capability(
+    handle: &PrismSyncHandle,
+) -> Result<SnapshotUploadCapabilityInfo, String> {
+    let transport = match build_resumable_transport(handle).await {
+        Ok(transport) => transport,
+        Err(error) => {
+            return Ok(SnapshotUploadCapabilityInfo {
+                state: SnapshotUploadCapabilityState::EngineUnconfigured,
+                version: 0,
+                chunk_bytes: 0,
+                max_wire_bytes: 0,
+                reason: Some(redact_sensitive_message(&error)),
+            });
+        }
+    };
+    let capability = ResumableSnapshotTransport::resumable_snapshot_capability(&*transport).await;
+    Ok(match capability {
+        Ok(capability) => SnapshotUploadCapabilityInfo {
+            state: SnapshotUploadCapabilityState::Available,
+            version: i64::from(capability.version),
+            chunk_bytes: i64::try_from(capability.chunk_bytes).unwrap_or(0),
+            max_wire_bytes: i64::try_from(capability.max_wire_bytes).unwrap_or(0),
+            reason: None,
+        },
+        Err(reason) => SnapshotUploadCapabilityInfo {
+            state: SnapshotUploadCapabilityState::Unavailable,
+            version: 0,
+            chunk_bytes: 0,
+            max_wire_bytes: 0,
+            reason: Some(reason.as_str().to_string()),
+        },
+    })
 }
 
 // ── ML-DSA key rotation ──
@@ -6403,11 +7218,348 @@ pub async fn get_ml_dsa_key_generation(handle: &PrismSyncHandle) -> Result<u32, 
 mod tests {
     use super::*;
     use chrono::Utc;
+    use prism_sync_core::relay::mock::MockResumableFault;
     use prism_sync_core::relay::{DeviceInfo, MockRelay, SignedRegistryResponse};
     use prism_sync_core::secure_store::SecureStore;
     use prism_sync_core::storage::RusqliteSyncStorage;
     use prism_sync_core::{DeviceRecord, SyncMetadata, SyncStorage};
     use std::sync::Arc;
+
+    // ── Resumable split ceremony invariants ──
+
+    /// Credentials may not be released before the snapshot is published, and not
+    /// at all without a verified ceremony. This is the ordering requirement the
+    /// split ceremony exists to enforce.
+    #[test]
+    fn credentials_cannot_be_released_without_a_completed_upload() {
+        // Upload succeeded but no verified ceremony: still refused.
+        let error = credential_release_gate(false, true)
+            .expect_err("an unverified ceremony must never release credentials");
+        assert!(error.contains("no verified initiator ceremony"), "{error}");
+
+        // Verified ceremony, upload not done: refused. This is the case that
+        // would publish credentials before the joiner can find a snapshot.
+        let error = credential_release_gate(true, false)
+            .expect_err("credentials must not be released before the upload succeeds");
+        assert!(error.contains("snapshot upload must succeed"), "{error}");
+        assert!(error.contains("upload_pairing_snapshot_resumable"), "{error}");
+
+        // Both halves present: permitted.
+        assert!(credential_release_gate(true, true).is_ok());
+    }
+
+    /// A completed upload is never aborted; an unfinished one always is, because
+    /// the relay otherwise retains the reservation until its own expiry.
+    #[test]
+    fn only_unfinished_uploads_are_aborted() {
+        assert!(should_abort_upload(false), "an unfinished upload must be aborted");
+        assert!(
+            !should_abort_upload(true),
+            "a published snapshot must never have its session aborted"
+        );
+    }
+
+    /// Only a legacy (non-lease) ceremony may be wrapped in a fixed FFI
+    /// deadline. A lease-capable ceremony must leave timing to core, which can
+    /// run to the four-hour absolute cap.
+    #[test]
+    fn fixed_wrapper_deadline_only_applies_without_a_lease() {
+        let legacy =
+            resumable_legacy_budget(false).expect("a legacy ceremony keeps its bounded deadline");
+        assert_eq!(legacy.as_secs(), FFI_RESUMABLE_LEGACY_BUDGET_SECS);
+        assert!(
+            resumable_legacy_budget(true).is_none(),
+            "a lease-capable ceremony must not be preempted by a fixed FFI deadline"
+        );
+    }
+
+    /// The best-effort abort wrapper must stay well below the legacy phase
+    /// budget, so a cancelled ceremony never stalls on a black-holed relay.
+    #[test]
+    fn abort_wrapper_is_short_relative_to_the_phase_budget() {
+        const { assert!(FFI_UPLOAD_ABORT_TIMEOUT_SECS < FFI_RESUMABLE_LEGACY_BUDGET_SECS) };
+    }
+
+    /// Log tags for upload ids are short, stable, and non-reversible; the full
+    /// session id must never reach a log.
+    #[test]
+    fn upload_id_log_tag_is_short_and_does_not_leak_the_id() {
+        let upload_id = "upload-abcdef0123456789abcdef0123456789";
+        let tag = upload_id_hash_for_log(upload_id);
+        assert_eq!(tag.len(), 12, "12 hex chars (48 bits) is the intended tag length");
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(tag, upload_id);
+        assert!(!tag.contains("upload"), "the tag must not embed the identifier");
+        // Stable for the same input, distinct across inputs.
+        assert_eq!(tag, upload_id_hash_for_log(upload_id));
+        assert_ne!(tag, upload_id_hash_for_log("upload-other"));
+    }
+
+    /// The FFI lease hook must forward acknowledged offsets into the progress
+    /// renewer, which coalesces them. This asserts the wiring exists and that a
+    /// non-capable handle records "not negotiated" rather than panicking or
+    /// claiming an extension.
+    #[tokio::test]
+    async fn lease_hook_reports_progress_and_never_claims_a_renewal_without_a_lease() {
+        use prism_sync_core::pairing::lease::{
+            LeaseUnavailableReason, PairingLeaseHandle, VerifiedInitiatorState,
+        };
+        use prism_sync_core::relay::MockPairingRelay;
+
+        // A fixed-TTL ceremony: no lease secret, so no renewal is possible.
+        let state = VerifiedInitiatorState::fixed_ttl(
+            "00112233445566778899aabbccddeeff".to_string(),
+            [0u8; 32],
+            LeaseUnavailableReason::LegacyConfirmation,
+        );
+        let mut handle = PairingLeaseHandle::new(&state);
+        assert!(!handle.is_lease_capable());
+
+        let relay = MockPairingRelay::new();
+        let session = Arc::new(UploadSessionCell::new());
+        let offset_cell = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let renewed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut hook = FfiLeaseUploadHook {
+            handle: &mut handle,
+            pairing_relay: &relay,
+            session: Arc::clone(&session),
+            offset_cell: Arc::clone(&offset_cell),
+            lease_renewed: Arc::clone(&renewed),
+        };
+
+        hook.on_session_created("session-1").await;
+        assert_eq!(
+            lock_or_recover(&session.upload_id).clone(),
+            "session-1",
+            "the session id must be published for cancellation"
+        );
+
+        hook.on_committed_offset_advanced(1024).await;
+        assert_eq!(offset_cell.load(std::sync::atomic::Ordering::Acquire), 1024);
+        assert!(
+            !renewed.load(std::sync::atomic::Ordering::Acquire),
+            "a non-lease ceremony must never report a lease renewal"
+        );
+        assert!(
+            !handle.last_outcome().is_renewed(),
+            "a renewal must not be claimed without a negotiated lease"
+        );
+    }
+
+    /// The handle's resumable state starts empty, so a cancellation before the
+    /// relay create completes has nothing to abort.
+    #[test]
+    fn upload_session_cell_starts_without_a_session() {
+        let cell = UploadSessionCell::new();
+        assert!(lock_or_recover(&cell.upload_id).is_empty());
+    }
+
+    /// Install a verified split-ceremony slot whose upload is still in flight,
+    /// plus the `ActiveUpload` a cancellation must act on.
+    ///
+    /// This is the production state between `verify_initiator_confirmation_resumable`
+    /// and `upload_pairing_snapshot_resumable`'s success, minus the upload call
+    /// itself. The `InitiatorCeremony` is real (built against an in-memory
+    /// `MockPairingRelay`) because the FFI's own helpers already construct one for
+    /// the guard tests; everything else is the same shape the FFI builds at its
+    /// call sites.
+    async fn plant_active_upload(
+        handle: &PrismSyncHandle,
+        relay: Arc<MockRelay>,
+        upload_id: Option<&str>,
+        upload_completed: bool,
+    ) -> Arc<UploadSessionCell> {
+        let cell = Arc::new(UploadSessionCell::new());
+        if let Some(upload_id) = upload_id {
+            *lock_or_recover(&cell.upload_id) = upload_id.to_string();
+        }
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(upload_completed));
+        let ceremony = make_real_initiator_ceremony().await;
+        let state = prism_sync_core::pairing::lease::VerifiedInitiatorState::fixed_ttl(
+            "00112233445566778899aabbccddeeff".to_string(),
+            [0u8; 32],
+            prism_sync_core::pairing::lease::LeaseUnavailableReason::LegacyConfirmation,
+        );
+        lock_or_recover(&handle.initiator_verified).replace(InitiatorVerifiedSlot {
+            ceremony,
+            lease: Arc::new(std::sync::Mutex::new(Some(
+                prism_sync_core::pairing::lease::PairingLeaseHandle::new(&state),
+            ))),
+            target_device_id: "target-device".to_string(),
+            upload_completed: completed,
+        });
+        lock_or_recover(&handle.active_upload).replace(ActiveUpload {
+            relay_url: handle.relay_url.clone(),
+            cell: Arc::clone(&cell),
+            transport: relay,
+        });
+        cell
+    }
+
+    /// Cancellation mid-upload aborts exactly the recorded session, once.
+    ///
+    /// The whole point of publishing the session id to the shared cell is that a
+    /// user cancel can abort **that** session and no other. A second abort would
+    /// also be wrong: the relay would see a duplicate mutation of a session the
+    /// first abort already made terminal.
+    #[tokio::test]
+    async fn cancel_aborts_the_active_upload_exactly_once_by_id() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let relay = Arc::new(MockRelay::new());
+        let upload_id = "mock-upload-0000000000000001";
+        let _cell = plant_active_upload(&handle, Arc::clone(&relay), Some(upload_id), false).await;
+
+        cancel_pairing_ceremony(&handle).await.expect("cancel must succeed");
+
+        assert_eq!(relay.resumable_abort_calls(), 1, "exactly one abort for one cancellation");
+        assert_eq!(
+            relay.resumable_aborted_upload_ids(),
+            vec![upload_id.to_string()],
+            "the abort targets the recorded session id, not another session"
+        );
+        // The cancellation took its slots, so a repeat cannot abort again.
+        cancel_pairing_ceremony(&handle).await.expect("a second cancel is a no-op");
+        assert_eq!(
+            relay.resumable_abort_calls(),
+            1,
+            "a completed cancellation must not abort the same session a second time"
+        );
+    }
+
+    /// A cancellation that races a create which has not yet returned an id has
+    /// nothing to abort, and must not fabricate one.
+    #[tokio::test]
+    async fn cancel_without_a_session_id_issues_no_abort() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let relay = Arc::new(MockRelay::new());
+        let _cell = plant_active_upload(&handle, Arc::clone(&relay), None, false).await;
+
+        cancel_pairing_ceremony(&handle).await.expect("cancel must succeed");
+        assert_eq!(relay.resumable_abort_calls(), 0, "no id means no session to abort");
+    }
+
+    /// A published upload is never aborted. Aborting it would delete the session
+    /// a joiner's bootstrap snapshot depends on — the snapshot must stand.
+    #[tokio::test]
+    async fn cancel_never_aborts_a_completed_upload() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let relay = Arc::new(MockRelay::new());
+        let _cell =
+            plant_active_upload(&handle, Arc::clone(&relay), Some("mock-upload-published"), true)
+                .await;
+
+        cancel_pairing_ceremony(&handle).await.expect("cancel must succeed");
+        assert_eq!(
+            relay.resumable_abort_calls(),
+            0,
+            "a completed upload's session must never be aborted"
+        );
+        assert!(relay.resumable_aborted_upload_ids().is_empty());
+    }
+
+    /// An abort that fails remains nonfatal: cancellation still clears local
+    /// state and returns success, because the relay's own session expiry reclaims
+    /// a lost abort.
+    #[tokio::test]
+    async fn cancel_swallows_a_failing_abort() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let relay = Arc::new(MockRelay::new());
+        relay.inject_resumable_fault("abort", MockResumableFault::TransportError);
+        let _cell =
+            plant_active_upload(&handle, Arc::clone(&relay), Some("mock-upload-doomed"), false)
+                .await;
+
+        cancel_pairing_ceremony(&handle).await.expect("a failing abort must not fail the cancel");
+        assert_eq!(relay.resumable_abort_calls(), 1, "the abort was attempted");
+        assert!(
+            lock_or_recover(&handle.initiator_verified).is_none(),
+            "local ceremony state is cleared regardless of the abort outcome"
+        );
+
+        // Credentials still cannot be released: the upload never completed.
+        let error = complete_initiator_resumable_ceremony(
+            &handle,
+            b"password".to_vec(),
+            b"mnemonic".to_vec(),
+        )
+        .await
+        .expect_err("release must stay gated after a cancelled ceremony");
+        assert!(error.contains("no verified initiator ceremony"), "{error}");
+    }
+
+    /// Cancelling a ceremony whose upload is still in flight must leave the
+    /// credential gate closed. This is the ordering the split ceremony exists to
+    /// enforce, asserted against the real cancel path rather than a bare handle.
+    #[tokio::test]
+    async fn cancel_keeps_the_credential_release_gate_closed() {
+        let handle = create_prism_sync(
+            "http://127.0.0.1:9".into(),
+            ":memory:".into(),
+            true,
+            String::new(),
+            None,
+        )
+        .expect("create_prism_sync");
+
+        let relay = Arc::new(MockRelay::new());
+        let _cell =
+            plant_active_upload(&handle, Arc::clone(&relay), Some("mock-upload-active"), false)
+                .await;
+        // While the ceremony is verified but its upload is unfinished, release is
+        // refused with the upload-specific reason.
+        let gated = complete_initiator_resumable_ceremony(
+            &handle,
+            b"password".to_vec(),
+            b"mnemonic".to_vec(),
+        )
+        .await
+        .expect_err("an unfinished upload must not release credentials");
+        assert!(gated.contains("snapshot upload must succeed"), "{gated}");
+
+        cancel_pairing_ceremony(&handle).await.expect("cancel must succeed");
+        // The verified slot is gone, so the gate now reports the missing ceremony.
+        let after = complete_initiator_resumable_ceremony(
+            &handle,
+            b"password".to_vec(),
+            b"mnemonic".to_vec(),
+        )
+        .await
+        .expect_err("a cancelled ceremony must not release credentials");
+        assert!(after.contains("no verified initiator ceremony"), "{after}");
+    }
 
     #[test]
     fn media_fetch_error_kind_mapping() {
@@ -7523,9 +8675,7 @@ mod tests {
         .expect("create_prism_sync");
         let password = b"test-password".to_vec();
         let secret_key = vec![0xCC; 32];
-        initialize(&handle, password.clone(), secret_key.clone())
-            .await
-            .expect("initialize");
+        initialize(&handle, password.clone(), secret_key.clone()).await.expect("initialize");
         lock(&handle).await;
 
         let epoch_4_key = [0x44u8; 32];
@@ -8158,21 +9308,11 @@ mod tests {
 
     #[test]
     fn hydration_reconstructs_required_fields_split_beyond_raw_page() {
-        let mut member = delivery(
-            200,
-            "front-1",
-            Some("member_id"),
-            Some("\"stale-member\""),
-        );
+        let mut member = delivery(200, "front-1", Some("member_id"), Some("\"stale-member\""));
         member.entity_table = "fronting_sessions".into();
         let current = vec![
             winner("front-1", "member_id", Some("\"real-member\""), "2:0:peer"),
-            winner(
-                "front-1",
-                "start_time",
-                Some("\"2026-09-07T12:00:00.000Z\""),
-                "1:0:peer",
-            ),
+            winner("front-1", "start_time", Some("\"2026-09-07T12:00:00.000Z\""), "1:0:peer"),
             winner("front-1", "notes", Some("\"complete payload\""), "1:0:peer"),
             winner("front-1", "is_deleted", Some("false"), "1:0:peer"),
         ];
@@ -8181,22 +9321,15 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["id"], 200);
         assert_eq!(out[0]["fields"]["member_id"], "real-member");
-        assert_eq!(
-            out[0]["fields"]["start_time"],
-            "2026-09-07T12:00:00.000Z"
-        );
+        assert_eq!(out[0]["fields"]["start_time"], "2026-09-07T12:00:00.000Z");
         assert_eq!(out[0]["fields"]["notes"], "complete payload");
         assert!(out[0]["fields"].get("is_deleted").is_none());
     }
 
     #[test]
     fn hydration_never_revives_authoritatively_tombstoned_entity() {
-        let mut stale = delivery(
-            201,
-            "front-1",
-            Some("start_time"),
-            Some("\"2026-09-07T12:00:00Z\""),
-        );
+        let mut stale =
+            delivery(201, "front-1", Some("start_time"), Some("\"2026-09-07T12:00:00Z\""));
         stale.entity_table = "fronting_sessions".into();
         let current = vec![
             winner("front-1", "member_id", Some("\"real-member\""), "1:0:peer"),
@@ -8453,14 +9586,9 @@ mod tests {
             config
         };
         let relay_for_notifications: Arc<dyn prism_sync_core::relay::SyncRelay> = relay;
-        apply_auto_sync_config(
-            handle,
-            config,
-            Some(relay_for_notifications),
-            true,
-        )
-        .await
-        .expect("replace auto-sync runtime");
+        apply_auto_sync_config(handle, config, Some(relay_for_notifications), true)
+            .await
+            .expect("replace auto-sync runtime");
     }
 
     async fn set_mock_auto_sync(
@@ -8471,14 +9599,9 @@ mod tests {
         let _lifecycle = handle.lifecycle.lock().await;
         let relay_for_notifications: Arc<dyn prism_sync_core::relay::SyncRelay> = relay;
         let kick_catch_up = config.enabled;
-        apply_auto_sync_config(
-            handle,
-            config,
-            Some(relay_for_notifications),
-            kick_catch_up,
-        )
-        .await
-        .expect("set mock auto-sync");
+        apply_auto_sync_config(handle, config, Some(relay_for_notifications), kick_catch_up)
+            .await
+            .expect("set mock auto-sync");
     }
 
     async fn wait_for_pull(relay: &MockRelay, after: u32) {
@@ -8518,9 +9641,8 @@ mod tests {
         set_mock_auto_sync(&handle, first.clone(), config.clone()).await;
         wait_for_pull(&first, before_reenable).await;
         let first_before = first.pull_call_count();
-        first.send_notification(prism_sync_core::relay::SyncNotification::NewData {
-            server_seq: 1,
-        });
+        first
+            .send_notification(prism_sync_core::relay::SyncNotification::NewData { server_seq: 1 });
         wait_for_pull(&first, first_before).await;
 
         let second = Arc::new(MockRelay::new());
@@ -8529,27 +9651,24 @@ mod tests {
         assert_eq!(handle.inner.lock().await.auto_sync_config(), &config);
 
         let second_before = second.pull_call_count();
-        first.send_notification(prism_sync_core::relay::SyncNotification::NewData {
-            server_seq: 2,
-        });
+        first
+            .send_notification(prism_sync_core::relay::SyncNotification::NewData { server_seq: 2 });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(
             second.pull_call_count(),
             second_before,
             "the retired relay must not trigger the replacement engine"
         );
-        second.send_notification(prism_sync_core::relay::SyncNotification::NewData {
-            server_seq: 3,
-        });
+        second
+            .send_notification(prism_sync_core::relay::SyncNotification::NewData { server_seq: 3 });
         wait_for_pull(&second, second_before).await;
 
         let third = Arc::new(MockRelay::new());
         replace_with_mock_relay(&handle, third.clone()).await;
         wait_for_pull(&third, 0).await;
         let third_before = third.pull_call_count();
-        third.send_notification(prism_sync_core::relay::SyncNotification::NewData {
-            server_seq: 4,
-        });
+        third
+            .send_notification(prism_sync_core::relay::SyncNotification::NewData { server_seq: 4 });
         wait_for_pull(&third, third_before).await;
         assert_eq!(handle.inner.lock().await.auto_sync_config(), &config);
 
@@ -8572,9 +9691,8 @@ mod tests {
         let second = Arc::new(MockRelay::new());
         set_mock_auto_sync(&handle, second.clone(), disabled.clone()).await;
         replace_with_mock_relay(&handle, second.clone()).await;
-        second.send_notification(prism_sync_core::relay::SyncNotification::NewData {
-            server_seq: 1,
-        });
+        second
+            .send_notification(prism_sync_core::relay::SyncNotification::NewData { server_seq: 1 });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(second.pull_call_count(), 0);
         assert_eq!(handle.inner.lock().await.auto_sync_config(), &disabled);
@@ -8582,9 +9700,8 @@ mod tests {
         reset_sync_state(&handle).await.expect("reset sync state");
         let third = Arc::new(MockRelay::new());
         replace_with_mock_relay(&handle, third.clone()).await;
-        third.send_notification(prism_sync_core::relay::SyncNotification::NewData {
-            server_seq: 2,
-        });
+        third
+            .send_notification(prism_sync_core::relay::SyncNotification::NewData { server_seq: 2 });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(third.pull_call_count(), 0);
         assert_eq!(

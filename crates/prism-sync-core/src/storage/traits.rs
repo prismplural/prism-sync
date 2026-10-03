@@ -50,10 +50,7 @@ pub trait SyncStorage: Send + Sync {
     /// list and re-runs the full pipeline per envelope.
     ///
     /// Default: empty (no-op for in-memory impls).
-    fn list_quarantined_pull_batches(
-        &self,
-        _sync_id: &str,
-    ) -> Result<Vec<QuarantinedPullBatch>> {
+    fn list_quarantined_pull_batches(&self, _sync_id: &str) -> Result<Vec<QuarantinedPullBatch>> {
         Ok(vec![])
     }
 
@@ -168,10 +165,7 @@ pub trait SyncStorage: Send + Sync {
     /// rotation to a terminal state after a crash.
     ///
     /// Default: `None` (no-op for in-memory impls).
-    fn get_pending_epoch_rotation(
-        &self,
-        _sync_id: &str,
-    ) -> Result<Option<PendingEpochRotation>> {
+    fn get_pending_epoch_rotation(&self, _sync_id: &str) -> Result<Option<PendingEpochRotation>> {
         Ok(None)
     }
 
@@ -536,11 +530,7 @@ pub trait SyncStorageTx {
     /// Clear every sender-health row for a sender whose batch finally applied via
     /// Phase 0b replay (full recovery — the sender is resolvable again, so all of
     /// its accumulated reason rows are stale). Default: no-op for in-memory impls.
-    fn clear_pull_sender_health(
-        &mut self,
-        _sync_id: &str,
-        _sender_device_id: &str,
-    ) -> Result<()> {
+    fn clear_pull_sender_health(&mut self, _sync_id: &str, _sender_device_id: &str) -> Result<()> {
         Ok(())
     }
 

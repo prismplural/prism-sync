@@ -53,9 +53,7 @@ impl VerifiedEpochKey {
             )))
         })?;
         let expected = snapshot.epoch_key_hashes.get(&epoch).ok_or_else(|| {
-            CoreError::Engine(format!(
-                "signed registry has no epoch_key_hash for epoch {epoch}"
-            ))
+            CoreError::Engine(format!("signed registry has no epoch_key_hash for epoch {epoch}"))
         })?;
         if compute_epoch_key_hash(&arr) != *expected {
             return Err(CoreError::Engine(format!(
@@ -280,10 +278,8 @@ impl EpochManager {
             }
 
             // Reject any recipient the pinned registry never committed.
-            let pinned_device = pinned
-                .iter()
-                .find(|p| p.device_id == device.device_id)
-                .ok_or_else(|| {
+            let pinned_device =
+                pinned.iter().find(|p| p.device_id == device.device_id).ok_or_else(|| {
                     CoreError::Engine(format!(
                         "refusing rekey: relay-listed device {} is not in the pinned registry",
                         device.device_id
@@ -620,9 +616,8 @@ impl EpochManager {
                 return Ok(None);
             }
 
-            let (epoch_key, wrapped_keys) = Self::prepare_wrapped_keys_for_devices(
-                &devices, new_epoch, None, pinned,
-            )?;
+            let (epoch_key, wrapped_keys) =
+                Self::prepare_wrapped_keys_for_devices(&devices, new_epoch, None, pinned)?;
 
             match Self::post_prepared_rekey(
                 relay,
@@ -923,8 +918,9 @@ mod tests {
                 PostRekeyBehavior::SurvivorMismatchThenSuccess => {
                     if call == 1 {
                         Err(RelayError::Protocol {
-                            message: "HTTP 400: wrapped_keys must match the active device set exactly"
-                                .to_string(),
+                            message:
+                                "HTTP 400: wrapped_keys must match the active device set exactly"
+                                    .to_string(),
                         })
                     } else {
                         self.commit_rekey(epoch, keys);
@@ -997,10 +993,7 @@ mod tests {
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
             unimplemented!()
         }
-        async fn batch_exists(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<Vec<String>, RelayError> {
+        async fn batch_exists(&self, _: &[String]) -> std::result::Result<Vec<String>, RelayError> {
             unimplemented!()
         }
         async fn send_ephemeral(
@@ -1014,10 +1007,7 @@ mod tests {
         ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
             unimplemented!()
         }
-        async fn ack_ephemeral(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<(), RelayError> {
+        async fn ack_ephemeral(&self, _: &[String]) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -1878,12 +1868,10 @@ mod tests {
             },
         ];
 
-        let result = EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
+        let result =
+            EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
         let err = result.expect_err("injected recipient must abort the rotation");
-        assert!(
-            err.to_string().contains("not in the pinned registry"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("not in the pinned registry"), "unexpected error: {err}");
     }
 
     /// A relay that swaps a known device's X-Wing key (key differs from the
@@ -1925,7 +1913,8 @@ mod tests {
             needs_rekey: false,
         }];
 
-        let result = EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
+        let result =
+            EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
         let err = result.expect_err("swapped X-Wing key must abort the rotation");
         assert!(
             err.to_string().contains("differs from pinned registry"),
@@ -1978,7 +1967,8 @@ mod tests {
             needs_rekey: false,
         }];
 
-        let result = EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
+        let result =
+            EpochManager::prepare_wrapped_keys_for_devices(&relay_devices, 1, None, &pinned);
         let err = result.expect_err("a pinned-revoked recipient must abort the rotation");
         assert!(
             err.to_string().contains("revoked in the pinned registry"),
@@ -2033,9 +2023,15 @@ mod tests {
         let mut kh = KeyHierarchy::new();
         kh.initialize("password", &[1u8; 16]).unwrap();
 
-        let result =
-            EpochManager::handle_rotation(&relay, &mut kh, 5, "receiver", &receiver_xwing, &snapshot)
-                .await;
+        let result = EpochManager::handle_rotation(
+            &relay,
+            &mut kh,
+            5,
+            "receiver",
+            &receiver_xwing,
+            &snapshot,
+        )
+        .await;
         let err = result.expect_err("missing epoch hash must be refused");
         assert!(
             err.to_string().contains("no epoch_key_hash for epoch 5"),

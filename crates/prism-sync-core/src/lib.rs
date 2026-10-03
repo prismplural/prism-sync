@@ -10,8 +10,8 @@
 
 pub mod batch_signature;
 pub mod bootstrap;
-pub mod clock_drift;
 pub mod client;
+pub mod clock_drift;
 pub mod crdt_change;
 pub mod debug_log;
 pub mod device_registry;
@@ -33,16 +33,17 @@ pub mod runtime_keys;
 pub mod schema;
 pub mod secure_store;
 pub mod snapshot_limits;
+pub mod snapshot_upload;
 pub mod storage;
 pub mod sync_aad;
 pub mod sync_service;
 pub mod syncable_entity;
 
+pub use client::{KeyMode, PrismSync, PrismSyncBuilder, SelfRevocationStatus, SyncStatus};
 pub use clock_drift::{
     is_excessively_future, max_inheritable, sort_batch_ids_by_typed_hlc, ClockConfidence,
     MAX_CLOCK_DRIFT_MS,
 };
-pub use client::{KeyMode, PrismSync, PrismSyncBuilder, SelfRevocationStatus, SyncStatus};
 pub use crdt_change::{CrdtChange, BULK_RESET_FIELD};
 pub use debug_log::SyncDebugLog;
 pub use device_registry::DeviceRegistryManager;

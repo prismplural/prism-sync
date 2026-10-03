@@ -16,10 +16,15 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r prism && useradd -r -g prism -d /data -s /sbin/nologin prism
 COPY --from=builder /app/target/release/prism-sync-relay /usr/local/bin/prism-sync-relay
-RUN mkdir -p /data && chown prism:prism /data
+RUN mkdir -p /data/media && chown -R prism:prism /data
 VOLUME /data
 ENV DB_PATH=/data/relay.db
 ENV PORT=8080
+# Media and pair-time snapshot blobs live under this persistent mount. Keep it an
+# explicit absolute path on the writable volume: a relative default resolves
+# under the image workdir, which can be ephemeral or unwritable and would leave
+# snapshot rows referencing blobs that were never durably stored.
+ENV MEDIA_STORAGE_PATH=/data/media
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -f http://localhost:8080/health || exit 1

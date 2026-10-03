@@ -607,8 +607,7 @@ impl PrismSync {
             .await;
         self.apply_recovered_epoch_high_water();
         self.refresh_op_emitter_hlc_from_storage("sync_now");
-        let signed_exchange_validated =
-            matches!(&result, Ok(r) if r.signed_exchange_validated);
+        let signed_exchange_validated = matches!(&result, Ok(r) if r.signed_exchange_validated);
         self.note_signed_exchange_and_repair_clock(signed_exchange_validated);
         result
     }
@@ -1023,11 +1022,12 @@ impl PrismSync {
             return;
         };
 
-        let owns = match self.staged_rotation_is_ours(relay, device_id, staged_epoch, &staged_key).await {
-            Some(owns) => owns,
-            // Inconclusive (relay error mid-check): keep the journal, retry next.
-            None => return,
-        };
+        let owns =
+            match self.staged_rotation_is_ours(relay, device_id, staged_epoch, &staged_key).await {
+                Some(owns) => owns,
+                // Inconclusive (relay error mid-check): keep the journal, retry next.
+                None => return,
+            };
 
         if !owns {
             // A different device won the rotation to N. Discard our staged key and
@@ -1044,7 +1044,13 @@ impl PrismSync {
         // crash may have struck before the registry was published); the
         // holder-key repair is a no-op if the served registry already reached N.
         if let Err(error) = self
-            .repair_signed_registry_epoch_if_needed(relay, sync_id, device_id, staged_epoch, &devices)
+            .repair_signed_registry_epoch_if_needed(
+                relay,
+                sync_id,
+                device_id,
+                staged_epoch,
+                &devices,
+            )
             .await
         {
             tracing::warn!(
@@ -1083,9 +1089,8 @@ impl PrismSync {
             }
         }
         let raw = self.secure_store.get(&format!("epoch_key_{epoch}")).ok().flatten()?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(String::from_utf8(raw).ok()?)
-            .ok()?;
+        let decoded =
+            base64::engine::general_purpose::STANDARD.decode(String::from_utf8(raw).ok()?).ok()?;
         Some(zeroize::Zeroizing::new(decoded))
     }
 
@@ -1207,9 +1212,7 @@ impl PrismSync {
         let registry_response = match relay.get_signed_registry().await {
             Ok(Some(response)) => response,
             Ok(None) => {
-                tracing::warn!(
-                    "confirm_self_revocation: unknown (no signed registry available)"
-                );
+                tracing::warn!("confirm_self_revocation: unknown (no signed registry available)");
                 return SelfRevocationStatus::Unknown;
             }
             Err(e) => {
@@ -1256,14 +1259,13 @@ impl PrismSync {
                 // destructive confirmation. See the three-way match below.
                 let storage = self.storage.clone();
                 let sid = sync_id.clone();
-                let last_imported = tokio::task::spawn_blocking(move || {
-                    storage.get_sync_metadata(&sid)
-                })
-                .await
-                .ok()
-                .and_then(|res| res.ok())
-                .flatten()
-                .and_then(|meta| meta.last_imported_registry_version);
+                let last_imported =
+                    tokio::task::spawn_blocking(move || storage.get_sync_metadata(&sid))
+                        .await
+                        .ok()
+                        .and_then(|res| res.ok())
+                        .flatten()
+                        .and_then(|meta| meta.last_imported_registry_version);
 
                 match last_imported {
                     Some(baseline) if snapshot.registry_version < baseline => {
@@ -1461,10 +1463,7 @@ impl PrismSync {
         // The publishing device must be present AND active in the artifact it
         // signs: a registry that omits or revokes its own signer is never
         // legitimate and would strand survivors.
-        if !entries
-            .iter()
-            .any(|entry| entry.device_id == device_id && entry.status == "active")
-        {
+        if !entries.iter().any(|entry| entry.device_id == device_id && entry.status == "active") {
             return Err(CoreError::Engine(
                 "cannot repair signed registry: current device missing or non-active".into(),
             ));
@@ -1590,6 +1589,51 @@ impl PrismSync {
                 self.ml_dsa_key_generation.unwrap_or(0),
                 ttl_secs,
                 for_device_id,
+            )
+            .await
+    }
+
+    /// [`Self::upload_pairing_snapshot`], with a pairing-lease progress hook.
+    ///
+    /// The hook is the app-facing half of the split pairing ceremony: it is
+    /// invoked with the opaque upload's session identifier as soon as the relay
+    /// created the session, and again after each **strictly increased**
+    /// acknowledged committed offset, so a lease renewer can renew while bytes
+    /// are still progressing without the relay learning which upload is related
+    /// to a ceremony. A hook failure is never fatal here.
+    ///
+    /// Unlike the one-shot entry point, this returns the relay's session
+    /// identifier (when the resumable transport was used) so the caller can
+    /// best-effort abort exactly that session on cancellation or ceremony
+    /// expiry. `Ok(None)` means the resumable transport was unavailable and the
+    /// unchanged single `PUT` path published the snapshot instead.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_pairing_snapshot_with_lease_hook(
+        &self,
+        sync_id: &str,
+        epoch: i32,
+        device_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        ml_dsa_signing_key: &prism_sync_crypto::DevicePqSigningKey,
+        ml_dsa_key_generation: u32,
+        ttl_secs: Option<u64>,
+        for_device_id: Option<String>,
+        progress: Option<crate::relay::SnapshotUploadProgress>,
+        lease_hook: Option<&mut dyn crate::snapshot_upload::SnapshotUploadProgressHook>,
+    ) -> Result<Option<String>> {
+        self.sync_service
+            .upload_pairing_snapshot_with_lease_hook(
+                &self.key_hierarchy,
+                sync_id,
+                epoch,
+                device_id,
+                signing_key,
+                ml_dsa_signing_key,
+                ml_dsa_key_generation,
+                ttl_secs,
+                for_device_id,
+                progress,
+                lease_hook,
             )
             .await
     }
@@ -2014,8 +2058,13 @@ impl PrismSync {
             .op_emitter
             .as_mut()
             .ok_or_else(|| CoreError::Engine("sync not configured".into()))?;
-        let result =
-            emitter.emit_delete_at(&*self.storage, table, entity_id, &batch_id, origin_timestamp_ms);
+        let result = emitter.emit_delete_at(
+            &*self.storage,
+            table,
+            entity_id,
+            &batch_id,
+            origin_timestamp_ms,
+        );
         if result.is_ok() {
             if let Some(tx) = self.sync_service.auto_sync_sender() {
                 let _ = tx.try_send(());
@@ -2831,7 +2880,8 @@ impl PrismSync {
         let device_secret = self.device_secret.as_ref().ok_or_else(|| {
             CoreError::Engine("device secret not set — call configure_engine first".into())
         })?;
-        let signing_key = device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
+        let signing_key =
+            device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
         let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
             CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
         })?;
@@ -2979,8 +3029,9 @@ impl PrismSync {
         // recover the new epoch key via the existing `EpochRotated` -> registry
         // path. A publish failure is non-fatal: the rekey already committed and a
         // survivor's next `catch_up_epoch_keys` epoch repair backstops it.
-        if let Err(error) =
-            self.publish_post_rekey_registry(relay.as_ref(), &sync_id, &self_device_id, committed_epoch).await
+        if let Err(error) = self
+            .publish_post_rekey_registry(relay.as_ref(), &sync_id, &self_device_id, committed_epoch)
+            .await
         {
             tracing::warn!(
                 error = %error,
@@ -3058,7 +3109,8 @@ impl PrismSync {
         let device_secret = self.device_secret.as_ref().ok_or_else(|| {
             CoreError::Engine("device secret not set — call configure_engine first".into())
         })?;
-        let signing_key = device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
+        let signing_key =
+            device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
         let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
             CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
         })?;
@@ -3139,7 +3191,8 @@ impl PrismSync {
         let device_secret = self.device_secret.as_ref().ok_or_else(|| {
             CoreError::Engine("device secret not set — call configure_engine first".into())
         })?;
-        let signing_key = device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
+        let signing_key =
+            device_secret.ed25519_keypair(self_device_id).map_err(CoreError::Crypto)?;
         let pq_signing_key = self.device_ml_dsa_signing_key.as_ref().ok_or_else(|| {
             CoreError::Engine("ML-DSA signing key not set — call configure_engine first".into())
         })?;
@@ -3478,9 +3531,11 @@ impl PrismSync {
             emitter.clamp_watermark_to_now()?;
         }
 
-        let deleted = self
-            .storage
-            .delete_unpushed_future_pending_ops(&sync_id, &device_id, MAX_CLOCK_DRIFT_MS)?;
+        let deleted = self.storage.delete_unpushed_future_pending_ops(
+            &sync_id,
+            &device_id,
+            MAX_CLOCK_DRIFT_MS,
+        )?;
         tracing::debug!(deleted, "clock-excursion: dropped over-bound unpushed pending ops");
 
         let mut field_count = 0u64;
@@ -3546,9 +3601,7 @@ impl PrismSync {
             field_count += 1;
         }
 
-        let _ = self
-            .event_tx
-            .send(SyncEvent::ClockExcursionRepaired { field_count, max_drift_ms });
+        let _ = self.event_tx.send(SyncEvent::ClockExcursionRepaired { field_count, max_drift_ms });
 
         Ok(())
     }
@@ -3630,6 +3683,16 @@ impl PrismSync {
         self.device_ml_dsa_signing_key.as_ref()
     }
 
+    /// Access the device's Ed25519 signing key, if the engine is configured.
+    ///
+    /// Needed by the FFI's split pairing ceremony, which must drive the
+    /// snapshot upload itself (so it can interleave lease renewals and learn the
+    /// resumable session id) rather than going through
+    /// [`Self::upload_pairing_snapshot`].
+    pub fn device_signing_key(&self) -> Option<&ed25519_dalek::SigningKey> {
+        self.device_signing_key.as_ref()
+    }
+
     /// Access the ML-DSA key generation, if set.
     pub fn ml_dsa_key_generation(&self) -> Option<u32> {
         self.ml_dsa_key_generation
@@ -3690,8 +3753,8 @@ impl PrismSync {
             .sync_id()
             .ok_or_else(|| CoreError::Engine("no sync_id; engine not configured".into()))?;
         let epoch = self.epoch.ok_or_else(|| CoreError::Engine("no current epoch".into()))?;
-        let epoch_u32 =
-            u32::try_from(epoch).map_err(|_| CoreError::Engine(format!("invalid epoch {epoch}")))?;
+        let epoch_u32 = u32::try_from(epoch)
+            .map_err(|_| CoreError::Engine(format!("invalid epoch {epoch}")))?;
         let epoch_key = self.key_hierarchy.epoch_key(epoch_u32)?;
         let now = chrono::Utc::now().timestamp();
         crate::ephemeral::seal_envelope(
@@ -3917,10 +3980,7 @@ mod tests {
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
             unimplemented!()
         }
-        async fn batch_exists(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<Vec<String>, RelayError> {
+        async fn batch_exists(&self, _: &[String]) -> std::result::Result<Vec<String>, RelayError> {
             unimplemented!()
         }
         async fn send_ephemeral(
@@ -3934,10 +3994,7 @@ mod tests {
         ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
             unimplemented!()
         }
-        async fn ack_ephemeral(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<(), RelayError> {
+        async fn ack_ephemeral(&self, _: &[String]) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -4209,9 +4266,7 @@ mod tests {
         ) -> std::result::Result<Option<SignedRegistryResponse>, RelayError> {
             let state = self.state.lock().unwrap();
             if state.signed_registry_error {
-                return Err(RelayError::Protocol {
-                    message: "device_revoked".to_string(),
-                });
+                return Err(RelayError::Protocol { message: "device_revoked".to_string() });
             }
             Ok(state.signed_registry.clone())
         }
@@ -4293,10 +4348,7 @@ mod tests {
         async fn download_media(&self, _: &str) -> std::result::Result<Vec<u8>, RelayError> {
             unimplemented!()
         }
-        async fn batch_exists(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<Vec<String>, RelayError> {
+        async fn batch_exists(&self, _: &[String]) -> std::result::Result<Vec<String>, RelayError> {
             unimplemented!()
         }
         async fn send_ephemeral(
@@ -4310,10 +4362,7 @@ mod tests {
         ) -> std::result::Result<Vec<crate::ephemeral::EphemeralEnvelope>, RelayError> {
             unimplemented!()
         }
-        async fn ack_ephemeral(
-            &self,
-            _: &[String],
-        ) -> std::result::Result<(), RelayError> {
+        async fn ack_ephemeral(&self, _: &[String]) -> std::result::Result<(), RelayError> {
             unimplemented!()
         }
     }
@@ -4652,7 +4701,11 @@ mod tests {
         // The relay serves registry_version 1 (the floor); the relay-ahead verify
         // ratchets the NULL baseline up to it.
         assert_eq!(
-            sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().last_imported_registry_version,
+            sync.storage()
+                .get_sync_metadata("sync-1")
+                .unwrap()
+                .unwrap()
+                .last_imported_registry_version,
             Some(1),
             "verified relay-ahead read must populate a NULL baseline"
         );
@@ -4682,7 +4735,11 @@ mod tests {
         sync.catch_up_epoch_keys().await.unwrap();
 
         assert_eq!(
-            sync.storage().get_sync_metadata("sync-1").unwrap().unwrap().last_imported_registry_version,
+            sync.storage()
+                .get_sync_metadata("sync-1")
+                .unwrap()
+                .unwrap()
+                .last_imported_registry_version,
             Some(1),
             "verified no-repair-needed catch-up must populate a NULL baseline"
         );
@@ -4856,7 +4913,10 @@ mod tests {
         // confirm_self_revocation_returns_revoked_when_snapshot_at_or_above_baseline).
         let (sync, _relay, _id, _secret, _info) = prepare_self_revocation_check("revoked");
         assert_eq!(
-            sync.storage().get_sync_metadata("sync-1").unwrap().and_then(|m| m.last_imported_registry_version),
+            sync.storage()
+                .get_sync_metadata("sync-1")
+                .unwrap()
+                .and_then(|m| m.last_imported_registry_version),
             None,
             "precondition: helper records no last-imported baseline"
         );
@@ -5306,7 +5366,9 @@ mod tests {
         // configure_engine already seeded the emitter from storage; the
         // self-authored future HLC poisons the watermark.
         sync.refresh_op_emitter_hlc_from_storage("test");
-        assert!(sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS);
+        assert!(
+            sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS
+        );
 
         let mut events = sync.events();
 
@@ -5325,7 +5387,9 @@ mod tests {
         assert_eq!(fv.winning_encoded_value, Some("\"Future\"".to_string()));
 
         // The watermark was clamped back to a sane value.
-        assert!(sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() <= MAX_CLOCK_DRIFT_MS);
+        assert!(
+            sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() <= MAX_CLOCK_DRIFT_MS
+        );
 
         // A ClockExcursionRepaired event surfaced.
         let mut saw_event = false;
@@ -5361,7 +5425,9 @@ mod tests {
             sync.storage.get_field_version("sync-1", "members", "ent-1", "name").unwrap().unwrap();
         assert_eq!(fv.winning_hlc, poison_hlc.to_string());
         // Watermark untouched (still poisoned).
-        assert!(sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS);
+        assert!(
+            sync.op_emitter.as_ref().unwrap().last_hlc().future_drift_ms() > MAX_CLOCK_DRIFT_MS
+        );
     }
 
     #[test]
@@ -6101,7 +6167,13 @@ mod tests {
             RevokeBehavior::Success,
         ));
 
-        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
         seed_device_registry(&sync, "sync-1", &relay.devices());
 
         // Seed a pre-existing signed registry at the binding floor so the
@@ -6408,7 +6480,13 @@ mod tests {
             RevokeBehavior::Success,
         ));
 
-        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
         seed_device_registry(&sync, "sync-1", &relay.devices());
 
         let committed_epoch =
@@ -6621,9 +6699,13 @@ mod tests {
         signer_secret: &DeviceSecret,
         signer_device_id: &str,
     ) -> SignedRegistrySnapshot {
-        let served = relay.state.lock().unwrap().signed_registry.clone().expect(
-            "revoke_and_rekey must have published a signed registry",
-        );
+        let served = relay
+            .state
+            .lock()
+            .unwrap()
+            .signed_registry
+            .clone()
+            .expect("revoke_and_rekey must have published a signed registry");
         let signing_key = signer_secret.ed25519_keypair(signer_device_id).unwrap();
         let pq_signing_key = signer_secret.ml_dsa_65_keypair(signer_device_id).unwrap();
         SignedRegistrySnapshot::verify_and_decode_hybrid(
@@ -6652,7 +6734,13 @@ mod tests {
             RevokeBehavior::Success,
         ));
 
-        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
         seed_device_registry(&sync, "sync-1", &relay.devices());
 
         let committed_epoch =
@@ -6714,7 +6802,13 @@ mod tests {
             RevokeBehavior::Success,
         ));
 
-        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
         seed_device_registry(&sync, "sync-1", &relay.devices());
 
         // Pre-seed a served artifact at the floor version so the publisher must
@@ -6767,7 +6861,13 @@ mod tests {
             RevokeBehavior::Success,
         ));
 
-        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
         // Pin ONLY the survivor — the target was never imported, so the local
         // tombstone pin will fail. The survivor must be pinned so the rekey wrap
         // step still succeeds.
@@ -6836,8 +6936,8 @@ mod tests {
 
         let a_id = "a1b2c3d4e5f6";
         let b_id = "b7c8d9e0f1a2";
-        let a_secret = DeviceSecret::from_bytes(a.device_secret().unwrap().as_bytes().to_vec())
-            .unwrap();
+        let a_secret =
+            DeviceSecret::from_bytes(a.device_secret().unwrap().as_bytes().to_vec()).unwrap();
         let b_secret = DeviceSecret::generate();
         let a_relay = Arc::new(RevokeTestRelay::new(
             vec![
@@ -6852,8 +6952,7 @@ mod tests {
         a.revoke_and_rekey(a_relay.clone(), b_id, true).await.unwrap();
 
         // The artifact A just published, captured to drive B's verification.
-        let revoked_artifact =
-            a_relay.state.lock().unwrap().signed_registry.clone().unwrap();
+        let revoked_artifact = a_relay.state.lock().unwrap().signed_registry.clone().unwrap();
 
         // Build B: pins A (active, the signer) and itself, served the revoked
         // artifact A published. With a baseline at or below the artifact version
@@ -6921,7 +7020,13 @@ mod tests {
         let pin_revoked_secret = DeviceSecret::generate();
 
         let relay = Arc::new(RevokeTestRelay::new(vec![], RevokeBehavior::Success));
-        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
 
         // Local pins: self active, one device pinned revoked even though the
         // relay will report it active.
@@ -6930,8 +7035,7 @@ mod tests {
             (relay_revoked_id, &relay_revoked_secret, "active"),
             (pin_revoked_id, &pin_revoked_secret, "revoked"),
         ] {
-            let mut record =
-                make_device_record("sync-1", &make_device_info(id, secret, 0, status));
+            let mut record = make_device_record("sync-1", &make_device_info(id, secret, 0, status));
             record.status = status.to_string();
             DeviceRegistryManager::pin_device(sync.storage().as_ref(), "sync-1", &record).unwrap();
         }
@@ -6944,9 +7048,15 @@ mod tests {
             make_device_info(pin_revoked_id, &pin_revoked_secret, 0, "active"),
         ];
 
-        sync.repair_signed_registry_epoch_if_needed(relay.as_ref(), "sync-1", self_device_id, 0, &devices)
-            .await
-            .unwrap();
+        sync.repair_signed_registry_epoch_if_needed(
+            relay.as_ref(),
+            "sync-1",
+            self_device_id,
+            0,
+            &devices,
+        )
+        .await
+        .unwrap();
 
         let snapshot = decode_served_registry(&relay, &self_secret, self_device_id);
         let status_of = |id: &str| {
@@ -6974,10 +7084,18 @@ mod tests {
         let self_secret =
             DeviceSecret::from_bytes(sync.device_secret().unwrap().as_bytes().to_vec()).unwrap();
         let relay = Arc::new(RevokeTestRelay::new(vec![], RevokeBehavior::Success));
-        sync.configure_engine(relay.clone(), "sync-1".to_string(), self_device_id.to_string(), 0, 0);
+        sync.configure_engine(
+            relay.clone(),
+            "sync-1".to_string(),
+            self_device_id.to_string(),
+            0,
+            0,
+        );
 
-        let mut self_record =
-            make_device_record("sync-1", &make_device_info(self_device_id, &self_secret, 0, "active"));
+        let mut self_record = make_device_record(
+            "sync-1",
+            &make_device_info(self_device_id, &self_secret, 0, "active"),
+        );
         self_record.status = "active".to_string();
         DeviceRegistryManager::pin_device(sync.storage().as_ref(), "sync-1", &self_record).unwrap();
 
@@ -6985,7 +7103,13 @@ mod tests {
         // sign a registry that revokes its own signer.
         let devices = vec![make_device_info(self_device_id, &self_secret, 0, "revoked")];
         let err = sync
-            .repair_signed_registry_epoch_if_needed(relay.as_ref(), "sync-1", self_device_id, 0, &devices)
+            .repair_signed_registry_epoch_if_needed(
+                relay.as_ref(),
+                "sync-1",
+                self_device_id,
+                0,
+                &devices,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, CoreError::Engine(_)));
@@ -7552,7 +7676,11 @@ mod tests {
 
     /// A field_version marking `winning_op_id` as the current LWW winner for
     /// `field`. Mirrors what `emit_update` writes alongside a local op.
-    fn field_version(sync_id: &str, field: &str, winning_op_id: &str) -> crate::storage::FieldVersion {
+    fn field_version(
+        sync_id: &str,
+        field: &str,
+        winning_op_id: &str,
+    ) -> crate::storage::FieldVersion {
         crate::storage::FieldVersion {
             sync_id: sync_id.to_string(),
             entity_table: "members".to_string(),
@@ -7815,8 +7943,7 @@ mod tests {
         assert!(!unpushed.contains(&stuck_batch.to_string()));
         // And it was NOT deleted — a stuck winner stays in its quarantined
         // batch (excluded from the push set, but never lost).
-        let still_there =
-            sync.storage().begin_tx().unwrap().load_batch_ops(stuck_batch).unwrap();
+        let still_there = sync.storage().begin_tx().unwrap().load_batch_ops(stuck_batch).unwrap();
         assert!(still_there.iter().any(|o| o.op_id == "op-huge"));
     }
 

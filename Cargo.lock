@@ -2396,6 +2396,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -2419,6 +2420,7 @@ dependencies = [
 name = "prism_sync_ffi"
 version = "0.1.1"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",

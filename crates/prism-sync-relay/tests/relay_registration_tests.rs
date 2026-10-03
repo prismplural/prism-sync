@@ -366,6 +366,8 @@ async fn test_registration_rejects_expired_nonce() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 0, // Expire immediately
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
@@ -514,6 +516,8 @@ async fn test_nonce_rate_limiting() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
@@ -686,6 +690,8 @@ async fn test_brand_new_group_storage_cap_applies_before_global_cap() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
@@ -831,6 +837,8 @@ async fn test_first_device_registration_requires_valid_pow_when_enabled() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
@@ -1027,6 +1035,8 @@ async fn test_first_device_registration_accepts_apple_app_attest() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
@@ -1209,6 +1219,8 @@ async fn test_existing_group_registration_does_not_require_pow_when_enabled() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
@@ -1647,12 +1659,7 @@ async fn test_registration_succeeds_when_snapshot_lists_auto_revoked_device_as_a
         &approver_keys,
         vec![
             registry_snapshot_entry_hybrid(&sync_id, &approver_device_id, &approver_keys, "active"),
-            registry_snapshot_entry_hybrid(
-                &sync_id,
-                &revoked_device_id,
-                &revoked_keys,
-                "active",
-            ),
+            registry_snapshot_entry_hybrid(&sync_id, &revoked_device_id, &revoked_keys, "active"),
             registry_snapshot_entry_hybrid(&sync_id, &joiner_device_id, &joiner_keys, "active"),
         ],
     );
@@ -1698,6 +1705,8 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 8,
@@ -2117,6 +2126,8 @@ async fn test_nonce_rate_limiting_window_expiry() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
@@ -3279,6 +3290,8 @@ async fn test_revoke_rate_limiting() {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         invite_ttl_secs: 86400,
@@ -4499,6 +4512,8 @@ fn default_test_config() -> Config {
         port: 0,
         db_path: ":memory:".into(),
         nonce_expiry_secs: 60,
+        pairing_lease: prism_sync_relay::config::PairingLeaseConfig::default(),
+        snapshot_upload: prism_sync_relay::config::SnapshotUploadConfig::default(),
         session_expiry_secs: 3600,
         session_max_age_secs: 7_776_000,
         first_device_pow_difficulty_bits: 0,
@@ -4881,11 +4896,7 @@ async fn revoked_device_registry_read_allowlist_is_tight() {
     // Helper: assert a request from the revoked device is rejected with the
     // structured `device_revoked` 401 (proving the allowlist did NOT widen).
     async fn assert_rejected_device_revoked(resp: reqwest::Response, route: &str) {
-        assert_eq!(
-            resp.status(),
-            401,
-            "revoked device must be rejected (401) on {route}"
-        );
+        assert_eq!(resp.status(), 401, "revoked device must be rejected (401) on {route}");
         let body: Value = resp.json().await.unwrap();
         assert_eq!(
             body["error"].as_str(),

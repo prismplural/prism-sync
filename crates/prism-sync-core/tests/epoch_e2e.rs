@@ -517,17 +517,20 @@ async fn relay_injected_epoch_key_is_refused() {
     let mut kh = KeyHierarchy::new();
     kh.initialize("password", &[1u8; 16]).unwrap();
 
-    let result =
-        EpochManager::handle_rotation(&relay, &mut kh, 1, "victim", &victim_xwing, &signed_registry)
-            .await;
+    let result = EpochManager::handle_rotation(
+        &relay,
+        &mut kh,
+        1,
+        "victim",
+        &victim_xwing,
+        &signed_registry,
+    )
+    .await;
 
     assert!(result.is_err(), "relay-injected attacker key must be refused");
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("hash mismatch"), "error should be a hash mismatch, got: {msg}");
-    assert!(
-        !kh.has_epoch_key(1),
-        "attacker key must NOT be installed into the key hierarchy"
-    );
+    assert!(!kh.has_epoch_key(1), "attacker key must NOT be installed into the key hierarchy");
 
     // ── POSITIVE CONTROL: serving the REAL key installs cleanly ──
     let honest_artifact = build_v2_artifact(&victim_xwing, &real_key, 1, "victim");

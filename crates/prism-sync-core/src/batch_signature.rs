@@ -502,9 +502,8 @@ mod tests {
         // A generation mismatch is a TYPED, distinguishable verdict carrying both
         // generations — routed to the transient stall path instead of the
         // permanent invalid-signature quarantine.
-        let err =
-            verify_batch_signature_for_generation(&envelope, &ed25519_pk, &ml_dsa_pk, 1)
-                .unwrap_err();
+        let err = verify_batch_signature_for_generation(&envelope, &ed25519_pk, &ml_dsa_pk, 1)
+            .unwrap_err();
         match err {
             CoreError::StaleKeyGeneration { envelope_gen, registry_gen, .. } => {
                 assert_eq!(envelope_gen, 0);

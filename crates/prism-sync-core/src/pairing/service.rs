@@ -14,6 +14,9 @@ use crate::bootstrap::{
 };
 use crate::epoch::EpochManager;
 use crate::error::{CoreError, Result};
+use crate::pairing::lease::{
+    wait_for_pairing_slot_with_policy, LeasePollBackoff, PairingLeaseHandle, VerifiedInitiatorState,
+};
 use crate::pairing::models::*;
 use crate::relay::pairing_relay::{PairingRelay, PairingSlot};
 use crate::relay::traits::{
@@ -388,11 +391,22 @@ impl PairingService {
     where
         F: FnOnce(&str, &str, Option<&str>) -> Result<Arc<dyn SyncRelay>> + Send,
     {
-        // Publish our confirmation MAC before accepting credentials.
-        let confirmation_mac = ceremony.confirmation_mac()?;
+        // Negotiate the optional lease before publishing our confirmation.
+        //
+        // The initiator posts its capability *before* `pairing_init`, and the
+        // caller has already processed and authenticated that message, so the
+        // slot is present here with no empty-slot race. A missing slot, an old
+        // relay 404, or a tampered frame all mean no lease — never a ceremony
+        // failure. Only when the relay echo and the authenticated capability
+        // both support v1 does `confirmation_frame` emit the extended protected
+        // payload; otherwise it returns the exact legacy 32-byte MAC.
+        ceremony.verify_lease_capability(relay).await;
+
+        // Publish our confirmation before accepting credentials.
+        let confirmation_frame = ceremony.confirmation_frame()?;
         let rendezvous_id = ceremony.rendezvous_id_hex();
         if let Err(e) =
-            relay.put_slot(&rendezvous_id, PairingSlot::Confirmation, &confirmation_mac).await
+            relay.put_slot(&rendezvous_id, PairingSlot::Confirmation, &confirmation_frame).await
         {
             if !is_pairing_slot_already_written(&e) {
                 return Err(CoreError::from_relay_with_context(Some("posting confirmation"), e));
@@ -405,11 +419,31 @@ impl PairingService {
             match self.secure_store.get(&credential_cache_key)? {
                 Some(cached) => cached,
                 None => {
-                    let bytes = wait_for_pairing_slot_bytes(
+                    // The initiator cannot release credentials until it has
+                    // produced and uploaded the snapshot, so this wait is paced
+                    // by that upload. A ceremony that cryptographically
+                    // negotiated lease v1 may wait through the lease absolute
+                    // cap; every other ceremony keeps the exact legacy deadline,
+                    // so lease support never extends a ceremony that did not
+                    // negotiate it.
+                    let wait_policy = terminal_slot_wait_policy(
+                        ceremony.lease_negotiation(),
+                        "credential bundle",
+                    );
+                    let bytes = wait_for_pairing_slot_with_policy(
                         relay,
                         &rendezvous_id,
                         PairingSlot::Credentials,
                         "credential bundle",
+                        wait_policy,
+                        || {
+                            wait_for_pairing_slot_bytes(
+                                relay,
+                                &rendezvous_id,
+                                PairingSlot::Credentials,
+                                "credential bundle",
+                            )
+                        },
                     )
                     .await?;
                     // Cache the one-shot terminal payload before fallible work.
@@ -671,7 +705,96 @@ impl PairingService {
         InitiatorCeremony::start(token, relay, &device_secret, &device_id).await
     }
 
-    /// Complete the initiator side after SAS confirmation.
+    /// Verify the joiner's confirmation and extract the optional lease secret.
+    ///
+    /// This is the first half of the split initiator ceremony. It waits for the
+    /// confirmation slot, verifies it (legacy MAC or lease v1 extended frame),
+    /// and performs the **initial lease renewal** immediately — no upload
+    /// progress is required for that first renewal.
+    ///
+    /// It returns in-memory [`VerifiedInitiatorState`] plus a
+    /// [`PairingLeaseHandle`] so the caller can produce and upload the snapshot
+    /// (renewing on strict progress, coalesced to one per five minutes) and then
+    /// call [`Self::complete_bootstrap_initiator_split`] to release credentials.
+    ///
+    /// `lease_wait` selects the lease-aware slot wait used when the initiator's
+    /// capability slot was accepted. It is ignored for legacy/fixed-TTL
+    /// ceremonies, which keep their existing fixed-cadence deadline.
+    pub async fn verify_initiator_confirmation(
+        &self,
+        ceremony: &InitiatorCeremony,
+        pairing_relay: &dyn PairingRelay,
+        lease_wait: crate::pairing::lease::LeasePollBackoff,
+    ) -> Result<(VerifiedInitiatorState, crate::pairing::lease::PairingLeaseHandle)> {
+        use crate::pairing::lease::{renew_pairing_lease, LeaseRenewalOutcome, PairingLeaseHandle};
+
+        let rendezvous_id = ceremony.rendezvous_id_hex();
+        let transcript_prefix = diag_prefix(ceremony.transcript_hash());
+
+        // A lease-capable ceremony can wait through the four-hour absolute cap;
+        // a legacy one keeps its existing fixed deadline. Not-found terminates
+        // early either way. The predicate is the same authenticated-negotiation
+        // selector the terminal slot waits use, so all three waits agree on what
+        // "this ceremony negotiated lease v1" means.
+        let confirmation =
+            if terminal_slot_wait_policy(ceremony.lease_negotiation(), "joiner confirmation")
+                .is_lease_aware()
+            {
+                crate::pairing::lease::wait_for_pairing_slot_bytes_with_backoff(
+                    pairing_relay,
+                    &rendezvous_id,
+                    PairingSlot::Confirmation,
+                    "joiner confirmation",
+                    lease_wait,
+                )
+                .await?
+            } else {
+                wait_for_pairing_slot_bytes(
+                    pairing_relay,
+                    &rendezvous_id,
+                    PairingSlot::Confirmation,
+                    "joiner confirmation",
+                )
+                .await?
+            };
+        let confirmation_hash = diag_hash(&confirmation);
+
+        let negotiation =
+            ceremony.verify_joiner_confirmation_frame(&confirmation).map_err(|e| {
+                CoreError::Engine(format!(
+                    "initiator joiner confirmation verification failed; rid={rendezvous_id}; transcript={transcript_prefix}; confirmation_len={}; confirmation_sha={confirmation_hash}; err={e}",
+                    confirmation.len()
+                ))
+            })?;
+
+        let state = ceremony.verified_state();
+        let mut handle = PairingLeaseHandle::new(&state);
+
+        // Initial renewal: one immediate renewal with no upload progress
+        // required. A failure here is nonfatal; the ceremony continues under
+        // the previously established expiry.
+        if handle.is_lease_capable() {
+            let now = std::time::Instant::now();
+            let outcome = match (state.lease_secret(), negotiation.is_v1()) {
+                (Some(secret), true) => {
+                    renew_pairing_lease(pairing_relay, &rendezvous_id, secret).await
+                }
+                _ => LeaseRenewalOutcome::LeaseNotNegotiated,
+            };
+            // Record the outcome without claiming an extension. A terminal
+            // not-found means the rendezvous is gone; the ceremony will fail
+            // naturally on the next slot operation, so it is not fatal here.
+            handle.record_initial_renewal(outcome, now);
+        }
+
+        Ok((state, handle))
+    }
+
+    /// Complete the initiator side after SAS confirmation (legacy one-shot API).
+    ///
+    /// Retained for callers that do not need the split ceremony. It performs
+    /// confirmation verification and the initial lease renewal, then releases
+    /// credentials on the supplied ceremony.
     ///
     /// The `sync_relay` is used for relay operations that require the real
     /// sync_id (e.g., listing devices, posting rekey artifacts). The
@@ -689,7 +812,104 @@ impl PairingService {
     /// `last_imported_registry_version` freshness baseline forward — the
     /// `PairingService` itself has no `SyncStorage` handle, so the ratchet lives
     /// at the call site where storage is available.
+    /// Complete the initiator side in one call (legacy-compatible entry point).
+    ///
+    /// Verifies the joiner's confirmation, performs the initial lease renewal
+    /// when lease v1 was negotiated, releases credentials, and performs the
+    /// final renewal immediately before release. Callers that need to interleave
+    /// the snapshot upload should use [`Self::verify_initiator_confirmation`]
+    /// followed by [`Self::complete_bootstrap_initiator_split`] instead.
     pub async fn complete_bootstrap_initiator(
+        &self,
+        ceremony: &InitiatorCeremony,
+        pairing_relay: &dyn PairingRelay,
+        password: &str,
+        mnemonic: &str,
+        sync_relay: &dyn SyncRelay,
+        storage: &dyn crate::storage::SyncStorage,
+    ) -> Result<i64> {
+        // A lease-capable ceremony may wait through the four-hour absolute cap;
+        // a legacy one keeps its existing fixed deadline. Selection reads the
+        // ceremony's authenticated post-confirmation negotiation state, not the
+        // bare "the relay accepted our capability slot" flag.
+        let lease_wait =
+            if terminal_slot_wait_policy(ceremony.lease_negotiation(), "joiner confirmation")
+                .is_lease_aware()
+            {
+                LeasePollBackoff::for_absolute_cap()
+            } else {
+                LeasePollBackoff::for_legacy_deadline()
+            };
+        let (state, mut handle) =
+            self.verify_initiator_confirmation(ceremony, pairing_relay, lease_wait).await?;
+        self.complete_bootstrap_initiator_split(
+            &state,
+            ceremony,
+            pairing_relay,
+            password,
+            mnemonic,
+            sync_relay,
+            storage,
+            &mut handle,
+        )
+        .await
+    }
+
+    /// Release credentials, performing the final lease renewal first.
+    ///
+    /// The final renewal is exempt from the five-minute coalescing interval so
+    /// the joiner gets a fresh 30-minute window for unlock, registration, epoch
+    /// catch-up, and posting its terminal bundle. Failure is nonfatal: the
+    /// ceremony continues under the expiry already in force.
+    pub async fn complete_bootstrap_initiator_split(
+        &self,
+        _state: &VerifiedInitiatorState,
+        ceremony: &InitiatorCeremony,
+        pairing_relay: &dyn PairingRelay,
+        password: &str,
+        mnemonic: &str,
+        sync_relay: &dyn SyncRelay,
+        storage: &dyn crate::storage::SyncStorage,
+        final_renewal: &mut PairingLeaseHandle,
+    ) -> Result<i64> {
+        if final_renewal.is_lease_capable() && !final_renewal.is_terminal() {
+            let _ = final_renewal.renew(pairing_relay, None, std::time::Instant::now()).await;
+        }
+
+        self.release_initiator_credentials(
+            ceremony,
+            pairing_relay,
+            password,
+            mnemonic,
+            sync_relay,
+            storage,
+        )
+        .await
+    }
+
+    /// Renew the lease for strictly larger acknowledged upload progress.
+    ///
+    /// No-op unless lease v1 was negotiated, the lease is not terminal, the
+    /// committed offset advanced past the last offset that earned a renewal, and
+    /// at least five minutes have elapsed. Returns the renewal outcome.
+    pub async fn renew_lease_for_progress(
+        &self,
+        handle: &mut PairingLeaseHandle,
+        pairing_relay: &dyn PairingRelay,
+        committed_offset: u64,
+    ) -> crate::pairing::lease::LeaseRenewalOutcome {
+        let now = std::time::Instant::now();
+        if !handle.should_renew_for_progress(committed_offset, now) {
+            return handle.last_outcome();
+        }
+        handle.renew(pairing_relay, Some(committed_offset), now).await
+    }
+
+    /// Release credentials to the joiner using retained verified state.
+    ///
+    /// This is the second half of the split ceremony. It performs no lease
+    /// work: the caller has already done the final renewal.
+    pub async fn release_initiator_credentials(
         &self,
         ceremony: &InitiatorCeremony,
         pairing_relay: &dyn PairingRelay,
@@ -701,21 +921,16 @@ impl PairingService {
         let rendezvous_id = ceremony.rendezvous_id_hex();
         let transcript_prefix = diag_prefix(ceremony.transcript_hash());
 
-        // Verify the joiner's confirmation MAC before sending credentials.
-        let confirmation = wait_for_pairing_slot_bytes(
-            pairing_relay,
-            &rendezvous_id,
-            PairingSlot::Confirmation,
-            "joiner confirmation",
-        )
-        .await?;
-        let confirmation_hash = diag_hash(&confirmation);
-        ceremony.verify_joiner_confirmation(&confirmation).map_err(|e| {
-            CoreError::Engine(format!(
-                "initiator joiner confirmation verification failed; rid={rendezvous_id}; transcript={transcript_prefix}; confirmation_len={}; confirmation_sha={confirmation_hash}; err={e}",
-                confirmation.len()
-            ))
-        })?;
+        // Credential release is only permitted after the joiner's confirmation
+        // was verified. The split API verifies earlier; the one-shot API relies
+        // on this gate.
+        if !ceremony.joiner_confirmation_verified() {
+            return Err(CoreError::Engine(
+                "joiner confirmation must be verified before releasing credentials".into(),
+            ));
+        }
+        let confirmation_hash = String::from("verified");
+        let confirmation_len = 0usize;
 
         let (device_secret, device_id) = self.load_current_device_identity()?;
         let signing_key = device_secret.ed25519_keypair(&device_id).map_err(CoreError::Crypto)?;
@@ -1021,11 +1236,28 @@ impl PairingService {
         let joiner_bundle_bytes = match self.secure_store.get(&joiner_bundle_cache_key)? {
             Some(cached) => cached,
             None => {
-                let bytes = wait_for_pairing_slot_bytes(
+                // The joiner cannot post its terminal bundle until it has
+                // imported the credentials, registered, and caught up on epochs,
+                // so this wait is paced by that import. Selection uses this
+                // ceremony's post-confirmation negotiation state, which is only
+                // ever set by an authenticated lease v1 extended confirmation —
+                // never by relay metadata alone.
+                let wait_policy =
+                    terminal_slot_wait_policy(ceremony.lease_negotiation(), "joiner bundle");
+                let bytes = wait_for_pairing_slot_with_policy(
                     pairing_relay,
                     &rendezvous_id,
                     PairingSlot::Joiner,
                     "joiner bundle",
+                    wait_policy,
+                    || {
+                        wait_for_pairing_slot_bytes(
+                            pairing_relay,
+                            &rendezvous_id,
+                            PairingSlot::Joiner,
+                            "joiner bundle",
+                        )
+                    },
                 )
                 .await?;
                 // Cache the one-shot terminal payload before fallible work.
@@ -1044,7 +1276,7 @@ impl PairingService {
             CoreError::Engine(format!(
                 "initiator failed to decrypt joiner bundle; rid={rendezvous_id}; transcript={transcript_prefix}; expected_joiner_device={}; confirmation_len={}; confirmation_sha={confirmation_hash}; joiner_bundle_len={}; joiner_bundle_version={joiner_bundle_version}; joiner_bundle_sha={joiner_bundle_hash}; err={e}",
                 ceremony.joiner_device_id(),
-                confirmation.len(),
+                confirmation_len,
                 joiner_bundle_bytes.len()
             ))
         })?;
@@ -1657,10 +1889,7 @@ pub async fn cleanup_failed_setup(
     // cancelled, not completed). Safe — a post-restart retry uses a fresh
     // rendezvous, so any cached payload is encrypted under a discarded in-memory
     // key and unreachable. Keys reconstructed from markers (no enumeration).
-    for marker in [
-        PAIRING_PENDING_CREDENTIAL_CACHE_KEY,
-        PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY,
-    ] {
+    for marker in [PAIRING_PENDING_CREDENTIAL_CACHE_KEY, PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY] {
         if let Ok(Some(key)) = secure_store.get(marker) {
             let _ = secure_store.delete(&String::from_utf8_lossy(&key));
             let _ = secure_store.delete(marker);
@@ -1697,6 +1926,28 @@ pub async fn cleanup_failed_setup(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Select the wait policy for a user-paced terminal slot wait.
+///
+/// The negotiation state is the ceremony's *authenticated* result: lease v1
+/// requires both the relay's create-time echo and cryptographic verification of
+/// the peer's capability frame. Untrusted relay metadata alone can therefore
+/// never widen a wait — a relay that merely advertises lease support on a
+/// ceremony whose peer did not negotiate it gets the legacy deadline.
+fn terminal_slot_wait_policy(
+    negotiation: crate::pairing::lease::LeaseNegotiation,
+    description: &str,
+) -> crate::pairing::lease::SlotWaitPolicy {
+    let policy = crate::pairing::lease::pairing_slot_wait_policy(negotiation.is_v1());
+    if policy.is_lease_aware() {
+        tracing::debug!(
+            description,
+            negotiated_lease_version = ?negotiation.negotiated_version(),
+            "pairing slot wait is lease-aware after authenticated lease v1 negotiation"
+        );
+    }
+    policy
 }
 
 async fn wait_for_pairing_slot_bytes(
@@ -1900,6 +2151,322 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), b"credential-bundle".to_vec());
+    }
+
+    #[test]
+    fn slot_wait_policy_reads_authenticated_negotiation_state() {
+        // The selector is fed the ceremony's authenticated negotiation, not the
+        // bare "relay accepted our capability" flag. A relay that merely echoes
+        // lease support while the peer never presented a verifiable capability
+        // must not widen any wait.
+        let relay_only = crate::pairing::lease::LeaseNegotiation {
+            relay_lease_version: Some(crate::pairing::lease::LEASE_VERSION_V1),
+            capability: None,
+        };
+        assert!(
+            !terminal_slot_wait_policy(relay_only, "test").is_lease_aware(),
+            "an unauthenticated relay echo alone must not widen a wait"
+        );
+
+        // Unverified/unnegotiated metadata — no echo, no capability — is legacy.
+        assert!(!terminal_slot_wait_policy(
+            crate::pairing::lease::LeaseNegotiation::none(),
+            "test"
+        )
+        .is_lease_aware());
+
+        // Only the fully negotiated v1 result is lease-aware, and it selects the
+        // absolute-cap budget.
+        let v1 = crate::pairing::lease::LeaseNegotiation {
+            relay_lease_version: Some(crate::pairing::lease::LEASE_VERSION_V1),
+            capability: Some(crate::pairing::lease::LeaseCapability::v1()),
+        };
+        assert!(v1.is_v1());
+        let policy = terminal_slot_wait_policy(v1, "test");
+        assert!(policy.is_lease_aware());
+        assert_eq!(
+            policy.deadline(),
+            std::time::Duration::from_secs(crate::pairing::lease::LEASE_ABSOLUTE_CAP_SECS)
+        );
+    }
+
+    /// Drive the real joiner credential-bundle wait to its terminal budget and
+    /// return the resulting error message.
+    ///
+    /// The caller's runtime is paused, so tokio advances virtual time to each
+    /// timer: a wait that would take four real hours finishes instantly while
+    /// still reporting the budget it exhausted. That is what makes the
+    /// production call site's policy observable, rather than only the selector.
+    async fn joiner_credential_wait_error(lease_supported: bool) -> String {
+        let relay = MockPairingRelay::new();
+        if !lease_supported {
+            relay.set_lease_supported(false);
+        }
+        let (joiner, _initiator) = run_lease_ceremony_for_service(&relay).await;
+        let service = PairingService::new(Arc::new(MemStore::default()));
+
+        // The initiator never posts credentials: this wait runs to its budget.
+        // `complete_bootstrap_join` reaches registration only after the slot
+        // lands, so the relay builder is unreachable here.
+        let result = service
+            .complete_bootstrap_join(&joiner, &relay, &[], "bootstrap-password", |_, _, _| {
+                unreachable!("registration is unreachable: the credential slot never lands")
+            })
+            .await;
+        match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the credential slot never lands, so the wait must time out"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joiner_credential_wait_budget_follows_authenticated_negotiation() {
+        // A negotiated ceremony's credential wait is paced by the initiator's
+        // snapshot upload, so it must be able to span the lease absolute cap.
+        let message = joiner_credential_wait_error(true).await;
+        assert!(
+            message.contains("after 14400s"),
+            "a lease v1 credential wait must exhaust the lease absolute cap, got: {message}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joiner_credential_wait_budget_stays_legacy_without_negotiation() {
+        // An old relay never negotiates: the wait keeps its exact legacy
+        // deadline, message, and error surface — the same fixed-cadence helper
+        // the code used before lease support existed.
+        let message = joiner_credential_wait_error(false).await;
+        assert!(
+            message.contains("timed out waiting for credential bundle"),
+            "a non-lease ceremony must keep the legacy timeout message, got: {message}"
+        );
+        assert!(
+            !message.contains("after "),
+            "the legacy path must not report a lease-aware budget, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn joiner_credential_wait_stays_legacy_without_a_verified_capability() {
+        use crate::bootstrap::JoinerCeremony;
+
+        // The relay accepts the capability slot but the initiator never posts a
+        // verifiable frame: an old peer on a new relay. No authenticated
+        // capability exists, so the joiner must keep the legacy deadline.
+        let relay_url = "https://relay.example.com";
+        let mailbox = MockPairingRelay::new();
+        let (joiner, _token) = JoinerCeremony::start(&mailbox, relay_url).await.unwrap();
+        joiner.verify_lease_capability(&mailbox).await;
+
+        let negotiation = joiner.lease_negotiation();
+        assert!(!negotiation.is_v1());
+        // The relay-side echo is present (new relay) but the capability is not.
+        assert_eq!(negotiation.relay_lease_version, Some(crate::pairing::lease::LEASE_VERSION_V1));
+        assert!(negotiation.capability.is_none());
+
+        let policy = terminal_slot_wait_policy(negotiation, "credential bundle");
+        assert!(!policy.is_lease_aware(), "an unverified peer must keep the legacy budget");
+        assert_eq!(policy.deadline(), crate::pairing::lease::LEGACY_SLOT_WAIT_DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn joiner_credential_wait_stays_legacy_on_an_old_relay() {
+        use crate::bootstrap::JoinerCeremony;
+
+        let relay_url = "https://relay.example.com";
+        let mailbox = MockPairingRelay::new();
+        mailbox.set_lease_supported(false);
+        let (mut joiner, token) = JoinerCeremony::start(&mailbox, relay_url).await.unwrap();
+        let initiator_secret = DeviceSecret::generate();
+        let initiator_device_id = crate::node_id::generate_node_id();
+        let (_initiator, _sas) =
+            InitiatorCeremony::start(token, &mailbox, &initiator_secret, &initiator_device_id)
+                .await
+                .unwrap();
+        let init_bytes =
+            wait_for_slot(&mailbox, &joiner.rendezvous_id_hex(), PairingSlot::Init).await;
+        joiner.process_pairing_init(&init_bytes).unwrap();
+        joiner.verify_lease_capability(&mailbox).await;
+
+        let negotiation = joiner.lease_negotiation();
+        assert!(!negotiation.is_v1());
+        assert_eq!(negotiation.relay_lease_version, None);
+
+        let policy = terminal_slot_wait_policy(negotiation, "credential bundle");
+        assert!(!policy.is_lease_aware(), "an old relay must keep the legacy budget");
+        assert_eq!(policy.deadline(), crate::pairing::lease::LEGACY_SLOT_WAIT_DEADLINE);
+    }
+
+    /// Drive the real initiator joiner-bundle wait to its terminal budget and
+    /// return the resulting error message.
+    ///
+    /// [`PairingService::release_initiator_credentials`] reaches this wait at
+    /// exactly the point `complete_bootstrap_initiator` does — after the joiner
+    /// confirmation has been verified and the initial lease renewal recorded —
+    /// so this observes the production call site's policy rather than the
+    /// selector alone. With the runtime paused, tokio advances virtual time to
+    /// each timer, so a four-hour budget finishes instantly while still
+    /// reporting the deadline it exhausted.
+    async fn initiator_joiner_bundle_wait_error(lease_supported: bool) -> String {
+        let relay = MockPairingRelay::new();
+        if !lease_supported {
+            relay.set_lease_supported(false);
+        }
+        let (joiner, initiator) = run_lease_ceremony_for_service(&relay).await;
+        // The authentication step, exactly as `verify_initiator_confirmation`
+        // performs it before the joiner-bundle wait.
+        let _ = initiator
+            .verify_joiner_confirmation_frame(&joiner.confirmation_frame().unwrap())
+            .unwrap();
+
+        let password = "bootstrap-password";
+        let sync_id = "ab".repeat(32);
+        let device_secret = DeviceSecret::generate();
+        let device_id = crate::node_id::generate_node_id();
+        let mnemonic = mnemonic::generate();
+        let secret_key = mnemonic::to_bytes(&mnemonic).unwrap();
+        let mut hierarchy = KeyHierarchy::new();
+        let (wrapped_dek, salt) = hierarchy.initialize(password, &secret_key).unwrap();
+
+        let signing_key = device_secret.ed25519_keypair(&device_id).unwrap();
+        let exchange_key = device_secret.x25519_keypair(&device_id).unwrap();
+        let pq_signing_key = device_secret.ml_dsa_65_keypair(&device_id).unwrap();
+        let pq_kem_key = device_secret.ml_kem_768_keypair(&device_id).unwrap();
+        let xwing_key = device_secret.xwing_keypair(&device_id).unwrap();
+        let registry = Arc::new(BootstrapRegistryRelay::new(vec![DeviceInfo {
+            device_id: device_id.clone(),
+            epoch: 0,
+            status: "active".to_string(),
+            ed25519_public_key: signing_key.public_key_bytes().to_vec(),
+            x25519_public_key: exchange_key.public_key_bytes().to_vec(),
+            ml_dsa_65_public_key: pq_signing_key.public_key_bytes(),
+            ml_kem_768_public_key: pq_kem_key.public_key_bytes(),
+            x_wing_public_key: xwing_key.encapsulation_key_bytes(),
+            permission: None,
+            ml_dsa_key_generation: 0,
+            needs_rekey: false,
+        }]));
+
+        let store = Arc::new(MemStore::default());
+        seed_bootstrap_store(
+            &store,
+            &device_secret,
+            &device_id,
+            &sync_id,
+            "https://relay.example.com",
+            &wrapped_dek,
+            &salt,
+        );
+        let service = PairingService::new(store.clone());
+        let storage = initiator_storage_with_self(&sync_id, &device_secret, &device_id, 0);
+
+        // The joiner never posts its terminal bundle: this wait runs to its
+        // budget.
+        let result = service
+            .release_initiator_credentials(
+                &initiator,
+                &relay,
+                password,
+                &mnemonic,
+                registry.as_ref(),
+                storage.as_ref(),
+            )
+            .await;
+        match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the joiner bundle never lands, so the wait must time out"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_joiner_bundle_wait_budget_follows_authenticated_negotiation() {
+        // The joiner cannot post its bundle until it has imported credentials and
+        // registered, so a negotiated ceremony's wait must span the lease
+        // absolute cap rather than the pre-confirmation legacy deadline.
+        let message = initiator_joiner_bundle_wait_error(true).await;
+        assert!(
+            message.contains("after 14400s"),
+            "a lease v1 initiator wait must exhaust the lease absolute cap, got: {message}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initiator_joiner_bundle_wait_budget_stays_legacy_without_negotiation() {
+        // An old relay never negotiates, so the wait keeps its exact legacy
+        // deadline, message, and error surface. Lease support must not widen it.
+        let message = initiator_joiner_bundle_wait_error(false).await;
+        assert!(
+            message.contains("timed out waiting for joiner bundle"),
+            "a non-lease initiator ceremony must keep the legacy timeout message, got: {message}"
+        );
+        assert!(
+            !message.contains("after "),
+            "the legacy path must not report a lease-aware budget, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_wait_fast_fails_a_definitive_not_found_on_a_lease_aware_budget() {
+        // The policy-driven entry point must terminate on the relay's uniform
+        // not-found rather than spinning out the absolute cap.
+        let relay = MockPairingRelay::new();
+        let started = std::time::Instant::now();
+        let result = wait_for_pairing_slot_with_policy(
+            &relay,
+            "00000000000000000000000000000000",
+            PairingSlot::Credentials,
+            "credential bundle",
+            terminal_slot_wait_policy(
+                crate::pairing::lease::LeaseNegotiation {
+                    relay_lease_version: Some(crate::pairing::lease::LEASE_VERSION_V1),
+                    capability: Some(crate::pairing::lease::LeaseCapability::v1()),
+                },
+                "credential bundle",
+            ),
+            || {
+                wait_for_pairing_slot_bytes(
+                    &relay,
+                    "00000000000000000000000000000000",
+                    PairingSlot::Credentials,
+                    "credential bundle",
+                )
+            },
+        )
+        .await;
+        assert!(result.is_err(), "a definitive not-found must surface as an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a definitive not-found must fast-fail, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_wait_uses_the_legacy_cadence_when_no_lease_was_negotiated() {
+        // The legacy arm must actually be the legacy fixed-cadence wait: a slot
+        // that appears after several empty polls is returned by reusing that
+        // helper, with no change in behavior.
+        let relay = FlakyPairingRelay::empty_polls_then_ok(5, b"legacy-credential-bundle".to_vec());
+        let result = wait_for_pairing_slot_with_policy(
+            &relay,
+            "rendezvous-hex",
+            PairingSlot::Credentials,
+            "credential bundle",
+            terminal_slot_wait_policy(
+                crate::pairing::lease::LeaseNegotiation::none(),
+                "credential bundle",
+            ),
+            || {
+                wait_for_pairing_slot_bytes(
+                    &relay,
+                    "rendezvous-hex",
+                    PairingSlot::Credentials,
+                    "credential bundle",
+                )
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), b"legacy-credential-bundle".to_vec());
     }
 
     #[test]
@@ -2528,6 +3095,30 @@ mod tests {
             sleep(Duration::from_millis(25)).await;
         }
         panic!("timed out waiting for slot {slot:?}");
+    }
+
+    /// Bring a ceremony to the point where the joiner has authenticated the
+    /// initiator's capability and can emit its confirmation frame.
+    ///
+    /// Shared by the slot-wait policy tests, which need a real, transcript-bound
+    /// negotiation rather than a hand-built metadata value.
+    async fn run_lease_ceremony_for_service(
+        relay: &MockPairingRelay,
+    ) -> (JoinerCeremony, InitiatorCeremony) {
+        let relay_url = "https://relay.example.com";
+        let (mut joiner, token) = JoinerCeremony::start(relay, relay_url).await.unwrap();
+        let initiator_secret = DeviceSecret::generate();
+        let initiator_device_id = crate::node_id::generate_node_id();
+        let (initiator, _sas) =
+            InitiatorCeremony::start(token, relay, &initiator_secret, &initiator_device_id)
+                .await
+                .unwrap();
+
+        let init_bytes = wait_for_slot(relay, &joiner.rendezvous_id_hex(), PairingSlot::Init).await;
+        joiner.process_pairing_init(&init_bytes).unwrap();
+        joiner.verify_lease_capability(relay).await;
+
+        (joiner, initiator)
     }
 
     fn build_v2_artifact(
@@ -3205,10 +3796,7 @@ mod tests {
 
         // Re-recording the SAME key (a same-rid retry) must not purge the live cache.
         service.record_terminal_cache_key(PAIRING_PENDING_JOINER_BUNDLE_CACHE_KEY, &k2);
-        assert!(
-            store.get(&k2).unwrap().is_some(),
-            "same-key re-record must keep the live cache"
-        );
+        assert!(store.get(&k2).unwrap().is_some(), "same-key re-record must keep the live cache");
     }
 
     #[test]

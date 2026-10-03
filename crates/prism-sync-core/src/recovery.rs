@@ -126,7 +126,11 @@ impl EpochRecoverer for KeyHierarchyRecoverer {
         let sync_id = self.sync_id.clone();
         let blob = response.artifact_blob.clone();
         tokio::task::spawn_blocking(move || {
-            DeviceRegistryManager::verify_signed_registry_snapshot(storage.as_ref(), &sync_id, &blob)
+            DeviceRegistryManager::verify_signed_registry_snapshot(
+                storage.as_ref(),
+                &sync_id,
+                &blob,
+            )
         })
         .await
         .map_err(|e| CoreError::Storage(StorageError::Logic(e.to_string())))?

@@ -24,7 +24,10 @@ pub struct WinningOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaQuarantineReason {
     UnknownTable(String),
-    UnknownField { table: String, field: String },
+    UnknownField {
+        table: String,
+        field: String,
+    },
     /// The op's HLC is further in the future than the receiver's drift
     /// tolerance. Deferred (not dropped) and replayed with its ORIGINAL HLC
     /// once the local clock catches up — convergence must not depend on which
@@ -343,15 +346,15 @@ impl MergeEngine {
             // receiver backstop. Effective state = the in-batch winner if any,
             // else the persisted version.
             let is_deleted_key = format!("{}:{}:is_deleted", op.entity_table, op.entity_id);
-            let current_deleted: Option<CrdtChange> =
-                if let Some(bw) = batch_winners.get(&is_deleted_key) {
-                    Some(bw.clone())
-                } else {
-                    get_field_version(sync_id, &op.entity_table, &op.entity_id, "is_deleted")?
-                        .map(|fv| {
-                            field_version_to_change(fv, &op.entity_table, &op.entity_id, "is_deleted")
-                        })
-                };
+            let current_deleted: Option<CrdtChange> = if let Some(bw) =
+                batch_winners.get(&is_deleted_key)
+            {
+                Some(bw.clone())
+            } else {
+                get_field_version(sync_id, &op.entity_table, &op.entity_id, "is_deleted")?.map(
+                    |fv| field_version_to_change(fv, &op.entity_table, &op.entity_id, "is_deleted"),
+                )
+            };
             // NULL/absent counts as a tombstone (defensive default); only an
             // explicit "false" is live.
             let is_tombstoned = current_deleted
@@ -374,8 +377,8 @@ impl MergeEngine {
                         let incoming_true = op.encoded_value == "true";
                         let current_true = is_tombstone_value(Some(cur.encoded_value.as_str()));
                         match (incoming_true, current_true) {
-                            (true, false) => true,  // true absorbs false, any HLC
-                            (false, true) => false, // false never beats a tombstone
+                            (true, false) => true,   // true absorbs false, any HLC
+                            (false, true) => false,  // false never beats a tombstone
                             _ => op.wins_over(cur)?, // same value: HLC tiebreak
                         }
                     }
@@ -559,10 +562,7 @@ mod replay_eligibility_tests {
     #[test]
     fn schema_quarantine_reason_strings_round_trip() {
         assert_eq!(SchemaQuarantineReason::FutureHlc.as_str(), "future_hlc");
-        assert_eq!(
-            SchemaQuarantineReason::UnsupportedBulkReset.as_str(),
-            "unsupported_bulk_reset"
-        );
+        assert_eq!(SchemaQuarantineReason::UnsupportedBulkReset.as_str(), "unsupported_bulk_reset");
     }
 
     #[test]
@@ -598,9 +598,7 @@ mod bulk_reset_tests {
     use crate::schema::SyncType;
 
     fn members_schema() -> SyncSchema {
-        SyncSchema::builder()
-            .entity("members", |e| e.field("name", SyncType::String))
-            .build()
+        SyncSchema::builder().entity("members", |e| e.field("name", SyncType::String)).build()
     }
 
     fn op(op_id: &str, field: &str, hlc_ts: i64) -> CrdtChange {
@@ -665,16 +663,10 @@ mod bulk_reset_tests {
             !outcome.winners.contains_key("op-reset"),
             "bulk reset must never enter the winners map"
         );
-        assert!(
-            outcome.winners.contains_key("op-name"),
-            "replacement rows still win"
-        );
+        assert!(outcome.winners.contains_key("op-name"), "replacement rows still win");
         assert_eq!(outcome.quarantined.len(), 1);
         assert_eq!(outcome.quarantined[0].op.op_id, "op-reset");
-        assert_eq!(
-            outcome.quarantined[0].reason,
-            SchemaQuarantineReason::UnsupportedBulkReset
-        );
+        assert_eq!(outcome.quarantined[0].reason, SchemaQuarantineReason::UnsupportedBulkReset);
     }
 }
 
@@ -685,9 +677,7 @@ mod backfill_merge_tests {
     use crate::schema::SyncType;
 
     fn schema() -> SyncSchema {
-        SyncSchema::builder()
-            .entity("members", |e| e.field("name", SyncType::String))
-            .build()
+        SyncSchema::builder().entity("members", |e| e.field("name", SyncType::String)).build()
     }
 
     fn change(op_id: &str, hlc_ts: i64, device: &str, value: &str) -> CrdtChange {
@@ -722,10 +712,7 @@ mod backfill_merge_tests {
         let backfill = change("op-backfill", BACKFILL_HLC_TIMESTAMP_MS, "dev-a", "Backfill");
         let fresh = change("op-fresh", crate::hlc::Hlc::now_ms(), "dev-b", "Real");
 
-        for ops in [
-            vec![backfill.clone(), fresh.clone()],
-            vec![fresh.clone(), backfill.clone()],
-        ] {
+        for ops in [vec![backfill.clone(), fresh.clone()], vec![fresh.clone(), backfill.clone()]] {
             let winners = engine
                 .determine_winners(&ops, &no_field_versions, &no_ops_applied, "sync-1")
                 .unwrap();
@@ -753,9 +740,8 @@ mod backfill_merge_tests {
         let get_fv = |_: &str, _: &str, _: &str, _: &str| Ok(Some(existing.clone()));
 
         let backfill = change("op-backfill", BACKFILL_HLC_TIMESTAMP_MS, "dev-a", "Backfill");
-        let winners = engine
-            .determine_winners(&[backfill], &get_fv, &no_ops_applied, "sync-1")
-            .unwrap();
+        let winners =
+            engine.determine_winners(&[backfill], &get_fv, &no_ops_applied, "sync-1").unwrap();
         assert!(winners.is_empty(), "backfill must not beat an existing winner");
     }
 
@@ -768,7 +754,12 @@ mod backfill_merge_tests {
         let b = change("op-b", BACKFILL_HLC_TIMESTAMP_MS, "dev-b", "FromB");
 
         let forward = engine
-            .determine_winners(&[a.clone(), b.clone()], &no_field_versions, &no_ops_applied, "sync-1")
+            .determine_winners(
+                &[a.clone(), b.clone()],
+                &no_field_versions,
+                &no_ops_applied,
+                "sync-1",
+            )
             .unwrap();
         let reverse = engine
             .determine_winners(&[b, a], &no_field_versions, &no_ops_applied, "sync-1")
