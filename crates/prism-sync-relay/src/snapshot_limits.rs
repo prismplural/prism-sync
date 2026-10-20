@@ -22,11 +22,16 @@ pub const MAX_SNAPSHOT_COMPRESSED_BYTES: usize = 100 * 1024 * 1024;
 /// `body.len()` check inside the handler.
 pub const MAX_SNAPSHOT_WIRE_BYTES: usize = 150 * 1024 * 1024;
 
-/// Maximum concurrent unexpired *targeted* snapshot rows per sync group. Each
-/// can hold up to `MAX_SNAPSHOT_WIRE_BYTES`, so this caps the relay storage a
-/// pathological burst of simultaneous pairings can consume. A fresh targeted
-/// audience beyond this is rejected with 409 (existing audiences still update).
+/// Concurrent admission is separate from retained-storage limits.
 pub const MAX_TARGETED_SNAPSHOTS_PER_GROUP: i64 = 4;
+
+/// Older unregistered targets release slots but retain snapshots and bootstrap tails.
+pub const TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS: i64 = 30 * 60;
+
+/// Preserve the previous payload budget while allowing more small abandoned attempts.
+pub const MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP: i64 = 32;
+pub const MAX_RETAINED_TARGETED_SNAPSHOT_BYTES: u64 =
+    MAX_SNAPSHOT_WIRE_BYTES as u64 * MAX_TARGETED_SNAPSHOTS_PER_GROUP as u64;
 
 /// TTL (seconds) the relay applies to a targeted snapshot uploaded without an
 /// explicit `X-Snapshot-TTL`. Targeted rows are pair-time bootstrap blobs that

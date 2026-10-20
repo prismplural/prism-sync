@@ -19,6 +19,500 @@ use prism_sync_relay::snapshot_limits::{
 
 use common::*;
 
+#[test]
+fn signature_and_activity_waiters_leave_capacity_in_the_blocking_pool() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use prism_sync_relay::{db::Database, state::AppState};
+            use std::sync::Arc;
+            let config = test_config();
+            let storage = config.resolve_snapshot_storage(false).unwrap();
+            let mut state =
+                AppState::with_snapshot_storage(Database::in_memory().unwrap(), config, storage);
+            state.signature_verification_work = Arc::new(tokio::sync::Semaphore::new(1));
+            state.activity_touch_work = Arc::new(tokio::sync::Semaphore::new(1));
+            let (url, server, db, _) = start_test_relay_with_app_state(state).await;
+            let client = Client::new();
+            let group = generate_sync_id();
+            let device = generate_device_id();
+            let keys = TestDeviceKeys::generate(&device);
+            let token = register_device(&client, &url, &group, &device, &keys).await;
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = tokio::task::spawn_blocking(move || {
+                db.with_conn(|_| {
+                    let _ = held_tx.send(());
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                    Ok::<(), rusqlite::Error>(())
+                })
+                .unwrap();
+            });
+            held_rx.await.unwrap();
+            let targets: Vec<_> = (0..3).map(|_| generate_device_id()).collect();
+            let requests = futures::future::join_all(targets.iter().map(|target| async {
+                put_snapshot_signed(
+                    &client,
+                    &url,
+                    &group,
+                    &device,
+                    &token,
+                    &keys,
+                    "1",
+                    b"bootstrap".to_vec(),
+                    &[("X-For-Device-Id", target)],
+                )
+                .await
+            }));
+            tokio::pin!(requests);
+            tokio::select! {
+                _=&mut requests=>panic!("writes completed while the writer was held"),
+                _=tokio::time::sleep(std::time::Duration::from_millis(150))=>{}
+            }
+            let independent = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::task::spawn_blocking(|| 42),
+            )
+            .await;
+            let _ = release_tx.send(());
+            let responses = requests.await;
+            holder.await.unwrap();
+            assert_eq!(independent.expect("writer waiters exhausted the shared pool").unwrap(), 42);
+            for response in responses {
+                assert_eq!(response.status(), 204);
+            }
+            server.abort();
+        });
+}
+
+#[tokio::test]
+async fn node_proxy_is_bounded_without_blocking_cached_metrics() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let started = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let started_handler = started.clone();
+    let gate_handler = gate.clone();
+    let upstream = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let started = started_handler.clone();
+            let gate = gate_handler.clone();
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _permit = gate.acquire_owned().await.unwrap();
+                "node_value 1\n"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let mut config = test_config();
+    config.node_exporter_url = Some(format!("http://{address}"));
+    let (url, server, _) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    let mut requests = Vec::new();
+    for _ in 0..6 {
+        let client = client.clone();
+        let url = url.clone();
+        requests.push(tokio::spawn(async move {
+            client.get(format!("{url}/metrics/node")).send().await.unwrap()
+        }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(started.load(Ordering::SeqCst), 4);
+    let cached = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.get(format!("{url}/metrics")).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(cached.status(), 200);
+    gate.add_permits(6);
+    for request in requests {
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+        assert_eq!(response.text().await.unwrap(), "node_value 1\n");
+    }
+    server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn node_proxy_rejects_oversized_length_and_chunked_responses() {
+    for chunked in [false, true] {
+        let upstream = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || async move {
+                let body =
+                    if chunked {
+                        axum::body::Body::from_stream(futures::stream::iter([
+                            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![b'x'; 8 * 1024 * 1024],
+                            )),
+                            Ok(axum::body::Bytes::from_static(b"x")),
+                        ]))
+                    } else {
+                        axum::body::Body::from(vec![b'x'; 8 * 1024 * 1024 + 1])
+                    };
+                axum::response::Response::new(body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let mut config = test_config();
+        config.node_exporter_url = Some(format!("http://{address}"));
+        let (url, server, _) = start_test_relay_with_config(config).await;
+        let client = Client::new();
+        let response = client.get(format!("{url}/metrics/node")).send().await.unwrap();
+        assert_eq!(response.status(), 500, "chunked={chunked}");
+        assert_eq!(client.get(format!("{url}/metrics")).send().await.unwrap().status(), 200);
+        server.abort();
+        upstream_server.abort();
+    }
+}
+
+#[tokio::test]
+async fn abandoned_pairing_snapshots_stop_blocking_retries_without_losing_payloads() {
+    use prism_sync_relay::snapshot_limits::TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS;
+    for file_backed in [false, true] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (config, snapshot_root) = storage_under_tmp(tmp.path());
+        let (url, server, db) = if file_backed {
+            start_file_backed_test_relay_with_config(config).await
+        } else {
+            start_test_relay_with_config(config).await
+        };
+        let client = Client::new();
+        let group = generate_sync_id();
+        let uploader = generate_device_id();
+        let keys = TestDeviceKeys::generate(&uploader);
+        let token = register_device(&client, &url, &group, &uploader, &keys).await;
+        let old_targets: Vec<_> =
+            (0..MAX_TARGETED_SNAPSHOTS_PER_GROUP).map(|_| generate_device_id()).collect();
+        for target in &old_targets {
+            assert_eq!(
+                put_snapshot_signed(
+                    &client,
+                    &url,
+                    &group,
+                    &uploader,
+                    &token,
+                    &keys,
+                    "1",
+                    b"retained-bootstrap".to_vec(),
+                    &[("X-For-Device-Id", target)]
+                )
+                .await
+                .status(),
+                204
+            );
+        }
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE snapshots SET created_at=?1 WHERE sync_id=?2",
+                rusqlite::params![
+                    db::now_secs() - TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS - 1,
+                    group
+                ],
+            )?;
+            if file_backed {
+                let sized: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM snapshots WHERE sync_id=?1 AND blob_bytes=18",
+                    [&group],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(sized, 4, "wire lengths must be persisted for real file-backed PUTs");
+            }
+            Ok(())
+        })
+        .unwrap();
+        let new_target = generate_device_id();
+        let response = put_snapshot_signed(
+            &client,
+            &url,
+            &group,
+            &uploader,
+            &token,
+            &keys,
+            "2",
+            b"new-bootstrap".to_vec(),
+            &[("X-For-Device-Id", &new_target)],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            204,
+            "abandoned attempts must not block a new pair (file_backed={file_backed})"
+        );
+        db.with_read_conn(|conn| {
+            assert_eq!(db::get_min_unexpired_snapshot_seq(conn, &group)?, Some(1));
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM snapshots WHERE sync_id=?1", [&group], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(count, 5);
+            Ok(())
+        })
+        .unwrap();
+        if file_backed {
+            assert_eq!(snapshot_files(&snapshot_root, &group).len(), 5);
+        }
+        let (late_token, _) = prepare_device(&db, &group, &old_targets[0]).await;
+        let response = client
+            .get(format!("{url}/v1/sync/{group}/snapshot"))
+            .bearer_auth(late_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let snapshot: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            BASE64.decode(snapshot["data"].as_str().unwrap()).unwrap(),
+            b"retained-bootstrap"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn retained_snapshot_quota_returns_storage_status_without_removing_payloads() {
+    use prism_sync_relay::snapshot_limits::{
+        MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP, TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS,
+    };
+    let (url, server, db) = start_test_relay().await;
+    let client = Client::new();
+    let group = generate_sync_id();
+    let uploader = generate_device_id();
+    let keys = TestDeviceKeys::generate(&uploader);
+    let token = register_device(&client, &url, &group, &uploader, &keys).await;
+    db.with_conn(|conn| {
+        for _ in 0..MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP {
+            db::upsert_snapshot(
+                conn,
+                &group,
+                0,
+                1,
+                b"retained",
+                Some(db::now_secs() + 86400),
+                Some(&generate_device_id()),
+                Some(&uploader),
+            )?;
+        }
+        conn.execute(
+            "UPDATE snapshots SET created_at=?1 WHERE sync_id=?2",
+            rusqlite::params![db::now_secs() - TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS - 1, group],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let target = generate_device_id();
+    let response = put_snapshot_signed(
+        &client,
+        &url,
+        &group,
+        &uploader,
+        &token,
+        &keys,
+        "2",
+        b"fresh".to_vec(),
+        &[("X-For-Device-Id", &target)],
+    )
+    .await;
+    assert_eq!(response.status(), 507);
+    assert!(response.text().await.unwrap().contains("retained row quota"));
+    db.with_read_conn(|conn| {
+        let (count, bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*),SUM(LENGTH(data)) FROM snapshots WHERE sync_id=?1",
+            [&group],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(count, MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP);
+        assert_eq!(bytes, count * 8);
+        Ok(())
+    })
+    .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn expired_file_backed_rows_do_not_block_admission_before_cleanup() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (config, root) = storage_under_tmp(tmp.path());
+    let (url, server, db) = start_file_backed_test_relay_with_config(config).await;
+    let client = Client::new();
+    let group = generate_sync_id();
+    let uploader = generate_device_id();
+    let keys = TestDeviceKeys::generate(&uploader);
+    let token = register_device(&client, &url, &group, &uploader, &keys).await;
+    for _ in 0..4 {
+        let target = generate_device_id();
+        assert_eq!(
+            put_snapshot_signed(
+                &client,
+                &url,
+                &group,
+                &uploader,
+                &token,
+                &keys,
+                "1",
+                b"retained".to_vec(),
+                &[("X-For-Device-Id", &target)]
+            )
+            .await
+            .status(),
+            204
+        );
+    }
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE snapshots SET expires_at=?1 WHERE sync_id=?2",
+            rusqlite::params![db::now_secs() - 1, group],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let target = generate_device_id();
+    assert_eq!(
+        put_snapshot_signed(
+            &client,
+            &url,
+            &group,
+            &uploader,
+            &token,
+            &keys,
+            "2",
+            b"fresh".to_vec(),
+            &[("X-For-Device-Id", &target)]
+        )
+        .await
+        .status(),
+        204
+    );
+    assert_eq!(
+        snapshot_files(&root, &group).len(),
+        5,
+        "admission must not delete the expired payloads"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn signed_request_does_not_starve_runtime_while_writer_held() {
+    let (url, server, db) = start_test_relay().await;
+    let client = Client::new();
+    let group = generate_sync_id();
+    let device = generate_device_id();
+    let keys = TestDeviceKeys::generate(&device);
+    let token = register_device(&client, &url, &group, &device, &keys).await;
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let hold_db = db.clone();
+    let holder = tokio::task::spawn_blocking(move || {
+        hold_db
+            .with_conn(|_| {
+                let _ = held_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                Ok::<(), rusqlite::Error>(())
+            })
+            .unwrap();
+    });
+    held_rx.await.unwrap();
+    let started = std::time::Instant::now();
+    let signed = put_snapshot_signed(
+        &client,
+        &url,
+        &group,
+        &device,
+        &token,
+        &keys,
+        "1",
+        b"bootstrap".to_vec(),
+        &[],
+    );
+    let heartbeat = async {
+        let mut ticks = 0;
+        while started.elapsed() < std::time::Duration::from_millis(1300) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ticks += 1;
+        }
+        ticks
+    };
+    let (response, ticks) = tokio::join!(signed, heartbeat);
+    holder.await.unwrap();
+    assert!(ticks >= 10, "runtime advanced only {ticks} heartbeat ticks behind a held writer");
+    assert_eq!(response.status(), 204);
+    server.abort();
+}
+
+#[tokio::test]
+async fn monitoring_remains_available_when_the_request_gate_is_full() {
+    let mut config = test_config();
+    config.default_request_concurrency = 1;
+    let (url, server, _, state) = start_test_relay_with_state(config).await;
+    let client = Client::new();
+    let hold_db = state.db.clone();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let holder = tokio::task::spawn_blocking(move || {
+        hold_db
+            .with_conn(|_| {
+                let _ = held_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                Ok::<(), rusqlite::Error>(())
+            })
+            .unwrap();
+    });
+    held_rx.await.unwrap();
+    let request = client
+        .post(format!("{url}/v1/pairing"))
+        .json(&serde_json::json!({"joiner_bootstrap":"YQ=="}))
+        .send();
+    tokio::pin!(request);
+    tokio::select! {
+        _ = &mut request => panic!("pairing write completed while writer held"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+    }
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        client.get(format!("{url}/health")).send(),
+    )
+    .await
+    .expect("health must bypass a full default request gate")
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    let metrics = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        client.get(format!("{url}/metrics")).send(),
+    )
+    .await
+    .expect("metrics auth must bypass a full default request gate")
+    .unwrap();
+    assert!(metrics.status().is_success() || metrics.status() == 401);
+    assert_eq!(request.await.unwrap().status(), 201);
+    holder.await.unwrap();
+    server.abort();
+}
+
 // ───────────────── File-backed snapshot blob tests ─────────────────
 //
 // The relay stores snapshot bytes on disk (like media) and keeps only a

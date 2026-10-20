@@ -387,6 +387,10 @@ pub struct AppState {
     pub upload_chunk_work: Arc<Semaphore>,
     pub upload_completion_work: Arc<Semaphore>,
     pub upload_control_work: Arc<Semaphore>,
+    pub node_metrics_http_client: reqwest::Client,
+    /// Bound writer waiters before spawning; hold permits through cancellation.
+    pub signature_verification_work: Arc<Semaphore>,
+    pub activity_touch_work: Arc<Semaphore>,
     pub ws_upgrade_rate_limiter: RateLimiter,
     pub sharing_fetch_rate_limiter: RateLimiter,
     pub sharing_init_rate_limiter: RateLimiter,
@@ -484,6 +488,9 @@ impl AppState {
 
         Self {
             db: Arc::new(db),
+            node_metrics_http_client: reqwest::Client::new(),
+            signature_verification_work: Arc::new(Semaphore::new(16)),
+            activity_touch_work: Arc::new(Semaphore::new(16)),
             upload_chunk_work: Arc::new(Semaphore::new(config.snapshot_upload_chunk_concurrency())),
             upload_completion_work: Arc::new(Semaphore::new(
                 config.snapshot_upload_concurrency.max(1),

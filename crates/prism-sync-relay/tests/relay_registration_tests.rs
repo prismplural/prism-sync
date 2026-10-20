@@ -1797,7 +1797,7 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
     let client = Client::new();
     let sync_id = generate_sync_id();
     let device_id = generate_device_id();
-    let other_device_id = generate_device_id();
+    let mut other_device_id = generate_device_id();
     let test_keys = TestDeviceKeys::generate(&device_id);
     let signing_key = &test_keys.ed25519_signing_key;
 
@@ -1807,6 +1807,12 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
     let nonce_json: Value = nonce_resp.json().await.unwrap();
     let nonce = nonce_json["nonce"].as_str().unwrap();
     let pow_solution = pow_solution_from_nonce_json(&sync_id, &device_id, &nonce_json).unwrap();
+    // An 8-bit puzzle can accept the same counter for another device by chance.
+    let counter = pow_solution["counter"].as_u64().unwrap();
+    while is_first_device_pow_valid(&sync_id, &other_device_id, nonce, counter, 8) {
+        other_device_id = generate_device_id();
+    }
+
     let other_device_sig_ml_dsa_kp = test_keys.device_secret.ml_dsa_65_keypair(&device_id).unwrap();
 
     let other_device_sig = sign_hybrid_challenge(
@@ -1851,7 +1857,9 @@ async fn test_first_device_pow_is_bound_to_device_and_nonce() {
     let second_nonce_json: Value = nonce_resp.json().await.unwrap();
     let second_nonce = second_nonce_json["nonce"].as_str().unwrap();
     assert_ne!(first_nonce, second_nonce);
-    while is_first_device_pow_valid(&sync_id, &device_id, second_nonce, replay_counter, 8) {
+    while !is_first_device_pow_valid(&sync_id, &device_id, &first_nonce, replay_counter, 8)
+        || is_first_device_pow_valid(&sync_id, &device_id, second_nonce, replay_counter, 8)
+    {
         replay_counter += 1;
     }
     replay_pow_solution["counter"] = serde_json::json!(replay_counter);

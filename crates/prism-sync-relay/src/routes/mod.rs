@@ -47,7 +47,37 @@ pub struct AuthIdentity {
     pub prev_ml_dsa_65_public_key: Option<Vec<u8>>,
 }
 
-pub(crate) fn verify_signed_request(
+/// SQLite writer waits must stay off async workers. Cancellation may consume
+/// a nonce, so retries need a fresh one.
+pub(crate) async fn verify_signed_request(
+    state: &AppState,
+    auth_identity: &AuthIdentity,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    body: impl Into<axum::body::Bytes> + Send,
+) -> Result<(), AppError> {
+    let permit = state
+        .signature_verification_work
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Internal("Verification admission closed".into()))?;
+    let state = state.clone();
+    let auth_identity = auth_identity.clone();
+    let headers = headers.clone();
+    let method = method.to_owned();
+    let path = path.to_owned();
+    let body = body.into();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_signed_request_blocking(&state, &auth_identity, &headers, &method, &path, &body)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Signed-request verification task failed: {e}")))?
+}
+
+fn verify_signed_request_blocking(
     state: &AppState,
     auth_identity: &AuthIdentity,
     headers: &HeaderMap,
@@ -206,7 +236,7 @@ pub(crate) fn client_ip_for_rate_limit(
     }
 
     if is_trusted_proxy(peer_addr.ip(), &config.trusted_proxy_cidrs) {
-        if let Some(ip) = forwarded_client_ip(headers) {
+        if let Some(ip) = forwarded_client_ip(headers, &config.trusted_proxy_cidrs) {
             return ip.to_string();
         }
     }
@@ -214,29 +244,34 @@ pub(crate) fn client_ip_for_rate_limit(
     peer_addr.ip().to_string()
 }
 
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    header_ip(headers, "cf-connecting-ip")
-        .or_else(|| header_ip(headers, "x-forwarded-for"))
-        .or_else(|| forwarded_header_ip(headers))
-}
-
-fn header_ip(headers: &HeaderMap, header_name: &'static str) -> Option<IpAddr> {
-    headers
-        .get(header_name)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .and_then(parse_ip_candidate)
-}
-
-fn forwarded_header_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    let value = headers.get("forwarded").and_then(|v| v.to_str().ok())?;
-    for element in value.split(',') {
-        for part in element.split(';') {
-            let Some((name, raw_value)) = part.trim().split_once('=') else {
-                continue;
-            };
-            if name.trim().eq_ignore_ascii_case("for") {
-                return parse_ip_candidate(raw_value);
+fn forwarded_client_ip(headers: &HeaderMap, trusted: &[String]) -> Option<IpAddr> {
+    // Trusted proxies must overwrite CF-Connecting-IP or strip it before
+    // appending XFF/Forwarded; otherwise clients could spoof their identity.
+    if let Some(value) = headers.get_all("cf-connecting-ip").iter().next_back() {
+        return value.to_str().ok().and_then(parse_ip_candidate);
+    }
+    if headers.contains_key("x-forwarded-for") {
+        let values: Vec<_> = headers.get_all("x-forwarded-for").iter().collect();
+        for value in values.into_iter().rev() {
+            for raw in value.to_str().ok()?.split(',').rev() {
+                let ip = parse_ip_candidate(raw)?;
+                if !is_trusted_proxy(ip, trusted) {
+                    return Some(ip);
+                }
+            }
+        }
+        return None;
+    }
+    let values: Vec<_> = headers.get_all("forwarded").iter().collect();
+    for value in values.into_iter().rev() {
+        for element in value.to_str().ok()?.split(',').rev() {
+            let raw = element.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                name.trim().eq_ignore_ascii_case("for").then_some(value)
+            })?;
+            let ip = parse_ip_candidate(raw)?;
+            if !is_trusted_proxy(ip, trusted) {
+                return Some(ip);
             }
         }
     }
@@ -467,12 +502,19 @@ pub fn router(state: AppState) -> Router {
     let default_timeout_routes = Router::new()
         .merge(public_routes)
         .merge(authenticated_routes)
+        .layer(GlobalConcurrencyLimitLayer::new(default_request_concurrency))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(default_request_timeout_secs),
+        ));
+
+    // Keep liveness and cached metrics available when ordinary requests saturate.
+    let monitoring_routes = Router::new()
         .merge(metrics::routes())
         .route(
             "/health",
             axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         )
-        .layer(GlobalConcurrencyLimitLayer::new(default_request_concurrency))
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(default_request_timeout_secs),
@@ -488,6 +530,7 @@ pub fn router(state: AppState) -> Router {
     // light routes.
     Router::new()
         .merge(default_timeout_routes)
+        .merge(monitoring_routes)
         .merge(snapshot_put_route)
         .merge(media_routes)
         .merge(uploads::routes(state.clone()))
@@ -691,8 +734,13 @@ async fn auth_middleware(
             let db_write = state.db.clone();
             let sid = identity.sync_id.clone();
             let did = identity.device_id.clone();
+            let touch_work = state.activity_touch_work.clone();
             tokio::spawn(async move {
+                let Ok(permit) = touch_work.acquire_owned().await else {
+                    return;
+                };
                 let _ = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     db_write.with_conn(|conn| {
                         db::touch_session(conn, &sid, &did, session_expiry, session_max_age)?;
                         // Reactivate a returning 'stale' device. The status guard
@@ -801,6 +849,45 @@ mod allowlist_tests {
                 !is_revoked_device_registry_read(&Method::GET, path),
                 "path {path} must NOT be allowlisted"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod forwarded_identity_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn proxy_chains_use_the_nearest_untrusted_hop_and_fail_closed() {
+        let trusted = vec!["127.0.0.0/8".into()];
+        type HeaderCase = (Vec<(&'static str, &'static str)>, Option<IpAddr>);
+        let cases: Vec<HeaderCase> = vec![
+            (
+                vec![
+                    ("x-forwarded-for", "192.0.2.1"),
+                    ("x-forwarded-for", "198.51.100.10, 127.0.0.2"),
+                ],
+                Some("198.51.100.10".parse().unwrap()),
+            ),
+            (vec![("x-forwarded-for", "127.0.0.1, 127.0.0.2")], None),
+            (vec![("x-forwarded-for", "192.0.2.1, invalid")], None),
+            (
+                vec![("forwarded", "for=\"[2001:db8::1]:443\"")],
+                Some("2001:db8::1".parse().unwrap()),
+            ),
+            (vec![("x-forwarded-for", "invalid"), ("forwarded", "for=192.0.2.1")], None),
+            (
+                vec![("cf-connecting-ip", "192.0.2.1"), ("cf-connecting-ip", "198.51.100.10")],
+                Some("198.51.100.10".parse().unwrap()),
+            ),
+        ];
+        for (values, expected) in cases {
+            let mut headers = HeaderMap::new();
+            for (key, value) in values {
+                headers.append(key, HeaderValue::from_str(value).unwrap());
+            }
+            assert_eq!(forwarded_client_ip(&headers, &trusted), expected);
         }
     }
 }

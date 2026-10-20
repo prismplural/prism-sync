@@ -33,7 +33,7 @@ All configuration via environment variables:
 | MEDIA_UPLOAD_CONCURRENCY | 32 | Max in-flight media uploads/downloads (must be ≥ 1) |
 | MEDIA_STORAGE_PATH | data/media | Root for media and (derived) snapshot blobs. In containers set an explicit absolute path on the persistent mount, e.g. `/data/media`. |
 | SNAPSHOT_FILE_BACKING_ENABLED | (unset) | Set `true` to enable file-backed snapshot writes and require an absolute, writable persistent root. Unset or `false` keeps new snapshots inline in SQLite, even with a valid root; existing blob files remain readable. |
-| TRUSTED_PROXY_CIDRS | (none) | Comma-separated CIDRs of reverse proxies/tunnels whose forwarded client-IP headers (`CF-Connecting-IP`, `X-Forwarded-For`, `Forwarded`) are trusted. Required before enabling `PAIRING_LEASE_ENABLED` in a proxy-fronted deployment. |
+| TRUSTED_PROXY_CIDRS | (none) | List every trusted intermediate proxy hop, not only the immediate peer. Comma-separated CIDRs of reverse proxies/tunnels whose forwarded client-IP headers (`CF-Connecting-IP`, `X-Forwarded-For`, `Forwarded`) are trusted. Required before enabling `PAIRING_LEASE_ENABLED` in a proxy-fronted deployment. |
 | PAIRING_LEASE_ENABLED | false | Offer the opaque pairing lease (v1). Dark by default. When `false`, a create request that offers lease metadata is downgraded to a fixed-TTL session with no `lease_version` echo, and `/lease/renew` returns the uniform not-found. |
 | PAIRING_LEASE_MAX_CONCURRENT_SESSIONS | 256 | Global cap on concurrently leased pairing rows. Renewal of an already-leased row is never blocked by this cap. |
 | PAIRING_LEASE_RENEW_RATE_LIMIT | 120 | Max lease renewals per trusted-proxy-derived client IP per window. |
@@ -122,6 +122,25 @@ Contract summary.
   documented single-replica contract. Do not run multiple relay writers against one database
   and storage volume.
 
+### Snapshot retention
+
+Pair-time snapshots have separate admission and retention bounds. At most four
+registered or recently unregistered target audiences occupy concurrent pairing
+slots. An unregistered audience older than thirty minutes stops occupying a
+slot; its snapshot stays readable until its existing expiry, and its bootstrap
+tail remains protected from pruning. Admission never deletes the old payload.
+Unexpired targeted rows are additionally limited to 32 rows and a 600 MiB
+payload budget per group. New file-backed rows record their verified wire size;
+legacy rows without size metadata are charged the full 150 MiB maximum.
+Ordinary PUTs and resumable
+publication enforce the same policy under the database writer lock.
+
+Signature verification and asynchronous activity touches each admit at most 16
+blocking jobs before entering Tokio's shared blocking pool. Their permits remain
+held if an HTTP request is cancelled while its blocking work continues. Cached
+metrics and health have independent admission; the node-exporter proxy has its
+own four-request cap and request timeout.
+
 ### Devices
 - `GET /v1/sync/{sync_id}/devices` — List devices with public keys
 - `DELETE /v1/sync/{sync_id}/devices/{device_id}` — Revoke or deregister
@@ -170,3 +189,10 @@ DB rows have diverged (e.g. a restore that missed the blob tree).
 ## Security
 
 The relay only sees ciphertext — it stores encrypted blobs and never reads plaintext data. Authentication uses per-device session tokens issued via Ed25519 challenge-response.
+
+Trusted proxies must overwrite `CF-Connecting-IP` before forwarding it, or strip
+it when using appended `X-Forwarded-For`/`Forwarded` chains. Those chains are
+resolved from the right, skipping known trusted hops; malformed boundary entries
+fall back to the immediate peer. Never allow a direct untrusted peer to assert
+an original-client identity. The node metrics proxy caps each body at 8 MiB,
+including chunked responses, and reuses an HTTP client.

@@ -46,7 +46,7 @@ pub async fn push_changes(
     }
 
     let path = format!("/v1/sync/{}/changes", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "PUT", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "PUT", &path, body.clone()).await?;
 
     if body.len() > MAX_CHANGESET_SIZE {
         return Err(AppError::PayloadTooLarge("Batch exceeds 1 MB limit"));
@@ -426,7 +426,8 @@ pub async fn delete_snapshot(
     }
 
     let path = format!("/v1/sync/{}/snapshot", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "DELETE", &path, &[])?;
+    verify_signed_request(&state, &auth, &headers, "DELETE", &path, axum::body::Bytes::new())
+        .await?;
 
     let db = state.db.clone();
     let sid = auth.sync_id.clone();
@@ -491,7 +492,7 @@ pub async fn put_snapshot(
     }
 
     let path = format!("/v1/sync/{}/snapshot", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "PUT", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "PUT", &path, body.clone()).await?;
 
     let server_seq_at = headers
         .get("X-Server-Seq-At")
@@ -537,26 +538,31 @@ pub async fn put_snapshot(
         "Put snapshot request"
     );
 
-    // Preflight cap reject (read-only) BEFORE writing the bytes to disk: a fresh
-    // targeted audience beyond the cap would be rejected by the authoritative
-    // atomic check below anyway, so reject it here to avoid persisting up to
-    // 150 MB only to delete it. This is an optimization, not the guard — the
-    // count+upsert under the writer mutex remains the atomic enforcer.
+    // Avoid staging rejected uploads; publication rechecks under the writer mutex.
     if let Some(target) = target_device_id.as_deref() {
         let db = state.db.clone();
         let sid = sync_id.clone();
         let tgt = target.to_string();
-        let other_audiences = tokio::task::spawn_blocking(move || {
-            db.with_read_conn(|conn| db::count_unexpired_targeted_snapshots(conn, &sid, Some(&tgt)))
+        let incoming_bytes = body.len() as u64;
+        let admitted = tokio::task::spawn_blocking(move || {
+            db.with_read_conn(|conn| {
+                db::targeted_snapshot_admission(
+                    conn,
+                    &sid,
+                    &tgt,
+                    incoming_bytes,
+                    MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+                )
+            })
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .map_err(|e| AppError::Internal(e.to_string()))?;
-        if other_audiences >= MAX_TARGETED_SNAPSHOTS_PER_GROUP {
-            state.metrics.inc(&state.metrics.snapshots_rejected_targeted_cap);
-            return Err(AppError::TooManyTargetedSnapshots {
-                max: MAX_TARGETED_SNAPSHOTS_PER_GROUP,
-            });
+        if let Err(error) = snapshot_admission_result(admitted) {
+            if matches!(error, AppError::TooManyTargetedSnapshots { .. }) {
+                state.metrics.inc(&state.metrics.snapshots_rejected_targeted_cap);
+            }
+            return Err(error);
         }
     }
 
@@ -647,6 +653,21 @@ pub async fn put_snapshot(
     }
 }
 
+fn snapshot_admission_result(admission: db::TargetedSnapshotAdmission) -> Result<(), AppError> {
+    match admission {
+        db::TargetedSnapshotAdmission::Admitted => Ok(()),
+        db::TargetedSnapshotAdmission::AudienceCap => {
+            Err(AppError::TooManyTargetedSnapshots { max: MAX_TARGETED_SNAPSHOTS_PER_GROUP })
+        }
+        db::TargetedSnapshotAdmission::StorageQuota("retained_rows") => {
+            Err(AppError::StorageFull("Targeted snapshot retained row quota exceeded"))
+        }
+        db::TargetedSnapshotAdmission::StorageQuota(_) => {
+            Err(AppError::StorageFull("Targeted snapshot retained byte quota exceeded"))
+        }
+    }
+}
+
 /// Commit the snapshot ROW under the writer mutex so the targeted-snapshot cap
 /// count and the upsert stay atomic.
 ///
@@ -674,22 +695,17 @@ fn do_put_snapshot(
         .ok_or(AppError::NotFound)?;
     let epoch = device.epoch;
 
-    // Cap concurrent targeted rows. The count excludes the caller's own
-    // audience, so re-uploading to an existing audience updates it in place and
-    // never trips the cap — and an expired-then-refreshed caller row can't push
-    // the live unexpired total to cap+1 (the slack the expiry-agnostic precheck
-    // used to leave until hourly cleanup). This function is only the DB
-    // critical section: the caller already wrote any blob bytes to disk outside
-    // the lock, so the count read, the old-blob lookup, and the upsert all run
-    // under `with_conn`'s writer mutex together and stay atomic.
+    // Admission, old-blob lookup, and publication must share the writer mutex.
     if let Some(target) = target_device_id {
-        let other_audiences = db::count_unexpired_targeted_snapshots(conn, sync_id, Some(target))
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        if other_audiences >= MAX_TARGETED_SNAPSHOTS_PER_GROUP {
-            return Err(AppError::TooManyTargetedSnapshots {
-                max: MAX_TARGETED_SNAPSHOTS_PER_GROUP,
-            });
-        }
+        let admitted = db::targeted_snapshot_admission(
+            conn,
+            sync_id,
+            target,
+            inline_data.len() as u64,
+            MAX_TARGETED_SNAPSHOTS_PER_GROUP,
+        )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+        snapshot_admission_result(admitted)?;
     }
 
     // Read the old blob_ref for this audience BEFORE the upsert (same writer
@@ -700,12 +716,13 @@ fn do_put_snapshot(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let affected = match blob_ref {
-        Some(blob_ref) => db::upsert_snapshot_ref(
+        Some(blob_ref) => db::upsert_snapshot_ref_sized(
             conn,
             sync_id,
             epoch,
             server_seq_at,
             blob_ref,
+            inline_data.len() as u64,
             expires_at,
             target_device_id,
             Some(device_id),
@@ -763,8 +780,9 @@ pub async fn delete_account(
         &headers,
         "DELETE",
         &format!("/v1/sync/{}", auth.sync_id),
-        &[],
-    )?;
+        axum::body::Bytes::new(),
+    )
+    .await?;
 
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();

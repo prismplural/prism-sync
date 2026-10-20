@@ -6,8 +6,23 @@ use prism_sync_relay::{cleanup, config::Config, db, db::Database, routes, state:
 #[cfg(all(feature = "test-helpers", not(debug_assertions)))]
 compile_error!("test-helpers feature must not be enabled in release builds");
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(4)
+        });
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 

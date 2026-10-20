@@ -103,8 +103,9 @@ async fn put_registry(
         &headers,
         "PUT",
         &format!("/v1/sync/{}/registry", path_sync_id),
-        &body,
-    )?;
+        body.clone(),
+    )
+    .await?;
 
     // Parse request body
     let req: PutRegistryRequest =

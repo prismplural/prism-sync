@@ -118,7 +118,8 @@ pub async fn delete_device(
     }
 
     let path = format!("/v1/sync/{sync_id}/devices/{target_device_id}");
-    verify_signed_request(&state, &auth, &headers, "DELETE", &path, &[])?;
+    verify_signed_request(&state, &auth, &headers, "DELETE", &path, axum::body::Bytes::new())
+        .await?;
 
     let db = state.db.clone();
     let sid = sync_id.clone();
@@ -180,7 +181,7 @@ pub async fn post_atomic_revoke(
     }
 
     let path = format!("/v1/sync/{}/devices/{}/revoke", auth.sync_id, target_device_id);
-    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "POST", &path, body.clone()).await?;
 
     if !state.revoke_rate_limiter.check(
         &format!("revoke:{}", auth.sync_id),
@@ -365,7 +366,7 @@ pub async fn post_rekey(
     }
 
     let path = format!("/v1/sync/{}/rekey", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "POST", &path, body.clone()).await?;
 
     let body_json: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
@@ -658,7 +659,7 @@ pub async fn post_ack(
     }
 
     let path = format!("/v1/sync/{}/ack", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "POST", &path, body.clone()).await?;
 
     let body_json: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
@@ -736,7 +737,7 @@ pub async fn post_rotate_ml_dsa(
     }
 
     let path = format!("/v1/sync/{}/devices/{}/rotate-ml-dsa", auth_identity.sync_id, device_id);
-    verify_signed_request(&state, &auth_identity, &headers, "POST", &path, &body)?;
+    verify_signed_request(&state, &auth_identity, &headers, "POST", &path, body.clone()).await?;
 
     let req: RotateMlDsaRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;

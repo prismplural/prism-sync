@@ -460,6 +460,7 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             target_device_id        TEXT,
             uploaded_by_device_id   TEXT,
             blob_ref                TEXT,
+            blob_bytes              INTEGER,
             FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
         );
         -- The per-audience UNIQUE index is created by
@@ -905,6 +906,10 @@ fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Err
         return Ok(());
     }
 
+    // Legacy schemas lack file columns; preserve both when rebuilding modern rows.
+    let blob_ref = if snapshot_has_column(conn, "blob_ref")? { "blob_ref" } else { "NULL" };
+    let blob_bytes = if snapshot_has_column(conn, "blob_bytes")? { "blob_bytes" } else { "NULL" };
+
     // Rebuild the table off its sync_id-only PK onto per-audience uniqueness.
     // The whole rebuild runs in one transaction (SQLite DDL is transactional)
     // so a crash mid-migration rolls back cleanly: either the legacy table
@@ -914,7 +919,7 @@ fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Err
     // row. The defensive pre-drop clears any orphan left by a pre-transaction
     // build. unchecked_transaction mirrors prune_batches_before.
     let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
+    tx.execute_batch(&format!(
         "DROP TABLE IF EXISTS snapshots_per_audience_new;
          CREATE TABLE snapshots_per_audience_new (
              sync_id                 TEXT NOT NULL,
@@ -926,19 +931,18 @@ fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Err
              target_device_id        TEXT,
              uploaded_by_device_id   TEXT,
              blob_ref                TEXT,
+             blob_bytes              INTEGER,
              FOREIGN KEY (sync_id) REFERENCES sync_groups(sync_id)
          );
          -- Copy the newest row per audience. Legacy tables can only hold one
          -- row per sync_id, but a future re-run (or a hand-doctored DB) might
          -- carry duplicates; the window keeps the latest and drops the rest.
-         -- The rebuilt table carries `blob_ref` so it matches the final schema
-         -- (legacy rows are inline, so it copies as NULL); migrate_snapshots_blob_ref
-         -- then no-ops on this path.
+         -- Preserve modern file metadata; old inline schemas select NULLs.
          INSERT INTO snapshots_per_audience_new
              (sync_id, epoch, server_seq_at, data, created_at, expires_at,
-              target_device_id, uploaded_by_device_id, blob_ref)
+              target_device_id, uploaded_by_device_id, blob_ref, blob_bytes)
          SELECT sync_id, epoch, server_seq_at, data, created_at, expires_at,
-                target_device_id, uploaded_by_device_id, NULL
+                target_device_id, uploaded_by_device_id, {blob_ref}, {blob_bytes}
          FROM (
              SELECT *, ROW_NUMBER() OVER (
                  PARTITION BY sync_id, COALESCE(target_device_id, '')
@@ -953,13 +957,13 @@ fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Err
              ON snapshots (sync_id, COALESCE(target_device_id, ''));
          CREATE INDEX IF NOT EXISTS idx_snapshots_expires_at
              ON snapshots (expires_at) WHERE expires_at IS NOT NULL;",
-    )?;
+    ))?;
     tx.commit()?;
 
     Ok(())
 }
 
-/// Add the `blob_ref` column to an existing `snapshots` table. File-backed
+/// Add `blob_ref` and `blob_bytes` to an existing `snapshots` table. File-backed
 /// uploads store the snapshot bytes on disk and only a filename reference in
 /// the row; pre-existing rows are inline (`blob_ref IS NULL`) and keep being
 /// served from `data`, so this is a pure additive ADD COLUMN with no data
@@ -968,6 +972,9 @@ fn migrate_snapshots_per_audience(conn: &Connection) -> Result<(), rusqlite::Err
 fn migrate_snapshots_blob_ref(conn: &Connection) -> Result<(), rusqlite::Error> {
     if !snapshot_has_column(conn, "blob_ref")? {
         conn.execute_batch("ALTER TABLE snapshots ADD COLUMN blob_ref TEXT;")?;
+    }
+    if !snapshot_has_column(conn, "blob_bytes")? {
+        conn.execute_batch("ALTER TABLE snapshots ADD COLUMN blob_bytes INTEGER;")?;
     }
     Ok(())
 }
@@ -2247,6 +2254,7 @@ pub fn upsert_snapshot(
         server_seq_at,
         data,
         None,
+        None,
         expires_at,
         target_device_id,
         uploaded_by_device_id,
@@ -2276,6 +2284,36 @@ pub fn upsert_snapshot_ref(
         server_seq_at,
         &[],
         Some(blob_ref),
+        None,
+        expires_at,
+        target_device_id,
+        uploaded_by_device_id,
+    )
+}
+
+/// Publish a file reference with the verified wire size for retention accounting.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_snapshot_ref_sized(
+    conn: &Connection,
+    sync_id: &str,
+    epoch: i64,
+    server_seq_at: i64,
+    blob_ref: &str,
+    blob_bytes: u64,
+    expires_at: Option<i64>,
+    target_device_id: Option<&str>,
+    uploaded_by_device_id: Option<&str>,
+) -> Result<usize, rusqlite::Error> {
+    let bytes = i64::try_from(blob_bytes)
+        .map_err(|_| rusqlite::Error::InvalidParameterName("snapshot size overflow".into()))?;
+    upsert_snapshot_inner(
+        conn,
+        sync_id,
+        epoch,
+        server_seq_at,
+        &[],
+        Some(blob_ref),
+        Some(bytes),
         expires_at,
         target_device_id,
         uploaded_by_device_id,
@@ -2295,6 +2333,7 @@ fn upsert_snapshot_inner(
     server_seq_at: i64,
     data: &[u8],
     blob_ref: Option<&str>,
+    blob_bytes: Option<i64>,
     expires_at: Option<i64>,
     target_device_id: Option<&str>,
     uploaded_by_device_id: Option<&str>,
@@ -2305,13 +2344,14 @@ fn upsert_snapshot_inner(
     // row for THIS audience. An upload targeted at one joiner can never replace
     // the group-wide row or another joiner's targeted row.
     let affected = conn.execute(
-        "INSERT INTO snapshots (sync_id, epoch, server_seq_at, data, blob_ref, created_at, expires_at, target_device_id, uploaded_by_device_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO snapshots (sync_id, epoch, server_seq_at, data, blob_ref, created_at, expires_at, target_device_id, uploaded_by_device_id, blob_bytes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(sync_id, COALESCE(target_device_id, '')) DO UPDATE SET
             epoch = excluded.epoch,
             server_seq_at = excluded.server_seq_at,
             data = excluded.data,
             blob_ref = excluded.blob_ref,
+            blob_bytes = excluded.blob_bytes,
             created_at = excluded.created_at,
             expires_at = excluded.expires_at,
             target_device_id = excluded.target_device_id,
@@ -2333,6 +2373,7 @@ fn upsert_snapshot_inner(
             expires_at,
             target_device_id,
             uploaded_by_device_id,
+            blob_bytes,
         ],
     )?;
     Ok(affected)
@@ -2500,14 +2541,7 @@ pub fn get_min_unexpired_snapshot_seq(
     )
 }
 
-/// Count the group's unexpired *targeted* snapshot rows (NULL group-wide rows
-/// excluded), optionally skipping one audience (`exclude_target`). Bounds
-/// concurrent pairings: each targeted row can hold up to `MAX_SNAPSHOT_WIRE_BYTES`,
-/// so an uncapped count would let a pathological burst of pairings fill the
-/// relay. The put handler counts the *other* audiences (excluding the caller's
-/// own) and rejects once that reaches the cap — so re-uploading to an existing
-/// audience never trips it, and an expired-then-refreshed caller row can't push
-/// the live total to cap+1.
+/// Includes abandoned attempts; use `targeted_snapshot_admission` for admission.
 pub fn count_unexpired_targeted_snapshots(
     conn: &Connection,
     sync_id: &str,
@@ -2522,6 +2556,60 @@ pub fn count_unexpired_targeted_snapshots(
         params![sync_id, exclude_target],
         |row| row.get(0),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetedSnapshotAdmission {
+    Admitted,
+    AudienceCap,
+    StorageQuota(&'static str),
+}
+
+/// Old unregistered targets retain payloads and bootstrap tails without using slots.
+/// Legacy file references with unknown sizes are charged the wire maximum.
+pub fn targeted_snapshot_admission(
+    conn: &Connection,
+    sync_id: &str,
+    target: &str,
+    incoming_bytes: u64,
+    audience_cap: i64,
+) -> Result<TargetedSnapshotAdmission, rusqlite::Error> {
+    use crate::snapshot_limits::{
+        MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP, MAX_RETAINED_TARGETED_SNAPSHOT_BYTES,
+        MAX_SNAPSHOT_WIRE_BYTES, TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS,
+    };
+    let now = now_secs();
+    let (active, retained, bytes): (i64, i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(CASE WHEN s.created_at >= ?4
+                    OR d.status IN ('active','stale') THEN 1 ELSE 0 END),0),
+                COUNT(*), COALESCE(SUM(CASE WHEN s.blob_ref IS NOT NULL
+                    THEN COALESCE(s.blob_bytes,?5) ELSE LENGTH(s.data) END),0)
+         FROM snapshots s LEFT JOIN devices d
+           ON d.sync_id=s.sync_id AND d.device_id=s.target_device_id
+         WHERE s.sync_id=?1 AND s.target_device_id IS NOT NULL
+           AND s.target_device_id!=?2
+           AND (s.expires_at IS NULL OR s.expires_at>=?3)",
+        params![
+            sync_id,
+            target,
+            now,
+            now.saturating_sub(TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS),
+            MAX_SNAPSHOT_WIRE_BYTES as i64
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(if active >= audience_cap {
+        TargetedSnapshotAdmission::AudienceCap
+    } else if retained >= MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP {
+        TargetedSnapshotAdmission::StorageQuota("retained_rows")
+    } else if incoming_bytes > MAX_SNAPSHOT_WIRE_BYTES as u64
+        || (bytes.max(0) as u64).saturating_add(incoming_bytes)
+            > MAX_RETAINED_TARGETED_SNAPSHOT_BYTES
+    {
+        TargetedSnapshotAdmission::StorageQuota("retained_bytes")
+    } else {
+        TargetedSnapshotAdmission::Admitted
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2539,6 +2627,123 @@ pub fn count_unexpired_targeted_snapshots(
 // per-upload mutation lock and do their file I/O outside the writer mutex.
 
 use crate::uploads::{self, StagingError, UploadState};
+
+#[cfg(test)]
+mod targeted_snapshot_admission_tests {
+    use super::*;
+    use crate::snapshot_limits::{
+        MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP, MAX_SNAPSHOT_WIRE_BYTES,
+        TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS,
+    };
+    fn seeded(count: i64, registered: bool, file_backed: bool) -> Database {
+        let db = Database::in_memory().unwrap();
+        db.with_conn(|conn| {
+            create_sync_group(conn, "group", 0)?;
+            for i in 0..count {
+                let target = format!("{i:032x}");
+                if registered {
+                    register_device(conn, "group", &target, &[1; 32], &[2; 32], 0)?;
+                }
+                if file_backed {
+                    upsert_snapshot_ref(
+                        conn,
+                        "group",
+                        0,
+                        i,
+                        &target,
+                        Some(now_secs() + 86400),
+                        Some(&target),
+                        Some("uploader"),
+                    )?;
+                } else {
+                    upsert_snapshot(
+                        conn,
+                        "group",
+                        0,
+                        i,
+                        b"retained",
+                        Some(now_secs() + 86400),
+                        Some(&target),
+                        Some("uploader"),
+                    )?;
+                }
+            }
+            conn.execute(
+                "UPDATE snapshots SET created_at=?1",
+                [now_secs() - TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS - 1],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db
+    }
+    #[test]
+    fn old_registered_targets_still_occupy_concurrency_slots() {
+        seeded(4, true, false)
+            .with_read_conn(|conn| {
+                assert_eq!(
+                    targeted_snapshot_admission(conn, "group", "new", 10, 4)?,
+                    TargetedSnapshotAdmission::AudienceCap
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn retained_row_quota_is_distinct_from_concurrent_pairings() {
+        seeded(MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP, false, false)
+            .with_read_conn(|conn| {
+                assert_eq!(
+                    targeted_snapshot_admission(conn, "group", "new", 10, 4)?,
+                    TargetedSnapshotAdmission::StorageQuota("retained_rows")
+                );
+                assert_eq!(
+                    targeted_snapshot_admission(conn, "group", &format!("{:032x}", 0), 10, 4)?,
+                    TargetedSnapshotAdmission::Admitted
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn unknown_legacy_file_sizes_remain_conservative_but_expired_rows_do_not_block() {
+        let db = seeded(4, false, true);
+        db.with_conn(|conn| {
+            assert_eq!(
+                targeted_snapshot_admission(conn, "group", "new", 1, 4)?,
+                TargetedSnapshotAdmission::StorageQuota("retained_bytes")
+            );
+            assert_eq!(
+                targeted_snapshot_admission(
+                    conn,
+                    "group",
+                    &format!("{:032x}", 0),
+                    MAX_SNAPSHOT_WIRE_BYTES as u64,
+                    4
+                )?,
+                TargetedSnapshotAdmission::Admitted
+            );
+            conn.execute("UPDATE snapshots SET expires_at=?1", [now_secs() - 1])?;
+            assert_eq!(
+                targeted_snapshot_admission(conn, "group", "new", 1, 4)?,
+                TargetedSnapshotAdmission::Admitted
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    #[test]
+    fn snapshot_size_migration_is_additive_and_preserves_inline_payloads() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE snapshots(data BLOB NOT NULL,blob_ref TEXT);INSERT INTO snapshots VALUES (X'010203',NULL);").unwrap();
+        migrate_snapshots_blob_ref(&conn).unwrap();
+        let (data, size): (Vec<u8>, Option<i64>) = conn
+            .query_row("SELECT data,blob_bytes FROM snapshots", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(data, vec![1, 2, 3]);
+        assert_eq!(size, None);
+    }
+}
 
 /// One upload session row.
 #[derive(Debug, Clone)]
@@ -2822,14 +3027,22 @@ pub fn create_snapshot_upload(
         return Ok(CreateSnapshotUploadOutcome::InsufficientStorage);
     }
 
-    // 3c. Audience precheck: a fresh target beyond the cap is rejected here so we
-    // never stage up to 150 MB only to fail the authoritative check later. A
-    // completed unexpired snapshot for the same target counts once, as does any
-    // other active reservation, without double-counting the same target.
-    let other_audiences =
-        count_unexpired_targeted_snapshots(&tx, input.sync_id, Some(input.target_device_id))?;
-    if other_audiences >= input.audience_cap {
-        return Ok(CreateSnapshotUploadOutcome::AudienceCapReached);
+    // Publication rechecks admission atomically; staging quotas are separate.
+    match targeted_snapshot_admission(
+        &tx,
+        input.sync_id,
+        input.target_device_id,
+        u64::try_from(input.total_bytes).unwrap_or(u64::MAX),
+        input.audience_cap,
+    )? {
+        TargetedSnapshotAdmission::Admitted => {}
+        TargetedSnapshotAdmission::AudienceCap => {
+            return Ok(CreateSnapshotUploadOutcome::AudienceCapReached)
+        }
+        TargetedSnapshotAdmission::StorageQuota(scope) => {
+            tracing::warn!(scope, "Targeted snapshot retention quota reached at upload creation");
+            return Ok(CreateSnapshotUploadOutcome::InsufficientStorage);
+        }
     }
 
     let idle_expires_at = now + SNAPSHOT_UPLOAD_IDLE_TTL;
@@ -3546,11 +3759,22 @@ fn publish_snapshot_upload(
 
         // Authoritative audience cap, excluding this session's own target so a
         // replacement never trips it.
-        let other_audiences =
-            count_unexpired_targeted_snapshots(conn, sync_id, Some(&row.target_device_id))
-                .map_err(|e| CompletionRejection::Internal(e.to_string()))?;
-        if other_audiences >= audience_cap {
-            return Err(CompletionRejection::AudienceCapReached);
+        match targeted_snapshot_admission(
+            conn,
+            sync_id,
+            &row.target_device_id,
+            u64::try_from(row.total_bytes).unwrap_or(u64::MAX),
+            audience_cap,
+        )
+        .map_err(|e| CompletionRejection::Internal(e.to_string()))?
+        {
+            TargetedSnapshotAdmission::Admitted => {}
+            TargetedSnapshotAdmission::AudienceCap => {
+                return Err(CompletionRejection::AudienceCapReached)
+            }
+            TargetedSnapshotAdmission::StorageQuota(_) => {
+                return Err(CompletionRejection::InsufficientStorage)
+            }
         }
 
         let old_blob_ref = get_snapshot_blob_ref(conn, sync_id, &row.target_device_id)
@@ -3581,12 +3805,13 @@ fn publish_snapshot_upload(
         // rather than a BLOB. Same staleness guard, same per-audience conflict
         // target as single PUT, so `SnapshotStale` semantics are unchanged.
         let expires_at = now.saturating_add(row.snapshot_ttl_secs);
-        let affected = upsert_snapshot_ref(
+        let affected = upsert_snapshot_ref_sized(
             conn,
             sync_id,
             row.epoch,
             row.server_seq_at,
             &row.blob_ref,
+            row.total_bytes.max(0) as u64,
             Some(expires_at),
             Some(&row.target_device_id),
             Some(device_id),
@@ -7517,6 +7742,38 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn audience_rebuild_preserves_surviving_file_reference_size_and_inline_payload() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sync_groups(sync_id TEXT PRIMARY KEY);
+            INSERT INTO sync_groups VALUES ('group');
+            CREATE TABLE snapshots(sync_id TEXT NOT NULL,epoch INTEGER NOT NULL,
+                server_seq_at INTEGER NOT NULL,data BLOB NOT NULL,created_at INTEGER NOT NULL,
+                expires_at INTEGER,target_device_id TEXT,uploaded_by_device_id TEXT,
+                blob_ref TEXT,blob_bytes INTEGER);
+            INSERT INTO snapshots VALUES ('group',0,1,X'',1,NULL,'target','uploader','old-blob',10);
+            INSERT INTO snapshots VALUES ('group',0,2,X'',2,NULL,'target','uploader','new-blob',13);
+            INSERT INTO snapshots VALUES ('group',0,3,X'616263',1,NULL,NULL,'uploader',NULL,NULL);",
+        )
+        .unwrap();
+        migrate_snapshots_per_audience(&conn).unwrap();
+        let row: (String, i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT blob_ref,blob_bytes,data FROM snapshots WHERE target_device_id='target'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("new-blob".into(), 13, vec![]));
+        assert_eq!(get_snapshot(&conn, "group", "other").unwrap().unwrap().data, b"abc");
+        migrate_snapshots_per_audience(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get::<_, i64>(0)).unwrap(),
+            2
+        );
     }
 
     #[test]

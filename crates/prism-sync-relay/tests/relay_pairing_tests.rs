@@ -40,6 +40,73 @@ async fn create_pairing_session(client: &Client, url: &str, bootstrap: &[u8]) ->
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn pairing_admission_separates_clients_behind_a_trusted_proxy() {
+    let mut config = test_config();
+    config.pairing_session_rate_limit = 1;
+    config.trusted_proxy_cidrs = vec!["127.0.0.0/8".into()];
+    let (url, server, _) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    for (ip, expected) in [("192.0.2.1", 201), ("192.0.2.1", 429), ("192.0.2.2", 201)] {
+        let response = client
+            .post(format!("{url}/v1/pairing"))
+            .header("CF-Connecting-IP", ip)
+            .json(&serde_json::json!({"joiner_bootstrap": "YQ=="}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn appended_proxy_headers_cannot_rotate_the_pairing_bucket() {
+    for header in ["x-forwarded-for", "forwarded"] {
+        let mut config = test_config();
+        config.pairing_session_rate_limit = 1;
+        config.trusted_proxy_cidrs = vec!["127.0.0.0/8".into()];
+        let (url, server, _) = start_test_relay_with_config(config).await;
+        let client = Client::new();
+        for (spoofed, expected) in [("192.0.2.1", 201), ("192.0.2.2", 429)] {
+            let value = if header == "forwarded" {
+                format!("for={spoofed}, for=198.51.100.10, for=127.0.0.2")
+            } else {
+                format!("{spoofed}, 198.51.100.10, 127.0.0.2")
+            };
+            let response = client
+                .post(format!("{url}/v1/pairing"))
+                .header(header, value)
+                .json(&serde_json::json!({"joiner_bootstrap":"YQ=="}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected, "{header}");
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn pairing_admission_ignores_forwarded_identity_from_untrusted_peers() {
+    let mut config = test_config();
+    config.pairing_session_rate_limit = 1;
+    config.trusted_proxy_cidrs.clear();
+    let (url, server, _) = start_test_relay_with_config(config).await;
+    let client = Client::new();
+    for (ip, expected) in [("192.0.2.1", 201), ("192.0.2.2", 429)] {
+        let response = client
+            .post(format!("{url}/v1/pairing"))
+            .header("CF-Connecting-IP", ip)
+            .json(&serde_json::json!({"joiner_bootstrap": "YQ=="}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn test_pairing_create_and_get_bootstrap() {
     let (url, _server, _db) = start_test_relay().await;
     let client = Client::new();

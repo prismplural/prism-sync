@@ -167,7 +167,7 @@ pub async fn upload_media(
 
     // 8. Verify signed request
     let path = format!("/v1/sync/{}/media", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "POST", &path, body.clone()).await?;
 
     // 9. (TTL + `now` were resolved up front, before the rate-limit lane split.)
     let sync_id = auth.sync_id.clone();

@@ -194,12 +194,12 @@ fn resolve_lease_offer(
 async fn create_session(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Rate limit by the actual peer address. Pairing rendezvous IDs are bearer
-    // capabilities, so spoofable forwarded headers are not trusted here.
+    // A shared tunnel must not turn this per-client limit into a relay-wide cap.
     if !state.pairing_rate_limiter.check(
-        &client_ip_key(peer_addr),
+        &super::client_ip_for_rate_limit(&headers, peer_addr, &state.config),
         state.config.pairing_session_rate_limit,
         60,
     ) {
@@ -722,10 +722,6 @@ async fn delete_session(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn client_ip_key(peer_addr: SocketAddr) -> String {
-    peer_addr.ip().to_string()
-}
 
 #[cfg(test)]
 mod tests {

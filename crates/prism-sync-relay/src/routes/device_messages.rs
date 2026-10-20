@@ -66,7 +66,7 @@ pub async fn send_device_message(
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
     let path = format!("/v1/sync/{}/device-messages", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "POST", &path, body.clone()).await?;
 
     let req: SendDeviceMessageRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
@@ -156,7 +156,7 @@ pub async fn pending_device_messages(
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
     let path = format!("/v1/sync/{}/device-messages/pending", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "GET", &path, &[])?;
+    verify_signed_request(&state, &auth, &headers, "GET", &path, axum::body::Bytes::new()).await?;
 
     let sync_id = auth.sync_id.clone();
     let device_id = auth.device_id.clone();
@@ -210,7 +210,7 @@ pub async fn ack_device_messages(
         return Err(AppError::Forbidden("sync_id mismatch"));
     }
     let path = format!("/v1/sync/{}/device-messages/ack", auth.sync_id);
-    verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+    verify_signed_request(&state, &auth, &headers, "POST", &path, body.clone()).await?;
 
     let req: AckDeviceMessagesRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;

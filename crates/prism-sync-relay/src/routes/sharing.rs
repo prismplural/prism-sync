@@ -107,7 +107,8 @@ pub async fn put_identity(
     Extension(auth): Extension<AuthIdentity>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(&state, &auth, &headers, "PUT", "/v1/sharing/identity", &body)?;
+    verify_signed_request(&state, &auth, &headers, "PUT", "/v1/sharing/identity", body.clone())
+        .await?;
 
     let req: PublishIdentityRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
@@ -184,7 +185,8 @@ pub async fn put_prekey(
     Extension(auth): Extension<AuthIdentity>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(&state, &auth, &headers, "PUT", "/v1/sharing/prekey", &body)?;
+    verify_signed_request(&state, &auth, &headers, "PUT", "/v1/sharing/prekey", body.clone())
+        .await?;
 
     let req: PublishPrekeyRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
@@ -320,7 +322,8 @@ pub async fn post_init(
     Extension(auth): Extension<AuthIdentity>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(&state, &auth, &headers, "POST", "/v1/sharing/init", &body)?;
+    verify_signed_request(&state, &auth, &headers, "POST", "/v1/sharing/init", body.clone())
+        .await?;
 
     let req: SharingInitRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::BadRequest("Invalid JSON"))?;
@@ -423,7 +426,15 @@ pub async fn get_pending_inits(
     headers: HeaderMap,
     Extension(auth): Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(&state, &auth, &headers, "GET", "/v1/sharing/init/pending", &[])?;
+    verify_signed_request(
+        &state,
+        &auth,
+        &headers,
+        "GET",
+        "/v1/sharing/init/pending",
+        axum::body::Bytes::new(),
+    )
+    .await?;
 
     let db = state.db.clone();
     let sync_id = auth.sync_id.clone();
@@ -466,7 +477,15 @@ pub async fn delete_identity(
     headers: HeaderMap,
     Extension(auth): Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_signed_request(&state, &auth, &headers, "DELETE", "/v1/sharing/identity", &[])?;
+    verify_signed_request(
+        &state,
+        &auth,
+        &headers,
+        "DELETE",
+        "/v1/sharing/identity",
+        axum::body::Bytes::new(),
+    )
+    .await?;
 
     let db = state.db.clone();
     let sync_id = auth.sync_id.clone();

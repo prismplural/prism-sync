@@ -253,7 +253,7 @@ async fn create_upload(
 
     let root = require_resumable_root(&state)?;
     let path = format!("/v1/sync/{}/snapshot/uploads", auth.sync_id);
-    super::verify_signed_request(&state, &auth, &headers, "POST", &path, &body)?;
+    super::verify_signed_request(&state, &auth, &headers, "POST", &path, body.clone()).await?;
     let request: CreateUploadRequest = serde_json::from_slice(&body)
         .map_err(|_| AppError::Upload(UploadError::InvalidUpload("malformed create body")))?;
 
@@ -444,7 +444,8 @@ async fn upload_status(
         return Err(AppError::Upload(UploadError::NotFound));
     }
     let path = format!("/v1/sync/{}/snapshot/uploads/{}", auth.sync_id, upload_id);
-    super::verify_signed_request(&state, &auth, &headers, "GET", &path, &[])?;
+    super::verify_signed_request(&state, &auth, &headers, "GET", &path, axum::body::Bytes::new())
+        .await?;
 
     let db = state.db.clone();
     let sid = auth.sync_id.clone();
@@ -490,7 +491,7 @@ async fn put_chunk(
         .map_err(|_| AppError::Upload(UploadError::InvalidUpload("invalid chunk offset")))?;
     let path =
         format!("/v1/sync/{}/snapshot/uploads/{}/chunks/{}", auth.sync_id, upload_id, offset);
-    super::verify_signed_request(&state, &auth, &headers, "PUT", &path, &body)?;
+    super::verify_signed_request(&state, &auth, &headers, "PUT", &path, body.clone()).await?;
 
     // Body bounds: an oversize body is normally refused by the route's body
     // layer before reaching the handler (with a plain-text 413), which is the
@@ -627,7 +628,8 @@ async fn complete_upload(
         return Err(AppError::Upload(UploadError::InvalidUpload("complete takes no body")));
     }
     let path = format!("/v1/sync/{}/snapshot/uploads/{}/complete", auth.sync_id, upload_id);
-    super::verify_signed_request(&state, &auth, &headers, "POST", &path, &[])?;
+    super::verify_signed_request(&state, &auth, &headers, "POST", &path, axum::body::Bytes::new())
+        .await?;
 
     let lock = state.upload_locks.acquire(&upload_id);
     let db = state.db.clone();
@@ -812,7 +814,15 @@ async fn abort_upload(
         return Err(AppError::NotFound);
     }
     let path = format!("/v1/sync/{}/snapshot/uploads/{}", auth.sync_id, upload_id);
-    super::verify_signed_request(&state, &auth, &headers, "DELETE", &path, &[])?;
+    super::verify_signed_request(
+        &state,
+        &auth,
+        &headers,
+        "DELETE",
+        &path,
+        axum::body::Bytes::new(),
+    )
+    .await?;
 
     let lock = state.upload_locks.acquire(&upload_id);
     let db = state.db.clone();

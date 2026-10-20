@@ -120,8 +120,9 @@ async fn refresh_session(
         &headers,
         "POST",
         &format!("/v1/sync/{sync_id}/session/refresh"),
-        &body,
-    )?;
+        body.clone(),
+    )
+    .await?;
 
     // Signature verified. A revoked device gets a structured 401 carrying the
     // latest signed registry artifact so it can confirm its own revocation

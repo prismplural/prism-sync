@@ -1017,6 +1017,50 @@ async fn new_upload_key_supersedes_the_previous_nonterminal_session() {
 // ───────────────────── quotas ─────────────────────
 
 #[tokio::test]
+async fn retained_snapshot_storage_quota_is_507_at_resumable_create() {
+    use prism_sync_relay::snapshot_limits::{
+        MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP, TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS,
+    };
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = fixture(tmp.path()).await;
+    let epoch = device_epoch(&f.db, &f.sync_id, &f.device_id);
+    f.db.with_conn(|conn| {
+        for _ in 0..MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP {
+            db::upsert_snapshot(
+                conn,
+                &f.sync_id,
+                epoch,
+                0,
+                b"retained",
+                Some(db::now_secs() + 86400),
+                Some(&generate_device_id()),
+                Some(&f.device_id),
+            )?;
+        }
+        conn.execute(
+            "UPDATE snapshots SET created_at=?1 WHERE sync_id=?2",
+            rusqlite::params![
+                db::now_secs() - TARGETED_SNAPSHOT_PAIRING_WINDOW_SECS - 1,
+                f.sync_id
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let response =
+        create_upload(&f, &create_body(&f.other_device_id, 1, &sha256_hex(b"x"), epoch, 0)).await;
+    assert_eq!(response.status(), 507);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "insufficient_storage");
+    assert_eq!(
+        f.db.with_read_conn(|c| db::count_unexpired_targeted_snapshots(c, &f.sync_id, None))
+            .unwrap(),
+        MAX_RETAINED_TARGETED_SNAPSHOTS_PER_GROUP
+    );
+    assert!(upload_files(&f.snapshot_root, &f.sync_id).is_empty());
+}
+
+#[tokio::test]
 async fn reservation_ceilings_reject_and_release_atomically() {
     let tmp = tempfile::TempDir::new().unwrap();
     let mut config = test_config();
@@ -1552,12 +1596,18 @@ async fn chunk_acceptance_refreshes_idle_but_never_absolute_expiry() {
         device_epoch(&f.db, &f.sync_id, &f.device_id),
         1,
     );
+    let request_started_at = db::now_secs();
     let upload_id = created_upload_id(create_upload(&f, &create).await).await;
     let before: serde_json::Value = status_upload(&f, &upload_id).await.json().await.unwrap();
     let absolute_before = before["absolute_expires_at"].as_i64().unwrap();
     let idle_before = before["idle_expires_at"].as_i64().unwrap();
-    assert_eq!(idle_before - db::now_secs(), SNAPSHOT_UPLOAD_IDLE_TTL_SECS);
-    assert!(absolute_before - db::now_secs() <= SNAPSHOT_UPLOAD_MAX_SESSION_SECS);
+    let observed_at = db::now_secs();
+    assert!((request_started_at + SNAPSHOT_UPLOAD_IDLE_TTL_SECS
+        ..=observed_at + SNAPSHOT_UPLOAD_IDLE_TTL_SECS)
+        .contains(&idle_before));
+    assert!((request_started_at + SNAPSHOT_UPLOAD_MAX_SESSION_SECS
+        ..=observed_at + SNAPSHOT_UPLOAD_MAX_SESSION_SECS)
+        .contains(&absolute_before));
 
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(

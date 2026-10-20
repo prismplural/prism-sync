@@ -9,13 +9,16 @@ use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use subtle::ConstantTimeEq;
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::{errors::AppError, state::AppState};
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/metrics", get(prometheus_metrics))
-        .route("/metrics/node", get(node_metrics))
+    Router::new().route("/metrics", get(prometheus_metrics)).merge(
+        Router::new()
+            .route("/metrics/node", get(node_metrics))
+            .layer(GlobalConcurrencyLimitLayer::new(4)),
+    )
 }
 
 /// Authorize a metrics request, failing closed when no token is configured.
@@ -217,12 +220,33 @@ async fn node_metrics(
     let base_url = state.config.node_exporter_url.as_deref().ok_or(AppError::NotFound)?;
 
     let url = format!("{base_url}/metrics");
-    let body = reqwest::get(&url)
+    const MAX_NODE_METRICS_BYTES: usize = 8 * 1024 * 1024;
+    let mut response = state
+        .node_metrics_http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(state.config.default_request_timeout_secs))
+        .send()
         .await
-        .map_err(|e| AppError::Internal(format!("node-exporter fetch failed: {e}")))?
-        .text()
+        .map_err(|e| AppError::Internal(format!("node-exporter fetch failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Internal("node-exporter returned an unsuccessful status".into()));
+    }
+    if response.content_length().is_some_and(|size| size > MAX_NODE_METRICS_BYTES as u64) {
+        return Err(AppError::Internal("node-exporter response exceeded the size limit".into()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| AppError::Internal(format!("node-exporter read failed: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("node-exporter read failed: {e}")))?
+    {
+        if chunk.len() > MAX_NODE_METRICS_BYTES.saturating_sub(body.len()) {
+            return Err(AppError::Internal(
+                "node-exporter response exceeded the size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
 
     Ok(([("content-type", "text/plain; version=0.0.4; charset=utf-8")], body))
 }
