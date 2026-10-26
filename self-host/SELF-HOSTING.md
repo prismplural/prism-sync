@@ -178,6 +178,13 @@ If anything fronts your relay (Caddy, nginx, Cloudflare Tunnel), set
 Otherwise every renewal is rate limited by the ingress address and all users
 share one bucket. A relay reached directly by clients needs no allowlist.
 
+When using `TRUSTED_PROXY_CIDRS`, configure every trusted ingress to overwrite
+`CF-Connecting-IP` with the verified client address or strip any client-supplied
+value before forwarding the request. The relay checks this header before
+`X-Forwarded-For` or `Forwarded`, and pairing creation uses that address for its
+per-client rate limit even when pairing leases are disabled. Forwarding an
+untrusted value lets a client change its claimed address to bypass that limit.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PAIRING_LEASE_ENABLED` | `false` | Offer the pairing lease. Dark by default; enabling it in a proxy-fronted deployment without `TRUSTED_PROXY_CIDRS` is refused at startup. |

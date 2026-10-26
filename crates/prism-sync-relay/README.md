@@ -41,6 +41,13 @@ All configuration via environment variables:
 | PAIRING_LEASE_FAILURE_LIMIT | 20 | Max *failed* verifier attempts per presented rendezvous ID per window. Failures are counted only; a legitimate renewal is never starved by garbage knowing the rendezvous ID. |
 | PAIRING_LEASE_FAILURE_WINDOW_SECS | 60 | Window for `PAIRING_LEASE_FAILURE_LIMIT`. |
 
+When using `TRUSTED_PROXY_CIDRS`, configure every trusted ingress to overwrite
+`CF-Connecting-IP` with the verified client address or strip any client-supplied
+value before forwarding the request. The relay checks this header before
+`X-Forwarded-For` or `Forwarded`, and pairing creation uses that address for its
+per-client rate limit even when pairing leases are disabled. Forwarding an
+untrusted value lets a client change its claimed address to bypass that limit.
+
 ## API Endpoints
 
 ### Registration
