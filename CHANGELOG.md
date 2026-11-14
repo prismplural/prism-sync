@@ -2,6 +2,26 @@
 
 All notable changes to prism-sync are recorded here.
 
+## [0.16.0] - 2026-11-14
+
+Sync snapshot for Prism 0.16.0. The app retains its tested client pin at
+`726b29376d2756e3702d2ac3fc4ae07c9556d138`; this tag also includes newer
+relay-only fixes. Cargo crate versions remain `0.1.1`.
+
+### Added
+- Opt-in resumable snapshot uploads and pairing leases. These capabilities
+  remain disabled by default; tagging this release does not enable them.
+
+### Fixed
+- Cancelled pairing bootstrap attempts are fenced off, and delayed uploads
+  are aborted instead of continuing an older attempt.
+- Pairing retries preserve separate ceremony state instead of clearing a
+  different attempt's progress.
+- Relay blocking work, snapshot admission and retention, and resumable-upload
+  work are bounded, including through timeouts.
+- Snapshot file writes require explicit opt-in. Trusted proxy forwarding
+  requirements are documented for self-hosted relays.
+
 ## [0.15.2] - 2026-09-22
 
 Tagged for the matching `prism-app 0.15.2+15201` release. Cargo crate
